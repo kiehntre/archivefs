@@ -723,19 +723,22 @@ fn scan_source(source_root: &Path, source: &Path, archives: &mut Vec<Archive>) -
 
 pub fn plan_mounts(archives: &[Archive], mount_root: impl AsRef<Path>) -> Vec<MountPlan> {
     let mount_root = mount_root.as_ref();
-    let mut base_counts = HashMap::<String, usize>::new();
+    let mut base_counts = HashMap::<(String, String), usize>::new();
     for archive in archives {
+        let platform_folder = platform_mount_folder(archive);
         *base_counts
-            .entry(safe_mount_name(&archive.path))
+            .entry((platform_folder, safe_mount_name(&archive.path)))
             .or_default() += 1;
     }
 
-    let mut used = HashSet::new();
+    let mut used = HashSet::<(String, String)>::new();
     archives
         .iter()
         .map(|archive| {
+            let platform_folder = platform_mount_folder(archive);
             let base = safe_mount_name(&archive.path);
-            let mut name = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
+            let key = (platform_folder.clone(), base.clone());
+            let mut name = if base_counts.get(&key).copied().unwrap_or(0) > 1 {
                 format!(
                     "{base}--{}",
                     archive.identity.path_fingerprint(&archive.path)
@@ -744,22 +747,30 @@ pub fn plan_mounts(archives: &[Archive], mount_root: impl AsRef<Path>) -> Vec<Mo
                 base
             };
 
-            if used.contains(&name) {
+            if used.contains(&(platform_folder.clone(), name.clone())) {
                 name = format!(
                     "{name}--{}",
                     archive.identity.path_fingerprint(&archive.path)
                 );
             }
             let mut suffix = 2;
-            while used.contains(&name) {
+            while used.contains(&(platform_folder.clone(), name.clone())) {
                 name = format!("{}-{suffix}", safe_mount_name(&archive.path));
                 suffix += 1;
             }
-            used.insert(name.clone());
+            used.insert((platform_folder.clone(), name.clone()));
 
-            MountPlan::new(archive.clone(), mount_root.join(name))
+            MountPlan::new(archive.clone(), mount_root.join(platform_folder).join(name))
         })
         .collect()
+}
+
+fn platform_mount_folder(archive: &Archive) -> String {
+    archive
+        .identity
+        .platform
+        .clone()
+        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 pub fn safe_mount_name(path: impl AsRef<Path>) -> String {
@@ -1136,6 +1147,63 @@ mod tests {
     }
 
     #[test]
+    fn platform_aware_mount_paths_use_platform_folder() {
+        let archives = vec![archive_with_platform(
+            "/roms/xbox360/Halo 3.zip",
+            Some("Xbox360"),
+        )];
+        let mounts = plan_mounts(&archives, "/mnt/archivefs");
+
+        assert_eq!(
+            mounts[0].mount_path,
+            PathBuf::from("/mnt/archivefs/Xbox360/Halo_3")
+        );
+    }
+
+    #[test]
+    fn platform_aware_mount_paths_use_unknown_folder_without_platform() {
+        let archives = vec![archive_with_platform("/roms/misc/Mystery.zip", None)];
+        let mounts = plan_mounts(&archives, "/mnt/archivefs");
+
+        assert_eq!(
+            mounts[0].mount_path,
+            PathBuf::from("/mnt/archivefs/Unknown/Mystery")
+        );
+    }
+
+    #[test]
+    fn duplicate_mount_suffixes_are_scoped_to_platform_folder() {
+        let archives = vec![
+            archive_with_platform("/roms/xbox/game.zip", Some("Xbox")),
+            archive_with_platform("/roms/xbox-alt/game.zip", Some("Xbox")),
+            archive_with_platform("/roms/xbox360/game.zip", Some("Xbox360")),
+        ];
+        let mounts = plan_mounts(&archives, "/mnt/archivefs");
+
+        assert_ne!(mounts[0].mount_path, mounts[1].mount_path);
+        assert!(
+            mounts[0]
+                .mount_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("game--")
+        );
+        assert!(
+            mounts[1]
+                .mount_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("game--")
+        );
+        assert_eq!(
+            mounts[2].mount_path,
+            PathBuf::from("/mnt/archivefs/Xbox360/game")
+        );
+    }
+
+    #[test]
     fn archive_health_marks_retryable_states() {
         assert!(ArchiveHealth::Failed.is_retryable());
         assert!(ArchiveHealth::MissingParts.is_retryable());
@@ -1257,7 +1325,7 @@ mod tests {
         assert_eq!(plans[0].archive.identity.normalized_name, "resident_evil_2");
         assert_eq!(
             plans[0].mount_path,
-            PathBuf::from("/mnt/archivefs/Resident_Evil_2")
+            PathBuf::from("/mnt/archivefs/Unknown/Resident_Evil_2")
         );
         assert_eq!(plans[0].state, MountState::Pending);
     }
@@ -1334,6 +1402,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn archive_with_platform(path: &str, platform: Option<&str>) -> Archive {
+        let mut archive = archive(path);
+        archive.identity.platform = platform.map(str::to_string);
+        archive
     }
 
     fn archive(path: &str) -> Archive {
