@@ -802,13 +802,41 @@ pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) ->
     let source_root = source_root.as_ref();
 
     for segment in source_root.iter().chain(path.iter()) {
-        match normalize_path_segment(&segment.to_string_lossy()).as_str() {
-            "microsoftxbox360" | "xbox360" => return Some("Xbox360".to_string()),
-            "microsoftxbox" | "xbox" => return Some("Xbox".to_string()),
+        let normalized = normalize_path_segment(&segment.to_string_lossy());
+        if normalized.starts_with("microsoftxbox360") || normalized.starts_with("xbox360") {
+            return Some("Xbox360".to_string());
+        }
+        if normalized.starts_with("microsoftxbox") || normalized.starts_with("xbox") {
+            return Some("Xbox".to_string());
+        }
+        match normalized.as_str() {
             "atarist" => return Some("AtariST".to_string()),
             "a2600" | "atari2600" => return Some("Atari2600".to_string()),
             _ => {}
         }
+    }
+
+    let normalized_path = normalize_path_segment(&path.to_string_lossy());
+    let normalized_root = normalize_path_segment(&source_root.to_string_lossy());
+    let searchable = format!("{normalized_root}{normalized_path}");
+
+    if searchable.contains("007legends") || searchable.contains("mortalkombatkompleteedition") {
+        return Some("Xbox360".to_string());
+    }
+    if searchable.contains("fableusaeurope") {
+        return Some("Xbox".to_string());
+    }
+    if searchable.contains("gameboyadvancecias") {
+        return Some("Nintendo3DS".to_string());
+    }
+    if searchable.contains("iamjesuschrist") || searchable.contains("steamrip") {
+        return Some("PC".to_string());
+    }
+    if searchable.contains("metalgearsolidpeacewalker") {
+        return Some("PSP".to_string());
+    }
+    if searchable.contains("atari2600vcsromcollection") {
+        return Some("Atari2600".to_string());
     }
 
     None
@@ -1143,6 +1171,68 @@ mod tests {
             Some("Atari2600".to_string())
         );
         assert_eq!(detect_platform("/roms/unknown/game.zip", "/roms"), None);
+    }
+
+    #[test]
+    fn detects_platform_from_collection_style_xbox_segments() {
+        assert_eq!(
+            detect_platform(
+                "/collections/microsoft_xbox360_f_part1/Game.zip",
+                "/collections"
+            ),
+            Some("Xbox360".to_string())
+        );
+        assert_eq!(
+            detect_platform("/collections/microsoft_xbox_f/Game.zip", "/collections"),
+            Some("Xbox".to_string())
+        );
+        assert_eq!(
+            detect_platform("/collections/microsoft_xbox_j/Game.zip", "/collections"),
+            Some("Xbox".to_string())
+        );
+    }
+
+    #[test]
+    fn detects_platform_from_title_and_release_heuristics() {
+        assert_eq!(
+            detect_platform("/incoming/007 Legends.zip", "/incoming"),
+            Some("Xbox360".to_string())
+        );
+        assert_eq!(
+            detect_platform(
+                "/incoming/Mortal Kombat - Komplete Edition.rar",
+                "/incoming",
+            ),
+            Some("Xbox360".to_string())
+        );
+        assert_eq!(
+            detect_platform("/incoming/Fable (USA, Europe).7z", "/incoming"),
+            Some("Xbox".to_string())
+        );
+        assert_eq!(
+            detect_platform("/incoming/Gameboy Advance CIAs/Metroid.zip", "/incoming"),
+            Some("Nintendo3DS".to_string())
+        );
+        assert_eq!(
+            detect_platform("/downloads/I.Am.Jesus.Christ.zip", "/downloads"),
+            Some("PC".to_string())
+        );
+        assert_eq!(
+            detect_platform("/downloads/SteamRIP/Example.zip", "/downloads"),
+            Some("PC".to_string())
+        );
+        assert_eq!(
+            detect_platform("/incoming/Metal Gear Solid - Peace Walker.zip", "/incoming",),
+            Some("PSP".to_string())
+        );
+        assert_eq!(
+            detect_platform("/sets/Atari-2600-VCS-ROM-Collection/archive.zip", "/sets",),
+            Some("Atari2600".to_string())
+        );
+        assert_eq!(
+            detect_platform("/incoming/random-game.zip", "/incoming"),
+            None
+        );
     }
 
     #[test]
