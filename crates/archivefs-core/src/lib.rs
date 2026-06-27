@@ -19,6 +19,13 @@ pub enum ArchiveFsError {
         status: Option<i32>,
         stderr: String,
     },
+    NoMountMatch {
+        input: String,
+    },
+    AmbiguousMountMatch {
+        input: String,
+        matches: Vec<(PathBuf, PathBuf)>,
+    },
 }
 
 impl fmt::Display for ArchiveFsError {
@@ -37,6 +44,22 @@ impl fmt::Display for ArchiveFsError {
                 }
                 if !stderr.trim().is_empty() {
                     write!(f, ": {}", stderr.trim())?;
+                }
+                Ok(())
+            }
+            Self::NoMountMatch { input } => {
+                write!(f, "no archive matched '{input}'")
+            }
+            Self::AmbiguousMountMatch { input, matches } => {
+                writeln!(f, "multiple archives matched '{input}':")?;
+                for (archive_path, mount_path) in matches {
+                    writeln!(
+                        f,
+                        "  Archive: {}
+  Mount:   {}",
+                        archive_path.display(),
+                        mount_path.display()
+                    )?;
                 }
                 Ok(())
             }
@@ -773,6 +796,61 @@ fn platform_mount_folder(archive: &Archive) -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
+pub fn select_mount_plan(plans: &[MountPlan], input: &str) -> Result<MountPlan> {
+    let exact_matches = plans
+        .iter()
+        .filter(|plan| Path::new(input) == plan.archive.path)
+        .collect::<Vec<_>>();
+    if !exact_matches.is_empty() {
+        return single_mount_match(input, exact_matches);
+    }
+
+    let needle = input.to_lowercase();
+    let display_name_matches = plans
+        .iter()
+        .filter(|plan| {
+            plan.archive
+                .identity
+                .display_name
+                .to_lowercase()
+                .contains(&needle)
+        })
+        .collect::<Vec<_>>();
+    if !display_name_matches.is_empty() {
+        return single_mount_match(input, display_name_matches);
+    }
+
+    let safe_name_matches = plans
+        .iter()
+        .filter(|plan| {
+            safe_mount_name(&plan.archive.path)
+                .to_lowercase()
+                .contains(&needle)
+        })
+        .collect::<Vec<_>>();
+    if !safe_name_matches.is_empty() {
+        return single_mount_match(input, safe_name_matches);
+    }
+
+    Err(ArchiveFsError::NoMountMatch {
+        input: input.to_string(),
+    })
+}
+
+fn single_mount_match(input: &str, matches: Vec<&MountPlan>) -> Result<MountPlan> {
+    if matches.len() == 1 {
+        return Ok(matches[0].clone());
+    }
+
+    Err(ArchiveFsError::AmbiguousMountMatch {
+        input: input.to_string(),
+        matches: matches
+            .into_iter()
+            .map(|plan| (plan.archive.path.clone(), plan.mount_path.clone()))
+            .collect(),
+    })
+}
+
 pub fn safe_mount_name(path: impl AsRef<Path>) -> String {
     let base = archive_title(path.as_ref());
     let mut safe = String::new();
@@ -949,6 +1027,36 @@ pub fn mount_archives_with_backend(
     }
 
     current_statuses(config)
+}
+
+pub fn mount_one_archive(config: &Config, input: &str) -> Result<MountPlan> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    mount_one_archive_with_backend(config, input, &backend)
+}
+
+pub fn mount_one_archive_with_backend(
+    config: &Config,
+    input: &str,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
+    let archives = scan_archives(config)?;
+    let plans = plan_mounts(&archives, &config.mount_root);
+    let plan = select_mount_plan(&plans, input)?;
+
+    fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
+        path: config.mount_root.clone(),
+        source,
+    })?;
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+    if !mounted_paths.contains(&plan.mount_path) {
+        fs::create_dir_all(&plan.mount_path).map_err(|source| ArchiveFsError::Io {
+            path: plan.mount_path.clone(),
+            source,
+        })?;
+        backend.mount(&plan)?;
+    }
+
+    Ok(plan)
 }
 
 pub fn unmount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
@@ -1201,6 +1309,89 @@ mod tests {
             mounts[2].mount_path,
             PathBuf::from("/mnt/archivefs/Xbox360/game")
         );
+    }
+
+    #[test]
+    fn select_mount_plan_matches_exact_archive_path() {
+        let archives = vec![archive_with_platform(
+            "/roms/xbox360/007 Legends.zip",
+            Some("Xbox360"),
+        )];
+        let plans = plan_mounts(&archives, "/mnt/archivefs");
+        let selected = select_mount_plan(&plans, "/roms/xbox360/007 Legends.zip").unwrap();
+
+        assert_eq!(
+            selected.archive.path,
+            PathBuf::from("/roms/xbox360/007 Legends.zip")
+        );
+        assert_eq!(
+            selected.mount_path,
+            PathBuf::from("/mnt/archivefs/Xbox360/007_Legends")
+        );
+    }
+
+    #[test]
+    fn select_mount_plan_matches_display_name_partial_case_insensitively() {
+        let archives = vec![archive_with_platform(
+            "/roms/xbox360/007 Legends.zip",
+            Some("Xbox360"),
+        )];
+        let plans = plan_mounts(&archives, "/mnt/archivefs");
+        let selected = select_mount_plan(&plans, "legends").unwrap();
+
+        assert_eq!(
+            selected.archive.path,
+            PathBuf::from("/roms/xbox360/007 Legends.zip")
+        );
+    }
+
+    #[test]
+    fn select_mount_plan_matches_safe_mount_name() {
+        let archives = vec![archive_with_platform(
+            "/roms/ps1/Metal: Gear? Solid.zip",
+            None,
+        )];
+        let plans = plan_mounts(&archives, "/mnt/archivefs");
+        let selected = select_mount_plan(&plans, "metal_gear").unwrap();
+
+        assert_eq!(
+            selected.mount_path,
+            PathBuf::from("/mnt/archivefs/Unknown/Metal_Gear_Solid")
+        );
+    }
+
+    #[test]
+    fn select_mount_plan_errors_for_zero_matches() {
+        let archives = vec![archive_with_platform(
+            "/roms/xbox360/007 Legends.zip",
+            Some("Xbox360"),
+        )];
+        let plans = plan_mounts(&archives, "/mnt/archivefs");
+        let error = select_mount_plan(&plans, "not here").unwrap_err();
+
+        assert!(matches!(error, ArchiveFsError::NoMountMatch { input } if input == "not here"));
+    }
+
+    #[test]
+    fn select_mount_plan_errors_for_multiple_matches() {
+        let archives = vec![
+            archive_with_platform("/roms/xbox360/007 Legends.zip", Some("Xbox360")),
+            archive_with_platform("/roms/xbox360/007 Racing.zip", Some("Xbox360")),
+        ];
+        let plans = plan_mounts(&archives, "/mnt/archivefs");
+        let error = select_mount_plan(&plans, "007").unwrap_err();
+
+        match error {
+            ArchiveFsError::AmbiguousMountMatch { input, matches } => {
+                assert_eq!(input, "007");
+                assert_eq!(matches.len(), 2);
+                assert!(matches.iter().any(|(archive_path, mount_path)| {
+                    archive_path == &PathBuf::from("/roms/xbox360/007 Legends.zip")
+                        && mount_path == &PathBuf::from("/mnt/archivefs/Xbox360/007_Legends")
+                }));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
