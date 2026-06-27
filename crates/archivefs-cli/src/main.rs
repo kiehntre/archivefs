@@ -5,9 +5,10 @@ use std::process::ExitCode;
 use archivefs_core::{
     ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveStatus,
     Config, DoctorReport, MountPlan, build_and_write_archive_index, check_archive_index_freshness,
-    clean_mount_root, current_statuses, default_index_path, find_archive_index_entries,
-    mount_archives, mount_one_archive, read_default_archive_index, run_doctor_default,
-    scan_archives, summarize_archive_index, unmount_archives, unmount_one_archive,
+    clean_mount_root, cleanup_selected_mount_dir, current_statuses, default_index_path,
+    find_archive_index_entries, mount_archives, mount_one_archive, read_default_archive_index,
+    run_doctor_default, scan_archives, summarize_archive_index, unmount_archives,
+    unmount_one_archive,
 };
 
 fn main() -> ExitCode {
@@ -60,7 +61,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Vec<_>>()
                 .join(" ");
             let config = Config::load_default()?;
-            print_unmount_one(&unmount_one_archive(&config, &input)?);
+            let plan = unmount_one_archive(&config, &input)?;
+            print_unmount_one(&plan);
+            warn_if_mount_dir_cleanup_failed(&config, &plan);
             warn_if_index_refresh_failed(&config);
         }
         "status" => {
@@ -112,6 +115,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn warn_if_mount_dir_cleanup_failed(config: &Config, plan: &MountPlan) {
+    if let Err(error) = cleanup_selected_mount_dir(config, &plan.mount_path) {
+        eprintln!(
+            "Warning: unmounted {}, but mount directory cleanup failed: {error}",
+            plan.mount_path.display()
+        );
+    }
 }
 
 fn warn_if_index_refresh_failed(config: &Config) {
