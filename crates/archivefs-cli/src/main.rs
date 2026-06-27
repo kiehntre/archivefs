@@ -2,8 +2,10 @@ use std::env;
 use std::process::ExitCode;
 
 use archivefs_core::{
-    ArchiveStatus, Config, DoctorReport, MountPlan, current_statuses, mount_archives,
-    mount_one_archive, run_doctor_default, scan_archives, unmount_archives, unmount_one_archive,
+    ArchiveIndexSummary, ArchiveStatus, Config, DoctorReport, MountPlan,
+    build_and_write_archive_index, current_statuses, default_index_path, mount_archives,
+    mount_one_archive, read_default_archive_index_summary, run_doctor_default, scan_archives,
+    unmount_archives, unmount_one_archive,
 };
 
 fn main() -> ExitCode {
@@ -64,6 +66,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "doctor" => {
             print_doctor_report(&run_doctor_default());
         }
+        "index-build" => {
+            let config = Config::load_default()?;
+            let index = build_and_write_archive_index(&config)?;
+            println!(
+                "Wrote index: {} ({} archives)",
+                default_index_path()?.display(),
+                index.archives.len()
+            );
+        }
+        "index-show" => {
+            print_index_summary(&read_default_archive_index_summary()?);
+        }
         "help" | "-h" | "--help" => print_help(),
         unknown => {
             print_help();
@@ -72,6 +86,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_index_summary(summary: &ArchiveIndexSummary) {
+    println!("ArchiveFS index");
+    println!("Archives: {}", summary.archives_count);
+    println!("Mounted: {}", summary.mounted_count);
+    println!("Pending: {}", summary.pending_count);
+    println!("Platforms:");
+    if summary.platform_counts.is_empty() {
+        println!("  none");
+    } else {
+        for (platform, count) in &summary.platform_counts {
+            println!("  {platform}: {count}");
+        }
+    }
 }
 
 fn print_mount_one(plan: &MountPlan) {
@@ -155,6 +184,8 @@ fn print_help() {
     println!("  unmount-one unmount one archive by path or name");
     println!("  status    show archive path, mount path, and state");
     println!("  doctor    diagnose whether ArchiveFS is ready to run safely");
+    println!("  index-build build the JSON archive index");
+    println!("  index-show show a summary of the JSON archive index");
     println!();
     println!("Config: ~/.config/archivefs/config.toml");
     println!("Example:");

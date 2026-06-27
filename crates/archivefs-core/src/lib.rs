@@ -504,6 +504,21 @@ impl ArchiveHealth {
     }
 }
 
+impl fmt::Display for ArchiveHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "Pending"),
+            Self::Mounted => write!(f, "Mounted"),
+            Self::Failed => write!(f, "Failed"),
+            Self::MissingParts => write!(f, "MissingParts"),
+            Self::Corrupt => write!(f, "Corrupt"),
+            Self::Unsupported => write!(f, "Unsupported"),
+            Self::PermissionDenied => write!(f, "PermissionDenied"),
+            Self::RetryAvailable => write!(f, "RetryAvailable"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ArchiveIdentity {
     pub display_name: String,
@@ -991,6 +1006,212 @@ impl Hasher for FnvHasher {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveIndexEntry {
+    pub archive_path: PathBuf,
+    pub platform: Option<String>,
+    pub display_name: String,
+    pub mount_path: PathBuf,
+    pub health: ArchiveHealth,
+    pub mount_state: MountState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveIndex {
+    pub archives: Vec<ArchiveIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveIndexSummary {
+    pub archives_count: usize,
+    pub platform_counts: Vec<(String, usize)>,
+    pub mounted_count: usize,
+    pub pending_count: usize,
+}
+
+pub fn default_index_path() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("archivefs")
+        .join("index.json"))
+}
+
+pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
+    let archives = scan_archives(config)?;
+    let plans = plan_mounts(&archives, &config.mount_root);
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+
+    Ok(ArchiveIndex {
+        archives: plans
+            .into_iter()
+            .map(|plan| {
+                let mount_state = if mounted_paths.contains(&plan.mount_path) {
+                    MountState::Mounted
+                } else if plan.mount_path.exists() {
+                    MountState::MountPathExists
+                } else {
+                    MountState::Pending
+                };
+                ArchiveIndexEntry {
+                    archive_path: plan.archive.path,
+                    platform: plan.archive.identity.platform,
+                    display_name: plan.archive.identity.display_name,
+                    mount_path: plan.mount_path,
+                    health: plan.archive.health,
+                    mount_state,
+                }
+            })
+            .collect(),
+    })
+}
+
+pub fn write_archive_index(index: &ArchiveIndex, path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ArchiveFsError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(path, archive_index_to_json(index)).map_err(|source| ArchiveFsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
+    let index = build_archive_index(config)?;
+    write_archive_index(&index, default_index_path()?)?;
+    Ok(index)
+}
+
+pub fn read_archive_index_summary(path: impl AsRef<Path>) -> Result<ArchiveIndexSummary> {
+    let path = path.as_ref();
+    let json = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(summarize_archive_index_json(&json))
+}
+
+pub fn read_default_archive_index_summary() -> Result<ArchiveIndexSummary> {
+    read_archive_index_summary(default_index_path()?)
+}
+
+fn summarize_archive_index_json(json: &str) -> ArchiveIndexSummary {
+    let mut archives_count = 0;
+    let mut mounted_count = 0;
+    let mut pending_count = 0;
+    let mut platform_counts = BTreeMap::<String, usize>::new();
+
+    for object in json.split("\n    {").skip(1) {
+        archives_count += 1;
+        if let Some(platform) = extract_json_string_field(object, "platform") {
+            *platform_counts.entry(platform).or_default() += 1;
+        } else {
+            *platform_counts.entry("Unknown".to_string()).or_default() += 1;
+        }
+        match extract_json_string_field(object, "mount_state").as_deref() {
+            Some("Mounted") => mounted_count += 1,
+            Some("Pending") => pending_count += 1,
+            _ => {}
+        }
+    }
+
+    ArchiveIndexSummary {
+        archives_count,
+        platform_counts: platform_counts.into_iter().collect(),
+        mounted_count,
+        pending_count,
+    }
+}
+
+fn archive_index_to_json(index: &ArchiveIndex) -> String {
+    let mut json = String::from("{\n  \"archives\": [\n");
+    for (idx, entry) in index.archives.iter().enumerate() {
+        if idx > 0 {
+            json.push_str(",\n");
+        }
+        json.push_str("    {\n");
+        json.push_str(&format!(
+            "      \"archive_path\": \"{}\",\n",
+            escape_json(&entry.archive_path.display().to_string())
+        ));
+        match &entry.platform {
+            Some(platform) => json.push_str(&format!(
+                "      \"platform\": \"{}\",\n",
+                escape_json(platform)
+            )),
+            None => json.push_str("      \"platform\": null,\n"),
+        }
+        json.push_str(&format!(
+            "      \"display_name\": \"{}\",\n",
+            escape_json(&entry.display_name)
+        ));
+        json.push_str(&format!(
+            "      \"mount_path\": \"{}\",\n",
+            escape_json(&entry.mount_path.display().to_string())
+        ));
+        json.push_str(&format!("      \"health\": \"{}\",\n", entry.health));
+        json.push_str(&format!(
+            "      \"mount_state\": \"{}\"\n",
+            entry.mount_state
+        ));
+        json.push_str("    }");
+    }
+    json.push_str("\n  ]\n}\n");
+    json
+}
+
+fn extract_json_string_field(object: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":");
+    let start = object.find(&needle)? + needle.len();
+    let rest = object[start..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in rest.chars() {
+        if escaped {
+            value.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(value);
+        } else {
+            value.push(ch);
+        }
+    }
+    None
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 pub fn current_statuses(config: &Config) -> Result<Vec<ArchiveStatus>> {
     let archives = scan_archives(config)?;
     let plans = plan_mounts(&archives, &config.mount_root);
@@ -1461,6 +1682,61 @@ mod tests {
 
         assert!(matches!(error, ArchiveFsError::NoMountMatch { input } if input == "missing"));
         assert!(backend.unmounted().is_empty());
+    }
+
+    #[test]
+    fn archive_index_json_contains_required_fields() {
+        let index = ArchiveIndex {
+            archives: vec![ArchiveIndexEntry {
+                archive_path: PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                platform: Some("Xbox360".to_string()),
+                display_name: "007 Legends".to_string(),
+                mount_path: PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+                health: ArchiveHealth::Pending,
+                mount_state: MountState::Pending,
+            }],
+        };
+        let json = archive_index_to_json(&index);
+
+        assert!(json.contains("\"archive_path\": \"/roms/xbox360/007 Legends.zip\""));
+        assert!(json.contains("\"platform\": \"Xbox360\""));
+        assert!(json.contains("\"display_name\": \"007 Legends\""));
+        assert!(json.contains("\"mount_path\": \"/mnt/archivefs/Xbox360/007_Legends\""));
+        assert!(json.contains("\"health\": \"Pending\""));
+        assert!(json.contains("\"mount_state\": \"Pending\""));
+    }
+
+    #[test]
+    fn archive_index_summary_counts_platforms_and_mount_states() {
+        let index = ArchiveIndex {
+            archives: vec![
+                ArchiveIndexEntry {
+                    archive_path: PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                    platform: Some("Xbox360".to_string()),
+                    display_name: "007 Legends".to_string(),
+                    mount_path: PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+                    health: ArchiveHealth::Pending,
+                    mount_state: MountState::Mounted,
+                },
+                ArchiveIndexEntry {
+                    archive_path: PathBuf::from("/roms/unknown/Mystery.zip"),
+                    platform: None,
+                    display_name: "Mystery".to_string(),
+                    mount_path: PathBuf::from("/mnt/archivefs/Unknown/Mystery"),
+                    health: ArchiveHealth::Pending,
+                    mount_state: MountState::Pending,
+                },
+            ],
+        };
+        let summary = summarize_archive_index_json(&archive_index_to_json(&index));
+
+        assert_eq!(summary.archives_count, 2);
+        assert_eq!(summary.mounted_count, 1);
+        assert_eq!(summary.pending_count, 1);
+        assert_eq!(
+            summary.platform_counts,
+            vec![("Unknown".to_string(), 1), ("Xbox360".to_string(), 1),]
+        );
     }
 
     #[test]
