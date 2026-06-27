@@ -1,59 +1,125 @@
-# ArchiveFS Security
+# ArchiveFS Security Design
 
-ArchiveFS treats all downloaded archives as untrusted.
+This document describes the security boundaries and safety rules for ArchiveFS.
 
-## Core rules
+ArchiveFS mounts untrusted archive files as folders. Archives may be incomplete, corrupt, malicious, or unexpectedly large. The security design should assume archive contents and filenames are attacker-controlled.
 
-- Never write inside source archives.
-- Never extract archives by default.
-- Never mount outside the configured `mount_root`.
-- Never follow paths that escape the mount root.
-- Never invoke shell commands with interpolated strings.
-- Always pass subprocess arguments directly.
-- Prefer read-only mounts.
-- Never delete source data automatically.
-- Retry failed mounts safely, with limits.
+## Goals
 
-## Threat model
+- Never perform destructive operations on source archives.
+- Only mount archives discovered from configured source folders.
+- Only unmount mountpoints created under the configured `mount_root`.
+- Avoid path traversal through archive filenames, internal paths, or generated mount names.
+- Keep mount backend behavior isolated behind `MountBackend`.
+- Make failures visible and retryable without hiding unsafe state.
 
-ArchiveFS may process archives from the internet, download tools, debrid services, and user collections. These archives may be corrupt, malicious, incomplete, or intentionally crafted to abuse path handling.
+## Non-Goals
 
-## Path traversal
+- No native FUSE implementation in v0.1.
+- No daemon security model in v0.1.
+- No GUI permission model in v0.1.
+- No Docker or container sandbox design in v0.1.
+- No malware scanning.
 
-ArchiveFS must reject archive entries such as:
+## Trust Boundaries
 
-- `../../file`
-- `/absolute/path`
-- paths containing unsafe symlink escapes
+### Config File
 
-## Mount containment
+ArchiveFS reads configuration from:
 
-All mount paths must stay under the configured `mount_root`.
+```text
+~/.config/archivefs/config.toml
+```
 
-## Symlinks
+The config controls source folders, mount root, and the ratarmount binary path. ArchiveFS should treat config as user-controlled but not archive-controlled.
 
-Symlinks inside archives must not be followed if they escape the mount root or expose host paths.
+Security rules:
 
-## Command execution
+- Source folders must be explicit.
+- Mounts must be created under the configured `mount_root`.
+- Unmount operations must never target paths outside `mount_root`.
 
-ArchiveFS must not use shell string execution. External tools such as `ratarmount` must be invoked with direct argument arrays.
+### Source Archives
 
-## Read-only by default
+Archive files are untrusted input.
 
-Mounted archives should be read-only unless a future user explicitly enables writable overlays.
+Security rules:
 
-## Destructive actions
+- Do not modify or delete source archives.
+- Do not extract archives into source folders.
+- Do not trust archive filenames as safe path components.
+- Skip obvious split archive continuation parts to avoid mounting incomplete fragments.
+- Mark unsupported, corrupt, missing-part, and permission failures in archive health instead of guessing.
 
-ArchiveFS must not delete, modify, or overwrite source archives automatically.
+### Mount Root
 
-## Retry behaviour
+The mount root is the only place ArchiveFS should create mount directories.
 
-Failed mounts may be retried manually or automatically when source files change, but retry loops must have limits and backoff.
+Security rules:
 
-## Audit logging
+- Generate safe mount names from archive names.
+- Resolve duplicate mount names deterministically.
+- Treat pre-existing mount directories as potentially suspicious unless they are confirmed mounted by ArchiveFS.
+- Only unmount paths under `mount_root`.
+- Prefer unmounting known mounted paths from system mount information, filtered by `mount_root`.
 
-ArchiveFS should log scans, mounts, unmounts, retries, failures, and security warnings.
+### Mount Backend
 
-## GUI warnings
+v0.1 uses `ratarmount` through `RatarmountBackend`.
 
-The GUI should clearly warn when an archive is corrupt, incomplete, unsafe, or blocked by security rules.
+Security rules:
+
+- Core mount logic should depend on the `MountBackend` trait.
+- Backend implementations should receive a `MountPlan`, not raw unvalidated strings.
+- Backend command arguments should be passed as arguments, not shell-concatenated command strings.
+- Backend failures should be surfaced as health or command errors.
+
+## Path Safety
+
+ArchiveFS must not allow archive names or internal archive paths to escape the configured mount area.
+
+Required behavior:
+
+- Convert unsafe filename characters to safe mount-name characters.
+- Collapse repeated separators where practical.
+- Trim unsafe leading and trailing separators.
+- Fall back to a neutral name such as `archive` when a filename has no safe characters.
+- Never use archive-internal paths to create host filesystem paths outside a mounted archive view.
+
+## Health and Retry Safety
+
+Archive health exists to make unsafe or incomplete states explicit.
+
+Important states:
+
+- `Failed`: a mount or inspection operation failed.
+- `MissingParts`: a split archive appears incomplete.
+- `Corrupt`: the archive appears damaged.
+- `Unsupported`: the archive format or layout is unsupported.
+- `PermissionDenied`: ArchiveFS cannot read or mount the archive.
+- `RetryAvailable`: a failed archive can be retried.
+
+Retry behavior should be explicit. ArchiveFS should not silently retry in a tight loop or hide repeated failures.
+
+## Future Work
+
+Future versions should consider:
+
+- Persistent ownership records for mountpoints in SQLite.
+- Stronger source-root canonicalization.
+- Symlink and bind-mount checks around `mount_root`.
+- Separate health diagnostics for missing split archive parts.
+- Optional archive hashing before mount.
+- Permission checks before invoking mount backends.
+- Daemon-specific least-privilege rules.
+- GUI warnings for corrupt, unsupported, or permission-denied archives.
+
+## v0.1 Summary
+
+The v0.1 security posture is conservative:
+
+- Archives are mounted read-only through ratarmount.
+- Source archives are not modified.
+- Mount directories are generated under `mount_root`.
+- Unmounting is restricted to paths under `mount_root`.
+- Native FUSE, daemon behavior, GUI behavior, and Docker packaging are intentionally out of scope.

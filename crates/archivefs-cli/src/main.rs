@@ -2,7 +2,8 @@ use std::env;
 use std::process::ExitCode;
 
 use archivefs_core::{
-    ArchiveStatus, Config, current_statuses, mount_archives, scan_archives, unmount_archives,
+    ArchiveStatus, Config, DoctorReport, current_statuses, mount_archives, run_doctor_default,
+    scan_archives, unmount_archives,
 };
 
 fn main() -> ExitCode {
@@ -38,6 +39,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let config = Config::load_default()?;
             print_statuses(&current_statuses(&config)?);
         }
+        "doctor" => {
+            print_doctor_report(&run_doctor_default());
+        }
         "help" | "-h" | "--help" => print_help(),
         unknown => {
             print_help();
@@ -46,6 +50,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_doctor_report(report: &DoctorReport) {
+    println!("ArchiveFS doctor");
+    println!("Config: {}", report.config_path.display());
+    println!();
+    println!("Checks:");
+    for check in &report.checks {
+        println!(
+            "  [{:<4}] {:<16} {}",
+            check.status, check.name, check.detail
+        );
+    }
+    println!();
+    println!("Summary:");
+    println!("  Archives found: {}", report.archives_found);
+    println!(
+        "  Archives with detected platform: {}",
+        report.archives_with_platform
+    );
+    println!("  Pending archives: {}", report.pending_archives);
+    println!("  Mounted archives: {}", report.mounted_archives);
+    println!("  Ready: {}", if report.is_ready() { "yes" } else { "no" });
 }
 
 fn print_statuses(statuses: &[ArchiveStatus]) {
@@ -68,6 +95,7 @@ fn print_help() {
     println!("  mount     mount scanned archives with ratarmount");
     println!("  unmount   unmount archivefs mountpoints under configured mount_root");
     println!("  status    show archive path, mount path, and state");
+    println!("  doctor    diagnose whether ArchiveFS is ready to run safely");
     println!();
     println!("Config: ~/.config/archivefs/config.toml");
     println!("Example:");

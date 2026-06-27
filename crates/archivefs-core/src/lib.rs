@@ -70,6 +70,224 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl fmt::Display for DoctorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warn => write!(f, "WARN"),
+            Self::Fail => write!(f, "FAIL"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: DoctorStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub config_path: PathBuf,
+    pub checks: Vec<DoctorCheck>,
+    pub archives_found: usize,
+    pub archives_with_platform: usize,
+    pub pending_archives: usize,
+    pub mounted_archives: usize,
+}
+
+impl DoctorReport {
+    pub fn is_ready(&self) -> bool {
+        !self
+            .checks
+            .iter()
+            .any(|check| check.status == DoctorStatus::Fail)
+    }
+
+    fn pass(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(DoctorCheck {
+            name: name.into(),
+            status: DoctorStatus::Pass,
+            detail: detail.into(),
+        });
+    }
+
+    fn warn(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(DoctorCheck {
+            name: name.into(),
+            status: DoctorStatus::Warn,
+            detail: detail.into(),
+        });
+    }
+
+    fn fail(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(DoctorCheck {
+            name: name.into(),
+            status: DoctorStatus::Fail,
+            detail: detail.into(),
+        });
+    }
+}
+
+pub fn run_doctor_default() -> DoctorReport {
+    match default_config_path() {
+        Ok(path) => run_doctor(path),
+        Err(error) => DoctorReport {
+            config_path: PathBuf::from("~/.config/archivefs/config.toml"),
+            checks: vec![DoctorCheck {
+                name: "config path".to_string(),
+                status: DoctorStatus::Fail,
+                detail: error.to_string(),
+            }],
+            archives_found: 0,
+            archives_with_platform: 0,
+            pending_archives: 0,
+            mounted_archives: 0,
+        },
+    }
+}
+
+pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
+    let config_path = config_path.as_ref().to_path_buf();
+    let mut report = DoctorReport {
+        config_path: config_path.clone(),
+        checks: Vec::new(),
+        archives_found: 0,
+        archives_with_platform: 0,
+        pending_archives: 0,
+        mounted_archives: 0,
+    };
+
+    if config_path.exists() {
+        report.pass("config file", format!("found {}", config_path.display()));
+    } else {
+        report.fail("config file", format!("missing {}", config_path.display()));
+        return report;
+    }
+
+    let config = match Config::load_from(&config_path) {
+        Ok(config) => {
+            report.pass("config parses", "configuration parsed successfully");
+            config
+        }
+        Err(error) => {
+            report.fail("config parses", error.to_string());
+            return report;
+        }
+    };
+
+    let mut sources_ok = true;
+    for source in &config.source_folders {
+        if source.is_dir() {
+            report.pass("source folder", format!("{} exists", source.display()));
+        } else {
+            sources_ok = false;
+            report.fail(
+                "source folder",
+                format!("{} does not exist or is not a directory", source.display()),
+            );
+        }
+    }
+
+    if config.mount_root.is_dir() {
+        report.pass(
+            "mount root",
+            format!("{} exists", config.mount_root.display()),
+        );
+    } else if config.mount_root.exists() {
+        report.fail(
+            "mount root",
+            format!(
+                "{} exists but is not a directory",
+                config.mount_root.display()
+            ),
+        );
+    } else {
+        match fs::create_dir_all(&config.mount_root) {
+            Ok(()) => report.pass(
+                "mount root",
+                format!("{} was created", config.mount_root.display()),
+            ),
+            Err(error) => report.fail(
+                "mount root",
+                format!("{} cannot be created: {error}", config.mount_root.display()),
+            ),
+        }
+    }
+
+    if command_available(&config.ratarmount_bin) {
+        report.pass(
+            "ratarmount",
+            format!("{} is available", config.ratarmount_bin),
+        );
+    } else {
+        report.fail(
+            "ratarmount",
+            format!("{} was not found", config.ratarmount_bin),
+        );
+    }
+
+    if command_available("fusermount3") || command_available("umount") {
+        report.pass("unmount tool", "fusermount3 or umount is available");
+    } else {
+        report.fail("unmount tool", "neither fusermount3 nor umount was found");
+    }
+
+    if sources_ok {
+        match scan_archives(&config) {
+            Ok(archives) => {
+                report.archives_found = archives.len();
+                report.archives_with_platform = archives
+                    .iter()
+                    .filter(|archive| archive.identity.platform.is_some())
+                    .count();
+                report.pass("archive scan", format!("{} archives found", archives.len()));
+            }
+            Err(error) => report.fail("archive scan", error.to_string()),
+        }
+    } else {
+        report.warn(
+            "archive scan",
+            "skipped because one or more source folders are unavailable",
+        );
+    }
+
+    match current_statuses(&config) {
+        Ok(statuses) => {
+            report.pending_archives = statuses
+                .iter()
+                .filter(|status| status.state == MountState::Pending)
+                .count();
+            report.mounted_archives = statuses
+                .iter()
+                .filter(|status| status.state == MountState::Mounted)
+                .count();
+            report.pass(
+                "mount status",
+                format!(
+                    "{} pending, {} mounted",
+                    report.pending_archives, report.mounted_archives
+                ),
+            );
+        }
+        Err(error) if sources_ok => report.fail("mount status", error.to_string()),
+        Err(_) => report.warn(
+            "mount status",
+            "skipped because one or more source folders are unavailable",
+        ),
+    }
+
+    report
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -775,6 +993,17 @@ fn unmount_path(path: &Path) -> Result<()> {
     })
 }
 
+pub fn command_available(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.is_absolute() || path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+        .unwrap_or(false)
+}
+
 fn run_command(program: &str, args: &[&Path]) -> Result<()> {
     let output = Command::new(program)
         .args(args)
@@ -923,6 +1152,74 @@ mod tests {
             PathBuf::from("/mnt/archivefs/Resident_Evil_2")
         );
         assert_eq!(plans[0].state, MountState::Pending);
+    }
+
+    #[test]
+    fn doctor_reports_missing_config() {
+        let root = test_root("doctor_missing_config");
+        let config_path = root.join("missing.toml");
+        let report = run_doctor(&config_path);
+
+        assert!(!report.is_ready());
+        assert_eq!(report.archives_found, 0);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "config file" && check.status == DoctorStatus::Fail)
+        );
+    }
+
+    #[test]
+    fn doctor_counts_archives_platforms_and_pending_mounts() {
+        let root = test_root("doctor_counts");
+        let source_root = root.join("roms");
+        let xbox = source_root.join("microsoft_xbox");
+        let unknown = source_root.join("unknown");
+        let mount_root = root.join("mounts");
+        let ratarmount = root.join("ratarmount");
+        fs::create_dir_all(&xbox).unwrap();
+        fs::create_dir_all(&unknown).unwrap();
+        fs::write(xbox.join("Halo.zip"), b"").unwrap();
+        fs::write(unknown.join("Mystery.7z"), b"").unwrap();
+        fs::write(&ratarmount, b"").unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\n",
+                source_root.display(),
+                mount_root.display(),
+                ratarmount.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_doctor(&config_path);
+
+        assert_eq!(report.archives_found, 2);
+        assert_eq!(report.archives_with_platform, 1);
+        assert_eq!(report.pending_archives, 2);
+        assert_eq!(report.mounted_archives, 0);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "config parses" && check.status == DoctorStatus::Pass)
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "archive scan" && check.status == DoctorStatus::Pass)
+        );
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!("archivefs-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     fn archive(path: &str) -> Archive {
