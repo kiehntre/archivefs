@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use archivefs_core::{
     ArchiveStatus, Config, DoctorReport, MountPlan, current_statuses, mount_archives,
-    mount_one_archive, run_doctor_default, scan_archives, unmount_archives,
+    mount_one_archive, run_doctor_default, scan_archives, unmount_archives, unmount_one_archive,
 };
 
 fn main() -> ExitCode {
@@ -46,6 +46,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let config = Config::load_default()?;
             print_statuses(&unmount_archives(&config)?);
         }
+        "unmount-one" => {
+            let Some(first) = args.next() else {
+                return Err("unmount-one requires an archive path or name".into());
+            };
+            let input = std::iter::once(first)
+                .chain(args)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let config = Config::load_default()?;
+            print_unmount_one(&unmount_one_archive(&config, &input)?);
+        }
         "status" => {
             let config = Config::load_default()?;
             print_statuses(&current_statuses(&config)?);
@@ -65,6 +76,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_mount_one(plan: &MountPlan) {
     println!("Mounted:");
+    println!("  Archive: {}", plan.archive.path.display());
+    println!("  Mount:   {}", plan.mount_path.display());
+}
+
+fn print_unmount_one(plan: &MountPlan) {
+    println!("Unmounted:");
     println!("  Archive: {}", plan.archive.path.display());
     println!("  Mount:   {}", plan.mount_path.display());
 }
@@ -135,6 +152,7 @@ fn print_help() {
     println!("  mount     mount scanned archives with ratarmount");
     println!("  mount-one mount one archive by path or name");
     println!("  unmount   unmount archivefs mountpoints under configured mount_root");
+    println!("  unmount-one unmount one archive by path or name");
     println!("  status    show archive path, mount path, and state");
     println!("  doctor    diagnose whether ArchiveFS is ready to run safely");
     println!();

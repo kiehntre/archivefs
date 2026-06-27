@@ -1082,6 +1082,32 @@ pub fn unmount_archives_with_backend(
     current_statuses(config)
 }
 
+pub fn unmount_one_archive(config: &Config, input: &str) -> Result<MountPlan> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    unmount_one_archive_with_backend(config, input, &backend)
+}
+
+pub fn unmount_one_archive_with_backend(
+    config: &Config,
+    input: &str,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
+    let archives = scan_archives(config)?;
+    let plans = plan_mounts(&archives, &config.mount_root);
+    let plan = select_mount_plan(&plans, input)?;
+
+    if !path_is_under(&plan.mount_path, &config.mount_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to unmount {} outside mount root {}",
+            plan.mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+
+    backend.unmount(&plan.mount_path)?;
+    Ok(plan)
+}
+
 fn statuses_from_plans(
     plans: Vec<MountPlan>,
     mounted_paths: &HashSet<PathBuf>,
@@ -1395,6 +1421,49 @@ mod tests {
     }
 
     #[test]
+    fn unmount_one_unmounts_only_selected_mount_path() {
+        let root = test_root("unmount_one_selected");
+        let source_root = root.join("roms");
+        let xbox360 = source_root.join("xbox360");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&xbox360).unwrap();
+        fs::write(xbox360.join("007 Legends.zip"), b"").unwrap();
+        fs::write(xbox360.join("Halo 3.zip"), b"").unwrap();
+        let config = Config {
+            source_folders: vec![source_root],
+            mount_root: mount_root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+
+        let plan = unmount_one_archive_with_backend(&config, "007 Legends", &backend).unwrap();
+
+        assert_eq!(
+            plan.mount_path,
+            mount_root.join("Xbox360").join("007_Legends")
+        );
+        assert_eq!(backend.unmounted(), vec![plan.mount_path]);
+    }
+
+    #[test]
+    fn unmount_one_reuses_selection_errors() {
+        let root = test_root("unmount_one_zero");
+        let source_root = root.join("roms");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("Halo.zip"), b"").unwrap();
+        let config = Config {
+            source_folders: vec![source_root],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+        let error = unmount_one_archive_with_backend(&config, "missing", &backend).unwrap_err();
+
+        assert!(matches!(error, ArchiveFsError::NoMountMatch { input } if input == "missing"));
+        assert!(backend.unmounted().is_empty());
+    }
+
+    #[test]
     fn archive_health_marks_retryable_states() {
         assert!(ArchiveHealth::Failed.is_retryable());
         assert!(ArchiveHealth::MissingParts.is_retryable());
@@ -1593,6 +1662,28 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        unmounted: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl RecordingBackend {
+        fn unmounted(&self) -> Vec<PathBuf> {
+            self.unmounted.borrow().clone()
+        }
+    }
+
+    impl MountBackend for RecordingBackend {
+        fn mount(&self, _plan: &MountPlan) -> Result<()> {
+            Ok(())
+        }
+
+        fn unmount(&self, mount_path: &Path) -> Result<()> {
+            self.unmounted.borrow_mut().push(mount_path.to_path_buf());
+            Ok(())
+        }
     }
 
     fn archive_with_platform(path: &str, platform: Option<&str>) -> Archive {
