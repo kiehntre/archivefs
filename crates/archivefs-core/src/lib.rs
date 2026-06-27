@@ -210,11 +210,115 @@ fn parse_string_array(value: &str, line_number: usize) -> Result<Vec<String>> {
     Ok(values)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchiveKind {
     Zip,
     SevenZip,
     Rar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArchiveHealth {
+    Pending,
+    Mounted,
+    Failed,
+    MissingParts,
+    Corrupt,
+    Unsupported,
+    PermissionDenied,
+    RetryAvailable,
+}
+
+impl ArchiveHealth {
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Failed | Self::MissingParts | Self::RetryAvailable
+        )
+    }
+
+    pub fn is_terminal_without_source_change(self) -> bool {
+        matches!(
+            self,
+            Self::Corrupt | Self::Unsupported | Self::PermissionDenied
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArchiveIdentity {
+    pub display_name: String,
+    pub normalized_name: String,
+    pub source_root: PathBuf,
+    pub size_bytes: Option<u64>,
+    pub modified_time: Option<std::time::SystemTime>,
+    pub platform: Option<String>,
+    pub region: Option<String>,
+    pub content_hash: Option<String>,
+    pub archive_hash: Option<String>,
+    pub internal_listing_hash: Option<String>,
+}
+
+impl ArchiveIdentity {
+    pub fn from_path(
+        path: &Path,
+        source_root: impl Into<PathBuf>,
+        metadata: Option<&fs::Metadata>,
+    ) -> Self {
+        Self {
+            display_name: archive_title(path),
+            normalized_name: normalized_title(path),
+            source_root: source_root.into(),
+            size_bytes: metadata.map(fs::Metadata::len),
+            modified_time: metadata.and_then(|metadata| metadata.modified().ok()),
+            platform: None,
+            region: None,
+            content_hash: None,
+            archive_hash: None,
+            internal_listing_hash: None,
+        }
+    }
+
+    fn path_fingerprint(&self, archive_path: &Path) -> String {
+        let mut input = self.source_root.clone();
+        input.push(archive_path);
+        short_path_hash(&input)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Archive {
+    pub path: PathBuf,
+    pub kind: ArchiveKind,
+    pub identity: ArchiveIdentity,
+    pub health: ArchiveHealth,
+}
+
+impl Archive {
+    pub fn from_path(path: impl AsRef<Path>) -> Option<Self> {
+        Self::from_path_in_root(path, PathBuf::new())
+    }
+
+    pub fn from_path_in_root(
+        path: impl AsRef<Path>,
+        source_root: impl Into<PathBuf>,
+    ) -> Option<Self> {
+        let path = path.as_ref();
+        let kind = archive_kind(path)?;
+        let metadata = fs::metadata(path).ok();
+        Some(Self {
+            path: path.to_path_buf(),
+            kind,
+            identity: ArchiveIdentity::from_path(path, source_root, metadata.as_ref()),
+            health: ArchiveHealth::Pending,
+        })
+    }
+}
+
+impl AsRef<Path> for Archive {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
 }
 
 pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
@@ -266,20 +370,14 @@ fn rar_part_number(filename: &str) -> Option<u32> {
     part.parse().ok()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchiveMount {
-    pub archive_path: PathBuf,
-    pub mount_path: PathBuf,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArchiveState {
+pub enum MountState {
     Pending,
     Mounted,
     MountPathExists,
 }
 
-impl fmt::Display for ArchiveState {
+impl fmt::Display for MountState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pending => write!(f, "Pending"),
@@ -290,23 +388,71 @@ impl fmt::Display for ArchiveState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountPlan {
+    pub archive: Archive,
+    pub mount_path: PathBuf,
+    pub state: MountState,
+}
+
+impl MountPlan {
+    pub fn new(archive: Archive, mount_path: PathBuf) -> Self {
+        Self {
+            archive,
+            mount_path,
+            state: MountState::Pending,
+        }
+    }
+}
+
+pub trait MountBackend {
+    fn mount(&self, plan: &MountPlan) -> Result<()>;
+    fn unmount(&self, mount_path: &Path) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatarmountBackend {
+    ratarmount_bin: String,
+}
+
+impl RatarmountBackend {
+    pub fn new(ratarmount_bin: impl Into<String>) -> Self {
+        Self {
+            ratarmount_bin: ratarmount_bin.into(),
+        }
+    }
+}
+
+impl MountBackend for RatarmountBackend {
+    fn mount(&self, plan: &MountPlan) -> Result<()> {
+        run_command(
+            &self.ratarmount_bin,
+            &[plan.archive.path.as_path(), plan.mount_path.as_path()],
+        )
+    }
+
+    fn unmount(&self, mount_path: &Path) -> Result<()> {
+        unmount_path(mount_path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveStatus {
     pub archive_path: PathBuf,
     pub mount_path: PathBuf,
-    pub state: ArchiveState,
+    pub state: MountState,
 }
 
-pub fn scan_archives(config: &Config) -> Result<Vec<PathBuf>> {
+pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     let mut archives = Vec::new();
     for source in &config.source_folders {
-        scan_source(source, &mut archives)?;
+        scan_source(source, source, &mut archives)?;
     }
-    archives.sort();
-    archives.dedup();
+    archives.sort_by(|left, right| left.path.cmp(&right.path));
+    archives.dedup_by(|left, right| left.path == right.path);
     Ok(archives)
 }
 
-fn scan_source(source: &Path, archives: &mut Vec<PathBuf>) -> Result<()> {
+fn scan_source(source_root: &Path, source: &Path, archives: &mut Vec<Archive>) -> Result<()> {
     let entries = fs::read_dir(source).map_err(|source_error| ArchiveFsError::Io {
         path: source.to_path_buf(),
         source: source_error,
@@ -326,47 +472,54 @@ fn scan_source(source: &Path, archives: &mut Vec<PathBuf>) -> Result<()> {
             })?;
 
         if file_type.is_dir() {
-            scan_source(&path, archives)?;
-        } else if file_type.is_file() && is_supported_archive(&path) {
-            archives.push(path);
+            scan_source(source_root, &path, archives)?;
+        } else if file_type.is_file() {
+            if let Some(archive) = Archive::from_path_in_root(&path, source_root) {
+                archives.push(archive);
+            }
         }
     }
 
     Ok(())
 }
 
-pub fn plan_mounts(archives: &[PathBuf], mount_root: impl AsRef<Path>) -> Vec<ArchiveMount> {
+pub fn plan_mounts(archives: &[Archive], mount_root: impl AsRef<Path>) -> Vec<MountPlan> {
     let mount_root = mount_root.as_ref();
     let mut base_counts = HashMap::<String, usize>::new();
     for archive in archives {
-        *base_counts.entry(safe_mount_name(archive)).or_default() += 1;
+        *base_counts
+            .entry(safe_mount_name(&archive.path))
+            .or_default() += 1;
     }
 
     let mut used = HashSet::new();
     archives
         .iter()
         .map(|archive| {
-            let base = safe_mount_name(archive);
+            let base = safe_mount_name(&archive.path);
             let mut name = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
-                format!("{base}--{}", short_path_hash(archive))
+                format!(
+                    "{base}--{}",
+                    archive.identity.path_fingerprint(&archive.path)
+                )
             } else {
                 base
             };
 
             if used.contains(&name) {
-                name = format!("{name}--{}", short_path_hash(archive));
+                name = format!(
+                    "{name}--{}",
+                    archive.identity.path_fingerprint(&archive.path)
+                );
             }
             let mut suffix = 2;
             while used.contains(&name) {
-                name = format!("{}-{suffix}", safe_mount_name(archive));
+                name = format!("{}-{suffix}", safe_mount_name(&archive.path));
                 suffix += 1;
             }
             used.insert(name.clone());
 
-            ArchiveMount {
-                archive_path: archive.clone(),
-                mount_path: mount_root.join(name),
-            }
+            MountPlan::new(archive.clone(), mount_root.join(name))
         })
         .collect()
 }
@@ -400,6 +553,10 @@ pub fn safe_mount_name(path: impl AsRef<Path>) -> String {
     } else {
         safe
     }
+}
+
+fn normalized_title(path: &Path) -> String {
+    safe_mount_name(path).to_lowercase()
 }
 
 fn archive_title(path: &Path) -> String {
@@ -457,56 +614,51 @@ impl Hasher for FnvHasher {
 
 pub fn current_statuses(config: &Config) -> Result<Vec<ArchiveStatus>> {
     let archives = scan_archives(config)?;
-    let mounts = plan_mounts(&archives, &config.mount_root);
+    let plans = plan_mounts(&archives, &config.mount_root);
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
-
-    Ok(mounts
-        .into_iter()
-        .map(|mount| {
-            let state = if mounted_paths.contains(&mount.mount_path) {
-                ArchiveState::Mounted
-            } else if mount.mount_path.exists() {
-                ArchiveState::MountPathExists
-            } else {
-                ArchiveState::Pending
-            };
-
-            ArchiveStatus {
-                archive_path: mount.archive_path,
-                mount_path: mount.mount_path,
-                state,
-            }
-        })
-        .collect())
+    Ok(statuses_from_plans(plans, &mounted_paths))
 }
 
 pub fn mount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    mount_archives_with_backend(config, &backend)
+}
+
+pub fn mount_archives_with_backend(
+    config: &Config,
+    backend: &impl MountBackend,
+) -> Result<Vec<ArchiveStatus>> {
     let archives = scan_archives(config)?;
-    let mounts = plan_mounts(&archives, &config.mount_root);
+    let plans = plan_mounts(&archives, &config.mount_root);
     fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
         path: config.mount_root.clone(),
         source,
     })?;
 
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    for mount in &mounts {
-        if mounted_paths.contains(&mount.mount_path) {
+    for plan in &plans {
+        if mounted_paths.contains(&plan.mount_path) {
             continue;
         }
-        fs::create_dir_all(&mount.mount_path).map_err(|source| ArchiveFsError::Io {
-            path: mount.mount_path.clone(),
+        fs::create_dir_all(&plan.mount_path).map_err(|source| ArchiveFsError::Io {
+            path: plan.mount_path.clone(),
             source,
         })?;
-        run_command(
-            &config.ratarmount_bin,
-            &[mount.archive_path.as_path(), mount.mount_path.as_path()],
-        )?;
+        backend.mount(plan)?;
     }
 
     current_statuses(config)
 }
 
 pub fn unmount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    unmount_archives_with_backend(config, &backend)
+}
+
+pub fn unmount_archives_with_backend(
+    config: &Config,
+    backend: &impl MountBackend,
+) -> Result<Vec<ArchiveStatus>> {
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     let mut mounted_paths = mounted_paths.into_iter().collect::<Vec<_>>();
     mounted_paths.sort();
@@ -514,11 +666,35 @@ pub fn unmount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
 
     for mount_path in mounted_paths {
         if path_is_under(&mount_path, &config.mount_root) {
-            unmount_path(&mount_path)?;
+            backend.unmount(&mount_path)?;
         }
     }
 
     current_statuses(config)
+}
+
+fn statuses_from_plans(
+    plans: Vec<MountPlan>,
+    mounted_paths: &HashSet<PathBuf>,
+) -> Vec<ArchiveStatus> {
+    plans
+        .into_iter()
+        .map(|plan| {
+            let state = if mounted_paths.contains(&plan.mount_path) {
+                MountState::Mounted
+            } else if plan.mount_path.exists() {
+                MountState::MountPathExists
+            } else {
+                MountState::Pending
+            };
+
+            ArchiveStatus {
+                archive_path: plan.archive.path,
+                mount_path: plan.mount_path,
+                state,
+            }
+        })
+        .collect()
 }
 
 fn mounted_paths_under(root: &Path) -> Result<HashSet<PathBuf>> {
@@ -635,10 +811,7 @@ mod tests {
 
     #[test]
     fn duplicate_filenames_get_distinct_mount_paths() {
-        let archives = vec![
-            PathBuf::from("/roms/ps1/game.zip"),
-            PathBuf::from("/roms/ps2/game.zip"),
-        ];
+        let archives = vec![archive("/roms/ps1/game.zip"), archive("/roms/ps2/game.zip")];
         let mounts = plan_mounts(&archives, "/mnt/archivefs");
 
         assert_eq!(mounts.len(), 2);
@@ -659,5 +832,51 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("game--")
         );
+    }
+
+    #[test]
+    fn archive_health_marks_retryable_states() {
+        assert!(ArchiveHealth::Failed.is_retryable());
+        assert!(ArchiveHealth::MissingParts.is_retryable());
+        assert!(ArchiveHealth::RetryAvailable.is_retryable());
+        assert!(!ArchiveHealth::Pending.is_retryable());
+        assert!(!ArchiveHealth::Mounted.is_retryable());
+    }
+
+    #[test]
+    fn archive_health_marks_terminal_states() {
+        assert!(ArchiveHealth::Corrupt.is_terminal_without_source_change());
+        assert!(ArchiveHealth::Unsupported.is_terminal_without_source_change());
+        assert!(ArchiveHealth::PermissionDenied.is_terminal_without_source_change());
+        assert!(!ArchiveHealth::Failed.is_terminal_without_source_change());
+    }
+
+    #[test]
+    fn mount_plan_generation_carries_archive_identity_and_pending_state() {
+        let archives = vec![archive("/roms/ps1/Resident Evil 2.zip")];
+        let plans = plan_mounts(&archives, "/mnt/archivefs");
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].archive.path,
+            PathBuf::from("/roms/ps1/Resident Evil 2.zip")
+        );
+        assert_eq!(plans[0].archive.kind, ArchiveKind::Zip);
+        assert_eq!(plans[0].archive.identity.normalized_name, "resident_evil_2");
+        assert_eq!(
+            plans[0].mount_path,
+            PathBuf::from("/mnt/archivefs/Resident_Evil_2")
+        );
+        assert_eq!(plans[0].state, MountState::Pending);
+    }
+
+    fn archive(path: &str) -> Archive {
+        let path = PathBuf::from(path);
+        Archive {
+            kind: archive_kind(&path).unwrap(),
+            identity: ArchiveIdentity::from_path(&path, PathBuf::new(), None),
+            path,
+            health: ArchiveHealth::Pending,
+        }
     }
 }

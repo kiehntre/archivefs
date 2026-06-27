@@ -23,7 +23,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "scan" => {
             let config = Config::load_default()?;
             for archive in scan_archives(&config)? {
-                println!("{}", archive.display());
+                println!("{}", archive.path.display());
             }
         }
         "mount" => {
