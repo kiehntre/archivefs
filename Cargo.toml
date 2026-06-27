@@ -1,6 +1,10 @@
-[package]
-name = "archivefs"
+[workspace]
+members = [
+    "crates/archivefs-core",
+    "crates/archivefs-cli",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]

@@ -1,0 +1,7 @@
+[package]
+name = "archivefs-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+archivefs-core = { path = "../archivefs-core" }
