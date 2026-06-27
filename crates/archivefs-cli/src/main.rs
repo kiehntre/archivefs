@@ -45,6 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .join(" ");
             let config = Config::load_default()?;
             print_mount_one(&mount_one_archive(&config, &input)?);
+            warn_if_index_refresh_failed(&config);
         }
         "unmount" => {
             let config = Config::load_default()?;
@@ -60,6 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .join(" ");
             let config = Config::load_default()?;
             print_unmount_one(&unmount_one_archive(&config, &input)?);
+            warn_if_index_refresh_failed(&config);
         }
         "status" => {
             let config = Config::load_default()?;
@@ -110,6 +112,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn warn_if_index_refresh_failed(config: &Config) {
+    if let Err(error) = build_and_write_archive_index(config) {
+        eprintln!("Warning: mounted state changed, but index refresh failed: {error}");
+    }
 }
 
 fn read_index_or_print_build_hint() -> Result<Option<ArchiveIndex>, Box<dyn std::error::Error>> {

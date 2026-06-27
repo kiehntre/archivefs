@@ -2075,6 +2075,20 @@ mod tests {
     }
 
     #[test]
+    fn write_archive_index_creates_parent_dirs_and_writes_readable_index() {
+        let root = test_root("write_index_parent_dirs");
+        let index_path = root.join("nested").join("index.json");
+        let index = sample_index_for_find();
+
+        write_archive_index(&index, &index_path).unwrap();
+        let parsed = read_archive_index(&index_path).unwrap();
+
+        assert!(index_path.exists());
+        assert_eq!(parsed.archives.len(), 2);
+        assert_eq!(find_archive_index_entries(&parsed, "007").len(), 1);
+    }
+
+    #[test]
     fn archive_health_marks_retryable_states() {
         assert!(ArchiveHealth::Failed.is_retryable());
         assert!(ArchiveHealth::MissingParts.is_retryable());
