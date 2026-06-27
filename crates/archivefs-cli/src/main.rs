@@ -1,12 +1,13 @@
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 
 use archivefs_core::{
-    ArchiveIndexEntry, ArchiveIndexSummary, ArchiveStatus, Config, DoctorReport, MountPlan,
-    build_and_write_archive_index, current_statuses, default_index_path,
-    find_default_archive_index_entries, mount_archives, mount_one_archive,
-    read_default_archive_index_summary, run_doctor_default, scan_archives, unmount_archives,
-    unmount_one_archive,
+    ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveStatus,
+    Config, DoctorReport, MountPlan, build_and_write_archive_index, check_archive_index_freshness,
+    clean_mount_root, current_statuses, default_index_path, find_archive_index_entries,
+    mount_archives, mount_one_archive, read_default_archive_index, run_doctor_default,
+    scan_archives, summarize_archive_index, unmount_archives, unmount_one_archive,
 };
 
 fn main() -> ExitCode {
@@ -77,7 +78,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "index-show" => {
-            print_index_summary(&read_default_archive_index_summary()?);
+            let Some(index) = read_index_or_print_build_hint()? else {
+                return Ok(());
+            };
+            print_index_warnings(&check_archive_index_freshness(&index));
+            print_index_summary(&summarize_archive_index(&index));
         }
         "index-find" => {
             let Some(first) = args.next() else {
@@ -87,7 +92,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .chain(args)
                 .collect::<Vec<_>>()
                 .join(" ");
-            print_index_find_results(&query, &find_default_archive_index_entries(&query)?);
+            let Some(index) = read_index_or_print_build_hint()? else {
+                return Ok(());
+            };
+            print_index_warnings(&check_archive_index_freshness(&index));
+            print_index_find_results(&query, &find_archive_index_entries(&index, &query));
+        }
+        "clean" => {
+            let config = Config::load_default()?;
+            print_cleaned_dirs(&clean_mount_root(&config)?);
         }
         "help" | "-h" | "--help" => print_help(),
         unknown => {
@@ -97,6 +110,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn read_index_or_print_build_hint() -> Result<Option<ArchiveIndex>, Box<dyn std::error::Error>> {
+    let index_path = default_index_path()?;
+    if !Path::new(&index_path).exists() {
+        println!(
+            "No archive index found at {}. Run: archivefs index-build",
+            index_path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(read_default_archive_index()?))
+}
+
+fn print_index_warnings(freshness: &ArchiveIndexFreshness) {
+    if !freshness.missing_archive_paths.is_empty() {
+        println!("Warning: index contains missing archive paths. Run archivefs index-build.");
+    }
+    if !freshness.stale_archive_paths.is_empty() {
+        println!("Warning: index may be stale. Run archivefs index-build.");
+    }
+}
+
+fn print_cleaned_dirs(paths: &[std::path::PathBuf]) {
+    for path in paths {
+        println!("Removed: {}", path.display());
+    }
+    println!("Removed {} empty directories.", paths.len());
 }
 
 fn print_index_find_results(query: &str, entries: &[ArchiveIndexEntry]) {
@@ -219,6 +260,7 @@ fn print_help() {
     println!("  index-build build the JSON archive index");
     println!("  index-show show a summary of the JSON archive index");
     println!("  index-find find entries in the JSON archive index");
+    println!("  clean     remove empty directories under mount_root");
     println!();
     println!("Config: ~/.config/archivefs/config.toml");
     println!("Example:");

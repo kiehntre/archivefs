@@ -1012,6 +1012,7 @@ pub struct ArchiveIndexEntry {
     pub platform: Option<String>,
     pub display_name: String,
     pub mount_path: PathBuf,
+    pub modified_time_seconds: Option<u64>,
     pub health: ArchiveHealth,
     pub mount_state: MountState,
 }
@@ -1027,6 +1028,18 @@ pub struct ArchiveIndexSummary {
     pub platform_counts: Vec<(String, usize)>,
     pub mounted_count: usize,
     pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveIndexFreshness {
+    pub missing_archive_paths: Vec<PathBuf>,
+    pub stale_archive_paths: Vec<PathBuf>,
+}
+
+impl ArchiveIndexFreshness {
+    pub fn has_warnings(&self) -> bool {
+        !self.missing_archive_paths.is_empty() || !self.stale_archive_paths.is_empty()
+    }
 }
 
 pub fn default_index_path() -> Result<PathBuf> {
@@ -1061,6 +1074,11 @@ pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
                     platform: plan.archive.identity.platform,
                     display_name: plan.archive.identity.display_name,
                     mount_path: plan.mount_path,
+                    modified_time_seconds: plan
+                        .archive
+                        .identity
+                        .modified_time
+                        .and_then(system_time_seconds),
                     health: plan.archive.health,
                     mount_state,
                 }
@@ -1137,13 +1155,65 @@ pub fn find_default_archive_index_entries(query: &str) -> Result<Vec<ArchiveInde
     Ok(find_archive_index_entries(&index, query))
 }
 
+pub fn summarize_archive_index(index: &ArchiveIndex) -> ArchiveIndexSummary {
+    let mut mounted_count = 0;
+    let mut pending_count = 0;
+    let mut platform_counts = BTreeMap::<String, usize>::new();
+
+    for entry in &index.archives {
+        *platform_counts
+            .entry(
+                entry
+                    .platform
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+            .or_default() += 1;
+        match entry.mount_state {
+            MountState::Mounted => mounted_count += 1,
+            MountState::Pending => pending_count += 1,
+            MountState::MountPathExists => {}
+        }
+    }
+
+    ArchiveIndexSummary {
+        archives_count: index.archives.len(),
+        platform_counts: platform_counts.into_iter().collect(),
+        mounted_count,
+        pending_count,
+    }
+}
+
+pub fn check_archive_index_freshness(index: &ArchiveIndex) -> ArchiveIndexFreshness {
+    let mut missing_archive_paths = Vec::new();
+    let mut stale_archive_paths = Vec::new();
+
+    for entry in &index.archives {
+        let Ok(metadata) = fs::metadata(&entry.archive_path) else {
+            missing_archive_paths.push(entry.archive_path.clone());
+            continue;
+        };
+        let current_modified_time = metadata.modified().ok().and_then(system_time_seconds);
+        if entry.modified_time_seconds != current_modified_time {
+            stale_archive_paths.push(entry.archive_path.clone());
+        }
+    }
+
+    ArchiveIndexFreshness {
+        missing_archive_paths,
+        stale_archive_paths,
+    }
+}
+
+fn system_time_seconds(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
 pub fn read_archive_index_summary(path: impl AsRef<Path>) -> Result<ArchiveIndexSummary> {
-    let path = path.as_ref();
-    let json = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(summarize_archive_index_json(&json))
+    let index = read_archive_index(path)?;
+    Ok(summarize_archive_index(&index))
 }
 
 pub fn read_default_archive_index_summary() -> Result<ArchiveIndexSummary> {
@@ -1166,6 +1236,7 @@ fn parse_archive_index_entry(object: &str) -> Option<ArchiveIndexEntry> {
         platform: extract_json_string_field(object, "platform"),
         display_name: extract_json_string_field(object, "display_name")?,
         mount_path: PathBuf::from(extract_json_string_field(object, "mount_path")?),
+        modified_time_seconds: extract_json_number_field(object, "modified_time"),
         health: parse_archive_health(&extract_json_string_field(object, "health")?),
         mount_state: parse_mount_state(&extract_json_string_field(object, "mount_state")?),
     })
@@ -1189,34 +1260,6 @@ fn parse_mount_state(value: &str) -> MountState {
         "Mounted" => MountState::Mounted,
         "MountPathExists" => MountState::MountPathExists,
         _ => MountState::Pending,
-    }
-}
-
-fn summarize_archive_index_json(json: &str) -> ArchiveIndexSummary {
-    let mut archives_count = 0;
-    let mut mounted_count = 0;
-    let mut pending_count = 0;
-    let mut platform_counts = BTreeMap::<String, usize>::new();
-
-    for object in json.split("\n    {").skip(1) {
-        archives_count += 1;
-        if let Some(platform) = extract_json_string_field(object, "platform") {
-            *platform_counts.entry(platform).or_default() += 1;
-        } else {
-            *platform_counts.entry("Unknown".to_string()).or_default() += 1;
-        }
-        match extract_json_string_field(object, "mount_state").as_deref() {
-            Some("Mounted") => mounted_count += 1,
-            Some("Pending") => pending_count += 1,
-            _ => {}
-        }
-    }
-
-    ArchiveIndexSummary {
-        archives_count,
-        platform_counts: platform_counts.into_iter().collect(),
-        mounted_count,
-        pending_count,
     }
 }
 
@@ -1246,6 +1289,12 @@ fn archive_index_to_json(index: &ArchiveIndex) -> String {
             "      \"mount_path\": \"{}\",\n",
             escape_json(&entry.mount_path.display().to_string())
         ));
+        match entry.modified_time_seconds {
+            Some(modified_time) => {
+                json.push_str(&format!("      \"modified_time\": {modified_time},\n"))
+            }
+            None => json.push_str("      \"modified_time\": null,\n"),
+        }
         json.push_str(&format!("      \"health\": \"{}\",\n", entry.health));
         json.push_str(&format!(
             "      \"mount_state\": \"{}\"\n",
@@ -1255,6 +1304,21 @@ fn archive_index_to_json(index: &ArchiveIndex) -> String {
     }
     json.push_str("\n  ]\n}\n");
     json
+}
+
+fn extract_json_number_field(object: &str, field: &str) -> Option<u64> {
+    let needle = format!("\"{field}\":");
+    let start = object.find(&needle)? + needle.len();
+    let rest = object[start..].trim_start();
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 fn extract_json_string_field(object: &str, field: &str) -> Option<String> {
@@ -1417,6 +1481,69 @@ pub fn unmount_one_archive_with_backend(
 
     backend.unmount(&plan.mount_path)?;
     Ok(plan)
+}
+
+pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+    clean_empty_dirs_under(&config.mount_root, &mounted_paths)
+}
+
+fn clean_empty_dirs_under(root: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    if !root.exists() {
+        return Ok(removed);
+    }
+    clean_empty_dirs_recursive(root, root, mounted_paths, &mut removed)?;
+    Ok(removed)
+}
+
+fn clean_empty_dirs_recursive(
+    root: &Path,
+    dir: &Path,
+    mounted_paths: &HashSet<PathBuf>,
+    removed: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if mounted_paths.contains(dir) {
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(dir).map_err(|source| ArchiveFsError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| ArchiveFsError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|source| ArchiveFsError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            clean_empty_dirs_recursive(root, &path, mounted_paths, removed)?;
+        }
+    }
+
+    if dir != root && !mounted_paths.contains(dir) && directory_is_empty(dir)? {
+        fs::remove_dir(dir).map_err(|source| ArchiveFsError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        removed.push(dir.to_path_buf());
+    }
+
+    Ok(())
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool> {
+    let mut entries = fs::read_dir(path).map_err(|source| ArchiveFsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(entries.next().is_none())
 }
 
 fn statuses_from_plans(
@@ -1782,6 +1909,7 @@ mod tests {
                 platform: Some("Xbox360".to_string()),
                 display_name: "007 Legends".to_string(),
                 mount_path: PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+                modified_time_seconds: None,
                 health: ArchiveHealth::Pending,
                 mount_state: MountState::Pending,
             }],
@@ -1805,6 +1933,7 @@ mod tests {
                     platform: Some("Xbox360".to_string()),
                     display_name: "007 Legends".to_string(),
                     mount_path: PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+                    modified_time_seconds: None,
                     health: ArchiveHealth::Pending,
                     mount_state: MountState::Mounted,
                 },
@@ -1813,12 +1942,14 @@ mod tests {
                     platform: None,
                     display_name: "Mystery".to_string(),
                     mount_path: PathBuf::from("/mnt/archivefs/Unknown/Mystery"),
+                    modified_time_seconds: None,
                     health: ArchiveHealth::Pending,
                     mount_state: MountState::Pending,
                 },
             ],
         };
-        let summary = summarize_archive_index_json(&archive_index_to_json(&index));
+        let summary =
+            summarize_archive_index(&parse_archive_index_json(&archive_index_to_json(&index)));
 
         assert_eq!(summary.archives_count, 2);
         assert_eq!(summary.mounted_count, 1);
@@ -1857,6 +1988,90 @@ mod tests {
 
         assert_eq!(find_archive_index_entries(&parsed, "xbox360").len(), 1);
         assert_eq!(find_archive_index_entries(&parsed, "mystery").len(), 1);
+    }
+
+    #[test]
+    fn clean_empty_dirs_removes_empty_dirs_but_not_root_or_nonempty_dirs() {
+        let root = test_root("clean_empty_dirs");
+        let empty_child = root.join("Unknown").join("Empty");
+        let nonempty_child = root.join("Xbox360").join("Keep");
+        fs::create_dir_all(&empty_child).unwrap();
+        fs::create_dir_all(&nonempty_child).unwrap();
+        fs::write(nonempty_child.join("file.txt"), b"keep").unwrap();
+
+        let removed = clean_empty_dirs_under(&root, &HashSet::new()).unwrap();
+
+        assert!(root.exists());
+        assert!(!empty_child.exists());
+        assert!(!root.join("Unknown").exists());
+        assert!(nonempty_child.exists());
+        assert!(removed.contains(&empty_child));
+        assert!(removed.contains(&root.join("Unknown")));
+        assert!(!removed.contains(&root));
+    }
+
+    #[test]
+    fn clean_empty_dirs_skips_mounted_dirs_and_their_children() {
+        let root = test_root("clean_mounted_dirs");
+        let mounted = root.join("Xbox360").join("Mounted");
+        let virtual_empty = mounted.join("Empty");
+        fs::create_dir_all(&virtual_empty).unwrap();
+        let mounted_paths = HashSet::from([mounted.clone()]);
+
+        let removed = clean_empty_dirs_under(&root, &mounted_paths).unwrap();
+
+        assert!(mounted.exists());
+        assert!(virtual_empty.exists());
+        assert!(!removed.contains(&mounted));
+        assert!(!removed.contains(&virtual_empty));
+    }
+
+    #[test]
+    fn archive_index_freshness_detects_missing_archive_paths() {
+        let index = ArchiveIndex {
+            archives: vec![ArchiveIndexEntry {
+                archive_path: PathBuf::from("/definitely/missing/archive.zip"),
+                platform: Some("Xbox360".to_string()),
+                display_name: "Missing".to_string(),
+                mount_path: PathBuf::from("/mnt/archivefs/Xbox360/Missing"),
+                modified_time_seconds: Some(1),
+                health: ArchiveHealth::Pending,
+                mount_state: MountState::Pending,
+            }],
+        };
+
+        let freshness = check_archive_index_freshness(&index);
+
+        assert_eq!(
+            freshness.missing_archive_paths,
+            vec![PathBuf::from("/definitely/missing/archive.zip")]
+        );
+        assert!(freshness.stale_archive_paths.is_empty());
+        assert!(freshness.has_warnings());
+    }
+
+    #[test]
+    fn archive_index_freshness_detects_stale_modified_time() {
+        let root = test_root("index_stale_modified_time");
+        let archive_path = root.join("game.zip");
+        fs::write(&archive_path, b"game").unwrap();
+        let index = ArchiveIndex {
+            archives: vec![ArchiveIndexEntry {
+                archive_path: archive_path.clone(),
+                platform: None,
+                display_name: "game".to_string(),
+                mount_path: root.join("Unknown").join("game"),
+                modified_time_seconds: Some(0),
+                health: ArchiveHealth::Pending,
+                mount_state: MountState::Pending,
+            }],
+        };
+
+        let freshness = check_archive_index_freshness(&index);
+
+        assert!(freshness.missing_archive_paths.is_empty());
+        assert_eq!(freshness.stale_archive_paths, vec![archive_path]);
+        assert!(freshness.has_warnings());
     }
 
     #[test]
@@ -2090,6 +2305,7 @@ mod tests {
                     platform: Some("Xbox360".to_string()),
                     display_name: "007 Legends".to_string(),
                     mount_path: PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+                    modified_time_seconds: None,
                     health: ArchiveHealth::Pending,
                     mount_state: MountState::Mounted,
                 },
@@ -2098,6 +2314,7 @@ mod tests {
                     platform: None,
                     display_name: "Mystery".to_string(),
                     mount_path: PathBuf::from("/mnt/archivefs/Unknown/Mystery"),
+                    modified_time_seconds: None,
                     health: ArchiveHealth::Pending,
                     mount_state: MountState::Pending,
                 },
