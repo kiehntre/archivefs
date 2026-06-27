@@ -2,10 +2,11 @@ use std::env;
 use std::process::ExitCode;
 
 use archivefs_core::{
-    ArchiveIndexSummary, ArchiveStatus, Config, DoctorReport, MountPlan,
-    build_and_write_archive_index, current_statuses, default_index_path, mount_archives,
-    mount_one_archive, read_default_archive_index_summary, run_doctor_default, scan_archives,
-    unmount_archives, unmount_one_archive,
+    ArchiveIndexEntry, ArchiveIndexSummary, ArchiveStatus, Config, DoctorReport, MountPlan,
+    build_and_write_archive_index, current_statuses, default_index_path,
+    find_default_archive_index_entries, mount_archives, mount_one_archive,
+    read_default_archive_index_summary, run_doctor_default, scan_archives, unmount_archives,
+    unmount_one_archive,
 };
 
 fn main() -> ExitCode {
@@ -78,6 +79,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "index-show" => {
             print_index_summary(&read_default_archive_index_summary()?);
         }
+        "index-find" => {
+            let Some(first) = args.next() else {
+                return Err("index-find requires a query".into());
+            };
+            let query = std::iter::once(first)
+                .chain(args)
+                .collect::<Vec<_>>()
+                .join(" ");
+            print_index_find_results(&query, &find_default_archive_index_entries(&query)?);
+        }
         "help" | "-h" | "--help" => print_help(),
         unknown => {
             print_help();
@@ -86,6 +97,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_index_find_results(query: &str, entries: &[ArchiveIndexEntry]) {
+    if entries.is_empty() {
+        println!("No index matches found for '{query}'.");
+        return;
+    }
+
+    println!("Index matches for '{query}':");
+    for entry in entries {
+        println!(
+            "  Platform: {}",
+            entry.platform.as_deref().unwrap_or("Unknown")
+        );
+        println!("  Display:  {}", entry.display_name);
+        println!("  Archive:  {}", entry.archive_path.display());
+        println!("  Mount:    {}", entry.mount_path.display());
+        println!("  Health:   {}", entry.health);
+        println!("  State:    {}", entry.mount_state);
+        println!();
+    }
 }
 
 fn print_index_summary(summary: &ArchiveIndexSummary) {
@@ -186,6 +218,7 @@ fn print_help() {
     println!("  doctor    diagnose whether ArchiveFS is ready to run safely");
     println!("  index-build build the JSON archive index");
     println!("  index-show show a summary of the JSON archive index");
+    println!("  index-find find entries in the JSON archive index");
     println!();
     println!("Config: ~/.config/archivefs/config.toml");
     println!("Example:");

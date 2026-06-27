@@ -1089,6 +1089,54 @@ pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
     Ok(index)
 }
 
+pub fn read_archive_index(path: impl AsRef<Path>) -> Result<ArchiveIndex> {
+    let path = path.as_ref();
+    let json = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(parse_archive_index_json(&json))
+}
+
+pub fn read_default_archive_index() -> Result<ArchiveIndex> {
+    read_archive_index(default_index_path()?)
+}
+
+pub fn find_archive_index_entries(index: &ArchiveIndex, query: &str) -> Vec<ArchiveIndexEntry> {
+    let needle = query.to_lowercase();
+    index
+        .archives
+        .iter()
+        .filter(|entry| {
+            entry
+                .archive_path
+                .display()
+                .to_string()
+                .to_lowercase()
+                .contains(&needle)
+                || entry.display_name.to_lowercase().contains(&needle)
+                || entry
+                    .platform
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&needle)
+                || entry
+                    .mount_path
+                    .display()
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn find_default_archive_index_entries(query: &str) -> Result<Vec<ArchiveIndexEntry>> {
+    let index = read_default_archive_index()?;
+    Ok(find_archive_index_entries(&index, query))
+}
+
 pub fn read_archive_index_summary(path: impl AsRef<Path>) -> Result<ArchiveIndexSummary> {
     let path = path.as_ref();
     let json = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
@@ -1100,6 +1148,48 @@ pub fn read_archive_index_summary(path: impl AsRef<Path>) -> Result<ArchiveIndex
 
 pub fn read_default_archive_index_summary() -> Result<ArchiveIndexSummary> {
     read_archive_index_summary(default_index_path()?)
+}
+
+fn parse_archive_index_json(json: &str) -> ArchiveIndex {
+    ArchiveIndex {
+        archives: json
+            .split("\n    {")
+            .skip(1)
+            .filter_map(parse_archive_index_entry)
+            .collect(),
+    }
+}
+
+fn parse_archive_index_entry(object: &str) -> Option<ArchiveIndexEntry> {
+    Some(ArchiveIndexEntry {
+        archive_path: PathBuf::from(extract_json_string_field(object, "archive_path")?),
+        platform: extract_json_string_field(object, "platform"),
+        display_name: extract_json_string_field(object, "display_name")?,
+        mount_path: PathBuf::from(extract_json_string_field(object, "mount_path")?),
+        health: parse_archive_health(&extract_json_string_field(object, "health")?),
+        mount_state: parse_mount_state(&extract_json_string_field(object, "mount_state")?),
+    })
+}
+
+fn parse_archive_health(value: &str) -> ArchiveHealth {
+    match value {
+        "Mounted" => ArchiveHealth::Mounted,
+        "Failed" => ArchiveHealth::Failed,
+        "MissingParts" => ArchiveHealth::MissingParts,
+        "Corrupt" => ArchiveHealth::Corrupt,
+        "Unsupported" => ArchiveHealth::Unsupported,
+        "PermissionDenied" => ArchiveHealth::PermissionDenied,
+        "RetryAvailable" => ArchiveHealth::RetryAvailable,
+        _ => ArchiveHealth::Pending,
+    }
+}
+
+fn parse_mount_state(value: &str) -> MountState {
+    match value {
+        "Mounted" => MountState::Mounted,
+        "MountPathExists" => MountState::MountPathExists,
+        _ => MountState::Pending,
+    }
 }
 
 fn summarize_archive_index_json(json: &str) -> ArchiveIndexSummary {
@@ -1740,6 +1830,36 @@ mod tests {
     }
 
     #[test]
+    fn archive_index_find_searches_all_requested_fields_case_insensitively() {
+        let index = sample_index_for_find();
+
+        assert_eq!(find_archive_index_entries(&index, "007").len(), 1);
+        assert_eq!(find_archive_index_entries(&index, "legends").len(), 1);
+        assert_eq!(find_archive_index_entries(&index, "xbox360").len(), 1);
+        assert_eq!(
+            find_archive_index_entries(&index, "unknown/mystery").len(),
+            1
+        );
+        assert_eq!(find_archive_index_entries(&index, "MYSTERY").len(), 1);
+    }
+
+    #[test]
+    fn archive_index_find_returns_empty_for_no_matches() {
+        let index = sample_index_for_find();
+
+        assert!(find_archive_index_entries(&index, "not present").is_empty());
+    }
+
+    #[test]
+    fn archive_index_json_round_trips_for_find() {
+        let index = sample_index_for_find();
+        let parsed = parse_archive_index_json(&archive_index_to_json(&index));
+
+        assert_eq!(find_archive_index_entries(&parsed, "xbox360").len(), 1);
+        assert_eq!(find_archive_index_entries(&parsed, "mystery").len(), 1);
+    }
+
+    #[test]
     fn archive_health_marks_retryable_states() {
         assert!(ArchiveHealth::Failed.is_retryable());
         assert!(ArchiveHealth::MissingParts.is_retryable());
@@ -1959,6 +2079,29 @@ mod tests {
         fn unmount(&self, mount_path: &Path) -> Result<()> {
             self.unmounted.borrow_mut().push(mount_path.to_path_buf());
             Ok(())
+        }
+    }
+
+    fn sample_index_for_find() -> ArchiveIndex {
+        ArchiveIndex {
+            archives: vec![
+                ArchiveIndexEntry {
+                    archive_path: PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                    platform: Some("Xbox360".to_string()),
+                    display_name: "007 Legends".to_string(),
+                    mount_path: PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+                    health: ArchiveHealth::Pending,
+                    mount_state: MountState::Mounted,
+                },
+                ArchiveIndexEntry {
+                    archive_path: PathBuf::from("/roms/misc/Mystery.zip"),
+                    platform: None,
+                    display_name: "Mystery".to_string(),
+                    mount_path: PathBuf::from("/mnt/archivefs/Unknown/Mystery"),
+                    health: ArchiveHealth::Pending,
+                    mount_state: MountState::Pending,
+                },
+            ],
         }
     }
 
