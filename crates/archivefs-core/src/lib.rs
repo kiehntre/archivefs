@@ -265,13 +265,15 @@ impl ArchiveIdentity {
         source_root: impl Into<PathBuf>,
         metadata: Option<&fs::Metadata>,
     ) -> Self {
+        let source_root = source_root.into();
+        let platform = detect_platform(path, &source_root);
         Self {
             display_name: archive_title(path),
             normalized_name: normalized_title(path),
-            source_root: source_root.into(),
+            source_root,
             size_bytes: metadata.map(fs::Metadata::len),
             modified_time: metadata.and_then(|metadata| metadata.modified().ok()),
-            platform: None,
+            platform,
             region: None,
             content_hash: None,
             archive_hash: None,
@@ -559,6 +561,30 @@ fn normalized_title(path: &Path) -> String {
     safe_mount_name(path).to_lowercase()
 }
 
+pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) -> Option<String> {
+    let path = path.as_ref();
+    let source_root = source_root.as_ref();
+
+    for segment in source_root.iter().chain(path.iter()) {
+        match normalize_path_segment(&segment.to_string_lossy()).as_str() {
+            "microsoftxbox360" | "xbox360" => return Some("Xbox360".to_string()),
+            "microsoftxbox" | "xbox" => return Some("Xbox".to_string()),
+            "atarist" => return Some("AtariST".to_string()),
+            "a2600" | "atari2600" => return Some("Atari2600".to_string()),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn normalize_path_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 fn archive_title(path: &Path) -> String {
     let filename = path
         .file_name()
@@ -849,6 +875,35 @@ mod tests {
         assert!(ArchiveHealth::Unsupported.is_terminal_without_source_change());
         assert!(ArchiveHealth::PermissionDenied.is_terminal_without_source_change());
         assert!(!ArchiveHealth::Failed.is_terminal_without_source_change());
+    }
+
+    #[test]
+    fn detects_platform_from_known_source_path_segments() {
+        assert_eq!(
+            detect_platform("/roms/microsoft_xbox/Halo.zip", "/roms"),
+            Some("Xbox".to_string())
+        );
+        assert_eq!(
+            detect_platform("/roms/xbox360/Halo 3.zip", "/roms"),
+            Some("Xbox360".to_string())
+        );
+        assert_eq!(
+            detect_platform("/collections/Atari ST/Gem.zip", "/collections"),
+            Some("AtariST".to_string())
+        );
+        assert_eq!(
+            detect_platform("/collections/Atari-2600/Pitfall.zip", "/collections"),
+            Some("Atari2600".to_string())
+        );
+        assert_eq!(detect_platform("/roms/unknown/game.zip", "/roms"), None);
+    }
+
+    #[test]
+    fn archive_identity_stores_detected_platform() {
+        let archive =
+            Archive::from_path_in_root("/roms/microsoft_xbox360/Halo 3.zip", "/roms").unwrap();
+
+        assert_eq!(archive.identity.platform, Some("Xbox360".to_string()));
     }
 
     #[test]
