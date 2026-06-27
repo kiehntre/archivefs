@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -100,6 +100,9 @@ pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
     pub archives_found: usize,
     pub archives_with_platform: usize,
+    pub archives_unknown_platform: usize,
+    pub unknown_platform_examples: Vec<PathBuf>,
+    pub platform_counts: Vec<(String, usize)>,
     pub pending_archives: usize,
     pub mounted_archives: usize,
 }
@@ -149,6 +152,9 @@ pub fn run_doctor_default() -> DoctorReport {
             }],
             archives_found: 0,
             archives_with_platform: 0,
+            archives_unknown_platform: 0,
+            unknown_platform_examples: Vec::new(),
+            platform_counts: Vec::new(),
             pending_archives: 0,
             mounted_archives: 0,
         },
@@ -162,6 +168,9 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
         checks: Vec::new(),
         archives_found: 0,
         archives_with_platform: 0,
+        archives_unknown_platform: 0,
+        unknown_platform_examples: Vec::new(),
+        platform_counts: Vec::new(),
         pending_archives: 0,
         mounted_archives: 0,
     };
@@ -245,10 +254,19 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
         match scan_archives(&config) {
             Ok(archives) => {
                 report.archives_found = archives.len();
-                report.archives_with_platform = archives
-                    .iter()
-                    .filter(|archive| archive.identity.platform.is_some())
-                    .count();
+                let mut platform_counts = BTreeMap::<String, usize>::new();
+                for archive in &archives {
+                    if let Some(platform) = &archive.identity.platform {
+                        *platform_counts.entry(platform.clone()).or_default() += 1;
+                    } else {
+                        report.archives_unknown_platform += 1;
+                        if report.unknown_platform_examples.len() < 10 {
+                            report.unknown_platform_examples.push(archive.path.clone());
+                        }
+                    }
+                }
+                report.archives_with_platform = archives.len() - report.archives_unknown_platform;
+                report.platform_counts = platform_counts.into_iter().collect();
                 report.pass("archive scan", format!("{} archives found", archives.len()));
             }
             Err(error) => report.fail("archive scan", error.to_string()),
@@ -1199,6 +1217,12 @@ mod tests {
 
         assert_eq!(report.archives_found, 2);
         assert_eq!(report.archives_with_platform, 1);
+        assert_eq!(report.archives_unknown_platform, 1);
+        assert_eq!(
+            report.unknown_platform_examples,
+            vec![unknown.join("Mystery.7z")]
+        );
+        assert_eq!(report.platform_counts, vec![("Xbox".to_string(), 1)]);
         assert_eq!(report.pending_archives, 2);
         assert_eq!(report.mounted_archives, 0);
         assert!(

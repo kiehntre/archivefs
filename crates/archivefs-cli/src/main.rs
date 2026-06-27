@@ -70,8 +70,31 @@ fn print_doctor_report(report: &DoctorReport) {
         "  Archives with detected platform: {}",
         report.archives_with_platform
     );
+    println!(
+        "  Archives with unknown platform: {}",
+        report.archives_unknown_platform
+    );
     println!("  Pending archives: {}", report.pending_archives);
     println!("  Mounted archives: {}", report.mounted_archives);
+    println!();
+    println!("Platform summary:");
+    if report.platform_counts.is_empty() {
+        println!("  none detected");
+    } else {
+        for (platform, count) in &report.platform_counts {
+            println!("  {platform}: {count}");
+        }
+    }
+    println!();
+    println!("Unknown platform examples:");
+    if report.unknown_platform_examples.is_empty() {
+        println!("  none");
+    } else {
+        for path in &report.unknown_platform_examples {
+            println!("  {}", path.display());
+        }
+    }
+    println!();
     println!("  Ready: {}", if report.is_ready() { "yes" } else { "no" });
 }
 
