@@ -10,6 +10,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use log::{debug, info};
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Serialize, Serializer};
 
 #[derive(Debug)]
 pub enum ArchiveFsError {
@@ -1613,7 +1615,7 @@ pub struct ArchiveIndexSummary {
     pub pending_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArchiveSizeSummary {
     pub archive_path: PathBuf,
     pub size_bytes: u64,
@@ -1629,6 +1631,39 @@ pub struct ArchiveStats {
     pub largest_archive: Option<ArchiveSizeSummary>,
     pub smallest_archive: Option<ArchiveSizeSummary>,
     pub total_size_bytes: u64,
+}
+
+impl Serialize for ArchiveStats {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ArchiveStats", 8)?;
+        state.serialize_field("total_archives", &self.total_archives)?;
+        state.serialize_field("mounted_count", &self.mounted_count)?;
+        state.serialize_field("pending_count", &self.pending_count)?;
+        state.serialize_field("platform_counts", &CountMap(&self.platform_counts))?;
+        state.serialize_field("extension_counts", &CountMap(&self.extension_counts))?;
+        state.serialize_field("largest_archive", &self.largest_archive)?;
+        state.serialize_field("smallest_archive", &self.smallest_archive)?;
+        state.serialize_field("total_size_bytes", &self.total_size_bytes)?;
+        state.end()
+    }
+}
+
+struct CountMap<'a>(&'a [(String, usize)]);
+
+impl Serialize for CountMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

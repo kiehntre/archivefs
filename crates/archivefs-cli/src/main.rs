@@ -143,8 +143,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_statuses(&current_statuses(&config)?);
         }
         "stats" => {
+            let json = args.any(|arg| arg == "--json");
             let config = Config::load_default()?;
-            print_archive_stats(&current_archive_stats(&config)?);
+            let stats = current_archive_stats(&config)?;
+            if json {
+                print_archive_stats_json(&stats)?;
+            } else {
+                print_archive_stats(&stats);
+            }
         }
         "duplicates" => {
             let config = Config::load_default()?;
@@ -519,6 +525,15 @@ fn print_archive_stats(stats: &ArchiveStats) {
     print!("{}", format_archive_stats(stats));
 }
 
+fn print_archive_stats_json(stats: &ArchiveStats) -> Result<(), serde_json::Error> {
+    println!("{}", format_archive_stats_json(stats)?);
+    Ok(())
+}
+
+fn format_archive_stats_json(stats: &ArchiveStats) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(stats)
+}
+
 fn format_archive_stats(stats: &ArchiveStats) -> String {
     let mut output = String::new();
     output.push_str("ArchiveFS Stats\n\n");
@@ -651,6 +666,7 @@ fn print_help() {
     println!("  archivefs doctor");
     println!("  archivefs config-check");
     println!("  archivefs stats");
+    println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
     println!("  archivefs mount-one \"007 Legends\"");
     println!("  archivefs unmount-one \"007 Legends\"");
@@ -741,6 +757,42 @@ mod tests {
         assert!(output.contains("Mount state: Mounted"));
         assert!(output.contains("Metadata provider: FilenameMetadataProvider"));
         assert!(output.contains("Health provider: FilesystemHealthProvider"));
+    }
+
+    #[test]
+    fn format_archive_stats_json_outputs_pretty_json_only() {
+        let stats = ArchiveStats {
+            total_archives: 2,
+            mounted_count: 1,
+            pending_count: 1,
+            platform_counts: vec![("Unknown".to_string(), 1), ("Xbox360".to_string(), 1)],
+            extension_counts: vec![("7z".to_string(), 1), ("zip".to_string(), 1)],
+            largest_archive: Some(archivefs_core::ArchiveSizeSummary {
+                archive_path: std::path::PathBuf::from("/roms/Halo.zip"),
+                size_bytes: 2048,
+            }),
+            smallest_archive: Some(archivefs_core::ArchiveSizeSummary {
+                archive_path: std::path::PathBuf::from("/roms/Mystery.7z"),
+                size_bytes: 512,
+            }),
+            total_size_bytes: 2560,
+        };
+
+        let output = format_archive_stats_json(&stats).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("{\n"));
+        assert!(!output.contains("ArchiveFS Stats"));
+        assert_eq!(json["total_archives"], 2);
+        assert_eq!(json["mounted_count"], 1);
+        assert_eq!(json["pending_count"], 1);
+        assert_eq!(json["total_size_bytes"], 2560);
+        assert_eq!(json["platform_counts"]["Unknown"], 1);
+        assert_eq!(json["platform_counts"]["Xbox360"], 1);
+        assert_eq!(json["extension_counts"]["7z"], 1);
+        assert_eq!(json["extension_counts"]["zip"], 1);
+        assert_eq!(json["largest_archive"]["archive_path"], "/roms/Halo.zip");
+        assert_eq!(json["smallest_archive"]["size_bytes"], 512);
     }
 
     #[test]
