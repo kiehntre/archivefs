@@ -562,6 +562,71 @@ impl ArchiveIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArchiveMetadata {
+    pub title: Option<String>,
+    pub platform: Option<String>,
+    pub region: Option<String>,
+    pub languages: Option<Vec<String>>,
+    pub version: Option<String>,
+    pub disc: Option<String>,
+    pub publisher: Option<String>,
+    pub developer: Option<String>,
+    pub release_year: Option<u16>,
+    pub genre: Option<String>,
+    pub notes: Option<String>,
+    pub source: Option<String>,
+}
+
+impl ArchiveMetadata {
+    fn empty() -> Self {
+        Self {
+            title: None,
+            platform: None,
+            region: None,
+            languages: None,
+            version: None,
+            disc: None,
+            publisher: None,
+            developer: None,
+            release_year: None,
+            genre: None,
+            notes: None,
+            source: None,
+        }
+    }
+}
+
+pub trait MetadataProvider {
+    fn metadata_for(&self, archive: &Archive) -> ArchiveMetadata;
+}
+
+pub trait HealthProvider {
+    fn health_for(&self, archive: &Archive) -> ArchiveHealth;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilesystemHealthProvider;
+
+impl HealthProvider for FilesystemHealthProvider {
+    fn health_for(&self, archive: &Archive) -> ArchiveHealth {
+        archive.health
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilenameMetadataProvider;
+
+impl MetadataProvider for FilenameMetadataProvider {
+    fn metadata_for(&self, archive: &Archive) -> ArchiveMetadata {
+        let mut metadata = ArchiveMetadata::empty();
+        metadata.title = Some(archive_title(&archive.path));
+        metadata.platform = detect_platform(&archive.path, &archive.identity.source_root);
+        metadata.region = archive.identity.region.clone();
+        metadata
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Archive {
     pub path: PathBuf,
@@ -676,6 +741,33 @@ impl MountPlan {
             archive,
             mount_path,
             state: MountState::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveRecord {
+    pub identity: ArchiveIdentity,
+    pub metadata: ArchiveMetadata,
+    pub mount_plan: MountPlan,
+    pub health: ArchiveHealth,
+    pub mount_state: MountState,
+}
+
+impl ArchiveRecord {
+    pub fn new(
+        mut mount_plan: MountPlan,
+        mount_state: MountState,
+        metadata: ArchiveMetadata,
+        health: ArchiveHealth,
+    ) -> Self {
+        mount_plan.state = mount_state;
+        Self {
+            identity: mount_plan.archive.identity.clone(),
+            metadata,
+            health,
+            mount_plan,
+            mount_state,
         }
     }
 }
@@ -1054,35 +1146,10 @@ pub fn default_index_path() -> Result<PathBuf> {
 }
 
 pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
-    let archives = scan_archives(config)?;
-    let plans = plan_mounts(&archives, &config.mount_root);
-    let mounted_paths = mounted_paths_under(&config.mount_root)?;
-
     Ok(ArchiveIndex {
-        archives: plans
+        archives: current_archive_records(config)?
             .into_iter()
-            .map(|plan| {
-                let mount_state = if mounted_paths.contains(&plan.mount_path) {
-                    MountState::Mounted
-                } else if plan.mount_path.exists() {
-                    MountState::MountPathExists
-                } else {
-                    MountState::Pending
-                };
-                ArchiveIndexEntry {
-                    archive_path: plan.archive.path,
-                    platform: plan.archive.identity.platform,
-                    display_name: plan.archive.identity.display_name,
-                    mount_path: plan.mount_path,
-                    modified_time_seconds: plan
-                        .archive
-                        .identity
-                        .modified_time
-                        .and_then(system_time_seconds),
-                    health: plan.archive.health,
-                    mount_state,
-                }
-            })
+            .map(archive_index_entry_from_record)
             .collect(),
     })
 }
@@ -1366,11 +1433,41 @@ fn escape_json(value: &str) -> String {
     escaped
 }
 
-pub fn current_statuses(config: &Config) -> Result<Vec<ArchiveStatus>> {
+pub fn current_archive_records(config: &Config) -> Result<Vec<ArchiveRecord>> {
+    let metadata_provider = FilenameMetadataProvider;
+    let health_provider = FilesystemHealthProvider;
+    current_archive_records_with_providers(config, &metadata_provider, &health_provider)
+}
+
+pub fn current_archive_records_with_metadata_provider(
+    config: &Config,
+    metadata_provider: &impl MetadataProvider,
+) -> Result<Vec<ArchiveRecord>> {
+    let health_provider = FilesystemHealthProvider;
+    current_archive_records_with_providers(config, metadata_provider, &health_provider)
+}
+
+pub fn current_archive_records_with_providers(
+    config: &Config,
+    metadata_provider: &impl MetadataProvider,
+    health_provider: &impl HealthProvider,
+) -> Result<Vec<ArchiveRecord>> {
     let archives = scan_archives(config)?;
     let plans = plan_mounts(&archives, &config.mount_root);
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    Ok(statuses_from_plans(plans, &mounted_paths))
+    Ok(records_from_plans(
+        plans,
+        &mounted_paths,
+        metadata_provider,
+        health_provider,
+    ))
+}
+
+pub fn current_statuses(config: &Config) -> Result<Vec<ArchiveStatus>> {
+    Ok(current_archive_records(config)?
+        .into_iter()
+        .map(archive_status_from_record)
+        .collect())
 }
 
 pub fn mount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
@@ -1567,28 +1664,54 @@ fn directory_is_empty(path: &Path) -> Result<bool> {
     Ok(entries.next().is_none())
 }
 
-fn statuses_from_plans(
+fn records_from_plans(
     plans: Vec<MountPlan>,
     mounted_paths: &HashSet<PathBuf>,
-) -> Vec<ArchiveStatus> {
+    metadata_provider: &impl MetadataProvider,
+    health_provider: &impl HealthProvider,
+) -> Vec<ArchiveRecord> {
     plans
         .into_iter()
         .map(|plan| {
-            let state = if mounted_paths.contains(&plan.mount_path) {
-                MountState::Mounted
-            } else if plan.mount_path.exists() {
-                MountState::MountPathExists
-            } else {
-                MountState::Pending
-            };
-
-            ArchiveStatus {
-                archive_path: plan.archive.path,
-                mount_path: plan.mount_path,
-                state,
-            }
+            let mount_state = mount_state_for_plan(&plan, mounted_paths);
+            let metadata = metadata_provider.metadata_for(&plan.archive);
+            let health = health_provider.health_for(&plan.archive);
+            ArchiveRecord::new(plan, mount_state, metadata, health)
         })
         .collect()
+}
+
+fn mount_state_for_plan(plan: &MountPlan, mounted_paths: &HashSet<PathBuf>) -> MountState {
+    if mounted_paths.contains(&plan.mount_path) {
+        MountState::Mounted
+    } else if plan.mount_path.exists() {
+        MountState::MountPathExists
+    } else {
+        MountState::Pending
+    }
+}
+
+fn archive_status_from_record(record: ArchiveRecord) -> ArchiveStatus {
+    ArchiveStatus {
+        archive_path: record.mount_plan.archive.path,
+        mount_path: record.mount_plan.mount_path,
+        state: record.mount_state,
+    }
+}
+
+fn archive_index_entry_from_record(record: ArchiveRecord) -> ArchiveIndexEntry {
+    ArchiveIndexEntry {
+        archive_path: record.mount_plan.archive.path,
+        platform: record.metadata.platform,
+        display_name: record
+            .metadata
+            .title
+            .unwrap_or(record.identity.display_name),
+        mount_path: record.mount_plan.mount_path,
+        modified_time_seconds: record.identity.modified_time.and_then(system_time_seconds),
+        health: record.health,
+        mount_state: record.mount_state,
+    }
 }
 
 fn mounted_paths_under(root: &Path) -> Result<HashSet<PathBuf>> {
