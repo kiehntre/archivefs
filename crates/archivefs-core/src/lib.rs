@@ -1226,11 +1226,11 @@ impl<'a> ArchiveScanner<'a> {
 
             if file_type.is_dir() {
                 self.scan_source(source_root, &path, archives)?;
-            } else if file_type.is_file() {
-                if let Some(archive) = Archive::from_path_in_root(&path, source_root) {
-                    debug!("discovered archive {}", archive.path.display());
-                    archives.push(archive);
-                }
+            } else if file_type.is_file()
+                && let Some(archive) = Archive::from_path_in_root(&path, source_root)
+            {
+                debug!("discovered archive {}", archive.path.display());
+                archives.push(archive);
             }
         }
 
@@ -1441,16 +1441,16 @@ fn archive_title(path: &Path) -> String {
         .unwrap_or_else(|| "archive".to_string());
     let lower = filename.to_lowercase();
 
-    if let Some(part_number) = rar_part_number(&lower) {
-        if part_number == 1 {
-            let suffix_len = ".part1.rar".len();
-            let part_digits = lower
-                .strip_suffix(".rar")
-                .and_then(|name| name.rsplit_once(".part"))
-                .map(|(_, digits)| digits.len())
-                .unwrap_or(1);
-            return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
-        }
+    if let Some(part_number) = rar_part_number(&lower)
+        && part_number == 1
+    {
+        let suffix_len = ".part1.rar".len();
+        let part_digits = lower
+            .strip_suffix(".rar")
+            .and_then(|name| name.rsplit_once(".part"))
+            .map(|(_, digits)| digits.len())
+            .unwrap_or(1);
+        return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
     }
 
     for extension in [".zip", ".7z", ".rar"] {
