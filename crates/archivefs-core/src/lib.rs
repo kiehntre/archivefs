@@ -121,6 +121,80 @@ pub struct DoctorCheck {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigCheckStatus {
+    Pass,
+    Warn,
+    Error,
+}
+
+impl fmt::Display for ConfigCheckStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warn => write!(f, "WARN"),
+            Self::Error => write!(f, "ERROR"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigCheck {
+    pub name: String,
+    pub status: ConfigCheckStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigCheckReport {
+    pub config_path: PathBuf,
+    pub checks: Vec<ConfigCheck>,
+}
+
+impl ConfigCheckReport {
+    pub fn error_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| check.status == ConfigCheckStatus::Error)
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| check.status == ConfigCheckStatus::Warn)
+            .count()
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.error_count() == 0
+    }
+
+    fn pass(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(ConfigCheck {
+            name: name.into(),
+            status: ConfigCheckStatus::Pass,
+            detail: detail.into(),
+        });
+    }
+
+    fn warn(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(ConfigCheck {
+            name: name.into(),
+            status: ConfigCheckStatus::Warn,
+            detail: detail.into(),
+        });
+    }
+
+    fn error(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(ConfigCheck {
+            name: name.into(),
+            status: ConfigCheckStatus::Error,
+            detail: detail.into(),
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorReport {
     pub config_path: PathBuf,
@@ -278,7 +352,8 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
     }
 
     if sources_ok {
-        match scan_archives(&config) {
+        let scanner = ArchiveScanner::new(&config);
+        match scanner.scan_archives() {
             Ok(archives) => {
                 report.archives_found = archives.len();
                 let mut platform_counts = BTreeMap::<String, usize>::new();
@@ -333,6 +408,186 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
     report
 }
 
+pub fn run_config_check_default() -> ConfigCheckReport {
+    match default_config_path() {
+        Ok(path) => run_config_check(path),
+        Err(error) => ConfigCheckReport {
+            config_path: PathBuf::from("~/.config/archivefs/config.toml"),
+            checks: vec![ConfigCheck {
+                name: "config path".to_string(),
+                status: ConfigCheckStatus::Error,
+                detail: error.to_string(),
+            }],
+        },
+    }
+}
+
+pub fn run_config_check(config_path: impl AsRef<Path>) -> ConfigCheckReport {
+    let config_path = config_path.as_ref().to_path_buf();
+    let mut report = ConfigCheckReport {
+        config_path: config_path.clone(),
+        checks: Vec::new(),
+    };
+
+    let contents = match fs::read_to_string(&config_path) {
+        Ok(contents) => {
+            report.pass(
+                "config file exists",
+                format!("found {}", config_path.display()),
+            );
+            contents
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            report.error(
+                "config file exists",
+                format!("missing {}", config_path.display()),
+            );
+            return report;
+        }
+        Err(error) => {
+            report.error(
+                "config file exists",
+                format!("{} cannot be read: {error}", config_path.display()),
+            );
+            return report;
+        }
+    };
+
+    let fields = match parse_config_fields(&contents) {
+        Ok(fields) => {
+            report.pass("config parses", "configuration syntax parsed successfully");
+            fields
+        }
+        Err(error) => {
+            report.error("config parses", error.to_string());
+            return report;
+        }
+    };
+
+    match &fields.source_folders {
+        Some(source_folders) if source_folders.is_empty() => {
+            report.error("source_folders not empty", "source_folders is empty");
+        }
+        Some(source_folders) => {
+            report.pass(
+                "source_folders not empty",
+                format!("{} source folder(s) configured", source_folders.len()),
+            );
+            let mut seen = HashSet::<PathBuf>::new();
+            for source in source_folders {
+                let source = PathBuf::from(source);
+                if !seen.insert(source.clone()) {
+                    report.warn(
+                        "duplicate source folder",
+                        format!("{} is listed more than once", source.display()),
+                    );
+                }
+                if source.exists() {
+                    report.pass(
+                        "source folder exists",
+                        format!("{} exists", source.display()),
+                    );
+                    if source.is_dir() {
+                        report.pass(
+                            "source folder is directory",
+                            format!("{} is a directory", source.display()),
+                        );
+                    } else {
+                        report.error(
+                            "source folder is directory",
+                            format!("{} exists but is not a directory", source.display()),
+                        );
+                    }
+                } else {
+                    report.error(
+                        "source folder exists",
+                        format!("{} does not exist", source.display()),
+                    );
+                    report.error(
+                        "source folder is directory",
+                        format!("{} is not a directory", source.display()),
+                    );
+                }
+            }
+        }
+        None => {
+            report.error("source_folders not empty", "missing source_folders");
+        }
+    }
+
+    match &fields.mount_root {
+        Some(mount_root) => {
+            report.pass("mount_root set", format!("{}", mount_root.display()));
+            if mount_root.is_dir() {
+                report.pass(
+                    "mount_root exists",
+                    format!("{} exists", mount_root.display()),
+                );
+                report.pass(
+                    "mount_root is directory",
+                    format!("{} is a directory", mount_root.display()),
+                );
+            } else if mount_root.exists() {
+                report.pass(
+                    "mount_root exists",
+                    format!("{} exists", mount_root.display()),
+                );
+                report.error(
+                    "mount_root is directory",
+                    format!("{} exists but is not a directory", mount_root.display()),
+                );
+            } else {
+                match fs::create_dir_all(mount_root) {
+                    Ok(()) => {
+                        report.pass(
+                            "mount_root exists",
+                            format!("{} was created", mount_root.display()),
+                        );
+                        report.pass(
+                            "mount_root is directory",
+                            format!("{} is a directory", mount_root.display()),
+                        );
+                    }
+                    Err(error) => {
+                        report.error(
+                            "mount_root exists",
+                            format!("{} cannot be created: {error}", mount_root.display()),
+                        );
+                        report.error(
+                            "mount_root is directory",
+                            format!("{} is not a directory", mount_root.display()),
+                        );
+                    }
+                }
+            }
+        }
+        None => {
+            report.error("mount_root set", "missing mount_root");
+        }
+    }
+
+    let ratarmount_bin = fields.ratarmount_bin.as_deref().unwrap_or("ratarmount");
+    if command_available(ratarmount_bin) {
+        report.pass(
+            "ratarmount binary",
+            format!("{ratarmount_bin} is available"),
+        );
+    } else {
+        report.error(
+            "ratarmount binary",
+            format!("{ratarmount_bin} was not found"),
+        );
+    }
+
+    if command_available("fusermount3") || command_available("umount") {
+        report.pass("unmount tool", "fusermount3 or umount is available");
+    } else {
+        report.error("unmount tool", "neither fusermount3 nor umount was found");
+    }
+
+    report
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -343,10 +598,41 @@ pub fn default_config_path() -> Result<PathBuf> {
         .join("config.toml"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFields {
+    source_folders: Option<Vec<String>>,
+    mount_root: Option<PathBuf>,
+    ratarmount_bin: Option<String>,
+}
+
 pub fn parse_config(contents: &str) -> Result<Config> {
-    let mut source_folders = None;
-    let mut mount_root = None;
-    let mut ratarmount_bin = None;
+    let fields = parse_config_fields(contents)?;
+    let source_folders = fields
+        .source_folders
+        .ok_or_else(|| ArchiveFsError::Config("missing source_folders".to_string()))?;
+    if source_folders.is_empty() {
+        return Err(ArchiveFsError::Config(
+            "source_folders must contain at least one path".to_string(),
+        ));
+    }
+
+    Ok(Config {
+        source_folders: source_folders.into_iter().map(PathBuf::from).collect(),
+        mount_root: fields
+            .mount_root
+            .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?,
+        ratarmount_bin: fields
+            .ratarmount_bin
+            .unwrap_or_else(|| "ratarmount".to_string()),
+    })
+}
+
+fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
+    let mut fields = ConfigFields {
+        source_folders: None,
+        mount_root: None,
+        ratarmount_bin: None,
+    };
 
     for (line_number, raw_line) in contents.lines().enumerate() {
         let line = strip_comment(raw_line).trim();
@@ -363,32 +649,20 @@ pub fn parse_config(contents: &str) -> Result<Config> {
 
         match key.trim() {
             "source_folders" | "sources" => {
-                source_folders = Some(parse_string_array(value.trim(), line_number + 1)?);
+                fields.source_folders = Some(parse_string_array(value.trim(), line_number + 1)?);
             }
             "mount_root" => {
-                mount_root = Some(PathBuf::from(parse_string(value.trim(), line_number + 1)?));
+                fields.mount_root =
+                    Some(PathBuf::from(parse_string(value.trim(), line_number + 1)?));
             }
             "ratarmount_bin" | "ratarmount" => {
-                ratarmount_bin = Some(parse_string(value.trim(), line_number + 1)?);
+                fields.ratarmount_bin = Some(parse_string(value.trim(), line_number + 1)?);
             }
             _ => {}
         }
     }
 
-    let source_folders = source_folders
-        .ok_or_else(|| ArchiveFsError::Config("missing source_folders".to_string()))?;
-    if source_folders.is_empty() {
-        return Err(ArchiveFsError::Config(
-            "source_folders must contain at least one path".to_string(),
-        ));
-    }
-
-    Ok(Config {
-        source_folders: source_folders.into_iter().map(PathBuf::from).collect(),
-        mount_root: mount_root
-            .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?,
-        ratarmount_bin: ratarmount_bin.unwrap_or_else(|| "ratarmount".to_string()),
-    })
+    Ok(fields)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -814,45 +1088,90 @@ pub struct ArchiveStatus {
     pub state: MountState,
 }
 
-pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
-    let mut archives = Vec::new();
-    for source in &config.source_folders {
-        scan_source(source, source, &mut archives)?;
-    }
-    archives.sort_by(|left, right| left.path.cmp(&right.path));
-    archives.dedup_by(|left, right| left.path == right.path);
-    Ok(archives)
+pub struct ArchiveScanner<'a> {
+    config: &'a Config,
 }
 
-fn scan_source(source_root: &Path, source: &Path, archives: &mut Vec<Archive>) -> Result<()> {
-    let entries = fs::read_dir(source).map_err(|source_error| ArchiveFsError::Io {
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
+impl<'a> ArchiveScanner<'a> {
+    pub fn new(config: &'a Config) -> Self {
+        Self { config }
+    }
 
-    for entry in entries {
-        let entry = entry.map_err(|source_error| ArchiveFsError::Io {
+    pub fn scan_archives(&self) -> Result<Vec<Archive>> {
+        let mut archives = Vec::new();
+        for source in &self.config.source_folders {
+            self.scan_source(source, source, &mut archives)?;
+        }
+        archives.sort_by(|left, right| left.path.cmp(&right.path));
+        archives.dedup_by(|left, right| left.path == right.path);
+        Ok(archives)
+    }
+
+    pub fn mount_plans(&self) -> Result<Vec<MountPlan>> {
+        let archives = self.scan_archives()?;
+        Ok(plan_mounts(&archives, &self.config.mount_root))
+    }
+
+    pub fn archive_records(&self) -> Result<Vec<ArchiveRecord>> {
+        let metadata_provider = FilenameMetadataProvider;
+        let health_provider = FilesystemHealthProvider;
+        self.archive_records_with_providers(&metadata_provider, &health_provider)
+    }
+
+    pub fn archive_records_with_providers(
+        &self,
+        metadata_provider: &impl MetadataProvider,
+        health_provider: &impl HealthProvider,
+    ) -> Result<Vec<ArchiveRecord>> {
+        let plans = self.mount_plans()?;
+        let mounted_paths = mounted_paths_under(&self.config.mount_root)?;
+        Ok(records_from_plans(
+            plans,
+            &mounted_paths,
+            metadata_provider,
+            health_provider,
+        ))
+    }
+
+    fn scan_source(
+        &self,
+        source_root: &Path,
+        source: &Path,
+        archives: &mut Vec<Archive>,
+    ) -> Result<()> {
+        let entries = fs::read_dir(source).map_err(|source_error| ArchiveFsError::Io {
             path: source.to_path_buf(),
             source: source_error,
         })?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|source_error| ArchiveFsError::Io {
-                path: path.clone(),
+
+        for entry in entries {
+            let entry = entry.map_err(|source_error| ArchiveFsError::Io {
+                path: source.to_path_buf(),
                 source: source_error,
             })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|source_error| ArchiveFsError::Io {
+                    path: path.clone(),
+                    source: source_error,
+                })?;
 
-        if file_type.is_dir() {
-            scan_source(source_root, &path, archives)?;
-        } else if file_type.is_file() {
-            if let Some(archive) = Archive::from_path_in_root(&path, source_root) {
-                archives.push(archive);
+            if file_type.is_dir() {
+                self.scan_source(source_root, &path, archives)?;
+            } else if file_type.is_file() {
+                if let Some(archive) = Archive::from_path_in_root(&path, source_root) {
+                    archives.push(archive);
+                }
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
+}
+
+pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
+    ArchiveScanner::new(config).scan_archives()
 }
 
 pub fn plan_mounts(archives: &[Archive], mount_root: impl AsRef<Path>) -> Vec<MountPlan> {
@@ -1180,10 +1499,16 @@ pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
 
 pub const WATCH_DEBOUNCE_DURATION: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchRebuildSummary {
+    pub archive_event_count: usize,
+    pub changed_paths: Vec<PathBuf>,
+}
+
 pub fn watch_archive_index(
     config: &Config,
     mut on_started: impl FnMut(),
-    mut on_rebuilt: impl FnMut(&ArchiveIndex),
+    mut on_rebuilt: impl FnMut(&ArchiveIndex, &WatchRebuildSummary),
 ) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
@@ -1208,9 +1533,9 @@ pub fn watch_archive_index(
                 Ok(event) => handle_watch_event(event, &mut debouncer)?,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if debouncer.should_fire(Instant::now()) {
-                        debouncer.mark_fired();
+                        let summary = debouncer.take_summary();
                         let index = build_and_write_archive_index(config)?;
-                        on_rebuilt(&index);
+                        on_rebuilt(&index, &summary);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1236,18 +1561,29 @@ fn handle_watch_event(
     debouncer: &mut WatchDebouncer,
 ) -> Result<()> {
     let event = event.map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
-    if watch_event_should_rebuild(&event) {
-        debouncer.record_change(Instant::now());
+    let archive_paths = watch_event_archive_paths(&event);
+    if !archive_paths.is_empty() {
+        debouncer.record_change(Instant::now(), archive_paths);
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn watch_event_should_rebuild(event: &notify::Event) -> bool {
-    watch_event_kind_can_change_archive(&event.kind)
-        && event
-            .paths
-            .iter()
-            .any(|path| watch_path_is_supported_archive(path))
+    !watch_event_archive_paths(event).is_empty()
+}
+
+fn watch_event_archive_paths(event: &notify::Event) -> Vec<PathBuf> {
+    if !watch_event_kind_can_change_archive(&event.kind) {
+        return Vec::new();
+    }
+
+    event
+        .paths
+        .iter()
+        .filter(|path| watch_path_is_supported_archive(path))
+        .cloned()
+        .collect()
 }
 
 fn watch_event_kind_can_change_archive(kind: &notify::EventKind) -> bool {
@@ -1311,6 +1647,8 @@ pub fn is_temporary_or_incomplete_path(path: impl AsRef<Path>) -> bool {
 struct WatchDebouncer {
     debounce: Duration,
     last_change: Option<Instant>,
+    archive_event_count: usize,
+    changed_paths: Vec<PathBuf>,
 }
 
 impl WatchDebouncer {
@@ -1318,11 +1656,22 @@ impl WatchDebouncer {
         Self {
             debounce,
             last_change: None,
+            archive_event_count: 0,
+            changed_paths: Vec::new(),
         }
     }
 
-    fn record_change(&mut self, now: Instant) {
+    fn record_change(&mut self, now: Instant, changed_paths: Vec<PathBuf>) {
         self.last_change = Some(now);
+        self.archive_event_count += 1;
+        for path in changed_paths {
+            if self.changed_paths.len() >= 5 {
+                break;
+            }
+            if !self.changed_paths.contains(&path) {
+                self.changed_paths.push(path);
+            }
+        }
     }
 
     fn should_fire(&self, now: Instant) -> bool {
@@ -1330,8 +1679,19 @@ impl WatchDebouncer {
             .is_some_and(|last_change| now.duration_since(last_change) >= self.debounce)
     }
 
-    fn mark_fired(&mut self) {
+    fn take_summary(&mut self) -> WatchRebuildSummary {
+        let summary = WatchRebuildSummary {
+            archive_event_count: self.archive_event_count,
+            changed_paths: std::mem::take(&mut self.changed_paths),
+        };
         self.last_change = None;
+        self.archive_event_count = 0;
+        summary
+    }
+
+    #[cfg(test)]
+    fn mark_fired(&mut self) {
+        let _ = self.take_summary();
     }
 
     fn recv_timeout(&self) -> Option<Duration> {
@@ -1601,9 +1961,7 @@ fn escape_json(value: &str) -> String {
 }
 
 pub fn current_archive_records(config: &Config) -> Result<Vec<ArchiveRecord>> {
-    let metadata_provider = FilenameMetadataProvider;
-    let health_provider = FilesystemHealthProvider;
-    current_archive_records_with_providers(config, &metadata_provider, &health_provider)
+    ArchiveScanner::new(config).archive_records()
 }
 
 pub fn current_archive_records_with_metadata_provider(
@@ -1611,7 +1969,7 @@ pub fn current_archive_records_with_metadata_provider(
     metadata_provider: &impl MetadataProvider,
 ) -> Result<Vec<ArchiveRecord>> {
     let health_provider = FilesystemHealthProvider;
-    current_archive_records_with_providers(config, metadata_provider, &health_provider)
+    ArchiveScanner::new(config).archive_records_with_providers(metadata_provider, &health_provider)
 }
 
 pub fn current_archive_records_with_providers(
@@ -1619,15 +1977,7 @@ pub fn current_archive_records_with_providers(
     metadata_provider: &impl MetadataProvider,
     health_provider: &impl HealthProvider,
 ) -> Result<Vec<ArchiveRecord>> {
-    let archives = scan_archives(config)?;
-    let plans = plan_mounts(&archives, &config.mount_root);
-    let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    Ok(records_from_plans(
-        plans,
-        &mounted_paths,
-        metadata_provider,
-        health_provider,
-    ))
+    ArchiveScanner::new(config).archive_records_with_providers(metadata_provider, health_provider)
 }
 
 pub fn current_statuses(config: &Config) -> Result<Vec<ArchiveStatus>> {
@@ -1646,8 +1996,8 @@ pub fn mount_archives_with_backend(
     config: &Config,
     backend: &impl MountBackend,
 ) -> Result<Vec<ArchiveStatus>> {
-    let archives = scan_archives(config)?;
-    let plans = plan_mounts(&archives, &config.mount_root);
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
     fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
         path: config.mount_root.clone(),
         source,
@@ -1678,8 +2028,8 @@ pub fn mount_one_archive_with_backend(
     input: &str,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
-    let archives = scan_archives(config)?;
-    let plans = plan_mounts(&archives, &config.mount_root);
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
     let plan = select_mount_plan(&plans, input)?;
 
     fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
@@ -1731,8 +2081,8 @@ pub fn unmount_one_archive_with_backend(
     input: &str,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
-    let archives = scan_archives(config)?;
-    let plans = plan_mounts(&archives, &config.mount_root);
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
     let plan = select_mount_plan(&plans, input)?;
 
     if !path_is_under(&plan.mount_path, &config.mount_root) {
@@ -2654,6 +3004,72 @@ mod tests {
     }
 
     #[test]
+    fn config_check_reports_empty_sources_as_validation_error() {
+        let root = test_root("config_check_empty_sources");
+        let config_path = root.join("config.toml");
+        let ratarmount = root.join("ratarmount");
+        fs::write(&ratarmount, b"").unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = []\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\n",
+                root.join("mounts").display(),
+                ratarmount.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_config_check(&config_path);
+
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "config parses"
+                    && check.status == ConfigCheckStatus::Pass)
+        );
+        assert!(report.checks.iter().any(|check| {
+            check.name == "source_folders not empty" && check.status == ConfigCheckStatus::Error
+        }));
+        assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn config_check_warns_for_duplicate_source_folders() {
+        let root = test_root("config_check_duplicate_sources");
+        let source = root.join("roms");
+        let ratarmount = root.join("ratarmount");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(&ratarmount, b"").unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\", \"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\n",
+                source.display(),
+                source.display(),
+                root.join("mounts").display(),
+                ratarmount.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_config_check(&config_path);
+
+        assert_eq!(report.warning_count(), 1);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "duplicate source folder" && check.status == ConfigCheckStatus::Warn
+        }));
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.name == "source folder exists"
+                    && check.status == ConfigCheckStatus::Error)
+        );
+    }
+
+    #[test]
     fn watcher_ignores_obvious_temporary_and_incomplete_paths() {
         for path in [
             "Game.zip.part",
@@ -2720,15 +3136,57 @@ mod tests {
 
         assert!(!debouncer.should_fire(start + debounce));
 
-        debouncer.record_change(start);
+        debouncer.record_change(start, vec![PathBuf::from("/roms/Game.zip")]);
         assert!(!debouncer.should_fire(start + Duration::from_secs(4)));
         assert!(debouncer.should_fire(start + debounce));
 
-        debouncer.record_change(start + Duration::from_secs(3));
+        debouncer.record_change(
+            start + Duration::from_secs(3),
+            vec![PathBuf::from("/roms/Game.7z")],
+        );
         assert!(!debouncer.should_fire(start + Duration::from_secs(7)));
         assert!(debouncer.should_fire(start + Duration::from_secs(8)));
 
         debouncer.mark_fired();
+        assert!(!debouncer.should_fire(start + Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn watcher_debouncer_tracks_event_count_and_first_five_changed_paths() {
+        let start = Instant::now();
+        let mut debouncer = WatchDebouncer::new(Duration::from_secs(5));
+
+        debouncer.record_change(
+            start,
+            vec![
+                PathBuf::from("/roms/one.zip"),
+                PathBuf::from("/roms/two.7z"),
+            ],
+        );
+        debouncer.record_change(
+            start + Duration::from_secs(1),
+            vec![
+                PathBuf::from("/roms/two.7z"),
+                PathBuf::from("/roms/three.rar"),
+                PathBuf::from("/roms/four.iso"),
+                PathBuf::from("/roms/five.zip"),
+                PathBuf::from("/roms/six.zip"),
+            ],
+        );
+
+        let summary = debouncer.take_summary();
+
+        assert_eq!(summary.archive_event_count, 2);
+        assert_eq!(
+            summary.changed_paths,
+            vec![
+                PathBuf::from("/roms/one.zip"),
+                PathBuf::from("/roms/two.7z"),
+                PathBuf::from("/roms/three.rar"),
+                PathBuf::from("/roms/four.iso"),
+                PathBuf::from("/roms/five.zip"),
+            ]
+        );
         assert!(!debouncer.should_fire(start + Duration::from_secs(20)));
     }
 
