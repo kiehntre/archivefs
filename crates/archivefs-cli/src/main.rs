@@ -153,25 +153,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "duplicates" => {
+            let json = args.any(|arg| arg == "--json");
             let config = Config::load_default()?;
             let scanner = ArchiveScanner::new(&config);
             let records = scanner.archive_records()?;
             let detector = FilenameDuplicateDetector;
-            print_duplicate_report(&detector.detect_duplicates(&records)?);
+            let report = detector.detect_duplicates(&records)?;
+            if json {
+                print_duplicate_report_json(&report)?;
+            } else {
+                print_duplicate_report(&report);
+            }
         }
         "info" => {
             let Some(first) = args.next() else {
                 return Err("info requires an archive path or name".into());
             };
-            let input = std::iter::once(first)
-                .chain(args)
-                .collect::<Vec<_>>()
-                .join(" ");
+            let mut input_args = std::iter::once(first).chain(args).collect::<Vec<_>>();
+            let json = input_args.last().is_some_and(|arg| arg == "--json");
+            if json {
+                input_args.pop();
+            }
+            let input = input_args.join(" ");
+            if input.is_empty() {
+                return Err("info requires an archive path or name".into());
+            }
             let config = Config::load_default()?;
-            print_archive_info(&current_archive_info(&config, &input)?);
+            let info = current_archive_info(&config, &input)?;
+            if json {
+                print_archive_info_json(&info)?;
+            } else {
+                print_archive_info(&info);
+            }
         }
         "doctor" => {
-            print_doctor_report(&run_doctor_default());
+            let json = args.any(|arg| arg == "--json");
+            let report = run_doctor_default();
+            if json {
+                print_doctor_report_json(&report)?;
+            } else {
+                print_doctor_report(&report);
+            }
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
@@ -399,52 +421,81 @@ fn print_unmount_one(plan: &MountPlan) {
 }
 
 fn print_doctor_report(report: &DoctorReport) {
-    println!("ArchiveFS Doctor");
-    println!("Config: {}", report.config_path.display());
-    println!();
-    println!("Checks:");
+    print!("{}", format_doctor_report(report));
+}
+
+fn print_doctor_report_json(report: &DoctorReport) -> Result<(), serde_json::Error> {
+    println!("{}", format_doctor_report_json(report)?);
+    Ok(())
+}
+
+fn format_doctor_report_json(report: &DoctorReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
+}
+
+fn format_doctor_report(report: &DoctorReport) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS Doctor\n");
+    output.push_str(&format!("Config: {}\n", report.config_path.display()));
+    output.push_str("\nChecks:\n");
     for check in &report.checks {
-        println!(
-            "  [{:<4}] {:<16} {}",
+        output.push_str(&format!(
+            "  [{:<4}] {:<16} {}\n",
             check.status, check.name, check.detail
-        );
+        ));
     }
-    println!();
-    println!("Summary:");
-    println!("  Archives found: {}", report.archives_found);
-    println!(
-        "  Archives with detected platform: {}",
+    output.push_str("\nSummary:\n");
+    output.push_str(&format!("  Archives found: {}\n", report.archives_found));
+    output.push_str(&format!(
+        "  Archives with detected platform: {}\n",
         report.archives_with_platform
-    );
-    println!(
-        "  Archives with unknown platform: {}",
+    ));
+    output.push_str(&format!(
+        "  Archives with unknown platform: {}\n",
         report.archives_unknown_platform
-    );
-    println!("  Pending archives: {}", report.pending_archives);
-    println!("  Mounted archives: {}", report.mounted_archives);
-    println!("  Ready: {}", if report.is_ready() { "yes" } else { "no" });
-    println!();
-    println!("Platforms:");
+    ));
+    output.push_str(&format!(
+        "  Pending archives: {}\n",
+        report.pending_archives
+    ));
+    output.push_str(&format!(
+        "  Mounted archives: {}\n",
+        report.mounted_archives
+    ));
+    output.push_str(&format!(
+        "  Ready: {}\n",
+        if report.is_ready() { "yes" } else { "no" }
+    ));
+    output.push_str("\nPlatforms:\n");
     if report.platform_counts.is_empty() {
-        println!("  none");
+        output.push_str("  none\n");
     } else {
         for (platform, count) in &report.platform_counts {
-            println!("  {platform}: {count}");
+            output.push_str(&format!("  {platform}: {count}\n"));
         }
     }
-    println!();
-    println!("Unknown platform examples:");
+    output.push_str("\nUnknown platform examples:\n");
     if report.unknown_platform_examples.is_empty() {
-        println!("  none");
+        output.push_str("  none\n");
     } else {
         for path in &report.unknown_platform_examples {
-            println!("  {}", path.display());
+            output.push_str(&format!("  {}\n", path.display()));
         }
     }
+    output
 }
 
 fn print_duplicate_report(report: &DuplicateReport) {
     print!("{}", format_duplicate_report(report));
+}
+
+fn print_duplicate_report_json(report: &DuplicateReport) -> Result<(), serde_json::Error> {
+    println!("{}", format_duplicate_report_json(report)?);
+    Ok(())
+}
+
+fn format_duplicate_report_json(report: &DuplicateReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
 }
 
 fn format_duplicate_report(report: &DuplicateReport) -> String {
@@ -482,6 +533,15 @@ fn push_duplicate_entry(output: &mut String, index: usize, entry: &DuplicateEntr
 
 fn print_archive_info(info: &ArchiveInfo) {
     print!("{}", format_archive_info(info));
+}
+
+fn print_archive_info_json(info: &ArchiveInfo) -> Result<(), serde_json::Error> {
+    println!("{}", format_archive_info_json(info)?);
+    Ok(())
+}
+
+fn format_archive_info_json(info: &ArchiveInfo) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(info)
 }
 
 fn format_archive_info(info: &ArchiveInfo) -> String {
@@ -684,6 +744,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_doctor_report_preserves_human_output_shape() {
+        let report = DoctorReport {
+            config_path: std::path::PathBuf::from("/home/user/.config/archivefs/config.toml"),
+            checks: vec![archivefs_core::DoctorCheck {
+                name: "config".to_string(),
+                status: archivefs_core::DoctorStatus::Pass,
+                detail: "configuration loaded".to_string(),
+            }],
+            archives_found: 3,
+            archives_with_platform: 2,
+            archives_unknown_platform: 1,
+            unknown_platform_examples: vec![std::path::PathBuf::from("/roms/Unknown.zip")],
+            platform_counts: vec![("Xbox360".to_string(), 2)],
+            pending_archives: 2,
+            mounted_archives: 1,
+        };
+
+        let output = format_doctor_report(&report);
+
+        assert!(output.contains("ArchiveFS Doctor"));
+        assert!(output.contains("Config: /home/user/.config/archivefs/config.toml"));
+        assert!(output.contains("Checks:"));
+        assert!(output.contains("[PASS] config"));
+        assert!(output.contains("Summary:"));
+        assert!(output.contains("Archives found: 3"));
+        assert!(output.contains("Ready: yes"));
+        assert!(output.contains("Platforms:"));
+        assert!(output.contains("Xbox360: 2"));
+        assert!(output.contains("Unknown platform examples:"));
+        assert!(output.contains("/roms/Unknown.zip"));
+    }
+
+    #[test]
+    fn format_doctor_report_json_outputs_pretty_json_only() {
+        let report = DoctorReport {
+            config_path: std::path::PathBuf::from("/home/user/.config/archivefs/config.toml"),
+            checks: vec![archivefs_core::DoctorCheck {
+                name: "config".to_string(),
+                status: archivefs_core::DoctorStatus::Warn,
+                detail: "configuration has warnings".to_string(),
+            }],
+            archives_found: 3,
+            archives_with_platform: 2,
+            archives_unknown_platform: 1,
+            unknown_platform_examples: vec![std::path::PathBuf::from("/roms/Unknown.zip")],
+            platform_counts: vec![("Xbox360".to_string(), 2)],
+            pending_archives: 2,
+            mounted_archives: 1,
+        };
+
+        let output = format_doctor_report_json(&report).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("{\n"));
+        assert!(!output.contains("ArchiveFS Doctor"));
+        assert!(!output.contains("Summary:"));
+        assert_eq!(
+            json["config_path"],
+            "/home/user/.config/archivefs/config.toml"
+        );
+        assert_eq!(json["checks"][0]["name"], "config");
+        assert_eq!(json["checks"][0]["status"], "Warn");
+        assert_eq!(json["archives_found"], 3);
+        assert_eq!(json["archives_with_platform"], 2);
+        assert_eq!(json["archives_unknown_platform"], 1);
+        assert_eq!(json["unknown_platform_examples"][0], "/roms/Unknown.zip");
+        assert_eq!(json["platform_counts"][0][0], "Xbox360");
+        assert_eq!(json["platform_counts"][0][1], 2);
+        assert_eq!(json["pending_archives"], 2);
+        assert_eq!(json["mounted_archives"], 1);
+    }
+
+    #[test]
     fn format_duplicate_report_shows_friendly_empty_message() {
         let report = DuplicateReport {
             detector: "filename".to_string(),
@@ -697,6 +830,44 @@ mod tests {
         assert!(output.contains("Records checked: 2"));
         assert!(output.contains("Duplicate groups found: 0"));
         assert!(output.contains("No duplicate candidates found."));
+    }
+
+    #[test]
+    fn format_duplicate_report_json_outputs_pretty_json_only() {
+        let report = DuplicateReport {
+            detector: "filename".to_string(),
+            archives_checked: 2,
+            entries: vec![DuplicateEntry {
+                platform: "Xbox360".to_string(),
+                severity: archivefs_core::DuplicateSeverity::Warning,
+                reason: "same normalized archive name '007_legends' on platform 'Xbox360'"
+                    .to_string(),
+                archive_paths: vec![
+                    std::path::PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                    std::path::PathBuf::from("/roms/imports/007 Legends.7z"),
+                ],
+            }],
+        };
+
+        let output = format_duplicate_report_json(&report).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("{\n"));
+        assert!(!output.contains("ArchiveFS Duplicates"));
+        assert!(!output.contains("Summary:"));
+        assert_eq!(json["detector"], "filename");
+        assert_eq!(json["archives_checked"], 2);
+        assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(json["entries"][0]["platform"], "Xbox360");
+        assert_eq!(json["entries"][0]["severity"], "Warning");
+        assert_eq!(
+            json["entries"][0]["archive_paths"][0],
+            "/roms/xbox360/007 Legends.zip"
+        );
+        assert_eq!(
+            json["entries"][0]["archive_paths"][1],
+            "/roms/imports/007 Legends.7z"
+        );
     }
 
     #[test]
@@ -757,6 +928,41 @@ mod tests {
         assert!(output.contains("Mount state: Mounted"));
         assert!(output.contains("Metadata provider: FilenameMetadataProvider"));
         assert!(output.contains("Health provider: FilesystemHealthProvider"));
+    }
+
+    #[test]
+    fn format_archive_info_json_outputs_expected_fields_without_headings() {
+        let info = ArchiveInfo {
+            title: "Halo".to_string(),
+            platform: Some("Xbox".to_string()),
+            archive_path: std::path::PathBuf::from("/roms/xbox/Halo.zip"),
+            mount_path: std::path::PathBuf::from("/mnt/archivefs/Xbox/Halo"),
+            extension: "zip".to_string(),
+            size_bytes: Some(2048),
+            modified_time: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400)),
+            health: archivefs_core::ArchiveHealth::Pending,
+            mount_state: archivefs_core::MountState::Mounted,
+            metadata_provider: "FilenameMetadataProvider".to_string(),
+            health_provider: "FilesystemHealthProvider".to_string(),
+        };
+
+        let output = format_archive_info_json(&info).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("{\n"));
+        assert!(!output.contains("ArchiveFS Info"));
+        assert!(!output.contains("Details:"));
+        assert_eq!(json["title"], "Halo");
+        assert_eq!(json["platform"], "Xbox");
+        assert_eq!(json["archive_path"], "/roms/xbox/Halo.zip");
+        assert_eq!(json["mount_path"], "/mnt/archivefs/Xbox/Halo");
+        assert_eq!(json["extension"], "zip");
+        assert_eq!(json["size_bytes"], 2048);
+        assert_eq!(json["modified_time"], 86_400);
+        assert_eq!(json["health"], "Pending");
+        assert_eq!(json["mount_state"], "Mounted");
+        assert_eq!(json["metadata_provider"], "FilenameMetadataProvider");
+        assert_eq!(json["health_provider"], "FilesystemHealthProvider");
     }
 
     #[test]

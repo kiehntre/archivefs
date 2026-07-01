@@ -167,7 +167,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DoctorStatus {
     Pass,
     Warn,
@@ -184,7 +184,7 @@ impl fmt::Display for DoctorStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorCheck {
     pub name: String,
     pub status: DoctorStatus,
@@ -265,7 +265,7 @@ impl ConfigCheckReport {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub config_path: PathBuf,
     pub checks: Vec<DoctorCheck>,
@@ -1124,14 +1124,14 @@ pub trait DuplicateDetector {
     fn detect_duplicates(&self, records: &[ArchiveRecord]) -> Result<DuplicateReport>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DuplicateReport {
     pub detector: String,
     pub archives_checked: usize,
     pub entries: Vec<DuplicateEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DuplicateEntry {
     pub platform: String,
     pub severity: DuplicateSeverity,
@@ -1139,7 +1139,7 @@ pub struct DuplicateEntry {
     pub archive_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DuplicateSeverity {
     Warning,
     Low,
@@ -1679,6 +1679,32 @@ pub struct ArchiveInfo {
     pub mount_state: MountState,
     pub metadata_provider: String,
     pub health_provider: String,
+}
+
+impl Serialize for ArchiveInfo {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let modified_time = self
+            .modified_time
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+
+        let mut state = serializer.serialize_struct("ArchiveInfo", 11)?;
+        state.serialize_field("title", &self.title)?;
+        state.serialize_field("platform", &self.platform)?;
+        state.serialize_field("archive_path", &self.archive_path)?;
+        state.serialize_field("mount_path", &self.mount_path)?;
+        state.serialize_field("extension", &self.extension)?;
+        state.serialize_field("size_bytes", &self.size_bytes)?;
+        state.serialize_field("modified_time", &modified_time)?;
+        state.serialize_field("health", &self.health.to_string())?;
+        state.serialize_field("mount_state", &self.mount_state.to_string())?;
+        state.serialize_field("metadata_provider", &self.metadata_provider)?;
+        state.serialize_field("health_provider", &self.health_provider)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
