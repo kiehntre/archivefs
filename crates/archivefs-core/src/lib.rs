@@ -1118,6 +1118,95 @@ impl ArchiveRecord {
     }
 }
 
+pub trait DuplicateDetector {
+    fn detect_duplicates(&self, records: &[ArchiveRecord]) -> Result<DuplicateReport>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateReport {
+    pub detector: String,
+    pub archives_checked: usize,
+    pub entries: Vec<DuplicateEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateEntry {
+    pub severity: DuplicateSeverity,
+    pub reason: String,
+    pub archive_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateSeverity {
+    Warning,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilenameDuplicateDetector;
+
+impl DuplicateDetector for FilenameDuplicateDetector {
+    fn detect_duplicates(&self, records: &[ArchiveRecord]) -> Result<DuplicateReport> {
+        let mut groups = BTreeMap::<(String, String), Vec<PathBuf>>::new();
+
+        for record in records {
+            let platform = duplicate_record_platform(record);
+            let name = safe_mount_name(&record.mount_plan.archive.path).to_lowercase();
+            groups
+                .entry((platform, name))
+                .or_default()
+                .push(record.mount_plan.archive.path.clone());
+        }
+
+        let entries = groups
+            .into_iter()
+            .filter_map(|((platform, name), archive_paths)| {
+                if archive_paths.len() < 2 {
+                    return None;
+                }
+
+                Some(DuplicateEntry {
+                    severity: DuplicateSeverity::Warning,
+                    reason: format!(
+                        "same normalized archive name '{name}' on platform '{platform}'"
+                    ),
+                    archive_paths,
+                })
+            })
+            .collect();
+
+        Ok(DuplicateReport {
+            detector: "filename".to_string(),
+            archives_checked: records.len(),
+            entries,
+        })
+    }
+}
+
+fn duplicate_record_platform(record: &ArchiveRecord) -> String {
+    record
+        .metadata
+        .platform
+        .clone()
+        .or_else(|| record.identity.platform.clone())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmptyDuplicateDetector;
+
+impl DuplicateDetector for EmptyDuplicateDetector {
+    fn detect_duplicates(&self, records: &[ArchiveRecord]) -> Result<DuplicateReport> {
+        Ok(DuplicateReport {
+            detector: "empty".to_string(),
+            archives_checked: records.len(),
+            entries: Vec::new(),
+        })
+    }
+}
+
 pub trait MountBackend {
     fn mount(&self, plan: &MountPlan) -> Result<()>;
     fn unmount(&self, mount_path: &Path) -> Result<()>;
@@ -2937,6 +3026,207 @@ mod tests {
         assert!(json.contains("\"mount_path\": \"/mnt/archivefs/Xbox360/007_Legends\""));
         assert!(json.contains("\"health\": \"Pending\""));
         assert!(json.contains("\"mount_state\": \"Pending\""));
+    }
+
+    #[test]
+    fn filename_duplicate_detector_returns_empty_report_for_empty_input() {
+        let detector = FilenameDuplicateDetector;
+
+        let report = detector.detect_duplicates(&[]).unwrap();
+
+        assert_eq!(report.detector, "filename");
+        assert_eq!(report.archives_checked, 0);
+        assert!(report.entries.is_empty());
+    }
+
+    #[test]
+    fn filename_duplicate_detector_matches_same_platform_and_name_ignoring_extension() {
+        let detector = FilenameDuplicateDetector;
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox360/007 Legends.zip",
+                Some("Xbox360"),
+                MountState::Pending,
+                1024,
+            ),
+            archive_record_with_size(
+                "/roms/imports/007 Legends.7z",
+                Some("Xbox360"),
+                MountState::Pending,
+                2048,
+            ),
+        ];
+
+        let report = detector.detect_duplicates(&records).unwrap();
+
+        assert_eq!(report.detector, "filename");
+        assert_eq!(report.archives_checked, 2);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].severity, DuplicateSeverity::Warning);
+        assert_eq!(
+            report.entries[0].archive_paths,
+            vec![
+                PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                PathBuf::from("/roms/imports/007 Legends.7z"),
+            ]
+        );
+        assert!(report.entries[0].reason.contains("007_legends"));
+        assert!(report.entries[0].reason.contains("Xbox360"));
+    }
+
+    #[test]
+    fn filename_duplicate_detector_normalizes_names_with_safe_mount_logic() {
+        let detector = FilenameDuplicateDetector;
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox/Halo 3.zip",
+                Some("Xbox"),
+                MountState::Pending,
+                1024,
+            ),
+            archive_record_with_size(
+                "/roms/imports/Halo_3.rar",
+                Some("Xbox"),
+                MountState::Pending,
+                2048,
+            ),
+        ];
+
+        let report = detector.detect_duplicates(&records).unwrap();
+
+        assert_eq!(report.entries.len(), 1);
+        assert!(report.entries[0].reason.contains("halo_3"));
+    }
+
+    #[test]
+    fn filename_duplicate_detector_keeps_platforms_separate() {
+        let detector = FilenameDuplicateDetector;
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox/Halo.zip",
+                Some("Xbox"),
+                MountState::Pending,
+                1024,
+            ),
+            archive_record_with_size(
+                "/roms/xbox360/Halo.7z",
+                Some("Xbox360"),
+                MountState::Pending,
+                2048,
+            ),
+        ];
+
+        let report = detector.detect_duplicates(&records).unwrap();
+
+        assert!(report.entries.is_empty());
+    }
+
+    #[test]
+    fn filename_duplicate_detector_ignores_different_names_on_same_platform() {
+        let detector = FilenameDuplicateDetector;
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox/Halo.zip",
+                Some("Xbox"),
+                MountState::Pending,
+                1024,
+            ),
+            archive_record_with_size(
+                "/roms/xbox/Fable.zip",
+                Some("Xbox"),
+                MountState::Pending,
+                2048,
+            ),
+        ];
+
+        let report = detector.detect_duplicates(&records).unwrap();
+
+        assert!(report.entries.is_empty());
+    }
+
+    #[test]
+    fn filename_duplicate_detector_uses_metadata_platform_before_identity_platform() {
+        let detector = FilenameDuplicateDetector;
+        let mut xbox_record =
+            archive_record_with_size("/roms/a/Game.zip", Some("Xbox"), MountState::Pending, 1024);
+        xbox_record.identity.platform = Some("PC".to_string());
+        xbox_record.metadata.platform = Some("Xbox".to_string());
+        let mut pc_record =
+            archive_record_with_size("/roms/b/Game.7z", Some("PC"), MountState::Pending, 2048);
+        pc_record.identity.platform = Some("Xbox".to_string());
+        pc_record.metadata.platform = Some("PC".to_string());
+
+        let report = detector
+            .detect_duplicates(&[xbox_record, pc_record])
+            .unwrap();
+
+        assert!(report.entries.is_empty());
+    }
+
+    #[test]
+    fn filename_duplicate_detector_groups_more_than_two_records() {
+        let detector = FilenameDuplicateDetector;
+        let records = vec![
+            archive_record_with_size(
+                "/roms/a/Game.zip",
+                Some("Unknown"),
+                MountState::Pending,
+                1024,
+            ),
+            archive_record_with_size(
+                "/roms/b/Game.7z",
+                Some("Unknown"),
+                MountState::Pending,
+                2048,
+            ),
+            archive_record_with_size(
+                "/roms/c/Game.rar",
+                Some("Unknown"),
+                MountState::Pending,
+                4096,
+            ),
+        ];
+
+        let report = detector.detect_duplicates(&records).unwrap();
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].archive_paths.len(), 3);
+    }
+
+    #[test]
+    fn empty_duplicate_detector_returns_empty_report_for_empty_input() {
+        let detector = EmptyDuplicateDetector;
+
+        let report = detector.detect_duplicates(&[]).unwrap();
+
+        assert_eq!(report.detector, "empty");
+        assert_eq!(report.archives_checked, 0);
+        assert!(report.entries.is_empty());
+    }
+
+    #[test]
+    fn empty_duplicate_detector_counts_inputs_without_entries() {
+        let detector = EmptyDuplicateDetector;
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox360/007 Legends.zip",
+                Some("Xbox360"),
+                MountState::Pending,
+                1024,
+            ),
+            archive_record_with_size(
+                "/roms/xbox360/007 Racing.zip",
+                Some("Xbox360"),
+                MountState::Pending,
+                2048,
+            ),
+        ];
+
+        let report = detector.detect_duplicates(&records).unwrap();
+
+        assert_eq!(report.detector, "empty");
+        assert_eq!(report.archives_checked, 2);
+        assert_eq!(report.entries, Vec::<DuplicateEntry>::new());
     }
 
     #[test]
