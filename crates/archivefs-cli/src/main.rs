@@ -8,7 +8,7 @@ use archivefs_core::{
     clean_mount_root, cleanup_selected_mount_dir, current_statuses, default_index_path,
     find_archive_index_entries, mount_archives, mount_one_archive, read_default_archive_index,
     run_doctor_default, scan_archives, summarize_archive_index, unmount_archives,
-    unmount_one_archive,
+    unmount_one_archive, watch_archive_index,
 };
 
 fn main() -> ExitCode {
@@ -106,6 +106,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "clean" => {
             let config = Config::load_default()?;
             print_cleaned_dirs(&clean_mount_root(&config)?);
+        }
+        "watch" => {
+            let config = Config::load_default()?;
+            watch_archive_index(
+                &config,
+                || println!("Watching configured source folders for archive changes."),
+                |index| println!("Rebuilt index ({} archives).", index.archives.len()),
+            )?;
         }
         "help" | "-h" | "--help" => print_help(),
         unknown => {
@@ -281,6 +289,7 @@ fn print_help() {
     println!("  index-show show a summary of the JSON archive index");
     println!("  index-find find entries in the JSON archive index");
     println!("  clean     remove empty directories under mount_root");
+    println!("  watch     watch source folders and refresh the JSON index");
     println!();
     println!("Config: ~/.config/archivefs/config.toml");
     println!("Example:");

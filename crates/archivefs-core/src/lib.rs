@@ -6,6 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum ArchiveFsError {
@@ -19,6 +21,7 @@ pub enum ArchiveFsError {
         status: Option<i32>,
         stderr: String,
     },
+    Watcher(String),
     NoMountMatch {
         input: String,
     },
@@ -47,6 +50,7 @@ impl fmt::Display for ArchiveFsError {
                 }
                 Ok(())
             }
+            Self::Watcher(message) => write!(f, "watcher error: {message}"),
             Self::NoMountMatch { input } => {
                 write!(f, "no archive matched '{input}'")
             }
@@ -1172,6 +1176,169 @@ pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
     let index = build_archive_index(config)?;
     write_archive_index(&index, default_index_path()?)?;
     Ok(index)
+}
+
+pub const WATCH_DEBOUNCE_DURATION: Duration = Duration::from_secs(5);
+
+pub fn watch_archive_index(
+    config: &Config,
+    mut on_started: impl FnMut(),
+    mut on_rebuilt: impl FnMut(&ArchiveIndex),
+) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+
+    let (sender, receiver) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })
+    .map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
+
+    for source in &config.source_folders {
+        watcher
+            .watch(source, RecursiveMode::Recursive)
+            .map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
+    }
+
+    on_started();
+
+    let mut debouncer = WatchDebouncer::new(WATCH_DEBOUNCE_DURATION);
+    loop {
+        match debouncer.recv_timeout() {
+            Some(timeout) => match receiver.recv_timeout(timeout) {
+                Ok(event) => handle_watch_event(event, &mut debouncer)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if debouncer.should_fire(Instant::now()) {
+                        debouncer.mark_fired();
+                        let index = build_and_write_archive_index(config)?;
+                        on_rebuilt(&index);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ArchiveFsError::Watcher(
+                        "filesystem watcher channel disconnected".to_string(),
+                    ));
+                }
+            },
+            None => match receiver.recv() {
+                Ok(event) => handle_watch_event(event, &mut debouncer)?,
+                Err(_) => {
+                    return Err(ArchiveFsError::Watcher(
+                        "filesystem watcher channel disconnected".to_string(),
+                    ));
+                }
+            },
+        }
+    }
+}
+
+fn handle_watch_event(
+    event: std::result::Result<notify::Event, notify::Error>,
+    debouncer: &mut WatchDebouncer,
+) -> Result<()> {
+    let event = event.map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
+    if watch_event_should_rebuild(&event) {
+        debouncer.record_change(Instant::now());
+    }
+    Ok(())
+}
+
+fn watch_event_should_rebuild(event: &notify::Event) -> bool {
+    watch_event_kind_can_change_archive(&event.kind)
+        && event
+            .paths
+            .iter()
+            .any(|path| watch_path_is_supported_archive(path))
+}
+
+fn watch_event_kind_can_change_archive(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, RemoveKind};
+
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Other)
+            | EventKind::Modify(_)
+            | EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Other)
+            | EventKind::Access(AccessKind::Close(AccessMode::Write | AccessMode::Any))
+    )
+}
+
+fn watch_path_is_supported_archive(path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+
+    if is_temporary_or_incomplete_path(path) {
+        return false;
+    }
+
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "zip" | "rar" | "7z" | "iso"
+    )
+}
+
+pub fn is_temporary_or_incomplete_path(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = filename.to_ascii_lowercase();
+
+    if lower.ends_with('~') {
+        return true;
+    }
+
+    let temporary_suffixes = [
+        ".part",
+        ".partial",
+        ".crdownload",
+        ".download",
+        ".tmp",
+        ".temp",
+        ".!qb",
+        ".aria2",
+    ];
+    temporary_suffixes
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+#[derive(Debug, Clone)]
+struct WatchDebouncer {
+    debounce: Duration,
+    last_change: Option<Instant>,
+}
+
+impl WatchDebouncer {
+    fn new(debounce: Duration) -> Self {
+        Self {
+            debounce,
+            last_change: None,
+        }
+    }
+
+    fn record_change(&mut self, now: Instant) {
+        self.last_change = Some(now);
+    }
+
+    fn should_fire(&self, now: Instant) -> bool {
+        self.last_change
+            .is_some_and(|last_change| now.duration_since(last_change) >= self.debounce)
+    }
+
+    fn mark_fired(&mut self) {
+        self.last_change = None;
+    }
+
+    fn recv_timeout(&self) -> Option<Duration> {
+        let last_change = self.last_change?;
+        let elapsed = Instant::now().duration_since(last_change);
+        Some(self.debounce.saturating_sub(elapsed))
+    }
 }
 
 pub fn read_archive_index(path: impl AsRef<Path>) -> Result<ArchiveIndex> {
@@ -2484,6 +2651,85 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "archive scan" && check.status == DoctorStatus::Pass)
         );
+    }
+
+    #[test]
+    fn watcher_ignores_obvious_temporary_and_incomplete_paths() {
+        for path in [
+            "Game.zip.part",
+            "Game.zip.partial",
+            "Game.zip.crdownload",
+            "Game.zip.download",
+            "Game.zip.tmp",
+            "Game.zip.temp",
+            "Game.zip.!qB",
+            "Game.zip.aria2",
+            "Game.zip~",
+        ] {
+            assert!(is_temporary_or_incomplete_path(path), "{path}");
+        }
+
+        assert!(!is_temporary_or_incomplete_path("Game.zip"));
+        assert!(!is_temporary_or_incomplete_path("Game.7z"));
+        assert!(!is_temporary_or_incomplete_path("Game.rar"));
+    }
+
+    #[test]
+    fn watcher_event_filter_accepts_only_archive_related_mutations() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
+
+        let archive_create = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(PathBuf::from("/roms/Game.zip"));
+        assert!(watch_event_should_rebuild(&archive_create));
+
+        let archive_iso_modify = notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("/roms/Game.iso"));
+        assert!(watch_event_should_rebuild(&archive_iso_modify));
+
+        let close_write =
+            notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                .add_path(PathBuf::from("/roms/Game.7z"));
+        assert!(watch_event_should_rebuild(&close_write));
+
+        let unrelated_file = notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("/roms/Game.nfo"));
+        assert!(!watch_event_should_rebuild(&unrelated_file));
+
+        let temp_archive = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(PathBuf::from("/roms/Game.zip.part"));
+        assert!(!watch_event_should_rebuild(&temp_archive));
+
+        let directory_only = notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("/roms/New Folder"));
+        assert!(!watch_event_should_rebuild(&directory_only));
+
+        let read_access = notify::Event::new(EventKind::Access(AccessKind::Read))
+            .add_path(PathBuf::from("/roms/Game.zip"));
+        assert!(!watch_event_should_rebuild(&read_access));
+
+        let archive_named_folder = notify::Event::new(EventKind::Create(CreateKind::Folder))
+            .add_path(PathBuf::from("/roms/Folder.zip"));
+        assert!(!watch_event_should_rebuild(&archive_named_folder));
+    }
+
+    #[test]
+    fn watcher_debouncer_fires_after_quiet_period() {
+        let debounce = Duration::from_secs(5);
+        let start = Instant::now();
+        let mut debouncer = WatchDebouncer::new(debounce);
+
+        assert!(!debouncer.should_fire(start + debounce));
+
+        debouncer.record_change(start);
+        assert!(!debouncer.should_fire(start + Duration::from_secs(4)));
+        assert!(debouncer.should_fire(start + debounce));
+
+        debouncer.record_change(start + Duration::from_secs(3));
+        assert!(!debouncer.should_fire(start + Duration::from_secs(7)));
+        assert!(debouncer.should_fire(start + Duration::from_secs(8)));
+
+        debouncer.mark_fired();
+        assert!(!debouncer.should_fire(start + Duration::from_secs(20)));
     }
 
     fn test_root(name: &str) -> PathBuf {
