@@ -7,12 +7,14 @@ name = "archivefs-cli"
 version = "0.1.0"
 dependencies = [
  "archivefs-core",
+ "log",
 ]
 
 [[package]]
 name = "archivefs-core"
 version = "0.1.0"
 dependencies = [
+ "log",
  "notify",
 ]
 

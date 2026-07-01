@@ -9,6 +9,8 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use log::{debug, info};
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Io {
@@ -84,16 +86,26 @@ pub struct Config {
 
 impl Config {
     pub fn load_default() -> Result<Self> {
-        Self::load_from(default_config_path()?)
+        let path = default_config_path()?;
+        info!("loading config from {}", path.display());
+        Self::load_from(path)
     }
 
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        debug!("reading config file {}", path.display());
         let contents = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        parse_config(&contents)
+        let config = parse_config(&contents)?;
+        info!(
+            "loaded config: {} source folder(s), mount_root={}, ratarmount_bin={}",
+            config.source_folders.len(),
+            config.mount_root.display(),
+            config.ratarmount_bin
+        );
+        Ok(config)
     }
 }
 
@@ -1098,12 +1110,18 @@ impl<'a> ArchiveScanner<'a> {
     }
 
     pub fn scan_archives(&self) -> Result<Vec<Archive>> {
+        info!(
+            "starting archive scan across {} source folder(s)",
+            self.config.source_folders.len()
+        );
         let mut archives = Vec::new();
         for source in &self.config.source_folders {
+            debug!("scanning source folder {}", source.display());
             self.scan_source(source, source, &mut archives)?;
         }
         archives.sort_by(|left, right| left.path.cmp(&right.path));
         archives.dedup_by(|left, right| left.path == right.path);
+        info!("archive scan complete: {} archive(s) found", archives.len());
         Ok(archives)
     }
 
@@ -1161,6 +1179,7 @@ impl<'a> ArchiveScanner<'a> {
                 self.scan_source(source_root, &path, archives)?;
             } else if file_type.is_file() {
                 if let Some(archive) = Archive::from_path_in_root(&path, source_root) {
+                    debug!("discovered archive {}", archive.path.display());
                     archives.push(archive);
                 }
             }
@@ -1446,6 +1465,24 @@ pub struct ArchiveIndexSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveSizeSummary {
+    pub archive_path: PathBuf,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveStats {
+    pub total_archives: usize,
+    pub mounted_count: usize,
+    pub pending_count: usize,
+    pub platform_counts: Vec<(String, usize)>,
+    pub extension_counts: Vec<(String, usize)>,
+    pub largest_archive: Option<ArchiveSizeSummary>,
+    pub smallest_archive: Option<ArchiveSizeSummary>,
+    pub total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveIndexFreshness {
     pub missing_archive_paths: Vec<PathBuf>,
     pub stale_archive_paths: Vec<PathBuf>,
@@ -1469,6 +1506,7 @@ pub fn default_index_path() -> Result<PathBuf> {
 }
 
 pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
+    debug!("building archive index records");
     Ok(ArchiveIndex {
         archives: current_archive_records(config)?
             .into_iter()
@@ -1492,12 +1530,21 @@ pub fn write_archive_index(index: &ArchiveIndex, path: impl AsRef<Path>) -> Resu
 }
 
 pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
+    let index_path = default_index_path()?;
+    info!("starting index rebuild");
+    debug!("index path {}", index_path.display());
     let index = build_archive_index(config)?;
-    write_archive_index(&index, default_index_path()?)?;
+    write_archive_index(&index, &index_path)?;
+    info!(
+        "index rebuild complete: {} archive(s) written to {}",
+        index.archives.len(),
+        index_path.display()
+    );
     Ok(index)
 }
 
 pub const WATCH_DEBOUNCE_DURATION: Duration = Duration::from_secs(5);
+const WATCH_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchRebuildSummary {
@@ -1512,6 +1559,10 @@ pub fn watch_archive_index(
 ) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
+    info!(
+        "starting watcher for {} source folder(s)",
+        config.source_folders.len()
+    );
     let (sender, receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
@@ -1519,6 +1570,7 @@ pub fn watch_archive_index(
     .map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
 
     for source in &config.source_folders {
+        debug!("watching source folder {}", source.display());
         watcher
             .watch(source, RecursiveMode::Recursive)
             .map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
@@ -1527,15 +1579,22 @@ pub fn watch_archive_index(
     on_started();
 
     let mut debouncer = WatchDebouncer::new(WATCH_DEBOUNCE_DURATION);
+    let mut stats = WatchStats::new(WATCH_STATS_INTERVAL);
     loop {
         match debouncer.recv_timeout() {
             Some(timeout) => match receiver.recv_timeout(timeout) {
-                Ok(event) => handle_watch_event(event, &mut debouncer)?,
+                Ok(event) => {
+                    handle_watch_event(event, &mut debouncer, &mut stats)?;
+                    stats.log_if_due(Instant::now(), &debouncer);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if debouncer.should_fire(Instant::now()) {
+                    let now = Instant::now();
+                    if debouncer.should_fire(now) {
                         let summary = debouncer.take_summary();
                         let index = build_and_write_archive_index(config)?;
                         on_rebuilt(&index, &summary);
+                        stats.record_rebuild();
+                        stats.log_if_due(now, &debouncer);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1544,9 +1603,15 @@ pub fn watch_archive_index(
                     ));
                 }
             },
-            None => match receiver.recv() {
-                Ok(event) => handle_watch_event(event, &mut debouncer)?,
-                Err(_) => {
+            None => match receiver.recv_timeout(WATCH_STATS_INTERVAL) {
+                Ok(event) => {
+                    handle_watch_event(event, &mut debouncer, &mut stats)?;
+                    stats.log_if_due(Instant::now(), &debouncer);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    stats.log_if_due(Instant::now(), &debouncer);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(ArchiveFsError::Watcher(
                         "filesystem watcher channel disconnected".to_string(),
                     ));
@@ -1559,11 +1624,24 @@ pub fn watch_archive_index(
 fn handle_watch_event(
     event: std::result::Result<notify::Event, notify::Error>,
     debouncer: &mut WatchDebouncer,
+    stats: &mut WatchStats,
 ) -> Result<()> {
     let event = event.map_err(|error| ArchiveFsError::Watcher(error.to_string()))?;
+    stats.record_received();
     let archive_paths = watch_event_archive_paths(&event);
     if !archive_paths.is_empty() {
+        info!(
+            "watcher accepted archive event: {:?} for {} path(s)",
+            event.kind,
+            archive_paths.len()
+        );
+        for path in &archive_paths {
+            debug!("watcher accepted path {}", path.display());
+        }
         debouncer.record_change(Instant::now(), archive_paths);
+        stats.record_accepted();
+    } else {
+        stats.record_ignored();
     }
     Ok(())
 }
@@ -1644,6 +1722,61 @@ pub fn is_temporary_or_incomplete_path(path: impl AsRef<Path>) -> bool {
 }
 
 #[derive(Debug, Clone)]
+struct WatchStats {
+    interval: Duration,
+    last_logged: Instant,
+    events_received: usize,
+    ignored: usize,
+    accepted: usize,
+    rebuilds: usize,
+}
+
+impl WatchStats {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_logged: Instant::now(),
+            events_received: 0,
+            ignored: 0,
+            accepted: 0,
+            rebuilds: 0,
+        }
+    }
+
+    fn record_received(&mut self) {
+        self.events_received += 1;
+    }
+
+    fn record_ignored(&mut self) {
+        self.ignored += 1;
+    }
+
+    fn record_accepted(&mut self) {
+        self.accepted += 1;
+    }
+
+    fn record_rebuild(&mut self) {
+        self.rebuilds += 1;
+    }
+
+    fn log_if_due(&mut self, now: Instant, debouncer: &WatchDebouncer) {
+        if now.duration_since(self.last_logged) < self.interval {
+            return;
+        }
+
+        debug!(
+            "Watcher statistics\n------------------\nEvents received: {}\nIgnored: {}\nAccepted: {}\nRebuilds: {}\nCurrent debounce queue: {}",
+            self.events_received,
+            self.ignored,
+            self.accepted,
+            self.rebuilds,
+            debouncer.queue_len()
+        );
+        self.last_logged = now;
+    }
+}
+
+#[derive(Debug, Clone)]
 struct WatchDebouncer {
     debounce: Duration,
     last_change: Option<Instant>,
@@ -1672,6 +1805,10 @@ impl WatchDebouncer {
                 self.changed_paths.push(path);
             }
         }
+    }
+
+    fn queue_len(&self) -> usize {
+        self.archive_event_count
     }
 
     fn should_fire(&self, now: Instant) -> bool {
@@ -1747,6 +1884,82 @@ pub fn find_archive_index_entries(index: &ArchiveIndex, query: &str) -> Vec<Arch
 pub fn find_default_archive_index_entries(query: &str) -> Result<Vec<ArchiveIndexEntry>> {
     let index = read_default_archive_index()?;
     Ok(find_archive_index_entries(&index, query))
+}
+
+pub fn summarize_archive_records(records: &[ArchiveRecord]) -> ArchiveStats {
+    let mut platform_counts = BTreeMap::<String, usize>::new();
+    let mut extension_counts = BTreeMap::<String, usize>::new();
+    let mut mounted_count = 0;
+    let mut pending_count = 0;
+    let mut largest_archive = None::<ArchiveSizeSummary>;
+    let mut smallest_archive = None::<ArchiveSizeSummary>;
+    let mut total_size_bytes = 0;
+
+    for record in records {
+        *(platform_counts
+            .entry(
+                record
+                    .metadata
+                    .platform
+                    .clone()
+                    .or_else(|| record.identity.platform.clone())
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+            .or_default()) += 1;
+
+        let extension = record
+            .mount_plan
+            .archive
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
+        *extension_counts.entry(extension).or_default() += 1;
+
+        match record.mount_state {
+            MountState::Mounted => mounted_count += 1,
+            MountState::Pending => pending_count += 1,
+            MountState::MountPathExists => {}
+        }
+
+        if let Some(size_bytes) = record.identity.size_bytes {
+            total_size_bytes += size_bytes;
+            let size_summary = ArchiveSizeSummary {
+                archive_path: record.mount_plan.archive.path.clone(),
+                size_bytes,
+            };
+            if largest_archive
+                .as_ref()
+                .is_none_or(|largest| size_bytes > largest.size_bytes)
+            {
+                largest_archive = Some(size_summary.clone());
+            }
+            if smallest_archive
+                .as_ref()
+                .is_none_or(|smallest| size_bytes < smallest.size_bytes)
+            {
+                smallest_archive = Some(size_summary);
+            }
+        }
+    }
+
+    ArchiveStats {
+        total_archives: records.len(),
+        mounted_count,
+        pending_count,
+        platform_counts: platform_counts.into_iter().collect(),
+        extension_counts: extension_counts.into_iter().collect(),
+        largest_archive,
+        smallest_archive,
+        total_size_bytes,
+    }
+}
+
+pub fn current_archive_stats(config: &Config) -> Result<ArchiveStats> {
+    let scanner = ArchiveScanner::new(config);
+    let records = scanner.archive_records()?;
+    Ok(summarize_archive_records(&records))
 }
 
 pub fn summarize_archive_index(index: &ArchiveIndex) -> ArchiveIndexSummary {
@@ -2028,9 +2241,15 @@ pub fn mount_one_archive_with_backend(
     input: &str,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
+    info!("mount-one requested for {input}");
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
     let plan = select_mount_plan(&plans, input)?;
+    debug!(
+        "mount-one selected archive={} mount={}",
+        plan.archive.path.display(),
+        plan.mount_path.display()
+    );
 
     fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
         path: config.mount_root.clone(),
@@ -2038,11 +2257,19 @@ pub fn mount_one_archive_with_backend(
     })?;
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     if !mounted_paths.contains(&plan.mount_path) {
+        info!("mounting {}", plan.archive.path.display());
         fs::create_dir_all(&plan.mount_path).map_err(|source| ArchiveFsError::Io {
             path: plan.mount_path.clone(),
             source,
         })?;
         backend.mount(&plan)?;
+        info!(
+            "mounted {} at {}",
+            plan.archive.path.display(),
+            plan.mount_path.display()
+        );
+    } else {
+        info!("{} is already mounted", plan.mount_path.display());
     }
 
     Ok(plan)
@@ -2081,9 +2308,15 @@ pub fn unmount_one_archive_with_backend(
     input: &str,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
+    info!("unmount-one requested for {input}");
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
     let plan = select_mount_plan(&plans, input)?;
+    debug!(
+        "unmount-one selected archive={} mount={}",
+        plan.archive.path.display(),
+        plan.mount_path.display()
+    );
 
     if !path_is_under(&plan.mount_path, &config.mount_root) {
         return Err(ArchiveFsError::Config(format!(
@@ -2093,7 +2326,9 @@ pub fn unmount_one_archive_with_backend(
         )));
     }
 
+    info!("unmounting {}", plan.mount_path.display());
     backend.unmount(&plan.mount_path)?;
+    info!("unmounted {}", plan.mount_path.display());
     Ok(plan)
 }
 
@@ -2583,6 +2818,63 @@ mod tests {
         assert!(json.contains("\"mount_path\": \"/mnt/archivefs/Xbox360/007_Legends\""));
         assert!(json.contains("\"health\": \"Pending\""));
         assert!(json.contains("\"mount_state\": \"Pending\""));
+    }
+
+    #[test]
+    fn archive_stats_summarizes_records_counts_and_sizes() {
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox360/Big Game.ZIP",
+                Some("Xbox360"),
+                MountState::Mounted,
+                2048,
+            ),
+            archive_record_with_size(
+                "/roms/xbox360/Small Game.7z",
+                Some("Xbox360"),
+                MountState::Pending,
+                512,
+            ),
+            archive_record_with_size(
+                "/roms/misc/Mystery.rar",
+                None,
+                MountState::MountPathExists,
+                1024,
+            ),
+        ];
+
+        let stats = summarize_archive_records(&records);
+
+        assert_eq!(stats.total_archives, 3);
+        assert_eq!(stats.mounted_count, 1);
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(
+            stats.platform_counts,
+            vec![("Unknown".to_string(), 1), ("Xbox360".to_string(), 2)]
+        );
+        assert_eq!(
+            stats.extension_counts,
+            vec![
+                ("7z".to_string(), 1),
+                ("rar".to_string(), 1),
+                ("zip".to_string(), 1),
+            ]
+        );
+        assert_eq!(stats.total_size_bytes, 3584);
+        assert_eq!(
+            stats.largest_archive,
+            Some(ArchiveSizeSummary {
+                archive_path: PathBuf::from("/roms/xbox360/Big Game.ZIP"),
+                size_bytes: 2048,
+            })
+        );
+        assert_eq!(
+            stats.smallest_archive,
+            Some(ArchiveSizeSummary {
+                archive_path: PathBuf::from("/roms/xbox360/Small Game.7z"),
+                size_bytes: 512,
+            })
+        );
     }
 
     #[test]
@@ -3242,6 +3534,24 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn archive_record_with_size(
+        path: &str,
+        platform: Option<&str>,
+        mount_state: MountState,
+        size_bytes: u64,
+    ) -> ArchiveRecord {
+        let mut archive = archive_with_platform(path, platform);
+        archive.identity.size_bytes = Some(size_bytes);
+        let mut metadata = ArchiveMetadata::empty();
+        metadata.platform = platform.map(str::to_string);
+        ArchiveRecord::new(
+            MountPlan::new(archive, PathBuf::from("/mnt/archivefs/Test")),
+            mount_state,
+            metadata,
+            ArchiveHealth::Pending,
+        )
     }
 
     fn archive_with_platform(path: &str, platform: Option<&str>) -> Archive {
