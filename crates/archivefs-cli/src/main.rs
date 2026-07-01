@@ -216,10 +216,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_config_check_report(report: &ConfigCheckReport) {
-    println!("ArchiveFS config-check");
+    println!("ArchiveFS Config Check");
     println!("Config: {}", report.config_path.display());
     println!();
-    println!("Checklist:");
+    println!("Checks:");
     for check in &report.checks {
         println!(
             "  [{:<5}] {:<28} {}",
@@ -258,15 +258,17 @@ fn print_config_check_report(report: &ConfigCheckReport) {
     }
 
     println!();
-    if report.is_ok() {
-        println!("Configuration OK");
-    } else {
-        println!(
-            "Configuration has {} error(s), {} warning(s)",
-            report.error_count(),
-            report.warning_count()
-        );
-    }
+    println!("Summary:");
+    println!("  Errors: {}", report.error_count());
+    println!("  Warnings: {}", report.warning_count());
+    println!(
+        "  Status: {}",
+        if report.is_ok() {
+            "OK"
+        } else {
+            "Needs attention"
+        }
+    );
 }
 
 fn print_watch_rebuild(index: &ArchiveIndex, summary: &WatchRebuildSummary) {
@@ -335,26 +337,32 @@ fn print_index_find_results(query: &str, entries: &[ArchiveIndexEntry]) {
         return;
     }
 
-    println!("Index matches for '{query}':");
+    println!("ArchiveFS Index Find");
+    println!("Query: {query}");
+    println!();
+    println!("Matches:");
     for entry in entries {
         println!(
             "  Platform: {}",
             entry.platform.as_deref().unwrap_or("Unknown")
         );
-        println!("  Display:  {}", entry.display_name);
-        println!("  Archive:  {}", entry.archive_path.display());
-        println!("  Mount:    {}", entry.mount_path.display());
-        println!("  Health:   {}", entry.health);
-        println!("  State:    {}", entry.mount_state);
+        println!("  Display: {}", entry.display_name);
+        println!("  Archive: {}", entry.archive_path.display());
+        println!("  Mount: {}", entry.mount_path.display());
+        println!("  Health: {}", entry.health);
+        println!("  State: {}", entry.mount_state);
         println!();
     }
 }
 
 fn print_index_summary(summary: &ArchiveIndexSummary) {
-    println!("ArchiveFS index");
-    println!("Archives: {}", summary.archives_count);
-    println!("Mounted: {}", summary.mounted_count);
-    println!("Pending: {}", summary.pending_count);
+    println!("ArchiveFS Index");
+    println!();
+    println!("Summary:");
+    println!("  Total archives: {}", summary.archives_count);
+    println!("  Mounted: {}", summary.mounted_count);
+    println!("  Pending: {}", summary.pending_count);
+    println!();
     println!("Platforms:");
     if summary.platform_counts.is_empty() {
         println!("  none");
@@ -378,7 +386,7 @@ fn print_unmount_one(plan: &MountPlan) {
 }
 
 fn print_doctor_report(report: &DoctorReport) {
-    println!("ArchiveFS doctor");
+    println!("ArchiveFS Doctor");
     println!("Config: {}", report.config_path.display());
     println!();
     println!("Checks:");
@@ -401,10 +409,11 @@ fn print_doctor_report(report: &DoctorReport) {
     );
     println!("  Pending archives: {}", report.pending_archives);
     println!("  Mounted archives: {}", report.mounted_archives);
+    println!("  Ready: {}", if report.is_ready() { "yes" } else { "no" });
     println!();
-    println!("Platform summary:");
+    println!("Platforms:");
     if report.platform_counts.is_empty() {
-        println!("  none detected");
+        println!("  none");
     } else {
         for (platform, count) in &report.platform_counts {
             println!("  {platform}: {count}");
@@ -419,8 +428,6 @@ fn print_doctor_report(report: &DoctorReport) {
             println!("  {}", path.display());
         }
     }
-    println!();
-    println!("  Ready: {}", if report.is_ready() { "yes" } else { "no" });
 }
 
 fn print_archive_info(info: &ArchiveInfo) {
@@ -429,31 +436,38 @@ fn print_archive_info(info: &ArchiveInfo) {
 
 fn format_archive_info(info: &ArchiveInfo) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS info\n");
-    output.push_str(&format!("Title: {}\n", info.title));
+    output.push_str("ArchiveFS Info\n\n");
+    output.push_str("Details:\n");
+    output.push_str(&format!("  Title: {}\n", info.title));
     output.push_str(&format!(
-        "Platform: {}\n",
+        "  Platform: {}\n",
         info.platform.as_deref().unwrap_or("Unknown")
     ));
-    output.push_str(&format!("Archive path: {}\n", info.archive_path.display()));
-    output.push_str(&format!("Mount path: {}\n", info.mount_path.display()));
-    output.push_str(&format!("Extension: {}\n", info.extension));
     output.push_str(&format!(
-        "Archive size: {}\n",
+        "  Archive path: {}\n",
+        info.archive_path.display()
+    ));
+    output.push_str(&format!("  Mount path: {}\n", info.mount_path.display()));
+    output.push_str(&format!("  Extension: {}\n", info.extension));
+    output.push_str(&format!(
+        "  Archive size: {}\n",
         info.size_bytes
             .map(human_size)
             .unwrap_or_else(|| "unknown".to_string())
     ));
     output.push_str(&format!(
-        "Last modified: {}\n",
+        "  Last modified: {}\n",
         info.modified_time
             .map(format_system_time)
             .unwrap_or_else(|| "unknown".to_string())
     ));
-    output.push_str(&format!("Health: {}\n", info.health));
-    output.push_str(&format!("Mount state: {}\n", info.mount_state));
-    output.push_str(&format!("Metadata provider: {}\n", info.metadata_provider));
-    output.push_str(&format!("Health provider: {}\n", info.health_provider));
+    output.push_str(&format!("  Health: {}\n", info.health));
+    output.push_str(&format!("  Mount state: {}\n", info.mount_state));
+    output.push_str(&format!(
+        "  Metadata provider: {}\n",
+        info.metadata_provider
+    ));
+    output.push_str(&format!("  Health provider: {}\n", info.health_provider));
     output
 }
 
@@ -463,12 +477,13 @@ fn print_archive_stats(stats: &ArchiveStats) {
 
 fn format_archive_stats(stats: &ArchiveStats) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS stats\n");
-    output.push_str(&format!("Total archives: {}\n", stats.total_archives));
-    output.push_str(&format!("Mounted: {}\n", stats.mounted_count));
-    output.push_str(&format!("Pending: {}\n", stats.pending_count));
+    output.push_str("ArchiveFS Stats\n\n");
+    output.push_str("Summary:\n");
+    output.push_str(&format!("  Total archives: {}\n", stats.total_archives));
+    output.push_str(&format!("  Mounted: {}\n", stats.mounted_count));
+    output.push_str(&format!("  Pending: {}\n", stats.pending_count));
     output.push_str(&format!(
-        "Total archive size: {}\n",
+        "  Total archive size: {}\n",
         human_size(stats.total_size_bytes)
     ));
     output.push_str("\nPlatforms:\n");
@@ -567,28 +582,37 @@ fn print_help() {
     println!("archivefs [--verbose|-v] [--debug] <command>");
     println!();
     println!("Global flags:");
-    println!("  -v, --verbose print operational details");
-    println!("  --debug      print diagnostic details");
+    println!("  -v, --verbose  Show operational logs");
+    println!("  --debug        Show diagnostic logs");
     println!();
     println!("Commands:");
-    println!("  scan      list supported archives from configured source folders");
-    println!("  mount     mount scanned archives with ratarmount");
-    println!("  mount-one mount one archive by path or name");
-    println!("  unmount   unmount archivefs mountpoints under configured mount_root");
-    println!("  unmount-one unmount one archive by path or name");
-    println!("  status    show archive path, mount path, and state");
-    println!("  stats     show archive library counts and sizes");
-    println!("  info      show details for one archive by path or name");
-    println!("  doctor    diagnose whether ArchiveFS is ready to run safely");
-    println!("  config-check validate ArchiveFS configuration");
-    println!("  index-build build the JSON archive index");
-    println!("  index-show show a summary of the JSON archive index");
-    println!("  index-find find entries in the JSON archive index");
-    println!("  clean     remove empty directories under mount_root");
-    println!("  watch     watch source folders and refresh the JSON index");
+    println!("  scan           List supported archives from configured source folders");
+    println!("  doctor         Check whether ArchiveFS is ready to run");
+    println!("  config-check   Validate ArchiveFS configuration");
+    println!("  status         Show archive paths, mount paths, and mount states");
+    println!("  stats          Show archive library counts and sizes");
+    println!("  info           Show details for one archive by path or name");
+    println!("  mount          Mount scanned archives with ratarmount");
+    println!("  mount-one      Mount one archive by path or name");
+    println!("  unmount        Unmount ArchiveFS mountpoints under mount_root");
+    println!("  unmount-one    Unmount one archive by path or name");
+    println!("  clean          Remove empty directories under mount_root");
+    println!("  watch          Watch source folders and refresh the JSON index");
+    println!("  index-build    Build the JSON archive index");
+    println!("  index-show     Show a summary of the JSON archive index");
+    println!("  index-find     Find entries in the JSON archive index");
+    println!();
+    println!("Examples:");
+    println!("  archivefs doctor");
+    println!("  archivefs config-check");
+    println!("  archivefs stats");
+    println!("  archivefs info \"007 Legends\"");
+    println!("  archivefs mount-one \"007 Legends\"");
+    println!("  archivefs unmount-one \"007 Legends\"");
+    println!("  archivefs watch");
     println!();
     println!("Config: ~/.config/archivefs/config.toml");
-    println!("Example:");
+    println!("Example config:");
     println!("  source_folders = [\"/data/archives\"]");
     println!("  mount_root = \"/mnt/archivefs\"");
     println!("  ratarmount_bin = \"ratarmount\"");
