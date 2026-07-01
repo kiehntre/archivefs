@@ -4,13 +4,14 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use archivefs_core::{
-    ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveScanner,
-    ArchiveStats, ArchiveStatus, Config, ConfigCheckReport, ConfigCheckStatus, DoctorReport,
-    MountPlan, WatchRebuildSummary, build_and_write_archive_index, check_archive_index_freshness,
-    clean_mount_root, cleanup_selected_mount_dir, current_archive_stats, current_statuses,
-    default_index_path, find_archive_index_entries, mount_archives, mount_one_archive,
-    read_default_archive_index, run_config_check_default, run_doctor_default,
-    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
+    ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveInfo,
+    ArchiveScanner, ArchiveStats, ArchiveStatus, Config, ConfigCheckReport, ConfigCheckStatus,
+    DoctorReport, MountPlan, WatchRebuildSummary, build_and_write_archive_index,
+    check_archive_index_freshness, clean_mount_root, cleanup_selected_mount_dir,
+    current_archive_info, current_archive_stats, current_statuses, default_index_path,
+    find_archive_index_entries, mount_archives, mount_one_archive, read_default_archive_index,
+    run_config_check_default, run_doctor_default, summarize_archive_index, unmount_archives,
+    unmount_one_archive, watch_archive_index,
 };
 
 static LOGGER: StderrLogger = StderrLogger;
@@ -144,6 +145,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "stats" => {
             let config = Config::load_default()?;
             print_archive_stats(&current_archive_stats(&config)?);
+        }
+        "info" => {
+            let Some(first) = args.next() else {
+                return Err("info requires an archive path or name".into());
+            };
+            let input = std::iter::once(first)
+                .chain(args)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let config = Config::load_default()?;
+            print_archive_info(&current_archive_info(&config, &input)?);
         }
         "doctor" => {
             print_doctor_report(&run_doctor_default());
@@ -411,6 +423,40 @@ fn print_doctor_report(report: &DoctorReport) {
     println!("  Ready: {}", if report.is_ready() { "yes" } else { "no" });
 }
 
+fn print_archive_info(info: &ArchiveInfo) {
+    print!("{}", format_archive_info(info));
+}
+
+fn format_archive_info(info: &ArchiveInfo) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS info\n");
+    output.push_str(&format!("Title: {}\n", info.title));
+    output.push_str(&format!(
+        "Platform: {}\n",
+        info.platform.as_deref().unwrap_or("Unknown")
+    ));
+    output.push_str(&format!("Archive path: {}\n", info.archive_path.display()));
+    output.push_str(&format!("Mount path: {}\n", info.mount_path.display()));
+    output.push_str(&format!("Extension: {}\n", info.extension));
+    output.push_str(&format!(
+        "Archive size: {}\n",
+        info.size_bytes
+            .map(human_size)
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    output.push_str(&format!(
+        "Last modified: {}\n",
+        info.modified_time
+            .map(format_system_time)
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    output.push_str(&format!("Health: {}\n", info.health));
+    output.push_str(&format!("Mount state: {}\n", info.mount_state));
+    output.push_str(&format!("Metadata provider: {}\n", info.metadata_provider));
+    output.push_str(&format!("Health provider: {}\n", info.health_provider));
+    output
+}
+
 fn print_archive_stats(stats: &ArchiveStats) {
     print!("{}", format_archive_stats(stats));
 }
@@ -473,6 +519,38 @@ fn human_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+fn format_system_time(time: std::time::SystemTime) -> String {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format_unix_timestamp(duration.as_secs()),
+        Err(error) => format!("before UNIX epoch by {}s", error.duration().as_secs()),
+    }
+}
+
+fn format_unix_timestamp(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year, month as u32, day as u32)
+}
+
 fn print_statuses(statuses: &[ArchiveStatus]) {
     println!("{:<48}  {:<48}  State", "Archive", "Mount");
     for status in statuses {
@@ -500,6 +578,7 @@ fn print_help() {
     println!("  unmount-one unmount one archive by path or name");
     println!("  status    show archive path, mount path, and state");
     println!("  stats     show archive library counts and sizes");
+    println!("  info      show details for one archive by path or name");
     println!("  doctor    diagnose whether ArchiveFS is ready to run safely");
     println!("  config-check validate ArchiveFS configuration");
     println!("  index-build build the JSON archive index");
@@ -518,6 +597,37 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_archive_info_includes_all_display_fields() {
+        let info = ArchiveInfo {
+            title: "Halo".to_string(),
+            platform: Some("Xbox".to_string()),
+            archive_path: std::path::PathBuf::from("/roms/xbox/Halo.zip"),
+            mount_path: std::path::PathBuf::from("/mnt/archivefs/Xbox/Halo"),
+            extension: "zip".to_string(),
+            size_bytes: Some(2048),
+            modified_time: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400)),
+            health: archivefs_core::ArchiveHealth::Pending,
+            mount_state: archivefs_core::MountState::Mounted,
+            metadata_provider: "FilenameMetadataProvider".to_string(),
+            health_provider: "FilesystemHealthProvider".to_string(),
+        };
+
+        let output = format_archive_info(&info);
+
+        assert!(output.contains("Title: Halo"));
+        assert!(output.contains("Platform: Xbox"));
+        assert!(output.contains("Archive path: /roms/xbox/Halo.zip"));
+        assert!(output.contains("Mount path: /mnt/archivefs/Xbox/Halo"));
+        assert!(output.contains("Extension: zip"));
+        assert!(output.contains("Archive size: 2.0 KiB"));
+        assert!(output.contains("Last modified: 1970-01-02 00:00:00 UTC"));
+        assert!(output.contains("Health: Pending"));
+        assert!(output.contains("Mount state: Mounted"));
+        assert!(output.contains("Metadata provider: FilenameMetadataProvider"));
+        assert!(output.contains("Health provider: FilesystemHealthProvider"));
+    }
 
     #[test]
     fn format_archive_stats_includes_counts_and_sizes() {

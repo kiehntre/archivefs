@@ -13,32 +13,72 @@ use log::{debug, info};
 
 #[derive(Debug)]
 pub enum ArchiveFsError {
+    Config(String),
+    Scanner(String),
+    Selection(SelectionError),
+    Mount(String),
+    Unmount(String),
+    Index(String),
+    Watcher(String),
     Io {
-        path: PathBuf,
+        path: Option<PathBuf>,
         source: io::Error,
     },
-    Config(String),
-    CommandFailed {
+    ExternalCommand {
         program: String,
         status: Option<i32>,
         stderr: String,
     },
-    Watcher(String),
-    NoMountMatch {
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionError {
+    NoMatch {
         input: String,
     },
-    AmbiguousMountMatch {
+    Ambiguous {
         input: String,
         matches: Vec<(PathBuf, PathBuf)>,
     },
 }
 
+impl ArchiveFsError {
+    fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Io {
+            path: Some(path.into()),
+            source,
+        }
+    }
+
+    fn selection_no_match(input: impl Into<String>) -> Self {
+        Self::Selection(SelectionError::NoMatch {
+            input: input.into(),
+        })
+    }
+
+    fn selection_ambiguous(input: impl Into<String>, matches: Vec<(PathBuf, PathBuf)>) -> Self {
+        Self::Selection(SelectionError::Ambiguous {
+            input: input.into(),
+            matches,
+        })
+    }
+}
+
 impl fmt::Display for ArchiveFsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { path, source } => write!(f, "{}: {}", path.display(), source),
             Self::Config(message) => write!(f, "config error: {message}"),
-            Self::CommandFailed {
+            Self::Scanner(message) => write!(f, "scanner error: {message}"),
+            Self::Selection(error) => write!(f, "{error}"),
+            Self::Mount(message) => write!(f, "mount error: {message}"),
+            Self::Unmount(message) => write!(f, "unmount error: {message}"),
+            Self::Index(message) => write!(f, "index error: {message}"),
+            Self::Watcher(message) => write!(f, "watcher error: {message}"),
+            Self::Io { path, source } => match path {
+                Some(path) => write!(f, "{}: {}", path.display(), source),
+                None => write!(f, "{source}"),
+            },
+            Self::ExternalCommand {
                 program,
                 status,
                 stderr,
@@ -52,17 +92,20 @@ impl fmt::Display for ArchiveFsError {
                 }
                 Ok(())
             }
-            Self::Watcher(message) => write!(f, "watcher error: {message}"),
-            Self::NoMountMatch { input } => {
-                write!(f, "no archive matched '{input}'")
-            }
-            Self::AmbiguousMountMatch { input, matches } => {
+        }
+    }
+}
+
+impl fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMatch { input } => write!(f, "no archive matched '{input}'"),
+            Self::Ambiguous { input, matches } => {
                 writeln!(f, "multiple archives matched '{input}':")?;
                 for (archive_path, mount_path) in matches {
                     writeln!(
                         f,
-                        "  Archive: {}
-  Mount:   {}",
+                        "  Archive: {}\n  Mount:   {}",
                         archive_path.display(),
                         mount_path.display()
                     )?;
@@ -73,7 +116,22 @@ impl fmt::Display for ArchiveFsError {
     }
 }
 
-impl std::error::Error for ArchiveFsError {}
+impl std::error::Error for ArchiveFsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
+impl From<io::Error> for ArchiveFsError {
+    fn from(source: io::Error) -> Self {
+        Self::Io { path: None, source }
+    }
+}
 
 pub type Result<T> = std::result::Result<T, ArchiveFsError>;
 
@@ -94,10 +152,8 @@ impl Config {
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         debug!("reading config file {}", path.display());
-        let contents = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let contents = fs::read_to_string(path)
+            .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
         let config = parse_config(&contents)?;
         info!(
             "loaded config: {} source folder(s), mount_root={}, ratarmount_bin={}",
@@ -1157,23 +1213,16 @@ impl<'a> ArchiveScanner<'a> {
         source: &Path,
         archives: &mut Vec<Archive>,
     ) -> Result<()> {
-        let entries = fs::read_dir(source).map_err(|source_error| ArchiveFsError::Io {
-            path: source.to_path_buf(),
-            source: source_error,
-        })?;
+        let entries = fs::read_dir(source)
+            .map_err(|source_error| ArchiveFsError::io(source.to_path_buf(), source_error))?;
 
         for entry in entries {
-            let entry = entry.map_err(|source_error| ArchiveFsError::Io {
-                path: source.to_path_buf(),
-                source: source_error,
-            })?;
+            let entry = entry
+                .map_err(|source_error| ArchiveFsError::io(source.to_path_buf(), source_error))?;
             let path = entry.path();
             let file_type = entry
                 .file_type()
-                .map_err(|source_error| ArchiveFsError::Io {
-                    path: path.clone(),
-                    source: source_error,
-                })?;
+                .map_err(|source_error| ArchiveFsError::io(path.clone(), source_error))?;
 
             if file_type.is_dir() {
                 self.scan_source(source_root, &path, archives)?;
@@ -1281,9 +1330,7 @@ pub fn select_mount_plan(plans: &[MountPlan], input: &str) -> Result<MountPlan> 
         return single_mount_match(input, safe_name_matches);
     }
 
-    Err(ArchiveFsError::NoMountMatch {
-        input: input.to_string(),
-    })
+    Err(ArchiveFsError::selection_no_match(input))
 }
 
 fn single_mount_match(input: &str, matches: Vec<&MountPlan>) -> Result<MountPlan> {
@@ -1291,13 +1338,13 @@ fn single_mount_match(input: &str, matches: Vec<&MountPlan>) -> Result<MountPlan
         return Ok(matches[0].clone());
     }
 
-    Err(ArchiveFsError::AmbiguousMountMatch {
-        input: input.to_string(),
-        matches: matches
+    Err(ArchiveFsError::selection_ambiguous(
+        input,
+        matches
             .into_iter()
             .map(|plan| (plan.archive.path.clone(), plan.mount_path.clone()))
             .collect(),
-    })
+    ))
 }
 
 pub fn safe_mount_name(path: impl AsRef<Path>) -> String {
@@ -1483,6 +1530,21 @@ pub struct ArchiveStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveInfo {
+    pub title: String,
+    pub platform: Option<String>,
+    pub archive_path: PathBuf,
+    pub mount_path: PathBuf,
+    pub extension: String,
+    pub size_bytes: Option<u64>,
+    pub modified_time: Option<std::time::SystemTime>,
+    pub health: ArchiveHealth,
+    pub mount_state: MountState,
+    pub metadata_provider: String,
+    pub health_provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveIndexFreshness {
     pub missing_archive_paths: Vec<PathBuf>,
     pub stale_archive_paths: Vec<PathBuf>,
@@ -1497,7 +1559,7 @@ impl ArchiveIndexFreshness {
 pub fn default_index_path() -> Result<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
+        .ok_or_else(|| ArchiveFsError::Index("HOME is not set".to_string()))?;
     Ok(PathBuf::from(home)
         .join(".local")
         .join("share")
@@ -1518,15 +1580,11 @@ pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
 pub fn write_archive_index(index: &ArchiveIndex, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ArchiveFsError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
     }
-    fs::write(path, archive_index_to_json(index)).map_err(|source| ArchiveFsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    fs::write(path, archive_index_to_json(index))
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))
 }
 
 pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
@@ -1840,10 +1898,8 @@ impl WatchDebouncer {
 
 pub fn read_archive_index(path: impl AsRef<Path>) -> Result<ArchiveIndex> {
     let path = path.as_ref();
-    let json = fs::read_to_string(path).map_err(|source| ArchiveFsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let json = fs::read_to_string(path)
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     Ok(parse_archive_index_json(&json))
 }
 
@@ -1960,6 +2016,57 @@ pub fn current_archive_stats(config: &Config) -> Result<ArchiveStats> {
     let scanner = ArchiveScanner::new(config);
     let records = scanner.archive_records()?;
     Ok(summarize_archive_records(&records))
+}
+
+pub fn select_archive_record(records: &[ArchiveRecord], input: &str) -> Result<ArchiveRecord> {
+    let plans = records
+        .iter()
+        .map(|record| record.mount_plan.clone())
+        .collect::<Vec<_>>();
+    let selected = select_mount_plan(&plans, input)?;
+    records
+        .iter()
+        .find(|record| {
+            record.mount_plan.archive.path == selected.archive.path
+                && record.mount_plan.mount_path == selected.mount_path
+        })
+        .cloned()
+        .ok_or_else(|| ArchiveFsError::selection_no_match(input))
+}
+
+pub fn archive_info_from_record(record: ArchiveRecord) -> ArchiveInfo {
+    let extension = record
+        .mount_plan
+        .archive
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    ArchiveInfo {
+        title: record
+            .metadata
+            .title
+            .unwrap_or(record.identity.display_name),
+        platform: record.metadata.platform.or(record.identity.platform),
+        archive_path: record.mount_plan.archive.path,
+        mount_path: record.mount_plan.mount_path,
+        extension,
+        size_bytes: record.identity.size_bytes,
+        modified_time: record.identity.modified_time,
+        health: record.health,
+        mount_state: record.mount_state,
+        metadata_provider: "FilenameMetadataProvider".to_string(),
+        health_provider: "FilesystemHealthProvider".to_string(),
+    }
+}
+
+pub fn current_archive_info(config: &Config, input: &str) -> Result<ArchiveInfo> {
+    let scanner = ArchiveScanner::new(config);
+    let records = scanner.archive_records()?;
+    let record = select_archive_record(&records, input)?;
+    Ok(archive_info_from_record(record))
 }
 
 pub fn summarize_archive_index(index: &ArchiveIndex) -> ArchiveIndexSummary {
@@ -2211,20 +2318,16 @@ pub fn mount_archives_with_backend(
 ) -> Result<Vec<ArchiveStatus>> {
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
-    fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
-        path: config.mount_root.clone(),
-        source,
-    })?;
+    fs::create_dir_all(&config.mount_root)
+        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
 
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     for plan in &plans {
         if mounted_paths.contains(&plan.mount_path) {
             continue;
         }
-        fs::create_dir_all(&plan.mount_path).map_err(|source| ArchiveFsError::Io {
-            path: plan.mount_path.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&plan.mount_path)
+            .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
         backend.mount(plan)?;
     }
 
@@ -2251,17 +2354,13 @@ pub fn mount_one_archive_with_backend(
         plan.mount_path.display()
     );
 
-    fs::create_dir_all(&config.mount_root).map_err(|source| ArchiveFsError::Io {
-        path: config.mount_root.clone(),
-        source,
-    })?;
+    fs::create_dir_all(&config.mount_root)
+        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     if !mounted_paths.contains(&plan.mount_path) {
         info!("mounting {}", plan.archive.path.display());
-        fs::create_dir_all(&plan.mount_path).map_err(|source| ArchiveFsError::Io {
-            path: plan.mount_path.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&plan.mount_path)
+            .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
         backend.mount(&plan)?;
         info!(
             "mounted {} at {}",
@@ -2346,10 +2445,8 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
     if !directory_is_empty(mount_path)? {
         return Ok(false);
     }
-    fs::remove_dir(mount_path).map_err(|source| ArchiveFsError::Io {
-        path: mount_path.to_path_buf(),
-        source,
-    })?;
+    fs::remove_dir(mount_path)
+        .map_err(|source| ArchiveFsError::io(mount_path.to_path_buf(), source))?;
     Ok(true)
 }
 
@@ -2377,31 +2474,22 @@ fn clean_empty_dirs_recursive(
         return Ok(());
     }
 
-    let entries = fs::read_dir(dir).map_err(|source| ArchiveFsError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
+    let entries =
+        fs::read_dir(dir).map_err(|source| ArchiveFsError::io(dir.to_path_buf(), source))?;
 
     for entry in entries {
-        let entry = entry.map_err(|source| ArchiveFsError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+        let entry = entry.map_err(|source| ArchiveFsError::io(dir.to_path_buf(), source))?;
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| ArchiveFsError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| ArchiveFsError::io(path.clone(), source))?;
         if file_type.is_dir() {
             clean_empty_dirs_recursive(root, &path, mounted_paths, removed)?;
         }
     }
 
     if dir != root && !mounted_paths.contains(dir) && directory_is_empty(dir)? {
-        fs::remove_dir(dir).map_err(|source| ArchiveFsError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+        fs::remove_dir(dir).map_err(|source| ArchiveFsError::io(dir.to_path_buf(), source))?;
         removed.push(dir.to_path_buf());
     }
 
@@ -2409,10 +2497,8 @@ fn clean_empty_dirs_recursive(
 }
 
 fn directory_is_empty(path: &Path) -> Result<bool> {
-    let mut entries = fs::read_dir(path).map_err(|source| ArchiveFsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut entries =
+        fs::read_dir(path).map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     Ok(entries.next().is_none())
 }
 
@@ -2467,11 +2553,8 @@ fn archive_index_entry_from_record(record: ArchiveRecord) -> ArchiveIndexEntry {
 }
 
 fn mounted_paths_under(root: &Path) -> Result<HashSet<PathBuf>> {
-    let mountinfo =
-        fs::read_to_string("/proc/self/mountinfo").map_err(|source| ArchiveFsError::Io {
-            path: PathBuf::from("/proc/self/mountinfo"),
-            source,
-        })?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|source| ArchiveFsError::io(PathBuf::from("/proc/self/mountinfo"), source))?;
 
     Ok(mountinfo
         .lines()
@@ -2503,7 +2586,7 @@ fn unmount_path(path: &Path) -> Result<()> {
     for program in ["fusermount3", "fusermount", "umount"] {
         match run_command(program, &[path]) {
             Ok(()) => return Ok(()),
-            Err(ArchiveFsError::CommandFailed { .. }) => continue,
+            Err(ArchiveFsError::ExternalCommand { .. }) => continue,
             Err(ArchiveFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 continue;
             }
@@ -2511,7 +2594,7 @@ fn unmount_path(path: &Path) -> Result<()> {
         }
     }
 
-    Err(ArchiveFsError::CommandFailed {
+    Err(ArchiveFsError::ExternalCommand {
         program: "fusermount3/fusermount/umount".to_string(),
         status: None,
         stderr: format!("failed to unmount {}", path.display()),
@@ -2533,15 +2616,12 @@ fn run_command(program: &str, args: &[&Path]) -> Result<()> {
     let output = Command::new(program)
         .args(args)
         .output()
-        .map_err(|source| ArchiveFsError::Io {
-            path: PathBuf::from(program),
-            source,
-        })?;
+        .map_err(|source| ArchiveFsError::io(PathBuf::from(program), source))?;
 
     if output.status.success() {
         Ok(())
     } else {
-        Err(ArchiveFsError::CommandFailed {
+        Err(ArchiveFsError::ExternalCommand {
             program: program.to_string(),
             status: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -2552,6 +2632,39 @@ fn run_command(program: &str, args: &[&Path]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn central_error_display_preserves_selection_messages() {
+        let error = ArchiveFsError::selection_no_match("missing");
+        assert_eq!(error.to_string(), "no archive matched 'missing'");
+
+        let error = ArchiveFsError::selection_ambiguous(
+            "007",
+            vec![(
+                PathBuf::from("/roms/007 Legends.zip"),
+                PathBuf::from("/mnt/archivefs/Xbox360/007_Legends"),
+            )],
+        );
+        let message = error.to_string();
+        assert!(message.contains("multiple archives matched '007':"));
+        assert!(message.contains("Archive: /roms/007 Legends.zip"));
+        assert!(message.contains("Mount:   /mnt/archivefs/Xbox360/007_Legends"));
+    }
+
+    #[test]
+    fn central_error_from_io_error_keeps_source() {
+        let error = ArchiveFsError::from(io::Error::new(io::ErrorKind::Other, "boom"));
+
+        assert_eq!(error.to_string(), "boom");
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn index_error_has_index_category() {
+        let error = ArchiveFsError::Index("HOME is not set".to_string());
+
+        assert_eq!(error.to_string(), "index error: HOME is not set");
+    }
 
     #[test]
     fn detects_supported_archive_extensions_case_insensitively() {
@@ -2729,7 +2842,10 @@ mod tests {
         let plans = plan_mounts(&archives, "/mnt/archivefs");
         let error = select_mount_plan(&plans, "not here").unwrap_err();
 
-        assert!(matches!(error, ArchiveFsError::NoMountMatch { input } if input == "not here"));
+        assert!(matches!(
+            error,
+            ArchiveFsError::Selection(SelectionError::NoMatch { input }) if input == "not here"
+        ));
     }
 
     #[test]
@@ -2742,7 +2858,7 @@ mod tests {
         let error = select_mount_plan(&plans, "007").unwrap_err();
 
         match error {
-            ArchiveFsError::AmbiguousMountMatch { input, matches } => {
+            ArchiveFsError::Selection(SelectionError::Ambiguous { input, matches }) => {
                 assert_eq!(input, "007");
                 assert_eq!(matches.len(), 2);
                 assert!(matches.iter().any(|(archive_path, mount_path)| {
@@ -2793,7 +2909,10 @@ mod tests {
         let backend = RecordingBackend::default();
         let error = unmount_one_archive_with_backend(&config, "missing", &backend).unwrap_err();
 
-        assert!(matches!(error, ArchiveFsError::NoMountMatch { input } if input == "missing"));
+        assert!(matches!(
+            error,
+            ArchiveFsError::Selection(SelectionError::NoMatch { input }) if input == "missing"
+        ));
         assert!(backend.unmounted().is_empty());
     }
 
@@ -2818,6 +2937,84 @@ mod tests {
         assert!(json.contains("\"mount_path\": \"/mnt/archivefs/Xbox360/007_Legends\""));
         assert!(json.contains("\"health\": \"Pending\""));
         assert!(json.contains("\"mount_state\": \"Pending\""));
+    }
+
+    #[test]
+    fn archive_info_from_record_includes_archive_record_details() {
+        let mut record = archive_record_with_size(
+            "/roms/xbox360/Halo.zip",
+            Some("Xbox360"),
+            MountState::Mounted,
+            2048,
+        );
+        record.metadata.title = Some("Halo Custom".to_string());
+        record.identity.modified_time = Some(std::time::UNIX_EPOCH + Duration::from_secs(5));
+        record.health = ArchiveHealth::Mounted;
+
+        let info = archive_info_from_record(record);
+
+        assert_eq!(info.title, "Halo Custom");
+        assert_eq!(info.platform, Some("Xbox360".to_string()));
+        assert_eq!(info.archive_path, PathBuf::from("/roms/xbox360/Halo.zip"));
+        assert_eq!(info.mount_path, PathBuf::from("/mnt/archivefs/Test"));
+        assert_eq!(info.extension, "zip");
+        assert_eq!(info.size_bytes, Some(2048));
+        assert_eq!(
+            info.modified_time,
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(5))
+        );
+        assert_eq!(info.health, ArchiveHealth::Mounted);
+        assert_eq!(info.mount_state, MountState::Mounted);
+        assert_eq!(info.metadata_provider, "FilenameMetadataProvider");
+        assert_eq!(info.health_provider, "FilesystemHealthProvider");
+    }
+
+    #[test]
+    fn select_archive_record_reuses_selection_errors() {
+        let records = vec![
+            archive_record_with_size(
+                "/roms/xbox360/007 Legends.zip",
+                Some("Xbox360"),
+                MountState::Pending,
+                1,
+            ),
+            archive_record_with_size(
+                "/roms/xbox360/007 Racing.zip",
+                Some("Xbox360"),
+                MountState::Pending,
+                1,
+            ),
+        ];
+
+        let missing = select_archive_record(&records, "missing").unwrap_err();
+        assert!(matches!(
+            missing,
+            ArchiveFsError::Selection(SelectionError::NoMatch { input }) if input == "missing"
+        ));
+
+        let ambiguous = select_archive_record(&records, "007").unwrap_err();
+        assert!(matches!(
+            ambiguous,
+            ArchiveFsError::Selection(SelectionError::Ambiguous { input, matches })
+                if input == "007" && matches.len() == 2
+        ));
+    }
+
+    #[test]
+    fn select_archive_record_returns_matching_record() {
+        let records = vec![archive_record_with_size(
+            "/roms/xbox360/007 Legends.zip",
+            Some("Xbox360"),
+            MountState::Pending,
+            1,
+        )];
+
+        let selected = select_archive_record(&records, "legends").unwrap();
+
+        assert_eq!(
+            selected.mount_plan.archive.path,
+            PathBuf::from("/roms/xbox360/007 Legends.zip")
+        );
     }
 
     #[test]
