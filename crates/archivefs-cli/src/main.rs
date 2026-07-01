@@ -6,12 +6,12 @@ use std::sync::OnceLock;
 use archivefs_core::{
     ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveInfo,
     ArchiveScanner, ArchiveStats, ArchiveStatus, Config, ConfigCheckReport, ConfigCheckStatus,
-    DoctorReport, MountPlan, WatchRebuildSummary, build_and_write_archive_index,
-    check_archive_index_freshness, clean_mount_root, cleanup_selected_mount_dir,
-    current_archive_info, current_archive_stats, current_statuses, default_index_path,
-    find_archive_index_entries, mount_archives, mount_one_archive, read_default_archive_index,
-    run_config_check_default, run_doctor_default, summarize_archive_index, unmount_archives,
-    unmount_one_archive, watch_archive_index,
+    DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
+    MountPlan, WatchRebuildSummary, build_and_write_archive_index, check_archive_index_freshness,
+    clean_mount_root, cleanup_selected_mount_dir, current_archive_info, current_archive_stats,
+    current_statuses, default_index_path, find_archive_index_entries, mount_archives,
+    mount_one_archive, read_default_archive_index, run_config_check_default, run_doctor_default,
+    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
 };
 
 static LOGGER: StderrLogger = StderrLogger;
@@ -145,6 +145,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "stats" => {
             let config = Config::load_default()?;
             print_archive_stats(&current_archive_stats(&config)?);
+        }
+        "duplicates" => {
+            let config = Config::load_default()?;
+            let scanner = ArchiveScanner::new(&config);
+            let records = scanner.archive_records()?;
+            let detector = FilenameDuplicateDetector;
+            print_duplicate_report(&detector.detect_duplicates(&records)?);
         }
         "info" => {
             let Some(first) = args.next() else {
@@ -430,6 +437,43 @@ fn print_doctor_report(report: &DoctorReport) {
     }
 }
 
+fn print_duplicate_report(report: &DuplicateReport) {
+    print!("{}", format_duplicate_report(report));
+}
+
+fn format_duplicate_report(report: &DuplicateReport) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS Duplicates\n\n");
+    output.push_str("Summary:\n");
+    output.push_str(&format!("  Records checked: {}\n", report.archives_checked));
+    output.push_str(&format!(
+        "  Duplicate groups found: {}\n",
+        report.entries.len()
+    ));
+
+    if report.entries.is_empty() {
+        output.push_str("\nNo duplicate candidates found.\n");
+        return output;
+    }
+
+    output.push_str("\nDuplicate groups:\n");
+    for (index, entry) in report.entries.iter().enumerate() {
+        push_duplicate_entry(&mut output, index + 1, entry);
+    }
+    output
+}
+
+fn push_duplicate_entry(output: &mut String, index: usize, entry: &DuplicateEntry) {
+    output.push_str(&format!("  Group {index}:\n"));
+    output.push_str(&format!("    Platform: {}\n", entry.platform));
+    output.push_str(&format!("    Severity: {}\n", entry.severity));
+    output.push_str(&format!("    Reason: {}\n", entry.reason));
+    output.push_str("    Archives:\n");
+    for archive_path in &entry.archive_paths {
+        output.push_str(&format!("      {}\n", archive_path.display()));
+    }
+}
+
 fn print_archive_info(info: &ArchiveInfo) {
     print!("{}", format_archive_info(info));
 }
@@ -591,6 +635,7 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
+    println!("  duplicates     Show filename-based duplicate candidates");
     println!("  info           Show details for one archive by path or name");
     println!("  mount          Mount scanned archives with ratarmount");
     println!("  mount-one      Mount one archive by path or name");
@@ -621,6 +666,51 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_duplicate_report_shows_friendly_empty_message() {
+        let report = DuplicateReport {
+            detector: "filename".to_string(),
+            archives_checked: 2,
+            entries: Vec::new(),
+        };
+
+        let output = format_duplicate_report(&report);
+
+        assert!(output.contains("ArchiveFS Duplicates"));
+        assert!(output.contains("Records checked: 2"));
+        assert!(output.contains("Duplicate groups found: 0"));
+        assert!(output.contains("No duplicate candidates found."));
+    }
+
+    #[test]
+    fn format_duplicate_report_shows_group_details() {
+        let report = DuplicateReport {
+            detector: "filename".to_string(),
+            archives_checked: 2,
+            entries: vec![DuplicateEntry {
+                platform: "Xbox360".to_string(),
+                severity: archivefs_core::DuplicateSeverity::Warning,
+                reason: "same normalized archive name '007_legends' on platform 'Xbox360'"
+                    .to_string(),
+                archive_paths: vec![
+                    std::path::PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                    std::path::PathBuf::from("/roms/imports/007 Legends.7z"),
+                ],
+            }],
+        };
+
+        let output = format_duplicate_report(&report);
+
+        assert!(output.contains("Records checked: 2"));
+        assert!(output.contains("Duplicate groups found: 1"));
+        assert!(output.contains("Group 1:"));
+        assert!(output.contains("Platform: Xbox360"));
+        assert!(output.contains("Severity: Warning"));
+        assert!(output.contains("007_legends"));
+        assert!(output.contains("/roms/xbox360/007 Legends.zip"));
+        assert!(output.contains("/roms/imports/007 Legends.7z"));
+    }
 
     #[test]
     fn format_archive_info_includes_all_display_fields() {

@@ -1131,6 +1131,7 @@ pub struct DuplicateReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateEntry {
+    pub platform: String,
     pub severity: DuplicateSeverity,
     pub reason: String,
     pub archive_paths: Vec<PathBuf>,
@@ -1142,6 +1143,17 @@ pub enum DuplicateSeverity {
     Low,
     Medium,
     High,
+}
+
+impl fmt::Display for DuplicateSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Warning => write!(f, "Warning"),
+            Self::Low => write!(f, "Low"),
+            Self::Medium => write!(f, "Medium"),
+            Self::High => write!(f, "High"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1168,6 +1180,7 @@ impl DuplicateDetector for FilenameDuplicateDetector {
                 }
 
                 Some(DuplicateEntry {
+                    platform: platform.clone(),
                     severity: DuplicateSeverity::Warning,
                     reason: format!(
                         "same normalized archive name '{name}' on platform '{platform}'"
@@ -3062,6 +3075,7 @@ mod tests {
         assert_eq!(report.detector, "filename");
         assert_eq!(report.archives_checked, 2);
         assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].platform, "Xbox360");
         assert_eq!(report.entries[0].severity, DuplicateSeverity::Warning);
         assert_eq!(
             report.entries[0].archive_paths,
