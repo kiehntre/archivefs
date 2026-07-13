@@ -685,7 +685,13 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn print_statuses(statuses: &[ArchiveStatus]) {
+use serde_json::to_string_pretty;
+
+fn print_statuses(statuses: &[ArchiveStatus]) -> Result<()> {
+    let json = to_string_pretty(&statuses)?;
+    println!($json);
+    Ok(())
+}
     println!("{:<48}  {:<48}  State", "Archive", "Mount");
     for status in statuses {
         println!(
