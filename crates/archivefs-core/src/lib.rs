@@ -1300,6 +1300,12 @@ pub enum MountOneOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnmountOneOutcome {
+    Unmounted(MountPlan),
+    NotMounted(MountPlan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountBatchTargetSkipReason {
     Selection(String),
     InvalidTarget(String),
@@ -1443,6 +1449,54 @@ pub struct ArchiveMountSession {
     config: Config,
     plans: Vec<MountPlan>,
     backend: RatarmountBackend,
+}
+
+pub struct ArchiveUnmountSession {
+    config: Config,
+    plans: Vec<MountPlan>,
+    backend: RatarmountBackend,
+}
+
+impl ArchiveUnmountSession {
+    /// Builds a reusable exact-path unmount session and validates batch-wide prerequisites.
+    pub fn new(config: &Config) -> Result<Self> {
+        fs::canonicalize(&config.mount_root)
+            .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+        current_mount_paths()?;
+        let scanner = ArchiveScanner::new(config);
+        Ok(Self {
+            config: config.clone(),
+            plans: scanner.mount_plans()?,
+            backend: RatarmountBackend::new(config.ratarmount_bin.clone()),
+        })
+    }
+
+    /// Normally unmounts one exact archive after revalidating its captured mount path.
+    pub fn unmount_archive_path(
+        &self,
+        archive_path: &Path,
+        expected_mount_path: &Path,
+    ) -> Result<UnmountOneOutcome> {
+        let plan = select_mount_plan_by_path(&self.plans, archive_path)?;
+        if plan.mount_path != expected_mount_path {
+            return Err(ArchiveFsError::Config(format!(
+                "mount target changed after batch capture: expected {}, found {}",
+                expected_mount_path.display(),
+                plan.mount_path.display()
+            )));
+        }
+        let active_mount_paths = current_mount_paths()?;
+        let outcome = unmount_one_plan_outcome_with_active_mounts(
+            &self.config,
+            plan,
+            &self.backend,
+            &active_mount_paths,
+        )?;
+        if let UnmountOneOutcome::Unmounted(plan) = &outcome {
+            ensure_mount_disappeared(&plan.mount_path, &current_mount_paths()?)?;
+        }
+        Ok(outcome)
+    }
 }
 
 impl ArchiveMountSession {
@@ -3209,41 +3263,7 @@ fn validate_lazy_unmount_path(
     mount_path: &Path,
     mounted_paths: &HashSet<PathBuf>,
 ) -> Result<()> {
-    if mount_path == config.mount_root || !path_is_under(mount_path, &config.mount_root) {
-        return Err(ArchiveFsError::Config(format!(
-            "refusing to lazy-unmount {} outside mount root {}",
-            mount_path.display(),
-            config.mount_root.display()
-        )));
-    }
-
-    if !mounted_paths.contains(mount_path) {
-        return Err(ArchiveFsError::Unmount(format!(
-            "{} is not currently mounted",
-            mount_path.display()
-        )));
-    }
-
-    let Some(parent) = mount_path.parent() else {
-        return Err(ArchiveFsError::Config(format!(
-            "refusing to lazy-unmount {} without a parent below mount root {}",
-            mount_path.display(),
-            config.mount_root.display()
-        )));
-    };
-    let resolved_root = fs::canonicalize(&config.mount_root)
-        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
-    let resolved_parent = fs::canonicalize(parent)
-        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
-    if resolved_parent != resolved_root && !path_is_under(&resolved_parent, &resolved_root) {
-        return Err(ArchiveFsError::Config(format!(
-            "refusing to lazy-unmount {} through a parent outside mount root {}",
-            mount_path.display(),
-            config.mount_root.display()
-        )));
-    }
-
-    Ok(())
+    validate_active_unmount_path(config, mount_path, mounted_paths, "lazy-unmount")
 }
 
 pub fn unmount_one_archive_with_backend(
@@ -3293,6 +3313,72 @@ fn unmount_one_plan(
     backend.unmount(&plan.mount_path)?;
     info!("unmounted {}", plan.mount_path.display());
     Ok(plan)
+}
+
+fn unmount_one_plan_outcome_with_active_mounts(
+    config: &Config,
+    plan: MountPlan,
+    backend: &impl MountBackend,
+    active_mount_paths: &HashSet<PathBuf>,
+) -> Result<UnmountOneOutcome> {
+    if !active_mount_paths.contains(&plan.mount_path) {
+        return Ok(UnmountOneOutcome::NotMounted(plan));
+    }
+    validate_active_unmount_path(config, &plan.mount_path, active_mount_paths, "unmount")?;
+    unmount_one_plan(config, plan, backend).map(UnmountOneOutcome::Unmounted)
+}
+
+fn ensure_mount_disappeared(
+    mount_path: &Path,
+    active_mount_paths: &HashSet<PathBuf>,
+) -> Result<()> {
+    if active_mount_paths.contains(mount_path) {
+        return Err(ArchiveFsError::Unmount(format!(
+            "{} is still mounted after normal unmount",
+            mount_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_active_unmount_path(
+    config: &Config,
+    mount_path: &Path,
+    mounted_paths: &HashSet<PathBuf>,
+    operation: &str,
+) -> Result<()> {
+    if mount_path == config.mount_root || !path_is_under(mount_path, &config.mount_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to {operation} {} outside mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+    if !mounted_paths.contains(mount_path) {
+        return Err(ArchiveFsError::Unmount(format!(
+            "{} is not currently mounted",
+            mount_path.display()
+        )));
+    }
+    let Some(parent) = mount_path.parent() else {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to {operation} {} without a parent below mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    };
+    let resolved_root = fs::canonicalize(&config.mount_root)
+        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    let resolved_parent = fs::canonicalize(parent)
+        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+    if resolved_parent != resolved_root && !path_is_under(&resolved_parent, &resolved_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to {operation} {} through a parent outside mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
@@ -3961,6 +4047,85 @@ mod tests {
 
         assert!(matches!(outcome, MountOneOutcome::AlreadyMounted(_)));
         assert!(backend.mounted().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_batch_unmount_requires_exact_membership_without_touching_target() {
+        let root = test_root("unmount_batch_no_touch");
+        let mount_root = root.join("mounts");
+        let parent = mount_root.join("Platform");
+        fs::create_dir_all(&parent).unwrap();
+        let mount_path = parent.join("Game");
+        std::os::unix::fs::symlink(root.join("missing-target"), &mount_path).unwrap();
+        let plan = MountPlan::new(
+            Archive::from_path(root.join("Game.zip")).unwrap(),
+            mount_path.clone(),
+        );
+        let config = Config {
+            source_folders: vec![root],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+
+        let not_mounted = unmount_one_plan_outcome_with_active_mounts(
+            &config,
+            plan.clone(),
+            &backend,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(matches!(not_mounted, UnmountOneOutcome::NotMounted(_)));
+        assert!(backend.unmounted().is_empty());
+
+        let outcome = unmount_one_plan_outcome_with_active_mounts(
+            &config,
+            plan,
+            &backend,
+            &HashSet::from([mount_path.clone()]),
+        )
+        .unwrap();
+        assert!(matches!(outcome, UnmountOneOutcome::Unmounted(_)));
+        assert_eq!(backend.unmounted(), vec![mount_path]);
+    }
+
+    #[test]
+    fn normal_batch_unmount_requires_mount_disappearance_before_cleanup() {
+        let mount_path = PathBuf::from("/mounts/Game");
+        assert!(ensure_mount_disappeared(&mount_path, &HashSet::new()).is_ok());
+        assert!(
+            ensure_mount_disappeared(&mount_path, &HashSet::from([mount_path.clone()]),).is_err()
+        );
+    }
+
+    #[test]
+    fn normal_batch_unmount_rejects_root_and_outside_paths() {
+        let root = test_root("unmount_batch_roots");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&mount_root).unwrap();
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: mount_root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+        for mount_path in [mount_root.clone(), root.join("outside/Game")] {
+            let plan = MountPlan::new(
+                Archive::from_path(root.join("Game.zip")).unwrap(),
+                mount_path.clone(),
+            );
+            assert!(
+                unmount_one_plan_outcome_with_active_mounts(
+                    &config,
+                    plan,
+                    &backend,
+                    &HashSet::from([mount_path]),
+                )
+                .is_err()
+            );
+        }
+        assert!(backend.unmounted().is_empty());
     }
 
     #[test]
