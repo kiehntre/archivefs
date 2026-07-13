@@ -1522,6 +1522,18 @@ pub fn select_mount_plan(plans: &[MountPlan], input: &str) -> Result<MountPlan> 
     Err(ArchiveFsError::selection_no_match(input))
 }
 
+fn select_mount_plan_by_path(plans: &[MountPlan], archive_path: &Path) -> Result<MountPlan> {
+    let input = archive_path.display().to_string();
+    let matches = plans
+        .iter()
+        .filter(|plan| plan.archive.path == archive_path)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(ArchiveFsError::selection_no_match(input));
+    }
+    single_mount_match(&input, matches)
+}
+
 fn single_mount_match(input: &str, matches: Vec<&MountPlan>) -> Result<MountPlan> {
     if matches.len() == 1 {
         return Ok(matches[0].clone());
@@ -2629,6 +2641,12 @@ pub fn mount_one_archive(config: &Config, input: &str) -> Result<MountPlan> {
     mount_one_archive_with_backend(config, input, &backend)
 }
 
+/// Mounts the archive whose filesystem path exactly matches `archive_path`.
+pub fn mount_one_archive_path(config: &Config, archive_path: &Path) -> Result<MountPlan> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    mount_one_archive_path_with_backend(config, archive_path, &backend)
+}
+
 pub fn mount_one_archive_with_backend(
     config: &Config,
     input: &str,
@@ -2638,6 +2656,26 @@ pub fn mount_one_archive_with_backend(
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
     let plan = select_mount_plan(&plans, input)?;
+    mount_one_plan(config, plan, backend)
+}
+
+fn mount_one_archive_path_with_backend(
+    config: &Config,
+    archive_path: &Path,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
+    info!("mount-one requested for {}", archive_path.display());
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
+    let plan = select_mount_plan_by_path(&plans, archive_path)?;
+    mount_one_plan(config, plan, backend)
+}
+
+fn mount_one_plan(
+    config: &Config,
+    plan: MountPlan,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
     debug!(
         "mount-one selected archive={} mount={}",
         plan.archive.path.display(),
@@ -2692,6 +2730,12 @@ pub fn unmount_one_archive(config: &Config, input: &str) -> Result<MountPlan> {
     unmount_one_archive_with_backend(config, input, &backend)
 }
 
+/// Unmounts the archive whose filesystem path exactly matches `archive_path`.
+pub fn unmount_one_archive_path(config: &Config, archive_path: &Path) -> Result<MountPlan> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    unmount_one_archive_path_with_backend(config, archive_path, &backend)
+}
+
 pub fn unmount_one_archive_with_backend(
     config: &Config,
     input: &str,
@@ -2701,6 +2745,26 @@ pub fn unmount_one_archive_with_backend(
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
     let plan = select_mount_plan(&plans, input)?;
+    unmount_one_plan(config, plan, backend)
+}
+
+fn unmount_one_archive_path_with_backend(
+    config: &Config,
+    archive_path: &Path,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
+    info!("unmount-one requested for {}", archive_path.display());
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
+    let plan = select_mount_plan_by_path(&plans, archive_path)?;
+    unmount_one_plan(config, plan, backend)
+}
+
+fn unmount_one_plan(
+    config: &Config,
+    plan: MountPlan,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
     debug!(
         "unmount-one selected archive={} mount={}",
         plan.archive.path.display(),
@@ -3150,6 +3214,65 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_archive_fixture(name: &str) -> (Config, PathBuf, PathBuf) {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root(name);
+        let source_root = root.join("roms");
+        fs::create_dir_all(&source_root).unwrap();
+        let first = source_root.join(OsString::from_vec(b"Game\x80.zip".to_vec()));
+        let second = source_root.join(OsString::from_vec(b"Game\x81.zip".to_vec()));
+        fs::write(&first, b"").unwrap();
+        fs::write(&second, b"").unwrap();
+        let config = Config {
+            source_folders: vec![source_root],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        (config, first, second)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_selector_matches_non_utf8_archive_exactly() {
+        let (config, first, second) = non_utf8_archive_fixture("non_utf8_select");
+        let plans = ArchiveScanner::new(&config).mount_plans().unwrap();
+
+        let selected = select_mount_plan_by_path(&plans, &second).unwrap();
+
+        assert_eq!(selected.archive.path, second);
+        assert_ne!(selected.archive.path, first);
+        assert!(select_mount_plan(&plans, &selected.archive.path.to_string_lossy()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_one_path_targets_non_utf8_archive_without_fuzzy_fallback() {
+        let (config, first, second) = non_utf8_archive_fixture("non_utf8_mount");
+        let backend = RecordingBackend::default();
+
+        let plan = mount_one_archive_path_with_backend(&config, &second, &backend).unwrap();
+
+        assert_eq!(plan.archive.path, second);
+        assert_ne!(plan.archive.path, first);
+        assert_eq!(backend.mounted(), vec![plan.archive.path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmount_one_path_targets_non_utf8_archive_exactly() {
+        let (config, first, second) = non_utf8_archive_fixture("non_utf8_unmount");
+        let backend = RecordingBackend::default();
+
+        let plan = unmount_one_archive_path_with_backend(&config, &second, &backend).unwrap();
+
+        assert_eq!(plan.archive.path, second);
+        assert_ne!(plan.archive.path, first);
+        assert_eq!(backend.unmounted(), vec![plan.mount_path]);
     }
 
     #[test]
@@ -4263,17 +4386,23 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingBackend {
+        mounted: std::cell::RefCell<Vec<PathBuf>>,
         unmounted: std::cell::RefCell<Vec<PathBuf>>,
     }
 
     impl RecordingBackend {
+        fn mounted(&self) -> Vec<PathBuf> {
+            self.mounted.borrow().clone()
+        }
+
         fn unmounted(&self) -> Vec<PathBuf> {
             self.unmounted.borrow().clone()
         }
     }
 
     impl MountBackend for RecordingBackend {
-        fn mount(&self, _plan: &MountPlan) -> Result<()> {
+        fn mount(&self, plan: &MountPlan) -> Result<()> {
+            self.mounted.borrow_mut().push(plan.archive.path.clone());
             Ok(())
         }
 
