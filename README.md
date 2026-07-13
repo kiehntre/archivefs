@@ -1,4 +1,4 @@
-<img width="1024" height="559" alt="archivefsilogo2" src="https://github.com/user-attachments/assets/88d9f2e0-50d6-422d-ae2c-9b6151e02e2e" />
+<img width="2816" height="1536" alt="archivefs7logopng" src="https://github.com/user-attachments/assets/30fa0c9f-eae2-4a82-bbde-91a7e71d1679" />
 
 
 # ArchiveFS
