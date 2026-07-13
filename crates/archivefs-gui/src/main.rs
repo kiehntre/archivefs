@@ -443,6 +443,18 @@ fn pending_unmount_items(records: &[ArchiveRecord]) -> Vec<UnmountAllItem> {
         .collect()
 }
 
+fn set_lazy_unmount_offer(
+    offers: &mut HashSet<PathBuf>,
+    archive_path: &Path,
+    recovery_needed: bool,
+) {
+    if recovery_needed {
+        offers.insert(archive_path.to_path_buf());
+    } else {
+        offers.remove(archive_path);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UnmountAllFailure {
     archive_path: PathBuf,
@@ -1394,6 +1406,11 @@ impl ArchiveFsApp {
                 }
                 UnmountAllEvent::ArchiveCompleted(item) => {
                     batch.progress.successful += 1;
+                    set_lazy_unmount_offer(
+                        &mut self.lazy_unmount_offers,
+                        &item.archive_path,
+                        false,
+                    );
                     self.history.record(HistoryEntry::new(
                         ActivityAction::Unmount,
                         Some(item.archive_path),
@@ -1408,7 +1425,11 @@ impl ArchiveFsApp {
                 } => {
                     batch.progress.failed += 1;
                     if offer_lazy_unmount {
-                        self.lazy_unmount_offers.insert(item.archive_path.clone());
+                        set_lazy_unmount_offer(
+                            &mut self.lazy_unmount_offers,
+                            &item.archive_path,
+                            true,
+                        );
                         self.history.record(HistoryEntry::new(
                             ActivityAction::LazyUnmount,
                             Some(item.archive_path.clone()),
@@ -1425,6 +1446,11 @@ impl ArchiveFsApp {
                 }
                 UnmountAllEvent::ArchiveSkipped { item, reason } => {
                     batch.progress.skipped += 1;
+                    set_lazy_unmount_offer(
+                        &mut self.lazy_unmount_offers,
+                        &item.archive_path,
+                        false,
+                    );
                     self.history.record(HistoryEntry::new(
                         ActivityAction::Unmount,
                         Some(item.archive_path),
@@ -4481,5 +4507,81 @@ mod tests {
                 && entry.outcome == ActivityOutcome::Completed
         }));
         assert!(app.lazy_unmount_offers.contains(&failed.archive_path));
+    }
+
+    #[test]
+    fn successful_batch_unmount_clears_only_its_previous_lazy_offer() {
+        let mut app = app_for_operation_tests();
+        let item = unmount_all_item("Game");
+        let other = PathBuf::from("/roms/Other.zip");
+        app.lazy_unmount_offers = HashSet::from([item.archive_path.clone(), other.clone()]);
+        let (sender, receiver) = mpsc::channel();
+        app.unmount_all = Some(RunningUnmountAll {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            progress: UnmountAllProgress::default(),
+        });
+        sender
+            .send(UnmountAllEvent::ArchiveCompleted(item.clone()))
+            .unwrap();
+
+        app.poll_unmount_all(&egui::Context::default());
+
+        assert!(!app.lazy_unmount_offers.contains(&item.archive_path));
+        assert!(app.lazy_unmount_offers.contains(&other));
+        let mounted_again = record("/roms/Game.zip", MountState::Mounted);
+        assert!(!lazy_unmount_available(
+            &mounted_again,
+            &app.lazy_unmount_offers,
+            false,
+        ));
+    }
+
+    #[test]
+    fn no_longer_mounted_batch_skip_clears_only_its_previous_lazy_offer() {
+        let mut app = app_for_operation_tests();
+        let item = unmount_all_item("Game");
+        let other = PathBuf::from("/roms/Other.zip");
+        app.lazy_unmount_offers = HashSet::from([item.archive_path.clone(), other.clone()]);
+        let (sender, receiver) = mpsc::channel();
+        app.unmount_all = Some(RunningUnmountAll {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            progress: UnmountAllProgress::default(),
+        });
+        sender
+            .send(UnmountAllEvent::ArchiveSkipped {
+                item: item.clone(),
+                reason: "archive is no longer mounted".to_string(),
+            })
+            .unwrap();
+
+        app.poll_unmount_all(&egui::Context::default());
+
+        assert!(!app.lazy_unmount_offers.contains(&item.archive_path));
+        assert!(app.lazy_unmount_offers.contains(&other));
+    }
+
+    #[test]
+    fn failed_normal_batch_unmount_retains_its_exact_lazy_offer() {
+        let mut app = app_for_operation_tests();
+        let item = unmount_all_item("Busy");
+        let (sender, receiver) = mpsc::channel();
+        app.unmount_all = Some(RunningUnmountAll {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            progress: UnmountAllProgress::default(),
+        });
+        sender
+            .send(UnmountAllEvent::ArchiveFailed {
+                item: item.clone(),
+                message: "mount is busy".to_string(),
+                offer_lazy_unmount: true,
+            })
+            .unwrap();
+
+        app.poll_unmount_all(&egui::Context::default());
+
+        assert!(app.lazy_unmount_offers.contains(&item.archive_path));
     }
 }
