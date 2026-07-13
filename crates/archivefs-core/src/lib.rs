@@ -2786,22 +2786,57 @@ fn unmount_one_plan(
 }
 
 pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
-    if mount_path == config.mount_root || !path_is_under(mount_path, &config.mount_root) {
-        return Ok(false);
-    }
-    if !mount_path.is_dir() {
+    if mount_path == config.mount_root
+        || !path_is_under(mount_path, &config.mount_root)
+        || !mount_path.is_dir()
+        || !path_resolves_below(mount_path, &config.mount_root)?
+    {
         return Ok(false);
     }
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    if mounted_paths.contains(mount_path) {
+    remove_empty_unmounted_dir(mount_path, &mounted_paths)
+}
+
+/// Removes an empty selected mount directory and its empty ancestors below the mount root.
+pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
+    if mount_path == config.mount_root
+        || !path_is_under(mount_path, &config.mount_root)
+        || !mount_path.is_dir()
+        || !path_resolves_below(mount_path, &config.mount_root)?
+    {
+        return Ok(Vec::new());
+    }
+
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+    let mut removed = Vec::new();
+    let mut current = mount_path.to_path_buf();
+    while current != config.mount_root && path_is_under(&current, &config.mount_root) {
+        if !remove_empty_unmounted_dir(&current, &mounted_paths)? {
+            break;
+        }
+        removed.push(current.clone());
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    Ok(removed)
+}
+
+fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<bool> {
+    if !path.is_dir() || mounted_paths.contains(path) || !directory_is_empty(path)? {
         return Ok(false);
     }
-    if !directory_is_empty(mount_path)? {
-        return Ok(false);
-    }
-    fs::remove_dir(mount_path)
-        .map_err(|source| ArchiveFsError::io(mount_path.to_path_buf(), source))?;
+    fs::remove_dir(path).map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     Ok(true)
+}
+
+fn path_resolves_below(path: &Path, root: &Path) -> Result<bool> {
+    let resolved_root =
+        fs::canonicalize(root).map_err(|source| ArchiveFsError::io(root.to_path_buf(), source))?;
+    let resolved_path =
+        fs::canonicalize(path).map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    Ok(resolved_path != resolved_root && path_is_under(&resolved_path, &resolved_root))
 }
 
 pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
@@ -3903,6 +3938,131 @@ mod tests {
 
         assert!(!cleanup_selected_mount_dir(&config, &outside).unwrap());
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn cleanup_selected_mount_tree_removes_empty_ancestors_but_not_mount_root() {
+        let root = test_root("cleanup_selected_tree");
+        let platform_path = root.join("Xbox360");
+        let mount_path = platform_path.join("Game");
+        fs::create_dir_all(&mount_path).unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        let removed = cleanup_selected_mount_tree(&config, &mount_path).unwrap();
+
+        assert_eq!(removed, vec![mount_path.clone(), platform_path.clone()]);
+        assert!(!mount_path.exists());
+        assert!(!platform_path.exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn cleanup_selected_mount_tree_rejects_mount_root_itself() {
+        let root = test_root("cleanup_selected_tree_root");
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(
+            cleanup_selected_mount_tree(&config, &root)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn cleanup_selected_mount_tree_rejects_paths_outside_mount_root() {
+        let root = test_root("cleanup_selected_tree_outside_root");
+        let outside = test_root("cleanup_selected_tree_outside_target").join("Game");
+        fs::create_dir_all(&outside).unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(
+            cleanup_selected_mount_tree(&config, &outside)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_selected_mount_tree_rejects_symlink_resolving_outside_mount_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("cleanup_selected_tree_symlink_root");
+        let outside = test_root("cleanup_selected_tree_symlink_target");
+        let outside_mount = outside.join("Game");
+        fs::create_dir_all(&outside_mount).unwrap();
+        symlink(&outside, root.join("Platform")).unwrap();
+        let linked_mount = root.join("Platform").join("Game");
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(
+            cleanup_selected_mount_tree(&config, &linked_mount)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(outside_mount.exists());
+    }
+
+    #[test]
+    fn cleanup_selected_mount_tree_preserves_non_empty_directories() {
+        let root = test_root("cleanup_selected_tree_nonempty");
+        let mount_path = root.join("Xbox360").join("Game");
+        fs::create_dir_all(&mount_path).unwrap();
+        fs::write(mount_path.join("file.txt"), b"keep").unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(
+            cleanup_selected_mount_tree(&config, &mount_path)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(mount_path.exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn cleanup_selected_mount_tree_preserves_parent_with_another_archive_directory() {
+        let root = test_root("cleanup_selected_tree_sibling");
+        let platform_path = root.join("Xbox360");
+        let mount_path = platform_path.join("RemovedGame");
+        let other_mount_path = platform_path.join("OtherGame");
+        fs::create_dir_all(&mount_path).unwrap();
+        fs::create_dir_all(&other_mount_path).unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        let removed = cleanup_selected_mount_tree(&config, &mount_path).unwrap();
+
+        assert_eq!(removed, vec![mount_path.clone()]);
+        assert!(!mount_path.exists());
+        assert!(other_mount_path.exists());
+        assert!(platform_path.exists());
+        assert!(root.exists());
     }
 
     #[test]

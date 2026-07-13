@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
     ArchiveKind, ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, Config, DoctorReport,
-    DoctorStatus, MountState, load_read_only_snapshot_default, mount_one_archive_path,
-    unmount_one_archive_path,
+    DoctorStatus, MountState, cleanup_selected_mount_tree, load_read_only_snapshot_default,
+    mount_one_archive_path, unmount_one_archive_path,
 };
 use eframe::egui;
 
@@ -21,6 +21,7 @@ enum ActivityAction {
     Refresh,
     Mount,
     Unmount,
+    Cleanup,
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -29,6 +30,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Refresh => "Refresh",
             Self::Mount => "Mount",
             Self::Unmount => "Unmount",
+            Self::Cleanup => "Cleanup",
         })
     }
 }
@@ -194,6 +196,7 @@ struct ArchiveFsApp {
     feedback: Option<ActionFeedback>,
     confirm_unmount: Option<PathBuf>,
     history: OperationHistory,
+    cleanup_after_unmount: bool,
 }
 
 impl ArchiveFsApp {
@@ -214,6 +217,7 @@ impl ArchiveFsApp {
             feedback: None,
             confirm_unmount: None,
             history,
+            cleanup_after_unmount: false,
         }
     }
 
@@ -269,10 +273,17 @@ impl ArchiveFsApp {
         context: egui::Context,
         action: ArchiveAction,
         archive_path: PathBuf,
+        cleanup_after_unmount: bool,
     ) -> bool {
-        self.start_operation_with_worker(context, action, archive_path, |action, archive_path| {
-            perform_archive_action(action, &archive_path)
-        })
+        self.start_operation_with_worker(
+            context,
+            action,
+            archive_path,
+            cleanup_after_unmount,
+            |action, archive_path, cleanup_after_unmount| {
+                perform_archive_action(action, &archive_path, cleanup_after_unmount)
+            },
+        )
     }
 
     fn start_operation_with_worker<F>(
@@ -280,16 +291,18 @@ impl ArchiveFsApp {
         context: egui::Context,
         action: ArchiveAction,
         archive_path: PathBuf,
+        cleanup_after_unmount: bool,
         worker: F,
     ) -> bool
     where
-        F: FnOnce(ArchiveAction, PathBuf) -> Result<String, String> + Send + 'static,
+        F: FnOnce(ArchiveAction, PathBuf, bool) -> OperationResult + Send + 'static,
     {
         if self.operation.is_some() {
             let message = "Another archive operation is already running.".to_string();
             self.feedback = Some(ActionFeedback {
                 succeeded: false,
                 message: message.clone(),
+                cleanup: None,
             });
             self.history.record(HistoryEntry::new(
                 ActivityAction::from(action),
@@ -318,7 +331,7 @@ impl ArchiveFsApp {
             receiver,
         });
         thread::spawn(move || {
-            let result = worker(action, archive_path);
+            let result = worker(action, archive_path, cleanup_after_unmount);
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -340,16 +353,24 @@ impl ArchiveFsApp {
         if let Some((action, archive_path, result)) = result {
             self.operation = None;
             match result {
-                Ok(message) => {
+                Ok(success) => {
                     self.history.record(HistoryEntry::new(
                         ActivityAction::from(action),
-                        Some(archive_path),
+                        Some(archive_path.clone()),
                         ActivityOutcome::Completed,
-                        message.clone(),
+                        success.message.clone(),
                     ));
+                    let cleanup_feedback = success.cleanup.as_ref().map(|cleanup| {
+                        record_cleanup_activity(&mut self.history, cleanup);
+                        CleanupFeedback {
+                            succeeded: matches!(cleanup, CleanupOutcome::Completed { .. }),
+                            message: cleanup.message().to_string(),
+                        }
+                    });
                     self.feedback = Some(ActionFeedback {
                         succeeded: true,
-                        message,
+                        message: success.message,
+                        cleanup: cleanup_feedback,
                     });
                     self.refresh(context);
                 }
@@ -363,6 +384,7 @@ impl ArchiveFsApp {
                     self.feedback = Some(ActionFeedback {
                         succeeded: false,
                         message,
+                        cleanup: None,
                     });
                 }
             }
@@ -376,6 +398,12 @@ enum ArchiveAction {
     Unmount,
 }
 
+struct OperationRequest {
+    action: ArchiveAction,
+    archive_path: PathBuf,
+    cleanup_after_unmount: bool,
+}
+
 impl From<ArchiveAction> for ActivityAction {
     fn from(action: ArchiveAction) -> Self {
         match action {
@@ -385,13 +413,72 @@ impl From<ArchiveAction> for ActivityAction {
     }
 }
 
+type OperationResult = Result<OperationSuccess, String>;
+
+#[derive(Debug)]
+struct OperationSuccess {
+    message: String,
+    cleanup: Option<CleanupOutcome>,
+}
+
+#[derive(Debug)]
+enum CleanupOutcome {
+    Completed {
+        mount_path: PathBuf,
+        message: String,
+    },
+    Failed {
+        mount_path: PathBuf,
+        message: String,
+    },
+}
+
+impl CleanupOutcome {
+    fn mount_path(&self) -> &Path {
+        match self {
+            Self::Completed { mount_path, .. } | Self::Failed { mount_path, .. } => mount_path,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Completed { message, .. } | Self::Failed { message, .. } => message,
+        }
+    }
+}
+
+fn record_cleanup_activity(history: &mut OperationHistory, cleanup: &CleanupOutcome) {
+    let mount_path = cleanup.mount_path().to_path_buf();
+    history.record(HistoryEntry::new(
+        ActivityAction::Cleanup,
+        Some(mount_path.clone()),
+        ActivityOutcome::Started,
+        format!("Cleanup started for {}.", mount_path.display()),
+    ));
+    history.record(HistoryEntry::new(
+        ActivityAction::Cleanup,
+        Some(mount_path),
+        match cleanup {
+            CleanupOutcome::Completed { .. } => ActivityOutcome::Completed,
+            CleanupOutcome::Failed { .. } => ActivityOutcome::Failed,
+        },
+        cleanup.message(),
+    ));
+}
+
 struct RunningOperation {
     action: ArchiveAction,
     archive_path: PathBuf,
-    receiver: Receiver<Result<String, String>>,
+    receiver: Receiver<OperationResult>,
 }
 
 struct ActionFeedback {
+    succeeded: bool,
+    message: String,
+    cleanup: Option<CleanupFeedback>,
+}
+
+struct CleanupFeedback {
     succeeded: bool,
     message: String,
 }
@@ -457,6 +544,7 @@ impl eframe::App for ArchiveFsApp {
                         operation: self.operation.as_ref(),
                         feedback: self.feedback.as_ref(),
                         confirm_unmount: &mut self.confirm_unmount,
+                        cleanup_after_unmount: &mut self.cleanup_after_unmount,
                     },
                 )
             }
@@ -464,8 +552,13 @@ impl eframe::App for ArchiveFsApp {
         if retry {
             self.refresh(context);
         }
-        if let Some((action, archive_path)) = requested_action {
-            self.start_operation(context.clone(), action, archive_path);
+        if let Some(request) = requested_action {
+            self.start_operation(
+                context.clone(),
+                request.action,
+                request.archive_path,
+                request.cleanup_after_unmount,
+            );
         }
     }
 }
@@ -486,17 +579,73 @@ fn load_data() -> LoadResult {
         .map_err(|error| error.to_string())
 }
 
-fn perform_archive_action(action: ArchiveAction, archive_path: &Path) -> Result<String, String> {
+fn perform_archive_action(
+    action: ArchiveAction,
+    archive_path: &Path,
+    cleanup_after_unmount: bool,
+) -> OperationResult {
     let config = Config::load_default().map_err(|error| error.to_string())?;
-    let plan = match action {
-        ArchiveAction::Mount => mount_one_archive_path(&config, archive_path),
-        ArchiveAction::Unmount => unmount_one_archive_path(&config, archive_path),
+    match action {
+        ArchiveAction::Mount => {
+            let plan =
+                mount_one_archive_path(&config, archive_path).map_err(|error| error.to_string())?;
+            Ok(OperationSuccess {
+                message: format!("Mounted at {}", plan.mount_path.display()),
+                cleanup: None,
+            })
+        }
+        ArchiveAction::Unmount => run_unmount_with_cleanup(
+            cleanup_after_unmount,
+            || {
+                let plan = unmount_one_archive_path(&config, archive_path)
+                    .map_err(|error| error.to_string())?;
+                Ok((
+                    format!("Unmounted {}", plan.mount_path.display()),
+                    plan.mount_path,
+                ))
+            },
+            |mount_path| {
+                cleanup_selected_mount_tree(&config, mount_path).map_err(|error| error.to_string())
+            },
+        ),
     }
-    .map_err(|error| error.to_string())?;
+}
 
-    Ok(match action {
-        ArchiveAction::Mount => format!("Mounted at {}", plan.mount_path.display()),
-        ArchiveAction::Unmount => format!("Unmounted {}", plan.mount_path.display()),
+fn run_unmount_with_cleanup<U, C>(
+    cleanup_after_unmount: bool,
+    unmount: U,
+    cleanup: C,
+) -> OperationResult
+where
+    U: FnOnce() -> Result<(String, PathBuf), String>,
+    C: FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
+{
+    let (message, mount_path) = unmount()?;
+    if !cleanup_after_unmount {
+        return Ok(OperationSuccess {
+            message,
+            cleanup: None,
+        });
+    }
+
+    let cleanup = match cleanup(&mount_path) {
+        Ok(removed) => CleanupOutcome::Completed {
+            message: format!(
+                "Cleanup completed for {}: removed {} empty director{}.",
+                mount_path.display(),
+                removed.len(),
+                if removed.len() == 1 { "y" } else { "ies" }
+            ),
+            mount_path,
+        },
+        Err(error) => CleanupOutcome::Failed {
+            message: format!("Cleanup failed for {}: {error}", mount_path.display()),
+            mount_path,
+        },
+    };
+    Ok(OperationSuccess {
+        message,
+        cleanup: Some(cleanup),
     })
 }
 
@@ -578,13 +727,14 @@ struct LoadedViewState<'a> {
     operation: Option<&'a RunningOperation>,
     feedback: Option<&'a ActionFeedback>,
     confirm_unmount: &'a mut Option<PathBuf>,
+    cleanup_after_unmount: &'a mut bool,
 }
 
 fn show_loaded_data(
     ui: &mut egui::Ui,
     data: &LoadedData,
     view_state: LoadedViewState<'_>,
-) -> Option<(ArchiveAction, PathBuf)> {
+) -> Option<OperationRequest> {
     let LoadedViewState {
         filter,
         filtered_rows,
@@ -592,6 +742,7 @@ fn show_loaded_data(
         operation,
         feedback,
         confirm_unmount,
+        cleanup_after_unmount,
     } = view_state;
     let mut requested_action = None;
     ui.horizontal_wrapped(|ui| {
@@ -641,12 +792,21 @@ fn show_loaded_data(
             ui.visuals().error_fg_color
         };
         ui.colored_label(color, &feedback.message);
+        if let Some(cleanup) = &feedback.cleanup {
+            let color = if cleanup.succeeded {
+                egui::Color32::from_rgb(70, 170, 90)
+            } else {
+                ui.visuals().error_fg_color
+            };
+            ui.colored_label(color, &cleanup.message);
+        }
     }
     if let Some(request) = show_selected_archive(
         ui,
         selected_record(&data.records, selected_archive.as_deref()),
         operation,
         confirm_unmount,
+        cleanup_after_unmount,
     ) {
         requested_action = Some(request);
     }
@@ -672,7 +832,11 @@ fn show_loaded_data(
                         .add_enabled(actions_available, egui::Button::new("Unmount"))
                         .clicked()
                     {
-                        requested_action = Some((ArchiveAction::Unmount, archive_path.clone()));
+                        requested_action = Some(OperationRequest {
+                            action: ArchiveAction::Unmount,
+                            archive_path: archive_path.clone(),
+                            cleanup_after_unmount: *cleanup_after_unmount,
+                        });
                         *confirm_unmount = None;
                     }
                 });
@@ -854,7 +1018,8 @@ fn show_selected_archive(
     record: Option<&ArchiveRecord>,
     operation: Option<&RunningOperation>,
     confirm_unmount: &mut Option<PathBuf>,
-) -> Option<(ArchiveAction, PathBuf)> {
+    cleanup_after_unmount: &mut bool,
+) -> Option<OperationRequest> {
     let mut request = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong("Selected archive");
@@ -915,6 +1080,14 @@ fn show_selected_archive(
         ui.add_space(6.0);
         let action = available_action(record.mount_state);
         let busy = operation.is_some();
+        ui.strong("Options");
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.checkbox(
+                cleanup_after_unmount,
+                "Clean empty mount directories after unmount",
+            );
+        });
+        ui.add_space(4.0);
         let label = match action {
             ArchiveAction::Mount => "Mount",
             ArchiveAction::Unmount => "Unmount",
@@ -923,7 +1096,13 @@ fn show_selected_archive(
             if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                 let archive_path = record.mount_plan.archive.path.clone();
                 match action {
-                    ArchiveAction::Mount => request = Some((action, archive_path)),
+                    ArchiveAction::Mount => {
+                        request = Some(OperationRequest {
+                            action,
+                            archive_path,
+                            cleanup_after_unmount: false,
+                        })
+                    }
                     ArchiveAction::Unmount => *confirm_unmount = Some(archive_path),
                 }
             }
@@ -1044,6 +1223,7 @@ mod tests {
             feedback: None,
             confirm_unmount: None,
             history: OperationHistory::default(),
+            cleanup_after_unmount: false,
         }
     }
 
@@ -1134,16 +1314,26 @@ mod tests {
             egui::Context::default(),
             ArchiveAction::Unmount,
             PathBuf::from("/roms/Beta.7z"),
+            true,
         ));
         assert_eq!(app.operation.as_ref().unwrap().action, ArchiveAction::Mount);
 
         sender
-            .send(Ok::<String, String>("original result".to_string()))
+            .send(Ok(OperationSuccess {
+                message: "original result".to_string(),
+                cleanup: None,
+            }))
             .unwrap();
-        assert_eq!(
-            app.operation.as_ref().unwrap().receiver.try_recv().unwrap(),
-            Ok("original result".to_string())
-        );
+        let result = app
+            .operation
+            .as_ref()
+            .unwrap()
+            .receiver
+            .try_recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.message, "original result");
+        assert!(result.cleanup.is_none());
         let feedback = app.feedback.as_ref().unwrap();
         assert!(!feedback.succeeded);
         assert!(feedback.message.contains("already running"));
@@ -1166,7 +1356,13 @@ mod tests {
             egui::Context::default(),
             ArchiveAction::Mount,
             PathBuf::from("/roms/Beta.7z"),
-            |_, _| Ok("mounted".to_string()),
+            false,
+            |_, _, _| {
+                Ok(OperationSuccess {
+                    message: "mounted".to_string(),
+                    cleanup: None,
+                })
+            },
         ));
         assert!(app.confirm_unmount.is_none());
         assert!(app.operation.is_some());
@@ -1238,5 +1434,121 @@ mod tests {
         assert_eq!(entries[0].message, "ratarmount returned an error");
         assert_eq!(entries[1].outcome, ActivityOutcome::Completed);
         assert_eq!(entries[1].message, "mounted successfully");
+    }
+
+    #[test]
+    fn cleanup_is_skipped_when_the_option_is_off() {
+        let cleanup_called = std::cell::Cell::new(false);
+        let success = run_unmount_with_cleanup(
+            false,
+            || Ok(("unmounted".to_string(), PathBuf::from("/mount/Game"))),
+            |_| {
+                cleanup_called.set(true);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+        assert!(!cleanup_called.get());
+        assert!(success.cleanup.is_none());
+    }
+
+    #[test]
+    fn cleanup_runs_after_a_successful_unmount_when_enabled() {
+        let cleanup_called = std::cell::Cell::new(false);
+        let success = run_unmount_with_cleanup(
+            true,
+            || Ok(("unmounted".to_string(), PathBuf::from("/mount/Game"))),
+            |mount_path| {
+                cleanup_called.set(true);
+                assert_eq!(mount_path, Path::new("/mount/Game"));
+                Ok(vec![mount_path.to_path_buf()])
+            },
+        )
+        .unwrap();
+
+        assert!(cleanup_called.get());
+        assert!(matches!(
+            success.cleanup,
+            Some(CleanupOutcome::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn cleanup_does_not_run_after_a_failed_unmount() {
+        let cleanup_called = std::cell::Cell::new(false);
+        let result = run_unmount_with_cleanup(
+            true,
+            || Err("unmount failed".to_string()),
+            |_| {
+                cleanup_called.set(true);
+                Ok(Vec::new())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), "unmount failed");
+        assert!(!cleanup_called.get());
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_successful_unmount_outcome() {
+        let success = run_unmount_with_cleanup(
+            true,
+            || {
+                Ok((
+                    "unmounted successfully".to_string(),
+                    PathBuf::from("/mount/Game"),
+                ))
+            },
+            |_| Err("directory is busy".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(success.message, "unmounted successfully");
+        let Some(CleanupOutcome::Failed { message, .. }) = success.cleanup else {
+            panic!("expected a separate cleanup failure");
+        };
+        assert!(message.contains("directory is busy"));
+    }
+
+    #[test]
+    fn activity_records_cleanup_success_and_failure_with_mount_paths() {
+        let mount_path = PathBuf::from("/mount/Platform/Game");
+        let mut history = OperationHistory::default();
+        record_cleanup_activity(
+            &mut history,
+            &CleanupOutcome::Completed {
+                mount_path: mount_path.clone(),
+                message: "cleanup succeeded".to_string(),
+            },
+        );
+        record_cleanup_activity(
+            &mut history,
+            &CleanupOutcome::Failed {
+                mount_path: mount_path.clone(),
+                message: "cleanup failed".to_string(),
+            },
+        );
+
+        let entries = history.entries().collect::<Vec<_>>();
+        assert_eq!(entries[0].action, ActivityAction::Cleanup);
+        assert_eq!(entries[0].outcome, ActivityOutcome::Failed);
+        assert_eq!(
+            entries[0].archive_path.as_deref(),
+            Some(mount_path.as_path())
+        );
+        assert_eq!(entries[0].message, "cleanup failed");
+        assert_eq!(entries[2].outcome, ActivityOutcome::Completed);
+        assert_eq!(entries[2].message, "cleanup succeeded");
+        assert!(
+            entries[1]
+                .message
+                .contains(&mount_path.display().to_string())
+        );
+        assert!(
+            entries[3]
+                .message
+                .contains(&mount_path.display().to_string())
+        );
     }
 }
