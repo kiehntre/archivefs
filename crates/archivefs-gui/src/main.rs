@@ -1,7 +1,9 @@
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
     ArchiveKind, ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, Config, DoctorReport,
@@ -12,6 +14,89 @@ use eframe::egui;
 
 const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
 const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
+const HISTORY_LIMIT: usize = 50;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivityAction {
+    Refresh,
+    Mount,
+    Unmount,
+}
+
+impl std::fmt::Display for ActivityAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Refresh => "Refresh",
+            Self::Mount => "Mount",
+            Self::Unmount => "Unmount",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivityOutcome {
+    Started,
+    Completed,
+    Failed,
+    Rejected,
+}
+
+impl std::fmt::Display for ActivityOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Started => "Started",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Rejected => "Rejected",
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HistoryEntry {
+    timestamp: SystemTime,
+    action: ActivityAction,
+    archive_path: Option<PathBuf>,
+    outcome: ActivityOutcome,
+    message: String,
+}
+
+impl HistoryEntry {
+    fn new(
+        action: ActivityAction,
+        archive_path: Option<PathBuf>,
+        outcome: ActivityOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            timestamp: SystemTime::now(),
+            action,
+            archive_path,
+            outcome,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct OperationHistory {
+    entries: VecDeque<HistoryEntry>,
+}
+
+impl OperationHistory {
+    fn record(&mut self, entry: HistoryEntry) {
+        self.entries.push_front(entry);
+        self.entries.truncate(HISTORY_LIMIT);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &HistoryEntry> {
+        self.entries.iter()
+    }
+}
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -108,10 +193,18 @@ struct ArchiveFsApp {
     operation: Option<RunningOperation>,
     feedback: Option<ActionFeedback>,
     confirm_unmount: Option<PathBuf>,
+    history: OperationHistory,
 }
 
 impl ArchiveFsApp {
     fn new(context: egui::Context) -> Self {
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Refresh,
+            None,
+            ActivityOutcome::Started,
+            "Loading archive snapshot.",
+        ));
         Self {
             state: start_load(context),
             filter: String::new(),
@@ -120,10 +213,17 @@ impl ArchiveFsApp {
             operation: None,
             feedback: None,
             confirm_unmount: None,
+            history,
         }
     }
 
     fn refresh(&mut self, context: &egui::Context) {
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Refresh,
+            None,
+            ActivityOutcome::Started,
+            "Refreshing archive snapshot.",
+        ));
         self.state = start_load(context.clone());
     }
 
@@ -143,9 +243,23 @@ impl ArchiveFsApp {
             self.state = match result {
                 Ok(data) => {
                     self.filtered_rows = matching_row_indices(&data.rows, &self.filter);
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Refresh,
+                        None,
+                        ActivityOutcome::Completed,
+                        "Archive snapshot refreshed.",
+                    ));
                     LoadState::Ready(Box::new(data))
                 }
-                Err(error) => LoadState::Error(error),
+                Err(error) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Refresh,
+                        None,
+                        ActivityOutcome::Failed,
+                        error.clone(),
+                    ));
+                    LoadState::Error(error)
+                }
             };
         }
     }
@@ -172,17 +286,37 @@ impl ArchiveFsApp {
         F: FnOnce(ArchiveAction, PathBuf) -> Result<String, String> + Send + 'static,
     {
         if self.operation.is_some() {
+            let message = "Another archive operation is already running.".to_string();
             self.feedback = Some(ActionFeedback {
                 succeeded: false,
-                message: "Another archive operation is already running.".to_string(),
+                message: message.clone(),
             });
+            self.history.record(HistoryEntry::new(
+                ActivityAction::from(action),
+                Some(archive_path),
+                ActivityOutcome::Rejected,
+                message,
+            ));
             return false;
         }
 
         let (sender, receiver) = mpsc::channel();
         self.confirm_unmount = None;
         self.feedback = None;
-        self.operation = Some(RunningOperation { action, receiver });
+        self.history.record(HistoryEntry::new(
+            ActivityAction::from(action),
+            Some(archive_path.clone()),
+            ActivityOutcome::Started,
+            match action {
+                ArchiveAction::Mount => "Mount started.",
+                ArchiveAction::Unmount => "Unmount started.",
+            },
+        ));
+        self.operation = Some(RunningOperation {
+            action,
+            archive_path: archive_path.clone(),
+            receiver,
+        });
         thread::spawn(move || {
             let result = worker(action, archive_path);
             let _ = sender.send(result);
@@ -192,21 +326,27 @@ impl ArchiveFsApp {
     }
 
     fn poll_operation(&mut self, context: &egui::Context) {
-        let result =
-            self.operation
-                .as_ref()
-                .and_then(|operation| match operation.receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => Some(Err(
-                        "background archive operation stopped unexpectedly".to_string(),
-                    )),
-                });
+        let result = self.operation.as_ref().and_then(|operation| {
+            let result = match operation.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "background archive operation stopped unexpectedly".to_string(),
+                )),
+            };
+            result.map(|result| (operation.action, operation.archive_path.clone(), result))
+        });
 
-        if let Some(result) = result {
+        if let Some((action, archive_path, result)) = result {
             self.operation = None;
             match result {
                 Ok(message) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::from(action),
+                        Some(archive_path),
+                        ActivityOutcome::Completed,
+                        message.clone(),
+                    ));
                     self.feedback = Some(ActionFeedback {
                         succeeded: true,
                         message,
@@ -214,6 +354,12 @@ impl ArchiveFsApp {
                     self.refresh(context);
                 }
                 Err(message) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::from(action),
+                        Some(archive_path),
+                        ActivityOutcome::Failed,
+                        message.clone(),
+                    ));
                     self.feedback = Some(ActionFeedback {
                         succeeded: false,
                         message,
@@ -230,8 +376,18 @@ enum ArchiveAction {
     Unmount,
 }
 
+impl From<ArchiveAction> for ActivityAction {
+    fn from(action: ArchiveAction) -> Self {
+        match action {
+            ArchiveAction::Mount => Self::Mount,
+            ArchiveAction::Unmount => Self::Unmount,
+        }
+    }
+}
+
 struct RunningOperation {
     action: ArchiveAction,
+    archive_path: PathBuf,
     receiver: Receiver<Result<String, String>>,
 }
 
@@ -268,6 +424,7 @@ impl eframe::App for ArchiveFsApp {
                 });
             });
         });
+        show_activity_panel(context, &mut self.history);
 
         let mut retry = false;
         let mut requested_action = None;
@@ -341,6 +498,77 @@ fn perform_archive_action(action: ArchiveAction, archive_path: &Path) -> Result<
         ArchiveAction::Mount => format!("Mounted at {}", plan.mount_path.display()),
         ArchiveAction::Unmount => format!("Unmounted {}", plan.mount_path.display()),
     })
+}
+
+fn show_activity_panel(context: &egui::Context, history: &mut OperationHistory) {
+    egui::SidePanel::right("activity")
+        .default_width(300.0)
+        .min_width(220.0)
+        .resizable(true)
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Activity");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!history.entries.is_empty(), egui::Button::new("Clear"))
+                        .clicked()
+                    {
+                        history.clear();
+                    }
+                });
+            });
+            ui.separator();
+
+            if history.entries.is_empty() {
+                ui.weak("No recent activity.");
+                return;
+            }
+
+            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+            egui::ScrollArea::vertical()
+                .id_salt("activity_history")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for entry in history.entries() {
+                        let text = history_entry_text(entry);
+                        ui.add_sized(
+                            [ui.available_width(), row_height],
+                            egui::Label::new(&text).truncate(),
+                        )
+                        .on_hover_text(text);
+                    }
+                });
+        });
+}
+
+fn history_entry_text(entry: &HistoryEntry) -> String {
+    let archive = entry
+        .archive_path
+        .as_deref()
+        .map(|path| format!(" · {}", path.display()))
+        .unwrap_or_default();
+    format!(
+        "[{}] {} · {}{} — {}",
+        format_history_timestamp(entry.timestamp),
+        entry.action,
+        entry.outcome,
+        archive,
+        entry.message
+    )
+}
+
+fn format_history_timestamp(timestamp: SystemTime) -> String {
+    let seconds = timestamp
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
 }
 
 struct LoadedViewState<'a> {
@@ -815,7 +1043,12 @@ mod tests {
             operation: None,
             feedback: None,
             confirm_unmount: None,
+            history: OperationHistory::default(),
         }
+    }
+
+    fn history_entry(outcome: ActivityOutcome, message: impl Into<String>) -> HistoryEntry {
+        HistoryEntry::new(ActivityAction::Mount, None, outcome, message)
     }
 
     #[test]
@@ -893,6 +1126,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         app.operation = Some(RunningOperation {
             action: ArchiveAction::Mount,
+            archive_path: PathBuf::from("/roms/Alpha.zip"),
             receiver,
         });
 
@@ -913,6 +1147,14 @@ mod tests {
         let feedback = app.feedback.as_ref().unwrap();
         assert!(!feedback.succeeded);
         assert!(feedback.message.contains("already running"));
+        let rejected = app.history.entries().next().unwrap();
+        assert_eq!(rejected.outcome, ActivityOutcome::Rejected);
+        assert_eq!(rejected.action, ActivityAction::Unmount);
+        assert_eq!(
+            rejected.archive_path.as_deref(),
+            Some(Path::new("/roms/Beta.7z"))
+        );
+        assert!(rejected.message.contains("already running"));
     }
 
     #[test]
@@ -935,10 +1177,66 @@ mod tests {
         let (_sender, receiver) = mpsc::channel();
         let operation = RunningOperation {
             action: ArchiveAction::Mount,
+            archive_path: PathBuf::from("/roms/Alpha.zip"),
             receiver,
         };
 
         assert!(confirmation_actions_available(None));
         assert!(!confirmation_actions_available(Some(&operation)));
+    }
+
+    #[test]
+    fn history_keeps_newest_entries_first() {
+        let mut history = OperationHistory::default();
+        history.record(history_entry(ActivityOutcome::Started, "first"));
+        history.record(history_entry(ActivityOutcome::Completed, "second"));
+
+        let messages = history
+            .entries()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["second", "first"]);
+    }
+
+    #[test]
+    fn history_is_capped_at_fifty_entries() {
+        let mut history = OperationHistory::default();
+        for index in 0..60 {
+            history.record(history_entry(ActivityOutcome::Started, index.to_string()));
+        }
+
+        assert_eq!(history.entries.len(), HISTORY_LIMIT);
+        assert_eq!(history.entries.front().unwrap().message, "59");
+        assert_eq!(history.entries.back().unwrap().message, "10");
+    }
+
+    #[test]
+    fn clearing_history_removes_every_entry() {
+        let mut history = OperationHistory::default();
+        history.record(history_entry(ActivityOutcome::Started, "one"));
+        history.record(history_entry(ActivityOutcome::Completed, "two"));
+
+        history.clear();
+
+        assert!(history.entries.is_empty());
+    }
+
+    #[test]
+    fn history_preserves_success_and_failure_messages() {
+        let mut history = OperationHistory::default();
+        history.record(history_entry(
+            ActivityOutcome::Completed,
+            "mounted successfully",
+        ));
+        history.record(history_entry(
+            ActivityOutcome::Failed,
+            "ratarmount returned an error",
+        ));
+
+        let entries = history.entries().collect::<Vec<_>>();
+        assert_eq!(entries[0].outcome, ActivityOutcome::Failed);
+        assert_eq!(entries[0].message, "ratarmount returned an error");
+        assert_eq!(entries[1].outcome, ActivityOutcome::Completed);
+        assert_eq!(entries[1].message, "mounted successfully");
     }
 }
