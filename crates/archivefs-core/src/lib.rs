@@ -64,6 +64,10 @@ impl ArchiveFsError {
             matches,
         })
     }
+
+    pub fn allows_lazy_unmount_recovery(&self) -> bool {
+        matches!(self, Self::Unmount(_) | Self::ExternalCommand { .. })
+    }
 }
 
 impl fmt::Display for ArchiveFsError {
@@ -1287,6 +1291,53 @@ impl DuplicateDetector for EmptyDuplicateDetector {
 pub trait MountBackend {
     fn mount(&self, plan: &MountPlan) -> Result<()>;
     fn unmount(&self, mount_path: &Path) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LazyUnmountTool {
+    Fusermount3,
+    Umount,
+}
+
+impl fmt::Display for LazyUnmountTool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Fusermount3 => "fusermount3 -uz",
+            Self::Umount => "umount -l",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LazyUnmountCleanupResult {
+    Completed(Vec<PathBuf>),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LazyUnmountResult {
+    pub succeeded: bool,
+    pub tool: LazyUnmountTool,
+    pub mount_path: PathBuf,
+    pub warning: Option<String>,
+    pub cleanup: Option<LazyUnmountCleanupResult>,
+}
+
+trait LazyUnmountBackend {
+    fn mounted_paths_under(&self, root: &Path) -> Result<HashSet<PathBuf>>;
+    fn lazy_unmount(&self, mount_path: &Path) -> Result<LazyUnmountTool>;
+}
+
+struct SystemLazyUnmountBackend;
+
+impl LazyUnmountBackend for SystemLazyUnmountBackend {
+    fn mounted_paths_under(&self, root: &Path) -> Result<HashSet<PathBuf>> {
+        mounted_paths_under(root)
+    }
+
+    fn lazy_unmount(&self, mount_path: &Path) -> Result<LazyUnmountTool> {
+        lazy_unmount_path(mount_path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2647,6 +2698,38 @@ pub fn mount_one_archive_path(config: &Config, archive_path: &Path) -> Result<Mo
     mount_one_archive_path_with_backend(config, archive_path, &backend)
 }
 
+/// Mounts one exact archive only when its planned mount path is not already active.
+pub fn remount_one_archive_path(config: &Config, archive_path: &Path) -> Result<MountPlan> {
+    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
+    let plan = select_mount_plan_by_path(&plans, archive_path)?;
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+    remount_one_plan(config, plan, &mounted_paths, &backend)
+}
+
+fn remount_one_plan(
+    config: &Config,
+    plan: MountPlan,
+    mounted_paths: &HashSet<PathBuf>,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
+    if !plan.archive.path.is_file() {
+        return Err(ArchiveFsError::Mount(format!(
+            "archive no longer exists: {}",
+            plan.archive.path.display()
+        )));
+    }
+    if mounted_paths.contains(&plan.mount_path) {
+        return Err(ArchiveFsError::Mount(format!(
+            "refusing to remount {} because {} is still mounted",
+            plan.archive.path.display(),
+            plan.mount_path.display()
+        )));
+    }
+    mount_unmounted_plan(config, plan, backend)
+}
+
 pub fn mount_one_archive_with_backend(
     config: &Config,
     input: &str,
@@ -2685,20 +2768,30 @@ fn mount_one_plan(
     fs::create_dir_all(&config.mount_root)
         .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    if !mounted_paths.contains(&plan.mount_path) {
-        info!("mounting {}", plan.archive.path.display());
-        fs::create_dir_all(&plan.mount_path)
-            .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
-        backend.mount(&plan)?;
-        info!(
-            "mounted {} at {}",
-            plan.archive.path.display(),
-            plan.mount_path.display()
-        );
-    } else {
+    if mounted_paths.contains(&plan.mount_path) {
         info!("{} is already mounted", plan.mount_path.display());
+        return Ok(plan);
     }
 
+    mount_unmounted_plan(config, plan, backend)
+}
+
+fn mount_unmounted_plan(
+    config: &Config,
+    plan: MountPlan,
+    backend: &impl MountBackend,
+) -> Result<MountPlan> {
+    fs::create_dir_all(&config.mount_root)
+        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    info!("mounting {}", plan.archive.path.display());
+    fs::create_dir_all(&plan.mount_path)
+        .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
+    backend.mount(&plan)?;
+    info!(
+        "mounted {} at {}",
+        plan.archive.path.display(),
+        plan.mount_path.display()
+    );
     Ok(plan)
 }
 
@@ -2734,6 +2827,123 @@ pub fn unmount_one_archive(config: &Config, input: &str) -> Result<MountPlan> {
 pub fn unmount_one_archive_path(config: &Config, archive_path: &Path) -> Result<MountPlan> {
     let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
     unmount_one_archive_path_with_backend(config, archive_path, &backend)
+}
+
+/// Lazily unmounts one exact archive after verifying its mount is active and safely rooted.
+pub fn lazy_unmount_one_archive_path(
+    config: &Config,
+    archive_path: &Path,
+    cleanup_after_unmount: bool,
+) -> Result<LazyUnmountResult> {
+    lazy_unmount_one_archive_path_with_progress(config, archive_path, cleanup_after_unmount, |_| {})
+}
+
+/// Lazily unmounts one exact archive and reports when optional cleanup begins.
+pub fn lazy_unmount_one_archive_path_with_progress(
+    config: &Config,
+    archive_path: &Path,
+    cleanup_after_unmount: bool,
+    cleanup_started: impl FnOnce(&Path),
+) -> Result<LazyUnmountResult> {
+    let backend = SystemLazyUnmountBackend;
+    lazy_unmount_one_archive_path_with_backend(
+        config,
+        archive_path,
+        cleanup_after_unmount,
+        &backend,
+        cleanup_started,
+    )
+}
+
+fn lazy_unmount_one_archive_path_with_backend(
+    config: &Config,
+    archive_path: &Path,
+    cleanup_after_unmount: bool,
+    backend: &impl LazyUnmountBackend,
+    cleanup_started: impl FnOnce(&Path),
+) -> Result<LazyUnmountResult> {
+    info!("lazy-unmount requested for {}", archive_path.display());
+    let scanner = ArchiveScanner::new(config);
+    let plans = scanner.mount_plans()?;
+    let plan = select_mount_plan_by_path(&plans, archive_path)?;
+    let mount_path = plan.mount_path;
+
+    let mounted_paths = backend.mounted_paths_under(&config.mount_root)?;
+    validate_lazy_unmount_path(config, &mount_path, &mounted_paths)?;
+
+    let tool = backend.lazy_unmount(&mount_path)?;
+    if backend
+        .mounted_paths_under(&config.mount_root)?
+        .contains(&mount_path)
+    {
+        return Err(ArchiveFsError::Unmount(format!(
+            "{} is still mounted after lazy unmount",
+            mount_path.display()
+        )));
+    }
+
+    let cleanup = if cleanup_after_unmount {
+        cleanup_started(&mount_path);
+        Some(match cleanup_selected_mount_tree(config, &mount_path) {
+            Ok(removed) => LazyUnmountCleanupResult::Completed(removed),
+            Err(error) => LazyUnmountCleanupResult::Failed(error.to_string()),
+        })
+    } else {
+        None
+    };
+
+    Ok(LazyUnmountResult {
+        succeeded: true,
+        tool,
+        mount_path,
+        warning: Some(
+            "Lazy unmount detached the mount; programs may still be using files from it."
+                .to_string(),
+        ),
+        cleanup,
+    })
+}
+
+fn validate_lazy_unmount_path(
+    config: &Config,
+    mount_path: &Path,
+    mounted_paths: &HashSet<PathBuf>,
+) -> Result<()> {
+    if mount_path == config.mount_root || !path_is_under(mount_path, &config.mount_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to lazy-unmount {} outside mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+
+    if !mounted_paths.contains(mount_path) {
+        return Err(ArchiveFsError::Unmount(format!(
+            "{} is not currently mounted",
+            mount_path.display()
+        )));
+    }
+
+    let Some(parent) = mount_path.parent() else {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to lazy-unmount {} without a parent below mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    };
+    let resolved_root = fs::canonicalize(&config.mount_root)
+        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    let resolved_parent = fs::canonicalize(parent)
+        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+    if resolved_parent != resolved_root && !path_is_under(&resolved_parent, &resolved_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to lazy-unmount {} through a parent outside mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+
+    Ok(())
 }
 
 pub fn unmount_one_archive_with_backend(
@@ -2982,6 +3192,30 @@ fn unmount_path(path: &Path) -> Result<()> {
     })
 }
 
+fn lazy_unmount_path(path: &Path) -> Result<LazyUnmountTool> {
+    let mut last_error = None;
+    if command_available("fusermount3") {
+        match run_command_os("fusermount3", &["-uz".as_ref(), path.as_os_str()]) {
+            Ok(()) => return Ok(LazyUnmountTool::Fusermount3),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if command_available("umount") {
+        match run_command_os("umount", &["-l".as_ref(), path.as_os_str()]) {
+            Ok(()) => return Ok(LazyUnmountTool::Umount),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(
+        last_error.unwrap_or_else(|| ArchiveFsError::ExternalCommand {
+            program: "fusermount3 -uz/umount -l".to_string(),
+            status: None,
+            stderr: "no supported lazy-unmount command is available".to_string(),
+        }),
+    )
+}
+
 pub fn command_available(command: &str) -> bool {
     let path = Path::new(command);
     if path.is_absolute() || path.components().count() > 1 {
@@ -2994,6 +3228,11 @@ pub fn command_available(command: &str) -> bool {
 }
 
 fn run_command(program: &str, args: &[&Path]) -> Result<()> {
+    let args = args.iter().map(|path| path.as_os_str()).collect::<Vec<_>>();
+    run_command_os(program, &args)
+}
+
+fn run_command_os(program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -3310,6 +3549,31 @@ mod tests {
         assert_eq!(backend.unmounted(), vec![plan.mount_path]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn lazy_unmount_path_targets_non_utf8_archive_exactly() {
+        let (config, first, second) = non_utf8_archive_fixture("non_utf8_lazy_unmount");
+        let plan = select_mount_plan_by_path(
+            &ArchiveScanner::new(&config).mount_plans().unwrap(),
+            &second,
+        )
+        .unwrap();
+        fs::create_dir_all(&plan.mount_path).unwrap();
+        let backend = RecordingLazyUnmountBackend::new(vec![
+            HashSet::from([plan.mount_path.clone()]),
+            HashSet::new(),
+        ]);
+
+        let result =
+            lazy_unmount_one_archive_path_with_backend(&config, &second, false, &backend, |_| {})
+                .unwrap();
+
+        assert_eq!(result.mount_path, plan.mount_path);
+        assert_ne!(plan.archive.path, first);
+        assert_eq!(plan.archive.path, second);
+        assert_eq!(backend.unmounted(), vec![result.mount_path]);
+    }
+
     #[test]
     fn unmount_one_unmounts_only_selected_mount_path() {
         let root = test_root("unmount_one_selected");
@@ -3354,6 +3618,213 @@ mod tests {
             ArchiveFsError::Selection(SelectionError::NoMatch { input }) if input == "missing"
         ));
         assert!(backend.unmounted().is_empty());
+    }
+
+    fn lazy_unmount_fixture(name: &str) -> (Config, PathBuf, PathBuf) {
+        let root = test_root(name);
+        let source_root = root.join("roms").join("xbox360");
+        let archive_path = source_root.join("Game.zip");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(&archive_path, b"").unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let mount_path = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0)
+            .mount_path;
+        fs::create_dir_all(&mount_path).unwrap();
+        (config, archive_path, mount_path)
+    }
+
+    #[test]
+    fn lazy_unmount_rejects_mount_root_and_outside_paths() {
+        let root = test_root("lazy_unmount_boundaries");
+        let outside = test_root("lazy_unmount_outside");
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(
+            validate_lazy_unmount_path(&config, &root, &HashSet::from([root.clone()])).is_err()
+        );
+        assert!(
+            validate_lazy_unmount_path(&config, &outside, &HashSet::from([outside.clone()]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lazy_unmount_validation_does_not_touch_the_mounted_target() {
+        let root = test_root("lazy_unmount_no_target_access");
+        let mount_root = root.join("mounts");
+        let parent = mount_root.join("Xbox360");
+        let mount_path = parent.join("Broken_Game");
+        fs::create_dir_all(&parent).unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(!mount_path.exists());
+        validate_lazy_unmount_path(&config, &mount_path, &HashSet::from([mount_path.clone()]))
+            .unwrap();
+        assert!(!mount_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lazy_unmount_validation_rejects_a_symlinked_parent_escape() {
+        let root = test_root("lazy_unmount_parent_escape");
+        let mount_root = root.join("mounts");
+        let outside = test_root("lazy_unmount_parent_escape_outside");
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, mount_root.join("escape")).unwrap();
+        let mount_path = mount_root.join("escape").join("Game");
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        let error =
+            validate_lazy_unmount_path(&config, &mount_path, &HashSet::from([mount_path.clone()]))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("parent outside mount root"));
+        assert!(!mount_path.exists());
+    }
+
+    #[test]
+    fn lazy_unmount_recovery_accepts_a_broken_mount_without_target_access() {
+        let (config, archive_path, mount_path) = lazy_unmount_fixture("lazy_unmount_broken_target");
+        fs::remove_dir(&mount_path).unwrap();
+        let backend = RecordingLazyUnmountBackend::new(vec![
+            HashSet::from([mount_path.clone()]),
+            HashSet::new(),
+        ]);
+
+        let result = lazy_unmount_one_archive_path_with_backend(
+            &config,
+            &archive_path,
+            false,
+            &backend,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(result.mount_path, mount_path);
+        assert_eq!(backend.unmounted(), vec![result.mount_path]);
+    }
+
+    #[test]
+    fn lazy_unmount_rejects_a_path_that_is_not_mounted() {
+        let (config, archive_path, _) = lazy_unmount_fixture("lazy_unmount_not_mounted");
+        let backend = RecordingLazyUnmountBackend::new(vec![HashSet::new()]);
+
+        let error = lazy_unmount_one_archive_path_with_backend(
+            &config,
+            &archive_path,
+            false,
+            &backend,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not currently mounted"));
+        assert!(backend.unmounted().is_empty());
+    }
+
+    #[test]
+    fn lazy_unmount_requires_mount_disappearance_before_cleanup() {
+        let (config, archive_path, mount_path) = lazy_unmount_fixture("lazy_unmount_still_active");
+        let mounted = HashSet::from([mount_path.clone()]);
+        let backend = RecordingLazyUnmountBackend::new(vec![mounted.clone(), mounted]);
+        let cleanup_started = std::cell::Cell::new(false);
+
+        let error = lazy_unmount_one_archive_path_with_backend(
+            &config,
+            &archive_path,
+            true,
+            &backend,
+            |_| cleanup_started.set(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("still mounted"));
+        assert!(!cleanup_started.get());
+        assert!(mount_path.exists());
+    }
+
+    #[test]
+    fn lazy_unmount_cleans_only_after_mount_disappears() {
+        let (config, archive_path, mount_path) = lazy_unmount_fixture("lazy_unmount_cleanup");
+        let backend = RecordingLazyUnmountBackend::new(vec![
+            HashSet::from([mount_path.clone()]),
+            HashSet::new(),
+        ]);
+
+        let cleanup_started = std::cell::Cell::new(false);
+        let result = lazy_unmount_one_archive_path_with_backend(
+            &config,
+            &archive_path,
+            true,
+            &backend,
+            |path| {
+                assert_eq!(path, mount_path);
+                cleanup_started.set(true);
+            },
+        )
+        .unwrap();
+
+        assert!(result.succeeded);
+        assert!(cleanup_started.get());
+        assert_eq!(result.tool, LazyUnmountTool::Fusermount3);
+        assert!(matches!(
+            result.cleanup,
+            Some(LazyUnmountCleanupResult::Completed(ref removed))
+                if removed.contains(&mount_path)
+        ));
+        assert!(!mount_path.exists());
+    }
+
+    #[test]
+    fn remount_rejects_a_still_active_mount_path() {
+        let (config, _, mount_path) = lazy_unmount_fixture("remount_still_active");
+        let plan = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0);
+        let backend = RecordingBackend::default();
+
+        let error =
+            remount_one_plan(&config, plan, &HashSet::from([mount_path]), &backend).unwrap_err();
+
+        assert!(error.to_string().contains("still mounted"));
+        assert!(backend.mounted().is_empty());
+    }
+
+    #[test]
+    fn remount_rejects_an_archive_that_no_longer_exists() {
+        let (config, archive_path, _) = lazy_unmount_fixture("remount_missing_archive");
+        let plan = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0);
+        fs::remove_file(&archive_path).unwrap();
+        let backend = RecordingBackend::default();
+
+        let error = remount_one_plan(&config, plan, &HashSet::new(), &backend).unwrap_err();
+
+        assert!(error.to_string().contains("no longer exists"));
+        assert!(backend.mounted().is_empty());
     }
 
     #[test]
@@ -4569,6 +5040,39 @@ mod tests {
         fn unmount(&self, mount_path: &Path) -> Result<()> {
             self.unmounted.borrow_mut().push(mount_path.to_path_buf());
             Ok(())
+        }
+    }
+
+    struct RecordingLazyUnmountBackend {
+        mounted_snapshots: std::cell::RefCell<std::collections::VecDeque<HashSet<PathBuf>>>,
+        unmounted: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl RecordingLazyUnmountBackend {
+        fn new(mounted_snapshots: Vec<HashSet<PathBuf>>) -> Self {
+            Self {
+                mounted_snapshots: std::cell::RefCell::new(mounted_snapshots.into()),
+                unmounted: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn unmounted(&self) -> Vec<PathBuf> {
+            self.unmounted.borrow().clone()
+        }
+    }
+
+    impl LazyUnmountBackend for RecordingLazyUnmountBackend {
+        fn mounted_paths_under(&self, _root: &Path) -> Result<HashSet<PathBuf>> {
+            Ok(self
+                .mounted_snapshots
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        fn lazy_unmount(&self, mount_path: &Path) -> Result<LazyUnmountTool> {
+            self.unmounted.borrow_mut().push(mount_path.to_path_buf());
+            Ok(LazyUnmountTool::Fusermount3)
         }
     }
 

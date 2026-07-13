@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -7,20 +7,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
     ArchiveKind, ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, Config, DoctorReport,
-    DoctorStatus, MountState, cleanup_selected_mount_tree, load_read_only_snapshot_default,
-    mount_one_archive_path, unmount_one_archive_path,
+    DoctorStatus, LazyUnmountCleanupResult, MountState, cleanup_selected_mount_tree,
+    lazy_unmount_one_archive_path_with_progress, load_read_only_snapshot_default,
+    mount_one_archive_path, remount_one_archive_path, unmount_one_archive_path,
 };
 use eframe::egui;
 
 const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
 const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
 const HISTORY_LIMIT: usize = 50;
+const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
+const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
+const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
+const LAZY_UNMOUNT_SUCCESS: &str = "Lazy unmount completed.\n\nThe mount is no longer visible. Some applications may still hold references to files that were open before the unmount. Close and reopen those applications before remounting.";
+const LAZY_CLEANUP_SUCCESS: &str = "Empty mount directories were cleaned safely.";
+const LAZY_CLEANUP_FAILURE: &str = "The mount was detached successfully, but ArchiveFS could not remove one or more empty directories. No non-empty directory was removed.";
+const REMOUNT_GUIDANCE: &str = "Make sure applications that used the previous mount have been closed. Remounting while an application still holds the old mount may cause confusing or stale file access.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivityAction {
     Refresh,
     Mount,
     Unmount,
+    LazyUnmount,
+    Remount,
     Cleanup,
 }
 
@@ -30,6 +40,8 @@ impl std::fmt::Display for ActivityAction {
             Self::Refresh => "Refresh",
             Self::Mount => "Mount",
             Self::Unmount => "Unmount",
+            Self::LazyUnmount => "Lazy unmount",
+            Self::Remount => "Remount",
             Self::Cleanup => "Cleanup",
         })
     }
@@ -38,6 +50,10 @@ impl std::fmt::Display for ActivityAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivityOutcome {
     Started,
+    Offered,
+    Retried,
+    Confirmed,
+    Cancelled,
     Completed,
     Failed,
     Rejected,
@@ -47,6 +63,10 @@ impl std::fmt::Display for ActivityOutcome {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Started => "Started",
+            Self::Offered => "Offered",
+            Self::Retried => "Retried",
+            Self::Confirmed => "Confirmed",
+            Self::Cancelled => "Cancelled",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Rejected => "Rejected",
@@ -195,6 +215,12 @@ struct ArchiveFsApp {
     operation: Option<RunningOperation>,
     feedback: Option<ActionFeedback>,
     confirm_unmount: Option<PathBuf>,
+    confirm_lazy_unmount: Option<PathBuf>,
+    confirm_lazy_unmount_final: Option<PathBuf>,
+    focus_lazy_cancel: bool,
+    focus_final_lazy_cancel: bool,
+    lazy_unmount_offer: Option<PathBuf>,
+    remount_offers: HashSet<PathBuf>,
     history: OperationHistory,
     cleanup_after_unmount: bool,
 }
@@ -216,6 +242,12 @@ impl ArchiveFsApp {
             operation: None,
             feedback: None,
             confirm_unmount: None,
+            confirm_lazy_unmount: None,
+            confirm_lazy_unmount_final: None,
+            focus_lazy_cancel: false,
+            focus_final_lazy_cancel: false,
+            lazy_unmount_offer: None,
+            remount_offers: HashSet::new(),
             history,
             cleanup_after_unmount: false,
         }
@@ -280,8 +312,13 @@ impl ArchiveFsApp {
             action,
             archive_path,
             cleanup_after_unmount,
-            |action, archive_path, cleanup_after_unmount| {
-                perform_archive_action(action, &archive_path, cleanup_after_unmount)
+            |action, archive_path, cleanup_after_unmount, progress_sender| {
+                perform_archive_action(
+                    action,
+                    &archive_path,
+                    cleanup_after_unmount,
+                    progress_sender,
+                )
             },
         )
     }
@@ -295,7 +332,9 @@ impl ArchiveFsApp {
         worker: F,
     ) -> bool
     where
-        F: FnOnce(ArchiveAction, PathBuf, bool) -> OperationResult + Send + 'static,
+        F: FnOnce(ArchiveAction, PathBuf, bool, mpsc::Sender<OperationProgress>) -> OperationResult
+            + Send
+            + 'static,
     {
         if self.operation.is_some() {
             let message = "Another archive operation is already running.".to_string();
@@ -303,6 +342,8 @@ impl ArchiveFsApp {
                 succeeded: false,
                 message: message.clone(),
                 cleanup: None,
+                warning: None,
+                more_information: None,
             });
             self.history.record(HistoryEntry::new(
                 ActivityAction::from(action),
@@ -314,7 +355,12 @@ impl ArchiveFsApp {
         }
 
         let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
         self.confirm_unmount = None;
+        self.confirm_lazy_unmount = None;
+        self.confirm_lazy_unmount_final = None;
+        self.focus_lazy_cancel = false;
+        self.focus_final_lazy_cancel = false;
         self.feedback = None;
         self.history.record(HistoryEntry::new(
             ActivityAction::from(action),
@@ -323,32 +369,57 @@ impl ArchiveFsApp {
             match action {
                 ArchiveAction::Mount => "Mount started.",
                 ArchiveAction::Unmount => "Unmount started.",
+                ArchiveAction::LazyUnmount => "Lazy unmount started.",
+                ArchiveAction::Remount => "Remount started.",
             },
         ));
         self.operation = Some(RunningOperation {
             action,
             archive_path: archive_path.clone(),
             receiver,
+            progress_receiver,
         });
         thread::spawn(move || {
-            let result = worker(action, archive_path, cleanup_after_unmount);
+            let result = worker(action, archive_path, cleanup_after_unmount, progress_sender);
             let _ = sender.send(result);
             context.request_repaint();
         });
         true
     }
 
+    fn record_pending_operation_progress(&mut self) {
+        let progress = self
+            .operation
+            .as_ref()
+            .map(|operation| operation.progress_receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in progress {
+            match event {
+                OperationProgress::CleanupStarted(mount_path) => {
+                    record_cleanup_started_activity(&mut self.history, &mount_path);
+                }
+            }
+        }
+    }
+
     fn poll_operation(&mut self, context: &egui::Context) {
+        self.record_pending_operation_progress();
+
         let result = self.operation.as_ref().and_then(|operation| {
             let result = match operation.receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err(
-                    "background archive operation stopped unexpectedly".to_string(),
-                )),
+                Err(TryRecvError::Disconnected) => Some(Err(OperationFailure {
+                    message: "background archive operation stopped unexpectedly".to_string(),
+                    offer_lazy_unmount: false,
+                })),
             };
             result.map(|result| (operation.action, operation.archive_path.clone(), result))
         });
+
+        if result.is_some() {
+            self.record_pending_operation_progress();
+        }
 
         if let Some((action, archive_path, result)) = result {
             self.operation = None;
@@ -361,7 +432,7 @@ impl ArchiveFsApp {
                         success.message.clone(),
                     ));
                     let cleanup_feedback = success.cleanup.as_ref().map(|cleanup| {
-                        record_cleanup_activity(&mut self.history, cleanup);
+                        record_cleanup_finished_activity(&mut self.history, cleanup);
                         CleanupFeedback {
                             succeeded: matches!(cleanup, CleanupOutcome::Completed { .. }),
                             message: cleanup.message().to_string(),
@@ -371,20 +442,65 @@ impl ArchiveFsApp {
                         succeeded: true,
                         message: success.message,
                         cleanup: cleanup_feedback,
+                        warning: success.warning,
+                        more_information: None,
                     });
+                    match action {
+                        ArchiveAction::Unmount | ArchiveAction::LazyUnmount => {
+                            self.lazy_unmount_offer = None;
+                            self.remount_offers.insert(archive_path.clone());
+                            self.history.record(HistoryEntry::new(
+                                ActivityAction::Remount,
+                                Some(archive_path),
+                                ActivityOutcome::Offered,
+                                "Remount offered after successful unmount.",
+                            ));
+                        }
+                        ArchiveAction::Remount => {
+                            self.remount_offers.remove(&archive_path);
+                        }
+                        ArchiveAction::Mount => {}
+                    }
                     self.refresh(context);
                 }
-                Err(message) => {
+                Err(failure) => {
+                    let normal_unmount_recovery =
+                        action == ArchiveAction::Unmount && failure.offer_lazy_unmount;
+                    let activity_message = if normal_unmount_recovery {
+                        format!("Normal unmount failed: {}", failure.message)
+                    } else {
+                        failure.message.clone()
+                    };
                     self.history.record(HistoryEntry::new(
                         ActivityAction::from(action),
-                        Some(archive_path),
+                        Some(archive_path.clone()),
                         ActivityOutcome::Failed,
-                        message.clone(),
+                        activity_message,
                     ));
+                    if normal_unmount_recovery {
+                        self.lazy_unmount_offer = Some(archive_path.clone());
+                        self.history.record(HistoryEntry::new(
+                            ActivityAction::LazyUnmount,
+                            Some(archive_path),
+                            ActivityOutcome::Offered,
+                            "Lazy unmount offered after normal unmount failed.",
+                        ));
+                    }
                     self.feedback = Some(ActionFeedback {
                         succeeded: false,
-                        message,
+                        message: if normal_unmount_recovery {
+                            NORMAL_UNMOUNT_FAILURE_SUMMARY.to_string()
+                        } else {
+                            failure.message.clone()
+                        },
                         cleanup: None,
+                        warning: None,
+                        more_information: normal_unmount_recovery.then(|| {
+                            format!(
+                                "{NORMAL_UNMOUNT_RECOVERY_GUIDANCE}\n\nArchiveFS detail: {}",
+                                failure.message
+                            )
+                        }),
                     });
                 }
             }
@@ -396,6 +512,8 @@ impl ArchiveFsApp {
 enum ArchiveAction {
     Mount,
     Unmount,
+    LazyUnmount,
+    Remount,
 }
 
 struct OperationRequest {
@@ -409,16 +527,30 @@ impl From<ArchiveAction> for ActivityAction {
         match action {
             ArchiveAction::Mount => Self::Mount,
             ArchiveAction::Unmount => Self::Unmount,
+            ArchiveAction::LazyUnmount => Self::LazyUnmount,
+            ArchiveAction::Remount => Self::Remount,
         }
     }
 }
 
-type OperationResult = Result<OperationSuccess, String>;
+type OperationResult = Result<OperationSuccess, OperationFailure>;
+
+#[derive(Debug)]
+enum OperationProgress {
+    CleanupStarted(PathBuf),
+}
+
+#[derive(Debug)]
+struct OperationFailure {
+    message: String,
+    offer_lazy_unmount: bool,
+}
 
 #[derive(Debug)]
 struct OperationSuccess {
     message: String,
     cleanup: Option<CleanupOutcome>,
+    warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -447,17 +579,19 @@ impl CleanupOutcome {
     }
 }
 
-fn record_cleanup_activity(history: &mut OperationHistory, cleanup: &CleanupOutcome) {
-    let mount_path = cleanup.mount_path().to_path_buf();
+fn record_cleanup_started_activity(history: &mut OperationHistory, mount_path: &Path) {
     history.record(HistoryEntry::new(
         ActivityAction::Cleanup,
-        Some(mount_path.clone()),
+        Some(mount_path.to_path_buf()),
         ActivityOutcome::Started,
         format!("Cleanup started for {}.", mount_path.display()),
     ));
+}
+
+fn record_cleanup_finished_activity(history: &mut OperationHistory, cleanup: &CleanupOutcome) {
     history.record(HistoryEntry::new(
         ActivityAction::Cleanup,
-        Some(mount_path),
+        Some(cleanup.mount_path().to_path_buf()),
         match cleanup {
             CleanupOutcome::Completed { .. } => ActivityOutcome::Completed,
             CleanupOutcome::Failed { .. } => ActivityOutcome::Failed,
@@ -470,12 +604,15 @@ struct RunningOperation {
     action: ArchiveAction,
     archive_path: PathBuf,
     receiver: Receiver<OperationResult>,
+    progress_receiver: Receiver<OperationProgress>,
 }
 
 struct ActionFeedback {
     succeeded: bool,
     message: String,
     cleanup: Option<CleanupFeedback>,
+    warning: Option<String>,
+    more_information: Option<String>,
 }
 
 struct CleanupFeedback {
@@ -544,7 +681,14 @@ impl eframe::App for ArchiveFsApp {
                         operation: self.operation.as_ref(),
                         feedback: self.feedback.as_ref(),
                         confirm_unmount: &mut self.confirm_unmount,
+                        confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
+                        confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
+                        focus_lazy_cancel: &mut self.focus_lazy_cancel,
+                        focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
+                        lazy_unmount_offer: self.lazy_unmount_offer.as_deref(),
+                        remount_offers: &self.remount_offers,
                         cleanup_after_unmount: &mut self.cleanup_after_unmount,
+                        history: &mut self.history,
                     },
                 )
             }
@@ -583,22 +727,35 @@ fn perform_archive_action(
     action: ArchiveAction,
     archive_path: &Path,
     cleanup_after_unmount: bool,
+    progress_sender: mpsc::Sender<OperationProgress>,
 ) -> OperationResult {
-    let config = Config::load_default().map_err(|error| error.to_string())?;
+    let config = Config::load_default().map_err(|error| OperationFailure {
+        message: error.to_string(),
+        offer_lazy_unmount: false,
+    })?;
     match action {
         ArchiveAction::Mount => {
-            let plan =
-                mount_one_archive_path(&config, archive_path).map_err(|error| error.to_string())?;
+            let plan = mount_one_archive_path(&config, archive_path).map_err(|error| {
+                OperationFailure {
+                    message: error.to_string(),
+                    offer_lazy_unmount: false,
+                }
+            })?;
             Ok(OperationSuccess {
                 message: format!("Mounted at {}", plan.mount_path.display()),
                 cleanup: None,
+                warning: None,
             })
         }
         ArchiveAction::Unmount => run_unmount_with_cleanup(
             cleanup_after_unmount,
             || {
-                let plan = unmount_one_archive_path(&config, archive_path)
-                    .map_err(|error| error.to_string())?;
+                let plan = unmount_one_archive_path(&config, archive_path).map_err(|error| {
+                    OperationFailure {
+                        message: error.to_string(),
+                        offer_lazy_unmount: error.allows_lazy_unmount_recovery(),
+                    }
+                })?;
                 Ok((
                     format!("Unmounted {}", plan.mount_path.display()),
                     plan.mount_path,
@@ -607,17 +764,75 @@ fn perform_archive_action(
             |mount_path| {
                 cleanup_selected_mount_tree(&config, mount_path).map_err(|error| error.to_string())
             },
+            |mount_path| send_cleanup_started(&progress_sender, mount_path),
         ),
+        ArchiveAction::LazyUnmount => {
+            let result = lazy_unmount_one_archive_path_with_progress(
+                &config,
+                archive_path,
+                cleanup_after_unmount,
+                |mount_path| send_cleanup_started(&progress_sender, mount_path),
+            )
+            .map_err(|error| OperationFailure {
+                message: error.to_string(),
+                offer_lazy_unmount: false,
+            })?;
+            let cleanup = result.cleanup.map(|cleanup| match cleanup {
+                LazyUnmountCleanupResult::Completed(removed) => CleanupOutcome::Completed {
+                    message: format!(
+                        "{LAZY_CLEANUP_SUCCESS} Removed {} empty director{} from {}.",
+                        removed.len(),
+                        if removed.len() == 1 { "y" } else { "ies" },
+                        result.mount_path.display()
+                    ),
+                    mount_path: result.mount_path.clone(),
+                },
+                LazyUnmountCleanupResult::Failed(error) => CleanupOutcome::Failed {
+                    message: format!(
+                        "{LAZY_CLEANUP_FAILURE} Path: {}. Detail: {error}",
+                        result.mount_path.display(),
+                    ),
+                    mount_path: result.mount_path.clone(),
+                },
+            });
+            Ok(OperationSuccess {
+                message: LAZY_UNMOUNT_SUCCESS.to_string(),
+                cleanup,
+                warning: Some(format!(
+                    "Emergency recovery used {} for {}.",
+                    result.tool,
+                    result.mount_path.display()
+                )),
+            })
+        }
+        ArchiveAction::Remount => {
+            let plan = remount_one_archive_path(&config, archive_path).map_err(|error| {
+                OperationFailure {
+                    message: error.to_string(),
+                    offer_lazy_unmount: false,
+                }
+            })?;
+            Ok(OperationSuccess {
+                message: format!("Remounted at {}", plan.mount_path.display()),
+                cleanup: None,
+                warning: None,
+            })
+        }
     }
+}
+
+fn send_cleanup_started(progress_sender: &mpsc::Sender<OperationProgress>, mount_path: &Path) {
+    let _ = progress_sender.send(OperationProgress::CleanupStarted(mount_path.to_path_buf()));
 }
 
 fn run_unmount_with_cleanup<U, C>(
     cleanup_after_unmount: bool,
     unmount: U,
     cleanup: C,
+    cleanup_started: impl FnOnce(&Path),
 ) -> OperationResult
 where
-    U: FnOnce() -> Result<(String, PathBuf), String>,
+    U: FnOnce() -> Result<(String, PathBuf), OperationFailure>,
     C: FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
 {
     let (message, mount_path) = unmount()?;
@@ -625,17 +840,14 @@ where
         return Ok(OperationSuccess {
             message,
             cleanup: None,
+            warning: None,
         });
     }
 
+    cleanup_started(&mount_path);
     let cleanup = match cleanup(&mount_path) {
         Ok(removed) => CleanupOutcome::Completed {
-            message: format!(
-                "Cleanup completed for {}: removed {} empty director{}.",
-                mount_path.display(),
-                removed.len(),
-                if removed.len() == 1 { "y" } else { "ies" }
-            ),
+            message: cleanup_completed_message(&mount_path, removed.len()),
             mount_path,
         },
         Err(error) => CleanupOutcome::Failed {
@@ -646,7 +858,17 @@ where
     Ok(OperationSuccess {
         message,
         cleanup: Some(cleanup),
+        warning: None,
     })
+}
+
+fn cleanup_completed_message(mount_path: &Path, removed_count: usize) -> String {
+    format!(
+        "Cleanup completed for {}: removed {} empty director{}.",
+        mount_path.display(),
+        removed_count,
+        if removed_count == 1 { "y" } else { "ies" }
+    )
 }
 
 fn show_activity_panel(context: &egui::Context, history: &mut OperationHistory) {
@@ -727,7 +949,14 @@ struct LoadedViewState<'a> {
     operation: Option<&'a RunningOperation>,
     feedback: Option<&'a ActionFeedback>,
     confirm_unmount: &'a mut Option<PathBuf>,
+    confirm_lazy_unmount: &'a mut Option<PathBuf>,
+    confirm_lazy_unmount_final: &'a mut Option<PathBuf>,
+    focus_lazy_cancel: &'a mut bool,
+    focus_final_lazy_cancel: &'a mut bool,
+    lazy_unmount_offer: Option<&'a Path>,
+    remount_offers: &'a HashSet<PathBuf>,
     cleanup_after_unmount: &'a mut bool,
+    history: &'a mut OperationHistory,
 }
 
 fn show_loaded_data(
@@ -742,7 +971,14 @@ fn show_loaded_data(
         operation,
         feedback,
         confirm_unmount,
+        confirm_lazy_unmount,
+        confirm_lazy_unmount_final,
+        focus_lazy_cancel,
+        focus_final_lazy_cancel,
+        lazy_unmount_offer,
+        remount_offers,
         cleanup_after_unmount,
+        history,
     } = view_state;
     let mut requested_action = None;
     ui.horizontal_wrapped(|ui| {
@@ -792,6 +1028,16 @@ fn show_loaded_data(
             ui.visuals().error_fg_color
         };
         ui.colored_label(color, &feedback.message);
+        if let Some(warning) = &feedback.warning {
+            ui.colored_label(egui::Color32::from_rgb(210, 140, 40), warning);
+        }
+        if let Some(more_information) = &feedback.more_information {
+            egui::CollapsingHeader::new("More information")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(more_information);
+                });
+        }
         if let Some(cleanup) = &feedback.cleanup {
             let color = if cleanup.succeeded {
                 egui::Color32::from_rgb(70, 170, 90)
@@ -804,11 +1050,135 @@ fn show_loaded_data(
     if let Some(request) = show_selected_archive(
         ui,
         selected_record(&data.records, selected_archive.as_deref()),
-        operation,
-        confirm_unmount,
-        cleanup_after_unmount,
+        SelectedArchiveViewState {
+            operation,
+            confirm_unmount,
+            confirm_lazy_unmount,
+            focus_lazy_cancel,
+            lazy_unmount_offer,
+            remount_offers,
+            cleanup_after_unmount,
+        },
     ) {
         requested_action = Some(request);
+    }
+
+    if let Some(archive_path) = confirm_lazy_unmount.clone() {
+        let actions_available =
+            lazy_confirmation_available(&archive_path, lazy_unmount_offer, operation.is_some());
+        egui::Window::new("Use Lazy Unmount?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(LAZY_UNMOUNT_WARNING);
+                ui.label(archive_path.display().to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.add_enabled(
+                        actions_available,
+                        egui::Button::new("Cancel").fill(ui.visuals().selection.bg_fill),
+                    );
+                    if *focus_lazy_cancel {
+                        cancel.request_focus();
+                        *focus_lazy_cancel = false;
+                    }
+                    if cancel.clicked() {
+                        record_recovery_activity(
+                            history,
+                            ActivityAction::LazyUnmount,
+                            &archive_path,
+                            ActivityOutcome::Cancelled,
+                            "User cancelled lazy unmount.",
+                        );
+                        *confirm_lazy_unmount = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            actions_available,
+                            egui::Button::new("Try Normal Unmount Again"),
+                        )
+                        .clicked()
+                    {
+                        record_recovery_activity(
+                            history,
+                            ActivityAction::Unmount,
+                            &archive_path,
+                            ActivityOutcome::Retried,
+                            "Normal unmount retried.",
+                        );
+                        requested_action = Some(OperationRequest {
+                            action: ArchiveAction::Unmount,
+                            archive_path: archive_path.clone(),
+                            cleanup_after_unmount: *cleanup_after_unmount,
+                        });
+                        *confirm_lazy_unmount = None;
+                    }
+                    if ui
+                        .add_enabled(actions_available, egui::Button::new("Lazy Unmount"))
+                        .clicked()
+                    {
+                        advance_to_final_lazy_confirmation(
+                            confirm_lazy_unmount,
+                            confirm_lazy_unmount_final,
+                            focus_final_lazy_cancel,
+                            &archive_path,
+                        );
+                    }
+                });
+            });
+    }
+
+    if let Some(archive_path) = confirm_lazy_unmount_final.clone() {
+        let actions_available =
+            lazy_confirmation_available(&archive_path, lazy_unmount_offer, operation.is_some());
+        egui::Window::new("Confirm Lazy Unmount")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label("This is the final confirmation. Close applications using this mount before continuing.");
+                ui.label(archive_path.display().to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.add_enabled(
+                        actions_available,
+                        egui::Button::new("Cancel").fill(ui.visuals().selection.bg_fill),
+                    );
+                    if *focus_final_lazy_cancel {
+                        cancel.request_focus();
+                        *focus_final_lazy_cancel = false;
+                    }
+                    if cancel.clicked() {
+                        record_recovery_activity(
+                            history,
+                            ActivityAction::LazyUnmount,
+                            &archive_path,
+                            ActivityOutcome::Cancelled,
+                            "User cancelled lazy unmount.",
+                        );
+                        *confirm_lazy_unmount_final = None;
+                    }
+                    if ui
+                        .add_enabled(actions_available, egui::Button::new("Confirm Lazy Unmount"))
+                        .clicked()
+                    {
+                        record_recovery_activity(
+                            history,
+                            ActivityAction::LazyUnmount,
+                            &archive_path,
+                            ActivityOutcome::Confirmed,
+                            "Lazy unmount confirmed.",
+                        );
+                        requested_action = Some(OperationRequest {
+                            action: ArchiveAction::LazyUnmount,
+                            archive_path: archive_path.clone(),
+                            cleanup_after_unmount: *cleanup_after_unmount,
+                        });
+                        *confirm_lazy_unmount_final = None;
+                    }
+                });
+            });
     }
 
     if let Some(archive_path) = confirm_unmount.clone() {
@@ -1013,13 +1383,89 @@ fn confirmation_actions_available(operation: Option<&RunningOperation>) -> bool 
     operation.is_none()
 }
 
+fn record_recovery_activity(
+    history: &mut OperationHistory,
+    action: ActivityAction,
+    archive_path: &Path,
+    outcome: ActivityOutcome,
+    message: &'static str,
+) {
+    history.record(HistoryEntry::new(
+        action,
+        Some(archive_path.to_path_buf()),
+        outcome,
+        message,
+    ));
+}
+
+fn advance_to_final_lazy_confirmation(
+    warning_confirmation: &mut Option<PathBuf>,
+    final_confirmation: &mut Option<PathBuf>,
+    focus_final_cancel: &mut bool,
+    archive_path: &Path,
+) {
+    *final_confirmation = Some(archive_path.to_path_buf());
+    *warning_confirmation = None;
+    *focus_final_cancel = true;
+}
+
+fn lazy_confirmation_available(
+    confirmed_archive: &Path,
+    offered_archive: Option<&Path>,
+    busy: bool,
+) -> bool {
+    !busy && offered_archive == Some(confirmed_archive)
+}
+
+fn lazy_unmount_available(
+    record: &ArchiveRecord,
+    offered_archive: Option<&Path>,
+    busy: bool,
+) -> bool {
+    !busy
+        && record.mount_state == MountState::Mounted
+        && offered_archive == Some(record.mount_plan.archive.path.as_path())
+}
+
+fn remount_available(
+    record: &ArchiveRecord,
+    offered_archives: &HashSet<PathBuf>,
+    busy: bool,
+) -> bool {
+    !busy
+        && record.mount_state != MountState::Mounted
+        && offered_archives.contains(&record.mount_plan.archive.path)
+}
+
+fn remount_is_offered(record: &ArchiveRecord, offered_archives: &HashSet<PathBuf>) -> bool {
+    record.mount_state != MountState::Mounted
+        && offered_archives.contains(&record.mount_plan.archive.path)
+}
+
+struct SelectedArchiveViewState<'a> {
+    operation: Option<&'a RunningOperation>,
+    confirm_unmount: &'a mut Option<PathBuf>,
+    confirm_lazy_unmount: &'a mut Option<PathBuf>,
+    focus_lazy_cancel: &'a mut bool,
+    lazy_unmount_offer: Option<&'a Path>,
+    remount_offers: &'a HashSet<PathBuf>,
+    cleanup_after_unmount: &'a mut bool,
+}
+
 fn show_selected_archive(
     ui: &mut egui::Ui,
     record: Option<&ArchiveRecord>,
-    operation: Option<&RunningOperation>,
-    confirm_unmount: &mut Option<PathBuf>,
-    cleanup_after_unmount: &mut bool,
+    view_state: SelectedArchiveViewState<'_>,
 ) -> Option<OperationRequest> {
+    let SelectedArchiveViewState {
+        operation,
+        confirm_unmount,
+        confirm_lazy_unmount,
+        focus_lazy_cancel,
+        lazy_unmount_offer,
+        remount_offers,
+        cleanup_after_unmount,
+    } = view_state;
     let mut request = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong("Selected archive");
@@ -1078,8 +1524,14 @@ fn show_selected_archive(
             });
 
         ui.add_space(6.0);
-        let action = available_action(record.mount_state);
         let busy = operation.is_some();
+        let can_lazy_unmount = lazy_unmount_available(record, lazy_unmount_offer, busy);
+        let remount_offered = remount_is_offered(record, remount_offers);
+        let action = if remount_offered {
+            ArchiveAction::Remount
+        } else {
+            available_action(record.mount_state)
+        };
         ui.strong("Options");
         ui.add_enabled_ui(!busy, |ui| {
             ui.checkbox(
@@ -1088,12 +1540,24 @@ fn show_selected_archive(
             );
         });
         ui.add_space(4.0);
+        if remount_offered {
+            ui.colored_label(egui::Color32::from_rgb(210, 140, 40), REMOUNT_GUIDANCE);
+        }
         let label = match action {
             ArchiveAction::Mount => "Mount",
             ArchiveAction::Unmount => "Unmount",
+            ArchiveAction::LazyUnmount => "Lazy Unmount",
+            ArchiveAction::Remount => "Remount",
+        };
+        let primary_enabled = match action {
+            ArchiveAction::Remount => remount_available(record, remount_offers, busy),
+            ArchiveAction::Mount | ArchiveAction::Unmount | ArchiveAction::LazyUnmount => !busy,
         };
         ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+            if ui
+                .add_enabled(primary_enabled, egui::Button::new(label))
+                .clicked()
+            {
                 let archive_path = record.mount_plan.archive.path.clone();
                 match action {
                     ArchiveAction::Mount => {
@@ -1104,13 +1568,34 @@ fn show_selected_archive(
                         })
                     }
                     ArchiveAction::Unmount => *confirm_unmount = Some(archive_path),
+                    ArchiveAction::LazyUnmount => unreachable!("lazy unmount uses recovery button"),
+                    ArchiveAction::Remount => {
+                        request = Some(OperationRequest {
+                            action,
+                            archive_path,
+                            cleanup_after_unmount: false,
+                        })
+                    }
                 }
+            }
+            if can_lazy_unmount
+                && ui
+                    .add(egui::Button::new("Lazy Unmount"))
+                    .on_hover_text(
+                        "Emergency recovery option available because normal unmount failed.",
+                    )
+                    .clicked()
+            {
+                *confirm_lazy_unmount = Some(record.mount_plan.archive.path.clone());
+                *focus_lazy_cancel = true;
             }
             if let Some(operation) = operation {
                 ui.spinner();
                 ui.label(match operation.action {
                     ArchiveAction::Mount => "Mounting...",
                     ArchiveAction::Unmount => "Unmounting...",
+                    ArchiveAction::LazyUnmount => "Lazy unmounting...",
+                    ArchiveAction::Remount => "Remounting...",
                 });
             }
         });
@@ -1222,6 +1707,12 @@ mod tests {
             operation: None,
             feedback: None,
             confirm_unmount: None,
+            confirm_lazy_unmount: None,
+            confirm_lazy_unmount_final: None,
+            focus_lazy_cancel: false,
+            focus_final_lazy_cancel: false,
+            lazy_unmount_offer: None,
+            remount_offers: HashSet::new(),
             history: OperationHistory::default(),
             cleanup_after_unmount: false,
         }
@@ -1308,6 +1799,7 @@ mod tests {
             action: ArchiveAction::Mount,
             archive_path: PathBuf::from("/roms/Alpha.zip"),
             receiver,
+            progress_receiver: mpsc::channel().1,
         });
 
         assert!(!app.start_operation(
@@ -1322,6 +1814,7 @@ mod tests {
             .send(Ok(OperationSuccess {
                 message: "original result".to_string(),
                 cleanup: None,
+                warning: None,
             }))
             .unwrap();
         let result = app
@@ -1357,10 +1850,11 @@ mod tests {
             ArchiveAction::Mount,
             PathBuf::from("/roms/Beta.7z"),
             false,
-            |_, _, _| {
+            |_, _, _, _| {
                 Ok(OperationSuccess {
                     message: "mounted".to_string(),
                     cleanup: None,
+                    warning: None,
                 })
             },
         ));
@@ -1375,6 +1869,7 @@ mod tests {
             action: ArchiveAction::Mount,
             archive_path: PathBuf::from("/roms/Alpha.zip"),
             receiver,
+            progress_receiver: mpsc::channel().1,
         };
 
         assert!(confirmation_actions_available(None));
@@ -1439,6 +1934,7 @@ mod tests {
     #[test]
     fn cleanup_is_skipped_when_the_option_is_off() {
         let cleanup_called = std::cell::Cell::new(false);
+        let cleanup_started = std::cell::Cell::new(false);
         let success = run_unmount_with_cleanup(
             false,
             || Ok(("unmounted".to_string(), PathBuf::from("/mount/Game"))),
@@ -1446,9 +1942,11 @@ mod tests {
                 cleanup_called.set(true);
                 Ok(Vec::new())
             },
+            |_| cleanup_started.set(true),
         )
         .unwrap();
 
+        assert!(!cleanup_started.get());
         assert!(!cleanup_called.get());
         assert!(success.cleanup.is_none());
     }
@@ -1456,17 +1954,21 @@ mod tests {
     #[test]
     fn cleanup_runs_after_a_successful_unmount_when_enabled() {
         let cleanup_called = std::cell::Cell::new(false);
+        let cleanup_started = std::cell::Cell::new(false);
         let success = run_unmount_with_cleanup(
             true,
             || Ok(("unmounted".to_string(), PathBuf::from("/mount/Game"))),
             |mount_path| {
+                assert!(cleanup_started.get());
                 cleanup_called.set(true);
                 assert_eq!(mount_path, Path::new("/mount/Game"));
                 Ok(vec![mount_path.to_path_buf()])
             },
+            |_| cleanup_started.set(true),
         )
         .unwrap();
 
+        assert!(cleanup_started.get());
         assert!(cleanup_called.get());
         assert!(matches!(
             success.cleanup,
@@ -1477,16 +1979,24 @@ mod tests {
     #[test]
     fn cleanup_does_not_run_after_a_failed_unmount() {
         let cleanup_called = std::cell::Cell::new(false);
+        let cleanup_started = std::cell::Cell::new(false);
         let result = run_unmount_with_cleanup(
             true,
-            || Err("unmount failed".to_string()),
+            || {
+                Err(OperationFailure {
+                    message: "unmount failed".to_string(),
+                    offer_lazy_unmount: true,
+                })
+            },
             |_| {
                 cleanup_called.set(true);
                 Ok(Vec::new())
             },
+            |_| cleanup_started.set(true),
         );
 
-        assert_eq!(result.unwrap_err(), "unmount failed");
+        assert_eq!(result.unwrap_err().message, "unmount failed");
+        assert!(!cleanup_started.get());
         assert!(!cleanup_called.get());
     }
 
@@ -1501,6 +2011,7 @@ mod tests {
                 ))
             },
             |_| Err("directory is busy".to_string()),
+            |_| {},
         )
         .unwrap();
 
@@ -1512,17 +2023,112 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_started_progress_is_recorded_before_the_final_result() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let mount_path = PathBuf::from("/mount/Game");
+        let (result_sender, result_receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Unmount,
+            archive_path: archive_path.clone(),
+            receiver: result_receiver,
+            progress_receiver,
+        });
+
+        progress_sender
+            .send(OperationProgress::CleanupStarted(mount_path.clone()))
+            .unwrap();
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.operation.is_some());
+        let latest = app.history.entries().next().unwrap();
+        assert_eq!(latest.action, ActivityAction::Cleanup);
+        assert_eq!(latest.outcome, ActivityOutcome::Started);
+        assert_eq!(latest.archive_path.as_deref(), Some(mount_path.as_path()));
+        assert!(!app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Cleanup
+                && matches!(
+                    entry.outcome,
+                    ActivityOutcome::Completed | ActivityOutcome::Failed
+                )
+        }));
+
+        result_sender
+            .send(Ok(OperationSuccess {
+                message: "unmounted".to_string(),
+                cleanup: Some(CleanupOutcome::Completed {
+                    mount_path: mount_path.clone(),
+                    message: "cleanup completed".to_string(),
+                }),
+                warning: None,
+            }))
+            .unwrap();
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Cleanup
+                && entry.outcome == ActivityOutcome::Completed
+                && entry.archive_path.as_deref() == Some(mount_path.as_path())
+        }));
+    }
+
+    #[test]
+    fn cleanup_progress_is_not_lost_when_the_final_result_is_already_ready() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let mount_path = PathBuf::from("/mount/Game");
+        let (result_sender, result_receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Unmount,
+            archive_path,
+            receiver: result_receiver,
+            progress_receiver,
+        });
+
+        progress_sender
+            .send(OperationProgress::CleanupStarted(mount_path.clone()))
+            .unwrap();
+        result_sender
+            .send(Ok(OperationSuccess {
+                message: "unmounted".to_string(),
+                cleanup: Some(CleanupOutcome::Completed {
+                    mount_path: mount_path.clone(),
+                    message: "cleanup completed".to_string(),
+                }),
+                warning: None,
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Cleanup
+                && entry.outcome == ActivityOutcome::Started
+                && entry.archive_path.as_deref() == Some(mount_path.as_path())
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Cleanup
+                && entry.outcome == ActivityOutcome::Completed
+                && entry.archive_path.as_deref() == Some(mount_path.as_path())
+        }));
+    }
+
+    #[test]
     fn activity_records_cleanup_success_and_failure_with_mount_paths() {
         let mount_path = PathBuf::from("/mount/Platform/Game");
         let mut history = OperationHistory::default();
-        record_cleanup_activity(
+        record_cleanup_started_activity(&mut history, &mount_path);
+        record_cleanup_finished_activity(
             &mut history,
             &CleanupOutcome::Completed {
                 mount_path: mount_path.clone(),
                 message: "cleanup succeeded".to_string(),
             },
         );
-        record_cleanup_activity(
+        record_cleanup_started_activity(&mut history, &mount_path);
+        record_cleanup_finished_activity(
             &mut history,
             &CleanupOutcome::Failed {
                 mount_path: mount_path.clone(),
@@ -1550,5 +2156,323 @@ mod tests {
                 .message
                 .contains(&mount_path.display().to_string())
         );
+    }
+
+    #[test]
+    fn lazy_unmount_is_unavailable_before_normal_unmount_failure() {
+        let mounted = record("/roms/Game.zip", MountState::Mounted);
+
+        assert!(!lazy_unmount_available(&mounted, None, false));
+        assert!(!lazy_unmount_available(
+            &mounted,
+            Some(Path::new("/roms/Other.zip")),
+            false
+        ));
+        assert!(lazy_unmount_available(
+            &mounted,
+            Some(Path::new("/roms/Game.zip")),
+            false
+        ));
+    }
+
+    #[test]
+    fn lazy_unmount_requires_matching_confirmation_and_is_blocked_while_busy() {
+        let archive = Path::new("/roms/Game.zip");
+
+        assert!(!lazy_confirmation_available(archive, None, false));
+        assert!(!lazy_confirmation_available(
+            archive,
+            Some(Path::new("/roms/Other.zip")),
+            false
+        ));
+        assert!(lazy_confirmation_available(archive, Some(archive), false));
+        assert!(!lazy_confirmation_available(archive, Some(archive), true));
+    }
+
+    #[test]
+    fn remount_is_available_only_for_the_successfully_unmounted_archive() {
+        let pending = record("/roms/Game.zip", MountState::Pending);
+        let mounted = record("/roms/Game.zip", MountState::Mounted);
+        let no_offers = HashSet::new();
+        let other_offer = HashSet::from([PathBuf::from("/roms/Other.zip")]);
+        let offer = HashSet::from([PathBuf::from("/roms/Game.zip")]);
+
+        assert!(!remount_available(&pending, &no_offers, false));
+        assert!(!remount_available(&pending, &other_offer, false));
+        assert!(remount_available(&pending, &offer, false));
+        assert!(!remount_available(&mounted, &offer, false));
+        assert!(!remount_available(&pending, &offer, true));
+        assert!(remount_is_offered(&pending, &offer));
+    }
+
+    #[test]
+    fn normal_unmount_failure_offers_lazy_recovery_and_records_activity() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Unmount,
+            archive_path: archive_path.clone(),
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+        sender
+            .send(Err(OperationFailure {
+                message: "mount is busy".to_string(),
+                offer_lazy_unmount: true,
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert_eq!(
+            app.lazy_unmount_offer.as_deref(),
+            Some(archive_path.as_path())
+        );
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Unmount
+                && entry.outcome == ActivityOutcome::Failed
+                && entry.message.contains("busy")
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::LazyUnmount && entry.outcome == ActivityOutcome::Offered
+        }));
+        let feedback = app.feedback.as_ref().unwrap();
+        assert_eq!(feedback.message, NORMAL_UNMOUNT_FAILURE_SUMMARY);
+        assert!(
+            feedback
+                .more_information
+                .as_deref()
+                .unwrap()
+                .contains("Try Normal Unmount again")
+        );
+    }
+
+    #[test]
+    fn successful_lazy_unmount_with_cleanup_failure_still_offers_remount() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let mount_path = PathBuf::from("/mount/Game");
+        let (sender, receiver) = mpsc::channel();
+        app.lazy_unmount_offer = Some(archive_path.clone());
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::LazyUnmount,
+            archive_path: archive_path.clone(),
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+        sender
+            .send(Ok(OperationSuccess {
+                message: "lazy unmount completed".to_string(),
+                cleanup: Some(CleanupOutcome::Failed {
+                    mount_path,
+                    message: "cleanup failed".to_string(),
+                }),
+                warning: Some("lazy warning".to_string()),
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.remount_offers.contains(&archive_path));
+        assert!(app.lazy_unmount_offer.is_none());
+        assert!(app.feedback.as_ref().unwrap().succeeded);
+        assert!(
+            !app.feedback
+                .as_ref()
+                .unwrap()
+                .cleanup
+                .as_ref()
+                .unwrap()
+                .succeeded
+        );
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::LazyUnmount
+                && entry.outcome == ActivityOutcome::Completed
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Cleanup && entry.outcome == ActivityOutcome::Failed
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Remount && entry.outcome == ActivityOutcome::Offered
+        }));
+    }
+
+    #[test]
+    fn successful_remount_clears_offer_and_records_completion() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let other_archive = PathBuf::from("/roms/Other.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.remount_offers.insert(archive_path.clone());
+        app.remount_offers.insert(other_archive.clone());
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Remount,
+            archive_path: archive_path.clone(),
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+        sender
+            .send(Ok(OperationSuccess {
+                message: "remounted".to_string(),
+                cleanup: None,
+                warning: None,
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert!(!app.remount_offers.contains(&archive_path));
+        assert!(app.remount_offers.contains(&other_archive));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Remount && entry.outcome == ActivityOutcome::Completed
+        }));
+    }
+
+    #[test]
+    fn successful_normal_unmount_offers_remount() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Unmount,
+            archive_path: archive_path.clone(),
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+        sender
+            .send(Ok(OperationSuccess {
+                message: "unmounted".to_string(),
+                cleanup: None,
+                warning: None,
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.remount_offers.contains(&archive_path));
+    }
+
+    #[test]
+    fn failed_remount_preserves_offer_and_records_failure() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/Game.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.remount_offers.insert(archive_path.clone());
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Remount,
+            archive_path: archive_path.clone(),
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+        sender
+            .send(Err(OperationFailure {
+                message: "mount path is still active".to_string(),
+                offer_lazy_unmount: false,
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.remount_offers.contains(&archive_path));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Remount
+                && entry.outcome == ActivityOutcome::Failed
+                && entry.message.contains("still active")
+        }));
+    }
+
+    #[test]
+    fn mounting_another_archive_preserves_existing_remount_offer() {
+        let mut app = app_for_operation_tests();
+        let offered_archive = PathBuf::from("/roms/Game.zip");
+        let mounted_archive = PathBuf::from("/roms/Other.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.remount_offers.insert(offered_archive.clone());
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Mount,
+            archive_path: mounted_archive,
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+        sender
+            .send(Ok(OperationSuccess {
+                message: "mounted".to_string(),
+                cleanup: None,
+                warning: None,
+            }))
+            .unwrap();
+
+        app.poll_operation(&egui::Context::default());
+
+        assert!(app.remount_offers.contains(&offered_archive));
+    }
+
+    #[test]
+    fn recovery_wording_is_explicit_and_avoids_aggressive_terms() {
+        let wording = format!(
+            "{NORMAL_UNMOUNT_FAILURE_SUMMARY}\n{NORMAL_UNMOUNT_RECOVERY_GUIDANCE}\n{LAZY_UNMOUNT_WARNING}\n{LAZY_UNMOUNT_SUCCESS}\n{REMOUNT_GUIDANCE}"
+        );
+
+        assert!(wording.contains("not responding correctly"));
+        assert!(wording.contains("still has files open"));
+        assert!(wording.contains("Normal Unmount repeatedly fails"));
+        for avoided in ["wedged", "force kill", "nuke"] {
+            assert!(!wording.to_lowercase().contains(avoided));
+        }
+    }
+
+    #[test]
+    fn lazy_unmount_advances_to_a_separate_final_confirmation() {
+        let archive = PathBuf::from("/roms/Game.zip");
+        let mut warning_confirmation = Some(archive.clone());
+        let mut final_confirmation = None;
+        let mut focus_final_cancel = false;
+
+        advance_to_final_lazy_confirmation(
+            &mut warning_confirmation,
+            &mut final_confirmation,
+            &mut focus_final_cancel,
+            &archive,
+        );
+
+        assert!(warning_confirmation.is_none());
+        assert_eq!(final_confirmation.as_deref(), Some(archive.as_path()));
+        assert!(focus_final_cancel);
+    }
+
+    #[test]
+    fn recovery_activity_records_cancel_retry_and_confirmation() {
+        let archive = Path::new("/roms/Game.zip");
+        let mut history = OperationHistory::default();
+        record_recovery_activity(
+            &mut history,
+            ActivityAction::LazyUnmount,
+            archive,
+            ActivityOutcome::Cancelled,
+            "User cancelled lazy unmount.",
+        );
+        record_recovery_activity(
+            &mut history,
+            ActivityAction::Unmount,
+            archive,
+            ActivityOutcome::Retried,
+            "Normal unmount retried.",
+        );
+        record_recovery_activity(
+            &mut history,
+            ActivityAction::LazyUnmount,
+            archive,
+            ActivityOutcome::Confirmed,
+            "Lazy unmount confirmed.",
+        );
+
+        let entries = history.entries().collect::<Vec<_>>();
+        assert_eq!(entries[0].outcome, ActivityOutcome::Confirmed);
+        assert_eq!(entries[1].outcome, ActivityOutcome::Retried);
+        assert_eq!(entries[2].outcome, ActivityOutcome::Cancelled);
+        assert!(entries.iter().all(|entry| {
+            entry.archive_path.as_deref() == Some(archive) && !entry.message.trim().is_empty()
+        }));
     }
 }
