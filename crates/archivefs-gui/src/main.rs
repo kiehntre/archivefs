@@ -1,15 +1,20 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
-    ArchiveKind, ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, Config, DoctorReport,
-    DoctorStatus, LazyUnmountCleanupResult, MountState, cleanup_selected_mount_tree,
-    lazy_unmount_one_archive_path_with_progress, load_read_only_snapshot_default,
-    mount_one_archive_path, remount_one_archive_path, unmount_one_archive_path,
+    ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus,
+    Config, DoctorReport, DoctorStatus, LazyUnmountCleanupResult, MountOneOutcome, MountState,
+    cleanup_selected_mount_tree, lazy_unmount_one_archive_path_with_progress,
+    load_read_only_snapshot_default, mount_one_archive_path, remount_one_archive_path,
+    unmount_one_archive_path,
 };
 use eframe::egui;
 
@@ -28,6 +33,7 @@ const REMOUNT_GUIDANCE: &str = "Make sure applications that used the previous mo
 enum ActivityAction {
     Refresh,
     Mount,
+    MountAll,
     Unmount,
     LazyUnmount,
     Remount,
@@ -39,6 +45,7 @@ impl std::fmt::Display for ActivityAction {
         formatter.write_str(match self {
             Self::Refresh => "Refresh",
             Self::Mount => "Mount",
+            Self::MountAll => "Mount All",
             Self::Unmount => "Unmount",
             Self::LazyUnmount => "Lazy unmount",
             Self::Remount => "Remount",
@@ -54,6 +61,7 @@ enum ActivityOutcome {
     Retried,
     Confirmed,
     Cancelled,
+    Skipped,
     Completed,
     Failed,
     Rejected,
@@ -67,6 +75,7 @@ impl std::fmt::Display for ActivityOutcome {
             Self::Retried => "Retried",
             Self::Confirmed => "Confirmed",
             Self::Cancelled => "Cancelled",
+            Self::Skipped => "Skipped",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Rejected => "Rejected",
@@ -138,6 +147,7 @@ fn main() -> eframe::Result<()> {
 }
 
 struct LoadedData {
+    mount_root: PathBuf,
     records: Vec<ArchiveRecord>,
     rows: Vec<ArchiveRow>,
     stats: ArchiveStats,
@@ -154,6 +164,7 @@ impl LoadedData {
             .collect();
 
         Self {
+            mount_root: snapshot.mount_root,
             records: snapshot.records,
             rows,
             stats: snapshot.stats,
@@ -199,6 +210,218 @@ impl ArchiveRow {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountAllItem {
+    archive_path: PathBuf,
+    mount_path: PathBuf,
+    display_name: String,
+}
+
+fn mount_all_available(pending_count: usize, busy: bool) -> bool {
+    pending_count > 0 && !busy
+}
+
+fn pending_mount_items(records: &[ArchiveRecord]) -> Vec<MountAllItem> {
+    records
+        .iter()
+        .filter(|record| record.mount_state == MountState::Pending)
+        .map(|record| MountAllItem {
+            archive_path: record.mount_plan.archive.path.clone(),
+            mount_path: record.mount_plan.mount_path.clone(),
+            display_name: record.identity.display_name.clone(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BatchMountAttempt {
+    Mounted(PathBuf),
+    AlreadyMounted(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountAllFailure {
+    archive_path: PathBuf,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountAllSkipped {
+    archive_path: PathBuf,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MountAllResult {
+    total: usize,
+    successful: usize,
+    failures: Vec<MountAllFailure>,
+    skipped: Vec<MountAllSkipped>,
+    unattempted: usize,
+    stopped: bool,
+    setup_failure: Option<String>,
+}
+
+impl MountAllResult {
+    fn setup_failed(total: usize, error: impl Into<String>) -> Self {
+        Self {
+            total,
+            unattempted: total,
+            setup_failure: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    fn attempted(&self) -> usize {
+        self.successful + self.failures.len()
+    }
+
+    fn failed(&self) -> usize {
+        self.failures.len()
+    }
+
+    fn skipped(&self) -> usize {
+        self.skipped.len()
+    }
+
+    fn completion_message(&self) -> String {
+        if self.setup_failure.is_some() {
+            "Mount All could not start.".to_string()
+        } else if self.stopped {
+            format!(
+                "Mount All stopped after the current archive. {} archives were not attempted.",
+                self.unattempted
+            )
+        } else if self.failed() > 0 {
+            format!(
+                "Mount All completed with {} failure{}.",
+                self.failed(),
+                if self.failed() == 1 { "" } else { "s" }
+            )
+        } else {
+            "Mount All completed successfully.".to_string()
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MountAllEvent {
+    ArchiveStarted {
+        index: usize,
+        total: usize,
+        item: MountAllItem,
+    },
+    ArchiveCompleted(MountAllItem),
+    ArchiveFailed {
+        item: MountAllItem,
+        message: String,
+    },
+    ArchiveSkipped {
+        item: MountAllItem,
+        reason: String,
+    },
+    Finished(MountAllResult),
+}
+
+#[derive(Clone, Debug, Default)]
+struct MountAllProgress {
+    current_index: usize,
+    total: usize,
+    current_archive: Option<String>,
+    successful: usize,
+    failed: usize,
+    skipped: usize,
+    stop_requested: bool,
+}
+
+struct RunningMountAll {
+    receiver: Receiver<MountAllEvent>,
+    stop: Arc<AtomicBool>,
+    progress: MountAllProgress,
+}
+
+#[derive(Clone)]
+struct MountAllConfirmation;
+
+fn run_mount_all_coordinator<E, V, M, P>(
+    items: Vec<MountAllItem>,
+    stop: &AtomicBool,
+    mut archive_exists: E,
+    mut validate: V,
+    mut mount: M,
+    mut publish: P,
+) -> MountAllResult
+where
+    E: FnMut(&Path) -> bool,
+    V: FnMut(&Path) -> Result<(), String>,
+    M: FnMut(&Path) -> Result<BatchMountAttempt, String>,
+    P: FnMut(MountAllEvent),
+{
+    let total = items.len();
+    let mut result = MountAllResult {
+        total,
+        ..MountAllResult::default()
+    };
+    for (offset, mut item) in items.into_iter().enumerate() {
+        if stop.load(Ordering::Acquire) {
+            result.stopped = true;
+            result.unattempted = total - offset;
+            break;
+        }
+
+        if !archive_exists(&item.archive_path) {
+            let reason = "archive disappeared before execution".to_string();
+            result.skipped.push(MountAllSkipped {
+                archive_path: item.archive_path.clone(),
+                reason: reason.clone(),
+            });
+            publish(MountAllEvent::ArchiveSkipped { item, reason });
+            continue;
+        }
+
+        if let Err(reason) = validate(&item.archive_path) {
+            result.skipped.push(MountAllSkipped {
+                archive_path: item.archive_path.clone(),
+                reason: reason.clone(),
+            });
+            publish(MountAllEvent::ArchiveSkipped { item, reason });
+            continue;
+        }
+
+        publish(MountAllEvent::ArchiveStarted {
+            index: offset + 1,
+            total,
+            item: item.clone(),
+        });
+        match mount(&item.archive_path) {
+            Ok(BatchMountAttempt::Mounted(actual_mount_path)) => {
+                item.mount_path = actual_mount_path;
+                result.successful += 1;
+                publish(MountAllEvent::ArchiveCompleted(item));
+            }
+            Ok(BatchMountAttempt::AlreadyMounted(actual_mount_path)) => {
+                item.mount_path = actual_mount_path;
+                let reason = "archive is already mounted".to_string();
+                result.skipped.push(MountAllSkipped {
+                    archive_path: item.archive_path.clone(),
+                    reason: reason.clone(),
+                });
+                publish(MountAllEvent::ArchiveSkipped { item, reason });
+            }
+            Err(message) => {
+                result.failures.push(MountAllFailure {
+                    archive_path: item.archive_path.clone(),
+                    message: message.clone(),
+                });
+                publish(MountAllEvent::ArchiveFailed { item, message });
+            }
+        }
+    }
+
+    publish(MountAllEvent::Finished(result.clone()));
+    result
+}
+
 type LoadResult = Result<LoadedData, String>;
 
 enum LoadState {
@@ -213,6 +436,10 @@ struct ArchiveFsApp {
     filtered_rows: Option<Vec<usize>>,
     selected_archive: Option<PathBuf>,
     operation: Option<RunningOperation>,
+    mount_all: Option<RunningMountAll>,
+    confirm_mount_all: Option<MountAllConfirmation>,
+    focus_mount_all_cancel: bool,
+    mount_all_result: Option<MountAllResult>,
     feedback: Option<ActionFeedback>,
     confirm_unmount: Option<PathBuf>,
     confirm_lazy_unmount: Option<PathBuf>,
@@ -226,6 +453,10 @@ struct ArchiveFsApp {
 }
 
 impl ArchiveFsApp {
+    fn is_busy(&self) -> bool {
+        self.operation.is_some() || self.mount_all.is_some()
+    }
+
     fn new(context: egui::Context) -> Self {
         let mut history = OperationHistory::default();
         history.record(HistoryEntry::new(
@@ -240,6 +471,10 @@ impl ArchiveFsApp {
             filtered_rows: None,
             selected_archive: None,
             operation: None,
+            mount_all: None,
+            confirm_mount_all: None,
+            focus_mount_all_cancel: false,
+            mount_all_result: None,
             feedback: None,
             confirm_unmount: None,
             confirm_lazy_unmount: None,
@@ -336,7 +571,7 @@ impl ArchiveFsApp {
             + Send
             + 'static,
     {
-        if self.operation.is_some() {
+        if self.is_busy() {
             let message = "Another archive operation is already running.".to_string();
             self.feedback = Some(ActionFeedback {
                 succeeded: false,
@@ -356,6 +591,8 @@ impl ArchiveFsApp {
 
         let (sender, receiver) = mpsc::channel();
         let (progress_sender, progress_receiver) = mpsc::channel();
+        self.confirm_mount_all = None;
+        self.focus_mount_all_cancel = false;
         self.confirm_unmount = None;
         self.confirm_lazy_unmount = None;
         self.confirm_lazy_unmount_final = None;
@@ -506,6 +743,264 @@ impl ArchiveFsApp {
             }
         }
     }
+
+    fn start_mount_all(&mut self, context: egui::Context, items: Vec<MountAllItem>) -> bool {
+        if self.is_busy() {
+            let message = "Another archive operation is already running.".to_string();
+            self.feedback = Some(ActionFeedback {
+                succeeded: false,
+                message: message.clone(),
+                cleanup: None,
+                warning: None,
+                more_information: None,
+            });
+            self.history.record(HistoryEntry::new(
+                ActivityAction::MountAll,
+                None,
+                ActivityOutcome::Rejected,
+                message,
+            ));
+            return false;
+        }
+
+        let total = items.len();
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        self.confirm_mount_all = None;
+        self.focus_mount_all_cancel = false;
+        self.confirm_unmount = None;
+        self.confirm_lazy_unmount = None;
+        self.confirm_lazy_unmount_final = None;
+        self.mount_all_result = None;
+        self.feedback = None;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::MountAll,
+            None,
+            ActivityOutcome::Started,
+            format!("Mount All started for {total} pending archives."),
+        ));
+        self.mount_all = Some(RunningMountAll {
+            receiver,
+            stop,
+            progress: MountAllProgress {
+                total,
+                ..MountAllProgress::default()
+            },
+        });
+
+        thread::spawn(move || {
+            let archive_paths = items
+                .iter()
+                .map(|item| item.archive_path.clone())
+                .collect::<Vec<_>>();
+            let setup = Config::load_default()
+                .and_then(|config| ArchiveMountSession::new(&config))
+                .map_err(|error| error.to_string())
+                .and_then(|session| {
+                    session
+                        .validate_batch_targets(&archive_paths)
+                        .map_err(|error| error.to_string())
+                        .map(|validations| {
+                            let validations = validations
+                                .into_iter()
+                                .map(|validation| {
+                                    (validation.archive_path().to_path_buf(), validation)
+                                })
+                                .collect::<HashMap<_, _>>();
+                            (session, validations)
+                        })
+                });
+            let (session, validations) = match setup {
+                Ok(setup) => setup,
+                Err(error) => {
+                    let _ = sender.send(MountAllEvent::Finished(MountAllResult::setup_failed(
+                        total, error,
+                    )));
+                    context.request_repaint();
+                    return;
+                }
+            };
+            let repaint_context = context.clone();
+            run_mount_all_coordinator(
+                items,
+                &worker_stop,
+                |archive_path| archive_path.is_file(),
+                |archive_path| match validations.get(archive_path) {
+                    Some(validation) => validation
+                        .skip_reason()
+                        .map_or(Ok(()), |reason| Err(reason.to_string())),
+                    None => Err("archive was not included in batch validation".to_string()),
+                },
+                |archive_path| {
+                    let validation = validations.get(archive_path).ok_or_else(|| {
+                        "archive was not included in batch validation".to_string()
+                    })?;
+                    match session
+                        .mount_validated_batch_target(validation)
+                        .map_err(|error| error.to_string())?
+                    {
+                        MountOneOutcome::Mounted(plan) => {
+                            Ok(BatchMountAttempt::Mounted(plan.mount_path))
+                        }
+                        MountOneOutcome::AlreadyMounted(plan) => {
+                            Ok(BatchMountAttempt::AlreadyMounted(plan.mount_path))
+                        }
+                    }
+                },
+                |event| {
+                    let _ = sender.send(event);
+                    repaint_context.request_repaint();
+                },
+            );
+        });
+        true
+    }
+
+    fn request_mount_all_stop(&mut self) {
+        let Some(batch) = self.mount_all.as_mut() else {
+            return;
+        };
+        if batch.progress.stop_requested {
+            return;
+        }
+        batch.progress.stop_requested = true;
+        batch.stop.store(true, Ordering::Release);
+        self.history.record(HistoryEntry::new(
+            ActivityAction::MountAll,
+            None,
+            ActivityOutcome::Cancelled,
+            "Stop requested; the current archive will finish before Mount All stops.",
+        ));
+    }
+
+    fn poll_mount_all(&mut self, context: &egui::Context) {
+        let mut disconnected = false;
+        let mut events = Vec::new();
+        if let Some(batch) = self.mount_all.as_ref() {
+            loop {
+                match batch.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut finished = None;
+        for event in events {
+            let Some(batch) = self.mount_all.as_mut() else {
+                break;
+            };
+            match event {
+                MountAllEvent::ArchiveStarted { index, total, item } => {
+                    batch.progress.current_index = index;
+                    batch.progress.total = total;
+                    batch.progress.current_archive = Some(item.display_name.clone());
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Mount,
+                        Some(item.archive_path),
+                        ActivityOutcome::Started,
+                        format!("Mounting archive {index} of {total}."),
+                    ));
+                }
+                MountAllEvent::ArchiveCompleted(item) => {
+                    batch.progress.successful += 1;
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Mount,
+                        Some(item.archive_path),
+                        ActivityOutcome::Completed,
+                        format!("Mounted at {}.", item.mount_path.display()),
+                    ));
+                }
+                MountAllEvent::ArchiveFailed { item, message } => {
+                    batch.progress.failed += 1;
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Mount,
+                        Some(item.archive_path),
+                        ActivityOutcome::Failed,
+                        message,
+                    ));
+                }
+                MountAllEvent::ArchiveSkipped { item, reason } => {
+                    batch.progress.skipped += 1;
+                    batch.progress.current_index =
+                        batch.progress.successful + batch.progress.failed + batch.progress.skipped;
+                    batch.progress.current_archive = Some(item.display_name.clone());
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Mount,
+                        Some(item.archive_path),
+                        ActivityOutcome::Skipped,
+                        reason,
+                    ));
+                }
+                MountAllEvent::Finished(result) => {
+                    finished = Some(result);
+                }
+            }
+        }
+
+        if let Some(result) = finished {
+            let message = result.completion_message();
+            let setup_failure = result.setup_failure.as_deref();
+            let activity_message = match setup_failure {
+                Some(error) => format!("{message} Setup error: {error}"),
+                None => format!(
+                    "{message} Successful: {}, failed: {}, skipped: {}, unattempted: {}.",
+                    result.successful,
+                    result.failed(),
+                    result.skipped(),
+                    result.unattempted
+                ),
+            };
+            self.history.record(HistoryEntry::new(
+                ActivityAction::MountAll,
+                None,
+                if setup_failure.is_some() {
+                    ActivityOutcome::Failed
+                } else {
+                    ActivityOutcome::Completed
+                },
+                activity_message,
+            ));
+            self.feedback = Some(ActionFeedback {
+                succeeded: setup_failure.is_none(),
+                message: match setup_failure {
+                    Some(error) => format!("{message} {error}"),
+                    None => message.clone(),
+                },
+                cleanup: None,
+                warning: None,
+                more_information: None,
+            });
+            let should_refresh = result.setup_failure.is_none();
+            self.mount_all_result = Some(result);
+            self.mount_all = None;
+            if should_refresh {
+                self.refresh(context);
+            }
+        } else if disconnected && self.mount_all.is_some() {
+            let message = "Mount All background worker stopped unexpectedly.".to_string();
+            self.history.record(HistoryEntry::new(
+                ActivityAction::MountAll,
+                None,
+                ActivityOutcome::Failed,
+                message.clone(),
+            ));
+            self.feedback = Some(ActionFeedback {
+                succeeded: false,
+                message,
+                cleanup: None,
+                warning: None,
+                more_information: None,
+            });
+            self.mount_all = None;
+            self.refresh(context);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,6 +1015,11 @@ struct OperationRequest {
     action: ArchiveAction,
     archive_path: PathBuf,
     cleanup_after_unmount: bool,
+}
+
+enum AppOperationRequest {
+    Archive(OperationRequest),
+    MountAll(Vec<MountAllItem>),
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -624,7 +1124,10 @@ impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_load();
         self.poll_operation(context);
-        if matches!(self.state, LoadState::Loading(_)) || self.operation.is_some() {
+        self.poll_mount_all(context);
+        let loading = matches!(self.state, LoadState::Loading(_));
+        let busy = self.is_busy();
+        if loading || busy {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -634,15 +1137,13 @@ impl eframe::App for ArchiveFsApp {
                 ui.separator();
                 ui.label("Library overview");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let loading = matches!(self.state, LoadState::Loading(_));
-                    let busy = loading || self.operation.is_some();
                     if ui
-                        .add_enabled(!busy, egui::Button::new("Refresh"))
+                        .add_enabled(!loading && !busy, egui::Button::new("Refresh"))
                         .clicked()
                     {
                         self.refresh(context);
                     }
-                    if busy {
+                    if loading || busy {
                         ui.spinner();
                     }
                 });
@@ -652,57 +1153,78 @@ impl eframe::App for ArchiveFsApp {
 
         let mut retry = false;
         let mut requested_action = None;
-        egui::CentralPanel::default().show(context, |ui| match &self.state {
-            LoadState::Loading(_) => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.spinner();
-                    ui.heading("Loading ArchiveFS data...");
-                    ui.label("Scanning runs in the background.");
-                });
+        let mut stop_mount_all = false;
+        egui::CentralPanel::default().show(context, |ui| {
+            if let Some(batch) = self.mount_all.as_ref() {
+                stop_mount_all = show_mount_all_progress(ui, &batch.progress);
+                ui.separator();
             }
-            LoadState::Error(error) => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.colored_label(ui.visuals().error_fg_color, "Could not load ArchiveFS");
-                    ui.label(error);
-                    ui.add_space(8.0);
-                    retry = ui.button("Try again").clicked();
-                });
-            }
-            LoadState::Ready(data) => {
-                requested_action = show_loaded_data(
-                    ui,
-                    data,
-                    LoadedViewState {
-                        filter: &mut self.filter,
-                        filtered_rows: &mut self.filtered_rows,
-                        selected_archive: &mut self.selected_archive,
-                        operation: self.operation.as_ref(),
-                        feedback: self.feedback.as_ref(),
-                        confirm_unmount: &mut self.confirm_unmount,
-                        confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
-                        confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
-                        focus_lazy_cancel: &mut self.focus_lazy_cancel,
-                        focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
-                        lazy_unmount_offer: self.lazy_unmount_offer.as_deref(),
-                        remount_offers: &self.remount_offers,
-                        cleanup_after_unmount: &mut self.cleanup_after_unmount,
-                        history: &mut self.history,
-                    },
-                )
+            match &self.state {
+                LoadState::Loading(_) => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.spinner();
+                        ui.heading("Loading ArchiveFS data...");
+                        ui.label("Scanning runs in the background.");
+                    });
+                }
+                LoadState::Error(error) => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.colored_label(ui.visuals().error_fg_color, "Could not load ArchiveFS");
+                        ui.label(error);
+                        ui.add_space(8.0);
+                        retry = ui.button("Try again").clicked();
+                    });
+                }
+                LoadState::Ready(data) => {
+                    requested_action = show_loaded_data(
+                        ui,
+                        data,
+                        LoadedViewState {
+                            filter: &mut self.filter,
+                            filtered_rows: &mut self.filtered_rows,
+                            selected_archive: &mut self.selected_archive,
+                            operation: self.operation.as_ref(),
+                            busy,
+                            feedback: self.feedback.as_ref(),
+                            confirm_unmount: &mut self.confirm_unmount,
+                            confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
+                            confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
+                            confirm_mount_all: &mut self.confirm_mount_all,
+                            focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
+                            focus_lazy_cancel: &mut self.focus_lazy_cancel,
+                            focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
+                            lazy_unmount_offer: self.lazy_unmount_offer.as_deref(),
+                            remount_offers: &self.remount_offers,
+                            cleanup_after_unmount: &mut self.cleanup_after_unmount,
+                            mount_all_result: self.mount_all_result.as_ref(),
+                            history: &mut self.history,
+                        },
+                    );
+                }
             }
         });
+        if stop_mount_all {
+            self.request_mount_all_stop();
+        }
         if retry {
             self.refresh(context);
         }
         if let Some(request) = requested_action {
-            self.start_operation(
-                context.clone(),
-                request.action,
-                request.archive_path,
-                request.cleanup_after_unmount,
-            );
+            match request {
+                AppOperationRequest::Archive(request) => {
+                    self.start_operation(
+                        context.clone(),
+                        request.action,
+                        request.archive_path,
+                        request.cleanup_after_unmount,
+                    );
+                }
+                AppOperationRequest::MountAll(items) => {
+                    self.start_mount_all(context.clone(), items);
+                }
+            }
         }
     }
 }
@@ -871,6 +1393,72 @@ fn cleanup_completed_message(mount_path: &Path, removed_count: usize) -> String 
     )
 }
 
+fn show_mount_all_progress(ui: &mut egui::Ui, progress: &MountAllProgress) -> bool {
+    egui::Frame::group(ui.style())
+        .show(ui, |ui| {
+            ui.strong(format!(
+                "Mounting {} of {}",
+                progress.current_index, progress.total
+            ));
+            if let Some(archive) = &progress.current_archive {
+                ui.label(archive);
+            } else {
+                ui.label("Preparing Mount All...");
+            }
+            ui.horizontal(|ui| {
+                ui.label(format!("Successful: {}", progress.successful));
+                ui.label(format!("Failed: {}", progress.failed));
+                ui.label(format!("Skipped: {}", progress.skipped));
+            });
+            let fraction = if progress.total == 0 {
+                0.0
+            } else {
+                progress.current_index as f32 / progress.total as f32
+            };
+            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).show_percentage());
+            ui.add_enabled(
+                !progress.stop_requested,
+                egui::Button::new(if progress.stop_requested {
+                    "Stop requested"
+                } else {
+                    "Stop After Current Archive"
+                }),
+            )
+            .clicked()
+        })
+        .inner
+}
+
+fn show_mount_all_result(ui: &mut egui::Ui, result: &MountAllResult) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.strong(result.completion_message());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Attempted: {}", result.attempted()));
+            ui.label(format!("Successful: {}", result.successful));
+            ui.label(format!("Failed: {}", result.failed()));
+            ui.label(format!("Skipped: {}", result.skipped()));
+            if result.unattempted > 0 {
+                ui.label(format!("Not attempted: {}", result.unattempted));
+            }
+        });
+        if let Some(error) = &result.setup_failure {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Setup error: {error}"));
+        }
+        if !result.failures.is_empty() {
+            egui::CollapsingHeader::new("Failed archives")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for failure in &result.failures {
+                        let text =
+                            format!("{} — {}", failure.archive_path.display(), failure.message);
+                        ui.add(egui::Label::new(&text).truncate())
+                            .on_hover_text(text);
+                    }
+                });
+        }
+    });
+}
+
 fn show_activity_panel(context: &egui::Context, history: &mut OperationHistory) {
     egui::SidePanel::right("activity")
         .default_width(300.0)
@@ -947,15 +1535,19 @@ struct LoadedViewState<'a> {
     filtered_rows: &'a mut Option<Vec<usize>>,
     selected_archive: &'a mut Option<PathBuf>,
     operation: Option<&'a RunningOperation>,
+    busy: bool,
     feedback: Option<&'a ActionFeedback>,
     confirm_unmount: &'a mut Option<PathBuf>,
     confirm_lazy_unmount: &'a mut Option<PathBuf>,
     confirm_lazy_unmount_final: &'a mut Option<PathBuf>,
+    confirm_mount_all: &'a mut Option<MountAllConfirmation>,
+    focus_mount_all_cancel: &'a mut bool,
     focus_lazy_cancel: &'a mut bool,
     focus_final_lazy_cancel: &'a mut bool,
     lazy_unmount_offer: Option<&'a Path>,
     remount_offers: &'a HashSet<PathBuf>,
     cleanup_after_unmount: &'a mut bool,
+    mount_all_result: Option<&'a MountAllResult>,
     history: &'a mut OperationHistory,
 }
 
@@ -963,28 +1555,49 @@ fn show_loaded_data(
     ui: &mut egui::Ui,
     data: &LoadedData,
     view_state: LoadedViewState<'_>,
-) -> Option<OperationRequest> {
+) -> Option<AppOperationRequest> {
     let LoadedViewState {
         filter,
         filtered_rows,
         selected_archive,
         operation,
+        busy,
         feedback,
         confirm_unmount,
         confirm_lazy_unmount,
         confirm_lazy_unmount_final,
+        confirm_mount_all,
+        focus_mount_all_cancel,
         focus_lazy_cancel,
         focus_final_lazy_cancel,
         lazy_unmount_offer,
         remount_offers,
         cleanup_after_unmount,
+        mount_all_result,
         history,
     } = view_state;
     let mut requested_action = None;
+    let pending_count = data.stats.pending_count;
     ui.horizontal_wrapped(|ui| {
         summary_value(ui, "Total archives", data.stats.total_archives);
         summary_value(ui, "Mounted", data.stats.mounted_count);
         summary_value(ui, "Pending", data.stats.pending_count);
+        if ui
+            .add_enabled(
+                mount_all_available(pending_count, busy),
+                egui::Button::new("Mount All"),
+            )
+            .clicked()
+        {
+            *confirm_mount_all = Some(MountAllConfirmation);
+            *focus_mount_all_cancel = true;
+            history.record(HistoryEntry::new(
+                ActivityAction::MountAll,
+                None,
+                ActivityOutcome::Offered,
+                format!("Mount All offered for {} pending archives.", pending_count),
+            ));
+        }
         ui.separator();
         let (readiness, color) = if data.doctor.is_ready() {
             ("Ready", ui.visuals().selection.bg_fill)
@@ -994,6 +1607,10 @@ fn show_loaded_data(
         ui.label("Doctor:");
         ui.colored_label(color, readiness);
     });
+
+    if let Some(result) = mount_all_result {
+        show_mount_all_result(ui, result);
+    }
 
     ui.add_space(8.0);
     egui::CollapsingHeader::new("Doctor checks")
@@ -1047,11 +1664,63 @@ fn show_loaded_data(
             ui.colored_label(color, &cleanup.message);
         }
     }
+    if confirm_mount_all.is_some() {
+        let actions_available = !busy;
+        egui::Window::new("Mount All pending archives?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{} pending archives will be mounted under {}.",
+                    pending_count,
+                    data.mount_root.display()
+                ));
+                ui.label(
+                    "Archives are mounted one at a time. Large libraries may take several minutes.",
+                );
+                ui.label("A failure will be recorded, and later archives will still be attempted.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.add_enabled(
+                        actions_available,
+                        egui::Button::new("Cancel").fill(ui.visuals().selection.bg_fill),
+                    );
+                    if *focus_mount_all_cancel {
+                        cancel.request_focus();
+                        *focus_mount_all_cancel = false;
+                    }
+                    if cancel.clicked() {
+                        history.record(HistoryEntry::new(
+                            ActivityAction::MountAll,
+                            None,
+                            ActivityOutcome::Cancelled,
+                            "Mount All cancelled before starting.",
+                        ));
+                        *confirm_mount_all = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            mount_all_available(pending_count, busy),
+                            egui::Button::new("Mount All"),
+                        )
+                        .clicked()
+                    {
+                        requested_action = Some(AppOperationRequest::MountAll(
+                            pending_mount_items(&data.records),
+                        ));
+                        *confirm_mount_all = None;
+                    }
+                });
+            });
+    }
+
     if let Some(request) = show_selected_archive(
         ui,
         selected_record(&data.records, selected_archive.as_deref()),
         SelectedArchiveViewState {
             operation,
+            busy,
             confirm_unmount,
             confirm_lazy_unmount,
             focus_lazy_cancel,
@@ -1060,12 +1729,12 @@ fn show_loaded_data(
             cleanup_after_unmount,
         },
     ) {
-        requested_action = Some(request);
+        requested_action = Some(AppOperationRequest::Archive(request));
     }
 
     if let Some(archive_path) = confirm_lazy_unmount.clone() {
         let actions_available =
-            lazy_confirmation_available(&archive_path, lazy_unmount_offer, operation.is_some());
+            lazy_confirmation_available(&archive_path, lazy_unmount_offer, busy);
         egui::Window::new("Use Lazy Unmount?")
             .collapsible(false)
             .resizable(false)
@@ -1107,11 +1776,11 @@ fn show_loaded_data(
                             ActivityOutcome::Retried,
                             "Normal unmount retried.",
                         );
-                        requested_action = Some(OperationRequest {
+                        requested_action = Some(AppOperationRequest::Archive(OperationRequest {
                             action: ArchiveAction::Unmount,
                             archive_path: archive_path.clone(),
                             cleanup_after_unmount: *cleanup_after_unmount,
-                        });
+                        }));
                         *confirm_lazy_unmount = None;
                     }
                     if ui
@@ -1131,7 +1800,7 @@ fn show_loaded_data(
 
     if let Some(archive_path) = confirm_lazy_unmount_final.clone() {
         let actions_available =
-            lazy_confirmation_available(&archive_path, lazy_unmount_offer, operation.is_some());
+            lazy_confirmation_available(&archive_path, lazy_unmount_offer, busy);
         egui::Window::new("Confirm Lazy Unmount")
             .collapsible(false)
             .resizable(false)
@@ -1170,11 +1839,11 @@ fn show_loaded_data(
                             ActivityOutcome::Confirmed,
                             "Lazy unmount confirmed.",
                         );
-                        requested_action = Some(OperationRequest {
+                        requested_action = Some(AppOperationRequest::Archive(OperationRequest {
                             action: ArchiveAction::LazyUnmount,
                             archive_path: archive_path.clone(),
                             cleanup_after_unmount: *cleanup_after_unmount,
-                        });
+                        }));
                         *confirm_lazy_unmount_final = None;
                     }
                 });
@@ -1182,7 +1851,7 @@ fn show_loaded_data(
     }
 
     if let Some(archive_path) = confirm_unmount.clone() {
-        let actions_available = confirmation_actions_available(operation);
+        let actions_available = confirmation_actions_available(busy);
         egui::Window::new("Confirm unmount")
             .collapsible(false)
             .resizable(false)
@@ -1202,11 +1871,11 @@ fn show_loaded_data(
                         .add_enabled(actions_available, egui::Button::new("Unmount"))
                         .clicked()
                     {
-                        requested_action = Some(OperationRequest {
+                        requested_action = Some(AppOperationRequest::Archive(OperationRequest {
                             action: ArchiveAction::Unmount,
                             archive_path: archive_path.clone(),
                             cleanup_after_unmount: *cleanup_after_unmount,
-                        });
+                        }));
                         *confirm_unmount = None;
                     }
                 });
@@ -1379,8 +2048,12 @@ fn available_action(mount_state: MountState) -> ArchiveAction {
     }
 }
 
-fn confirmation_actions_available(operation: Option<&RunningOperation>) -> bool {
-    operation.is_none()
+fn individual_actions_available(busy: bool) -> bool {
+    !busy
+}
+
+fn confirmation_actions_available(busy: bool) -> bool {
+    individual_actions_available(busy)
 }
 
 fn record_recovery_activity(
@@ -1444,6 +2117,7 @@ fn remount_is_offered(record: &ArchiveRecord, offered_archives: &HashSet<PathBuf
 
 struct SelectedArchiveViewState<'a> {
     operation: Option<&'a RunningOperation>,
+    busy: bool,
     confirm_unmount: &'a mut Option<PathBuf>,
     confirm_lazy_unmount: &'a mut Option<PathBuf>,
     focus_lazy_cancel: &'a mut bool,
@@ -1459,6 +2133,7 @@ fn show_selected_archive(
 ) -> Option<OperationRequest> {
     let SelectedArchiveViewState {
         operation,
+        busy,
         confirm_unmount,
         confirm_lazy_unmount,
         focus_lazy_cancel,
@@ -1524,7 +2199,6 @@ fn show_selected_archive(
             });
 
         ui.add_space(6.0);
-        let busy = operation.is_some();
         let can_lazy_unmount = lazy_unmount_available(record, lazy_unmount_offer, busy);
         let remount_offered = remount_is_offered(record, remount_offers);
         let action = if remount_offered {
@@ -1551,7 +2225,9 @@ fn show_selected_archive(
         };
         let primary_enabled = match action {
             ArchiveAction::Remount => remount_available(record, remount_offers, busy),
-            ArchiveAction::Mount | ArchiveAction::Unmount | ArchiveAction::LazyUnmount => !busy,
+            ArchiveAction::Mount | ArchiveAction::Unmount | ArchiveAction::LazyUnmount => {
+                individual_actions_available(busy)
+            }
         };
         ui.horizontal(|ui| {
             if ui
@@ -1705,6 +2381,10 @@ mod tests {
             filtered_rows: None,
             selected_archive: None,
             operation: None,
+            mount_all: None,
+            confirm_mount_all: None,
+            focus_mount_all_cancel: false,
+            mount_all_result: None,
             feedback: None,
             confirm_unmount: None,
             confirm_lazy_unmount: None,
@@ -1720,6 +2400,14 @@ mod tests {
 
     fn history_entry(outcome: ActivityOutcome, message: impl Into<String>) -> HistoryEntry {
         HistoryEntry::new(ActivityAction::Mount, None, outcome, message)
+    }
+
+    fn mount_all_item(name: &str, target: &str) -> MountAllItem {
+        MountAllItem {
+            archive_path: PathBuf::from(format!("/roms/{name}.zip")),
+            mount_path: PathBuf::from(format!("/mount/{target}")),
+            display_name: name.to_string(),
+        }
     }
 
     #[test]
@@ -1758,6 +2446,267 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_mount_all_render_state_uses_only_pending_count() {
+        assert!(mount_all_available(500_000, false));
+        assert!(!mount_all_available(0, false));
+        assert!(!mount_all_available(500_000, true));
+    }
+
+    #[test]
+    fn mount_all_selects_only_pending_archives() {
+        let records = vec![
+            record("/roms/Pending.zip", MountState::Pending),
+            record("/roms/Mounted.zip", MountState::Mounted),
+            record("/roms/Existing.zip", MountState::MountPathExists),
+        ];
+
+        let selected = pending_mount_items(&records);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].archive_path, PathBuf::from("/roms/Pending.zip"));
+    }
+
+    #[test]
+    fn mount_all_processes_sequentially_and_continues_after_failure() {
+        let items = vec![
+            mount_all_item("First", "First"),
+            mount_all_item("Second", "Second"),
+            mount_all_item("Third", "Third"),
+        ];
+        let order = std::cell::RefCell::new(Vec::new());
+        let events = std::cell::RefCell::new(Vec::new());
+        let stop = AtomicBool::new(false);
+
+        let result = run_mount_all_coordinator(
+            items,
+            &stop,
+            |_| true,
+            |_| Ok(()),
+            |archive_path| {
+                order.borrow_mut().push(archive_path.to_path_buf());
+                if archive_path.ends_with("Second.zip") {
+                    Err("second failed".to_string())
+                } else {
+                    Ok(BatchMountAttempt::Mounted(PathBuf::from("/mount/actual")))
+                }
+            },
+            |event| events.borrow_mut().push(event),
+        );
+
+        assert_eq!(
+            order.into_inner(),
+            vec![
+                PathBuf::from("/roms/First.zip"),
+                PathBuf::from("/roms/Second.zip"),
+                PathBuf::from("/roms/Third.zip"),
+            ]
+        );
+        assert_eq!(result.attempted(), 3);
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.failed(), 1);
+        assert_eq!(result.skipped(), 0);
+        assert_eq!(result.unattempted, 0);
+        let events = events.into_inner();
+        assert!(matches!(
+            events[0],
+            MountAllEvent::ArchiveStarted { index: 1, .. }
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MountAllEvent::ArchiveFailed { item, .. }
+                if item.archive_path == Path::new("/roms/Second.zip")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MountAllEvent::ArchiveCompleted(item)
+                if item.archive_path == Path::new("/roms/Third.zip")
+        )));
+    }
+
+    #[test]
+    fn mount_all_counts_already_mounted_missing_and_duplicate_targets_as_skipped() {
+        let items = vec![
+            mount_all_item("Mounted", "Mounted"),
+            mount_all_item("Missing", "Missing"),
+            mount_all_item("FirstDuplicate", "Shared"),
+            mount_all_item("SecondDuplicate", "Shared"),
+        ];
+        let stop = AtomicBool::new(false);
+        let mount_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = run_mount_all_coordinator(
+            items,
+            &stop,
+            |archive_path| !archive_path.ends_with("Missing.zip"),
+            |archive_path| {
+                if archive_path.ends_with("SecondDuplicate.zip") {
+                    Err("duplicate target after resolution".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |archive_path| {
+                mount_calls.borrow_mut().push(archive_path.to_path_buf());
+                if archive_path.ends_with("Mounted.zip") {
+                    Ok(BatchMountAttempt::AlreadyMounted(PathBuf::from(
+                        "/mount/already",
+                    )))
+                } else {
+                    Ok(BatchMountAttempt::Mounted(PathBuf::from("/mount/actual")))
+                }
+            },
+            |_| {},
+        );
+
+        assert_eq!(result.total, 4);
+        assert_eq!(result.attempted(), 1);
+        assert_eq!(result.successful, 1);
+        assert_eq!(result.failed(), 0);
+        assert_eq!(result.skipped(), 3);
+        assert!(
+            !mount_calls
+                .borrow()
+                .iter()
+                .any(|path| path.ends_with("SecondDuplicate.zip"))
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|entry| entry.reason.contains("already mounted"))
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|entry| entry.reason.contains("disappeared"))
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|entry| entry.reason.contains("duplicate target"))
+        );
+    }
+
+    #[test]
+    fn mount_all_stop_after_current_prevents_later_mounts() {
+        let items = vec![
+            mount_all_item("First", "First"),
+            mount_all_item("Second", "Second"),
+            mount_all_item("Third", "Third"),
+        ];
+        let stop = AtomicBool::new(false);
+        let attempted = std::cell::Cell::new(0);
+
+        let result = run_mount_all_coordinator(
+            items,
+            &stop,
+            |_| true,
+            |_| Ok(()),
+            |_| {
+                attempted.set(attempted.get() + 1);
+                stop.store(true, Ordering::Release);
+                Ok(BatchMountAttempt::Mounted(PathBuf::from("/mount/actual")))
+            },
+            |_| {},
+        );
+
+        assert_eq!(attempted.get(), 1);
+        assert_eq!(result.successful, 1);
+        assert_eq!(result.unattempted, 2);
+        assert!(result.stopped);
+    }
+
+    #[test]
+    fn mount_all_setup_failure_is_terminal_and_truthful() {
+        let result = MountAllResult::setup_failed(12, "mount root is unavailable");
+
+        assert_eq!(result.completion_message(), "Mount All could not start.");
+        assert_ne!(
+            result.completion_message(),
+            "Mount All completed successfully."
+        );
+        assert_eq!(result.attempted(), 0);
+        assert_eq!(result.successful, 0);
+        assert_eq!(result.failed(), 0);
+        assert_eq!(result.skipped(), 0);
+        assert!(result.skipped.is_empty());
+        assert_eq!(result.unattempted, 12);
+        assert_eq!(
+            result.setup_failure.as_deref(),
+            Some("mount root is unavailable")
+        );
+    }
+
+    #[test]
+    fn mount_all_setup_failure_records_failed_activity_and_feedback() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        app.mount_all = Some(RunningMountAll {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            progress: MountAllProgress {
+                total: 4,
+                ..MountAllProgress::default()
+            },
+        });
+        sender
+            .send(MountAllEvent::Finished(MountAllResult::setup_failed(
+                4,
+                "configuration could not be loaded",
+            )))
+            .unwrap();
+
+        app.poll_mount_all(&egui::Context::default());
+
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(!feedback.succeeded);
+        assert!(feedback.message.contains("Mount All could not start"));
+        assert!(
+            feedback
+                .message
+                .contains("configuration could not be loaded")
+        );
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::MountAll
+                && entry.outcome == ActivityOutcome::Failed
+                && entry.message.contains("configuration could not be loaded")
+        }));
+        let result = app.mount_all_result.as_ref().unwrap();
+        assert_eq!(result.unattempted, 4);
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn partial_mount_all_failure_is_not_a_total_failure() {
+        let result = MountAllResult {
+            total: 102,
+            successful: 100,
+            failures: vec![
+                MountAllFailure {
+                    archive_path: PathBuf::from("/roms/One.zip"),
+                    message: "failed".to_string(),
+                },
+                MountAllFailure {
+                    archive_path: PathBuf::from("/roms/Two.zip"),
+                    message: "failed".to_string(),
+                },
+            ],
+            skipped: Vec::new(),
+            unattempted: 0,
+            stopped: false,
+            setup_failure: None,
+        };
+
+        assert_eq!(
+            result.completion_message(),
+            "Mount All completed with 2 failures."
+        );
+        assert_eq!(result.attempted(), 102);
+    }
+
+    #[test]
     fn action_availability_follows_mount_state() {
         assert_eq!(available_action(MountState::Pending), ArchiveAction::Mount);
         assert_eq!(
@@ -1789,6 +2738,161 @@ mod tests {
         );
         assert!(selected_record(&records, Some(Path::new("/roms/Missing.rar"))).is_none());
         assert!(selected_record(&records, None).is_none());
+    }
+
+    #[test]
+    fn mount_all_is_rejected_while_an_individual_operation_is_active() {
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        app.operation = Some(RunningOperation {
+            action: ArchiveAction::Mount,
+            archive_path: PathBuf::from("/roms/Active.zip"),
+            receiver,
+            progress_receiver: mpsc::channel().1,
+        });
+
+        assert!(!app.start_mount_all(
+            egui::Context::default(),
+            vec![mount_all_item("Pending", "Pending")],
+        ));
+        assert!(app.mount_all.is_none());
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::MountAll && entry.outcome == ActivityOutcome::Rejected
+        }));
+    }
+
+    #[test]
+    fn individual_actions_are_unavailable_during_mount_all() {
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        app.mount_all = Some(RunningMountAll {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            progress: MountAllProgress {
+                total: 1,
+                ..MountAllProgress::default()
+            },
+        });
+        let mounted = record("/roms/Game.zip", MountState::Mounted);
+        let pending = record("/roms/Pending.zip", MountState::Pending);
+
+        assert!(app.is_busy());
+        assert!(!individual_actions_available(app.is_busy()));
+        assert!(!lazy_unmount_available(
+            &mounted,
+            Some(Path::new("/roms/Game.zip")),
+            app.is_busy(),
+        ));
+        assert!(!remount_available(
+            &pending,
+            &HashSet::from([PathBuf::from("/roms/Pending.zip")]),
+            app.is_busy(),
+        ));
+    }
+
+    #[test]
+    fn mount_all_stop_request_is_recorded_and_signalled() {
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        app.mount_all = Some(RunningMountAll {
+            receiver,
+            stop: Arc::clone(&stop),
+            progress: MountAllProgress {
+                total: 3,
+                ..MountAllProgress::default()
+            },
+        });
+
+        app.request_mount_all_stop();
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(app.mount_all.as_ref().unwrap().progress.stop_requested);
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::MountAll
+                && entry.outcome == ActivityOutcome::Cancelled
+                && entry.message.contains("current archive")
+        }));
+    }
+
+    #[test]
+    fn mount_all_activity_records_batch_and_archive_outcomes() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        let first = mount_all_item("First", "First");
+        let second = mount_all_item("Second", "Second");
+        let third = mount_all_item("Third", "Third");
+        app.history.record(HistoryEntry::new(
+            ActivityAction::MountAll,
+            None,
+            ActivityOutcome::Started,
+            "Mount All started.",
+        ));
+        app.mount_all = Some(RunningMountAll {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            progress: MountAllProgress {
+                total: 3,
+                ..MountAllProgress::default()
+            },
+        });
+        sender
+            .send(MountAllEvent::ArchiveStarted {
+                index: 1,
+                total: 3,
+                item: first.clone(),
+            })
+            .unwrap();
+        sender.send(MountAllEvent::ArchiveCompleted(first)).unwrap();
+        sender
+            .send(MountAllEvent::ArchiveFailed {
+                item: second,
+                message: "mount failed".to_string(),
+            })
+            .unwrap();
+        sender
+            .send(MountAllEvent::ArchiveSkipped {
+                item: third,
+                reason: "archive disappeared".to_string(),
+            })
+            .unwrap();
+        sender
+            .send(MountAllEvent::Finished(MountAllResult {
+                total: 3,
+                successful: 1,
+                failures: vec![MountAllFailure {
+                    archive_path: PathBuf::from("/roms/Second.zip"),
+                    message: "mount failed".to_string(),
+                }],
+                skipped: vec![MountAllSkipped {
+                    archive_path: PathBuf::from("/roms/Third.zip"),
+                    reason: "archive disappeared".to_string(),
+                }],
+                unattempted: 0,
+                stopped: false,
+                setup_failure: None,
+            }))
+            .unwrap();
+
+        app.poll_mount_all(&egui::Context::default());
+
+        assert!(app.mount_all.is_none());
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::MountAll && entry.outcome == ActivityOutcome::Completed
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Mount && entry.outcome == ActivityOutcome::Completed
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Mount && entry.outcome == ActivityOutcome::Failed
+        }));
+        assert!(app.history.entries().any(|entry| {
+            entry.action == ActivityAction::Mount && entry.outcome == ActivityOutcome::Skipped
+        }));
+        assert_eq!(
+            app.feedback.as_ref().unwrap().message,
+            "Mount All completed with 1 failure."
+        );
     }
 
     #[test]
@@ -1864,16 +2968,8 @@ mod tests {
 
     #[test]
     fn unmount_confirmation_actions_are_unavailable_while_busy() {
-        let (_sender, receiver) = mpsc::channel();
-        let operation = RunningOperation {
-            action: ArchiveAction::Mount,
-            archive_path: PathBuf::from("/roms/Alpha.zip"),
-            receiver,
-            progress_receiver: mpsc::channel().1,
-        };
-
-        assert!(confirmation_actions_available(None));
-        assert!(!confirmation_actions_available(Some(&operation)));
+        assert!(confirmation_actions_available(false));
+        assert!(!confirmation_actions_available(true));
     }
 
     #[test]

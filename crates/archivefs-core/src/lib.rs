@@ -1293,6 +1293,92 @@ pub trait MountBackend {
     fn unmount(&self, mount_path: &Path) -> Result<()>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountOneOutcome {
+    Mounted(MountPlan),
+    AlreadyMounted(MountPlan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountBatchTargetSkipReason {
+    Selection(String),
+    InvalidTarget(String),
+    DuplicateResolvedTarget {
+        resolved_mount_path: PathBuf,
+        first_mount_path: PathBuf,
+    },
+    AlreadyMountedResolvedTarget {
+        resolved_mount_path: PathBuf,
+    },
+}
+
+impl fmt::Display for MountBatchTargetSkipReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selection(message) | Self::InvalidTarget(message) => formatter.write_str(message),
+            Self::DuplicateResolvedTarget {
+                resolved_mount_path,
+                first_mount_path,
+            } => write!(
+                formatter,
+                "duplicate target {} already reserved by {}",
+                resolved_mount_path.display(),
+                first_mount_path.display()
+            ),
+            Self::AlreadyMountedResolvedTarget {
+                resolved_mount_path,
+            } => write!(
+                formatter,
+                "resolved target {} is already mounted",
+                resolved_mount_path.display()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountBatchTargetValidation {
+    Ready {
+        archive_path: PathBuf,
+        mount_path: PathBuf,
+        resolved_mount_path: PathBuf,
+    },
+    Skipped {
+        archive_path: PathBuf,
+        mount_path: Option<PathBuf>,
+        reason: MountBatchTargetSkipReason,
+    },
+}
+
+impl MountBatchTargetValidation {
+    pub fn archive_path(&self) -> &Path {
+        match self {
+            Self::Ready { archive_path, .. } | Self::Skipped { archive_path, .. } => archive_path,
+        }
+    }
+
+    pub fn skip_reason(&self) -> Option<&MountBatchTargetSkipReason> {
+        match self {
+            Self::Ready { .. } => None,
+            Self::Skipped { reason, .. } => Some(reason),
+        }
+    }
+}
+
+impl MountOneOutcome {
+    pub fn plan(&self) -> &MountPlan {
+        match self {
+            Self::Mounted(plan) | Self::AlreadyMounted(plan) => plan,
+        }
+    }
+
+    pub fn into_plan(self) -> MountPlan {
+        match self {
+            Self::Mounted(plan) | Self::AlreadyMounted(plan) => plan,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LazyUnmountTool {
     Fusermount3,
@@ -1350,6 +1436,76 @@ impl RatarmountBackend {
         Self {
             ratarmount_bin: ratarmount_bin.into(),
         }
+    }
+}
+
+pub struct ArchiveMountSession {
+    config: Config,
+    plans: Vec<MountPlan>,
+    backend: RatarmountBackend,
+}
+
+impl ArchiveMountSession {
+    pub fn new(config: &Config) -> Result<Self> {
+        let scanner = ArchiveScanner::new(config);
+        Ok(Self {
+            config: config.clone(),
+            plans: scanner.mount_plans()?,
+            backend: RatarmountBackend::new(config.ratarmount_bin.clone()),
+        })
+    }
+
+    pub fn mount_archive_path(&self, archive_path: &Path) -> Result<MountOneOutcome> {
+        let plan = select_mount_plan_by_path(&self.plans, archive_path)?;
+        mount_one_plan_outcome(&self.config, plan, &self.backend)
+    }
+
+    pub fn validate_batch_targets(
+        &self,
+        archive_paths: &[PathBuf],
+    ) -> Result<Vec<MountBatchTargetValidation>> {
+        fs::create_dir_all(&self.config.mount_root)
+            .map_err(|source| ArchiveFsError::io(self.config.mount_root.clone(), source))?;
+        let active_mount_paths = current_mount_paths()?;
+        Ok(validate_mount_batch_targets(
+            &self.config,
+            &self.plans,
+            archive_paths,
+            &active_mount_paths,
+        ))
+    }
+
+    pub fn mount_validated_batch_target(
+        &self,
+        validation: &MountBatchTargetValidation,
+    ) -> Result<MountOneOutcome> {
+        let (archive_path, mount_path, expected_resolved_path) = match validation {
+            MountBatchTargetValidation::Ready {
+                archive_path,
+                mount_path,
+                resolved_mount_path,
+            } => (archive_path, mount_path, resolved_mount_path),
+            MountBatchTargetValidation::Skipped { reason, .. } => {
+                return Err(ArchiveFsError::Config(format!(
+                    "refusing to mount a skipped batch target: {reason}"
+                )));
+            }
+        };
+        let plan = select_mount_plan_by_path(&self.plans, archive_path)?;
+        if plan.mount_path != *mount_path {
+            return Err(ArchiveFsError::Config(format!(
+                "mount target changed after batch validation: {}",
+                plan.mount_path.display()
+            )));
+        }
+        let resolved_path = resolved_mount_target(&self.config, &plan.mount_path)?;
+        if resolved_path != *expected_resolved_path {
+            return Err(ArchiveFsError::Config(format!(
+                "resolved mount target changed after batch validation: {}",
+                plan.mount_path.display()
+            )));
+        }
+        mount_one_plan_outcome(&self.config, plan, &self.backend)
     }
 }
 
@@ -1783,6 +1939,7 @@ pub struct ArchiveStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveSnapshot {
+    pub mount_root: PathBuf,
     pub records: Vec<ArchiveRecord>,
     pub stats: ArchiveStats,
     pub statuses: Vec<ArchiveStatus>,
@@ -2355,6 +2512,7 @@ pub fn load_read_only_snapshot(config_path: impl AsRef<Path>) -> Result<ArchiveS
     complete_doctor_report(&mut doctor, &config, false, Some((&records, &statuses)));
 
     Ok(ArchiveSnapshot {
+        mount_root: config.mount_root.clone(),
         records,
         stats,
         statuses,
@@ -2694,8 +2852,15 @@ pub fn mount_one_archive(config: &Config, input: &str) -> Result<MountPlan> {
 
 /// Mounts the archive whose filesystem path exactly matches `archive_path`.
 pub fn mount_one_archive_path(config: &Config, archive_path: &Path) -> Result<MountPlan> {
-    let backend = RatarmountBackend::new(config.ratarmount_bin.clone());
-    mount_one_archive_path_with_backend(config, archive_path, &backend)
+    mount_one_archive_path_outcome(config, archive_path).map(MountOneOutcome::into_plan)
+}
+
+/// Mounts one exact archive and reports whether it was already active.
+pub fn mount_one_archive_path_outcome(
+    config: &Config,
+    archive_path: &Path,
+) -> Result<MountOneOutcome> {
+    ArchiveMountSession::new(config)?.mount_archive_path(archive_path)
 }
 
 /// Mounts one exact archive only when its planned mount path is not already active.
@@ -2742,6 +2907,7 @@ pub fn mount_one_archive_with_backend(
     mount_one_plan(config, plan, backend)
 }
 
+#[cfg(test)]
 fn mount_one_archive_path_with_backend(
     config: &Config,
     archive_path: &Path,
@@ -2759,6 +2925,14 @@ fn mount_one_plan(
     plan: MountPlan,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
+    mount_one_plan_outcome(config, plan, backend).map(MountOneOutcome::into_plan)
+}
+
+fn mount_one_plan_outcome(
+    config: &Config,
+    plan: MountPlan,
+    backend: &impl MountBackend,
+) -> Result<MountOneOutcome> {
     debug!(
         "mount-one selected archive={} mount={}",
         plan.archive.path.display(),
@@ -2767,13 +2941,24 @@ fn mount_one_plan(
 
     fs::create_dir_all(&config.mount_root)
         .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
-    let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    if mounted_paths.contains(&plan.mount_path) {
-        info!("{} is already mounted", plan.mount_path.display());
-        return Ok(plan);
-    }
+    let active_mount_paths = current_mount_paths()?;
+    mount_one_plan_outcome_with_active_mounts(config, plan, backend, &active_mount_paths)
+}
 
-    mount_unmounted_plan(config, plan, backend)
+fn mount_one_plan_outcome_with_active_mounts(
+    config: &Config,
+    plan: MountPlan,
+    backend: &impl MountBackend,
+    active_mount_paths: &HashSet<PathBuf>,
+) -> Result<MountOneOutcome> {
+    let resolved_mount_path = resolved_mount_target(config, &plan.mount_path)?;
+    if active_mount_paths.contains(&plan.mount_path)
+        || active_mount_paths.contains(&resolved_mount_path)
+    {
+        info!("{} is already mounted", plan.mount_path.display());
+        return Ok(MountOneOutcome::AlreadyMounted(plan));
+    }
+    mount_unmounted_plan(config, plan, backend).map(MountOneOutcome::Mounted)
 }
 
 fn mount_unmounted_plan(
@@ -2783,9 +2968,16 @@ fn mount_unmounted_plan(
 ) -> Result<MountPlan> {
     fs::create_dir_all(&config.mount_root)
         .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    validate_mount_target_parent(config, &plan.mount_path)?;
     info!("mounting {}", plan.archive.path.display());
     fs::create_dir_all(&plan.mount_path)
         .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
+    if !path_resolves_below(&plan.mount_path, &config.mount_root)? {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to mount outside mount root: {}",
+            plan.mount_path.display()
+        )));
+    }
     backend.mount(&plan)?;
     info!(
         "mounted {} at {}",
@@ -2793,6 +2985,114 @@ fn mount_unmounted_plan(
         plan.mount_path.display()
     );
     Ok(plan)
+}
+
+fn validate_mount_batch_targets(
+    config: &Config,
+    plans: &[MountPlan],
+    archive_paths: &[PathBuf],
+    active_mount_paths: &HashSet<PathBuf>,
+) -> Vec<MountBatchTargetValidation> {
+    let mut seen_targets: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
+    archive_paths
+        .iter()
+        .map(|archive_path| {
+            let plan = match select_mount_plan_by_path(plans, archive_path) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return MountBatchTargetValidation::Skipped {
+                        archive_path: archive_path.clone(),
+                        mount_path: None,
+                        reason: MountBatchTargetSkipReason::Selection(error.to_string()),
+                    };
+                }
+            };
+            let resolved_mount_path = match resolved_mount_target(config, &plan.mount_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    return MountBatchTargetValidation::Skipped {
+                        archive_path: archive_path.clone(),
+                        mount_path: Some(plan.mount_path.clone()),
+                        reason: MountBatchTargetSkipReason::InvalidTarget(error.to_string()),
+                    };
+                }
+            };
+            if active_mount_paths.contains(&resolved_mount_path) {
+                return MountBatchTargetValidation::Skipped {
+                    archive_path: archive_path.clone(),
+                    mount_path: Some(plan.mount_path.clone()),
+                    reason: MountBatchTargetSkipReason::AlreadyMountedResolvedTarget {
+                        resolved_mount_path,
+                    },
+                };
+            }
+            if let Some(first_mount_path) = seen_targets.get(&resolved_mount_path) {
+                return MountBatchTargetValidation::Skipped {
+                    archive_path: archive_path.clone(),
+                    mount_path: Some(plan.mount_path.clone()),
+                    reason: MountBatchTargetSkipReason::DuplicateResolvedTarget {
+                        resolved_mount_path,
+                        first_mount_path: first_mount_path.clone(),
+                    },
+                };
+            }
+            seen_targets.insert(resolved_mount_path.clone(), plan.mount_path.clone());
+            MountBatchTargetValidation::Ready {
+                archive_path: archive_path.clone(),
+                mount_path: plan.mount_path.clone(),
+                resolved_mount_path,
+            }
+        })
+        .collect()
+}
+
+fn validate_mount_target_parent(config: &Config, mount_path: &Path) -> Result<()> {
+    resolved_mount_target(config, mount_path).map(|_| ())
+}
+
+fn resolved_mount_target(config: &Config, mount_path: &Path) -> Result<PathBuf> {
+    if mount_path == config.mount_root || !path_is_under(mount_path, &config.mount_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to mount {} outside mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+
+    let resolved_root = fs::canonicalize(&config.mount_root)
+        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    let mut existing_parent = mount_path.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!(
+            "mount path has no parent: {}",
+            mount_path.display()
+        ))
+    })?;
+    while !existing_parent.exists() {
+        existing_parent = existing_parent.parent().ok_or_else(|| {
+            ArchiveFsError::Config(format!(
+                "cannot resolve a safe parent for {}",
+                mount_path.display()
+            ))
+        })?;
+    }
+    let resolved_parent = fs::canonicalize(existing_parent)
+        .map_err(|source| ArchiveFsError::io(existing_parent.to_path_buf(), source))?;
+    if resolved_parent != resolved_root && !path_is_under(&resolved_parent, &resolved_root) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to mount {} through a parent outside mount root {}",
+            mount_path.display(),
+            config.mount_root.display()
+        )));
+    }
+    let suffix = mount_path.strip_prefix(existing_parent).map_err(|_| {
+        ArchiveFsError::Config(format!(
+            "cannot resolve mount target {} from parent {}",
+            mount_path.display(),
+            existing_parent.display()
+        ))
+    })?;
+    Ok(resolved_parent.join(suffix))
 }
 
 pub fn unmount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
@@ -3143,13 +3443,18 @@ fn archive_index_entry_from_record(record: ArchiveRecord) -> ArchiveIndexEntry {
     }
 }
 
-fn mounted_paths_under(root: &Path) -> Result<HashSet<PathBuf>> {
+fn current_mount_paths() -> Result<HashSet<PathBuf>> {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")
         .map_err(|source| ArchiveFsError::io(PathBuf::from("/proc/self/mountinfo"), source))?;
-
     Ok(mountinfo
         .lines()
         .filter_map(mount_path_from_mountinfo_line)
+        .collect())
+}
+
+fn mounted_paths_under(root: &Path) -> Result<HashSet<PathBuf>> {
+    Ok(current_mount_paths()?
+        .into_iter()
         .filter(|path| path_is_under(path, root))
         .collect())
 }
@@ -3488,6 +3793,221 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn mount_target_validation_rejects_root_and_outside_paths() {
+        let root = test_root("mount_target_safety");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&mount_root).unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: mount_root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(validate_mount_target_parent(&config, &mount_root).is_err());
+        assert!(validate_mount_target_parent(&config, &root.join("outside").join("Game")).is_err());
+        assert!(validate_mount_target_parent(&config, &mount_root.join("Platform/Game")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_target_validation_rejects_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("mount_target_symlink_escape");
+        let mount_root = root.join("mounts");
+        let outside = root.join("outside");
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, mount_root.join("escape")).unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: mount_root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        assert!(validate_mount_target_parent(&config, &mount_root.join("escape/Game")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_validation_deduplicates_symlinked_parent_aliases_before_mounting() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("batch_target_alias");
+        let mount_root = root.join("mounts");
+        let real_parent = mount_root.join("Real");
+        fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, mount_root.join("Alias")).unwrap();
+        let first_archive = root.join("First.zip");
+        let second_archive = root.join("Second.zip");
+        let plans = vec![
+            MountPlan::new(
+                Archive::from_path(&first_archive).unwrap(),
+                real_parent.join("Game"),
+            ),
+            MountPlan::new(
+                Archive::from_path(&second_archive).unwrap(),
+                mount_root.join("Alias/Game"),
+            ),
+        ];
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        let validations = validate_mount_batch_targets(
+            &config,
+            &plans,
+            &[first_archive.clone(), second_archive.clone()],
+            &HashSet::new(),
+        );
+
+        assert!(matches!(
+            &validations[0],
+            MountBatchTargetValidation::Ready { resolved_mount_path, .. }
+                if resolved_mount_path == &real_parent.join("Game")
+        ));
+        assert!(matches!(
+            &validations[1],
+            MountBatchTargetValidation::Skipped { reason, .. }
+                if reason.to_string().contains("duplicate target")
+        ));
+
+        let backend = RecordingBackend::default();
+        for validation in validations {
+            if let MountBatchTargetValidation::Ready { archive_path, .. } = validation {
+                let plan = select_mount_plan_by_path(&plans, &archive_path).unwrap();
+                mount_one_plan_outcome(&config, plan, &backend).unwrap();
+            }
+        }
+        assert_eq!(backend.mounted(), vec![first_archive]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_validation_rejects_active_mount_alias_without_backend_call() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("batch_active_alias");
+        let mount_root = root.join("mounts");
+        let real_parent = mount_root.join("Real");
+        fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, mount_root.join("Alias")).unwrap();
+        let archive_path = root.join("Game.zip");
+        let plans = vec![MountPlan::new(
+            Archive::from_path(&archive_path).unwrap(),
+            mount_root.join("Alias/Game"),
+        )];
+        let config = Config {
+            source_folders: vec![root],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let active_mounts = HashSet::from([real_parent.join("Game")]);
+
+        let validations = validate_mount_batch_targets(
+            &config,
+            &plans,
+            std::slice::from_ref(&archive_path),
+            &active_mounts,
+        );
+
+        assert!(matches!(
+            &validations[0],
+            MountBatchTargetValidation::Skipped {
+                reason: MountBatchTargetSkipReason::AlreadyMountedResolvedTarget { .. },
+                ..
+            }
+        ));
+        let backend = RecordingBackend::default();
+        for validation in validations {
+            if let MountBatchTargetValidation::Ready { archive_path, .. } = validation {
+                let plan = select_mount_plan_by_path(&plans, &archive_path).unwrap();
+                mount_one_plan_outcome_with_active_mounts(&config, plan, &backend, &active_mounts)
+                    .unwrap();
+            }
+        }
+        assert!(backend.mounted().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_active_mount_is_rejected_without_touching_target() {
+        let root = test_root("exact_active_no_touch");
+        let mount_root = root.join("mounts");
+        let parent = mount_root.join("Platform");
+        fs::create_dir_all(&parent).unwrap();
+        let mount_path = parent.join("Game");
+        std::os::unix::fs::symlink(root.join("missing-target"), &mount_path).unwrap();
+        let plan = MountPlan::new(
+            Archive::from_path(root.join("Game.zip")).unwrap(),
+            mount_path.clone(),
+        );
+        let config = Config {
+            source_folders: vec![root],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+        let active_mounts = HashSet::from([mount_path]);
+
+        let outcome =
+            mount_one_plan_outcome_with_active_mounts(&config, plan, &backend, &active_mounts)
+                .unwrap();
+
+        assert!(matches!(outcome, MountOneOutcome::AlreadyMounted(_)));
+        assert!(backend.mounted().is_empty());
+    }
+
+    #[test]
+    fn batch_validation_allows_distinct_targets_and_rejects_outside_root() {
+        let root = test_root("batch_target_distinct");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&mount_root).unwrap();
+        let archives = [
+            root.join("First.zip"),
+            root.join("Second.zip"),
+            root.join("Outside.zip"),
+        ];
+        let plans = vec![
+            MountPlan::new(
+                Archive::from_path(&archives[0]).unwrap(),
+                mount_root.join("One/Game"),
+            ),
+            MountPlan::new(
+                Archive::from_path(&archives[1]).unwrap(),
+                mount_root.join("Two/Game"),
+            ),
+            MountPlan::new(
+                Archive::from_path(&archives[2]).unwrap(),
+                root.join("outside/Game"),
+            ),
+        ];
+        let config = Config {
+            source_folders: vec![root],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+
+        let validations = validate_mount_batch_targets(&config, &plans, &archives, &HashSet::new());
+
+        assert!(matches!(
+            validations[0],
+            MountBatchTargetValidation::Ready { .. }
+        ));
+        assert!(matches!(
+            validations[1],
+            MountBatchTargetValidation::Ready { .. }
+        ));
+        assert!(matches!(
+            &validations[2],
+            MountBatchTargetValidation::Skipped { reason, .. }
+                if reason.to_string().contains("outside mount root")
+        ));
     }
 
     #[cfg(unix)]
@@ -4762,6 +5282,7 @@ mod tests {
         let expected_statuses = current_statuses(&config).unwrap();
         let expected_doctor = run_doctor_read_only(&config_path);
 
+        assert_eq!(snapshot.mount_root, mount_root);
         assert_eq!(snapshot.records.len(), 2);
         assert_eq!(snapshot.stats, expected_stats);
         assert_eq!(snapshot.statuses, expected_statuses);
