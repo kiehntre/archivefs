@@ -1,3 +1,6 @@
+<img width="1024" height="559" alt="archivefsilogo2" src="https://github.com/user-attachments/assets/88d9f2e0-50d6-422d-ae2c-9b6151e02e2e" />
+
+
 # ArchiveFS
 
 ArchiveFS is a Linux-first command-line tool for mounting archive files as read-only folders. It scans configured source folders, plans safe mount paths, can mount archives through `ratarmount`, and provides status, stats, info, index, and watcher commands over the same core scanner.
