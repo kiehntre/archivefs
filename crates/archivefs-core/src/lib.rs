@@ -333,6 +333,40 @@ pub fn run_doctor_default() -> DoctorReport {
 }
 
 pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
+    run_doctor_with_mount_root_creation(config_path, true)
+}
+
+/// Runs doctor diagnostics without creating a missing mount root.
+pub fn run_doctor_read_only_default() -> DoctorReport {
+    match default_config_path() {
+        Ok(path) => run_doctor_read_only(path),
+        Err(error) => DoctorReport {
+            config_path: PathBuf::from("~/.config/archivefs/config.toml"),
+            checks: vec![DoctorCheck {
+                name: "config path".to_string(),
+                status: DoctorStatus::Fail,
+                detail: error.to_string(),
+            }],
+            archives_found: 0,
+            archives_with_platform: 0,
+            archives_unknown_platform: 0,
+            unknown_platform_examples: Vec::new(),
+            platform_counts: Vec::new(),
+            pending_archives: 0,
+            mounted_archives: 0,
+        },
+    }
+}
+
+/// Runs doctor diagnostics without creating a missing mount root.
+pub fn run_doctor_read_only(config_path: impl AsRef<Path>) -> DoctorReport {
+    run_doctor_with_mount_root_creation(config_path, false)
+}
+
+fn run_doctor_with_mount_root_creation(
+    config_path: impl AsRef<Path>,
+    create_mount_root: bool,
+) -> DoctorReport {
     let config_path = config_path.as_ref().to_path_buf();
     let mut report = DoctorReport {
         config_path: config_path.clone(),
@@ -390,7 +424,7 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
                 config.mount_root.display()
             ),
         );
-    } else {
+    } else if create_mount_root {
         match fs::create_dir_all(&config.mount_root) {
             Ok(()) => report.pass(
                 "mount root",
@@ -401,6 +435,11 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
                 format!("{} cannot be created: {error}", config.mount_root.display()),
             ),
         }
+    } else {
+        report.fail(
+            "mount root",
+            format!("{} does not exist", config.mount_root.display()),
+        );
     }
 
     if command_available(&config.ratarmount_bin) {
@@ -1059,7 +1098,7 @@ fn rar_part_number(filename: &str) -> Option<u32> {
     part.parse().ok()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MountState {
     Pending,
     Mounted,
@@ -1253,7 +1292,7 @@ impl MountBackend for RatarmountBackend {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArchiveStatus {
     pub archive_path: PathBuf,
     pub mount_path: PathBuf,
@@ -3855,6 +3894,36 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "archive scan" && check.status == DoctorStatus::Pass)
         );
+    }
+
+    #[test]
+    fn read_only_doctor_does_not_create_missing_mount_root() {
+        let root = test_root("doctor_read_only");
+        let source_root = root.join("roms");
+        let mount_root = root.join("missing-mounts");
+        let ratarmount = root.join("ratarmount");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(&ratarmount, b"").unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\n",
+                source_root.display(),
+                mount_root.display(),
+                ratarmount.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_doctor_read_only(&config_path);
+
+        assert!(!mount_root.exists());
+        assert!(report.checks.iter().any(|check| {
+            check.name == "mount root"
+                && check.status == DoctorStatus::Fail
+                && check.detail.ends_with("does not exist")
+        }));
     }
 
     #[test]

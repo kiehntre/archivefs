@@ -5,11 +5,70 @@ This document describes ArchiveFS command output that is intended for programmat
 Commands that currently support JSON output:
 
 ```sh
+archivefs status --json
 archivefs stats --json
 archivefs info <archive> --json
 ```
 
 JSON mode always writes the JSON document to stdout. Human headings, summaries, and explanatory text are omitted. Operational logs, when enabled with `--verbose` or `--debug`, are written to stderr by the normal logger and must not be mixed into stdout.
+
+## `archivefs status --json`
+
+Command syntax:
+
+```sh
+archivefs status
+archivefs status --json
+```
+
+Both forms inspect the configured archive sources through the same status collection path. The first prints the existing human-readable table. The second pretty-prints a JSON array and no human heading or explanatory text.
+
+### Schema
+
+Top-level value: array of `ArchiveStatusJson` objects. An empty result is represented as `[]`.
+
+```text
+ArchiveStatusJson[]
+
+ArchiveStatusJson = {
+  archive_path: string,
+  mount_path: string,
+  state: "Pending" | "Mounted" | "MountPathExists"
+}
+```
+
+### Fields
+
+`archive_path`
+
+Filesystem path to the source archive represented as a string.
+
+`mount_path`
+
+Filesystem path where ArchiveFS mounts, or would mount, the archive.
+
+`state`
+
+Current mount state. `Pending` means the archive is not mounted and its mount path does not exist. `Mounted` means the planned mount path is currently mounted. `MountPathExists` means the planned mount path exists but is not currently detected as mounted.
+
+Status output contains no byte-count fields. Any byte counts added to this schema in a future compatible extension will be JSON integers measured in bytes, never formatted size strings.
+
+### Example response
+
+```json
+[
+  {
+    "archive_path": "/data/archives/xbox/Halo.zip",
+    "mount_path": "/mnt/archivefs/Xbox/Halo",
+    "state": "Mounted"
+  },
+  {
+    "archive_path": "/data/archives/atari/Another World.7z",
+    "mount_path": "/mnt/archivefs/AtariST/Another World",
+    "state": "Pending"
+  }
+]
+```
 
 ## `archivefs stats --json`
 

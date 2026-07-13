@@ -139,8 +139,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             warn_if_index_refresh_failed(&config);
         }
         "status" => {
+            let json = args.any(|arg| arg == "--json");
             let config = Config::load_default()?;
-            print_statuses(&current_statuses(&config)?);
+            let statuses = current_statuses(&config)?;
+            if json {
+                print_statuses_json(&statuses)?;
+            } else {
+                print_statuses(&statuses);
+            }
         }
         "stats" => {
             let json = args.any(|arg| arg == "--json");
@@ -685,22 +691,30 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-use serde_json::to_string_pretty;
-
-fn print_statuses(statuses: &[ArchiveStatus]) -> Result<()> {
-    let json = to_string_pretty(&statuses)?;
-    println!($json);
-    Ok(())
+fn print_statuses(statuses: &[ArchiveStatus]) {
+    print!("{}", format_statuses(statuses));
 }
-    println!("{:<48}  {:<48}  State", "Archive", "Mount");
+
+fn format_statuses(statuses: &[ArchiveStatus]) -> String {
+    let mut output = format!("{:<48}  {:<48}  State\n", "Archive", "Mount");
     for status in statuses {
-        println!(
-            "{:<48}  {:<48}  {}",
+        output.push_str(&format!(
+            "{:<48}  {:<48}  {}\n",
             status.archive_path.display(),
             status.mount_path.display(),
             status.state
-        );
+        ));
     }
+    output
+}
+
+fn print_statuses_json(statuses: &[ArchiveStatus]) -> Result<(), serde_json::Error> {
+    println!("{}", format_statuses_json(statuses)?);
+    Ok(())
+}
+
+fn format_statuses_json(statuses: &[ArchiveStatus]) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(statuses)
 }
 
 fn print_help() {
@@ -731,6 +745,7 @@ fn print_help() {
     println!("Examples:");
     println!("  archivefs doctor");
     println!("  archivefs config-check");
+    println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
@@ -748,6 +763,57 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn example_statuses() -> Vec<ArchiveStatus> {
+        vec![
+            ArchiveStatus {
+                archive_path: std::path::PathBuf::from("/roms/Halo.zip"),
+                mount_path: std::path::PathBuf::from("/mnt/archivefs/Xbox/Halo"),
+                state: archivefs_core::MountState::Mounted,
+            },
+            ArchiveStatus {
+                archive_path: std::path::PathBuf::from("/roms/Mystery.7z"),
+                mount_path: std::path::PathBuf::from("/mnt/archivefs/Unknown/Mystery"),
+                state: archivefs_core::MountState::Pending,
+            },
+        ]
+    }
+
+    #[test]
+    fn format_statuses_preserves_existing_human_output_exactly() {
+        let output = format_statuses(&example_statuses());
+
+        assert_eq!(
+            output,
+            concat!(
+                "Archive                                           Mount                                             State\n",
+                "/roms/Halo.zip                                    /mnt/archivefs/Xbox/Halo                          Mounted\n",
+                "/roms/Mystery.7z                                  /mnt/archivefs/Unknown/Mystery                    Pending\n",
+            )
+        );
+    }
+
+    #[test]
+    fn format_statuses_json_outputs_valid_pretty_json_with_expected_fields() {
+        let output = format_statuses_json(&example_statuses()).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+        let statuses = json.as_array().unwrap();
+
+        assert!(output.starts_with("[\n"));
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0]["archive_path"], "/roms/Halo.zip");
+        assert_eq!(statuses[0]["mount_path"], "/mnt/archivefs/Xbox/Halo");
+        assert_eq!(statuses[0]["state"], "Mounted");
+        assert_eq!(statuses[1]["state"], "Pending");
+    }
+
+    #[test]
+    fn format_statuses_json_contains_no_human_heading() {
+        let output = format_statuses_json(&example_statuses()).unwrap();
+
+        assert!(!output.contains("Archive                                           Mount"));
+        assert!(!output.contains("State\n"));
+    }
 
     #[test]
     fn format_doctor_report_preserves_human_output_shape() {
