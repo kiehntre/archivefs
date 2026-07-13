@@ -2,6 +2,7 @@
 members = [
     "crates/archivefs-core",
     "crates/archivefs-cli",
+    "crates/archivefs-gui",
 ]
 resolver = "2"
 

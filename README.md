@@ -35,6 +35,19 @@ For regular local use, install it with Cargo:
 cargo install --path crates/archivefs-cli
 ```
 
+## Desktop GUI
+
+ArchiveFS also includes a small read-only desktop frontend. It scans in the background and shows archive totals, mount states, doctor checks, paths, platforms, and searchable status rows.
+
+Build and run it from the workspace root:
+
+```sh
+cargo build -p archivefs-gui
+cargo run -p archivefs-gui
+```
+
+The GUI uses the same `~/.config/archivefs/config.toml` configuration and core scanning logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.
+
 Archive mounting uses `ratarmount`, so install it separately and make sure it is available on `PATH`, or set `ratarmount_bin` in the config.
 
 ## Configuration

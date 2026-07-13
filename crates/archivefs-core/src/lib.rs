@@ -314,21 +314,7 @@ impl DoctorReport {
 pub fn run_doctor_default() -> DoctorReport {
     match default_config_path() {
         Ok(path) => run_doctor(path),
-        Err(error) => DoctorReport {
-            config_path: PathBuf::from("~/.config/archivefs/config.toml"),
-            checks: vec![DoctorCheck {
-                name: "config path".to_string(),
-                status: DoctorStatus::Fail,
-                detail: error.to_string(),
-            }],
-            archives_found: 0,
-            archives_with_platform: 0,
-            archives_unknown_platform: 0,
-            unknown_platform_examples: Vec::new(),
-            platform_counts: Vec::new(),
-            pending_archives: 0,
-            mounted_archives: 0,
-        },
+        Err(error) => doctor_config_path_error(error),
     }
 }
 
@@ -340,21 +326,7 @@ pub fn run_doctor(config_path: impl AsRef<Path>) -> DoctorReport {
 pub fn run_doctor_read_only_default() -> DoctorReport {
     match default_config_path() {
         Ok(path) => run_doctor_read_only(path),
-        Err(error) => DoctorReport {
-            config_path: PathBuf::from("~/.config/archivefs/config.toml"),
-            checks: vec![DoctorCheck {
-                name: "config path".to_string(),
-                status: DoctorStatus::Fail,
-                detail: error.to_string(),
-            }],
-            archives_found: 0,
-            archives_with_platform: 0,
-            archives_unknown_platform: 0,
-            unknown_platform_examples: Vec::new(),
-            platform_counts: Vec::new(),
-            pending_archives: 0,
-            mounted_archives: 0,
-        },
+        Err(error) => doctor_config_path_error(error),
     }
 }
 
@@ -363,13 +335,15 @@ pub fn run_doctor_read_only(config_path: impl AsRef<Path>) -> DoctorReport {
     run_doctor_with_mount_root_creation(config_path, false)
 }
 
-fn run_doctor_with_mount_root_creation(
-    config_path: impl AsRef<Path>,
-    create_mount_root: bool,
-) -> DoctorReport {
-    let config_path = config_path.as_ref().to_path_buf();
-    let mut report = DoctorReport {
-        config_path: config_path.clone(),
+fn doctor_config_path_error(error: ArchiveFsError) -> DoctorReport {
+    let mut report = empty_doctor_report(PathBuf::from("~/.config/archivefs/config.toml"));
+    report.fail("config path", error.to_string());
+    report
+}
+
+fn empty_doctor_report(config_path: PathBuf) -> DoctorReport {
+    DoctorReport {
+        config_path,
         checks: Vec::new(),
         archives_found: 0,
         archives_with_platform: 0,
@@ -378,7 +352,15 @@ fn run_doctor_with_mount_root_creation(
         platform_counts: Vec::new(),
         pending_archives: 0,
         mounted_archives: 0,
-    };
+    }
+}
+
+fn run_doctor_with_mount_root_creation(
+    config_path: impl AsRef<Path>,
+    create_mount_root: bool,
+) -> DoctorReport {
+    let config_path = config_path.as_ref().to_path_buf();
+    let mut report = empty_doctor_report(config_path.clone());
 
     if config_path.exists() {
         report.pass("config file", format!("found {}", config_path.display()));
@@ -398,6 +380,16 @@ fn run_doctor_with_mount_root_creation(
         }
     };
 
+    complete_doctor_report(&mut report, &config, create_mount_root, None);
+    report
+}
+
+fn complete_doctor_report(
+    report: &mut DoctorReport,
+    config: &Config,
+    create_mount_root: bool,
+    snapshot: Option<(&[ArchiveRecord], &[ArchiveStatus])>,
+) {
     let mut sources_ok = true;
     for source in &config.source_folders {
         if source.is_dir() {
@@ -460,61 +452,92 @@ fn run_doctor_with_mount_root_creation(
         report.fail("unmount tool", "neither fusermount3 nor umount was found");
     }
 
-    if sources_ok {
-        let scanner = ArchiveScanner::new(&config);
-        match scanner.scan_archives() {
-            Ok(archives) => {
-                report.archives_found = archives.len();
-                let mut platform_counts = BTreeMap::<String, usize>::new();
-                for archive in &archives {
-                    if let Some(platform) = &archive.identity.platform {
-                        *platform_counts.entry(platform.clone()).or_default() += 1;
-                    } else {
-                        report.archives_unknown_platform += 1;
-                        if report.unknown_platform_examples.len() < 10 {
-                            report.unknown_platform_examples.push(archive.path.clone());
-                        }
-                    }
-                }
-                report.archives_with_platform = archives.len() - report.archives_unknown_platform;
-                report.platform_counts = platform_counts.into_iter().collect();
-                report.pass("archive scan", format!("{} archives found", archives.len()));
-            }
-            Err(error) => report.fail("archive scan", error.to_string()),
-        }
-    } else {
+    if !sources_ok {
         report.warn(
             "archive scan",
             "skipped because one or more source folders are unavailable",
         );
-    }
-
-    match current_statuses(&config) {
-        Ok(statuses) => {
-            report.pending_archives = statuses
-                .iter()
-                .filter(|status| status.state == MountState::Pending)
-                .count();
-            report.mounted_archives = statuses
-                .iter()
-                .filter(|status| status.state == MountState::Mounted)
-                .count();
-            report.pass(
-                "mount status",
-                format!(
-                    "{} pending, {} mounted",
-                    report.pending_archives, report.mounted_archives
-                ),
-            );
-        }
-        Err(error) if sources_ok => report.fail("mount status", error.to_string()),
-        Err(_) => report.warn(
+        report.warn(
             "mount status",
             "skipped because one or more source folders are unavailable",
-        ),
+        );
+        return;
     }
 
-    report
+    if let Some((records, statuses)) = snapshot {
+        populate_doctor_archive_results(
+            report,
+            records
+                .iter()
+                .map(|record| (&record.identity.platform, &record.mount_plan.archive.path)),
+        );
+        populate_doctor_status_results(report, statuses);
+        return;
+    }
+
+    let scanner = ArchiveScanner::new(config);
+    match scanner.scan_archives() {
+        Ok(archives) => {
+            populate_doctor_archive_results(
+                report,
+                archives
+                    .iter()
+                    .map(|archive| (&archive.identity.platform, &archive.path)),
+            );
+            match scanner.archive_records_from_archives(archives) {
+                Ok(records) => {
+                    let statuses = archive_statuses_from_records(&records);
+                    populate_doctor_status_results(report, &statuses);
+                }
+                Err(error) => report.fail("mount status", error.to_string()),
+            }
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            report.fail("archive scan", detail.clone());
+            report.fail("mount status", detail);
+        }
+    }
+}
+
+fn populate_doctor_archive_results<'a>(
+    report: &mut DoctorReport,
+    mut archives: impl ExactSizeIterator<Item = (&'a Option<String>, &'a PathBuf)>,
+) {
+    let archives_found = archives.len();
+    report.archives_found = archives_found;
+    let mut platform_counts = BTreeMap::<String, usize>::new();
+    for (platform, archive_path) in &mut archives {
+        if let Some(platform) = platform {
+            *platform_counts.entry(platform.clone()).or_default() += 1;
+        } else {
+            report.archives_unknown_platform += 1;
+            if report.unknown_platform_examples.len() < 10 {
+                report.unknown_platform_examples.push(archive_path.clone());
+            }
+        }
+    }
+    report.archives_with_platform = archives_found - report.archives_unknown_platform;
+    report.platform_counts = platform_counts.into_iter().collect();
+    report.pass("archive scan", format!("{archives_found} archives found"));
+}
+
+fn populate_doctor_status_results(report: &mut DoctorReport, statuses: &[ArchiveStatus]) {
+    report.pending_archives = statuses
+        .iter()
+        .filter(|status| status.state == MountState::Pending)
+        .count();
+    report.mounted_archives = statuses
+        .iter()
+        .filter(|status| status.state == MountState::Mounted)
+        .count();
+    report.pass(
+        "mount status",
+        format!(
+            "{} pending, {} mounted",
+            report.pending_archives, report.mounted_archives
+        ),
+    );
 }
 
 pub fn run_config_check_default() -> ConfigCheckReport {
@@ -1330,9 +1353,18 @@ impl<'a> ArchiveScanner<'a> {
     }
 
     pub fn archive_records(&self) -> Result<Vec<ArchiveRecord>> {
+        let archives = self.scan_archives()?;
+        self.archive_records_from_archives(archives)
+    }
+
+    fn archive_records_from_archives(&self, archives: Vec<Archive>) -> Result<Vec<ArchiveRecord>> {
         let metadata_provider = FilenameMetadataProvider;
         let health_provider = FilesystemHealthProvider;
-        self.archive_records_with_providers(&metadata_provider, &health_provider)
+        self.archive_records_from_archives_with_providers(
+            archives,
+            &metadata_provider,
+            &health_provider,
+        )
     }
 
     pub fn archive_records_with_providers(
@@ -1340,7 +1372,21 @@ impl<'a> ArchiveScanner<'a> {
         metadata_provider: &impl MetadataProvider,
         health_provider: &impl HealthProvider,
     ) -> Result<Vec<ArchiveRecord>> {
-        let plans = self.mount_plans()?;
+        let archives = self.scan_archives()?;
+        self.archive_records_from_archives_with_providers(
+            archives,
+            metadata_provider,
+            health_provider,
+        )
+    }
+
+    fn archive_records_from_archives_with_providers(
+        &self,
+        archives: Vec<Archive>,
+        metadata_provider: &impl MetadataProvider,
+        health_provider: &impl HealthProvider,
+    ) -> Result<Vec<ArchiveRecord>> {
+        let plans = plan_mounts(&archives, &self.config.mount_root);
         let mounted_paths = mounted_paths_under(&self.config.mount_root)?;
         Ok(records_from_plans(
             plans,
@@ -1670,6 +1716,14 @@ pub struct ArchiveStats {
     pub largest_archive: Option<ArchiveSizeSummary>,
     pub smallest_archive: Option<ArchiveSizeSummary>,
     pub total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveSnapshot {
+    pub records: Vec<ArchiveRecord>,
+    pub stats: ArchiveStats,
+    pub statuses: Vec<ArchiveStatus>,
+    pub doctor: DoctorReport,
 }
 
 impl Serialize for ArchiveStats {
@@ -2220,6 +2274,31 @@ pub fn current_archive_stats(config: &Config) -> Result<ArchiveStats> {
     Ok(summarize_archive_records(&records))
 }
 
+/// Loads one read-only view of the configured library for desktop frontends.
+pub fn load_read_only_snapshot_default() -> Result<ArchiveSnapshot> {
+    load_read_only_snapshot(default_config_path()?)
+}
+
+/// Loads one read-only view of a library without creating mount directories.
+pub fn load_read_only_snapshot(config_path: impl AsRef<Path>) -> Result<ArchiveSnapshot> {
+    let config_path = config_path.as_ref().to_path_buf();
+    let config = Config::load_from(&config_path)?;
+    let records = current_archive_records(&config)?;
+    let stats = summarize_archive_records(&records);
+    let statuses = archive_statuses_from_records(&records);
+    let mut doctor = empty_doctor_report(config_path.clone());
+    doctor.pass("config file", format!("found {}", config_path.display()));
+    doctor.pass("config parses", "configuration parsed successfully");
+    complete_doctor_report(&mut doctor, &config, false, Some((&records, &statuses)));
+
+    Ok(ArchiveSnapshot {
+        records,
+        stats,
+        statuses,
+        doctor,
+    })
+}
+
 pub fn select_archive_record(records: &[ArchiveRecord], input: &str) -> Result<ArchiveRecord> {
     let plans = records
         .iter()
@@ -2503,10 +2582,19 @@ pub fn current_archive_records_with_providers(
 }
 
 pub fn current_statuses(config: &Config) -> Result<Vec<ArchiveStatus>> {
-    Ok(current_archive_records(config)?
-        .into_iter()
-        .map(archive_status_from_record)
-        .collect())
+    let records = current_archive_records(config)?;
+    Ok(archive_statuses_from_records(&records))
+}
+
+fn archive_statuses_from_records(records: &[ArchiveRecord]) -> Vec<ArchiveStatus> {
+    records
+        .iter()
+        .map(|record| ArchiveStatus {
+            archive_path: record.mount_plan.archive.path.clone(),
+            mount_path: record.mount_plan.mount_path.clone(),
+            state: record.mount_state,
+        })
+        .collect()
 }
 
 pub fn mount_archives(config: &Config) -> Result<Vec<ArchiveStatus>> {
@@ -2728,14 +2816,6 @@ fn mount_state_for_plan(plan: &MountPlan, mounted_paths: &HashSet<PathBuf>) -> M
         MountState::MountPathExists
     } else {
         MountState::Pending
-    }
-}
-
-fn archive_status_from_record(record: ArchiveRecord) -> ArchiveStatus {
-    ArchiveStatus {
-        archive_path: record.mount_plan.archive.path,
-        mount_path: record.mount_plan.mount_path,
-        state: record.mount_state,
     }
 }
 
@@ -3893,6 +3973,67 @@ mod tests {
                 .checks
                 .iter()
                 .any(|check| check.name == "archive scan" && check.status == DoctorStatus::Pass)
+        );
+    }
+
+    #[test]
+    fn read_only_snapshot_matches_existing_stats_statuses_and_doctor_counts() {
+        let root = test_root("read_only_snapshot");
+        let source_root = root.join("roms");
+        let xbox = source_root.join("microsoft_xbox");
+        let unknown = source_root.join("unknown");
+        let mount_root = root.join("mounts");
+        let ratarmount = root.join("ratarmount");
+        fs::create_dir_all(&xbox).unwrap();
+        fs::create_dir_all(&unknown).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::write(xbox.join("Halo.zip"), b"halo").unwrap();
+        fs::write(unknown.join("Mystery.7z"), b"mystery").unwrap();
+        fs::write(&ratarmount, b"").unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\n",
+                source_root.display(),
+                mount_root.display(),
+                ratarmount.display()
+            ),
+        )
+        .unwrap();
+
+        let snapshot = load_read_only_snapshot(&config_path).unwrap();
+        let config = Config::load_from(&config_path).unwrap();
+        let expected_stats = current_archive_stats(&config).unwrap();
+        let expected_statuses = current_statuses(&config).unwrap();
+        let expected_doctor = run_doctor_read_only(&config_path);
+
+        assert_eq!(snapshot.records.len(), 2);
+        assert_eq!(snapshot.stats, expected_stats);
+        assert_eq!(snapshot.statuses, expected_statuses);
+        assert_eq!(
+            snapshot.doctor.archives_found,
+            expected_doctor.archives_found
+        );
+        assert_eq!(
+            snapshot.doctor.archives_with_platform,
+            expected_doctor.archives_with_platform
+        );
+        assert_eq!(
+            snapshot.doctor.archives_unknown_platform,
+            expected_doctor.archives_unknown_platform
+        );
+        assert_eq!(
+            snapshot.doctor.platform_counts,
+            expected_doctor.platform_counts
+        );
+        assert_eq!(
+            snapshot.doctor.pending_archives,
+            expected_doctor.pending_archives
+        );
+        assert_eq!(
+            snapshot.doctor.mounted_archives,
+            expected_doctor.mounted_archives
         );
     }
 
