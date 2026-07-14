@@ -2365,6 +2365,17 @@ impl<'a> ArchiveScanner<'a> {
                 .map_err(|source_error| ArchiveFsError::io(path.clone(), source_error))?;
 
             if file_type.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
+                {
+                    debug!(
+                        "not descending into container directory {} - its contents are internal \
+                         payload, not separate library archives",
+                        path.display()
+                    );
+                    continue;
+                }
                 self.scan_source(source_root, &path, archives)?;
             } else if file_type.is_file()
                 && let Some(archive) = Archive::from_path_in_root(&path, source_root)
@@ -2376,6 +2387,34 @@ impl<'a> ArchiveScanner<'a> {
 
         Ok(())
     }
+}
+
+/// Directory-name suffixes (case-insensitive) that mark a recognised
+/// "container" or game-directory format: the directory as a whole
+/// represents one release (the container directory itself is the game),
+/// and everything nested inside it - at any depth - is internal payload
+/// resources, not separate library content. Scanning does not descend
+/// into a directory whose name matches one of these suffixes at all, so
+/// nested archives below it (for example N-Gage's internal
+/// `System/Apps/.../data.zip` resource files) are never emitted as
+/// independent `Archive` records.
+///
+/// Deliberately a narrow, explicit allow-list rather than a rule that
+/// skips every archive found inside any directory: ordinary nested
+/// folders elsewhere are scanned exactly as before. Add a new suffix here
+/// only for a genuinely recognised container/game-directory format, not
+/// as a general-purpose exclusion mechanism.
+const CONTAINER_DIRECTORY_SUFFIXES: &[&str] = &[".ngage"];
+
+/// True if `name` (a directory's own file name, already lossily
+/// stringified so a non-UTF-8 name is a safe non-match rather than a
+/// panic) matches a recognised container/game-directory suffix,
+/// case-insensitively.
+fn is_container_directory(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    CONTAINER_DIRECTORY_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
@@ -2677,6 +2716,9 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("neogeo", "NeoGeo"),
     ("neogeoaes", "NeoGeo"),
     ("neogeomvs", "NeoGeo"),
+    ("neogeo64", "NeoGeo64"),
+    ("ngage", "NGage"),
+    ("nokiangage", "NGage"),
     ("intellivision", "Intellivision"),
     ("amiga", "Amiga"),
     ("commodoreamiga", "Amiga"),
@@ -6265,6 +6307,52 @@ mod tests {
     }
 
     #[test]
+    fn neogeo64_folder_detects_neo_geo_64() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/neogeo64/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("NeoGeo64".to_string())
+        );
+    }
+
+    #[test]
+    fn ngage_folder_detects_ngage_for_genuine_top_level_content() {
+        // A loose N-Gage archive sitting directly under the "ngage"
+        // category folder (not packaged as a *.ngage container directory)
+        // must still resolve via the folder alias.
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/ngage/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("NGage".to_string())
+        );
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/Nokia N-Gage/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("NGage".to_string())
+        );
+    }
+
+    #[test]
+    fn luigis_mansion_with_no_platform_hint_stays_unknown() {
+        // Reproduces the Nobara report: a loose archive sitting directly
+        // in the source root, no platform subfolder and no strong
+        // filename hint - must not be swept up by any alias or heuristic.
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/Luigis_Mansion_[hexrom.com].zip",
+                "/home/davedap/Archives"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn intellivision_folder_detects_intellivision() {
         assert_eq!(
             detect_platform(
@@ -6480,6 +6568,8 @@ mod tests {
             ("msx", "MSX"),
             ("msx2", "MSX2"),
             ("neogeo", "NeoGeo"),
+            ("neogeo64", "NeoGeo64"),
+            ("ngage", "NGage"),
             ("intellivision", "Intellivision"),
             ("amiga", "Amiga"),
             ("amigacd32", "AmigaCD32"),
@@ -6521,6 +6611,226 @@ mod tests {
                 "folder {folder:?} should detect {expected_platform:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Container/game-directory scanner boundary (e.g. *.ngage).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_container_directory_matches_ngage_case_insensitively() {
+        for name in [
+            "Glimmerati.ngage",
+            "SSX Out Of Bounds.ngage",
+            "game.NGAGE",
+            "Game.NgAge",
+        ] {
+            assert!(
+                is_container_directory(name),
+                "{name:?} should be recognised as a container directory"
+            );
+        }
+        for name in ["Glimmerati", "ngage", "notngage", "System", "data.zip"] {
+            assert!(
+                !is_container_directory(name),
+                "{name:?} should not be recognised as a container directory"
+            );
+        }
+    }
+
+    fn scanner_config(root: &Path) -> Config {
+        Config {
+            source_folders: vec![root.to_path_buf()],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        }
+    }
+
+    #[test]
+    fn nested_zips_beneath_dot_ngage_are_skipped() {
+        let root = test_root("ngage_container_boundary");
+        let game_dir = root
+            .join("ngage")
+            .join("Glimmerati.ngage")
+            .join("System")
+            .join("Apps")
+            .join("Glimmerati");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::write(game_dir.join("data.zip"), b"").unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives()
+            .unwrap();
+
+        assert!(
+            archives.is_empty(),
+            "the only archive present is internal N-Gage payload and must not be scanned: {archives:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_nested_archives_outside_container_directories_are_still_scanned() {
+        let root = test_root("ordinary_nested_scan_unaffected");
+        let deep = root.join("psp").join("collection").join("extras");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("Game.zip"), b"").unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives()
+            .unwrap();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].path, deep.join("Game.zip"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_sibling_paths_do_not_panic_during_container_boundary_scan() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("ngage_non_utf8_sibling");
+        let ngage_dir = root.join("ngage");
+        fs::create_dir_all(&ngage_dir).unwrap();
+
+        let container = ngage_dir.join("Glimmerati.ngage");
+        fs::create_dir_all(container.join("System")).unwrap();
+        fs::write(container.join("System").join("data.zip"), b"").unwrap();
+
+        // A sibling directory whose name is not valid UTF-8, sitting right
+        // next to the container directory - must not cause a panic, and
+        // must be scanned normally (it is not itself a container).
+        let mut invalid_name = b"broken-".to_vec();
+        invalid_name.push(0x80);
+        let invalid_dir = ngage_dir.join(std::ffi::OsString::from_vec(invalid_name));
+        fs::create_dir_all(&invalid_dir).unwrap();
+        fs::write(invalid_dir.join("Game.zip"), b"").unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives()
+            .unwrap();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].path, invalid_dir.join("Game.zip"));
+    }
+
+    #[test]
+    fn nobara_reproduction_matches_the_reported_directory_shape() {
+        let root = test_root("nobara_reproduction");
+
+        // 1. Luigi's Mansion: no platform folder, no strong filename hint.
+        fs::write(root.join("Luigis_Mansion_[hexrom.com].zip"), b"").unwrap();
+
+        // 2. neogeo64/: a genuine top-level archive under the folder alias.
+        let neogeo64_dir = root.join("neogeo64");
+        fs::create_dir_all(&neogeo64_dir).unwrap();
+        fs::write(neogeo64_dir.join("Game.zip"), b"").unwrap();
+
+        // 3. ngage/: two *.ngage game-container directories, each with a
+        //    nested internal resource zip that must not be scanned.
+        let glimmerati_data = root
+            .join("ngage")
+            .join("Glimmerati.ngage")
+            .join("System")
+            .join("Apps")
+            .join("Glimmerati");
+        fs::create_dir_all(&glimmerati_data).unwrap();
+        fs::write(glimmerati_data.join("data.zip"), b"").unwrap();
+
+        let ssx_data = root
+            .join("ngage")
+            .join("SSX Out Of Bounds.ngage")
+            .join("System")
+            .join("Apps")
+            .join("SSXOutOfBounds");
+        fs::create_dir_all(&ssx_data).unwrap();
+        fs::write(ssx_data.join("data.zip"), b"").unwrap();
+        fs::write(ssx_data.join("resource.zip"), b"").unwrap();
+
+        let config = scanner_config(&root);
+        let scanner = ArchiveScanner::new(&config);
+        let archives = scanner.scan_archives().unwrap();
+
+        let paths: Vec<_> = archives
+            .iter()
+            .map(|archive| archive.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                root.join("Luigis_Mansion_[hexrom.com].zip"),
+                neogeo64_dir.join("Game.zip"),
+            ],
+            "only the loose Luigi's Mansion archive and the neogeo64 archive should be scanned; \
+             all three internal N-Gage payload zips must be excluded"
+        );
+
+        let records = scanner.archive_records().unwrap();
+        let luigi = records
+            .iter()
+            .find(|record| {
+                record
+                    .mount_plan
+                    .archive
+                    .path
+                    .ends_with("Luigis_Mansion_[hexrom.com].zip")
+            })
+            .expect("Luigi's Mansion should be scanned");
+        assert_eq!(
+            luigi.identity.platform, None,
+            "Luigi's Mansion must stay Unknown for now"
+        );
+
+        let neogeo64 = records
+            .iter()
+            .find(|record| record.mount_plan.archive.path == neogeo64_dir.join("Game.zip"))
+            .expect("neogeo64 archive should be scanned");
+        assert_eq!(neogeo64.identity.platform, Some("NeoGeo64".to_string()));
+    }
+
+    #[test]
+    fn container_boundary_reduces_scan_count_by_exactly_the_nested_archives() {
+        // Build the identical tree twice, differing only in whether the
+        // per-game directories are named as recognised *.ngage containers
+        // or as an ordinary (non-container) directory name. The scanned
+        // count must drop by exactly the two nested payload archives -
+        // nothing else in the tree is affected by the boundary.
+        fn build_tree(root: &Path, game_dir_name: &str) {
+            for game in ["Glimmerati", "SSX Out Of Bounds"] {
+                let data_dir = root
+                    .join("ngage")
+                    .join(format!("{game}{game_dir_name}"))
+                    .join("System")
+                    .join("Apps")
+                    .join(game.replace(' ', ""));
+                fs::create_dir_all(&data_dir).unwrap();
+                fs::write(data_dir.join("data.zip"), b"").unwrap();
+            }
+            fs::write(root.join("Loose.zip"), b"").unwrap();
+        }
+
+        let without_boundary_root = test_root("ngage_count_without_boundary");
+        build_tree(&without_boundary_root, ".notacontainer");
+        let without_boundary_count = ArchiveScanner::new(&scanner_config(&without_boundary_root))
+            .scan_archives()
+            .unwrap()
+            .len();
+
+        let with_boundary_root = test_root("ngage_count_with_boundary");
+        build_tree(&with_boundary_root, ".ngage");
+        let with_boundary_count = ArchiveScanner::new(&scanner_config(&with_boundary_root))
+            .scan_archives()
+            .unwrap()
+            .len();
+
+        assert_eq!(
+            without_boundary_count, 3,
+            "sanity check: 2 nested + 1 loose archive"
+        );
+        assert_eq!(
+            with_boundary_count,
+            without_boundary_count - 2,
+            "the count must drop by exactly the two nested N-Gage payload archives"
+        );
     }
 
     #[test]
