@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use log::{debug, info};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 pub enum ArchiveFsError {
@@ -225,6 +227,58 @@ pub struct ConfigCheckReport {
     pub checks: Vec<ConfigCheck>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupDiagnosticStatus {
+    Ready,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupDiagnostic {
+    pub name: String,
+    pub status: SetupDiagnosticStatus,
+    pub detail: String,
+    pub why_it_matters: String,
+    pub next_step: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupDiagnostics {
+    pub config_path: Option<PathBuf>,
+    pub config_path_error: Option<String>,
+    pub config_missing: bool,
+    pub mount_root: Option<PathBuf>,
+    pub can_create_mount_root: bool,
+    pub ready_for_scanning: bool,
+    pub ready_for_actions: bool,
+    pub config_identity: ConfigIdentity,
+    pub checks: Vec<SetupDiagnostic>,
+}
+
+/// A strong identity for one read of the configuration file: the resolved
+/// path plus a SHA-256 digest of the exact bytes read. Two `ConfigIdentity`
+/// values are only equal when both the path and content digest match, so
+/// results derived from different reads of a changed config can never be
+/// mistaken for a single coherent state.
+///
+/// This digest is a staleness fingerprint, not a security or authentication
+/// mechanism: it is only ever compared against another value computed the
+/// same way within this process to detect a config file changing between
+/// two reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigIdentity {
+    pub config_path: Option<PathBuf>,
+    pub content_digest: Option<[u8; 32]>,
+}
+
+fn config_identity(config_path: &Path, contents: Option<&str>) -> ConfigIdentity {
+    ConfigIdentity {
+        config_path: Some(config_path.to_path_buf()),
+        content_digest: contents.map(|contents| Sha256::digest(contents.as_bytes()).into()),
+    }
+}
+
 impl ConfigCheckReport {
     pub fn error_count(&self) -> usize {
         self.checks
@@ -396,46 +450,59 @@ fn complete_doctor_report(
 ) {
     let mut sources_ok = true;
     for source in &config.source_folders {
-        if source.is_dir() {
-            report.pass("source folder", format!("{} exists", source.display()));
-        } else {
-            sources_ok = false;
-            report.fail(
-                "source folder",
-                format!("{} does not exist or is not a directory", source.display()),
-            );
+        match inspect_path(source) {
+            PathInspection::Directory => {
+                report.pass("source folder", format!("{} exists", source.display()));
+            }
+            state => {
+                sources_ok = false;
+                report.fail(
+                    "source folder",
+                    state.error_detail().map_or_else(
+                        || format!("{} does not exist or is not a directory", source.display()),
+                        |error| format!("{} cannot be inspected: {error}", source.display()),
+                    ),
+                );
+            }
         }
     }
 
-    if config.mount_root.is_dir() {
-        report.pass(
+    match inspect_path(&config.mount_root) {
+        PathInspection::Directory => report.pass(
             "mount root",
             format!("{} exists", config.mount_root.display()),
-        );
-    } else if config.mount_root.exists() {
-        report.fail(
+        ),
+        PathInspection::Other => report.fail(
             "mount root",
             format!(
                 "{} exists but is not a directory",
                 config.mount_root.display()
             ),
-        );
-    } else if create_mount_root {
-        match fs::create_dir_all(&config.mount_root) {
-            Ok(()) => report.pass(
-                "mount root",
-                format!("{} was created", config.mount_root.display()),
-            ),
-            Err(error) => report.fail(
-                "mount root",
-                format!("{} cannot be created: {error}", config.mount_root.display()),
-            ),
+        ),
+        PathInspection::Missing if create_mount_root => {
+            match fs::create_dir_all(&config.mount_root) {
+                Ok(()) => report.pass(
+                    "mount root",
+                    format!("{} was created", config.mount_root.display()),
+                ),
+                Err(error) => report.fail(
+                    "mount root",
+                    format!("{} cannot be created: {error}", config.mount_root.display()),
+                ),
+            }
         }
-    } else {
-        report.fail(
+        PathInspection::Missing => report.fail(
             "mount root",
             format!("{} does not exist", config.mount_root.display()),
-        );
+        ),
+        PathInspection::PermissionDenied(error) | PathInspection::MetadataError(error) => report
+            .fail(
+                "mount root",
+                format!(
+                    "{} cannot be inspected: {error}",
+                    config.mount_root.display()
+                ),
+            ),
     }
 
     if command_available(&config.ratarmount_bin) {
@@ -559,6 +626,471 @@ pub fn run_config_check_default() -> ConfigCheckReport {
 }
 
 pub fn run_config_check(config_path: impl AsRef<Path>) -> ConfigCheckReport {
+    run_config_check_with_mount_root_creation(config_path, true)
+}
+
+pub fn run_setup_diagnostics_default() -> SetupDiagnostics {
+    run_setup_diagnostics_default_with_path(default_config_path())
+}
+
+fn run_setup_diagnostics_default_with_path(config_path: Result<PathBuf>) -> SetupDiagnostics {
+    match config_path {
+        Ok(path) => run_setup_diagnostics(path),
+        Err(error) => SetupDiagnostics {
+            config_path: None,
+            config_path_error: Some(error.to_string()),
+            config_missing: false,
+            mount_root: None,
+            can_create_mount_root: false,
+            ready_for_scanning: false,
+            ready_for_actions: false,
+            config_identity: ConfigIdentity {
+                config_path: None,
+                content_digest: None,
+            },
+            checks: vec![SetupDiagnostic {
+                name: "Config path".to_string(),
+                status: SetupDiagnosticStatus::Error,
+                detail: format!(
+                    "ArchiveFS could not determine the user configuration directory: {error}"
+                ),
+                why_it_matters: "ArchiveFS needs a known configuration location.".to_string(),
+                next_step: "Set HOME and refresh diagnostics.".to_string(),
+            }],
+        },
+    }
+}
+
+pub fn run_setup_diagnostics(config_path: impl AsRef<Path>) -> SetupDiagnostics {
+    run_setup_diagnostics_with_command_check(config_path, command_available)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathInspection {
+    Missing,
+    Directory,
+    Other,
+    PermissionDenied(String),
+    MetadataError(String),
+}
+
+impl PathInspection {
+    fn is_directory(&self) -> bool {
+        matches!(self, Self::Directory)
+    }
+
+    fn is_confirmed_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    fn error_detail(&self) -> Option<&str> {
+        match self {
+            Self::PermissionDenied(detail) | Self::MetadataError(detail) => Some(detail),
+            Self::Missing | Self::Directory | Self::Other => None,
+        }
+    }
+}
+
+fn inspect_path(path: &Path) -> PathInspection {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => PathInspection::Directory,
+        Ok(_) => PathInspection::Other,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::symlink_metadata(path) {
+            Ok(_) => PathInspection::Other,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => PathInspection::Missing,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                PathInspection::PermissionDenied(error.to_string())
+            }
+            Err(error) => PathInspection::MetadataError(error.to_string()),
+        },
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            PathInspection::PermissionDenied(error.to_string())
+        }
+        Err(error) => PathInspection::MetadataError(error.to_string()),
+    }
+}
+
+fn run_setup_diagnostics_with_command_check(
+    config_path: impl AsRef<Path>,
+    command_check: impl Fn(&str) -> bool,
+) -> SetupDiagnostics {
+    let config_path = config_path.as_ref().to_path_buf();
+    run_setup_diagnostics_with_checks(
+        config_path,
+        |path| fs::read_to_string(path),
+        inspect_path,
+        command_check,
+    )
+}
+
+fn run_setup_diagnostics_with_checks(
+    config_path: PathBuf,
+    read_config: impl Fn(&Path) -> io::Result<String>,
+    inspect: impl Fn(&Path) -> PathInspection,
+    command_check: impl Fn(&str) -> bool,
+) -> SetupDiagnostics {
+    let (config_missing, config_read_ok, config_read_detail, contents) =
+        match read_config(&config_path) {
+            Ok(contents) => (
+                false,
+                true,
+                format!("Configuration path: {}", config_path.display()),
+                Some(contents),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let state = inspect(&config_path);
+                let missing = state.is_confirmed_missing();
+                let detail = if missing {
+                    format!("Configuration file is missing: {}", config_path.display())
+                } else {
+                    format!(
+                        "Configuration path {} could not be inspected safely: {}",
+                        config_path.display(),
+                        state
+                            .error_detail()
+                            .unwrap_or("the path is not a readable file")
+                    )
+                };
+                (missing, false, detail, None)
+            }
+            Err(error) => (
+                false,
+                false,
+                format!("{} cannot be read: {error}", config_path.display()),
+                None,
+            ),
+        };
+    let parsed = contents.as_deref().map(parse_config_fields);
+    let parse_detail = match &parsed {
+        Some(Ok(_)) => "Configuration parsed successfully.".to_string(),
+        Some(Err(error)) => error.to_string(),
+        None => "Configuration cannot be parsed until it can be read.".to_string(),
+    };
+    let fields = parsed.and_then(Result::ok);
+    let config_valid = contents
+        .as_deref()
+        .is_some_and(|contents| parse_config(contents).is_ok());
+    let source_folders = fields
+        .as_ref()
+        .and_then(|fields| fields.source_folders.as_ref())
+        .map(|sources| sources.iter().map(PathBuf::from).collect::<Vec<_>>());
+    let source_states = source_folders
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|source| (source.clone(), inspect(source)))
+        .collect::<Vec<_>>();
+    let mount_root = fields.as_ref().and_then(|fields| fields.mount_root.clone());
+    let mount_root_state = mount_root.as_ref().map(|root| inspect(root));
+    let can_create_mount_root = mount_root_state
+        .as_ref()
+        .is_some_and(PathInspection::is_confirmed_missing)
+        && mount_root.as_ref().is_some_and(|root| {
+            root.parent()
+                .is_some_and(|parent| inspect(parent).is_directory())
+        });
+    let sources_ready =
+        !source_states.is_empty() && source_states.iter().all(|(_, state)| state.is_directory());
+    let mount_root_ready = mount_root_state
+        .as_ref()
+        .is_some_and(PathInspection::is_directory);
+    let mount_root_writable = mount_root_ready
+        && mount_root
+            .as_ref()
+            .is_some_and(|root| directory_is_writable(root));
+    let ratarmount_name = fields
+        .as_ref()
+        .and_then(|fields| fields.ratarmount_bin.as_deref())
+        .unwrap_or("ratarmount");
+    let ratarmount_ready = command_check(ratarmount_name);
+    let unmount_ready = command_check("fusermount3") || command_check("umount");
+    let ready_for_scanning = config_valid && sources_ready;
+    let ready_for_actions = ready_for_scanning
+        && mount_root_ready
+        && mount_root_writable
+        && ratarmount_ready
+        && unmount_ready;
+    let mut checks = Vec::new();
+    setup_check(
+        &mut checks,
+        "Config file exists",
+        config_read_ok,
+        config_read_detail,
+        "ArchiveFS needs this file to locate archives and mounts.",
+        "Create a starter config or create this file manually.",
+    );
+    setup_check(
+        &mut checks,
+        "Config parses successfully",
+        fields.is_some(),
+        parse_detail,
+        "Invalid TOML prevents ArchiveFS from reading any settings.",
+        "Open the config and correct the reported fields or syntax.",
+    );
+    setup_check(
+        &mut checks,
+        "At least one source folder is configured",
+        source_folders
+            .as_ref()
+            .is_some_and(|sources| !sources.is_empty()),
+        source_folders.as_ref().map_or_else(
+            || "No usable source_folders setting is available.".to_string(),
+            |sources| format!("{} source folder(s) configured.", sources.len()),
+        ),
+        "Source folders contain the archives ArchiveFS scans.",
+        "Add at least one existing directory to source_folders.",
+    );
+    for (source, state) in &source_states {
+        setup_check(
+            &mut checks,
+            "Configured source folder exists",
+            state.is_directory(),
+            state.error_detail().map_or_else(
+                || format!("Source folder: {}", source.display()),
+                |error| {
+                    format!(
+                        "Source folder {} cannot be inspected: {error}",
+                        source.display()
+                    )
+                },
+            ),
+            "Unavailable source folders make library scans incomplete.",
+            "Create the directory or update source_folders to the correct path.",
+        );
+    }
+    setup_check(
+        &mut checks,
+        "mount_root is configured",
+        mount_root.is_some(),
+        mount_root.as_ref().map_or_else(
+            || "No mount_root setting is available.".to_string(),
+            |root| format!("Mount root: {}", root.display()),
+        ),
+        "ArchiveFS places read-only archive mounts below this directory.",
+        "Set mount_root to a dedicated directory.",
+    );
+    setup_check_with_warning(
+        &mut checks,
+        "Mount root exists or can be created safely",
+        mount_root_ready,
+        can_create_mount_root,
+        mount_root.as_ref().map_or_else(
+            || "No mount root is configured.".to_string(),
+            |root| {
+                mount_root_state
+                    .as_ref()
+                    .and_then(PathInspection::error_detail)
+                    .map_or_else(
+                        || format!("Mount root: {}", root.display()),
+                        |error| {
+                            format!("Mount root {} cannot be inspected: {error}", root.display())
+                        },
+                    )
+            },
+        ),
+        "Mount and unmount actions require a safe dedicated root.",
+        "Use Create Mount Root when offered, or correct its parent path.",
+    );
+    setup_check_with_warning(
+        &mut checks,
+        "Mount root is writable",
+        mount_root_writable,
+        can_create_mount_root,
+        mount_root.as_ref().map_or_else(
+            || "No mount root is available to test.".to_string(),
+            |root| format!("Writable directory required: {}", root.display()),
+        ),
+        "ArchiveFS must create mount-point directories below mount_root.",
+        "Grant the current user write access or choose another mount_root.",
+    );
+    setup_check(
+        &mut checks,
+        "ratarmount is available",
+        ratarmount_ready,
+        if ratarmount_ready {
+            format!("{ratarmount_name} is available.")
+        } else {
+            format!("{ratarmount_name} was not found.")
+        },
+        "ArchiveFS uses ratarmount to expose archive contents as read-only folders.",
+        "Install ratarmount and ensure it is available on PATH, then refresh diagnostics.",
+    );
+    setup_check(
+        &mut checks,
+        "fusermount3 or umount is available",
+        unmount_ready,
+        if unmount_ready {
+            "fusermount3 or umount is available.".to_string()
+        } else {
+            "Neither fusermount3 nor umount was found.".to_string()
+        },
+        "Without either tool, ArchiveFS cannot detach mounted archives.",
+        "Install fusermount3 or provide umount on PATH, then refresh diagnostics.",
+    );
+    setup_check(
+        &mut checks,
+        "ArchiveFS is ready for scanning",
+        ready_for_scanning,
+        "Scanning requires a valid config and all configured source folders.".to_string(),
+        "Archive scanning populates the library shown in the GUI.",
+        "Resolve config and source-folder errors above.",
+    );
+    setup_check(
+        &mut checks,
+        "ArchiveFS is ready for mount/unmount actions",
+        ready_for_actions,
+        "Actions additionally require a writable mount root and system tools.".to_string(),
+        "Mount and unmount controls are unsafe or unusable until these checks pass.",
+        "Resolve mount-root and tool errors above.",
+    );
+    let identity = config_identity(&config_path, contents.as_deref());
+    SetupDiagnostics {
+        config_path: Some(config_path),
+        config_path_error: None,
+        config_missing,
+        mount_root,
+        can_create_mount_root,
+        ready_for_scanning,
+        ready_for_actions,
+        config_identity: identity,
+        checks,
+    }
+}
+
+fn setup_check(
+    checks: &mut Vec<SetupDiagnostic>,
+    name: &str,
+    ready: bool,
+    detail: String,
+    why_it_matters: &str,
+    next_step: &str,
+) {
+    checks.push(SetupDiagnostic {
+        name: name.to_string(),
+        status: if ready {
+            SetupDiagnosticStatus::Ready
+        } else {
+            SetupDiagnosticStatus::Error
+        },
+        detail,
+        why_it_matters: why_it_matters.to_string(),
+        next_step: next_step.to_string(),
+    });
+}
+
+fn setup_check_with_warning(
+    checks: &mut Vec<SetupDiagnostic>,
+    name: &str,
+    ready: bool,
+    warning: bool,
+    detail: String,
+    why_it_matters: &str,
+    next_step: &str,
+) {
+    checks.push(SetupDiagnostic {
+        name: name.to_string(),
+        status: if ready {
+            SetupDiagnosticStatus::Ready
+        } else if warning {
+            SetupDiagnosticStatus::Warning
+        } else {
+            SetupDiagnosticStatus::Error
+        },
+        detail,
+        why_it_matters: why_it_matters.to_string(),
+        next_step: next_step.to_string(),
+    });
+}
+
+fn directory_is_writable(path: &Path) -> bool {
+    static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let probe = path.join(format!(
+        ".archivefs-write-test-{}-{}",
+        std::process::id(),
+        PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => fs::remove_file(probe).is_ok(),
+        Err(_) => false,
+    }
+}
+
+pub fn create_starter_config_default() -> Result<PathBuf> {
+    let path = default_config_path()?;
+    create_starter_config(&path)?;
+    Ok(path)
+}
+
+pub fn create_starter_config(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    use std::io::Write;
+    file.write_all(
+        b"# ArchiveFS starter configuration\n# Replace these example paths with directories on your system.\nsource_folders = [\"/path/to/archives\"]\nmount_root = \"/path/to/archivefs-mounts\"\nratarmount_bin = \"ratarmount\"\n",
+    )
+    .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))
+}
+
+pub fn create_configured_mount_root_default() -> Result<PathBuf> {
+    let config_path = default_config_path()?;
+    let contents = fs::read_to_string(&config_path)
+        .map_err(|source| ArchiveFsError::io(config_path.clone(), source))?;
+    let root = parse_config_fields(&contents)?
+        .mount_root
+        .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?;
+    create_mount_root(&root)?;
+    Ok(root)
+}
+
+pub fn create_configured_mount_root(config: &Config) -> Result<()> {
+    create_mount_root(&config.mount_root)
+}
+
+fn create_mount_root(root: &Path) -> Result<()> {
+    match inspect_path(root) {
+        PathInspection::Missing => {}
+        PathInspection::Directory | PathInspection::Other => {
+            return Err(ArchiveFsError::Config(format!(
+                "mount root already exists: {}",
+                root.display()
+            )));
+        }
+        PathInspection::PermissionDenied(error) | PathInspection::MetadataError(error) => {
+            return Err(ArchiveFsError::Config(format!(
+                "mount root cannot be inspected safely at {}: {error}",
+                root.display()
+            )));
+        }
+    }
+    let parent = root.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!("mount root has no parent: {}", root.display()))
+    })?;
+    if !inspect_path(parent).is_directory() {
+        return Err(ArchiveFsError::Config(format!(
+            "mount root parent is unavailable: {}",
+            parent.display()
+        )));
+    }
+    fs::create_dir(root).map_err(|source| ArchiveFsError::io(root.to_path_buf(), source))
+}
+
+/// Validates configuration without creating a missing mount root.
+pub fn run_config_check_read_only(config_path: impl AsRef<Path>) -> ConfigCheckReport {
+    run_config_check_with_mount_root_creation(config_path, false)
+}
+
+fn run_config_check_with_mount_root_creation(
+    config_path: impl AsRef<Path>,
+    create_mount_root: bool,
+) -> ConfigCheckReport {
     let config_path = config_path.as_ref().to_path_buf();
     let mut report = ConfigCheckReport {
         config_path: config_path.clone(),
@@ -618,31 +1150,48 @@ pub fn run_config_check(config_path: impl AsRef<Path>) -> ConfigCheckReport {
                         format!("{} is listed more than once", source.display()),
                     );
                 }
-                if source.exists() {
-                    report.pass(
-                        "source folder exists",
-                        format!("{} exists", source.display()),
-                    );
-                    if source.is_dir() {
+                match inspect_path(&source) {
+                    PathInspection::Directory => {
+                        report.pass(
+                            "source folder exists",
+                            format!("{} exists", source.display()),
+                        );
                         report.pass(
                             "source folder is directory",
                             format!("{} is a directory", source.display()),
                         );
-                    } else {
+                    }
+                    PathInspection::Other => {
+                        report.pass(
+                            "source folder exists",
+                            format!("{} exists", source.display()),
+                        );
                         report.error(
                             "source folder is directory",
                             format!("{} exists but is not a directory", source.display()),
                         );
                     }
-                } else {
-                    report.error(
-                        "source folder exists",
-                        format!("{} does not exist", source.display()),
-                    );
-                    report.error(
-                        "source folder is directory",
-                        format!("{} is not a directory", source.display()),
-                    );
+                    PathInspection::Missing => {
+                        report.error(
+                            "source folder exists",
+                            format!("{} does not exist", source.display()),
+                        );
+                        report.error(
+                            "source folder is directory",
+                            format!("{} is not a directory", source.display()),
+                        );
+                    }
+                    PathInspection::PermissionDenied(error)
+                    | PathInspection::MetadataError(error) => {
+                        report.error(
+                            "source folder exists",
+                            format!("{} cannot be inspected: {error}", source.display()),
+                        );
+                        report.error(
+                            "source folder is directory",
+                            format!("{} cannot be verified as a directory", source.display()),
+                        );
+                    }
                 }
             }
         }
@@ -654,46 +1203,90 @@ pub fn run_config_check(config_path: impl AsRef<Path>) -> ConfigCheckReport {
     match &fields.mount_root {
         Some(mount_root) => {
             report.pass("mount_root set", format!("{}", mount_root.display()));
-            if mount_root.is_dir() {
-                report.pass(
-                    "mount_root exists",
-                    format!("{} exists", mount_root.display()),
-                );
-                report.pass(
-                    "mount_root is directory",
-                    format!("{} is a directory", mount_root.display()),
-                );
-            } else if mount_root.exists() {
-                report.pass(
-                    "mount_root exists",
-                    format!("{} exists", mount_root.display()),
-                );
-                report.error(
-                    "mount_root is directory",
-                    format!("{} exists but is not a directory", mount_root.display()),
-                );
-            } else {
-                match fs::create_dir_all(mount_root) {
-                    Ok(()) => {
-                        report.pass(
-                            "mount_root exists",
-                            format!("{} was created", mount_root.display()),
-                        );
-                        report.pass(
-                            "mount_root is directory",
-                            format!("{} is a directory", mount_root.display()),
-                        );
+            match inspect_path(mount_root) {
+                PathInspection::Directory => {
+                    report.pass(
+                        "mount_root exists",
+                        format!("{} exists", mount_root.display()),
+                    );
+                    report.pass(
+                        "mount_root is directory",
+                        format!("{} is a directory", mount_root.display()),
+                    );
+                }
+                PathInspection::Other => {
+                    report.pass(
+                        "mount_root exists",
+                        format!("{} exists", mount_root.display()),
+                    );
+                    report.error(
+                        "mount_root is directory",
+                        format!("{} exists but is not a directory", mount_root.display()),
+                    );
+                }
+                PathInspection::Missing if create_mount_root => {
+                    match fs::create_dir_all(mount_root) {
+                        Ok(()) => {
+                            report.pass(
+                                "mount_root exists",
+                                format!("{} was created", mount_root.display()),
+                            );
+                            report.pass(
+                                "mount_root is directory",
+                                format!("{} is a directory", mount_root.display()),
+                            );
+                        }
+                        Err(error) => {
+                            report.error(
+                                "mount_root exists",
+                                format!("{} cannot be created: {error}", mount_root.display()),
+                            );
+                            report.error(
+                                "mount_root is directory",
+                                format!("{} is not a directory", mount_root.display()),
+                            );
+                        }
                     }
-                    Err(error) => {
-                        report.error(
-                            "mount_root exists",
-                            format!("{} cannot be created: {error}", mount_root.display()),
-                        );
-                        report.error(
-                            "mount_root is directory",
-                            format!("{} is not a directory", mount_root.display()),
-                        );
-                    }
+                }
+                PathInspection::Missing
+                    if mount_root
+                        .parent()
+                        .is_some_and(|parent| inspect_path(parent).is_directory()) =>
+                {
+                    report.warn(
+                        "mount_root exists",
+                        format!("{} does not exist but can be created", mount_root.display()),
+                    );
+                    report.warn(
+                        "mount_root is directory",
+                        format!(
+                            "{} will be a directory after creation",
+                            mount_root.display()
+                        ),
+                    );
+                }
+                PathInspection::Missing => {
+                    report.error(
+                        "mount_root exists",
+                        format!(
+                            "{} does not exist and its parent is unavailable",
+                            mount_root.display()
+                        ),
+                    );
+                    report.error(
+                        "mount_root is directory",
+                        format!("{} cannot be created safely", mount_root.display()),
+                    );
+                }
+                PathInspection::PermissionDenied(error) | PathInspection::MetadataError(error) => {
+                    report.error(
+                        "mount_root exists",
+                        format!("{} cannot be inspected: {error}", mount_root.display()),
+                    );
+                    report.error(
+                        "mount_root is directory",
+                        format!("{} cannot be verified as a directory", mount_root.display()),
+                    );
                 }
             }
         }
@@ -1998,6 +2591,7 @@ pub struct ArchiveSnapshot {
     pub stats: ArchiveStats,
     pub statuses: Vec<ArchiveStatus>,
     pub doctor: DoctorReport,
+    pub config_identity: ConfigIdentity,
 }
 
 impl Serialize for ArchiveStats {
@@ -2556,7 +3150,10 @@ pub fn load_read_only_snapshot_default() -> Result<ArchiveSnapshot> {
 /// Loads one read-only view of a library without creating mount directories.
 pub fn load_read_only_snapshot(config_path: impl AsRef<Path>) -> Result<ArchiveSnapshot> {
     let config_path = config_path.as_ref().to_path_buf();
-    let config = Config::load_from(&config_path)?;
+    let contents = fs::read_to_string(&config_path)
+        .map_err(|source| ArchiveFsError::io(config_path.clone(), source))?;
+    let config = parse_config(&contents)?;
+    let identity = config_identity(&config_path, Some(&contents));
     let records = current_archive_records(&config)?;
     let stats = summarize_archive_records(&records);
     let statuses = archive_statuses_from_records(&records);
@@ -2571,6 +3168,7 @@ pub fn load_read_only_snapshot(config_path: impl AsRef<Path>) -> Result<ArchiveS
         stats,
         statuses,
         doctor,
+        config_identity: identity,
     })
 }
 
@@ -5571,6 +6169,311 @@ mod tests {
                 .any(|check| check.name == "source folder exists"
                     && check.status == ConfigCheckStatus::Error)
         );
+    }
+
+    #[test]
+    fn starter_config_creates_parents_and_never_overwrites() {
+        let root = test_root("starter_config");
+        let path = root.join("nested/archivefs/config.toml");
+
+        create_starter_config(&path).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("source_folders"));
+        assert!(contents.contains("mount_root"));
+        assert!(contents.contains("ratarmount_bin"));
+        assert!(create_starter_config(&path).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn setup_diagnostics_report_invalid_sources_and_missing_tools() {
+        let root = test_root("setup_diagnostics_missing");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                root.join("missing-roms").display(),
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| false);
+
+        assert!(!report.ready_for_scanning);
+        assert!(!report.ready_for_actions);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Configured source folder exists"
+                && check.status == SetupDiagnosticStatus::Error
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "ratarmount is available" && check.status == SetupDiagnosticStatus::Error
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "fusermount3 or umount is available"
+                && check.status == SetupDiagnosticStatus::Error
+        }));
+    }
+
+    #[test]
+    fn setup_diagnostics_offer_mount_root_creation_only_with_valid_parent() {
+        let root = test_root("setup_mount_root_offer");
+        let source = root.join("roms");
+        fs::create_dir(&source).unwrap();
+        let config_path = root.join("config.toml");
+        let mount_root = root.join("mounts");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                source.display(),
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+        assert!(report.can_create_mount_root);
+        let config = Config::load_from(&config_path).unwrap();
+        create_configured_mount_root(&config).unwrap();
+        assert!(mount_root.is_dir());
+        assert!(create_configured_mount_root(&config).is_err());
+
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                source.display(),
+                root.join("missing-parent/mounts").display()
+            ),
+        )
+        .unwrap();
+        let unsafe_report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+        assert!(!unsafe_report.can_create_mount_root);
+    }
+
+    #[test]
+    fn setup_diagnostics_only_mark_confirmed_missing_config_as_missing() {
+        let actual_missing_path = test_root("setup_actual_missing").join("config.toml");
+        let actual_missing =
+            run_setup_diagnostics_with_command_check(&actual_missing_path, |_| false);
+        assert!(actual_missing.config_missing);
+        assert!(actual_missing.config_path_error.is_none());
+
+        let config_path = PathBuf::from("/virtual/config.toml");
+        let missing = run_setup_diagnostics_with_checks(
+            config_path.clone(),
+            |_| Err(io::Error::from(io::ErrorKind::NotFound)),
+            |_| PathInspection::Missing,
+            |_| false,
+        );
+        assert!(missing.config_missing);
+
+        let ambiguous = run_setup_diagnostics_with_checks(
+            config_path,
+            |_| Err(io::Error::from(io::ErrorKind::NotFound)),
+            |_| PathInspection::PermissionDenied("permission denied".to_string()),
+            |_| false,
+        );
+        assert!(!ambiguous.config_missing);
+        assert!(ambiguous.checks.iter().any(|check| {
+            check.name == "Config file exists"
+                && check.status == SetupDiagnosticStatus::Error
+                && check.detail.contains("permission denied")
+        }));
+    }
+
+    #[test]
+    fn unresolved_default_config_path_is_not_reported_as_missing() {
+        let report = run_setup_diagnostics_default_with_path(Err(ArchiveFsError::Config(
+            "HOME and USERPROFILE are unavailable".to_string(),
+        )));
+
+        assert!(!report.config_missing);
+        assert!(report.config_path_error.is_some());
+        assert!(!report.ready_for_scanning);
+        assert!(report.config_path.is_none());
+        assert!(report.config_identity.config_path.is_none());
+        assert!(report.config_identity.content_digest.is_none());
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config path"
+                && check.status == SetupDiagnosticStatus::Error
+                && check
+                    .detail
+                    .contains("could not determine the user configuration directory")
+        }));
+    }
+
+    #[test]
+    fn config_identity_changes_when_config_bytes_change() {
+        let root = test_root("config_identity_changes");
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "source_folders = [\"/a\"]\nmount_root = \"/mnt/a\"\n",
+        )
+        .unwrap();
+        let first = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        fs::write(
+            &config_path,
+            "source_folders = [\"/b\"]\nmount_root = \"/mnt/b\"\n",
+        )
+        .unwrap();
+        let second = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert_eq!(
+            first.config_identity.config_path,
+            second.config_identity.config_path
+        );
+        assert_ne!(first.config_identity, second.config_identity);
+    }
+
+    #[test]
+    fn snapshot_and_diagnostics_share_identity_for_the_same_config_read() {
+        let root = test_root("shared_identity");
+        let source = root.join("roms");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                source.display(),
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+
+        let snapshot = load_read_only_snapshot(&config_path).unwrap();
+        let diagnostics = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+        assert_eq!(snapshot.config_identity, diagnostics.config_identity);
+
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n# changed\n",
+                source.display(),
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+        let changed_diagnostics = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+        assert_ne!(
+            snapshot.config_identity,
+            changed_diagnostics.config_identity
+        );
+    }
+
+    #[test]
+    fn mount_root_creation_offer_requires_confirmed_absence_and_valid_parent() {
+        let config_path = PathBuf::from("/virtual/config.toml");
+        let source = PathBuf::from("/virtual/source");
+        let mount_root = PathBuf::from("/virtual/mounts");
+        let contents = format!(
+            "source_folders = [\"{}\"]\nmount_root = \"{}\"\n",
+            source.display(),
+            mount_root.display()
+        );
+        let missing_mount = run_setup_diagnostics_with_checks(
+            config_path.clone(),
+            |_| Ok(contents.clone()),
+            |path| {
+                if path == mount_root {
+                    PathInspection::Missing
+                } else {
+                    PathInspection::Directory
+                }
+            },
+            |_| true,
+        );
+        assert!(missing_mount.can_create_mount_root);
+
+        let ambiguous_mount = run_setup_diagnostics_with_checks(
+            config_path,
+            |_| Ok(contents.clone()),
+            |path| {
+                if path == mount_root {
+                    PathInspection::MetadataError("input/output error".to_string())
+                } else {
+                    PathInspection::Directory
+                }
+            },
+            |_| true,
+        );
+        assert!(!ambiguous_mount.can_create_mount_root);
+        assert!(ambiguous_mount.checks.iter().any(|check| {
+            check.name == "Mount root exists or can be created safely"
+                && check.detail.contains("input/output error")
+        }));
+    }
+
+    #[test]
+    fn setup_diagnostics_are_derived_from_one_config_read() {
+        use std::cell::Cell;
+
+        let root = test_root("setup_single_read");
+        let config_path = root.join("config.toml");
+        let source = root.join("source");
+        let mount_root = root.join("mounts");
+        let contents = format!(
+            "source_folders = [\"{}\"]\nmount_root = \"{}\"\n",
+            source.display(),
+            mount_root.display()
+        );
+        fs::write(&config_path, &contents).unwrap();
+        let reads = Cell::new(0);
+        let report = run_setup_diagnostics_with_checks(
+            config_path.clone(),
+            |path| {
+                reads.set(reads.get() + 1);
+                let snapshot = fs::read_to_string(path)?;
+                fs::write(path, "not valid config").unwrap();
+                Ok(snapshot)
+            },
+            |_| PathInspection::Directory,
+            |_| true,
+        );
+
+        assert_eq!(reads.get(), 1);
+        assert_eq!(fs::read_to_string(config_path).unwrap(), "not valid config");
+        assert!(report.ready_for_scanning);
+        assert_eq!(report.mount_root.as_deref(), Some(mount_root.as_path()));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Configured source folder exists"
+                && check.status == SetupDiagnosticStatus::Ready
+        }));
+    }
+
+    #[test]
+    fn ready_setup_diagnostics_distinguish_scanning_and_actions() {
+        let root = test_root("setup_ready");
+        let source = root.join("roms");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                source.display(),
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+
+        let ready = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+        assert!(ready.ready_for_scanning);
+        assert!(ready.ready_for_actions);
+        let tools_missing = run_setup_diagnostics_with_command_check(&config_path, |_| false);
+        assert!(tools_missing.ready_for_scanning);
+        assert!(!tools_missing.ready_for_actions);
     }
 
     #[test]

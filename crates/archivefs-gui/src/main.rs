@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -10,11 +11,14 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
-    ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus,
-    ArchiveUnmountSession, Config, DoctorReport, DoctorStatus, LazyUnmountCleanupResult,
-    MountOneOutcome, MountState, UnmountOneOutcome, cleanup_selected_mount_tree,
+    ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
+    ArchiveStatus, ArchiveUnmountSession, Config, ConfigIdentity, DoctorReport, DoctorStatus,
+    LazyUnmountCleanupResult, MountOneOutcome, MountState, SetupDiagnosticStatus, SetupDiagnostics,
+    UnmountOneOutcome, cleanup_selected_mount_tree, create_configured_mount_root_default,
+    create_starter_config_default, default_config_path,
     lazy_unmount_one_archive_path_with_progress, load_read_only_snapshot_default,
-    mount_one_archive_path, remount_one_archive_path, unmount_one_archive_path,
+    mount_one_archive_path, remount_one_archive_path, run_setup_diagnostics_default,
+    unmount_one_archive_path,
 };
 use eframe::egui;
 
@@ -39,6 +43,8 @@ enum ActivityAction {
     LazyUnmount,
     Remount,
     Cleanup,
+    Diagnostics,
+    Setup,
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -52,6 +58,8 @@ impl std::fmt::Display for ActivityAction {
             Self::LazyUnmount => "Lazy unmount",
             Self::Remount => "Remount",
             Self::Cleanup => "Cleanup",
+            Self::Diagnostics => "Diagnostics",
+            Self::Setup => "Setup",
         })
     }
 }
@@ -154,6 +162,7 @@ struct LoadedData {
     rows: Vec<ArchiveRow>,
     stats: ArchiveStats,
     doctor: DoctorReport,
+    config_identity: ConfigIdentity,
 }
 
 impl LoadedData {
@@ -171,6 +180,7 @@ impl LoadedData {
             rows,
             stats: snapshot.stats,
             doctor: snapshot.doctor,
+            config_identity: snapshot.config_identity,
         }
     }
 }
@@ -667,12 +677,122 @@ where
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RefreshGeneration(u64);
+
+impl RefreshGeneration {
+    const INITIAL: Self = Self(0);
+
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
 type LoadResult = Result<LoadedData, String>;
+type LoadMessage = (RefreshGeneration, LoadResult);
+type DiagnosticsMessage = (RefreshGeneration, SetupDiagnostics);
 
 enum LoadState {
-    Loading(Receiver<LoadResult>),
+    Loading {
+        generation: RefreshGeneration,
+        receiver: Receiver<LoadMessage>,
+        previous: Option<Box<LoadedData>>,
+    },
     Ready(Box<LoadedData>),
     Error(String),
+}
+
+enum DiagnosticsState {
+    Loading {
+        generation: RefreshGeneration,
+        receiver: Receiver<DiagnosticsMessage>,
+    },
+    Ready {
+        generation: RefreshGeneration,
+        report: SetupDiagnostics,
+    },
+    Error {
+        generation: RefreshGeneration,
+        message: String,
+    },
+}
+
+impl DiagnosticsState {
+    fn generation(&self) -> RefreshGeneration {
+        match self {
+            Self::Loading { generation, .. }
+            | Self::Ready { generation, .. }
+            | Self::Error { generation, .. } => *generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupAction {
+    CreateStarterConfig,
+    CreateMountRoot,
+    OpenConfigFolder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticsUiAction {
+    Refresh,
+    Continue,
+    ViewLastSnapshot,
+    CreateStarterConfig,
+    CreateMountRoot,
+    OpenConfigFolder,
+    CopyConfigPath,
+}
+
+fn open_diagnostics_view(show_diagnostics: &mut bool) {
+    *show_diagnostics = true;
+}
+
+fn diagnostics_can_continue(report: &SetupDiagnostics) -> bool {
+    report.ready_for_scanning
+}
+
+fn starter_config_available(report: &SetupDiagnostics) -> bool {
+    report.config_path.is_some() && report.config_missing && report.config_path_error.is_none()
+}
+
+fn diagnostics_state_can_continue(state: &DiagnosticsState) -> bool {
+    matches!(state, DiagnosticsState::Ready { report, .. } if diagnostics_can_continue(report))
+}
+
+/// Archive actions are only safe when the snapshot and diagnostics both
+/// belong to the current refresh generation *and* were derived from the
+/// exact same configuration contents. Matching generations alone is not
+/// enough: the config file can change between the snapshot read and the
+/// diagnostics read of the same generation, so identities are compared too.
+fn latest_generation_actions_safe(
+    current: RefreshGeneration,
+    snapshot_generation: Option<RefreshGeneration>,
+    snapshot_stale: bool,
+    snapshot_identity: Option<&ConfigIdentity>,
+    diagnostics: &DiagnosticsState,
+) -> bool {
+    if snapshot_generation != Some(current) || snapshot_stale || diagnostics.generation() != current
+    {
+        return false;
+    }
+    let DiagnosticsState::Ready { report, .. } = diagnostics else {
+        return false;
+    };
+    report.ready_for_actions && snapshot_identity == Some(&report.config_identity)
+}
+
+fn snapshot_identity(state: &LoadState) -> Option<&ConfigIdentity> {
+    match state {
+        LoadState::Ready(data) => Some(&data.config_identity),
+        LoadState::Loading { .. } | LoadState::Error(_) => None,
+    }
+}
+
+struct RunningSetupAction {
+    action: SetupAction,
+    receiver: Receiver<Result<String, String>>,
 }
 
 struct ArchiveFsApp {
@@ -699,14 +819,25 @@ struct ArchiveFsApp {
     remount_offers: HashSet<PathBuf>,
     history: OperationHistory,
     cleanup_after_unmount: bool,
+    diagnostics: DiagnosticsState,
+    show_diagnostics: bool,
+    setup_action: Option<RunningSetupAction>,
+    refresh_error: Option<String>,
+    snapshot_stale: bool,
+    refresh_generation: RefreshGeneration,
+    snapshot_generation: Option<RefreshGeneration>,
 }
 
 impl ArchiveFsApp {
     fn is_busy(&self) -> bool {
-        self.operation.is_some() || self.mount_all.is_some() || self.unmount_all.is_some()
+        self.operation.is_some()
+            || self.mount_all.is_some()
+            || self.unmount_all.is_some()
+            || self.setup_action.is_some()
     }
 
     fn new(context: egui::Context) -> Self {
+        let generation = RefreshGeneration::INITIAL;
         let mut history = OperationHistory::default();
         history.record(HistoryEntry::new(
             ActivityAction::Refresh,
@@ -715,7 +846,7 @@ impl ArchiveFsApp {
             "Loading archive snapshot.",
         ));
         Self {
-            state: start_load(context),
+            state: start_load(context.clone(), generation, None),
             filter: String::new(),
             filtered_rows: None,
             selected_archive: None,
@@ -738,32 +869,72 @@ impl ArchiveFsApp {
             remount_offers: HashSet::new(),
             history,
             cleanup_after_unmount: false,
+            diagnostics: start_diagnostics(context.clone(), generation),
+            show_diagnostics: false,
+            setup_action: None,
+            refresh_error: None,
+            snapshot_stale: false,
+            refresh_generation: generation,
+            snapshot_generation: None,
         }
     }
 
     fn refresh(&mut self, context: &egui::Context) {
+        self.refresh_generation = self.refresh_generation.next();
+        let generation = self.refresh_generation;
         self.history.record(HistoryEntry::new(
             ActivityAction::Refresh,
             None,
             ActivityOutcome::Started,
             "Refreshing archive snapshot.",
         ));
-        self.state = start_load(context.clone());
+        let previous = match std::mem::replace(
+            &mut self.state,
+            LoadState::Error("refresh starting".to_string()),
+        ) {
+            LoadState::Ready(data) => Some(data),
+            LoadState::Loading { previous, .. } => previous,
+            LoadState::Error(_) => None,
+        };
+        self.refresh_diagnostics(context);
+        self.state = start_load(context.clone(), generation, previous);
     }
 
-    fn poll_load(&mut self) {
+    fn poll_load(&mut self, _context: &egui::Context) {
         let result = match &self.state {
-            LoadState::Loading(receiver) => match receiver.try_recv() {
-                Ok(result) => Some(result),
+            LoadState::Loading {
+                generation,
+                receiver,
+                ..
+            } => match receiver.try_recv() {
+                Ok(message) => Some(message),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err(
-                    "background data loader stopped unexpectedly".to_string(),
+                Err(TryRecvError::Disconnected) => Some((
+                    *generation,
+                    Err("background data loader stopped unexpectedly".to_string()),
                 )),
             },
             LoadState::Ready(_) | LoadState::Error(_) => None,
         };
 
-        if let Some(result) = result {
+        if let Some((generation, result)) = result {
+            if generation != self.refresh_generation {
+                return;
+            }
+            let (state_generation, previous) = match std::mem::replace(
+                &mut self.state,
+                LoadState::Error("load result pending".to_string()),
+            ) {
+                LoadState::Loading {
+                    generation,
+                    previous,
+                    ..
+                } => (Some(generation), previous),
+                LoadState::Ready(_) | LoadState::Error(_) => (None, None),
+            };
+            if state_generation != Some(generation) {
+                return;
+            }
             self.state = match result {
                 Ok(data) => {
                     self.filtered_rows = matching_row_indices(&data.rows, &self.filter);
@@ -773,6 +944,9 @@ impl ArchiveFsApp {
                         ActivityOutcome::Completed,
                         "Archive snapshot refreshed.",
                     ));
+                    self.refresh_error = None;
+                    self.snapshot_stale = false;
+                    self.snapshot_generation = Some(generation);
                     LoadState::Ready(Box::new(data))
                 }
                 Err(error) => {
@@ -782,9 +956,152 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         error.clone(),
                     ));
-                    LoadState::Error(error)
+                    self.refresh_error = Some(error.clone());
+                    self.snapshot_stale = previous.is_some();
+                    self.show_diagnostics = true;
+                    previous.map_or_else(|| LoadState::Error(error), LoadState::Ready)
                 }
             };
+        }
+    }
+
+    fn refresh_diagnostics(&mut self, context: &egui::Context) {
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Diagnostics,
+            None,
+            ActivityOutcome::Started,
+            "Refreshing setup diagnostics.",
+        ));
+        self.diagnostics = start_diagnostics(context.clone(), self.refresh_generation);
+    }
+
+    fn poll_diagnostics(&mut self) {
+        enum PollResult {
+            Completed(DiagnosticsMessage),
+            Disconnected(RefreshGeneration),
+        }
+
+        let result = match &self.diagnostics {
+            DiagnosticsState::Loading {
+                generation,
+                receiver,
+            } => match receiver.try_recv() {
+                Ok(message) => Some(PollResult::Completed(message)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(PollResult::Disconnected(*generation)),
+            },
+            DiagnosticsState::Ready { .. } | DiagnosticsState::Error { .. } => None,
+        };
+        match result {
+            Some(PollResult::Completed((generation, report)))
+                if generation == self.refresh_generation =>
+            {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::Diagnostics,
+                    None,
+                    ActivityOutcome::Completed,
+                    if report.ready_for_actions {
+                        "Diagnostics completed: ArchiveFS is ready."
+                    } else {
+                        "Diagnostics completed: setup needs attention."
+                    },
+                ));
+                self.diagnostics = DiagnosticsState::Ready { generation, report };
+            }
+            Some(PollResult::Disconnected(generation)) if generation == self.refresh_generation => {
+                let message = "The diagnostics worker stopped unexpectedly. Run diagnostics again."
+                    .to_string();
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::Diagnostics,
+                    None,
+                    ActivityOutcome::Failed,
+                    message.clone(),
+                ));
+                self.diagnostics = DiagnosticsState::Error {
+                    generation,
+                    message,
+                };
+                self.show_diagnostics = true;
+            }
+            Some(PollResult::Completed(_)) | Some(PollResult::Disconnected(_)) | None => {}
+        }
+    }
+
+    fn start_setup_action(&mut self, context: egui::Context, action: SetupAction) {
+        if self.is_busy() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Setup,
+            None,
+            ActivityOutcome::Started,
+            match action {
+                SetupAction::CreateStarterConfig => "Creating starter config.",
+                SetupAction::CreateMountRoot => "Creating configured mount root.",
+                SetupAction::OpenConfigFolder => "Opening config folder.",
+            },
+        ));
+        self.setup_action = Some(RunningSetupAction { action, receiver });
+        thread::spawn(move || {
+            let result = match action {
+                SetupAction::CreateStarterConfig => create_starter_config_default()
+                    .map(|path| format!("Created starter config at {}.", path.display())),
+                SetupAction::CreateMountRoot => create_configured_mount_root_default()
+                    .map(|path| format!("Created mount root at {}.", path.display())),
+                SetupAction::OpenConfigFolder => open_default_config_folder(),
+            }
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_setup_action(&mut self, context: &egui::Context) {
+        let result = self.setup_action.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.action, result))
+        });
+        if let Some((action, result)) = result {
+            self.setup_action = None;
+            match result {
+                Ok(message) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Setup,
+                        None,
+                        ActivityOutcome::Completed,
+                        message.clone(),
+                    ));
+                    self.feedback = Some(ActionFeedback {
+                        succeeded: true,
+                        message,
+                        cleanup: None,
+                        warning: None,
+                        more_information: None,
+                    });
+                    if action != SetupAction::OpenConfigFolder {
+                        self.refresh_diagnostics(context);
+                    }
+                }
+                Err(message) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Setup,
+                        None,
+                        ActivityOutcome::Failed,
+                        message.clone(),
+                    ));
+                    self.feedback = Some(ActionFeedback {
+                        succeeded: false,
+                        message,
+                        cleanup: None,
+                        warning: None,
+                        more_information: None,
+                    });
+                }
+            }
         }
     }
 
@@ -1659,13 +1976,24 @@ struct CleanupFeedback {
 
 impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_load();
+        self.poll_load(context);
+        self.poll_diagnostics();
+        self.poll_setup_action(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
-        let loading = matches!(self.state, LoadState::Loading(_));
+        let loading = matches!(self.state, LoadState::Loading { .. });
+        let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
-        if loading || busy {
+        let actions_safe = latest_generation_actions_safe(
+            self.refresh_generation,
+            self.snapshot_generation,
+            self.snapshot_stale,
+            snapshot_identity(&self.state),
+            &self.diagnostics,
+        );
+        let archive_actions_blocked = busy || !actions_safe;
+        if loading || diagnostics_loading || busy {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -1675,6 +2003,13 @@ impl eframe::App for ArchiveFsApp {
                 ui.separator();
                 ui.label("Library overview");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Diagnostics"))
+                        .clicked()
+                    {
+                        open_diagnostics_view(&mut self.show_diagnostics);
+                        self.refresh_diagnostics(context);
+                    }
                     if ui
                         .add_enabled(!loading && !busy, egui::Button::new("Refresh"))
                         .clicked()
@@ -1691,9 +2026,28 @@ impl eframe::App for ArchiveFsApp {
 
         let mut retry = false;
         let mut requested_action = None;
+        let mut diagnostics_action = None;
         let mut stop_mount_all = false;
         let mut stop_unmount_all = false;
         egui::CentralPanel::default().show(context, |ui| {
+            if self.show_diagnostics {
+                diagnostics_action = show_setup_diagnostics(
+                    ui,
+                    &self.diagnostics,
+                    self.setup_action.is_some(),
+                    self.feedback.as_ref(),
+                    self.refresh_error.as_deref(),
+                    self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
+                );
+                return;
+            }
+            if let Some(error) = &self.refresh_error {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Refresh failed; showing the last known snapshot: {error}"),
+                );
+                ui.separator();
+            }
             if let Some(batch) = self.mount_all.as_ref() {
                 stop_mount_all = show_mount_all_progress(ui, &batch.progress);
                 ui.separator();
@@ -1703,7 +2057,7 @@ impl eframe::App for ArchiveFsApp {
                 ui.separator();
             }
             match &self.state {
-                LoadState::Loading(_) => {
+                LoadState::Loading { .. } => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
                         ui.spinner();
@@ -1729,7 +2083,7 @@ impl eframe::App for ArchiveFsApp {
                             filtered_rows: &mut self.filtered_rows,
                             selected_archive: &mut self.selected_archive,
                             operation: self.operation.as_ref(),
-                            busy,
+                            busy: archive_actions_blocked,
                             feedback: self.feedback.as_ref(),
                             confirm_unmount: &mut self.confirm_unmount,
                             confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
@@ -1753,6 +2107,41 @@ impl eframe::App for ArchiveFsApp {
         });
         if stop_mount_all {
             self.request_mount_all_stop();
+        }
+        if let Some(action) = diagnostics_action {
+            match action {
+                DiagnosticsUiAction::Refresh => self.refresh_diagnostics(context),
+                DiagnosticsUiAction::Continue => {
+                    self.show_diagnostics = false;
+                    self.refresh(context);
+                }
+                DiagnosticsUiAction::ViewLastSnapshot => {
+                    self.show_diagnostics = false;
+                }
+                DiagnosticsUiAction::CreateStarterConfig => {
+                    self.start_setup_action(context.clone(), SetupAction::CreateStarterConfig)
+                }
+                DiagnosticsUiAction::CreateMountRoot => {
+                    self.start_setup_action(context.clone(), SetupAction::CreateMountRoot)
+                }
+                DiagnosticsUiAction::OpenConfigFolder => {
+                    self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder)
+                }
+                DiagnosticsUiAction::CopyConfigPath => {
+                    if let DiagnosticsState::Ready { report, .. } = &self.diagnostics
+                        && let Some(path) = &report.config_path
+                    {
+                        let path = path.display().to_string();
+                        context.copy_text(path.clone());
+                        self.history.record(HistoryEntry::new(
+                            ActivityAction::Setup,
+                            None,
+                            ActivityOutcome::Completed,
+                            format!("Copied config path: {path}"),
+                        ));
+                    }
+                }
+            }
         }
         if stop_unmount_all {
             self.request_unmount_all_stop();
@@ -1784,14 +2173,63 @@ impl eframe::App for ArchiveFsApp {
     }
 }
 
-fn start_load(context: egui::Context) -> LoadState {
+fn start_load(
+    context: egui::Context,
+    generation: RefreshGeneration,
+    previous: Option<Box<LoadedData>>,
+) -> LoadState {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let result = load_data();
-        let _ = sender.send(result);
+        let _ = sender.send((generation, result));
         context.request_repaint();
     });
-    LoadState::Loading(receiver)
+    LoadState::Loading {
+        generation,
+        receiver,
+        previous,
+    }
+}
+
+fn start_diagnostics(context: egui::Context, generation: RefreshGeneration) -> DiagnosticsState {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send((generation, run_setup_diagnostics_default()));
+        context.request_repaint();
+    });
+    DiagnosticsState::Loading {
+        generation,
+        receiver,
+    }
+}
+
+fn open_default_config_folder() -> archivefs_core::Result<String> {
+    let config_path = default_config_path()?;
+    let folder = config_path.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!(
+            "config path has no parent folder: {}",
+            config_path.display()
+        ))
+    })?;
+    let (program, argument) = if cfg!(target_os = "windows") {
+        ("explorer", folder.as_os_str())
+    } else if cfg!(target_os = "macos") {
+        ("open", folder.as_os_str())
+    } else {
+        ("xdg-open", folder.as_os_str())
+    };
+    let status = Command::new(program)
+        .arg(argument)
+        .status()
+        .map_err(ArchiveFsError::from)?;
+    if !status.success() {
+        return Err(ArchiveFsError::ExternalCommand {
+            program: program.to_string(),
+            status: status.code(),
+            stderr: format!("could not open {}", folder.display()),
+        });
+    }
+    Ok(format!("Opened config folder {}.", folder.display()))
 }
 
 fn load_data() -> LoadResult {
@@ -2104,6 +2542,156 @@ fn show_unmount_all_result(ui: &mut egui::Ui, result: &UnmountAllResult) {
                 });
         }
     });
+}
+
+fn show_setup_diagnostics(
+    ui: &mut egui::Ui,
+    state: &DiagnosticsState,
+    action_running: bool,
+    feedback: Option<&ActionFeedback>,
+    refresh_error: Option<&str>,
+    has_last_snapshot: bool,
+) -> Option<DiagnosticsUiAction> {
+    let mut action = None;
+    ui.heading("Setup / Diagnostics");
+    ui.label("Check configuration, folders, and required system tools before using ArchiveFS.");
+    ui.add_space(8.0);
+    if let Some(error) = refresh_error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Archive refresh failed: {error}"),
+        );
+        ui.label("Diagnostics are being refreshed from the current configuration.");
+        if has_last_snapshot
+            && ui
+                .add_enabled(
+                    !action_running,
+                    egui::Button::new("View Last Known Snapshot"),
+                )
+                .clicked()
+        {
+            return Some(DiagnosticsUiAction::ViewLastSnapshot);
+        }
+        ui.add_space(8.0);
+    }
+    if let DiagnosticsState::Error { message, .. } = state {
+        ui.colored_label(ui.visuals().error_fg_color, message);
+        ui.label("Select Refresh Diagnostics to try again.");
+        if ui
+            .add_enabled(!action_running, egui::Button::new("Refresh Diagnostics"))
+            .clicked()
+        {
+            return Some(DiagnosticsUiAction::Refresh);
+        }
+        return None;
+    }
+    let DiagnosticsState::Ready { report, .. } = state else {
+        ui.spinner();
+        ui.label("Running diagnostics in the background...");
+        ui.add_enabled(false, egui::Button::new("Continue to ArchiveFS"));
+        return None;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Config path:");
+        match &report.config_path {
+            Some(path) => {
+                ui.monospace(path.display().to_string());
+                if ui
+                    .add_enabled(!action_running, egui::Button::new("Copy Config Path"))
+                    .clicked()
+                {
+                    action = Some(DiagnosticsUiAction::CopyConfigPath);
+                }
+                if ui
+                    .add_enabled(!action_running, egui::Button::new("Open Config Folder"))
+                    .clicked()
+                {
+                    action = Some(DiagnosticsUiAction::OpenConfigFolder);
+                }
+            }
+            None => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    report
+                        .config_path_error
+                        .as_deref()
+                        .unwrap_or("Config path could not be resolved."),
+                );
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if starter_config_available(report)
+            && ui
+                .add_enabled(!action_running, egui::Button::new("Create Starter Config"))
+                .clicked()
+        {
+            action = Some(DiagnosticsUiAction::CreateStarterConfig);
+        }
+        if report.can_create_mount_root
+            && ui
+                .add_enabled(!action_running, egui::Button::new("Create Mount Root"))
+                .clicked()
+        {
+            action = Some(DiagnosticsUiAction::CreateMountRoot);
+        }
+        if ui
+            .add_enabled(!action_running, egui::Button::new("Refresh Diagnostics"))
+            .clicked()
+        {
+            action = Some(DiagnosticsUiAction::Refresh);
+        }
+        if ui
+            .add_enabled(
+                !action_running && diagnostics_state_can_continue(state),
+                egui::Button::new("Continue to ArchiveFS"),
+            )
+            .clicked()
+        {
+            action = Some(DiagnosticsUiAction::Continue);
+        }
+        if action_running {
+            ui.spinner();
+            ui.label("Setup action running...");
+        }
+    });
+    if let Some(feedback) = feedback {
+        ui.colored_label(
+            if feedback.succeeded {
+                egui::Color32::from_rgb(70, 170, 90)
+            } else {
+                ui.visuals().error_fg_color
+            },
+            &feedback.message,
+        );
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt("setup_diagnostics_checks")
+        .show(ui, |ui| {
+            for check in &report.checks {
+                let (state_label, color) = match check.status {
+                    SetupDiagnosticStatus::Ready => ("Ready", egui::Color32::from_rgb(70, 170, 90)),
+                    SetupDiagnosticStatus::Warning => {
+                        ("Warning", egui::Color32::from_rgb(220, 170, 40))
+                    }
+                    SetupDiagnosticStatus::Error => ("Error", ui.visuals().error_fg_color),
+                };
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, state_label);
+                        ui.strong(&check.name);
+                    });
+                    ui.label(&check.detail);
+                    if check.status != SetupDiagnosticStatus::Ready {
+                        ui.label(format!("Why it matters: {}", check.why_it_matters));
+                        ui.label(format!("Next step: {}", check.next_step));
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        });
+    action
 }
 
 fn show_activity_panel(context: &egui::Context, history: &mut OperationHistory) {
@@ -3095,9 +3683,16 @@ mod tests {
         )
     }
 
+    fn default_config_identity() -> ConfigIdentity {
+        ConfigIdentity {
+            config_path: Some(PathBuf::from("/config/archivefs.toml")),
+            content_digest: Some([1; 32]),
+        }
+    }
+
     fn app_for_operation_tests() -> ArchiveFsApp {
         ArchiveFsApp {
-            state: LoadState::Error("not loaded in this test".to_string()),
+            state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
             filter: String::new(),
             filtered_rows: None,
             selected_archive: None,
@@ -3120,6 +3715,60 @@ mod tests {
             remount_offers: HashSet::new(),
             history: OperationHistory::default(),
             cleanup_after_unmount: false,
+            diagnostics: DiagnosticsState::Ready {
+                generation: RefreshGeneration::INITIAL,
+                report: setup_report(true, true),
+            },
+            show_diagnostics: false,
+            setup_action: None,
+            refresh_error: None,
+            snapshot_stale: false,
+            refresh_generation: RefreshGeneration::INITIAL,
+            snapshot_generation: Some(RefreshGeneration::INITIAL),
+        }
+    }
+
+    fn setup_report(ready_for_scanning: bool, ready_for_actions: bool) -> SetupDiagnostics {
+        SetupDiagnostics {
+            config_path: Some(PathBuf::from("/config/archivefs.toml")),
+            config_path_error: None,
+            config_missing: false,
+            mount_root: Some(PathBuf::from("/mount")),
+            can_create_mount_root: false,
+            ready_for_scanning,
+            ready_for_actions,
+            config_identity: default_config_identity(),
+            checks: Vec::new(),
+        }
+    }
+
+    fn empty_loaded_data(mount_root: &str) -> LoadedData {
+        LoadedData {
+            mount_root: PathBuf::from(mount_root),
+            records: Vec::new(),
+            rows: Vec::new(),
+            stats: ArchiveStats {
+                total_archives: 0,
+                mounted_count: 0,
+                pending_count: 0,
+                platform_counts: Vec::new(),
+                extension_counts: Vec::new(),
+                largest_archive: None,
+                smallest_archive: None,
+                total_size_bytes: 0,
+            },
+            doctor: DoctorReport {
+                config_path: PathBuf::from("/config/archivefs.toml"),
+                checks: Vec::new(),
+                archives_found: 0,
+                archives_with_platform: 0,
+                archives_unknown_platform: 0,
+                unknown_platform_examples: Vec::new(),
+                platform_counts: Vec::new(),
+                pending_archives: 0,
+                mounted_archives: 0,
+            },
+            config_identity: default_config_identity(),
         }
     }
 
@@ -4583,5 +5232,376 @@ mod tests {
         app.poll_unmount_all(&egui::Context::default());
 
         assert!(app.lazy_unmount_offers.contains(&item.archive_path));
+    }
+
+    #[test]
+    fn missing_config_load_opens_setup_instead_of_leaving_a_fatal_view() {
+        let mut app = app_for_operation_tests();
+        let (_diagnostics_sender, diagnostics_receiver) = mpsc::channel();
+        app.diagnostics = DiagnosticsState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver: diagnostics_receiver,
+        };
+        let (sender, receiver) = mpsc::channel();
+        app.state = LoadState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver,
+            previous: None,
+        };
+        sender
+            .send((
+                RefreshGeneration::INITIAL,
+                Err("missing /config/archivefs.toml".to_string()),
+            ))
+            .unwrap();
+
+        app.poll_load(&egui::Context::default());
+
+        assert!(app.show_diagnostics);
+        assert!(matches!(app.state, LoadState::Error(_)));
+        assert!(matches!(app.diagnostics, DiagnosticsState::Loading { .. }));
+        assert!(!diagnostics_state_can_continue(&app.diagnostics));
+        assert!(app.refresh_error.is_some());
+    }
+
+    #[test]
+    fn failed_refresh_retains_snapshot_and_invalidates_stale_diagnostics() {
+        let mut app = app_for_operation_tests();
+        let (_diagnostics_sender, diagnostics_receiver) = mpsc::channel();
+        app.diagnostics = DiagnosticsState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver: diagnostics_receiver,
+        };
+        let (sender, receiver) = mpsc::channel();
+        app.state = LoadState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver,
+            previous: Some(Box::new(empty_loaded_data("/old-mount"))),
+        };
+        sender
+            .send((
+                RefreshGeneration::INITIAL,
+                Err("config became invalid".to_string()),
+            ))
+            .unwrap();
+
+        app.poll_load(&egui::Context::default());
+
+        assert!(matches!(
+            &app.state,
+            LoadState::Ready(data) if data.mount_root == Path::new("/old-mount")
+        ));
+        assert!(app.snapshot_stale);
+        assert!(matches!(app.diagnostics, DiagnosticsState::Loading { .. }));
+        assert!(!diagnostics_state_can_continue(&app.diagnostics));
+        assert_eq!(app.refresh_error.as_deref(), Some("config became invalid"));
+    }
+
+    #[test]
+    fn retry_success_replaces_the_old_snapshot_and_clears_error() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        app.state = LoadState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver,
+            previous: Some(Box::new(empty_loaded_data("/old-mount"))),
+        };
+        app.refresh_error = Some("old failure".to_string());
+        app.snapshot_stale = true;
+        sender
+            .send((
+                RefreshGeneration::INITIAL,
+                Ok(empty_loaded_data("/new-mount")),
+            ))
+            .unwrap();
+
+        app.poll_load(&egui::Context::default());
+
+        assert!(matches!(
+            &app.state,
+            LoadState::Ready(data) if data.mount_root == Path::new("/new-mount")
+        ));
+        assert!(!app.snapshot_stale);
+        assert!(app.refresh_error.is_none());
+    }
+
+    #[test]
+    fn fresh_invalid_diagnostics_keep_setup_open() {
+        let mut app = app_for_operation_tests();
+        app.show_diagnostics = true;
+        let (sender, receiver) = mpsc::channel();
+        app.diagnostics = DiagnosticsState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver,
+        };
+        sender
+            .send((RefreshGeneration::INITIAL, setup_report(false, false)))
+            .unwrap();
+
+        app.poll_diagnostics();
+
+        assert!(app.show_diagnostics);
+        assert!(!diagnostics_state_can_continue(&app.diagnostics));
+    }
+
+    #[test]
+    fn successful_refresh_invalidates_stale_action_readiness() {
+        let mut app = app_for_operation_tests();
+        assert!(latest_generation_actions_safe(
+            app.refresh_generation,
+            app.snapshot_generation,
+            app.snapshot_stale,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        ));
+
+        app.refresh(&egui::Context::default());
+        let current = app.refresh_generation;
+        app.state = LoadState::Ready(Box::new(empty_loaded_data("/new-mount")));
+        app.snapshot_generation = Some(current);
+
+        assert!(matches!(
+            app.diagnostics,
+            DiagnosticsState::Loading {
+                generation,
+                ..
+            } if generation == current
+        ));
+        assert!(!latest_generation_actions_safe(
+            current,
+            app.snapshot_generation,
+            app.snapshot_stale,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        ));
+    }
+
+    #[test]
+    fn newer_unsafe_config_cannot_inherit_old_action_readiness() {
+        let current = RefreshGeneration(2);
+        let old_ready = DiagnosticsState::Ready {
+            generation: RefreshGeneration(1),
+            report: setup_report(true, true),
+        };
+        assert!(!latest_generation_actions_safe(
+            current,
+            Some(current),
+            false,
+            Some(&default_config_identity()),
+            &old_ready,
+        ));
+
+        let current_unsafe = DiagnosticsState::Ready {
+            generation: current,
+            report: setup_report(true, false),
+        };
+        assert!(!latest_generation_actions_safe(
+            current,
+            Some(current),
+            false,
+            Some(&default_config_identity()),
+            &current_unsafe,
+        ));
+    }
+
+    #[test]
+    fn late_diagnostics_from_an_older_generation_are_ignored() {
+        let mut app = app_for_operation_tests();
+        let current = RefreshGeneration(2);
+        app.refresh_generation = current;
+        let (sender, receiver) = mpsc::channel();
+        app.diagnostics = DiagnosticsState::Loading {
+            generation: current,
+            receiver,
+        };
+        sender
+            .send((RefreshGeneration(1), setup_report(true, true)))
+            .unwrap();
+
+        app.poll_diagnostics();
+
+        assert!(matches!(
+            app.diagnostics,
+            DiagnosticsState::Loading {
+                generation,
+                ..
+            } if generation == current
+        ));
+        assert!(!latest_generation_actions_safe(
+            current,
+            Some(current),
+            false,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        ));
+    }
+
+    #[test]
+    fn actions_require_current_valid_snapshot_and_diagnostics() {
+        let current = RefreshGeneration(4);
+        let ready = DiagnosticsState::Ready {
+            generation: current,
+            report: setup_report(true, true),
+        };
+        assert!(latest_generation_actions_safe(
+            current,
+            Some(current),
+            false,
+            Some(&default_config_identity()),
+            &ready,
+        ));
+        assert!(!latest_generation_actions_safe(
+            current,
+            Some(RefreshGeneration(3)),
+            false,
+            Some(&default_config_identity()),
+            &ready,
+        ));
+    }
+
+    #[test]
+    fn disconnected_diagnostics_stop_loading_and_allow_retry() {
+        let mut app = app_for_operation_tests();
+        let snapshot_root = PathBuf::from("/last-good");
+        app.state = LoadState::Ready(Box::new(empty_loaded_data("/last-good")));
+        let (sender, receiver) = mpsc::channel::<DiagnosticsMessage>();
+        drop(sender);
+        app.diagnostics = DiagnosticsState::Loading {
+            generation: app.refresh_generation,
+            receiver,
+        };
+
+        app.poll_diagnostics();
+
+        assert!(matches!(
+            &app.diagnostics,
+            DiagnosticsState::Error { message, .. }
+                if message.contains("Run diagnostics again")
+        ));
+        assert!(matches!(
+            &app.state,
+            LoadState::Ready(data) if data.mount_root == snapshot_root
+        ));
+        assert!(!diagnostics_state_can_continue(&app.diagnostics));
+        assert!(app.show_diagnostics);
+        assert!(!latest_generation_actions_safe(
+            app.refresh_generation,
+            app.snapshot_generation,
+            app.snapshot_stale,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        ));
+    }
+
+    #[test]
+    fn ready_diagnostics_allow_continue_and_can_be_reopened() {
+        let report = setup_report(true, false);
+        assert!(diagnostics_can_continue(&report));
+
+        let mut visible = false;
+        open_diagnostics_view(&mut visible);
+        assert!(visible);
+    }
+
+    #[test]
+    fn starter_config_requires_a_resolved_confirmed_missing_path() {
+        let mut report = setup_report(false, false);
+        report.config_missing = false;
+        report.config_path_error = Some("HOME is unavailable".to_string());
+        assert!(!starter_config_available(&report));
+
+        report.config_path_error = None;
+        report.config_missing = true;
+        assert!(starter_config_available(&report));
+    }
+
+    #[test]
+    fn unresolved_config_path_disables_starter_config_and_path_actions() {
+        let mut report = setup_report(false, false);
+        report.config_path = None;
+        report.config_path_error = Some("HOME and USERPROFILE are unavailable".to_string());
+        report.config_missing = true;
+
+        assert!(report.config_path.is_none());
+        assert!(!starter_config_available(&report));
+    }
+
+    #[test]
+    fn resolved_config_path_allows_path_actions() {
+        let report = setup_report(true, true);
+        assert!(report.config_path.is_some());
+    }
+
+    #[test]
+    fn mismatched_config_identity_blocks_actions_despite_matching_generation() {
+        let current = RefreshGeneration(7);
+        let ready = DiagnosticsState::Ready {
+            generation: current,
+            report: setup_report(true, true),
+        };
+        let different_identity = ConfigIdentity {
+            config_path: Some(PathBuf::from("/config/archivefs.toml")),
+            content_digest: Some([2; 32]),
+        };
+
+        assert!(!latest_generation_actions_safe(
+            current,
+            Some(current),
+            false,
+            Some(&different_identity),
+            &ready,
+        ));
+        assert!(latest_generation_actions_safe(
+            current,
+            Some(current),
+            false,
+            Some(&default_config_identity()),
+            &ready,
+        ));
+    }
+
+    #[test]
+    fn config_changed_between_worker_starts_cannot_produce_trusted_combined_state() {
+        let mut app = app_for_operation_tests();
+        let current = app.refresh_generation;
+        app.state = LoadState::Ready(Box::new(empty_loaded_data("/mount")));
+        let changed_identity = ConfigIdentity {
+            config_path: Some(PathBuf::from("/config/archivefs.toml")),
+            content_digest: Some([9; 32]),
+        };
+        app.diagnostics = DiagnosticsState::Ready {
+            generation: current,
+            report: SetupDiagnostics {
+                config_identity: changed_identity,
+                ..setup_report(true, true)
+            },
+        };
+
+        assert!(!latest_generation_actions_safe(
+            app.refresh_generation,
+            app.snapshot_generation,
+            app.snapshot_stale,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        ));
+    }
+
+    #[test]
+    fn setup_failure_preserves_the_last_valid_snapshot() {
+        let mut app = app_for_operation_tests();
+        app.state = LoadState::Ready(Box::new(empty_loaded_data("/mount")));
+        let (sender, receiver) = mpsc::channel();
+        app.setup_action = Some(RunningSetupAction {
+            action: SetupAction::OpenConfigFolder,
+            receiver,
+        });
+        sender
+            .send(Err("could not open folder".to_string()))
+            .unwrap();
+
+        app.poll_setup_action(&egui::Context::default());
+
+        assert!(matches!(app.state, LoadState::Ready(_)));
+        assert!(!app.feedback.as_ref().unwrap().succeeded);
     }
 }
