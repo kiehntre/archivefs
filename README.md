@@ -17,7 +17,67 @@ ArchiveFS is designed to inspect and mount archives without modifying the origin
 - Watches source folders and refreshes the JSON index without auto-mounting or auto-unmounting.
 - Includes config validation and doctor diagnostics.
 
-## Installation
+## Install from a Release
+
+Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.2.0-alpha`. This is the quickest way to get running without building from source.
+
+1. Download the release tarball and its `SHA256SUMS` file, for example:
+
+   ```sh
+   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.2.0-alpha/archivefs-v0.2.0-alpha-x86_64-linux.tar.gz
+   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.2.0-alpha/SHA256SUMS
+   ```
+
+2. Verify the tarball against the checksum file before extracting it:
+
+   ```sh
+   sha256sum -c SHA256SUMS --ignore-missing
+   ```
+
+3. Extract it:
+
+   ```sh
+   tar -xzf archivefs-v0.2.0-alpha-x86_64-linux.tar.gz
+   cd archivefs-v0.2.0-alpha-x86_64-linux
+   ```
+
+4. Make the binaries executable, if extraction did not already preserve that:
+
+   ```sh
+   chmod +x archivefs-cli archivefs-gui
+   ```
+
+5. Install `ratarmount` separately. It is an external dependency that ArchiveFS shells out to for mounting - it is not bundled in the release tarball, and archive mounting will not work without it. Install it however fits your system, then make sure the `ratarmount` command is on your `PATH` (or point `ratarmount_bin` in the config at its full path).
+
+6. Copy the example configuration and edit it for your system:
+
+   ```sh
+   mkdir -p ~/.config/archivefs
+   cp config.toml.example ~/.config/archivefs/config.toml
+   ```
+
+   Edit `source_folders` and `mount_root` in `~/.config/archivefs/config.toml` to point at real paths on your machine.
+
+7. Check that everything is set up correctly:
+
+   ```sh
+   ./archivefs-cli doctor
+   ./archivefs-cli config-check
+   ```
+
+8. Launch the desktop GUI, if you want it:
+
+   ```sh
+   ./archivefs-gui
+   ```
+
+   `archivefs-gui` needs a running Linux desktop session (X11 or Wayland) with the usual runtime graphics libraries present - it will not open a window over a bare SSH session or on a headless server with no desktop environment.
+
+Archive mounts created by ArchiveFS are always read-only; it never modifies files in your configured `source_folders`.
+
+There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pacman, Homebrew, or similar package) - the release tarball above and building from source below are the two supported ways to install it.
+
+## Build from Source (Developers)
 
 ArchiveFS is a Rust workspace. Build the CLI from source:
 
@@ -68,47 +128,49 @@ mount_root = "/mnt/archivefs"
 ratarmount_bin = "ratarmount"
 ```
 
-`source_folders` are scanned recursively. `mount_root` is where ArchiveFS creates planned mount directories. ArchiveFS does not modify files in `source_folders`.
+The same example, with comments, ships as [`config.toml.example`](config.toml.example) in this repository and in every release tarball - copy it to `~/.config/archivefs/config.toml` as a starting point.
+
+`source_folders` are scanned recursively. `mount_root` is where ArchiveFS creates planned mount directories. ArchiveFS does not modify files in `source_folders`. `ratarmount_bin` is optional and defaults to `"ratarmount"` resolved from `PATH`.
 
 ## Common Commands
 
 ```sh
-archivefs doctor
-archivefs config-check
-archivefs scan
-archivefs status
-archivefs stats
-archivefs info "007 Legends"
-archivefs mount-one "007 Legends"
-archivefs unmount-one "007 Legends"
-archivefs index-build
-archivefs index-show
-archivefs index-find "xbox360"
-archivefs watch
+archivefs-cli doctor
+archivefs-cli config-check
+archivefs-cli scan
+archivefs-cli status
+archivefs-cli stats
+archivefs-cli info "007 Legends"
+archivefs-cli mount-one "007 Legends"
+archivefs-cli unmount-one "007 Legends"
+archivefs-cli index-build
+archivefs-cli index-show
+archivefs-cli index-find "xbox360"
+archivefs-cli watch
 ```
 
 Use verbose or debug logging when you need more detail:
 
 ```sh
-archivefs --verbose stats
-archivefs --debug watch
+archivefs-cli --verbose stats
+archivefs-cli --debug watch
 ```
 
 ## Typical Workflow
 
 1. Create `~/.config/archivefs/config.toml`.
-2. Run `archivefs config-check` to validate the config.
-3. Run `archivefs doctor` to check source folders, mount root, tools, and current archive state.
-4. Run `archivefs stats` or `archivefs scan` to inspect what ArchiveFS sees.
-5. Run `archivefs info "name"` to inspect one archive.
-6. Run `archivefs mount-one "name"` to mount a single archive.
-7. Run `archivefs unmount-one "name"` when finished.
-8. Run `archivefs index-build` and `archivefs index-find "query"` for indexed search.
-9. Run `archivefs watch` if you want ArchiveFS to refresh the JSON index when source folders change.
+2. Run `archivefs-cli config-check` to validate the config.
+3. Run `archivefs-cli doctor` to check source folders, mount root, tools, and current archive state.
+4. Run `archivefs-cli stats` or `archivefs-cli scan` to inspect what ArchiveFS sees.
+5. Run `archivefs-cli info "name"` to inspect one archive.
+6. Run `archivefs-cli mount-one "name"` to mount a single archive.
+7. Run `archivefs-cli unmount-one "name"` when finished.
+8. Run `archivefs-cli index-build` and `archivefs-cli index-find "query"` for indexed search.
+9. Run `archivefs-cli watch` if you want ArchiveFS to refresh the JSON index when source folders change.
 
 ## Example Output
 
-`archivefs stats`:
+`archivefs-cli stats`:
 
 ```text
 ArchiveFS Stats
@@ -129,7 +191,7 @@ Archive extensions:
   zip: 75
 ```
 
-`archivefs info "007 Legends"`:
+`archivefs-cli info "007 Legends"`:
 
 ```text
 ArchiveFS Info
@@ -148,7 +210,7 @@ Details:
   Health provider: FilesystemHealthProvider
 ```
 
-`archivefs index-show`:
+`archivefs-cli index-show`:
 
 ```text
 ArchiveFS Index

@@ -1,0 +1,22 @@
+# Example ArchiveFS configuration.
+#
+# Copy this file to ~/.config/archivefs/config.toml and edit the values
+# below for your system. Every path below is a placeholder - replace it
+# with paths that actually exist on your machine.
+
+# Folders ArchiveFS scans recursively for supported archives (.zip, .7z,
+# .rar). Add one entry per folder you want scanned. Required: this key
+# must be present and contain at least one path.
+source_folders = ["/data/archives"]
+
+# Directory where ArchiveFS creates mount points for the archives it opens.
+# ArchiveFS creates this directory if it does not already exist, and never
+# writes anywhere under source_folders. Required.
+mount_root = "/mnt/archivefs"
+
+# Name or path of the ratarmount binary ArchiveFS uses to mount archives
+# read-only. ratarmount is a separate tool - install it yourself and make
+# sure it is reachable. Optional: defaults to "ratarmount" (resolved from
+# PATH) if this line is omitted. Set an absolute path here instead if
+# ratarmount is not on PATH.
+ratarmount_bin = "ratarmount"
