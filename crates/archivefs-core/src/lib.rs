@@ -15,6 +15,9 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+mod database;
+pub use database::{Database, DatabaseHealth, check_database_health, default_database_path};
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),
@@ -24,6 +27,7 @@ pub enum ArchiveFsError {
     Unmount(String),
     Index(String),
     Watcher(String),
+    Database(String),
     Io {
         path: Option<PathBuf>,
         source: io::Error,
@@ -82,6 +86,7 @@ impl fmt::Display for ArchiveFsError {
             Self::Unmount(message) => write!(f, "unmount error: {message}"),
             Self::Index(message) => write!(f, "index error: {message}"),
             Self::Watcher(message) => write!(f, "watcher error: {message}"),
+            Self::Database(message) => write!(f, "database error: {message}"),
             Self::Io { path, source } => match path {
                 Some(path) => write!(f, "{}: {}", path.display(), source),
                 None => write!(f, "{source}"),
