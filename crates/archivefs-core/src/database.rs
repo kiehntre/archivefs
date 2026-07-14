@@ -250,7 +250,7 @@ fn apply_migrations(connection: &mut Connection, migrations: &[Migration]) -> Re
 /// not applied. Field names deliberately stay technical (this is core,
 /// not a GUI layer) - `error` carries whatever went wrong as plain text
 /// for a caller to display however it likes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DatabaseHealth {
     pub resolved_path: PathBuf,
     pub database_exists: bool,
@@ -419,11 +419,23 @@ impl From<ArchiveChangeKind> for ArchiveObservationKind {
 
 /// Counters for one `scan_runs` row, filled in as a scan proceeds and
 /// written by [`Database::complete_scan_run`].
+///
+/// `archives_updated` is the sum of `archives_changed` and
+/// `archives_restored` - it is what actually gets written to the
+/// `scan_runs.archives_updated` column (that column predates this finer
+/// breakdown; splitting it out here needed no schema change, since these
+/// are plain Rust counters computed fresh each run, not columns of their
+/// own). `archives_unchanged` is likewise not persisted to any column
+/// today - it exists so callers (the CLI's `library-scan`) can report it
+/// without a schema change either.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanRunCounts {
     pub source_folders_scanned: i64,
     pub archives_seen: i64,
     pub archives_added: i64,
+    pub archives_changed: i64,
+    pub archives_restored: i64,
+    pub archives_unchanged: i64,
     pub archives_updated: i64,
     pub archives_missing: i64,
     pub errors_count: i64,
@@ -1004,6 +1016,113 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| db_error("failed to read archives", error))
     }
+
+    /// Aggregate counts over the whole catalogue: total archives, how many
+    /// are currently present vs. missing, and how many have a current
+    /// platform assignment vs. none. Computed with a single SQL aggregate
+    /// query rather than loading every row, for
+    /// [`crate::CatalogueStats`]-shaped callers like `library-status`.
+    pub fn catalogue_stats(&self) -> Result<CatalogueStats> {
+        self.connection
+            .query_row(
+                "SELECT \
+                     COUNT(*), \
+                     COUNT(*) FILTER (WHERE a.last_verified_missing_at IS NULL), \
+                     COUNT(*) FILTER (WHERE a.last_verified_missing_at IS NOT NULL), \
+                     COUNT(DISTINCT CASE WHEN p.archive_id IS NOT NULL THEN a.id END) \
+                 FROM archives a \
+                 LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1",
+                [],
+                |row| {
+                    let total_archives: i64 = row.get(0)?;
+                    let present_archives: i64 = row.get(1)?;
+                    let missing_archives: i64 = row.get(2)?;
+                    let archives_with_platform: i64 = row.get(3)?;
+                    Ok(CatalogueStats {
+                        total_archives,
+                        present_archives,
+                        missing_archives,
+                        archives_with_platform,
+                        archives_unknown_platform: total_archives - archives_with_platform,
+                    })
+                },
+            )
+            .map_err(|error| db_error("failed to compute catalogue stats", error))
+    }
+
+    /// The most recently completed (`status = 'completed'`) scan run, if
+    /// any. Never returns a `'running'`, `'interrupted'`, or `'failed'`
+    /// run - callers that specifically want the outcome of the most
+    /// recent attempt regardless of status are not served by this method
+    /// today (not needed by anything in this stage).
+    pub fn latest_completed_scan(&self) -> Result<Option<CompletedScanSummary>> {
+        self.connection
+            .query_row(
+                "SELECT id, started_at, finished_at, triggered_by, source_folders_scanned, \
+                 archives_seen, archives_added, archives_updated, archives_missing, \
+                 errors_count, error_message \
+                 FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(CompletedScanSummary {
+                        scan_run_id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        finished_at: row.get(2)?,
+                        triggered_by: row.get(3)?,
+                        source_folders_scanned: row.get(4)?,
+                        archives_seen: row.get(5)?,
+                        archives_added: row.get(6)?,
+                        archives_updated: row.get(7)?,
+                        archives_missing: row.get(8)?,
+                        errors_count: row.get(9)?,
+                        error_message: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| db_error("failed to load latest completed scan", error))
+    }
+}
+
+/// Aggregate counts over the whole persisted catalogue - see
+/// [`Database::catalogue_stats`]. `archives_unknown_platform` is derived as
+/// `total_archives - archives_with_platform`, matching how "unknown" is
+/// represented everywhere else in this schema: by the absence of a current
+/// `platform_assignments` row, never a sentinel string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct CatalogueStats {
+    pub total_archives: i64,
+    pub present_archives: i64,
+    pub missing_archives: i64,
+    pub archives_with_platform: i64,
+    pub archives_unknown_platform: i64,
+}
+
+/// A snapshot of one completed `scan_runs` row - see
+/// [`Database::latest_completed_scan`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CompletedScanSummary {
+    pub scan_run_id: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub triggered_by: String,
+    pub source_folders_scanned: i64,
+    pub archives_seen: i64,
+    pub archives_added: i64,
+    pub archives_updated: i64,
+    pub archives_missing: i64,
+    pub errors_count: i64,
+    pub error_message: Option<String>,
+}
+
+/// The highest schema version this build of ArchiveFS understands - the
+/// same value [`Database::open_or_create`] refuses to open a newer
+/// database than. Exposed so callers (the CLI's `library-status`) can
+/// distinguish "this database's schema is newer than this build
+/// supports" from "this database just needs a migration" without
+/// duplicating the migration list.
+pub fn latest_schema_version() -> i64 {
+    latest_known_version(MIGRATIONS)
 }
 
 /// Scans every folder in `config.source_folders` with the existing
@@ -1056,6 +1175,9 @@ pub fn scan_and_persist(
                 counts.source_folders_scanned += 1;
                 counts.archives_seen += folder_counts.archives_seen;
                 counts.archives_added += folder_counts.archives_added;
+                counts.archives_changed += folder_counts.archives_changed;
+                counts.archives_restored += folder_counts.archives_restored;
+                counts.archives_unchanged += folder_counts.archives_unchanged;
                 counts.archives_updated += folder_counts.archives_updated;
                 counts.archives_missing += folder_counts.archives_missing;
             }
@@ -1112,10 +1234,15 @@ fn persist_one_folder(
         counts.archives_seen += 1;
         match outcome.change {
             ArchiveChangeKind::New => counts.archives_added += 1,
-            ArchiveChangeKind::Restored | ArchiveChangeKind::Changed => {
+            ArchiveChangeKind::Restored => {
+                counts.archives_restored += 1;
                 counts.archives_updated += 1;
             }
-            ArchiveChangeKind::Unchanged => {}
+            ArchiveChangeKind::Changed => {
+                counts.archives_changed += 1;
+                counts.archives_updated += 1;
+            }
+            ArchiveChangeKind::Unchanged => counts.archives_unchanged += 1,
         }
 
         database.record_observation(
@@ -1925,6 +2052,65 @@ mod tests {
             archive_count, 0,
             "a failed upsert_archive transaction must leave no partial row behind"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn catalogue_stats_counts_present_missing_and_platform() {
+        let root = temp_dir("catalogue-stats");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "Xbox360/known.zip", b"a");
+        write_archive_file(&source, "mystery.zip", b"b");
+        let doomed = write_archive_file(&source, "gone.zip", b"c");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        fs::remove_file(&doomed).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let stats = database.catalogue_stats().unwrap();
+
+        assert_eq!(stats.total_archives, 3);
+        assert_eq!(stats.present_archives, 2);
+        assert_eq!(stats.missing_archives, 1);
+        assert_eq!(stats.archives_with_platform, 1);
+        assert_eq!(stats.archives_unknown_platform, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_completed_scan_reports_the_most_recent_run() {
+        let root = temp_dir("latest-completed-scan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        assert!(database.latest_completed_scan().unwrap().is_none());
+
+        let summary = scan_and_persist(&mut database, &config, "test-trigger").unwrap();
+        let latest = database.latest_completed_scan().unwrap().unwrap();
+
+        assert_eq!(latest.scan_run_id, summary.scan_run_id);
+        assert_eq!(latest.triggered_by, "test-trigger");
+        assert_eq!(latest.archives_seen, 1);
+        assert_eq!(latest.archives_added, 1);
+        assert!(latest.finished_at.is_some());
+        assert!(latest.error_message.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_schema_version_matches_the_migrated_database() {
+        let root = temp_dir("latest-schema-version");
+        let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
 
         let _ = fs::remove_dir_all(&root);
     }

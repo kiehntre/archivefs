@@ -1,18 +1,22 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use archivefs_core::{
     ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveInfo,
-    ArchiveScanner, ArchiveStats, ArchiveStatus, Config, ConfigCheckReport, ConfigCheckStatus,
-    DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
-    MountPlan, WatchRebuildSummary, build_and_write_archive_index, check_archive_index_freshness,
-    clean_mount_root, cleanup_selected_mount_dir, current_archive_info, current_archive_stats,
-    current_statuses, default_index_path, find_archive_index_entries, mount_archives,
-    mount_one_archive, read_default_archive_index, run_config_check_default, run_doctor_default,
-    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
+    ArchiveScanner, ArchiveStats, ArchiveStatus, CatalogueStats, CompletedScanSummary, Config,
+    ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth, DoctorReport,
+    DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector, MountPlan,
+    PersistedArchive, ScanPersistSummary, WatchRebuildSummary, build_and_write_archive_index,
+    check_archive_index_freshness, check_database_health, clean_mount_root,
+    cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
+    default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
+    mount_archives, mount_one_archive, read_default_archive_index, run_config_check_default,
+    run_doctor_default, scan_and_persist, summarize_archive_index, unmount_archives,
+    unmount_one_archive, watch_archive_index,
 };
+use serde::Serialize;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -234,6 +238,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_index_warnings(&check_archive_index_freshness(&index));
             print_index_find_results(&query, &find_archive_index_entries(&index, &query));
         }
+        "library-status" => {
+            let json = args.any(|arg| arg == "--json");
+            let view = build_library_status_view(&default_database_path()?);
+            if json {
+                print_library_status_json(&view)?;
+            } else {
+                print_library_status(&view);
+            }
+        }
+        "library-scan" => {
+            let json = args.any(|arg| arg == "--json");
+            let config = Config::load_default()?;
+            let database_path = default_database_path()?;
+            let report = run_library_scan(&config, &database_path, "cli-library-scan")?;
+            if json {
+                print_library_scan_json(&report)?;
+            } else {
+                print_library_scan(&report);
+            }
+        }
+        "library-list" => {
+            let json = args.any(|arg| arg == "--json");
+            let database_path = default_database_path()?;
+            let entries = build_library_entries(&database_path)?;
+            if json {
+                print_library_entries_json(&entries)?;
+            } else {
+                print_library_entries(&database_path, &entries);
+            }
+        }
+        "library-find" => {
+            let Some(first) = args.next() else {
+                return Err("library-find requires a query".into());
+            };
+            let mut input_args = std::iter::once(first).chain(args).collect::<Vec<_>>();
+            let json = input_args.last().is_some_and(|arg| arg == "--json");
+            if json {
+                input_args.pop();
+            }
+            let query = input_args.join(" ");
+            if query.is_empty() {
+                return Err("library-find requires a query".into());
+            }
+            let database_path = default_database_path()?;
+            let entries = build_library_entries(&database_path)?;
+            let matches = filter_library_entries(&entries, &query);
+            if json {
+                print_library_entries_json(&matches)?;
+            } else {
+                print_library_find_results(&query, &matches);
+            }
+        }
         "clean" => {
             let config = Config::load_default()?;
             print_cleaned_dirs(&clean_mount_root(&config)?);
@@ -363,6 +419,449 @@ fn print_index_warnings(freshness: &ArchiveIndexFreshness) {
     if !freshness.stale_archive_paths.is_empty() {
         println!("Warning: index may be stale. Run archivefs index-build.");
     }
+}
+
+// ---------------------------------------------------------------------
+// Library database commands (library-status, library-scan, library-list,
+// library-find). These read/write the persistent SQLite catalogue
+// (archivefs_core::Database) - a separate store from the JSON index above.
+// They never touch mount or unmount behavior, and index-build/index-show/
+// index-find are unchanged and unaffected by any of this.
+// ---------------------------------------------------------------------
+
+/// Combined status view for `library-status`. Built from
+/// [`check_database_health`] plus, only when the schema is already
+/// current, [`Database::catalogue_stats`] and
+/// [`Database::latest_completed_scan`] - a status check never triggers a
+/// migration itself.
+#[derive(Debug, Clone, Serialize)]
+struct LibraryStatusView {
+    #[serde(flatten)]
+    health: DatabaseHealth,
+    latest_known_schema_version: i64,
+    stats: Option<CatalogueStats>,
+    last_completed_scan: Option<CompletedScanSummary>,
+}
+
+fn build_library_status_view(database_path: &Path) -> LibraryStatusView {
+    let health = check_database_health(database_path);
+    let (stats, last_completed_scan) = if health.database_opens && health.migrations_current {
+        match Database::open_or_create(database_path) {
+            Ok(database) => (
+                database.catalogue_stats().ok(),
+                database.latest_completed_scan().ok().flatten(),
+            ),
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    LibraryStatusView {
+        health,
+        latest_known_schema_version: latest_schema_version(),
+        stats,
+        last_completed_scan,
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn print_library_status(view: &LibraryStatusView) {
+    print!("{}", format_library_status(view));
+}
+
+fn print_library_status_json(view: &LibraryStatusView) -> Result<(), serde_json::Error> {
+    println!("{}", format_library_status_json(view)?);
+    Ok(())
+}
+
+fn format_library_status_json(view: &LibraryStatusView) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(view)
+}
+
+fn format_library_status(view: &LibraryStatusView) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS Library Status\n\n");
+    output.push_str(&format!(
+        "Database: {}\n",
+        view.health.resolved_path.display()
+    ));
+    output.push_str(&format!(
+        "  Exists: {}\n",
+        yes_no(view.health.database_exists)
+    ));
+
+    if !view.health.database_exists {
+        output.push_str("\nNo library database yet. Run: archivefs-cli library-scan\n");
+        return output;
+    }
+
+    output.push_str(&format!(
+        "  Opens: {}\n",
+        yes_no(view.health.database_opens)
+    ));
+    if let Some(error) = &view.health.error {
+        output.push_str(&format!("  Error: {error}\n"));
+    }
+
+    if !view.health.database_opens {
+        output.push_str(
+            "\nThe database file exists but could not be opened. It is always safe to \
+             delete it and run archivefs-cli library-scan to rebuild it from your \
+             configured source folders.\n",
+        );
+        return output;
+    }
+
+    output.push_str(&format!(
+        "  Schema version: {}\n",
+        view.health
+            .schema_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    output.push_str(&format!(
+        "  Migrations current: {}\n",
+        yes_no(view.health.migrations_current)
+    ));
+    output.push_str(&format!(
+        "  Foreign keys enabled: {}\n",
+        yes_no(view.health.foreign_keys_enabled)
+    ));
+
+    if !view.health.migrations_current {
+        if let Some(schema_version) = view.health.schema_version {
+            if schema_version > view.latest_known_schema_version {
+                output.push_str(&format!(
+                    "\nThis database's schema (version {schema_version}) is newer than this \
+                     build of ArchiveFS supports (version {}). Upgrade ArchiveFS, or remove \
+                     the database file to rebuild it with this version.\n",
+                    view.latest_known_schema_version
+                ));
+            } else {
+                output.push_str(
+                    "\nThis database's schema is outdated. Run: archivefs-cli library-scan \
+                     to upgrade it.\n",
+                );
+            }
+        }
+        return output;
+    }
+
+    output.push_str("\nArchive counts:\n");
+    match &view.stats {
+        Some(stats) => {
+            output.push_str(&format!("  Total: {}\n", stats.total_archives));
+            output.push_str(&format!("  Present: {}\n", stats.present_archives));
+            output.push_str(&format!("  Missing: {}\n", stats.missing_archives));
+            output.push_str(&format!(
+                "  Detected platform: {}\n",
+                stats.archives_with_platform
+            ));
+            output.push_str(&format!(
+                "  Unknown platform: {}\n",
+                stats.archives_unknown_platform
+            ));
+        }
+        None => output.push_str("  unavailable\n"),
+    }
+
+    output.push_str("\nLast completed scan:\n");
+    match &view.last_completed_scan {
+        Some(scan) => {
+            output.push_str(&format!("  Started: {}\n", scan.started_at));
+            output.push_str(&format!(
+                "  Finished: {}\n",
+                scan.finished_at.as_deref().unwrap_or("unknown")
+            ));
+            output.push_str(&format!("  Triggered by: {}\n", scan.triggered_by));
+            output.push_str(&format!(
+                "  Source folders scanned: {}\n",
+                scan.source_folders_scanned
+            ));
+            output.push_str(&format!("  Archives seen: {}\n", scan.archives_seen));
+            output.push_str(&format!("  Archives added: {}\n", scan.archives_added));
+            output.push_str(&format!("  Archives updated: {}\n", scan.archives_updated));
+            output.push_str(&format!("  Archives missing: {}\n", scan.archives_missing));
+            output.push_str(&format!("  Errors: {}\n", scan.errors_count));
+            if let Some(message) = &scan.error_message {
+                output.push_str(&format!("  Error details: {message}\n"));
+            }
+        }
+        None => output.push_str("  none yet - run: archivefs-cli library-scan\n"),
+    }
+
+    output
+}
+
+/// A `library-scan` result, reshaped from [`ScanPersistSummary`] into
+/// names that read clearly on their own (`source_folders_attempted` etc.)
+/// rather than requiring the reader to know this crate's internal
+/// `ScanRunCounts` field names.
+#[derive(Debug, Clone, Serialize)]
+struct LibraryScanReport {
+    scan_run_id: i64,
+    source_folders_attempted: i64,
+    source_folders_succeeded: i64,
+    source_folders_failed: i64,
+    archives_new: i64,
+    archives_changed: i64,
+    archives_restored: i64,
+    archives_unchanged: i64,
+    archives_missing: i64,
+    folder_errors: Vec<FolderErrorView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FolderErrorView {
+    path: PathBuf,
+    error: String,
+}
+
+impl From<&ScanPersistSummary> for LibraryScanReport {
+    fn from(summary: &ScanPersistSummary) -> Self {
+        let succeeded = summary.counts.source_folders_scanned;
+        let failed = summary.folder_errors.len() as i64;
+        Self {
+            scan_run_id: summary.scan_run_id,
+            source_folders_attempted: succeeded + failed,
+            source_folders_succeeded: succeeded,
+            source_folders_failed: failed,
+            archives_new: summary.counts.archives_added,
+            archives_changed: summary.counts.archives_changed,
+            archives_restored: summary.counts.archives_restored,
+            archives_unchanged: summary.counts.archives_unchanged,
+            archives_missing: summary.counts.archives_missing,
+            folder_errors: summary
+                .folder_errors
+                .iter()
+                .map(|(path, error)| FolderErrorView {
+                    path: path.clone(),
+                    error: error.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Opens (creating if needed) the database at `database_path`, runs
+/// [`scan_and_persist`] against `config`, and reshapes the result. A
+/// database or config problem propagates as `Err` (a non-zero exit code
+/// from `main`); one or more failed source folders within an otherwise
+/// successful run does not - it shows up in the returned report's
+/// `folder_errors` instead. See `docs/DATABASE_DESIGN.md` section 5: this
+/// never touches mount or unmount state.
+fn run_library_scan(
+    config: &Config,
+    database_path: &Path,
+    triggered_by: &str,
+) -> Result<LibraryScanReport, Box<dyn std::error::Error>> {
+    let mut database = Database::open_or_create(database_path)?;
+    let summary = scan_and_persist(&mut database, config, triggered_by)?;
+    Ok(LibraryScanReport::from(&summary))
+}
+
+fn print_library_scan(report: &LibraryScanReport) {
+    print!("{}", format_library_scan(report));
+}
+
+fn print_library_scan_json(report: &LibraryScanReport) -> Result<(), serde_json::Error> {
+    println!("{}", format_library_scan_json(report)?);
+    Ok(())
+}
+
+fn format_library_scan_json(report: &LibraryScanReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
+}
+
+fn format_library_scan(report: &LibraryScanReport) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS Library Scan\n\n");
+    output.push_str("Source folders:\n");
+    output.push_str(&format!(
+        "  Attempted: {}\n",
+        report.source_folders_attempted
+    ));
+    output.push_str(&format!(
+        "  Succeeded: {}\n",
+        report.source_folders_succeeded
+    ));
+    output.push_str(&format!("  Failed: {}\n", report.source_folders_failed));
+    output.push_str("\nArchives:\n");
+    output.push_str(&format!("  New: {}\n", report.archives_new));
+    output.push_str(&format!("  Changed: {}\n", report.archives_changed));
+    output.push_str(&format!("  Restored: {}\n", report.archives_restored));
+    output.push_str(&format!("  Unchanged: {}\n", report.archives_unchanged));
+    output.push_str(&format!("  Missing: {}\n", report.archives_missing));
+    output.push_str("\nErrors:\n");
+    if report.folder_errors.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for error in &report.folder_errors {
+            output.push_str(&format!("  {}: {}\n", error.path.display(), error.error));
+        }
+    }
+    output
+}
+
+/// One archive as shown by `library-list`/`library-find`: a display-ready
+/// reshaping of [`PersistedArchive`] with just the fields those commands
+/// need (path, platform, present/missing, size, modified time), not the
+/// full persisted row (database id, normalized name, cached health, ...).
+///
+/// `path` serializes via `Path::display` (see `serialize_path_display`)
+/// rather than `PathBuf`'s own `Serialize` impl, which requires valid
+/// Unicode and would otherwise make `--json` output fail entirely for the
+/// whole list just because one archive's path is not valid UTF-8. Exact
+/// path bytes remain safely preserved in the database (see
+/// `PersistedArchive`/`archives.relative_path`) - this is purely a display
+/// concern for a view type, matching the same "display-safe path text"
+/// this crate already uses for `library-find`'s search matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LibraryArchiveView {
+    #[serde(serialize_with = "serialize_path_display")]
+    path: PathBuf,
+    platform: Option<String>,
+    present: bool,
+    size_bytes: Option<u64>,
+    modified_time_unix_seconds: Option<i64>,
+}
+
+fn serialize_path_display<S: serde::Serializer>(
+    path: &std::path::Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.display().to_string())
+}
+
+impl From<&PersistedArchive> for LibraryArchiveView {
+    fn from(archive: &PersistedArchive) -> Self {
+        Self {
+            path: archive.absolute_path.clone(),
+            platform: archive.platform.clone(),
+            present: archive.last_verified_missing_at.is_none(),
+            size_bytes: archive.size_bytes,
+            modified_time_unix_seconds: archive.modified_time_unix_seconds,
+        }
+    }
+}
+
+/// Loads every persisted archive for `library-list`/`library-find`. If no
+/// database file exists yet, this is an empty catalogue (`Ok(vec![])`),
+/// not an error - `print_library_entries` distinguishes "no database yet"
+/// from "database exists but is empty" for the human-readable message.
+fn build_library_entries(
+    database_path: &Path,
+) -> Result<Vec<LibraryArchiveView>, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Ok(Vec::new());
+    }
+    let database = Database::open_or_create(database_path)?;
+    Ok(database
+        .load_archives()?
+        .iter()
+        .map(LibraryArchiveView::from)
+        .collect())
+}
+
+/// Case-insensitive match against each entry's display-safe path text
+/// (`Path::display`, the same lossy-for-display-only conversion used
+/// throughout this CLI - never the entry's identity) and detected
+/// platform, mirroring `find_archive_index_entries`'s existing matching
+/// style for the JSON index.
+fn filter_library_entries(entries: &[LibraryArchiveView], query: &str) -> Vec<LibraryArchiveView> {
+    let needle = query.to_lowercase();
+    entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path
+                .display()
+                .to_string()
+                .to_lowercase()
+                .contains(&needle)
+                || entry
+                    .platform
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+fn print_library_entries(database_path: &Path, entries: &[LibraryArchiveView]) {
+    if entries.is_empty() {
+        if database_path.exists() {
+            println!("No archives in the library catalogue yet.");
+        } else {
+            println!(
+                "No library database found at {}. Run: archivefs-cli library-scan",
+                database_path.display()
+            );
+        }
+        return;
+    }
+
+    println!("ArchiveFS Library List\n");
+    print!("{}", format_library_entries(entries));
+}
+
+fn print_library_find_results(query: &str, entries: &[LibraryArchiveView]) {
+    if entries.is_empty() {
+        println!("No library matches found for '{query}'.");
+        return;
+    }
+
+    println!("ArchiveFS Library Find");
+    println!("Query: {query}\n");
+    print!("{}", format_library_entries(entries));
+}
+
+fn print_library_entries_json(entries: &[LibraryArchiveView]) -> Result<(), serde_json::Error> {
+    println!("{}", format_library_entries_json(entries)?);
+    Ok(())
+}
+
+fn format_library_entries_json(
+    entries: &[LibraryArchiveView],
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(entries)
+}
+
+fn format_library_entries(entries: &[LibraryArchiveView]) -> String {
+    let mut output = String::new();
+    for entry in entries {
+        output.push_str(&format!("  Path: {}\n", entry.path.display()));
+        output.push_str(&format!(
+            "  Platform: {}\n",
+            entry.platform.as_deref().unwrap_or("Unknown")
+        ));
+        output.push_str(&format!(
+            "  State: {}\n",
+            if entry.present { "Present" } else { "Missing" }
+        ));
+        output.push_str(&format!(
+            "  Size: {}\n",
+            entry
+                .size_bytes
+                .map(human_size)
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        output.push_str(&format!(
+            "  Modified: {}\n",
+            entry
+                .modified_time_unix_seconds
+                .map(|seconds| format_unix_timestamp(seconds.max(0) as u64))
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        output.push('\n');
+    }
+    output
 }
 
 fn print_cleaned_dirs(paths: &[std::path::PathBuf]) {
@@ -741,12 +1240,20 @@ fn print_help() {
     println!("  index-build    Build the JSON archive index");
     println!("  index-show     Show a summary of the JSON archive index");
     println!("  index-find     Find entries in the JSON archive index");
+    println!("  library-status Show the persistent library database's health and counts");
+    println!("  library-scan   Scan configured source folders into the library database");
+    println!("  library-list   List archives from the library database (no rescan)");
+    println!("  library-find   Search the library database by path or platform");
     println!();
     println!("Examples:");
     println!("  archivefs doctor");
     println!("  archivefs config-check");
     println!("  archivefs status --json");
     println!("  archivefs stats");
+    println!("  archivefs library-status");
+    println!("  archivefs library-scan");
+    println!("  archivefs library-list");
+    println!("  archivefs library-find \"007 Legends\"");
     println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
     println!("  archivefs mount-one \"007 Legends\"");
@@ -1132,5 +1639,419 @@ mod tests {
         assert_eq!(args.log_level, log::LevelFilter::Debug);
         assert_eq!(args.command, "mount-one");
         assert_eq!(args.args, vec!["Test".to_string(), "Game".to_string()]);
+    }
+
+    // -------------------------------------------------------------
+    // library-status / library-scan / library-list / library-find
+    //
+    // All of these call the testable core functions
+    // (build_library_status_view / run_library_scan / build_library_entries
+    // / filter_library_entries) directly with explicit temp paths, exactly
+    // like archivefs_core's own database tests - never Config::load_default
+    // or default_database_path, so nothing here touches the real $HOME or
+    // races other tests over process-wide environment variables.
+    // -------------------------------------------------------------
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("archivefs-cli-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBuf {
+        let full_path = dir.join(relative_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, content).unwrap();
+        full_path
+    }
+
+    fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
+        Config {
+            source_folders: vec![source_dir.to_path_buf()],
+            mount_root: mount_dir.to_path_buf(),
+            ratarmount_bin: "ratarmount".to_string(),
+        }
+    }
+
+    #[test]
+    fn library_status_reports_no_database_before_any_scan() {
+        let root = temp_dir("status-no-database");
+        let database_path = root.join("library.sqlite3");
+
+        let view = build_library_status_view(&database_path);
+
+        assert!(!view.health.database_exists);
+        assert!(!view.health.database_opens);
+        assert!(view.stats.is_none());
+        assert!(view.last_completed_scan.is_none());
+        assert!(
+            !database_path.exists(),
+            "a status check must never create the database"
+        );
+
+        let output = format_library_status(&view);
+        assert!(output.contains("Exists: no"));
+        assert!(output.contains("No library database yet. Run: archivefs-cli library-scan"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_status_reports_counts_after_a_successful_scan() {
+        let root = temp_dir("status-after-scan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "Xbox360/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let view = build_library_status_view(&database_path);
+
+        assert!(view.health.database_exists);
+        assert!(view.health.database_opens);
+        assert!(view.health.migrations_current);
+        assert!(view.health.foreign_keys_enabled);
+        let stats = view
+            .stats
+            .as_ref()
+            .expect("stats must be present once migrations are current");
+        assert_eq!(stats.total_archives, 1);
+        assert_eq!(stats.present_archives, 1);
+        assert_eq!(stats.archives_with_platform, 1);
+        let scan = view
+            .last_completed_scan
+            .as_ref()
+            .expect("a completed scan must be reported");
+        assert_eq!(scan.archives_added, 1);
+
+        let output = format_library_status(&view);
+        assert!(output.contains("Total: 1"));
+        assert!(output.contains("Present: 1"));
+        assert!(output.contains("Detected platform: 1"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_status_json_parses_and_contains_expected_fields() {
+        let root = temp_dir("status-json");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let view = build_library_status_view(&database_path);
+        let output = format_library_status_json(&view).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("{\n"));
+        assert_eq!(json["database_exists"], true);
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["migrations_current"], true);
+        assert_eq!(json["stats"]["total_archives"], 1);
+        assert_eq!(json["last_completed_scan"]["archives_added"], 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_scan_creates_the_database() {
+        let root = temp_dir("scan-creates-database");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        assert!(!database_path.exists());
+
+        let report = run_library_scan(&config, &database_path, "test").unwrap();
+
+        assert!(database_path.exists());
+        assert_eq!(report.archives_new, 1);
+        assert_eq!(report.source_folders_attempted, 1);
+        assert_eq!(report.source_folders_succeeded, 1);
+        assert_eq!(report.source_folders_failed, 0);
+        assert!(report.folder_errors.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_scan_reports_partial_source_folder_failure() {
+        let root = temp_dir("scan-partial-failure");
+        let source_a = root.join("source-a");
+        let source_b = root.join("source-b");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source_a, "a.zip", b"a");
+        write_archive_file(&source_b, "b.zip", b"b");
+        let config = Config {
+            source_folders: vec![source_a.clone(), source_b.clone()],
+            mount_root: mount,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        std::fs::remove_dir_all(&source_a).unwrap();
+        let report = run_library_scan(&config, &database_path, "test").unwrap();
+
+        assert_eq!(report.source_folders_attempted, 2);
+        assert_eq!(report.source_folders_succeeded, 1);
+        assert_eq!(report.source_folders_failed, 1);
+        assert_eq!(report.folder_errors.len(), 1);
+        assert_eq!(report.folder_errors[0].path, source_a);
+
+        let output = format_library_scan(&report);
+        assert!(output.contains("Attempted: 2"));
+        assert!(output.contains("Succeeded: 1"));
+        assert!(output.contains("Failed: 1"));
+        assert!(output.contains(&source_a.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_scan_json_parses_and_contains_expected_fields() {
+        let root = temp_dir("scan-json");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+
+        let report = run_library_scan(&config, &database_path, "test").unwrap();
+        let output = format_library_scan_json(&report).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("{\n"));
+        assert_eq!(json["archives_new"], 1);
+        assert_eq!(json["source_folders_succeeded"], 1);
+        assert_eq!(json["folder_errors"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_shows_present_and_missing_rows() {
+        let root = temp_dir("list-present-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "keep.zip", b"a");
+        let doomed = write_archive_file(&source, "gone.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        std::fs::remove_file(&doomed).unwrap();
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let entries = build_library_entries(&database_path).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        let keep = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("keep.zip"))
+            .unwrap();
+        let gone = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("gone.zip"))
+            .unwrap();
+        assert!(keep.present);
+        assert!(!gone.present);
+
+        let output = format_library_entries(&entries);
+        assert!(output.contains("State: Present"));
+        assert!(output.contains("State: Missing"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_with_no_database_is_an_empty_but_successful_result() {
+        let root = temp_dir("list-no-database");
+        let database_path = root.join("library.sqlite3");
+
+        let entries = build_library_entries(&database_path).unwrap();
+
+        assert!(entries.is_empty());
+        assert!(!database_path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_find_matches_case_insensitively_on_path() {
+        let root = temp_dir("find-path-match");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "Halo.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path).unwrap();
+
+        let matches = filter_library_entries(&entries, "HALO");
+
+        assert_eq!(matches.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_find_matches_on_platform() {
+        let root = temp_dir("find-platform-match");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "Xbox360/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path).unwrap();
+
+        let matches = filter_library_entries(&entries, "xbox360");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].platform.as_deref(), Some("Xbox360"));
+
+        let output = print_library_find_results_for_test("xbox360", &matches);
+        assert!(output.contains("Query: xbox360"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_find_returns_no_results_without_erroring() {
+        let entries: Vec<LibraryArchiveView> = Vec::new();
+        let matches = filter_library_entries(&entries, "nothing-will-match-this");
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn library_find_json_parses_and_round_trips_expected_fields() {
+        let root = temp_dir("find-json");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "Xbox360/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path).unwrap();
+        let matches = filter_library_entries(&entries, "game");
+
+        let output = format_library_entries_json(&matches).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("[\n"));
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["present"], true);
+        assert_eq!(json[0]["platform"], "Xbox360");
+        assert!(
+            json[0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("Xbox360/game.zip")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_platform_is_shown_as_unknown_not_a_stored_sentinel() {
+        let root = temp_dir("unknown-platform-cli");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].platform, None,
+            "an undetected platform must round-trip as None, not a sentinel string"
+        );
+
+        let output = format_library_entries(&entries);
+        assert!(output.contains("Platform: Unknown"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_path_formats_without_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let non_utf8_name =
+            OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f, b'.', b'z', b'i', b'p']);
+        let entry = LibraryArchiveView {
+            path: PathBuf::from("/roms").join(&non_utf8_name),
+            platform: Some("Unknown".to_string()),
+            present: true,
+            size_bytes: Some(10),
+            modified_time_unix_seconds: Some(0),
+        };
+
+        // Human output uses Path::display, which is lossy-but-safe and
+        // must not panic on a non-UTF-8 path.
+        let human = format_library_entries(std::slice::from_ref(&entry));
+        assert!(human.contains("Path: "));
+
+        // JSON output uses the same display-safe conversion (see
+        // serialize_path_display) rather than PathBuf's own Serialize
+        // impl (which requires valid Unicode and would otherwise fail the
+        // whole list's --json output over one oddly-named archive) - it
+        // must succeed and produce valid, parseable JSON, not panic or
+        // error out.
+        let json = format_library_entries_json(std::slice::from_ref(&entry)).unwrap();
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        assert!(parsed[0]["path"].as_str().unwrap().contains("fo"));
+    }
+
+    #[test]
+    fn database_failure_does_not_affect_mount_planning_in_the_cli_layer() {
+        // Mirrors the equivalent test in archivefs_core::database: force a
+        // database failure here, in the CLI's own test suite, then confirm
+        // real (unrelated) core mount-planning logic still behaves
+        // normally in the same test. mount/mount-one/unmount/unmount-one
+        // command handlers in `run()` never call any library-* function.
+        let root = temp_dir("cli-database-failure-mount-safety");
+        let occupied_by_a_file = root.join("not-a-directory");
+        std::fs::write(&occupied_by_a_file, b"not a directory").unwrap();
+        let impossible_db_path = occupied_by_a_file.join("library.sqlite3");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+
+        let result = run_library_scan(&config, &impossible_db_path, "test");
+        assert!(result.is_err());
+
+        let scanner = ArchiveScanner::new(&config);
+        let archives = scanner.scan_archives().unwrap();
+        let plans = archivefs_core::plan_mounts(&archives, &config.mount_root);
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].state, archivefs_core::MountState::Pending);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Small helper so `library_find_matches_on_platform` can check the
+    /// heading text without duplicating `print_library_find_results`'s
+    /// stdout-writing shape.
+    fn print_library_find_results_for_test(query: &str, entries: &[LibraryArchiveView]) -> String {
+        let mut output = format!("ArchiveFS Library Find\nQuery: {query}\n\n");
+        output.push_str(&format_library_entries(entries));
+        output
     }
 }
