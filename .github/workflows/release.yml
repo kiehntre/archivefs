@@ -1,0 +1,185 @@
+name: Release
+
+# Triggers on tag pushes matching v*, or manually via workflow_dispatch for
+# an existing tag (e.g. to re-run a release without pushing a new tag).
+# Ordinary branch pushes and pull requests are left to .github/workflows/ci.yml.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  BIN_CLI: archivefs-cli
+  BIN_GUI: archivefs-gui
+  TARGET_TRIPLE: x86_64-linux
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Resolves the release tag before checkout, so checkout can pin to
+      # that exact tag commit rather than whatever ref triggered the run.
+      # - Tag push: the tag IS github.ref_name.
+      # - workflow_dispatch: the tag is the free-text inputs.tag - this is
+      #   the only path where the workflow could otherwise silently build
+      #   whatever the default branch currently is instead of the release
+      #   the caller asked for, so the tag is validated against the GitHub
+      #   API before anything is built or uploaded.
+      - name: Resolve and validate release tag
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$DISPATCH_TAG"
+          else
+            TAG="$PUSH_TAG"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not determine a release tag." >&2
+            exit 1
+          fi
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag '${TAG}' does not exist in ${GITHUB_REPOSITORY}. Push the tag first, or check the spelling of the manual 'tag' input." >&2
+            exit 1
+          fi
+
+          BUNDLE="archivefs-${TAG}-${TARGET_TRIPLE}"
+
+          # SemVer prerelease detection: a hyphen suffix after MAJOR.MINOR.PATCH
+          # (e.g. v0.2.0-alpha, v1.0.0-rc.1) marks the GitHub Release as a
+          # prerelease. A plain vMAJOR.MINOR.PATCH does not.
+          PRERELEASE="false"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
+            PRERELEASE="true"
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "bundle=${BUNDLE}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Explicitly the resolved tag, not the default branch. This is
+          # what makes workflow_dispatch build the tagged commit (e.g.
+          # v0.2.0-alpha -> 379eeea) even if main has since moved on.
+          ref: refs/tags/${{ steps.vars.outputs.tag }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # No apt packages are installed for archivefs-gui on Linux.
+      #
+      # archivefs-gui depends on eframe (features: default_fonts, glow,
+      # wayland, x11). On Linux those winit backends use the *-dl variants
+      # (x11-dl, xkbcommon-dl) and wayland-client/wayland-sys, which load
+      # libX11, libxkbcommon and libwayland-client at RUNTIME via dlopen
+      # rather than linking against them at compile time. `ldd` on a local
+      # release build of archivefs-gui confirms the only NEEDED shared
+      # libraries are libgcc_s, libm, libc and the dynamic linker - no
+      # libX11/libwayland/libGL entries. The existing CI workflow
+      # (.github/workflows/ci.yml) has also been building archivefs-gui
+      # successfully on ubuntu-latest with zero extra apt packages, which
+      # confirms this empirically. If a future dependency bump changes this
+      # (e.g. switching eframe to a backend that links directly), update
+      # this step with the specific -dev packages required and why.
+      - name: Linux build dependencies
+        run: echo "No additional apt packages required to build archivefs-gui; see workflow comments for why."
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Assemble release bundle
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ steps.vars.outputs.bundle }}"
+          mkdir -p "$BUNDLE"
+
+          cp "target/release/${BIN_CLI}" "$BUNDLE/"
+          cp "target/release/${BIN_GUI}" "$BUNDLE/"
+          cp README.md "$BUNDLE/"
+          cp CHANGELOG.md "$BUNDLE/"
+
+          # Only copy a LICENSE file if one exists in the repository.
+          # None is present as of this workflow being written; this loop is
+          # here so a LICENSE added later is picked up automatically.
+          shopt -s nullglob
+          license_files=(LICENSE LICENSE-* LICENSES)
+          for f in "${license_files[@]}"; do
+            [ -e "$f" ] && cp "$f" "$BUNDLE/"
+          done
+
+          # Only copy an example config file if one exists in the repository.
+          # None is present as of this workflow being written (no
+          # config.toml.example / examples/config.toml in this repo); this
+          # loop is here so one added later is picked up automatically.
+          example_config_files=(config.toml.example config.example.toml examples/config.toml examples/config.toml.example)
+          for f in "${example_config_files[@]}"; do
+            [ -e "$f" ] && cp "$f" "$BUNDLE/"
+          done
+          shopt -u nullglob
+
+          tar -czf "${BUNDLE}.tar.gz" "$BUNDLE"
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ steps.vars.outputs.bundle }}"
+          # Paths recorded here are relative to the repo root, matching the
+          # layout produced by extracting the tar.gz - so `sha256sum -c
+          # SHA256SUMS` works unmodified after `tar -xzf` in the same
+          # directory.
+          sha256sum \
+            "$BUNDLE/${BIN_CLI}" \
+            "$BUNDLE/${BIN_GUI}" \
+            "${BUNDLE}.tar.gz" \
+            > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.vars.outputs.tag }}"
+          BUNDLE="${{ steps.vars.outputs.bundle }}"
+          PRERELEASE_FLAG=""
+          if [ "${{ steps.vars.outputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          # Don't create a duplicate release if one already exists for this
+          # tag (e.g. drafted manually, or left over from a re-run).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets to it."
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes \
+              $PRERELEASE_FLAG
+          fi
+
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "${BUNDLE}.tar.gz" \
+            SHA256SUMS

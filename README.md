@@ -28,7 +28,7 @@ cargo build --workspace
 The development binary will be at:
 
 ```sh
-target/debug/archivefs
+target/debug/archivefs-cli
 ```
 
 For regular local use, install it with Cargo:
