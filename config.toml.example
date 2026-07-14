@@ -7,6 +7,17 @@
 # Folders ArchiveFS scans recursively for supported archives (.zip, .7z,
 # .rar). Add one entry per folder you want scanned. Required: this key
 # must be present and contain at least one path.
+#
+# The array can be written on one line (as below) or split across
+# multiple lines within the brackets, e.g.:
+#   source_folders = [
+#     "/data/archives",
+#     "/data/more-archives",
+#   ]
+# ArchiveFS uses a small hand-written parser, not a full TOML
+# implementation - only this key = "value" / key = [...] form is
+# understood, with no support for tables, inline tables, or nested
+# arrays.
 source_folders = ["/data/archives"]
 
 # Directory where ArchiveFS creates mount points for the archives it opens.

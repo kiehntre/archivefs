@@ -164,6 +164,17 @@ The same example, with comments, ships as [`config.toml.example`](config.toml.ex
 
 `source_folders` are scanned recursively. `mount_root` is where ArchiveFS creates planned mount directories. ArchiveFS does not modify files in `source_folders`. `ratarmount_bin` is optional and defaults to `"ratarmount"` resolved from `PATH`.
 
+**Note on syntax:** ArchiveFS uses a small hand-written config parser, not a full TOML implementation. `source_folders = ["/data/archives"]` on one line (shown above) always works. Splitting the array across multiple lines, e.g.:
+
+```toml
+source_folders = [
+  "/data/archives",
+  "/data/more-archives",
+]
+```
+
+is also accepted, but only this `key = "value"` / `key = [...]` form is understood - there is no support for TOML tables, inline tables, or nested arrays.
+
 ## Common Commands
 
 ```sh

@@ -1363,35 +1363,110 @@ fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
         ratarmount_bin: None,
     };
 
-    for (line_number, raw_line) in contents.lines().enumerate() {
-        let line = strip_comment(raw_line).trim();
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line_number = i + 1;
+        let line = strip_comment(lines[i]).trim();
+        i += 1;
         if line.is_empty() || line.starts_with('[') {
             continue;
         }
 
         let Some((key, value)) = line.split_once('=') else {
             return Err(ArchiveFsError::Config(format!(
-                "line {} is not a key/value pair",
-                line_number + 1
+                "line {line_number} is not a key/value pair",
             )));
         };
 
         match key.trim() {
             "source_folders" | "sources" => {
-                fields.source_folders = Some(parse_string_array(value.trim(), line_number + 1)?);
+                // An array value may open with '[' here and only close
+                // with ']' on a later line - collect_array_text joins any
+                // such continuation lines into one string first, so
+                // parse_string_array always sees a complete, single-line
+                // array exactly like it always has. Single-line arrays
+                // (the common case) are returned unchanged with zero
+                // lines consumed, so this is a no-op for existing configs.
+                let (array_text, consumed) =
+                    collect_array_text(value.trim(), &lines[i..], line_number)?;
+                i += consumed;
+                fields.source_folders = Some(parse_string_array(&array_text, line_number)?);
             }
             "mount_root" => {
-                fields.mount_root =
-                    Some(PathBuf::from(parse_string(value.trim(), line_number + 1)?));
+                fields.mount_root = Some(PathBuf::from(parse_string(value.trim(), line_number)?));
             }
             "ratarmount_bin" | "ratarmount" => {
-                fields.ratarmount_bin = Some(parse_string(value.trim(), line_number + 1)?);
+                fields.ratarmount_bin = Some(parse_string(value.trim(), line_number)?);
             }
             _ => {}
         }
     }
 
     Ok(fields)
+}
+
+/// If `first` opens an array with '[' but does not itself close it with a
+/// matching ']', pulls further lines from `rest` (each comment-stripped;
+/// blank lines skipped) and joins them onto `first` with a single space
+/// until the array closes. Returns the joined text and how many lines
+/// from `rest` were consumed (0 if `first` was already a complete,
+/// single-line array or not an array at all - the common case, and
+/// unchanged from parse_config_fields's prior single-line-only
+/// behavior). `line_number` is only used for the "never closed" error.
+///
+/// This performs no comma handling of its own: it only re-joins physical
+/// lines into one logical line, so parse_string_array (unchanged) parses
+/// exactly the same comma/quote syntax it always has, just assembled
+/// from more than one source line.
+fn collect_array_text(first: &str, rest: &[&str], line_number: usize) -> Result<(String, usize)> {
+    let mut text = first.to_string();
+    if !text.starts_with('[') || array_is_balanced(&text) {
+        return Ok((text, 0));
+    }
+
+    let mut consumed = 0;
+    for raw in rest {
+        consumed += 1;
+        let cont = strip_comment(raw).trim();
+        if cont.is_empty() {
+            continue;
+        }
+        text.push(' ');
+        text.push_str(cont);
+        if array_is_balanced(&text) {
+            return Ok((text, consumed));
+        }
+    }
+
+    Err(ArchiveFsError::Config(format!(
+        "line {line_number} starts an array with '[' that is never closed with ']'",
+    )))
+}
+
+/// True if `text` contains a '[' ... ']' pair that balances back to depth
+/// zero, ignoring any '[' or ']' that appear inside quoted strings.
+fn array_is_balanced(text: &str) -> bool {
+    let mut in_string = false;
+    let mut previous_was_escape = false;
+    let mut depth: i32 = 0;
+
+    for ch in text.chars() {
+        match ch {
+            '"' if !previous_was_escape => in_string = !in_string,
+            '[' if !in_string => depth += 1,
+            ']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        previous_was_escape = ch == '\\' && !previous_was_escape;
+    }
+
+    false
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -6103,6 +6178,108 @@ mod tests {
                 && check.status == DoctorStatus::Fail
                 && check.detail.ends_with("does not exist")
         }));
+    }
+
+    #[test]
+    fn multiline_source_folders_with_single_entry_parses() {
+        let contents = concat!(
+            "source_folders = [\n",
+            "  \"/home/user/Archives\"\n",
+            "]\n",
+            "mount_root = \"/mnt/archivefs\"\n",
+        );
+
+        let config = parse_config(contents).unwrap();
+
+        assert_eq!(
+            config.source_folders,
+            vec![PathBuf::from("/home/user/Archives")]
+        );
+    }
+
+    #[test]
+    fn multiline_source_folders_with_multiple_entries_and_trailing_comma_parses() {
+        let contents = concat!(
+            "source_folders = [\n",
+            "  \"/data/archives\",\n",
+            "  \"/mnt/other\",\n",
+            "]\n",
+            "mount_root = \"/mnt/archivefs\"\n",
+        );
+
+        let config = parse_config(contents).unwrap();
+
+        assert_eq!(
+            config.source_folders,
+            vec![PathBuf::from("/data/archives"), PathBuf::from("/mnt/other")]
+        );
+    }
+
+    #[test]
+    fn multiline_source_folders_with_comment_on_continuation_line_parses() {
+        let contents = concat!(
+            "source_folders = [\n",
+            "  \"/data/archives\", # primary library\n",
+            "  \"/mnt/other\"\n",
+            "]\n",
+            "mount_root = \"/mnt/archivefs\"\n",
+        );
+
+        let config = parse_config(contents).unwrap();
+
+        assert_eq!(
+            config.source_folders,
+            vec![PathBuf::from("/data/archives"), PathBuf::from("/mnt/other")]
+        );
+    }
+
+    #[test]
+    fn unclosed_multiline_source_folders_array_is_a_config_error() {
+        let contents = concat!(
+            "source_folders = [\n",
+            "  \"/data/archives\"\n",
+            "mount_root = \"/mnt/archivefs\"\n",
+        );
+
+        let error = parse_config(contents).unwrap_err();
+
+        assert!(error.to_string().contains("never closed"));
+    }
+
+    #[test]
+    fn single_line_source_folders_array_is_unaffected_by_multiline_support() {
+        let contents = "source_folders = [\"/data/archives\", \"/mnt/other\"]\nmount_root = \"/mnt/archivefs\"\n";
+
+        let config = parse_config(contents).unwrap();
+
+        assert_eq!(
+            config.source_folders,
+            vec![PathBuf::from("/data/archives"), PathBuf::from("/mnt/other")]
+        );
+    }
+
+    #[test]
+    fn shipped_config_toml_example_parses_with_the_real_parser() {
+        // Reads the repository's actual config.toml.example (not a copy
+        // of its contents) so this test fails if the shipped file and
+        // the parser ever drift apart. No real $HOME or filesystem paths
+        // are touched - this only reads a file already in the repo.
+        let example_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.toml.example");
+        let contents = fs::read_to_string(&example_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read shipped example config at {}: {error}",
+                example_path.display()
+            )
+        });
+
+        let config = parse_config(&contents).expect(
+            "config.toml.example must parse with the real ArchiveFS config parser - \
+             if you changed the parser or the example, keep both in sync",
+        );
+
+        assert_eq!(config.source_folders, vec![PathBuf::from("/data/archives")]);
+        assert_eq!(config.mount_root, PathBuf::from("/mnt/archivefs"));
+        assert_eq!(config.ratarmount_bin, "ratarmount");
     }
 
     #[test]
