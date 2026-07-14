@@ -41,6 +41,38 @@ Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehn
    cd archivefs-v0.2.0-alpha-x86_64-linux
    ```
 
+### Quick install
+
+From inside the extracted directory, run the installer:
+
+```sh
+./install.sh
+```
+
+This installs `archivefs-cli` and `archivefs-gui` into `~/.local/bin` (override the location with `--prefix PATH`), creates `~/.config/archivefs`, and copies `config.toml.example` to `config.toml` there - but only if a config does not already exist; an existing config is never touched. It uses no `sudo` and does not modify your shell startup files. It also checks whether `ratarmount` is on `PATH` and prints installation guidance if it is not. It is safe to run again later (for example after upgrading to a newer release tarball).
+
+Edit `source_folders` and `mount_root` in `~/.config/archivefs/config.toml`, then run `archivefs-cli doctor` (see the PATH note below if that command is not found).
+
+To remove what it installed (your config is left in place):
+
+```sh
+./install.sh --uninstall
+```
+
+Pass the same `--prefix PATH` to `--uninstall` if you installed to a non-default location. Run `./install.sh --help` for the full list of options.
+
+**PATH note:** the installer never edits shell startup files, so if `~/.local/bin` is not already on your `PATH`, add it yourself - for example add this line to `~/.bashrc` or `~/.zshrc`, then restart your shell (or `source` that file):
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Until then, run the installed binaries with their full path: `~/.local/bin/archivefs-cli doctor`.
+
+### Manual installation
+
+Manual installation remains available if you would rather control each step yourself, or need to install somewhere the script does not handle:
+
 4. Make the binaries executable, if extraction did not already preserve that:
 
    ```sh

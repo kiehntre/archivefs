@@ -118,19 +118,27 @@ jobs:
           cp README.md "$BUNDLE/"
           cp CHANGELOG.md "$BUNDLE/"
 
+          # install.sh is always present in the repository (it installs the
+          # two binaries above into ~/.local/bin and sets up
+          # ~/.config/archivefs). chmod is explicit rather than relying on
+          # cp preserving the executable bit from the checkout.
+          cp install.sh "$BUNDLE/"
+          chmod +x "$BUNDLE/install.sh"
+
           # Only copy a LICENSE file if one exists in the repository.
-          # None is present as of this workflow being written; this loop is
-          # here so a LICENSE added later is picked up automatically.
+          # This loop is here so a LICENSE added or renamed later is picked
+          # up automatically without editing this workflow again.
           shopt -s nullglob
           license_files=(LICENSE LICENSE-* LICENSES)
           for f in "${license_files[@]}"; do
             [ -e "$f" ] && cp "$f" "$BUNDLE/"
           done
 
-          # Only copy an example config file if one exists in the repository.
-          # None is present as of this workflow being written (no
-          # config.toml.example / examples/config.toml in this repo); this
-          # loop is here so one added later is picked up automatically.
+          # config.toml.example is always present in the repository as of
+          # this workflow being written, but this stays a loop (rather than
+          # an unconditional cp like README.md/CHANGELOG.md above) so a
+          # rename to one of the other candidate names below still works
+          # without editing this workflow again.
           example_config_files=(config.toml.example config.example.toml examples/config.toml examples/config.toml.example)
           for f in "${example_config_files[@]}"; do
             [ -e "$f" ] && cp "$f" "$BUNDLE/"
