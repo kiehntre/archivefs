@@ -1619,6 +1619,13 @@ pub struct ArchiveIdentity {
     pub size_bytes: Option<u64>,
     pub modified_time: Option<std::time::SystemTime>,
     pub platform: Option<String>,
+    /// How `platform` was determined, or `None` iff `platform` is `None`.
+    /// Carried alongside `platform` (rather than recomputed later) so a
+    /// single detection pass is the source of truth for both the display
+    /// value and the provenance persisted with it - see
+    /// [`Database::assign_platform`](crate::database::Database::assign_platform)
+    /// and `detect_platform_with_provenance`.
+    pub platform_provenance: Option<PlatformProvenance>,
     pub region: Option<String>,
     pub content_hash: Option<String>,
     pub archive_hash: Option<String>,
@@ -1632,7 +1639,11 @@ impl ArchiveIdentity {
         metadata: Option<&fs::Metadata>,
     ) -> Self {
         let source_root = source_root.into();
-        let platform = detect_platform(path, &source_root);
+        let detection = detect_platform_with_provenance(path, &source_root);
+        let (platform, platform_provenance) = match detection {
+            Some(detection) => (Some(detection.platform), Some(detection.provenance)),
+            None => (None, None),
+        };
         Self {
             display_name: archive_title(path),
             normalized_name: normalized_title(path),
@@ -1640,6 +1651,7 @@ impl ArchiveIdentity {
             size_bytes: metadata.map(fs::Metadata::len),
             modified_time: metadata.and_then(|metadata| metadata.modified().ok()),
             platform,
+            platform_provenance,
             region: None,
             content_hash: None,
             archive_hash: None,
@@ -2522,10 +2534,92 @@ fn normalized_title(path: &Path) -> String {
     safe_mount_name(path).to_lowercase()
 }
 
+/// How a [`detect_platform_with_provenance`] result was determined. This is
+/// what `platform_assignments.source` (see `database.rs`) is ultimately
+/// derived from, and what decides whether a later, weaker guess is allowed
+/// to overwrite an existing assignment - see
+/// [`Database::assign_platform`](crate::database::Database::assign_platform).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlatformProvenance {
+    /// The existing filename/title/known-path-segment heuristic below
+    /// (`detect_platform_from_known_heuristics`) - unchanged from before
+    /// this enum existed, and always tried first.
+    Heuristic,
+    /// The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), used only
+    /// as a fallback when the heuristic above finds nothing.
+    FolderAlias,
+}
+
+impl PlatformProvenance {
+    /// The exact string persisted as `platform_assignments.source`.
+    /// `"heuristic-path-detector"` is unchanged from every row written
+    /// before this enum existed; `"folder_alias"` is new.
+    pub fn as_source_str(self) -> &'static str {
+        match self {
+            Self::Heuristic => "heuristic-path-detector",
+            Self::FolderAlias => "folder_alias",
+        }
+    }
+}
+
+/// The result of [`detect_platform_with_provenance`]: a canonical platform
+/// name plus how confidently/how it was determined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformDetection {
+    pub platform: String,
+    pub provenance: PlatformProvenance,
+}
+
+/// Detects a platform for `path` (an archive discovered under
+/// `source_root`), discarding provenance - the stable public entry point
+/// every existing caller (`ArchiveIdentity::from_path`,
+/// `FilenameMetadataProvider`) already used before folder-alias detection
+/// existed. Prefer [`detect_platform_with_provenance`] for any new caller
+/// that needs to know *how* confidently the platform was determined (for
+/// example, database persistence deciding whether it is safe to overwrite
+/// an existing assignment).
 pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) -> Option<String> {
+    detect_platform_with_provenance(path, source_root).map(|detection| detection.platform)
+}
+
+/// Detects a platform for `path` (an archive discovered under
+/// `source_root`), in priority order:
+///
+/// 1. The existing filename/title/known-path-segment heuristic
+///    (`detect_platform_from_known_heuristics`) - unchanged, and always
+///    tried first, since it is generally more specific than a bare folder
+///    name.
+/// 2. The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), walking
+///    from the archive's nearest containing directory up to (never beyond)
+///    `source_root` - see `detect_platform_from_folder_alias`.
+/// 3. `None` if neither found a confident match.
+pub fn detect_platform_with_provenance(
+    path: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+) -> Option<PlatformDetection> {
     let path = path.as_ref();
     let source_root = source_root.as_ref();
 
+    if let Some(platform) = detect_platform_from_known_heuristics(path, source_root) {
+        return Some(PlatformDetection {
+            platform,
+            provenance: PlatformProvenance::Heuristic,
+        });
+    }
+
+    detect_platform_from_folder_alias(path, source_root).map(|platform| PlatformDetection {
+        platform: platform.to_string(),
+        provenance: PlatformProvenance::FolderAlias,
+    })
+}
+
+/// The original `detect_platform` heuristic, unchanged: a small set of
+/// known path segments (Xbox/Xbox360/AtariST/Atari2600, matched with a
+/// `starts_with` on the Xbox family to tolerate region/part suffixes like
+/// `_f_part1`) and a short list of specific, hardcoded known-title
+/// substring matches. Deliberately left as-is - see
+/// `detect_platform_from_folder_alias` for the new, generic fallback.
+fn detect_platform_from_known_heuristics(path: &Path, source_root: &Path) -> Option<String> {
     for segment in source_root.iter().chain(path.iter()) {
         let normalized = normalize_path_segment(&segment.to_string_lossy());
         if normalized.starts_with("microsoftxbox360") || normalized.starts_with("xbox360") {
@@ -2565,6 +2659,131 @@ pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) ->
     }
 
     None
+}
+
+/// Canonical platform name for every folder alias this build recognizes,
+/// keyed by the alias already run through `normalize_path_segment` (ASCII
+/// alphanumeric only, lowercased - so separators and casing like
+/// `"MSX 2"`/`"msx_2"`/`"msx2"` all key to the same `"msx2"` entry without
+/// needing a separate row per spelling variant here). Exact match only,
+/// deliberately: a substring or prefix match would risk false positives
+/// like `"genesis".contains("nes")`. Keep entries specific and
+/// unambiguous, avoiding single common English words that are not also
+/// an explicitly requested platform alias.
+const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
+    ("msx", "MSX"),
+    ("msx1", "MSX"),
+    ("msx2", "MSX2"),
+    ("neogeo", "NeoGeo"),
+    ("neogeoaes", "NeoGeo"),
+    ("neogeomvs", "NeoGeo"),
+    ("intellivision", "Intellivision"),
+    ("amiga", "Amiga"),
+    ("commodoreamiga", "Amiga"),
+    ("amigacd32", "AmigaCD32"),
+    ("cd32", "AmigaCD32"),
+    ("atarist", "AtariST"),
+    ("atari2600", "Atari2600"),
+    ("a2600", "Atari2600"),
+    ("atarivcs", "Atari2600"),
+    ("atari5200", "Atari5200"),
+    ("a5200", "Atari5200"),
+    ("atari7800", "Atari7800"),
+    ("a7800", "Atari7800"),
+    ("nes", "NES"),
+    ("nintendoentertainmentsystem", "NES"),
+    ("famicom", "NES"),
+    ("nintendofamicom", "NES"),
+    ("snes", "SNES"),
+    ("supernintendo", "SNES"),
+    ("supernintendoentertainmentsystem", "SNES"),
+    ("superfamicom", "SNES"),
+    ("n64", "N64"),
+    ("nintendo64", "N64"),
+    ("gamecube", "GameCube"),
+    ("nintendogamecube", "GameCube"),
+    ("gcn", "GameCube"),
+    ("ngc", "GameCube"),
+    ("wii", "Wii"),
+    ("nintendowii", "Wii"),
+    ("wiiu", "WiiU"),
+    ("nintendowiiu", "WiiU"),
+    ("switch", "Switch"),
+    ("nintendoswitch", "Switch"),
+    ("megadrive", "MegaDrive"),
+    ("genesis", "MegaDrive"),
+    ("segamegadrive", "MegaDrive"),
+    ("segagenesis", "MegaDrive"),
+    ("smd", "MegaDrive"),
+    ("mastersystem", "MasterSystem"),
+    ("segamastersystem", "MasterSystem"),
+    ("sms", "MasterSystem"),
+    ("gamegear", "GameGear"),
+    ("segagamegear", "GameGear"),
+    ("saturn", "Saturn"),
+    ("segasaturn", "Saturn"),
+    ("dreamcast", "Dreamcast"),
+    ("segadreamcast", "Dreamcast"),
+    ("psx", "PSX"),
+    ("ps1", "PSX"),
+    ("playstation", "PSX"),
+    ("playstation1", "PSX"),
+    ("sonyplaystation", "PSX"),
+    ("sonyplaystation1", "PSX"),
+    ("ps2", "PS2"),
+    ("playstation2", "PS2"),
+    ("sonyplaystation2", "PS2"),
+    ("ps3", "PS3"),
+    ("playstation3", "PS3"),
+    ("sonyplaystation3", "PS3"),
+    ("psp", "PSP"),
+    ("playstationportable", "PSP"),
+    ("sonypsp", "PSP"),
+    ("xbox", "Xbox"),
+    ("microsoftxbox", "Xbox"),
+    ("xbox360", "Xbox360"),
+    ("microsoftxbox360", "Xbox360"),
+    ("arcade", "Arcade"),
+    ("mame", "Arcade"),
+    ("dos", "DOS"),
+    ("msdos", "DOS"),
+    ("scummvm", "ScummVM"),
+];
+
+/// Canonical platform name for one already-lossy-stringified path
+/// component, if it exactly matches a known folder alias after
+/// normalization, or `None` if it does not.
+fn folder_platform_alias(segment: &str) -> Option<&'static str> {
+    let normalized = normalize_path_segment(segment);
+    FOLDER_PLATFORM_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// Infers a platform from `path`'s folder structure alone, walking
+/// directory components from the archive's nearest containing folder
+/// upward to (but never beyond) `source_root` - the nearest matching
+/// folder wins. Only components strictly inside `source_root` ever
+/// participate: `source_root`'s own components (`/home/davedap/Archives`
+/// in the example from the platform-detection task) never do, and neither
+/// does anything outside `source_root` altogether. The archive's own
+/// filename is excluded too - this only ever looks at directory names.
+///
+/// Uses `to_string_lossy` on each component (matching
+/// `detect_platform_from_known_heuristics`'s existing convention) - this
+/// is a best-effort display guess, not an identity or reconciliation key,
+/// so a lossy conversion on a non-UTF-8 path component is safe and simply
+/// yields no match rather than panicking.
+fn detect_platform_from_folder_alias(path: &Path, source_root: &Path) -> Option<&'static str> {
+    let relative = path.strip_prefix(source_root).ok()?;
+    let mut components: Vec<_> = relative.components().collect();
+    components.pop(); // the archive's own filename never counts as a folder.
+
+    components
+        .iter()
+        .rev()
+        .find_map(|component| folder_platform_alias(&component.as_os_str().to_string_lossy()))
 }
 
 fn normalize_path_segment(segment: &str) -> String {
@@ -4398,7 +4617,10 @@ mod tests {
 
     #[test]
     fn duplicate_filenames_get_distinct_mount_paths() {
-        let archives = vec![archive("/roms/ps1/game.zip"), archive("/roms/ps2/game.zip")];
+        let archives = vec![
+            archive("/roms/collection-a/game.zip"),
+            archive("/roms/collection-b/game.zip"),
+        ];
         let mounts = plan_mounts(&archives, "/mnt/archivefs");
 
         assert_eq!(mounts.len(), 2);
@@ -6010,17 +6232,306 @@ mod tests {
             Archive::from_path_in_root("/roms/microsoft_xbox360/Halo 3.zip", "/roms").unwrap();
 
         assert_eq!(archive.identity.platform, Some("Xbox360".to_string()));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::Heuristic)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Folder-based platform detection (alias-map fallback).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn msx2_folder_detects_msx2() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/msx2/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("MSX2".to_string())
+        );
+    }
+
+    #[test]
+    fn neogeo_folder_detects_neo_geo() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/neogeo/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("NeoGeo".to_string())
+        );
+    }
+
+    #[test]
+    fn intellivision_folder_detects_intellivision() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/intellivision/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("Intellivision".to_string())
+        );
+    }
+
+    #[test]
+    fn folder_alias_matching_is_case_and_separator_insensitive() {
+        let root = "/home/davedap/Archives";
+        for folder in ["msx2", "MSX2", "MSX 2", "msx_2", "Msx-2"] {
+            assert_eq!(
+                detect_platform(format!("{root}/{folder}/Game.zip"), root),
+                Some("MSX2".to_string()),
+                "folder spelling {folder:?} should detect MSX2"
+            );
+        }
+
+        assert_eq!(
+            detect_platform(format!("{root}/sony-playstation-2/Game.zip"), root),
+            Some("PS2".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Nintendo GameCube/Game.zip"), root),
+            Some("GameCube".to_string())
+        );
+    }
+
+    #[test]
+    fn nearest_matching_parent_folder_wins_over_a_higher_one() {
+        // "ps2" (nearer) must win over "gamecube" (further from the file),
+        // even though both are valid aliases - see requirement 2's
+        // detection order.
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/gamecube/extras/ps2/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("PS2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_higher_parent_folder_is_used_when_the_nearest_one_does_not_match() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/msx2/subfolder/extras/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("MSX2".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_path_components_outside_source_root_are_ignored() {
+        // The source root itself is literally named "Archives", nested
+        // under "davedap" and "home" - none of those may ever influence
+        // detection, only "msx2" (a descendant of the configured root).
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/msx2/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("MSX2".to_string())
+        );
+
+        // A source root that is not itself under any alias-looking
+        // ancestor must not spuriously detect one either - sanity check
+        // that stripping the root is doing real work, not accidentally
+        // matching on the full absolute path.
+        assert_eq!(
+            detect_platform("/home/davedap/msx2/game.zip", "/home/davedap/msx2"),
+            None,
+            "the source root's own name must never itself count as a folder hint"
+        );
+    }
+
+    #[test]
+    fn filename_detection_remains_stronger_than_the_folder_fallback() {
+        // "/incoming/Fable (USA, Europe).7z" is inside an "incoming"
+        // folder with no platform hint, but the existing title heuristic
+        // still (correctly) detects Xbox - the folder fallback must never
+        // run at all when the heuristic already found something,
+        // regardless of what the folder path would have suggested.
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/psp/007 Legends.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("Xbox360".to_string()),
+            "the known-title heuristic for \"007 Legends\" must win over the \
+             \"psp\" folder alias"
+        );
+    }
+
+    #[test]
+    fn unknown_folder_remains_unknown() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/misc/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            None
+        );
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/roms/backup/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_vague_folder_names_do_not_false_positive() {
+        // "genesis" is a real, requested alias (MegaDrive) - but a folder
+        // literally containing the substring is not a match unless the
+        // *whole* normalized component equals a known alias. "genesis"
+        // itself is deliberately excluded here: this checks compound
+        // names that merely *contain* an alias substring are not matched.
+        for folder in ["genesis-of-a-nightmare", "my-nes-notes", "megadrivetools"] {
+            assert_eq!(
+                detect_platform(
+                    format!("/home/davedap/Archives/{folder}/Game.zip"),
+                    "/home/davedap/Archives"
+                ),
+                None,
+                "{folder:?} merely contains an alias substring and must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_is_folder_alias_for_the_fallback_and_heuristic_for_the_existing_path() {
+        let heuristic = detect_platform_with_provenance("/roms/xbox360/Halo.zip", "/roms")
+            .expect("known heuristic should detect Xbox360");
+        assert_eq!(heuristic.provenance, PlatformProvenance::Heuristic);
+        assert_eq!(
+            heuristic.provenance.as_source_str(),
+            "heuristic-path-detector"
+        );
+
+        let folder_alias = detect_platform_with_provenance(
+            "/home/davedap/Archives/msx2/Game.zip",
+            "/home/davedap/Archives",
+        )
+        .expect("folder alias should detect MSX2");
+        assert_eq!(folder_alias.provenance, PlatformProvenance::FolderAlias);
+        assert_eq!(folder_alias.provenance.as_source_str(), "folder_alias");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_path_components_do_not_panic_on_unix() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // "unknownfolder" plus one invalid byte in the middle - the
+        // invalid byte is dropped entirely by normalize_path_segment's
+        // ASCII-alphanumeric filter (lossy replacement characters are not
+        // alphanumeric), leaving "unknownfolder", which does not match
+        // any alias either way. The point of this test is that a
+        // non-UTF-8 component never panics, regardless of how it
+        // normalizes.
+        let mut folder_bytes = b"unknown".to_vec();
+        folder_bytes.push(0x80); // never valid UTF-8 on its own.
+        folder_bytes.extend_from_slice(b"folder");
+        let folder = OsString::from_vec(folder_bytes);
+
+        let root = PathBuf::from("/home/davedap/Archives");
+        let mut path = root.clone();
+        path.push(&folder);
+        path.push("Game.zip");
+        assert!(
+            path.to_str().is_none(),
+            "test path must actually be invalid UTF-8"
+        );
+
+        assert_eq!(detect_platform(&path, &root), None);
+    }
+
+    #[test]
+    fn real_nested_console_paths_behave_predictably() {
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/console/ps2/game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("PS2".to_string())
+        );
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/console/dreamcast/game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("Dreamcast".to_string())
+        );
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/console/unknown-thing/game.zip",
+                "/home/davedap/Archives"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn folder_alias_table_detects_every_listed_canonical_platform() {
+        let cases: &[(&str, &str)] = &[
+            ("msx", "MSX"),
+            ("msx2", "MSX2"),
+            ("neogeo", "NeoGeo"),
+            ("intellivision", "Intellivision"),
+            ("amiga", "Amiga"),
+            ("amigacd32", "AmigaCD32"),
+            ("atarist", "AtariST"),
+            ("atari2600", "Atari2600"),
+            ("atari5200", "Atari5200"),
+            ("atari7800", "Atari7800"),
+            ("nes", "NES"),
+            ("snes", "SNES"),
+            ("n64", "N64"),
+            ("gamecube", "GameCube"),
+            ("wii", "Wii"),
+            ("wiiu", "WiiU"),
+            ("switch", "Switch"),
+            ("megadrive", "MegaDrive"),
+            ("genesis", "MegaDrive"),
+            ("mastersystem", "MasterSystem"),
+            ("gamegear", "GameGear"),
+            ("saturn", "Saturn"),
+            ("dreamcast", "Dreamcast"),
+            ("psx", "PSX"),
+            ("ps1", "PSX"),
+            ("ps2", "PS2"),
+            ("ps3", "PS3"),
+            ("psp", "PSP"),
+            ("xbox", "Xbox"),
+            ("xbox360", "Xbox360"),
+            ("arcade", "Arcade"),
+            ("mame", "Arcade"),
+            ("dos", "DOS"),
+            ("scummvm", "ScummVM"),
+        ];
+
+        let root = "/home/davedap/Archives";
+        for (folder, expected_platform) in cases {
+            assert_eq!(
+                detect_platform(format!("{root}/{folder}/Game.zip"), root),
+                Some((*expected_platform).to_string()),
+                "folder {folder:?} should detect {expected_platform:?}"
+            );
+        }
     }
 
     #[test]
     fn mount_plan_generation_carries_archive_identity_and_pending_state() {
-        let archives = vec![archive("/roms/ps1/Resident Evil 2.zip")];
+        let archives = vec![archive("/roms/collection/Resident Evil 2.zip")];
         let plans = plan_mounts(&archives, "/mnt/archivefs");
 
         assert_eq!(plans.len(), 1);
         assert_eq!(
             plans[0].archive.path,
-            PathBuf::from("/roms/ps1/Resident Evil 2.zip")
+            PathBuf::from("/roms/collection/Resident Evil 2.zip")
         );
         assert_eq!(plans[0].archive.kind, ArchiveKind::Zip);
         assert_eq!(plans[0].archive.identity.normalized_name, "resident_evil_2");

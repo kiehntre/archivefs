@@ -31,7 +31,9 @@ use std::{env, fs};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, Result};
+use crate::{
+    Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
+};
 
 /// Resolves the default library database path:
 /// `~/.local/share/archivefs/library.sqlite3`, alongside the existing JSON
@@ -504,6 +506,25 @@ fn db_error(context: &str, error: rusqlite::Error) -> ArchiveFsError {
     ArchiveFsError::Database(format!("{context}: {error}"))
 }
 
+/// Relative strength of a `platform_assignments.source` value, used by
+/// [`Database::assign_platform`] to decide whether a new assignment may
+/// replace the current one. Only `"folder_alias"` (the generic
+/// folder-name fallback in `crate::detect_platform_with_provenance`) is
+/// weak: everything else - `"heuristic-path-detector"`, and any source
+/// string this build does not specifically recognize (a future
+/// `"manual"`/user-override source, for example) - is treated as at
+/// least as strong, so a folder guess can never quietly replace a
+/// stronger or manual assignment, while two assignments from the same
+/// tier can still freely replace each other (matching the existing
+/// heuristic-vs-heuristic reassignment behavior from before this
+/// function existed).
+fn provenance_priority(source: &str) -> u8 {
+    match source {
+        "folder_alias" => 0,
+        _ => 1,
+    }
+}
+
 /// The subset of an existing `archives` row read by
 /// [`Database::upsert_archive`] to decide which of [`ArchiveChangeKind`]'s
 /// four outcomes applies.
@@ -818,15 +839,25 @@ impl Database {
 
     /// Records `platform` as the current platform assignment for
     /// `archive_id`, with `source` as its provenance (for example
-    /// `"heuristic-path-detector"`, matching `detect_platform`'s output
-    /// today). `platform: None` (no platform detected) is a no-op - it
+    /// `"heuristic-path-detector"` or `"folder_alias"`, matching
+    /// `detect_platform_with_provenance`'s `PlatformProvenance::as_source_str`
+    /// output). `platform: None` (no platform detected) is a no-op - it
     /// never overwrites or removes an existing assignment, since a scan
     /// not detecting a platform this time is not evidence a previous
     /// detection was wrong. If `platform` already matches the current
     /// assignment, this is also a no-op, to avoid growing history with
-    /// every scan re-confirming the same guess. Otherwise the previous
-    /// current row (if any) is flipped to not-current and a new row is
-    /// inserted, preserving full history.
+    /// every scan re-confirming the same guess.
+    ///
+    /// A new assignment whose `source` is *weaker* than the current
+    /// assignment's `source` (see [`provenance_priority`]) is also a
+    /// no-op: today this means a `"folder_alias"` guess can never replace
+    /// an existing assignment made any other way (including a future
+    /// manual/user-override source this build does not specifically
+    /// recognize - `provenance_priority` treats every unrecognized source
+    /// as strong, not weak, so it is never silently overwritten by a
+    /// folder guess either). Otherwise the previous current row (if any)
+    /// is flipped to not-current and a new row is inserted, preserving
+    /// full history.
     pub fn assign_platform(
         &mut self,
         archive_id: i64,
@@ -837,18 +868,23 @@ impl Database {
             return Ok(());
         };
 
-        let current: Option<String> = self
+        let current: Option<(String, String)> = self
             .connection
             .query_row(
-                "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                "SELECT platform, source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
                 params![archive_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| db_error("failed to look up current platform assignment", error))?;
 
-        if current.as_deref() == Some(platform) {
-            return Ok(());
+        if let Some((current_platform, current_source)) = &current {
+            if current_platform == platform {
+                return Ok(());
+            }
+            if provenance_priority(current_source) > provenance_priority(source) {
+                return Ok(());
+            }
         }
 
         let tx = self
@@ -1268,7 +1304,11 @@ fn persist_one_folder(
         database.assign_platform(
             outcome.archive_id,
             archive.identity.platform.as_deref(),
-            "heuristic-path-detector",
+            archive
+                .identity
+                .platform_provenance
+                .map(PlatformProvenance::as_source_str)
+                .unwrap_or("heuristic-path-detector"),
         )?;
     }
 
@@ -2007,6 +2047,155 @@ mod tests {
             )
             .unwrap();
         assert_eq!(assignment_count, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn folder_alias_detection_is_persisted_with_folder_alias_provenance() {
+        let root = temp_dir("folder-alias-provenance");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("MSX2"));
+
+        let source_column: String = database
+            .connection
+            .query_row(
+                "SELECT source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                params![archive.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_column, "folder_alias");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stronger_platform_assignment_is_not_overwritten_by_a_weaker_folder_guess() {
+        let root = temp_dir("provenance-priority-protects-stronger");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive_id = find_archive(&archives, "msx2/game.zip").id;
+
+        // Simulate a stronger correction - a hypothetical future "manual"
+        // source is exactly the kind of assignment provenance_priority
+        // must never let a folder guess quietly replace.
+        database
+            .assign_platform(archive_id, Some("CustomPlatform"), "manual")
+            .unwrap();
+
+        // A later folder_alias guess - even one that disagrees - must be
+        // a no-op against the stronger assignment above.
+        database
+            .assign_platform(archive_id, Some("MSX2"), "folder_alias")
+            .unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("CustomPlatform"));
+
+        let source_column: String = database
+            .connection
+            .query_row(
+                "SELECT source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                params![archive.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_column, "manual");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stronger_source_can_still_replace_an_existing_folder_alias_guess() {
+        let root = temp_dir("provenance-priority-stronger-replaces-weaker");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive_id = find_archive(&archives, "msx2/game.zip").id;
+        assert_eq!(
+            find_archive(&archives, "msx2/game.zip").platform.as_deref(),
+            Some("MSX2")
+        );
+
+        // Unlike the reverse direction, a stronger source is always
+        // allowed to replace an existing weaker (folder_alias) guess.
+        database
+            .assign_platform(archive_id, Some("Corrected"), "heuristic-path-detector")
+            .unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("Corrected"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nobara_like_layout_persists_the_expected_platform_per_console_folder() {
+        // A small reproduction of the real-world layout that motivated
+        // folder-alias detection: msx2/neogeo/intellivision folders full
+        // of archives with no filename hints at all - only the folder
+        // name distinguishes them. Uses temporary directories throughout;
+        // never touches a real user library.
+        let root = temp_dir("nobara-like-layout");
+        let source = root.join("Archives");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/Game1.zip", b"a");
+        write_archive_file(&source, "neogeo/Game2.zip", b"b");
+        write_archive_file(&source, "intellivision/Game3.zip", b"c");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(summary.counts.archives_added, 3);
+        assert!(summary.folder_errors.is_empty());
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "msx2/Game1.zip")
+                .platform
+                .as_deref(),
+            Some("MSX2")
+        );
+        assert_eq!(
+            find_archive(&archives, "neogeo/Game2.zip")
+                .platform
+                .as_deref(),
+            Some("NeoGeo")
+        );
+        assert_eq!(
+            find_archive(&archives, "intellivision/Game3.zip")
+                .platform
+                .as_deref(),
+            Some("Intellivision")
+        );
+
+        let stats = database.catalogue_stats().unwrap();
+        assert_eq!(stats.total_archives, 3);
+        assert_eq!(stats.archives_with_platform, 3);
+        assert_eq!(stats.archives_unknown_platform, 0);
 
         let _ = fs::remove_dir_all(&root);
     }

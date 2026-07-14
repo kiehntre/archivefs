@@ -73,9 +73,13 @@ following existing types and behaviors constrain and inform every choice below:
   as `TEXT` would silently regress this guarantee the first time a real ROM/archive
   filename contains bytes that are not valid UTF-8. See [section 3](#3-archive-identity).
 - `detect_platform(path, source_root)` is a heuristic, path-substring classifier (Xbox,
-  Xbox360, AtariST, Atari2600, and a handful of hardcoded title matches today). It will
-  keep changing and improving; a schema that stores a bare `platform` column with no
-  provenance would make it impossible to tell "the current heuristic's guess" from "a
+  Xbox360, AtariST, Atari2600, and a handful of hardcoded title matches today), now
+  falling back to a generic folder-name alias map (`FOLDER_PLATFORM_ALIASES` - MSX2,
+  NeoGeo, PS2, and dozens more) when the heuristic finds nothing -
+  `detect_platform_with_provenance` exposes which of the two produced a given result.
+  It will keep changing and improving; a schema that stores a bare `platform` column
+  with no provenance would make it impossible to tell "the current heuristic's guess"
+  (or "the folder-alias fallback's weaker guess") from "a
   user's manual correction" once that exists. See `platform_assignments` below.
 - The workspace has **no async runtime dependency anywhere** - `archivefs-cli`'s
   `main.rs` is a plain blocking `fn main`, and `archivefs-gui`'s `eframe` integration is
@@ -389,14 +393,28 @@ CREATE INDEX platform_assignments_platform ON platform_assignments(platform);
 ```
 
 - `platform` (required) holds the same strings `detect_platform` already returns
-  today (`"Xbox360"`, `"Xbox"`, `"PC"`, `"PSP"`, etc.) - no new vocabulary.
-- `source` (required) is provenance: `'heuristic-path-detector'` for everything
-  `detect_platform` produces today, reserving room for `'user-override'` or a named
-  provider later without a schema change.
-- `confidence` (optional, currently always `NULL`) is reserved for later use.
-  `detect_platform` today returns a plain `Option<String>` with no confidence concept
-  at all, so there is nothing to put in this column yet; it is included now purely to
-  avoid a migration the day confidence scoring is added.
+  today (`"Xbox360"`, `"Xbox"`, `"PC"`, `"PSP"`, `"MSX2"`, `"NeoGeo"`, etc.) - no new
+  vocabulary.
+- `source` (required) is provenance. `detect_platform_with_provenance` produces two
+  values today: `'heuristic-path-detector'` for its existing filename/title/known-path-
+  segment heuristic, and `'folder_alias'` for the generic folder-name alias map
+  fallback it only tries once the heuristic finds nothing (see
+  `FOLDER_PLATFORM_ALIASES` in `lib.rs`). This still reserves room for
+  `'user-override'` or a named provider later without a schema change.
+- `Database::assign_platform` will not let a new assignment whose `source` is
+  `'folder_alias'` replace an existing assignment from a *different* source - a
+  folder guess is deliberately the weakest tier and can only ever replace another
+  `'folder_alias'` guess or fill in an archive with no assignment yet. Every other
+  source (including any future `'user-override'`) is treated as at least as strong,
+  so it always may replace a `'folder_alias'` guess, and only something
+  re-confirming/changing the *same* tier can replace it. This ranking
+  (`provenance_priority` in `database.rs`) is derived purely from the `source`
+  string - no separate priority/weight column was needed for it.
+- `confidence` (optional, currently always `NULL`) remains reserved for later,
+  finer-grained use (e.g. per-provider certainty scores). The coarse strong/weak
+  distinction above is deliberately handled via `source` alone instead, to avoid
+  taking on a confidence *scoring* design prematurely; a future provider that needs
+  real confidence values can still populate this column without a migration.
 - The partial unique index on `is_current = 1` guarantees at most one "current"
   assignment per archive at the database level - "what platform is this archive"
   is `SELECT platform FROM platform_assignments WHERE archive_id = ? AND is_current =
