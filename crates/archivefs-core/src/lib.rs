@@ -4347,7 +4347,7 @@ mod tests {
 
     #[test]
     fn central_error_from_io_error_keeps_source() {
-        let error = ArchiveFsError::from(io::Error::new(io::ErrorKind::Other, "boom"));
+        let error = ArchiveFsError::from(io::Error::other("boom"));
 
         assert_eq!(error.to_string(), "boom");
         assert!(std::error::Error::source(&error).is_some());

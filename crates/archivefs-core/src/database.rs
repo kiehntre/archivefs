@@ -279,7 +279,17 @@ pub fn check_database_health(path: impl AsRef<Path>) -> DatabaseHealth {
 
     match open_connection(&path) {
         Ok(connection) => {
-            let schema_version_value = schema_version(&connection).ok();
+            // Connection::open is lazy - SQLite does not validate the file
+            // header until the first real read, so a corrupt or
+            // non-database file still opens successfully here and only
+            // fails once schema_version below actually reads page 1. That
+            // failure must not be silently swallowed (as `.ok()` alone
+            // would do): a corrupt database and a database that merely has
+            // pending migrations both leave `schema_version` as `None`/
+            // stale, and a caller cannot tell them apart without this
+            // error being carried through.
+            let schema_version_result = schema_version(&connection);
+            let schema_version_value = schema_version_result.as_ref().ok().copied();
             let foreign_keys_value = foreign_keys_enabled(&connection).unwrap_or(false);
             let migrations_current = schema_version_value == Some(latest_known_version(MIGRATIONS));
 
@@ -290,7 +300,7 @@ pub fn check_database_health(path: impl AsRef<Path>) -> DatabaseHealth {
                 schema_version: schema_version_value,
                 migrations_current,
                 foreign_keys_enabled: foreign_keys_value,
-                error: None,
+                error: schema_version_result.err().map(|error| error.to_string()),
             }
         }
         Err(error) => DatabaseHealth {

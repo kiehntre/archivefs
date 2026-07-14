@@ -12,13 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
-    ArchiveStatus, ArchiveUnmountSession, Config, ConfigIdentity, DoctorReport, DoctorStatus,
-    LazyUnmountCleanupResult, MountOneOutcome, MountState, SetupDiagnosticStatus, SetupDiagnostics,
-    UnmountOneOutcome, cleanup_selected_mount_tree, create_configured_mount_root_default,
-    create_starter_config_default, default_config_path,
-    lazy_unmount_one_archive_path_with_progress, load_read_only_snapshot_default,
-    mount_one_archive_path, remount_one_archive_path, run_setup_diagnostics_default,
-    unmount_one_archive_path,
+    ArchiveStatus, ArchiveUnmountSession, CatalogueStats, CompletedScanSummary, Config,
+    ConfigIdentity, Database, DatabaseHealth, DoctorReport, DoctorStatus, LazyUnmountCleanupResult,
+    MountOneOutcome, MountState, PersistedArchive, ScanPersistSummary, SetupDiagnosticStatus,
+    SetupDiagnostics, UnmountOneOutcome, check_database_health, cleanup_selected_mount_tree,
+    create_configured_mount_root_default, create_starter_config_default, default_config_path,
+    default_database_path, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    load_read_only_snapshot_default, mount_one_archive_path, remount_one_archive_path,
+    run_setup_diagnostics_default, scan_and_persist, unmount_one_archive_path,
 };
 use eframe::egui;
 
@@ -45,6 +46,7 @@ enum ActivityAction {
     Cleanup,
     Diagnostics,
     Setup,
+    LibraryDatabase,
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -60,6 +62,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Cleanup => "Cleanup",
             Self::Diagnostics => "Diagnostics",
             Self::Setup => "Setup",
+            Self::LibraryDatabase => "Library database",
         })
     }
 }
@@ -185,40 +188,213 @@ impl LoadedData {
     }
 }
 
+/// Where a displayed row's data came from - see requirement 4. Only `Live`
+/// rows carry a path that `selected_record`/`selected_record_index` can
+/// ever match against `LoadedData.records`, since those come from the
+/// cache's `PersistedArchive.absolute_path`, never from a live
+/// `ArchiveRecord` - this is what guarantees a cache-only selection can
+/// never resolve to a live record and so can never expose an action
+/// button (see `show_selected_archive`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowOrigin {
+    /// Backed by the latest coherent live snapshot. Actions are available,
+    /// subject to `latest_generation_actions_safe`.
+    Live,
+    /// Known to the persisted catalogue, not (yet) confirmed by the live
+    /// snapshot, and not marked missing by the last scan.
+    CachedAwaitingValidation,
+    /// Known to the persisted catalogue and marked missing
+    /// (`last_verified_missing_at` set) as of the last completed scan.
+    CachedMissing,
+    /// Known to the persisted catalogue, not marked missing by the last
+    /// scan, but its path is not reachable right now (a cheap existence
+    /// check at merge time, for display only - never used to authorize
+    /// mount/unmount).
+    CachedUnavailable,
+}
+
+impl RowOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::CachedAwaitingValidation => "Cached: awaiting validation",
+            Self::CachedMissing => "Cached: missing",
+            Self::CachedUnavailable => "Cached: source unavailable",
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ArchiveRow {
+    /// Exact-byte identity used for selection and reconciliation - never
+    /// rendered directly, and never compared via `.display()` (see
+    /// requirement 5). For a live row this is
+    /// `ArchiveRecord.mount_plan.archive.path`; for a cache-only row it is
+    /// `PersistedArchive.absolute_path` - the same pairing the database's
+    /// own `(source_folder_id, relative_path)` uniqueness constraint
+    /// already encodes.
+    path: PathBuf,
     archive_path: String,
     mount_path: String,
     platform: String,
     state: String,
     search_text: String,
+    origin: RowOrigin,
+    unknown_platform: bool,
 }
 
 impl ArchiveRow {
     fn new(record: &ArchiveRecord, status: &ArchiveStatus) -> Self {
         let archive_path = status.archive_path.display().to_string();
         let mount_path = status.mount_path.display().to_string();
-        let platform = record
+        let raw_platform = record
             .metadata
             .platform
             .as_deref()
-            .or(record.identity.platform.as_deref())
-            .unwrap_or("Unknown")
-            .to_string();
+            .or(record.identity.platform.as_deref());
+        let unknown_platform = raw_platform.is_none();
+        let platform = raw_platform.unwrap_or("Unknown").to_string();
         let state = status.state.to_string();
         let search_text =
             format!("{archive_path}\n{mount_path}\n{platform}\n{state}").to_lowercase();
 
         Self {
+            path: record.mount_plan.archive.path.clone(),
             archive_path,
             mount_path,
             platform,
             state,
             search_text,
+            origin: RowOrigin::Live,
+            unknown_platform,
+        }
+    }
+
+    /// Synthesizes a display-only row for a cache-only archive: one the
+    /// persisted catalogue knows about but the latest live snapshot does
+    /// not confirm. `path_exists` is a cheap, display-only existence
+    /// check (never a substitute for live validation) that distinguishes
+    /// "unreachable right now" from "awaiting the next live refresh".
+    fn from_cached(persisted: &PersistedArchive, path_exists: bool) -> Self {
+        let archive_path = persisted.absolute_path.display().to_string();
+        let unknown_platform = persisted.platform.is_none();
+        let platform = persisted
+            .platform
+            .as_deref()
+            .unwrap_or("Unknown")
+            .to_string();
+        let origin = if persisted.last_verified_missing_at.is_some() {
+            RowOrigin::CachedMissing
+        } else if !path_exists {
+            RowOrigin::CachedUnavailable
+        } else {
+            RowOrigin::CachedAwaitingValidation
+        };
+        let state = origin.label().to_string();
+        let mount_path = String::new();
+        let search_text =
+            format!("{archive_path}\n{mount_path}\n{platform}\n{state}").to_lowercase();
+
+        Self {
+            path: persisted.absolute_path.clone(),
+            archive_path,
+            mount_path,
+            platform,
+            state,
+            search_text,
+            origin,
+            unknown_platform,
         }
     }
 
     fn matches(&self, normalized_filter: &str) -> bool {
         self.search_text.contains(normalized_filter)
+    }
+
+    fn row_text_color(&self, visuals: &egui::Visuals) -> Option<egui::Color32> {
+        match self.origin {
+            RowOrigin::Live => None,
+            RowOrigin::CachedAwaitingValidation => Some(egui::Color32::from_rgb(150, 150, 150)),
+            RowOrigin::CachedMissing => Some(visuals.error_fg_color),
+            RowOrigin::CachedUnavailable => Some(egui::Color32::from_rgb(210, 140, 40)),
+        }
+    }
+}
+
+/// Merges live rows with cache-only rows for display - see requirement 4
+/// and 5. Live rows always win: a cached archive whose exact path already
+/// appears among `records` is represented only by its live row, never
+/// duplicated. Recomputed fresh whenever the underlying live or cached
+/// data changes (see `ArchiveFsApp::recompute_filtered_rows`), not on
+/// every frame, so it stays cheap without risking a stale merge.
+fn build_display_rows(
+    records: &[ArchiveRecord],
+    live_rows: &[ArchiveRow],
+    cached: Option<&CachedLibrarySnapshot>,
+) -> Vec<ArchiveRow> {
+    let mut merged: Vec<ArchiveRow> = live_rows.to_vec();
+
+    if let Some(cached) = cached {
+        let live_paths: HashSet<&Path> = records
+            .iter()
+            .map(|record| record.mount_plan.archive.path.as_path())
+            .collect();
+        for persisted in &cached.archives {
+            if live_paths.contains(persisted.absolute_path.as_path()) {
+                continue;
+            }
+            let path_exists = persisted.absolute_path.exists();
+            merged.push(ArchiveRow::from_cached(persisted, path_exists));
+        }
+    }
+
+    merged
+}
+
+/// Optional search filters over the merged row list (requirement 6). Two
+/// independent groups - state and platform - each AND'd together; within
+/// a group, an unchecked filter set imposes no restriction (defaults to
+/// "show everything") and multiple checked filters within the same group
+/// are OR'd, so checking both `present` and `missing` shows both rather
+/// than nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LibraryRowFilters {
+    present: bool,
+    missing: bool,
+    awaiting_validation: bool,
+    known_platform: bool,
+    unknown_platform: bool,
+}
+
+impl LibraryRowFilters {
+    fn is_active(&self) -> bool {
+        self.present
+            || self.missing
+            || self.awaiting_validation
+            || self.known_platform
+            || self.unknown_platform
+    }
+
+    fn matches(&self, row: &ArchiveRow) -> bool {
+        let state_group_active = self.present || self.missing || self.awaiting_validation;
+        let state_match = !state_group_active || {
+            let is_present = matches!(row.origin, RowOrigin::Live);
+            let is_missing = matches!(row.origin, RowOrigin::CachedMissing);
+            let is_awaiting = matches!(
+                row.origin,
+                RowOrigin::CachedAwaitingValidation | RowOrigin::CachedUnavailable
+            );
+            (self.present && is_present)
+                || (self.missing && is_missing)
+                || (self.awaiting_validation && is_awaiting)
+        };
+
+        let platform_group_active = self.known_platform || self.unknown_platform;
+        let platform_match = !platform_group_active
+            || (self.known_platform && !row.unknown_platform)
+            || (self.unknown_platform && row.unknown_platform);
+
+        state_match && platform_match
     }
 }
 
@@ -790,6 +966,265 @@ fn snapshot_identity(state: &LoadState) -> Option<&ConfigIdentity> {
     }
 }
 
+// ---------------------------------------------------------------------
+// Persistent library database (stage 4): a read-only, background-loaded
+// cache of archivefs_core::Database that speeds up startup and browsing.
+// It is deliberately a *separate* state machine from LoadState/
+// DiagnosticsState above, polled the same way (its own generation
+// counter, its own channel, the same stale-message double-check) - see
+// docs/DATABASE_DESIGN.md section 5 and
+// docs/adr/0001-persistent-library-database.md: this cache is never
+// consulted to authorize a mount or unmount. Only `latest_generation_actions_safe`
+// (backed by a live snapshot and live diagnostics, both unchanged by this
+// stage) gates archive actions - see `build_display_rows` and
+// `show_selected_archive` below for how a cache-only row is guaranteed to
+// never carry a live ArchiveRecord into the action-granting code path.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DatabaseGeneration(u64);
+
+impl DatabaseGeneration {
+    const INITIAL: Self = Self(0);
+
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
+/// A read-only snapshot of the persisted library catalogue: every row
+/// `Database::load_archives` returned, plus aggregate stats and the most
+/// recent completed scan, all read from one opened `Database` handle in
+/// one background pass.
+#[derive(Debug, Clone)]
+struct CachedLibrarySnapshot {
+    database_path: PathBuf,
+    schema_version: i64,
+    archives: Vec<PersistedArchive>,
+    stats: CatalogueStats,
+    last_completed_scan: Option<CompletedScanSummary>,
+}
+
+enum DatabaseOutcome {
+    Loaded(CachedLibrarySnapshot),
+    Scanned {
+        snapshot: CachedLibrarySnapshot,
+        scan_summary: ScanPersistSummary,
+    },
+}
+
+enum DatabaseLoadError {
+    NotCreated { database_path: PathBuf },
+    Outdated { health: DatabaseHealth },
+    Failed { message: String },
+}
+
+type DatabaseLoadResult = Result<DatabaseOutcome, DatabaseLoadError>;
+type DatabaseMessage = (DatabaseGeneration, DatabaseLoadResult);
+
+/// The Library Database status area's state - see requirement 3's exact
+/// vocabulary ("Not created / Loading / Ready / Outdated / Error").
+enum DatabaseState {
+    NotCreated {
+        database_path: PathBuf,
+    },
+    Loading {
+        generation: DatabaseGeneration,
+        receiver: Receiver<DatabaseMessage>,
+        previous: Option<Box<CachedLibrarySnapshot>>,
+        scanning: bool,
+    },
+    Ready {
+        snapshot: Box<CachedLibrarySnapshot>,
+        last_scan_summary: Option<ScanPersistSummary>,
+    },
+    Outdated {
+        health: DatabaseHealth,
+        previous: Option<Box<CachedLibrarySnapshot>>,
+    },
+    Error {
+        message: String,
+        previous: Option<Box<CachedLibrarySnapshot>>,
+    },
+}
+
+impl DatabaseState {
+    /// The most recent known-good cached snapshot regardless of the
+    /// current state, so a failed reload never discards useful data
+    /// already on screen (requirement 7: retain the last useful database
+    /// catalogue where safe).
+    fn snapshot(&self) -> Option<&CachedLibrarySnapshot> {
+        match self {
+            Self::Ready { snapshot, .. } => Some(snapshot),
+            Self::Loading { previous, .. }
+            | Self::Outdated { previous, .. }
+            | Self::Error { previous, .. } => previous.as_deref(),
+            Self::NotCreated { .. } => None,
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading { .. })
+    }
+
+    fn is_scanning(&self) -> bool {
+        matches!(self, Self::Loading { scanning: true, .. })
+    }
+
+    fn status_label(&self) -> &'static str {
+        match self {
+            Self::NotCreated { .. } => "Not created",
+            Self::Loading { .. } => "Loading",
+            Self::Ready { .. } => "Ready",
+            Self::Outdated { .. } => "Outdated",
+            Self::Error { .. } => "Error",
+        }
+    }
+}
+
+fn start_database_load(
+    context: egui::Context,
+    generation: DatabaseGeneration,
+    previous: Option<Box<CachedLibrarySnapshot>>,
+    run_scan_first: bool,
+) -> DatabaseState {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = load_database_snapshot(run_scan_first);
+        let _ = sender.send((generation, result));
+        context.request_repaint();
+    });
+    DatabaseState::Loading {
+        generation,
+        receiver,
+        previous,
+        scanning: run_scan_first,
+    }
+}
+
+fn load_database_snapshot(run_scan_first: bool) -> DatabaseLoadResult {
+    let database_path = default_database_path().map_err(|error| DatabaseLoadError::Failed {
+        message: error.to_string(),
+    })?;
+
+    let scan_config = if run_scan_first {
+        Some(
+            Config::load_default().map_err(|error| DatabaseLoadError::Failed {
+                message: error.to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
+
+    load_database_snapshot_at(&database_path, scan_config.as_ref())
+}
+
+/// The logic behind [`load_database_snapshot`], taking the already-resolved
+/// database path (and, for a scan, the already-loaded config) as
+/// parameters instead of reading `HOME`/the default config path itself -
+/// the same split `resolve_database_path` uses in
+/// `archivefs-core/src/database.rs`, so tests can exercise every branch
+/// against a temporary database path without touching the real home
+/// directory.
+fn load_database_snapshot_at(
+    database_path: &Path,
+    scan_config: Option<&Config>,
+) -> DatabaseLoadResult {
+    if let Some(config) = scan_config {
+        let mut database =
+            Database::open_or_create(database_path).map_err(|error| DatabaseLoadError::Failed {
+                message: error.to_string(),
+            })?;
+        let scan_summary =
+            scan_and_persist(&mut database, config, "gui-scan-library").map_err(|error| {
+                DatabaseLoadError::Failed {
+                    message: error.to_string(),
+                }
+            })?;
+        let snapshot = load_snapshot_from(&database, database_path)?;
+        return Ok(DatabaseOutcome::Scanned {
+            snapshot,
+            scan_summary,
+        });
+    }
+
+    let health = check_database_health(database_path);
+    if !health.database_exists {
+        return Err(DatabaseLoadError::NotCreated {
+            database_path: database_path.to_path_buf(),
+        });
+    }
+    if !health.migrations_current {
+        return Err(classify_unhealthy_database(health));
+    }
+
+    let database =
+        Database::open_or_create(database_path).map_err(|error| DatabaseLoadError::Failed {
+            message: error.to_string(),
+        })?;
+    let snapshot = load_snapshot_from(&database, database_path)?;
+    Ok(DatabaseOutcome::Loaded(snapshot))
+}
+
+/// Turns a `DatabaseHealth` that is not `migrations_current` into the
+/// right `DatabaseLoadError` (requirement 7): a database that will not
+/// even open is a hard `Failed`, one whose schema is *newer* than this
+/// build understands is also `Failed` (with an explicit upgrade message,
+/// not a silent "just run a scan"), and everything else - a database that
+/// merely has pending migrations - is `Outdated`, which the caller can
+/// offer to fix with a scan. `check_database_health` guarantees
+/// `database_opens = false` implies `migrations_current = false`, so this
+/// is only ever called when at least one of these three applies.
+fn classify_unhealthy_database(health: DatabaseHealth) -> DatabaseLoadError {
+    // `database_opens` alone is not enough to rule out a corrupt file:
+    // Connection::open is lazy, so a garbage file still "opens" and only
+    // fails once something actually reads page 1 - `health.error` carries
+    // that failure through (see check_database_health) even when
+    // `database_opens` is true.
+    if !health.database_opens || health.error.is_some() {
+        return DatabaseLoadError::Failed {
+            message: health
+                .error
+                .clone()
+                .unwrap_or_else(|| "the database could not be opened".to_string()),
+        };
+    }
+    if let Some(version) = health.schema_version
+        && version > latest_schema_version()
+    {
+        return DatabaseLoadError::Failed {
+            message: format!(
+                "This database's schema (version {version}) is newer than this build of \
+                 ArchiveFS supports (version {}). Upgrade ArchiveFS, or remove the database \
+                 file to rebuild it.",
+                latest_schema_version()
+            ),
+        };
+    }
+    DatabaseLoadError::Outdated { health }
+}
+
+fn load_snapshot_from(
+    database: &Database,
+    database_path: &Path,
+) -> Result<CachedLibrarySnapshot, DatabaseLoadError> {
+    let to_failed = |error: ArchiveFsError| DatabaseLoadError::Failed {
+        message: error.to_string(),
+    };
+    let schema_version = database.schema_version().map_err(to_failed)?;
+    let archives = database.load_archives().map_err(to_failed)?;
+    let stats = database.catalogue_stats().map_err(to_failed)?;
+    let last_completed_scan = database.latest_completed_scan().map_err(to_failed)?;
+    Ok(CachedLibrarySnapshot {
+        database_path: database_path.to_path_buf(),
+        schema_version,
+        archives,
+        stats,
+        last_completed_scan,
+    })
+}
+
 struct RunningSetupAction {
     action: SetupAction,
     receiver: Receiver<Result<String, String>>,
@@ -826,6 +1261,9 @@ struct ArchiveFsApp {
     snapshot_stale: bool,
     refresh_generation: RefreshGeneration,
     snapshot_generation: Option<RefreshGeneration>,
+    database_state: DatabaseState,
+    database_generation: DatabaseGeneration,
+    library_filters: LibraryRowFilters,
 }
 
 impl ArchiveFsApp {
@@ -838,6 +1276,7 @@ impl ArchiveFsApp {
 
     fn new(context: egui::Context) -> Self {
         let generation = RefreshGeneration::INITIAL;
+        let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
         history.record(HistoryEntry::new(
             ActivityAction::Refresh,
@@ -847,6 +1286,9 @@ impl ArchiveFsApp {
         ));
         Self {
             state: start_load(context.clone(), generation, None),
+            database_state: start_database_load(context.clone(), database_generation, None, false),
+            database_generation,
+            library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
             selected_archive: None,
@@ -937,7 +1379,12 @@ impl ArchiveFsApp {
             }
             self.state = match result {
                 Ok(data) => {
-                    self.filtered_rows = matching_row_indices(&data.rows, &self.filter);
+                    let merged = build_display_rows(
+                        &data.records,
+                        &data.rows,
+                        self.database_state.snapshot(),
+                    );
+                    self.filtered_rows = matching_row_indices(&merged, &self.filter);
                     self.history.record(HistoryEntry::new(
                         ActivityAction::Refresh,
                         None,
@@ -962,6 +1409,149 @@ impl ArchiveFsApp {
                     previous.map_or_else(|| LoadState::Error(error), LoadState::Ready)
                 }
             };
+        }
+    }
+
+    /// Starts (or restarts) a background database load. `run_scan_first =
+    /// true` is "Scan Library" (runs `scan_and_persist` before reloading);
+    /// `false` is "Refresh Database Status" / "Retry Database Load" (a
+    /// read-only reload). Never blocks the UI thread - mirrors
+    /// `refresh`/`start_load` exactly.
+    fn start_database_action(&mut self, context: egui::Context, run_scan_first: bool) {
+        self.database_generation = self.database_generation.next();
+        let generation = self.database_generation;
+        let previous = match std::mem::replace(
+            &mut self.database_state,
+            DatabaseState::Error {
+                message: "database action starting".to_string(),
+                previous: None,
+            },
+        ) {
+            DatabaseState::Ready { snapshot, .. } => Some(snapshot),
+            DatabaseState::Loading { previous, .. }
+            | DatabaseState::Outdated { previous, .. }
+            | DatabaseState::Error { previous, .. } => previous,
+            DatabaseState::NotCreated { .. } => None,
+        };
+        if run_scan_first {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::LibraryDatabase,
+                None,
+                ActivityOutcome::Started,
+                "Scanning configured source folders into the library database.",
+            ));
+        }
+        self.database_state = start_database_load(context, generation, previous, run_scan_first);
+    }
+
+    fn poll_database_load(&mut self, _context: &egui::Context) {
+        let message = match &self.database_state {
+            DatabaseState::Loading {
+                generation,
+                receiver,
+                ..
+            } => match receiver.try_recv() {
+                Ok(message) => Some(message),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((
+                    *generation,
+                    Err(DatabaseLoadError::Failed {
+                        message: "background database loader stopped unexpectedly".to_string(),
+                    }),
+                )),
+            },
+            DatabaseState::NotCreated { .. }
+            | DatabaseState::Ready { .. }
+            | DatabaseState::Outdated { .. }
+            | DatabaseState::Error { .. } => None,
+        };
+
+        let Some((generation, result)) = message else {
+            return;
+        };
+        // Two independent staleness checks, mirroring poll_load exactly:
+        // (1) is this even the current database generation, and (2) does
+        // the state we are about to replace still agree it is Loading at
+        // that same generation (it could have been replaced by a newer
+        // start_database_action call between the channel send and this
+        // poll). Either mismatch means this message is from a previous
+        // generation and must be ignored, never merged into current state.
+        if generation != self.database_generation {
+            return;
+        }
+        let previous = match std::mem::replace(
+            &mut self.database_state,
+            DatabaseState::Error {
+                message: "database load result pending".to_string(),
+                previous: None,
+            },
+        ) {
+            DatabaseState::Loading {
+                generation: state_generation,
+                previous,
+                ..
+            } if state_generation == generation => previous,
+            other => {
+                self.database_state = other;
+                return;
+            }
+        };
+
+        self.database_state = match result {
+            Ok(DatabaseOutcome::Loaded(snapshot)) => DatabaseState::Ready {
+                snapshot: Box::new(snapshot),
+                last_scan_summary: None,
+            },
+            Ok(DatabaseOutcome::Scanned {
+                snapshot,
+                scan_summary,
+            }) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::LibraryDatabase,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "Library scan complete: {} new, {} changed, {} restored, {} missing, {} folder error(s).",
+                        scan_summary.counts.archives_added,
+                        scan_summary.counts.archives_changed,
+                        scan_summary.counts.archives_restored,
+                        scan_summary.counts.archives_missing,
+                        scan_summary.folder_errors.len(),
+                    ),
+                ));
+                DatabaseState::Ready {
+                    snapshot: Box::new(snapshot),
+                    last_scan_summary: Some(scan_summary),
+                }
+            }
+            Err(DatabaseLoadError::NotCreated { database_path }) => {
+                DatabaseState::NotCreated { database_path }
+            }
+            Err(DatabaseLoadError::Outdated { health }) => {
+                DatabaseState::Outdated { health, previous }
+            }
+            Err(DatabaseLoadError::Failed { message }) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::LibraryDatabase,
+                    None,
+                    ActivityOutcome::Failed,
+                    message.clone(),
+                ));
+                DatabaseState::Error { message, previous }
+            }
+        };
+
+        // The merged row set may have just changed (a cache reload/scan
+        // just settled) - recompute the cached filtered-index list against
+        // it now rather than leaving it stale until the next live refresh
+        // or filter-text edit. Only meaningful once a live snapshot
+        // exists; the cache-only preview shown before that filters itself
+        // fresh each frame instead (see `show_loaded_data`'s Loading
+        // branch).
+        if let LoadState::Ready(data) = &self.state {
+            let merged =
+                build_display_rows(&data.records, &data.rows, self.database_state.snapshot());
+            self.filtered_rows = matching_row_indices(&merged, &self.filter);
         }
     }
 
@@ -1977,6 +2567,7 @@ struct CleanupFeedback {
 impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_load(context);
+        self.poll_database_load(context);
         self.poll_diagnostics();
         self.poll_setup_action(context);
         self.poll_operation(context);
@@ -2056,6 +2647,18 @@ impl eframe::App for ArchiveFsApp {
                 stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
                 ui.separator();
             }
+            if let Some(action) = show_database_panel(ui, &self.database_state) {
+                match action {
+                    DatabasePanelAction::ScanLibrary => {
+                        self.start_database_action(context.clone(), true);
+                    }
+                    DatabasePanelAction::RefreshStatus | DatabasePanelAction::RetryLoad => {
+                        self.start_database_action(context.clone(), false);
+                    }
+                }
+            }
+            ui.separator();
+
             match &self.state {
                 LoadState::Loading { .. } => {
                     ui.vertical_centered(|ui| {
@@ -2064,6 +2667,71 @@ impl eframe::App for ArchiveFsApp {
                         ui.heading("Loading ArchiveFS data...");
                         ui.label("Scanning runs in the background.");
                     });
+                    // Requirement 1: show cached library rows before the
+                    // live snapshot finishes loading, clearly labelled as
+                    // last-known state. This is a read-only preview -
+                    // built with the same ArchiveRow/show_archive_rows
+                    // machinery as the live table, but with no selection
+                    // or action wiring at all, so it cannot expose a mount
+                    // or unmount button even in principle.
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        ui.separator();
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "Showing last-known catalogue state while the live snapshot loads.",
+                        );
+                        let preview_rows: Vec<ArchiveRow> = snapshot
+                            .archives
+                            .iter()
+                            .map(|persisted| {
+                                let path_exists = persisted.absolute_path.exists();
+                                ArchiveRow::from_cached(persisted, path_exists)
+                            })
+                            .collect();
+                        let row_height = fixed_row_height(
+                            ui.text_style_height(&egui::TextStyle::Body),
+                            ui.spacing().interact_size.y,
+                        );
+                        let horizontal_spacing = ui.spacing().item_spacing.x;
+                        egui::ScrollArea::horizontal()
+                            .id_salt("cache_preview_horizontal")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(table_width(horizontal_spacing));
+                                show_table_cells(
+                                    ui,
+                                    &COLUMN_HEADERS,
+                                    row_height,
+                                    true,
+                                    false,
+                                    None,
+                                );
+                                ui.separator();
+                                let body_height = ui.available_height().max(row_height);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("cache_preview_vertical")
+                                    .max_height(body_height)
+                                    .auto_shrink([false, false])
+                                    .show_rows(
+                                        ui,
+                                        row_height,
+                                        preview_rows.len(),
+                                        |ui, row_range| {
+                                            // Discard the clicked index: this preview never
+                                            // sets selected_archive, so it can never drive
+                                            // show_selected_archive's action buttons.
+                                            let _ = show_archive_rows(
+                                                ui,
+                                                &preview_rows,
+                                                None,
+                                                row_range,
+                                                row_height,
+                                                None,
+                                            );
+                                        },
+                                    );
+                            });
+                    }
                 }
                 LoadState::Error(error) => {
                     ui.vertical_centered(|ui| {
@@ -2100,6 +2768,8 @@ impl eframe::App for ArchiveFsApp {
                             mount_all_result: self.mount_all_result.as_ref(),
                             unmount_all_result: self.unmount_all_result.as_ref(),
                             history: &mut self.history,
+                            cached: self.database_state.snapshot(),
+                            library_filters: &mut self.library_filters,
                         },
                     );
                 }
@@ -2765,6 +3435,175 @@ fn format_history_timestamp(timestamp: SystemTime) -> String {
     )
 }
 
+/// Which "Library Database" panel button (requirement 3) was clicked.
+/// `RefreshStatus` and `RetryLoad` both trigger the same underlying
+/// read-only reload (`start_database_action(.., false)`) - they are kept
+/// as separate variants only because they are offered from different
+/// states and read better as separate buttons to the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabasePanelAction {
+    ScanLibrary,
+    RefreshStatus,
+    RetryLoad,
+}
+
+/// Renders the compact "Library Database" status area (requirement 3).
+/// Purely informational plus three buttons - never itself authorizes an
+/// action, and never blocks the caller (all of its data comes from
+/// `state`, already computed off the UI thread).
+fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<DatabasePanelAction> {
+    let mut action = None;
+    egui::CollapsingHeader::new("Library Database")
+        .id_salt("library_database_panel")
+        .default_open(!matches!(state, DatabaseState::Ready { .. }))
+        .show(ui, |ui| {
+            let database_path = match state {
+                DatabaseState::NotCreated { database_path } => Some(database_path.clone()),
+                DatabaseState::Loading { previous, .. }
+                | DatabaseState::Outdated { previous, .. }
+                | DatabaseState::Error { previous, .. } => previous
+                    .as_ref()
+                    .map(|snapshot| snapshot.database_path.clone()),
+                DatabaseState::Ready { snapshot, .. } => Some(snapshot.database_path.clone()),
+            };
+
+            egui::Grid::new("database_status_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.strong("Database path");
+                    ui.label(
+                        database_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "unresolved".to_string()),
+                    );
+                    ui.end_row();
+
+                    ui.strong("Status");
+                    ui.label(state.status_label());
+                    ui.end_row();
+
+                    if let Some(snapshot) = state.snapshot() {
+                        ui.strong("Schema version");
+                        ui.label(snapshot.schema_version.to_string());
+                        ui.end_row();
+
+                        ui.strong("Last completed scan");
+                        ui.label(
+                            snapshot
+                                .last_completed_scan
+                                .as_ref()
+                                .map(|scan| {
+                                    scan.finished_at.clone().unwrap_or_else(|| {
+                                        format!("{} (in progress)", scan.started_at)
+                                    })
+                                })
+                                .unwrap_or_else(|| "never".to_string()),
+                        );
+                        ui.end_row();
+
+                        ui.strong("Cached archives");
+                        ui.label(snapshot.stats.total_archives.to_string());
+                        ui.end_row();
+
+                        ui.strong("Present / missing");
+                        ui.label(format!(
+                            "{} / {}",
+                            snapshot.stats.present_archives, snapshot.stats.missing_archives
+                        ));
+                        ui.end_row();
+                    }
+
+                    if let DatabaseState::Ready {
+                        last_scan_summary: Some(summary),
+                        ..
+                    } = state
+                    {
+                        ui.strong("Last scan (this session)");
+                        ui.label(format!(
+                            "{} new, {} changed, {} restored, {} missing, {} folder error(s)",
+                            summary.counts.archives_added,
+                            summary.counts.archives_changed,
+                            summary.counts.archives_restored,
+                            summary.counts.archives_missing,
+                            summary.folder_errors.len(),
+                        ));
+                        ui.end_row();
+                    }
+
+                    ui.strong("Action safety");
+                    ui.label(
+                        "Cached rows never authorize mount or unmount - only a validated live \
+                         snapshot can.",
+                    );
+                    ui.end_row();
+                });
+
+            match state {
+                DatabaseState::Outdated { health, .. } => {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!(
+                            "Database schema is outdated (found version {}); run a library scan \
+                             to upgrade it.",
+                            health
+                                .schema_version
+                                .map(|version| version.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        ),
+                    );
+                }
+                DatabaseState::Error { message, .. } => {
+                    ui.colored_label(ui.visuals().error_fg_color, message.as_str());
+                }
+                DatabaseState::NotCreated { .. } => {
+                    ui.label("No library database yet. Run a library scan to create one.");
+                }
+                DatabaseState::Loading { .. } | DatabaseState::Ready { .. } => {}
+            }
+
+            ui.horizontal(|ui| {
+                let loading = state.is_loading();
+                if ui
+                    .add_enabled(!loading, egui::Button::new("Scan Library"))
+                    .clicked()
+                {
+                    action = Some(DatabasePanelAction::ScanLibrary);
+                }
+                match state {
+                    DatabaseState::Ready { .. } => {
+                        if ui
+                            .add_enabled(!loading, egui::Button::new("Refresh Database Status"))
+                            .clicked()
+                        {
+                            action = Some(DatabasePanelAction::RefreshStatus);
+                        }
+                    }
+                    DatabaseState::NotCreated { .. }
+                    | DatabaseState::Outdated { .. }
+                    | DatabaseState::Error { .. } => {
+                        if ui
+                            .add_enabled(!loading, egui::Button::new("Retry Database Load"))
+                            .clicked()
+                        {
+                            action = Some(DatabasePanelAction::RetryLoad);
+                        }
+                    }
+                    DatabaseState::Loading { .. } => {}
+                }
+                if loading {
+                    ui.spinner();
+                    ui.label(if state.is_scanning() {
+                        "Scanning..."
+                    } else {
+                        "Loading..."
+                    });
+                }
+            });
+        });
+    action
+}
+
 struct LoadedViewState<'a> {
     filter: &'a mut String,
     filtered_rows: &'a mut Option<Vec<usize>>,
@@ -2787,6 +3626,8 @@ struct LoadedViewState<'a> {
     mount_all_result: Option<&'a MountAllResult>,
     unmount_all_result: Option<&'a UnmountAllResult>,
     history: &'a mut OperationHistory,
+    cached: Option<&'a CachedLibrarySnapshot>,
+    library_filters: &'a mut LibraryRowFilters,
 }
 
 fn show_loaded_data(
@@ -2815,6 +3656,8 @@ fn show_loaded_data(
         cleanup_after_unmount,
         mount_all_result,
         unmount_all_result,
+        cached,
+        library_filters,
         history,
     } = view_state;
     let mut requested_action = None;
@@ -3192,6 +4035,14 @@ fn show_loaded_data(
     }
 
     ui.separator();
+    // Merged rows are rebuilt fresh every frame (cheap for realistic
+    // library sizes, and always exactly consistent with the current
+    // self.state/self.database_state - see build_display_rows). Only the
+    // *cached* filtered_rows index list is invalidated on the discrete
+    // events that actually change this merge (poll_load, poll_database_load),
+    // not every frame - see ArchiveFsApp::poll_load/poll_database_load.
+    let merged_rows = build_display_rows(&data.records, &data.rows, cached);
+
     let mut filter_changed = false;
     ui.horizontal(|ui| {
         ui.label("Search:");
@@ -3208,14 +4059,53 @@ fn show_loaded_data(
         }
     });
     if filter_changed {
-        *filtered_rows = matching_row_indices(&data.rows, filter);
+        *filtered_rows = matching_row_indices(&merged_rows, filter);
     }
 
-    let visible_count = filtered_rows.as_ref().map_or(data.rows.len(), Vec::len);
+    let mut filters_changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Filters:");
+        filters_changed |= ui
+            .checkbox(&mut library_filters.present, "Present")
+            .changed();
+        filters_changed |= ui
+            .checkbox(&mut library_filters.missing, "Missing")
+            .changed();
+        filters_changed |= ui
+            .checkbox(
+                &mut library_filters.awaiting_validation,
+                "Awaiting validation",
+            )
+            .changed();
+        filters_changed |= ui
+            .checkbox(&mut library_filters.known_platform, "Known platform")
+            .changed();
+        filters_changed |= ui
+            .checkbox(&mut library_filters.unknown_platform, "Unknown platform")
+            .changed();
+        if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
+            *library_filters = LibraryRowFilters::default();
+            filters_changed = true;
+        }
+    });
+    let _ = filters_changed;
+
+    let base_indices: Vec<usize> = filtered_rows
+        .clone()
+        .unwrap_or_else(|| (0..merged_rows.len()).collect());
+    let visible_indices: Vec<usize> = if library_filters.is_active() {
+        base_indices
+            .into_iter()
+            .filter(|&index| library_filters.matches(&merged_rows[index]))
+            .collect()
+    } else {
+        base_indices
+    };
+    let visible_count = visible_indices.len();
     ui.label(format!(
         "Showing {} of {} archives",
         visible_count,
-        data.rows.len()
+        merged_rows.len()
     ));
     ui.add_space(4.0);
     let row_height = fixed_row_height(
@@ -3223,14 +4113,14 @@ fn show_loaded_data(
         ui.spacing().interact_size.y,
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
-    let selected_index = selected_record_index(&data.records, selected_archive.as_deref());
+    let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
     let mut clicked_index = None;
     egui::ScrollArea::horizontal()
         .id_salt("archive_status_horizontal")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_min_width(table_width(horizontal_spacing));
-            show_table_cells(ui, &COLUMN_HEADERS, row_height, true, false);
+            show_table_cells(ui, &COLUMN_HEADERS, row_height, true, false, None);
             ui.separator();
 
             let body_height = ui.available_height().max(row_height);
@@ -3241,8 +4131,8 @@ fn show_loaded_data(
                 .show_rows(ui, row_height, visible_count, |ui, row_range| {
                     clicked_index = show_archive_rows(
                         ui,
-                        &data.rows,
-                        filtered_rows.as_deref(),
+                        &merged_rows,
+                        Some(&visible_indices),
                         row_range,
                         row_height,
                         selected_index,
@@ -3250,7 +4140,7 @@ fn show_loaded_data(
                 });
         });
     if let Some(index) = clicked_index {
-        *selected_archive = Some(data.records[index].mount_plan.archive.path.clone());
+        *selected_archive = Some(merged_rows[index].path.clone());
     }
 
     requested_action
@@ -3271,15 +4161,19 @@ fn show_table_cells(
     row_height: f32,
     strong: bool,
     selected: bool,
+    text_color: Option<egui::Color32>,
 ) -> bool {
     let mut clicked = false;
     ui.horizontal(|ui| {
         for (text, width) in cells.iter().zip(COLUMN_WIDTHS) {
-            let widget_text: egui::WidgetText = if strong {
-                egui::RichText::new(*text).strong().into()
-            } else {
-                (*text).into()
-            };
+            let mut rich_text = egui::RichText::new(*text);
+            if strong {
+                rich_text = rich_text.strong();
+            }
+            if let Some(color) = text_color {
+                rich_text = rich_text.color(color);
+            }
+            let widget_text: egui::WidgetText = rich_text.into();
             let response = if strong {
                 ui.add_sized(
                     [width, row_height],
@@ -3309,6 +4203,7 @@ fn show_archive_rows(
     selected_index: Option<usize>,
 ) -> Option<usize> {
     let mut clicked_index = None;
+    let visuals = ui.visuals().clone();
     for visible_index in row_range {
         let row_index = filtered_rows
             .map(|indices| indices[visible_index])
@@ -3326,6 +4221,7 @@ fn show_archive_rows(
             row_height,
             false,
             selected_index == Some(row_index),
+            row.row_text_color(&visuals),
         ) {
             clicked_index = Some(row_index);
         }
@@ -3348,6 +4244,17 @@ fn selected_record_index(
     records
         .iter()
         .position(|record| record.mount_plan.archive.path == selected_archive)
+}
+
+/// Like `selected_record_index`, but over the merged live+cache row list
+/// via each row's exact-byte `path` identity - never a lossy display
+/// string (requirement 5). Used to drive table-row highlighting for both
+/// live and cache-only rows; selecting a cache-only row still leaves
+/// `selected_record` (which only searches live records) returning `None`,
+/// so no action button is ever offered for it.
+fn selected_row_index(rows: &[ArchiveRow], selected_archive: Option<&Path>) -> Option<usize> {
+    let selected_archive = selected_archive?;
+    rows.iter().position(|row| row.path == selected_archive)
 }
 
 fn available_action(mount_state: MountState) -> ArchiveAction {
@@ -3649,14 +4556,21 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
 mod tests {
     use super::*;
     use archivefs_core::{Archive, ArchiveHealth, ArchiveMetadata, MountPlan};
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     fn row(search_text: &str) -> ArchiveRow {
         ArchiveRow {
+            path: PathBuf::new(),
             archive_path: String::new(),
             mount_path: String::new(),
             platform: String::new(),
             state: String::new(),
             search_text: search_text.to_lowercase(),
+            origin: RowOrigin::Live,
+            unknown_platform: false,
         }
     }
 
@@ -3693,6 +4607,11 @@ mod tests {
     fn app_for_operation_tests() -> ArchiveFsApp {
         ArchiveFsApp {
             state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
+            database_state: DatabaseState::NotCreated {
+                database_path: PathBuf::from("/config/library.sqlite3"),
+            },
+            database_generation: DatabaseGeneration::INITIAL,
+            library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
             selected_archive: None,
@@ -3789,6 +4708,115 @@ mod tests {
             archive_path: PathBuf::from(format!("/roms/{name}.zip")),
             mount_path: PathBuf::from(format!("/mount/{name}")),
             display_name: name.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 4: persistent library database GUI integration - helpers.
+    // -----------------------------------------------------------------
+
+    /// A unique per-test temporary directory, following the exact
+    /// pattern `archivefs-core/src/database.rs`'s own test module uses
+    /// (no `tempfile` dependency in this workspace) - see requirement 8:
+    /// every stage 4 test that touches real paths uses one of these, and
+    /// none of them ever touch the real `HOME`/config/database path.
+    fn database_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "archivefs-gui-database-test-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBuf {
+        let full_path = dir.join(relative_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, content).unwrap();
+        full_path
+    }
+
+    fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
+        Config {
+            source_folders: vec![source_dir.to_path_buf()],
+            mount_root: mount_dir.to_path_buf(),
+            ratarmount_bin: "ratarmount".to_string(),
+        }
+    }
+
+    fn record_at(path: PathBuf, mount_state: MountState) -> ArchiveRecord {
+        let archive = Archive::from_path(&path).unwrap();
+        ArchiveRecord::new(
+            MountPlan::new(archive, PathBuf::from("/mnt/archivefs/Test")),
+            mount_state,
+            ArchiveMetadata {
+                title: None,
+                platform: None,
+                region: None,
+                languages: None,
+                version: None,
+                disc: None,
+                publisher: None,
+                developer: None,
+                release_year: None,
+                genre: None,
+                notes: None,
+                source: None,
+            },
+            ArchiveHealth::Pending,
+        )
+    }
+
+    fn row_for(record: &ArchiveRecord) -> ArchiveRow {
+        let status = ArchiveStatus {
+            archive_path: record.mount_plan.archive.path.clone(),
+            mount_path: record.mount_plan.mount_path.clone(),
+            state: record.mount_state,
+        };
+        ArchiveRow::new(record, &status)
+    }
+
+    fn persisted_archive(path: PathBuf, missing: bool) -> PersistedArchive {
+        PersistedArchive {
+            id: 1,
+            source_folder_id: 1,
+            relative_path: PathBuf::from(path.file_name().unwrap()),
+            absolute_path: path,
+            archive_kind: "zip".to_string(),
+            display_name: "Test Archive".to_string(),
+            normalized_name: "test archive".to_string(),
+            size_bytes: Some(1024),
+            modified_time_unix_seconds: Some(0),
+            platform: None,
+            last_known_health: "Pending".to_string(),
+            last_verified_missing_at: missing.then(|| "2026-01-01T00:00:00Z".to_string()),
+        }
+    }
+
+    fn empty_catalogue_stats() -> CatalogueStats {
+        CatalogueStats {
+            total_archives: 0,
+            present_archives: 0,
+            missing_archives: 0,
+            archives_with_platform: 0,
+            archives_unknown_platform: 0,
+        }
+    }
+
+    fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
+        CachedLibrarySnapshot {
+            database_path: PathBuf::from("/config/library.sqlite3"),
+            schema_version: latest_schema_version(),
+            archives,
+            stats: empty_catalogue_stats(),
+            last_completed_scan: None,
         }
     }
 
@@ -5603,5 +6631,480 @@ mod tests {
 
         assert!(matches!(app.state, LoadState::Ready(_)));
         assert!(!app.feedback.as_ref().unwrap().succeeded);
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 4: persistent library database GUI integration - tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn startup_with_no_database_is_reported_as_not_created_not_as_an_error() {
+        let dir = database_test_dir("no-database");
+        let database_path = dir.join("library.sqlite3");
+
+        let result = load_database_snapshot_at(&database_path, None);
+
+        assert!(matches!(
+            result,
+            Err(DatabaseLoadError::NotCreated { database_path: reported }) if reported == database_path
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_rows_appear_before_live_refresh_completes() {
+        let snapshot = cached_snapshot(vec![
+            persisted_archive(PathBuf::from("/roms/present.zip"), false),
+            persisted_archive(PathBuf::from("/roms/missing.zip"), true),
+        ]);
+
+        let merged = build_display_rows(&[], &[], Some(&snapshot));
+
+        assert_eq!(merged.len(), 2);
+        assert!(
+            merged
+                .iter()
+                .any(|row| row.origin == RowOrigin::CachedAwaitingValidation
+                    || row.origin == RowOrigin::CachedUnavailable)
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|row| row.origin == RowOrigin::CachedMissing)
+        );
+    }
+
+    #[test]
+    fn cache_only_rows_cannot_resolve_to_a_live_record() {
+        let snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/cache-only.zip"),
+            false,
+        )]);
+        let merged = build_display_rows(&[], &[], Some(&snapshot));
+        let cache_row = &merged[0];
+
+        // No live records at all, so selecting the cache-only row's exact
+        // path can never resolve to an ArchiveRecord - this is the same
+        // fallback show_selected_archive already relies on to render zero
+        // action buttons for `None`.
+        assert_eq!(selected_record(&[], Some(&cache_row.path)), None);
+    }
+
+    #[test]
+    fn live_validation_enables_actions_for_a_confirmed_row() {
+        let record = record_at(PathBuf::from("/roms/confirmed.zip"), MountState::Pending);
+        let live_row = row_for(&record);
+        let snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/confirmed.zip"),
+            false,
+        )]);
+
+        let merged =
+            build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+        // The live row wins - the cache row for the same exact path is not
+        // duplicated - and selecting it resolves to the live record, which
+        // is what makes action buttons available.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::Live);
+        assert_eq!(
+            selected_record(std::slice::from_ref(&record), Some(&merged[0].path)),
+            Some(&record)
+        );
+    }
+
+    #[test]
+    fn missing_cached_rows_remain_visible_in_the_merge() {
+        let snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/gone.zip"),
+            true,
+        )]);
+
+        let merged = build_display_rows(&[], &[], Some(&snapshot));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::CachedMissing);
+    }
+
+    #[test]
+    fn newly_discovered_live_archive_not_yet_in_cache_appears_as_a_live_row() {
+        let record = record_at(PathBuf::from("/roms/brand-new.zip"), MountState::Pending);
+        let live_row = row_for(&record);
+        let snapshot = cached_snapshot(vec![]);
+
+        let merged =
+            build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::Live);
+    }
+
+    #[test]
+    fn corrupt_database_is_non_fatal() {
+        let dir = database_test_dir("corrupt");
+        let database_path = dir.join("library.sqlite3");
+        std::fs::write(&database_path, b"not a sqlite database").unwrap();
+
+        let result = load_database_snapshot_at(&database_path, None);
+
+        assert!(matches!(result, Err(DatabaseLoadError::Failed { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_unhealthy_database_reports_future_schema_as_a_clear_upgrade_message() {
+        let health = DatabaseHealth {
+            resolved_path: PathBuf::from("/config/library.sqlite3"),
+            database_exists: true,
+            database_opens: true,
+            schema_version: Some(latest_schema_version() + 1),
+            migrations_current: false,
+            foreign_keys_enabled: true,
+            error: None,
+        };
+
+        let error = classify_unhealthy_database(health);
+
+        match error {
+            DatabaseLoadError::Failed { message } => {
+                assert!(message.contains("newer than this build"));
+            }
+            DatabaseLoadError::NotCreated { .. } => panic!("expected Failed, got NotCreated"),
+            DatabaseLoadError::Outdated { .. } => panic!("expected Failed, got Outdated"),
+        }
+    }
+
+    #[test]
+    fn classify_unhealthy_database_reports_a_merely_old_schema_as_outdated_not_an_error() {
+        let health = DatabaseHealth {
+            resolved_path: PathBuf::from("/config/library.sqlite3"),
+            database_exists: true,
+            database_opens: true,
+            schema_version: Some(0),
+            migrations_current: false,
+            foreign_keys_enabled: true,
+            error: None,
+        };
+
+        let error = classify_unhealthy_database(health);
+
+        assert!(matches!(error, DatabaseLoadError::Outdated { .. }));
+    }
+
+    #[test]
+    fn classify_unhealthy_database_reports_unopenable_database_as_failed_with_its_error() {
+        let health = DatabaseHealth {
+            resolved_path: PathBuf::from("/config/library.sqlite3"),
+            database_exists: true,
+            database_opens: false,
+            schema_version: None,
+            migrations_current: false,
+            foreign_keys_enabled: false,
+            error: Some("disk I/O error".to_string()),
+        };
+
+        let error = classify_unhealthy_database(health);
+
+        match error {
+            DatabaseLoadError::Failed { message } => assert_eq!(message, "disk I/O error"),
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn scan_partial_success_reports_folder_errors_without_failing_the_scan() {
+        let dir = database_test_dir("scan-partial");
+        let source_a = dir.join("source-a");
+        let source_b = dir.join("source-b");
+        let mount = dir.join("mount");
+        write_archive_file(&source_a, "a.zip", b"a");
+        write_archive_file(&source_b, "b.zip", b"b");
+        let config = Config {
+            source_folders: vec![source_a.clone(), source_b.clone()],
+            mount_root: mount,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+        std::fs::remove_dir_all(&source_a).unwrap();
+
+        let result = load_database_snapshot_at(&database_path, Some(&config));
+
+        match result {
+            Ok(DatabaseOutcome::Scanned {
+                snapshot,
+                scan_summary,
+            }) => {
+                assert_eq!(scan_summary.folder_errors.len(), 1);
+                assert_eq!(scan_summary.folder_errors[0].0, source_a);
+                // Archives under the still-reachable folder remain in the
+                // catalogue - a partial failure does not crash or discard
+                // the rest of the scan.
+                assert!(
+                    snapshot
+                        .archives
+                        .iter()
+                        .any(|archive| archive.relative_path == Path::new("b.zip"))
+                );
+            }
+            _ => panic!("expected a partially-successful Scanned outcome"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successful_scan_refreshes_cached_counts() {
+        let dir = database_test_dir("scan-success");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        write_archive_file(&source, "game.zip", b"game data");
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+
+        let result = load_database_snapshot_at(&database_path, Some(&config));
+
+        match result {
+            Ok(DatabaseOutcome::Scanned {
+                snapshot,
+                scan_summary,
+            }) => {
+                assert_eq!(scan_summary.counts.archives_added, 1);
+                assert_eq!(snapshot.stats.total_archives, 1);
+                assert_eq!(snapshot.archives.len(), 1);
+            }
+            _ => panic!("expected a successful Scanned outcome"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn database_worker_disconnect_is_surfaced_as_an_error() {
+        let mut app = app_for_operation_tests();
+        let generation = DatabaseGeneration::INITIAL.next();
+        app.database_generation = generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        drop(sender);
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+
+        app.poll_database_load(&egui::Context::default());
+
+        match &app.database_state {
+            DatabaseState::Error { message, .. } => {
+                assert!(message.contains("stopped unexpectedly"));
+            }
+            _ => panic!("expected a disconnected worker to surface as DatabaseState::Error"),
+        }
+    }
+
+    #[test]
+    fn late_database_results_from_an_older_generation_are_ignored() {
+        let mut app = app_for_operation_tests();
+        let stale_generation = DatabaseGeneration::INITIAL;
+        let current_generation = stale_generation.next();
+        app.database_generation = current_generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation: stale_generation,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+        let stale_snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/stale.zip"),
+            false,
+        )]);
+        sender
+            .send((
+                stale_generation,
+                Ok(DatabaseOutcome::Loaded(stale_snapshot)),
+            ))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        // The message's generation does not match the current generation,
+        // so it must be dropped entirely - the state must still be the
+        // same stale Loading value, never overwritten with the stale
+        // snapshot's data.
+        assert!(matches!(
+            &app.database_state,
+            DatabaseState::Loading { generation, .. } if *generation == stale_generation
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconciliation_uses_exact_path_bytes_not_lossy_display_strings() {
+        // Two distinct invalid-UTF-8 byte sequences that both decode to
+        // the same lossy "fo<REPLACEMENT>o.zip" under Path::display() -
+        // see database.rs's own non_utf8_path_round_trips_exactly_through_a_blob_column
+        // test for why 0x80/0x81 alone are never valid UTF-8 continuation
+        // bytes here.
+        let bytes_a: Vec<u8> = vec![0x66, 0x6f, 0x80, 0x6f, b'.', b'z', b'i', b'p'];
+        let bytes_b: Vec<u8> = vec![0x66, 0x6f, 0x81, 0x6f, b'.', b'z', b'i', b'p'];
+        let path_a = PathBuf::from(OsString::from_vec(bytes_a));
+        let path_b = PathBuf::from(OsString::from_vec(bytes_b));
+        assert_ne!(
+            path_a, path_b,
+            "the two test paths must differ in exact bytes"
+        );
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "the two test paths must collide under lossy display - that is the point"
+        );
+
+        let record = record_at(path_a, MountState::Pending);
+        let live_row = row_for(&record);
+        let snapshot = cached_snapshot(vec![persisted_archive(path_b, false)]);
+
+        let merged =
+            build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+        // If reconciliation had compared lossy display strings instead of
+        // exact bytes, these two different archives would have been
+        // wrongly treated as the same one and collapsed into a single row.
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_paths_reconcile_correctly_on_unix() {
+        let bytes: Vec<u8> = vec![0x66, 0x6f, 0x80, 0x6f, b'.', b'z', b'i', b'p'];
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        assert!(
+            path.to_str().is_none(),
+            "test path must actually be invalid UTF-8"
+        );
+
+        let record = record_at(path.clone(), MountState::Pending);
+        let live_row = row_for(&record);
+        let snapshot = cached_snapshot(vec![persisted_archive(path, false)]);
+
+        let merged =
+            build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+        // Identical non-UTF-8 bytes on both sides must be recognized as
+        // the same archive - the cache-only entry must be suppressed, not
+        // duplicated.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::Live);
+    }
+
+    #[test]
+    fn scan_library_action_does_not_block_on_a_slow_background_worker() {
+        // Deliberately does not call the real start_database_action/
+        // start_database_load (those spawn a real thread that touches the
+        // real default database/config paths - see load_database_snapshot -
+        // which every other stage 4 test in this file avoids for exactly
+        // that reason, matching how the existing live-snapshot tests never
+        // call the real start_load/refresh either). Instead this drives
+        // the same Loading state and channel those functions would have
+        // produced by hand, with nothing sent on it yet, and proves
+        // poll_database_load's use of try_recv (not recv) means polling an
+        // in-progress scan never blocks the UI thread waiting for a result.
+        let mut app = app_for_operation_tests();
+        let generation = DatabaseGeneration::INITIAL;
+        app.database_generation = generation;
+        let (_sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            previous: None,
+            scanning: true,
+        };
+
+        app.poll_database_load(&egui::Context::default());
+
+        assert!(matches!(
+            app.database_state,
+            DatabaseState::Loading { scanning: true, .. }
+        ));
+    }
+
+    #[test]
+    fn database_scan_completing_while_a_live_refresh_is_active_does_not_panic() {
+        let mut app = app_for_operation_tests();
+        app.state = LoadState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver: mpsc::channel().1,
+            previous: None,
+        };
+        let generation = DatabaseGeneration::INITIAL.next();
+        app.database_generation = generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+        let snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/during-refresh.zip"),
+            false,
+        )]);
+        sender
+            .send((generation, Ok(DatabaseOutcome::Loaded(snapshot))))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        // No live snapshot exists yet, so the cached filtered-index
+        // recompute is a no-op - the important thing is that resolving
+        // the database mid-live-refresh does not panic and leaves the
+        // database state correctly Ready.
+        assert!(matches!(app.database_state, DatabaseState::Ready { .. }));
+        assert!(matches!(app.state, LoadState::Loading { .. }));
+    }
+
+    fn row_with_origin(origin: RowOrigin, unknown_platform: bool) -> ArchiveRow {
+        let mut row = row("");
+        row.origin = origin;
+        row.unknown_platform = unknown_platform;
+        row
+    }
+
+    #[test]
+    fn library_row_filters_default_hides_nothing() {
+        let filters = LibraryRowFilters::default();
+        assert!(!filters.is_active());
+        assert!(filters.matches(&row_with_origin(RowOrigin::Live, false)));
+        assert!(filters.matches(&row_with_origin(RowOrigin::CachedMissing, true)));
+    }
+
+    #[test]
+    fn library_row_filters_present_only_shows_only_live_rows() {
+        let filters = LibraryRowFilters {
+            present: true,
+            ..LibraryRowFilters::default()
+        };
+
+        assert!(filters.matches(&row_with_origin(RowOrigin::Live, false)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::CachedMissing, false)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::CachedAwaitingValidation, false)));
+    }
+
+    #[test]
+    fn library_row_filters_platform_groups_are_independent_of_state_groups() {
+        let filters = LibraryRowFilters {
+            missing: true,
+            known_platform: true,
+            ..LibraryRowFilters::default()
+        };
+
+        // A missing row with an unknown platform must fail the platform
+        // group even though it passes the state group - both active
+        // groups must match (AND across groups, OR within a group).
+        assert!(!filters.matches(&row_with_origin(RowOrigin::CachedMissing, true)));
+        assert!(filters.matches(&row_with_origin(RowOrigin::CachedMissing, false)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::Live, false)));
     }
 }
