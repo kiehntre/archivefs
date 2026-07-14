@@ -16,7 +16,11 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 mod database;
-pub use database::{Database, DatabaseHealth, check_database_health, default_database_path};
+pub use database::{
+    ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, Database, DatabaseHealth,
+    PersistedArchive, RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts,
+    check_database_health, default_database_path, scan_and_persist,
+};
 
 #[derive(Debug)]
 pub enum ArchiveFsError {
