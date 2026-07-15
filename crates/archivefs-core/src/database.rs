@@ -493,6 +493,21 @@ pub struct PersistedArchive {
     pub last_verified_missing_at: Option<String>,
 }
 
+/// Whether `archive`'s *effective* platform (manual assignment if one is
+/// active, otherwise the latest automatic detection - see
+/// `provenance_priority`) is unknown: there is no current platform
+/// assignment at all. The single canonical definition of "unknown"
+/// shared by every caller (CLI `library-list --unknown-only`, the GUI's
+/// unknown-platform count/filter) - never re-derived from display text
+/// like the literal string `"Unknown"`, and never computed from raw
+/// automatic-detection fields directly, so a manual assignment is never
+/// misclassified as unknown just because automatic detection found
+/// nothing (`archive.platform` already reflects the outcome of that
+/// precedence, not the automatic guess alone).
+pub fn persisted_archive_has_unknown_platform(archive: &PersistedArchive) -> bool {
+    archive.platform.is_none()
+}
+
 /// The result of one [`Database::set_manual_platform`] or
 /// [`Database::clear_manual_platform`] call: the platform assignment
 /// immediately before and after, so callers (CLI/GUI) can show exactly
@@ -1704,6 +1719,127 @@ mod tests {
             .iter()
             .find(|archive| archive.relative_path == Path::new(relative_path))
             .unwrap_or_else(|| panic!("no persisted archive with relative_path {relative_path}"))
+    }
+
+    // -----------------------------------------------------------------
+    // Unknown-platform classification (`persisted_archive_has_unknown_platform`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn no_effective_platform_is_classified_unknown() {
+        let root = temp_dir("unknown-classification-none");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert_eq!(archive.platform, None, "sanity check: nothing detected");
+        assert!(persisted_archive_has_unknown_platform(archive));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn automatic_platform_is_not_unknown() {
+        let root = temp_dir("unknown-classification-automatic");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("MSX2"));
+        assert!(!persisted_archive_has_unknown_platform(archive));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_platform_is_not_unknown_even_without_any_automatic_detection() {
+        // The crux of requirement 6: a manual assignment on an archive
+        // automatic detection never had an opinion about must not be
+        // classified as unknown just because there was no automatic
+        // signal underneath it.
+        let root = temp_dir("unknown-classification-manual");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+        assert!(!persisted_archive_has_unknown_platform(archive));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_archive_with_no_platform_remains_unknown() {
+        let root = temp_dir("unknown-classification-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        fs::remove_file(&archive_path).unwrap();
+        scan_and_persist(&mut database, &config, "rescan").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert!(
+            archive.last_verified_missing_at.is_some(),
+            "sanity check: marked missing"
+        );
+        assert!(persisted_archive_has_unknown_platform(archive));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_archive_with_a_manual_platform_is_not_unknown() {
+        // Requirement 7's cache-only/missing coverage combined with
+        // requirement 6's manual-outranks-unknown rule: a manually
+        // classified archive that later goes missing must not revert to
+        // "unknown" - the manual assignment is keyed by the stable
+        // archive id, untouched by presence/absence.
+        let root = temp_dir("unknown-classification-missing-manual");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+        fs::remove_file(&archive_path).unwrap();
+        scan_and_persist(&mut database, &config, "rescan").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert!(archive.last_verified_missing_at.is_some());
+        assert!(!persisted_archive_has_unknown_platform(archive));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

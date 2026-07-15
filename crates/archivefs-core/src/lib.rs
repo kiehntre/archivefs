@@ -20,7 +20,8 @@ pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, CatalogueStats,
     CompletedScanSummary, Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, PersistedArchive,
     PlatformAssignmentChange, RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts,
-    check_database_health, default_database_path, latest_schema_version, scan_and_persist,
+    check_database_health, default_database_path, latest_schema_version,
+    persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 #[derive(Debug)]

@@ -20,7 +20,8 @@ use archivefs_core::{
     cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
     latest_schema_version, lazy_unmount_one_archive_path_with_progress,
-    load_read_only_snapshot_default, mount_one_archive_path, remount_one_archive_path,
+    load_read_only_snapshot_default, mount_one_archive_path,
+    persisted_archive_has_unknown_platform, remount_one_archive_path,
     run_setup_diagnostics_default, scan_and_persist, unmount_one_archive_path,
 };
 use eframe::egui;
@@ -281,7 +282,7 @@ impl ArchiveRow {
     /// "unreachable right now" from "awaiting the next live refresh".
     fn from_cached(persisted: &PersistedArchive, path_exists: bool) -> Self {
         let archive_path = persisted.absolute_path.display().to_string();
-        let unknown_platform = persisted.platform.is_none();
+        let unknown_platform = persisted_archive_has_unknown_platform(persisted);
         let platform = persisted
             .platform
             .as_deref()
@@ -311,6 +312,37 @@ impl ArchiveRow {
         }
     }
 
+    /// Overrides this row's platform-derived fields (`platform`,
+    /// `unknown_platform`, and the platform portion of `search_text`)
+    /// with the library database's effective (manual-aware) platform for
+    /// this archive.
+    ///
+    /// A live row built from `ArchiveRecord` alone only ever sees the
+    /// live scan's own automatic detection
+    /// (`record.metadata.platform`/`record.identity.platform`), which
+    /// disagrees with the persisted effective platform exactly when a
+    /// manual assignment is active and automatic detection found
+    /// nothing. Without this override, such a row would be wrongly
+    /// classified (and counted/filtered) as unknown. Only ever applied
+    /// when the database already has a persisted row for this exact path
+    /// (see `build_display_rows`); a live row with no persisted
+    /// counterpart yet keeps its live-only classification, the only
+    /// signal available for it.
+    fn with_persisted_platform(mut self, persisted: &PersistedArchive) -> Self {
+        self.unknown_platform = persisted_archive_has_unknown_platform(persisted);
+        self.platform = persisted
+            .platform
+            .as_deref()
+            .unwrap_or("Unknown")
+            .to_string();
+        self.search_text = format!(
+            "{}\n{}\n{}\n{}",
+            self.archive_path, self.mount_path, self.platform, self.state
+        )
+        .to_lowercase();
+        self
+    }
+
     fn matches(&self, normalized_filter: &str) -> bool {
         self.search_text.contains(normalized_filter)
     }
@@ -328,15 +360,35 @@ impl ArchiveRow {
 /// Merges live rows with cache-only rows for display - see requirement 4
 /// and 5. Live rows always win: a cached archive whose exact path already
 /// appears among `records` is represented only by its live row, never
-/// duplicated. Recomputed fresh whenever the underlying live or cached
-/// data changes (see `ArchiveFsApp::recompute_filtered_rows`), not on
-/// every frame, so it stays cheap without risking a stale merge.
+/// duplicated - but with its platform/unknown-platform classification
+/// overridden from the persisted effective value when the database
+/// already has an entry for it (see `ArchiveRow::with_persisted_platform`
+/// and requirement 6). Recomputed fresh whenever the underlying live or
+/// cached data changes (see `ArchiveFsApp::recompute_filtered_rows`), not
+/// on every frame, so it stays cheap without risking a stale merge.
 fn build_display_rows(
     records: &[ArchiveRecord],
     live_rows: &[ArchiveRow],
     cached: Option<&CachedLibrarySnapshot>,
 ) -> Vec<ArchiveRow> {
-    let mut merged: Vec<ArchiveRow> = live_rows.to_vec();
+    let persisted_by_path: HashMap<&Path, &PersistedArchive> = cached
+        .map(|cached| {
+            cached
+                .archives
+                .iter()
+                .map(|persisted| (persisted.absolute_path.as_path(), persisted))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut merged: Vec<ArchiveRow> = live_rows
+        .iter()
+        .cloned()
+        .map(|row| match persisted_by_path.get(row.path.as_path()) {
+            Some(persisted) => row.with_persisted_platform(persisted),
+            None => row,
+        })
+        .collect();
 
     if let Some(cached) = cached {
         let live_paths: HashSet<&Path> = records
@@ -4279,7 +4331,25 @@ fn show_loaded_data(
         *filtered_rows = matching_row_indices(&merged_rows, filter);
     }
 
+    // Unknown-platform review workflow: a compact count plus a single
+    // "show unknown only" toggle, reusing the same `unknown_platform`
+    // filter field the "Filters:" row's platform group already reads
+    // (see `LibraryRowFilters`) - no separate filter state, no separate
+    // index generation, no rescan. The count covers every merged row
+    // (live and cache-only alike), independent of which filters are
+    // currently active - see requirement 7.
+    let unknown_count = merged_rows
+        .iter()
+        .filter(|row| row.unknown_platform)
+        .count();
     let mut filters_changed = false;
+    ui.horizontal(|ui| {
+        ui.label(format!("Unknown platforms: {unknown_count}"));
+        filters_changed |= ui
+            .checkbox(&mut library_filters.unknown_platform, "Show unknown only")
+            .changed();
+    });
+
     ui.horizontal_wrapped(|ui| {
         ui.label("Filters:");
         filters_changed |= ui
@@ -4296,9 +4366,6 @@ fn show_loaded_data(
             .changed();
         filters_changed |= ui
             .checkbox(&mut library_filters.known_platform, "Known platform")
-            .changed();
-        filters_changed |= ui
-            .checkbox(&mut library_filters.unknown_platform, "Unknown platform")
             .changed();
         if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
             *library_filters = LibraryRowFilters::default();
@@ -7135,6 +7202,126 @@ mod tests {
         assert_eq!(merged[0].origin, RowOrigin::Live);
     }
 
+    // -----------------------------------------------------------------
+    // Unknown-platform review workflow.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn live_row_with_a_persisted_manual_platform_is_not_classified_unknown() {
+        // The crux of requirement 6: automatic detection found nothing
+        // for this live record (no metadata/identity platform), but the
+        // database already has a manual assignment for the same exact
+        // path - the merged row must reflect the effective (manual)
+        // platform, not the live-only "nothing detected" signal.
+        let path = PathBuf::from("/roms/mystery.zip");
+        let record = record_at(path.clone(), MountState::Pending);
+        let live_row = row_for(&record);
+        assert!(
+            live_row.unknown_platform,
+            "sanity check: live-only detection found nothing"
+        );
+        let snapshot = cached_snapshot(vec![persisted_archive_with_platform(
+            path,
+            1,
+            "GameCube",
+            MANUAL_PLATFORM_SOURCE,
+        )]);
+
+        let merged =
+            build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::Live);
+        assert!(!merged[0].unknown_platform);
+        assert_eq!(merged[0].platform, "GameCube");
+    }
+
+    #[test]
+    fn live_row_without_a_persisted_entry_keeps_its_live_only_classification() {
+        // No database row exists for this archive yet (never scanned
+        // into the library database) - there is no persisted effective
+        // value to defer to, so the live-only signal is the only one
+        // available and must be used as-is.
+        let record = record_at(PathBuf::from("/roms/brand-new.zip"), MountState::Pending);
+        let live_row = row_for(&record);
+        let snapshot = cached_snapshot(vec![]);
+
+        let merged =
+            build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].unknown_platform);
+    }
+
+    #[test]
+    fn cache_only_missing_row_with_no_platform_is_classified_unknown() {
+        let snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/gone.zip"),
+            true,
+        )]);
+
+        let merged = build_display_rows(&[], &[], Some(&snapshot));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::CachedMissing);
+        assert!(merged[0].unknown_platform);
+    }
+
+    #[test]
+    fn cache_only_missing_row_with_a_manual_platform_is_not_unknown() {
+        let snapshot = cached_snapshot(vec![PersistedArchive {
+            platform: Some("GameCube".to_string()),
+            platform_source: Some(MANUAL_PLATFORM_SOURCE.to_string()),
+            ..persisted_archive(PathBuf::from("/roms/gone.zip"), true)
+        }]);
+
+        let merged = build_display_rows(&[], &[], Some(&snapshot));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, RowOrigin::CachedMissing);
+        assert!(!merged[0].unknown_platform);
+    }
+
+    #[test]
+    fn unknown_count_covers_every_merged_row_live_and_cache_only_alike() {
+        let known_live_record =
+            record_at(PathBuf::from("/roms/known-live.zip"), MountState::Pending);
+        let known_live_row = row_for(&known_live_record);
+        let unknown_live_record =
+            record_at(PathBuf::from("/roms/unknown-live.zip"), MountState::Pending);
+        let unknown_live_row = row_for(&unknown_live_record);
+        let records = vec![known_live_record, unknown_live_record];
+        let live_rows = vec![known_live_row, unknown_live_row];
+        let snapshot = cached_snapshot(vec![
+            persisted_archive_with_platform(
+                PathBuf::from("/roms/known-live.zip"),
+                1,
+                "GameCube",
+                MANUAL_PLATFORM_SOURCE,
+            ),
+            persisted_archive(PathBuf::from("/roms/unknown-cached.zip"), false),
+            persisted_archive_with_platform(
+                PathBuf::from("/roms/known-cached.zip"),
+                2,
+                "SNES",
+                "folder_alias",
+            ),
+        ]);
+
+        let merged = build_display_rows(&records, &live_rows, Some(&snapshot));
+
+        assert_eq!(
+            merged.len(),
+            4,
+            "sanity check: two live + two cache-only rows"
+        );
+        let unknown_count = merged.iter().filter(|row| row.unknown_platform).count();
+        assert_eq!(
+            unknown_count, 2,
+            "unknown-live.zip and unknown-cached.zip - the manual and known-automatic rows must not count"
+        );
+    }
+
     #[test]
     fn corrupt_database_is_non_fatal() {
         let dir = database_test_dir("corrupt");
@@ -7504,6 +7691,76 @@ mod tests {
         assert!(!filters.matches(&row_with_origin(RowOrigin::Live, false)));
     }
 
+    #[test]
+    fn show_unknown_only_combines_with_the_present_filter() {
+        // Requirement 3's exact example: present + unknown-only means
+        // present unknown rows only - missing rows stay excluded even
+        // though they are also unknown.
+        let filters = LibraryRowFilters {
+            present: true,
+            unknown_platform: true,
+            ..LibraryRowFilters::default()
+        };
+
+        assert!(filters.matches(&row_with_origin(RowOrigin::Live, true)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::Live, false)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::CachedMissing, true)));
+    }
+
+    #[test]
+    fn show_unknown_only_combines_with_the_missing_filter() {
+        let filters = LibraryRowFilters {
+            missing: true,
+            unknown_platform: true,
+            ..LibraryRowFilters::default()
+        };
+
+        assert!(filters.matches(&row_with_origin(RowOrigin::CachedMissing, true)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::CachedMissing, false)));
+        assert!(!filters.matches(&row_with_origin(RowOrigin::Live, true)));
+    }
+
+    #[test]
+    fn show_unknown_only_combines_with_text_search() {
+        // Mirrors exactly how `show_loaded_data` composes the two:
+        // `matching_row_indices` (text search) intersected with
+        // `library_filters.matches` (checkbox filters).
+        let known_record = record_at(
+            PathBuf::from("/roms/mystery-known.zip"),
+            MountState::Pending,
+        );
+        let mut known_row = row_for(&known_record);
+        known_row.archive_path = "/roms/mystery-known.zip".to_string();
+        known_row.unknown_platform = false;
+        known_row.platform = "GameCube".to_string();
+        known_row.search_text = "mystery-known.zip\n\ngamecube\npending".to_string();
+        let unknown_record = record_at(
+            PathBuf::from("/roms/mystery-unknown.zip"),
+            MountState::Pending,
+        );
+        let unknown_row = row_for(&unknown_record);
+        let rows = vec![known_row, unknown_row];
+
+        let text_matches = matching_row_indices(&rows, "mystery").unwrap();
+        assert_eq!(
+            text_matches.len(),
+            2,
+            "sanity check: both rows match the text search"
+        );
+
+        let filters = LibraryRowFilters {
+            unknown_platform: true,
+            ..LibraryRowFilters::default()
+        };
+        let combined: Vec<usize> = text_matches
+            .into_iter()
+            .filter(|&index| filters.matches(&rows[index]))
+            .collect();
+
+        assert_eq!(combined.len(), 1);
+        assert_eq!(rows[combined[0]].archive_path, "/roms/mystery-unknown.zip");
+    }
+
     // -------------------------------------------------------------
     // Manual platform assignment.
     // -------------------------------------------------------------
@@ -7658,6 +7915,185 @@ mod tests {
                 other.status_label()
             ),
         }
+    }
+
+    #[test]
+    fn database_reload_removes_a_newly_known_row_from_the_unknown_only_filtered_list() {
+        // The second half of "assigning a platform removes the row after
+        // the asynchronous database refresh" - the first half
+        // (poll_platform_action starting the reload) is covered by
+        // poll_platform_action_success_refreshes_the_database_cache_asynchronously;
+        // this covers what happens once that reload actually settles,
+        // exactly as poll_database_load's own other tests do (a
+        // synthetic channel/message, not a real database path).
+        let mut app = app_for_operation_tests();
+        app.library_filters.unknown_platform = true;
+        let archive_path = PathBuf::from("/roms/mystery.zip");
+        app.selected_archive = Some(archive_path.clone());
+        let generation = app.database_generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            previous: Some(Box::new(cached_snapshot(vec![persisted_archive(
+                archive_path.clone(),
+                false,
+            )]))),
+            scanning: false,
+        };
+        let after_snapshot = cached_snapshot(vec![persisted_archive_with_platform(
+            archive_path.clone(),
+            1,
+            "GameCube",
+            MANUAL_PLATFORM_SOURCE,
+        )]);
+        sender
+            .send((generation, Ok(DatabaseOutcome::Loaded(after_snapshot))))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        let merged = build_display_rows(&[], &[], app.database_state.snapshot());
+        assert_eq!(merged.len(), 1);
+        assert!(
+            !merged[0].unknown_platform,
+            "the row must now reflect the manual assignment"
+        );
+        assert!(
+            !app.library_filters.matches(&merged[0]),
+            "it must no longer match Show unknown only"
+        );
+
+        // Selection safety (requirement 4): the path-based selection is
+        // untouched and still resolves the archive's up-to-date details,
+        // even though it is no longer visible in the unknown-only
+        // filtered list - the existing, intentional
+        // selection-independent-of-filter-visibility behavior (see
+        // `RowOrigin`'s doc comment), not a new special case.
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(archive_path.as_path())
+        );
+        assert_eq!(
+            selected_persisted_archive(
+                app.database_state.snapshot(),
+                app.selected_archive.as_deref()
+            )
+            .and_then(|persisted| persisted.platform.as_deref()),
+            Some("GameCube")
+        );
+    }
+
+    #[test]
+    fn database_reload_adds_a_newly_unknown_row_when_a_manual_platform_is_cleared() {
+        let mut app = app_for_operation_tests();
+        app.library_filters.unknown_platform = true;
+        let archive_path = PathBuf::from("/roms/mystery.zip");
+        let generation = app.database_generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            previous: Some(Box::new(cached_snapshot(vec![
+                persisted_archive_with_platform(
+                    archive_path.clone(),
+                    1,
+                    "GameCube",
+                    MANUAL_PLATFORM_SOURCE,
+                ),
+            ]))),
+            scanning: false,
+        };
+        let after_snapshot = cached_snapshot(vec![persisted_archive(archive_path, false)]);
+        sender
+            .send((generation, Ok(DatabaseOutcome::Loaded(after_snapshot))))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        let merged = build_display_rows(&[], &[], app.database_state.snapshot());
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].unknown_platform);
+        assert!(
+            app.library_filters.matches(&merged[0]),
+            "clearing manual back to unknown must make the row match Show unknown only again"
+        );
+    }
+
+    #[test]
+    fn filtered_rows_index_cache_is_recomputed_not_left_stale_after_a_database_reload() {
+        let mut app = app_for_operation_tests();
+        app.filter = "mystery".to_string();
+        // A deliberately stale/out-of-bounds cached index list, as if
+        // left over from a previous, now-invalid merged row shape -
+        // poll_database_load must never trust or reuse this without
+        // recomputing it fresh against the new merge.
+        app.filtered_rows = Some(vec![0, 1, 2, 99]);
+        let generation = app.database_generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+        let snapshot = cached_snapshot(vec![persisted_archive(
+            PathBuf::from("/roms/mystery.zip"),
+            false,
+        )]);
+        sender
+            .send((generation, Ok(DatabaseOutcome::Loaded(snapshot))))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        let recomputed = app
+            .filtered_rows
+            .expect("filtered_rows must be recomputed, not left stale");
+        assert_eq!(
+            recomputed,
+            vec![0],
+            "must be freshly computed against the new merged row set, not the stale placeholder"
+        );
+    }
+
+    #[test]
+    fn toggling_show_unknown_only_performs_no_database_write_or_scan() {
+        let mut app = app_for_operation_tests();
+        let generation_before = app.database_generation;
+        let refresh_generation_before = app.refresh_generation;
+
+        app.library_filters.unknown_platform = true;
+        app.library_filters.unknown_platform = false;
+
+        assert_eq!(
+            app.database_generation, generation_before,
+            "toggling the filter must never start a database load"
+        );
+        assert_eq!(
+            app.refresh_generation, refresh_generation_before,
+            "toggling the filter must never trigger a live rescan either"
+        );
+        assert!(matches!(
+            app.database_state,
+            DatabaseState::NotCreated { .. }
+        ));
+    }
+
+    #[test]
+    fn mount_action_availability_is_unaffected_by_library_filters() {
+        let mut app = app_for_operation_tests();
+        let busy_before = app.is_busy();
+
+        app.library_filters.unknown_platform = true;
+        app.library_filters.present = true;
+        app.library_filters.missing = true;
+
+        assert_eq!(
+            app.is_busy(),
+            busy_before,
+            "library_filters must never influence mount/unmount action-safety gating"
+        );
     }
 
     #[test]

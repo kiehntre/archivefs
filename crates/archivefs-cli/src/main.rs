@@ -13,8 +13,9 @@ use archivefs_core::{
     check_database_health, clean_mount_root, cleanup_selected_mount_dir, current_archive_info,
     current_archive_stats, current_statuses, default_database_path, default_index_path,
     find_archive_index_entries, latest_schema_version, mount_archives, mount_one_archive,
-    read_default_archive_index, run_config_check_default, run_doctor_default, scan_and_persist,
-    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
+    persisted_archive_has_unknown_platform, read_default_archive_index, run_config_check_default,
+    run_doctor_default, scan_and_persist, summarize_archive_index, unmount_archives,
+    unmount_one_archive, watch_archive_index,
 };
 use serde::Serialize;
 
@@ -259,9 +260,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "library-list" => {
-            let json = args.any(|arg| arg == "--json");
+            let input_args: Vec<String> = args.collect();
+            let json = input_args.iter().any(|arg| arg == "--json");
+            let unknown_only = input_args.iter().any(|arg| arg == "--unknown-only");
             let database_path = default_database_path()?;
-            let entries = build_library_entries(&database_path)?;
+            let entries = build_library_entries(&database_path, unknown_only)?;
             if json {
                 print_library_entries_json(&entries)?;
             } else {
@@ -273,6 +276,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("library-find requires a query".into());
             };
             let mut input_args = std::iter::once(first).chain(args).collect::<Vec<_>>();
+            let unknown_only = extract_flag(&mut input_args, "--unknown-only");
             let json = input_args.last().is_some_and(|arg| arg == "--json");
             if json {
                 input_args.pop();
@@ -282,7 +286,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("library-find requires a query".into());
             }
             let database_path = default_database_path()?;
-            let entries = build_library_entries(&database_path)?;
+            let entries = build_library_entries(&database_path, unknown_only)?;
             let matches = filter_library_entries(&entries, &query);
             if json {
                 print_library_entries_json(&matches)?;
@@ -852,8 +856,22 @@ impl From<&PersistedArchive> for LibraryArchiveView {
 /// database file exists yet, this is an empty catalogue (`Ok(vec![])`),
 /// not an error - `print_library_entries` distinguishes "no database yet"
 /// from "database exists but is empty" for the human-readable message.
+/// Never rescans - reads the existing database only.
+///
+/// `unknown_only` filters to archives whose *effective* platform is
+/// unknown (see [`persisted_archive_has_unknown_platform`] - the same
+/// canonical definition the GUI's unknown-platform count/filter uses),
+/// applied here at the [`PersistedArchive`] stage before the
+/// [`LibraryArchiveView`] conversion so `library-list`/`library-find`
+/// share one filtering path rather than each re-deriving "unknown" from
+/// the view type. Includes both present and missing archives - nothing
+/// else currently controls state filtering for these two commands, so
+/// there is no other option to interact with. The JSON output shape is
+/// unaffected either way: the same array of the same object shape, just
+/// fewer elements when this is set.
 fn build_library_entries(
     database_path: &Path,
+    unknown_only: bool,
 ) -> Result<Vec<LibraryArchiveView>, Box<dyn std::error::Error>> {
     if !database_path.exists() {
         return Ok(Vec::new());
@@ -862,6 +880,7 @@ fn build_library_entries(
     Ok(database
         .load_archives()?
         .iter()
+        .filter(|archive| !unknown_only || persisted_archive_has_unknown_platform(archive))
         .map(LibraryArchiveView::from)
         .collect())
 }
@@ -1597,7 +1616,9 @@ fn print_help() {
     println!("  archivefs library-status");
     println!("  archivefs library-scan");
     println!("  archivefs library-list");
+    println!("  archivefs library-list --unknown-only");
     println!("  archivefs library-find \"007 Legends\"");
+    println!("  archivefs library-find --unknown-only n64");
     println!("  archivefs library-set-platform \"Luigi's Mansion\" GameCube");
     println!("  archivefs library-set-platform --id 42 GameCube");
     println!("  archivefs library-set-platform --path /roms/n64/Luigis_Mansion.zip GameCube");
@@ -2200,7 +2221,7 @@ mod tests {
         std::fs::remove_file(&doomed).unwrap();
         run_library_scan(&config, &database_path, "test").unwrap();
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
 
         assert_eq!(entries.len(), 2);
         let keep = entries
@@ -2226,10 +2247,155 @@ mod tests {
         let root = temp_dir("list-no-database");
         let database_path = root.join("library.sqlite3");
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
 
         assert!(entries.is_empty());
         assert!(!database_path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_unknown_only_returns_only_unknown_rows() {
+        let root = temp_dir("list-unknown-only");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"a"); // unknown
+        write_archive_file(&source, "msx2/game.zip", b"b"); // automatic MSX2
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let all_entries = build_library_entries(&database_path, false).unwrap();
+        assert_eq!(all_entries.len(), 2, "sanity check: both archives present");
+
+        let unknown_entries = build_library_entries(&database_path, true).unwrap();
+
+        assert_eq!(unknown_entries.len(), 1);
+        assert!(unknown_entries[0].path.ends_with("mystery.zip"));
+        assert!(unknown_entries[0].platform.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_unknown_only_excludes_known_manual_and_automatic_rows() {
+        let root = temp_dir("list-unknown-only-excludes-known");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"a");
+        write_archive_file(&source, "msx2/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let mystery_id = build_library_entries(&database_path, false)
+            .unwrap()
+            .iter()
+            .find(|entry| entry.path.ends_with("mystery.zip"))
+            .unwrap()
+            .id;
+        run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Id(mystery_id),
+            "GameCube",
+        )
+        .unwrap();
+
+        let unknown_entries = build_library_entries(&database_path, true).unwrap();
+
+        assert!(
+            unknown_entries.is_empty(),
+            "both rows are now known (one manual, one automatic) - neither should appear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_unknown_only_includes_missing_rows() {
+        let root = temp_dir("list-unknown-only-includes-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let doomed = write_archive_file(&source, "mystery.zip", b"a");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        std::fs::remove_file(&doomed).unwrap();
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let unknown_entries = build_library_entries(&database_path, true).unwrap();
+
+        assert_eq!(unknown_entries.len(), 1);
+        assert!(
+            !unknown_entries[0].present,
+            "missing unknown rows must still be included"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_unknown_only_with_no_database_is_an_empty_successful_result() {
+        let root = temp_dir("list-unknown-only-no-database");
+        let database_path = root.join("library.sqlite3");
+
+        let entries = build_library_entries(&database_path, true).unwrap();
+
+        assert!(entries.is_empty());
+        assert!(!database_path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_list_unknown_only_json_output_shape_matches_normal_output() {
+        let root = temp_dir("list-unknown-only-json-shape");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"a");
+        write_archive_file(&source, "msx2/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let unknown_entries = build_library_entries(&database_path, true).unwrap();
+        let output = format_library_entries_json(&unknown_entries).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+
+        assert!(output.starts_with("[\n"));
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        let entry = &json[0];
+        assert!(entry.get("id").is_some());
+        assert!(entry.get("path").is_some());
+        assert!(entry.get("platform").is_some());
+        assert!(entry.get("platform_source").is_some());
+        assert!(entry.get("present").is_some());
+        assert!(entry.get("size_bytes").is_some());
+        assert!(entry.get("modified_time_unix_seconds").is_some());
+        assert_eq!(entry["platform"], serde_json::Value::Null);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_find_unknown_only_combines_with_the_text_query() {
+        let root = temp_dir("find-unknown-only");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery-game.zip", b"a"); // no folder hint: unknown
+        write_archive_file(&source, "msx2/mystery-game.zip", b"b"); // automatic MSX2: known
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let entries = build_library_entries(&database_path, true).unwrap();
+        let matches = filter_library_entries(&entries, "mystery-game");
+
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches[0].path.ends_with("mystery-game.zip")
+                && !matches[0].path.ends_with("msx2/mystery-game.zip")
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2243,7 +2409,7 @@ mod tests {
         write_archive_file(&source, "Halo.zip", b"contents");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
 
         let matches = filter_library_entries(&entries, "HALO");
 
@@ -2261,7 +2427,7 @@ mod tests {
         write_archive_file(&source, "Xbox360/game.zip", b"contents");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
 
         let matches = filter_library_entries(&entries, "xbox360");
 
@@ -2291,7 +2457,7 @@ mod tests {
         write_archive_file(&source, "Xbox360/game.zip", b"contents");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         let matches = filter_library_entries(&entries, "game");
 
         let output = format_library_entries_json(&matches).unwrap();
@@ -2320,7 +2486,7 @@ mod tests {
         write_archive_file(&source, "mystery.zip", b"contents");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(
@@ -2432,7 +2598,7 @@ mod tests {
         assert_eq!(change.new_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
         assert!(change.path.display().to_string().ends_with("mystery.zip"));
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         assert_eq!(entries[0].platform.as_deref(), Some("GameCube"));
         assert_eq!(
             entries[0].platform_source.as_deref(),
@@ -2452,7 +2618,7 @@ mod tests {
         write_archive_file(&source, "collection-b/game.zip", b"b");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         let target_id = entries
             .iter()
             .find(|entry| entry.path.display().to_string().contains("collection-a"))
@@ -2466,7 +2632,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         let changed = entries.iter().find(|entry| entry.id == target_id).unwrap();
         let untouched = entries.iter().find(|entry| entry.id != target_id).unwrap();
         assert_eq!(changed.platform.as_deref(), Some("GameCube"));
@@ -2496,7 +2662,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         let changed = entries
             .iter()
             .find(|entry| entry.path == target_path)
@@ -2561,7 +2727,7 @@ mod tests {
         assert!(error.to_string().contains("multiple archives matched"));
         assert!(error.to_string().contains("--id"));
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         assert!(
             entries.iter().all(|entry| entry.platform.is_none()),
             "an ambiguous query must leave every candidate untouched"
@@ -2665,7 +2831,7 @@ mod tests {
             "mystery.zip never had an automatic detection to fall back to"
         );
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         assert_eq!(entries[0].platform, None);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2680,7 +2846,7 @@ mod tests {
         write_archive_file(&source, "msx2/game.zip", b"contents");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let target_id = build_library_entries(&database_path).unwrap()[0].id;
+        let target_id = build_library_entries(&database_path, false).unwrap()[0].id;
         run_library_set_platform(
             &database_path,
             &LibraryTargetSelector::Id(target_id),
@@ -2696,7 +2862,7 @@ mod tests {
         assert_eq!(change.old_platform.as_deref(), Some("GameCube"));
         assert_eq!(change.new_platform.as_deref(), Some("MSX2"));
         assert_eq!(change.new_source.as_deref(), Some("folder_alias"));
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         assert_eq!(entries[0].platform.as_deref(), Some("MSX2"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2711,7 +2877,7 @@ mod tests {
         write_archive_file(&source, "msx2/game.zip", b"contents");
         let config = config_for(&source, &mount);
         run_library_scan(&config, &database_path, "test").unwrap();
-        let target_id = build_library_entries(&database_path).unwrap()[0].id;
+        let target_id = build_library_entries(&database_path, false).unwrap()[0].id;
 
         let change =
             run_library_clear_platform(&database_path, &LibraryTargetSelector::Id(target_id))
@@ -2721,7 +2887,7 @@ mod tests {
         assert_eq!(change.old_source.as_deref(), Some("folder_alias"));
         assert_eq!(change.new_platform, change.old_platform);
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         assert_eq!(
             entries[0].platform.as_deref(),
             Some("MSX2"),
@@ -2929,7 +3095,7 @@ mod tests {
 
         run_library_scan(&config, &database_path, "rescan").unwrap();
 
-        let entries = build_library_entries(&database_path).unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
         assert_eq!(entries[0].platform.as_deref(), Some("GameCube"));
 
         let _ = std::fs::remove_dir_all(&root);
