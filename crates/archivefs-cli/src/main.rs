@@ -8,13 +8,13 @@ use archivefs_core::{
     ArchiveScanner, ArchiveStats, ArchiveStatus, CatalogueStats, CompletedScanSummary, Config,
     ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth, DoctorReport,
     DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector, MountPlan,
-    PersistedArchive, ScanPersistSummary, WatchRebuildSummary, build_and_write_archive_index,
-    check_archive_index_freshness, check_database_health, clean_mount_root,
-    cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
-    default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
-    mount_archives, mount_one_archive, read_default_archive_index, run_config_check_default,
-    run_doctor_default, scan_and_persist, summarize_archive_index, unmount_archives,
-    unmount_one_archive, watch_archive_index,
+    PersistedArchive, PlatformAssignmentChange, ScanPersistSummary, WatchRebuildSummary,
+    build_and_write_archive_index, canonical_platform_names, check_archive_index_freshness,
+    check_database_health, clean_mount_root, cleanup_selected_mount_dir, current_archive_info,
+    current_archive_stats, current_statuses, default_database_path, default_index_path,
+    find_archive_index_entries, latest_schema_version, mount_archives, mount_one_archive,
+    read_default_archive_index, run_config_check_default, run_doctor_default, scan_and_persist,
+    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
 };
 use serde::Serialize;
 
@@ -288,6 +288,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_entries_json(&matches)?;
             } else {
                 print_library_find_results(&query, &matches);
+            }
+        }
+        "library-set-platform" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let custom = extract_flag(&mut input_args, "--custom");
+            let id = extract_id_flag(&mut input_args)?;
+            let path = extract_path_flag(&mut input_args)?;
+            let Some(platform) = input_args.pop() else {
+                return Err(
+                    "library-set-platform requires a platform, e.g. archivefs-cli library-set-platform \"007 Legends\" Xbox360 (or --id <id> Xbox360, or --path <path> Xbox360)"
+                        .into(),
+                );
+            };
+            let selector = resolve_target_selector("library-set-platform", id, path, input_args)?;
+            let platform = resolve_platform_argument(platform, custom)?;
+            let database_path = default_database_path()?;
+            let change = run_library_set_platform(&database_path, &selector, &platform)?;
+            if json {
+                print_library_platform_change_json(&change)?;
+            } else {
+                print_library_platform_change("Set Platform", &change);
+            }
+        }
+        "library-clear-platform" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let id = extract_id_flag(&mut input_args)?;
+            let path = extract_path_flag(&mut input_args)?;
+            let selector = resolve_target_selector("library-clear-platform", id, path, input_args)?;
+            let database_path = default_database_path()?;
+            let change = run_library_clear_platform(&database_path, &selector)?;
+            if json {
+                print_library_platform_change_json(&change)?;
+            } else {
+                print_library_platform_change("Clear Platform", &change);
             }
         }
         "clean" => {
@@ -709,8 +745,15 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
 
 /// One archive as shown by `library-list`/`library-find`: a display-ready
 /// reshaping of [`PersistedArchive`] with just the fields those commands
-/// need (path, platform, present/missing, size, modified time), not the
-/// full persisted row (database id, normalized name, cached health, ...).
+/// (and `library-set-platform`/`library-clear-platform`'s query
+/// resolution - see `select_one_library_entry`) need, not the full
+/// persisted row (normalized name, cached health, ...).
+///
+/// `id` is the archive's stable persisted database id: the identity
+/// `library-set-platform --id`/`library-clear-platform --id` target
+/// directly, and the exact selection a query is required to narrow down
+/// to before either command acts (see `resolve_library_target`) - never
+/// a lossy display string.
 ///
 /// `path` serializes via `Path::display` (see `serialize_path_display`)
 /// rather than `PathBuf`'s own `Serialize` impl, which requires valid
@@ -722,9 +765,11 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
 /// this crate already uses for `library-find`'s search matching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct LibraryArchiveView {
+    id: i64,
     #[serde(serialize_with = "serialize_path_display")]
     path: PathBuf,
     platform: Option<String>,
+    platform_source: Option<String>,
     present: bool,
     size_bytes: Option<u64>,
     modified_time_unix_seconds: Option<i64>,
@@ -737,11 +782,65 @@ fn serialize_path_display<S: serde::Serializer>(
     serializer.serialize_str(&path.display().to_string())
 }
 
+/// Formats a platform assignment for human display as `"<platform>
+/// (<provenance>)"`, or `"Unknown"` when there is none. `platform` and
+/// `platform_source` are `None` together or not at all (see
+/// [`PersistedArchive::platform_source`]) - `(None, None)` and any
+/// otherwise-inconsistent combination both fall back to `"Unknown"`
+/// rather than panicking or fabricating a value.
+fn format_platform_and_source(platform: Option<&str>, source: Option<&str>) -> String {
+    match (platform, source) {
+        (Some(platform), Some(source)) => format!("{platform} ({source})"),
+        _ => "Unknown".to_string(),
+    }
+}
+
+/// Matches `input` against [`canonical_platform_names`] case-insensitively,
+/// returning the one canonical spelling to actually store (never
+/// whatever casing the user typed) - so `xbox360`, `Xbox360`, and
+/// `XBOX360` all resolve to the same stored value, and the database
+/// never accumulates casing variants of the same platform. `None` means
+/// no canonical platform matches at all (the `--custom` escape hatch is
+/// the only way to store such a value).
+fn resolve_canonical_platform_spelling(input: &str) -> Option<&'static str> {
+    canonical_platform_names()
+        .into_iter()
+        .find(|canonical| canonical.eq_ignore_ascii_case(input))
+}
+
+/// `library-set-platform`'s platform-argument resolution, factored out
+/// so it is directly testable (mirrors this file's existing convention
+/// of factoring `run()` match-arm logic into a plain function rather
+/// than testing `run()` itself - see `resolve_library_target`,
+/// `resolve_target_selector`). `--custom` stores `platform` exactly as
+/// typed; otherwise it must case-insensitively match a canonical name,
+/// and the canonical spelling (not the user's casing) is what gets
+/// stored.
+fn resolve_platform_argument(
+    platform: String,
+    custom: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if custom {
+        return Ok(platform);
+    }
+    resolve_canonical_platform_spelling(&platform)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "unsupported platform '{platform}'. Must be one of: {}. Pass --custom to assign free-form platform text.",
+                canonical_platform_names().join(", ")
+            )
+            .into()
+        })
+}
+
 impl From<&PersistedArchive> for LibraryArchiveView {
     fn from(archive: &PersistedArchive) -> Self {
         Self {
+            id: archive.id,
             path: archive.absolute_path.clone(),
             platform: archive.platform.clone(),
+            platform_source: archive.platform_source.clone(),
             present: archive.last_verified_missing_at.is_none(),
             size_bytes: archive.size_bytes,
             modified_time_unix_seconds: archive.modified_time_unix_seconds,
@@ -836,10 +935,11 @@ fn format_library_entries_json(
 fn format_library_entries(entries: &[LibraryArchiveView]) -> String {
     let mut output = String::new();
     for entry in entries {
+        output.push_str(&format!("  Id: {}\n", entry.id));
         output.push_str(&format!("  Path: {}\n", entry.path.display()));
         output.push_str(&format!(
             "  Platform: {}\n",
-            entry.platform.as_deref().unwrap_or("Unknown")
+            format_platform_and_source(entry.platform.as_deref(), entry.platform_source.as_deref())
         ));
         output.push_str(&format!(
             "  State: {}\n",
@@ -862,6 +962,246 @@ fn format_library_entries(entries: &[LibraryArchiveView]) -> String {
         output.push('\n');
     }
     output
+}
+
+/// The result of one `library-set-platform`/`library-clear-platform`
+/// call: the archive's display path plus [`PlatformAssignmentChange`]'s
+/// old/new platform and provenance, exactly what requirement 3 asks
+/// these commands to show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LibraryPlatformChangeView {
+    #[serde(serialize_with = "serialize_path_display")]
+    path: PathBuf,
+    old_platform: Option<String>,
+    old_source: Option<String>,
+    new_platform: Option<String>,
+    new_source: Option<String>,
+}
+
+impl LibraryPlatformChangeView {
+    fn new(path: PathBuf, change: PlatformAssignmentChange) -> Self {
+        Self {
+            path,
+            old_platform: change.old_platform,
+            old_source: change.old_source,
+            new_platform: change.new_platform,
+            new_source: change.new_source,
+        }
+    }
+}
+
+/// How `library-set-platform`/`library-clear-platform` select the one
+/// archive to act on - see [`resolve_library_target`]. Exactly one of
+/// these three ways is used per invocation, never a combination (see
+/// [`resolve_target_selector`], which enforces this from the parsed
+/// command-line flags).
+enum LibraryTargetSelector {
+    /// The stable persisted archive id - unambiguous by construction
+    /// (requirement 2: "a stable persisted archive ID where safer").
+    Id(i64),
+    /// The archive's exact absolute path ([`PersistedArchive::absolute_path`]),
+    /// compared exactly as parsed, never a lossy display string
+    /// (requirement 2: "the existing exact database identity").
+    Path(PathBuf),
+    /// A free-text query, matched exactly like `library-find`
+    /// ([`filter_library_entries`]) - see [`select_one_library_entry`]
+    /// for how more than one match is handled.
+    Query(String),
+}
+
+/// Resolves exactly one archive for `library-set-platform`/
+/// `library-clear-platform` to act on, and the open [`Database`] handle
+/// to act with. Every database write these two commands perform goes
+/// through the returned entry's `id`, never a lossy display string.
+fn resolve_library_target(
+    database_path: &Path,
+    selector: &LibraryTargetSelector,
+) -> Result<(Database, LibraryArchiveView), Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err(format!(
+            "No library database found at {}. Run: archivefs-cli library-scan",
+            database_path.display()
+        )
+        .into());
+    }
+    let database = Database::open_or_create(database_path)?;
+    let entries: Vec<LibraryArchiveView> = database
+        .load_archives()?
+        .iter()
+        .map(LibraryArchiveView::from)
+        .collect();
+
+    let target = match selector {
+        LibraryTargetSelector::Id(id) => entries
+            .into_iter()
+            .find(|entry| entry.id == *id)
+            .ok_or_else(|| format!("no archive found with id {id}"))?,
+        LibraryTargetSelector::Path(path) => entries
+            .into_iter()
+            .find(|entry| &entry.path == path)
+            .ok_or_else(|| format!("no archive found with exact path {}", path.display()))?,
+        LibraryTargetSelector::Query(query) => select_one_library_entry(&entries, query)?,
+    };
+    Ok((database, target))
+}
+
+/// Builds the one [`LibraryTargetSelector`] a `library-set-platform`/
+/// `library-clear-platform` invocation uses, from its already-extracted
+/// `--id`/`--path` flags and whatever positional query words remain.
+/// Exactly one selection method is required: giving both `--id` and
+/// `--path`, or giving a flag plus leftover query words, is a clear
+/// error rather than a silent "first one wins" guess.
+fn resolve_target_selector(
+    command: &str,
+    id: Option<i64>,
+    path: Option<PathBuf>,
+    remaining_query_args: Vec<String>,
+) -> Result<LibraryTargetSelector, Box<dyn std::error::Error>> {
+    match (id, path) {
+        (Some(_), Some(_)) => Err("--id and --path cannot both be given".into()),
+        (Some(id), None) => {
+            if remaining_query_args.is_empty() {
+                Ok(LibraryTargetSelector::Id(id))
+            } else {
+                Err(format!("{command} --id <id> takes no additional query arguments").into())
+            }
+        }
+        (None, Some(path)) => {
+            if remaining_query_args.is_empty() {
+                Ok(LibraryTargetSelector::Path(path))
+            } else {
+                Err(format!("{command} --path <path> takes no additional query arguments").into())
+            }
+        }
+        (None, None) => {
+            if remaining_query_args.is_empty() {
+                Err(format!("{command} requires a query, --id <id>, or --path <path>").into())
+            } else {
+                Ok(LibraryTargetSelector::Query(remaining_query_args.join(" ")))
+            }
+        }
+    }
+}
+
+/// Matches `query` against `entries` exactly like `library-find`
+/// ([`filter_library_entries`]), then requires the result to be exactly
+/// one archive: zero matches and more than one match are both clear
+/// errors (never a silent guess), so `library-set-platform`/
+/// `library-clear-platform` can never act on the wrong archive or more
+/// than one archive from an imprecise query. An ambiguous match lists
+/// every candidate with its id, so the caller can immediately retry with
+/// `--id <id>`.
+fn select_one_library_entry(
+    entries: &[LibraryArchiveView],
+    query: &str,
+) -> Result<LibraryArchiveView, Box<dyn std::error::Error>> {
+    let mut matches = filter_library_entries(entries, query);
+    match matches.len() {
+        0 => Err(format!("no archive matched '{query}'").into()),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let mut message = format!("multiple archives matched '{query}':\n");
+            for entry in &matches {
+                message.push_str(&format!("  [id {}] {}\n", entry.id, entry.path.display()));
+            }
+            message.push_str("Re-run with --id <id> to select exactly one archive.");
+            Err(message.into())
+        }
+    }
+}
+
+/// `library-set-platform`'s testable core: resolves the target archive,
+/// then sets `platform` as its manual assignment. See
+/// [`resolve_library_target`] for how `selector` picks the archive, and
+/// [`Database::set_manual_platform`] for the precedence this assignment
+/// gets over automatic detection.
+fn run_library_set_platform(
+    database_path: &Path,
+    selector: &LibraryTargetSelector,
+    platform: &str,
+) -> Result<LibraryPlatformChangeView, Box<dyn std::error::Error>> {
+    let (mut database, target) = resolve_library_target(database_path, selector)?;
+    let change = database.set_manual_platform(target.id, platform)?;
+    Ok(LibraryPlatformChangeView::new(target.path, change))
+}
+
+/// `library-clear-platform`'s testable core: resolves the target archive,
+/// then clears its manual assignment, if it has one - see
+/// [`Database::clear_manual_platform`] for the no-op behavior when it
+/// does not, and for how the latest automatic result becomes current
+/// again immediately (no rescan needed).
+fn run_library_clear_platform(
+    database_path: &Path,
+    selector: &LibraryTargetSelector,
+) -> Result<LibraryPlatformChangeView, Box<dyn std::error::Error>> {
+    let (mut database, target) = resolve_library_target(database_path, selector)?;
+    let change = database.clear_manual_platform(target.id)?;
+    Ok(LibraryPlatformChangeView::new(target.path, change))
+}
+
+/// Removes every occurrence of `flag` from `args`, returning whether it
+/// was present. Shared by `--json`, and `--custom`.
+fn extract_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let had_flag = args.iter().any(|arg| arg == flag);
+    args.retain(|arg| arg != flag);
+    had_flag
+}
+
+/// Removes `--id <value>` from `args` if present, returning the parsed
+/// id - the stable persisted archive id `library-set-platform`/
+/// `library-clear-platform` accept as an unambiguous alternative to a
+/// text query (see requirement 2: "or a stable persisted archive ID
+/// where safer").
+fn extract_id_flag(args: &mut Vec<String>) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    let Some(position) = args.iter().position(|arg| arg == "--id") else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err("--id requires a value".into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    value
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("--id value '{value}' is not a valid archive id").into())
+}
+
+/// Removes `--path <value>` from `args` if present, returning the parsed
+/// path unchanged (exact bytes, no normalization or lossy conversion) -
+/// the exact-path alternative to `--id`/a text query (requirement 2).
+fn extract_path_flag(
+    args: &mut Vec<String>,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let Some(position) = args.iter().position(|arg| arg == "--path") else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err("--path requires a value".into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(PathBuf::from(value)))
+}
+
+fn print_library_platform_change(action: &str, change: &LibraryPlatformChangeView) {
+    println!("ArchiveFS Library {action}");
+    println!("Path: {}", change.path.display());
+    println!(
+        "Old platform: {}",
+        format_platform_and_source(change.old_platform.as_deref(), change.old_source.as_deref())
+    );
+    println!(
+        "New platform: {}",
+        format_platform_and_source(change.new_platform.as_deref(), change.new_source.as_deref())
+    );
+}
+
+fn print_library_platform_change_json(
+    change: &LibraryPlatformChangeView,
+) -> Result<(), serde_json::Error> {
+    println!("{}", serde_json::to_string_pretty(change)?);
+    Ok(())
 }
 
 fn print_cleaned_dirs(paths: &[std::path::PathBuf]) {
@@ -1244,6 +1584,10 @@ fn print_help() {
     println!("  library-scan   Scan configured source folders into the library database");
     println!("  library-list   List archives from the library database (no rescan)");
     println!("  library-find   Search the library database by path or platform");
+    println!(
+        "  library-set-platform   Manually assign an archive's platform (outranks automatic detection)"
+    );
+    println!("  library-clear-platform Clear a manual platform assignment");
     println!();
     println!("Examples:");
     println!("  archivefs doctor");
@@ -1254,6 +1598,10 @@ fn print_help() {
     println!("  archivefs library-scan");
     println!("  archivefs library-list");
     println!("  archivefs library-find \"007 Legends\"");
+    println!("  archivefs library-set-platform \"Luigi's Mansion\" GameCube");
+    println!("  archivefs library-set-platform --id 42 GameCube");
+    println!("  archivefs library-set-platform --path /roms/n64/Luigis_Mansion.zip GameCube");
+    println!("  archivefs library-clear-platform \"Luigi's Mansion\"");
     println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
     println!("  archivefs mount-one \"007 Legends\"");
@@ -1270,6 +1618,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::MANUAL_PLATFORM_SOURCE;
 
     fn example_statuses() -> Vec<ArchiveStatus> {
         vec![
@@ -1994,8 +2343,10 @@ mod tests {
         let non_utf8_name =
             OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f, b'.', b'z', b'i', b'p']);
         let entry = LibraryArchiveView {
+            id: 1,
             path: PathBuf::from("/roms").join(&non_utf8_name),
             platform: Some("Unknown".to_string()),
+            platform_source: Some("heuristic-path-detector".to_string()),
             present: true,
             size_bytes: Some(10),
             modified_time_unix_seconds: Some(0),
@@ -2053,5 +2404,534 @@ mod tests {
         let mut output = format!("ArchiveFS Library Find\nQuery: {query}\n\n");
         output.push_str(&format_library_entries(entries));
         output
+    }
+
+    // -------------------------------------------------------------
+    // library-set-platform / library-clear-platform
+    // -------------------------------------------------------------
+
+    #[test]
+    fn library_set_platform_assigns_by_query() {
+        let root = temp_dir("set-platform-by-query");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let change = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("mystery".to_string()),
+            "GameCube",
+        )
+        .unwrap();
+
+        assert_eq!(change.old_platform, None);
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.new_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+        assert!(change.path.display().to_string().ends_with("mystery.zip"));
+
+        let entries = build_library_entries(&database_path).unwrap();
+        assert_eq!(entries[0].platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            entries[0].platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_assigns_by_exact_id_and_touches_only_that_row() {
+        let root = temp_dir("set-platform-by-id");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "collection-a/game.zip", b"a");
+        write_archive_file(&source, "collection-b/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path).unwrap();
+        let target_id = entries
+            .iter()
+            .find(|entry| entry.path.display().to_string().contains("collection-a"))
+            .unwrap()
+            .id;
+
+        run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Id(target_id),
+            "GameCube",
+        )
+        .unwrap();
+
+        let entries = build_library_entries(&database_path).unwrap();
+        let changed = entries.iter().find(|entry| entry.id == target_id).unwrap();
+        let untouched = entries.iter().find(|entry| entry.id != target_id).unwrap();
+        assert_eq!(changed.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            untouched.platform, None,
+            "only the exactly-selected archive may change"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_assigns_by_exact_path_and_touches_only_that_row() {
+        let root = temp_dir("set-platform-by-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let target_path = write_archive_file(&source, "collection-a/game.zip", b"a");
+        write_archive_file(&source, "collection-b/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Path(target_path.clone()),
+            "GameCube",
+        )
+        .unwrap();
+
+        let entries = build_library_entries(&database_path).unwrap();
+        let changed = entries
+            .iter()
+            .find(|entry| entry.path == target_path)
+            .unwrap();
+        let untouched = entries
+            .iter()
+            .find(|entry| entry.path != target_path)
+            .unwrap();
+        assert_eq!(changed.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            untouched.platform, None,
+            "only the exactly-selected archive may change"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_unknown_path_is_a_clear_error() {
+        let root = temp_dir("set-platform-unknown-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let error = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Path(PathBuf::from("/nowhere/does-not-exist.zip")),
+            "GameCube",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no archive found with exact path")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_ambiguous_query_changes_nothing() {
+        let root = temp_dir("set-platform-ambiguous");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "collection-a/game.zip", b"a");
+        write_archive_file(&source, "collection-b/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let error = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("game".to_string()),
+            "GameCube",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("multiple archives matched"));
+        assert!(error.to_string().contains("--id"));
+
+        let entries = build_library_entries(&database_path).unwrap();
+        assert!(
+            entries.iter().all(|entry| entry.platform.is_none()),
+            "an ambiguous query must leave every candidate untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_no_match_is_a_clear_error() {
+        let root = temp_dir("set-platform-no-match");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let error = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("nothing-will-match-this".to_string()),
+            "GameCube",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no archive matched"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_missing_database_is_a_clear_error() {
+        let root = temp_dir("set-platform-missing-database");
+        let database_path = root.join("library.sqlite3");
+
+        let error = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("anything".to_string()),
+            "GameCube",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("No library database found"));
+        assert!(error.to_string().contains("library-scan"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_unknown_id_is_a_clear_error() {
+        let root = temp_dir("set-platform-unknown-id");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let error = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Id(999_999),
+            "GameCube",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no archive found with id 999999")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_clear_platform_retires_a_manual_assignment() {
+        let root = temp_dir("clear-platform-retires");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("mystery".to_string()),
+            "GameCube",
+        )
+        .unwrap();
+
+        let change = run_library_clear_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("mystery".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(change.old_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.old_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+        assert_eq!(
+            change.new_platform, None,
+            "mystery.zip never had an automatic detection to fall back to"
+        );
+
+        let entries = build_library_entries(&database_path).unwrap();
+        assert_eq!(entries[0].platform, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_clear_platform_immediately_exposes_the_automatic_result() {
+        let root = temp_dir("clear-platform-exposes-automatic");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let target_id = build_library_entries(&database_path).unwrap()[0].id;
+        run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Id(target_id),
+            "GameCube",
+        )
+        .unwrap();
+
+        let change =
+            run_library_clear_platform(&database_path, &LibraryTargetSelector::Id(target_id))
+                .unwrap();
+
+        // No rescan anywhere in this test.
+        assert_eq!(change.old_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.new_platform.as_deref(), Some("MSX2"));
+        assert_eq!(change.new_source.as_deref(), Some("folder_alias"));
+        let entries = build_library_entries(&database_path).unwrap();
+        assert_eq!(entries[0].platform.as_deref(), Some("MSX2"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_clear_platform_by_id_is_a_no_op_when_not_manual() {
+        let root = temp_dir("clear-platform-not-manual");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let target_id = build_library_entries(&database_path).unwrap()[0].id;
+
+        let change =
+            run_library_clear_platform(&database_path, &LibraryTargetSelector::Id(target_id))
+                .unwrap();
+
+        assert_eq!(change.old_platform.as_deref(), Some("MSX2"));
+        assert_eq!(change.old_source.as_deref(), Some("folder_alias"));
+        assert_eq!(change.new_platform, change.old_platform);
+
+        let entries = build_library_entries(&database_path).unwrap();
+        assert_eq!(
+            entries[0].platform.as_deref(),
+            Some("MSX2"),
+            "a non-manual assignment must be untouched by clear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_target_selector_requires_exactly_one_selection_method() {
+        assert!(matches!(
+            resolve_target_selector("library-set-platform", Some(7), None, Vec::new()).unwrap(),
+            LibraryTargetSelector::Id(7)
+        ));
+        assert!(matches!(
+            resolve_target_selector(
+                "library-set-platform",
+                None,
+                Some(PathBuf::from("/a.zip")),
+                Vec::new()
+            )
+            .unwrap(),
+            LibraryTargetSelector::Path(path) if path == Path::new("/a.zip")
+        ));
+        assert!(matches!(
+            resolve_target_selector(
+                "library-set-platform",
+                None,
+                None,
+                vec!["query".to_string()]
+            )
+            .unwrap(),
+            LibraryTargetSelector::Query(query) if query == "query"
+        ));
+
+        assert!(
+            resolve_target_selector(
+                "library-set-platform",
+                Some(7),
+                Some(PathBuf::from("/a.zip")),
+                Vec::new()
+            )
+            .is_err(),
+            "--id and --path together must be rejected"
+        );
+        assert!(
+            resolve_target_selector("library-set-platform", None, None, Vec::new()).is_err(),
+            "no selector at all must be rejected"
+        );
+        assert!(
+            resolve_target_selector(
+                "library-set-platform",
+                Some(7),
+                None,
+                vec!["extra".to_string()]
+            )
+            .is_err(),
+            "--id plus leftover query words must be rejected"
+        );
+    }
+
+    #[test]
+    fn unsupported_platform_text_is_rejected_without_custom() {
+        let error = resolve_platform_argument("NotARealPlatform".to_string(), false).unwrap_err();
+        assert!(error.to_string().contains("unsupported platform"));
+        assert!(error.to_string().contains("--custom"));
+    }
+
+    #[test]
+    fn custom_flag_stores_unsupported_platform_text_exactly_as_typed() {
+        assert_eq!(
+            resolve_platform_argument("NotARealPlatform".to_string(), true).unwrap(),
+            "NotARealPlatform"
+        );
+    }
+
+    #[test]
+    fn platform_matching_is_case_insensitive_but_stores_one_canonical_spelling() {
+        for typed in ["gamecube", "GAMECUBE", "GameCube", "gAmEcUbE"] {
+            assert_eq!(
+                resolve_platform_argument(typed.to_string(), false).unwrap(),
+                "GameCube",
+                "{typed:?} must resolve to the canonical spelling"
+            );
+        }
+        // --custom bypasses canonical matching entirely, so casing is
+        // preserved exactly as typed.
+        assert_eq!(
+            resolve_platform_argument("gamecube".to_string(), true).unwrap(),
+            "gamecube"
+        );
+    }
+
+    #[test]
+    fn extract_id_flag_parses_removes_and_rejects_invalid_values() {
+        let mut args = vec!["--id".to_string(), "42".to_string(), "GameCube".to_string()];
+        assert_eq!(extract_id_flag(&mut args).unwrap(), Some(42));
+        assert_eq!(args, vec!["GameCube".to_string()]);
+
+        let mut args = vec!["GameCube".to_string()];
+        assert_eq!(extract_id_flag(&mut args).unwrap(), None);
+
+        let mut args = vec!["--id".to_string(), "not-a-number".to_string()];
+        assert!(extract_id_flag(&mut args).is_err());
+
+        let mut args = vec!["--id".to_string()];
+        assert!(extract_id_flag(&mut args).is_err());
+    }
+
+    #[test]
+    fn extract_path_flag_parses_removes_and_requires_a_value() {
+        let mut args = vec![
+            "--path".to_string(),
+            "/roms/game.zip".to_string(),
+            "GameCube".to_string(),
+        ];
+        assert_eq!(
+            extract_path_flag(&mut args).unwrap(),
+            Some(PathBuf::from("/roms/game.zip"))
+        );
+        assert_eq!(args, vec!["GameCube".to_string()]);
+
+        let mut args = vec!["GameCube".to_string()];
+        assert_eq!(extract_path_flag(&mut args).unwrap(), None);
+
+        let mut args = vec!["--path".to_string()];
+        assert!(extract_path_flag(&mut args).is_err());
+    }
+
+    #[test]
+    fn print_library_platform_change_shows_old_new_and_provenance() {
+        let change = LibraryPlatformChangeView {
+            path: PathBuf::from("/roms/n64/Luigis_Mansion.zip"),
+            old_platform: Some("N64".to_string()),
+            old_source: Some("folder_alias".to_string()),
+            new_platform: Some("GameCube".to_string()),
+            new_source: Some(MANUAL_PLATFORM_SOURCE.to_string()),
+        };
+
+        assert_eq!(
+            format_platform_and_source(
+                change.old_platform.as_deref(),
+                change.old_source.as_deref()
+            ),
+            "N64 (folder_alias)"
+        );
+        assert_eq!(
+            format_platform_and_source(
+                change.new_platform.as_deref(),
+                change.new_source.as_deref()
+            ),
+            "GameCube (manual)"
+        );
+    }
+
+    #[test]
+    fn library_set_platform_json_round_trips_expected_fields() {
+        let root = temp_dir("set-platform-json");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let change = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("mystery".to_string()),
+            "GameCube",
+        )
+        .unwrap();
+        let json = serde_json::to_string_pretty(&change).unwrap();
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+
+        assert!(parsed["path"].as_str().unwrap().ends_with("mystery.zip"));
+        assert_eq!(parsed["old_platform"], serde_json::Value::Null);
+        assert_eq!(parsed["new_platform"], "GameCube");
+        assert_eq!(parsed["new_source"], MANUAL_PLATFORM_SOURCE);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_platform_survives_a_rescan_via_the_cli_layer() {
+        // A CLI-layer confirmation of the same guarantee proven in depth
+        // in archivefs_core::database - manual assignment precedence is
+        // not something the CLI reimplements, only exposes.
+        let root = temp_dir("cli-manual-survives-rescan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "n64/Luigis_Mansion_[hexrom.com].zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial-scan").unwrap();
+
+        let change = run_library_set_platform(
+            &database_path,
+            &LibraryTargetSelector::Query("Luigis_Mansion".to_string()),
+            "GameCube",
+        )
+        .unwrap();
+        assert_eq!(change.old_platform.as_deref(), Some("N64"));
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+
+        run_library_scan(&config, &database_path, "rescan").unwrap();
+
+        let entries = build_library_entries(&database_path).unwrap();
+        assert_eq!(entries[0].platform.as_deref(), Some("GameCube"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

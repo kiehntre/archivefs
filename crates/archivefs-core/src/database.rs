@@ -484,8 +484,33 @@ pub struct PersistedArchive {
     /// database - i.e. `None` here - represents "unknown", not a
     /// sentinel string; see `platform_assignments` in the migration).
     pub platform: Option<String>,
+    /// The current platform assignment's provenance
+    /// (`platform_assignments.source`: `"heuristic-path-detector"`,
+    /// `"folder_alias"`, or [`MANUAL_PLATFORM_SOURCE`]), if any. `None`
+    /// exactly when `platform` is `None`.
+    pub platform_source: Option<String>,
     pub last_known_health: String,
     pub last_verified_missing_at: Option<String>,
+}
+
+/// The result of one [`Database::set_manual_platform`] or
+/// [`Database::clear_manual_platform`] call: the platform assignment
+/// immediately before and after, so callers (CLI/GUI) can show exactly
+/// what changed - old platform, new platform, and provenance - without a
+/// second query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformAssignmentChange {
+    pub old_platform: Option<String>,
+    pub old_source: Option<String>,
+    pub new_platform: Option<String>,
+    pub new_source: Option<String>,
+}
+
+fn split_assignment(assignment: Option<(String, String)>) -> (Option<String>, Option<String>) {
+    match assignment {
+        Some((platform, source)) => (Some(platform), Some(source)),
+        None => (None, None),
+    }
 }
 
 fn archive_kind_str(kind: ArchiveKind) -> &'static str {
@@ -506,21 +531,34 @@ fn db_error(context: &str, error: rusqlite::Error) -> ArchiveFsError {
     ArchiveFsError::Database(format!("{context}: {error}"))
 }
 
+/// The `platform_assignments.source` value for a manual (user-chosen)
+/// platform assignment - the highest-priority provenance recognised by
+/// [`provenance_priority`], so it can never be silently overwritten by a
+/// later scan's automatic detection. Set by [`Database::set_manual_platform`]
+/// and retired (without a replacement) by [`Database::clear_manual_platform`].
+pub const MANUAL_PLATFORM_SOURCE: &str = "manual";
+
 /// Relative strength of a `platform_assignments.source` value, used by
 /// [`Database::assign_platform`] to decide whether a new assignment may
-/// replace the current one. Only `"folder_alias"` (the generic
-/// folder-name fallback in `crate::detect_platform_with_provenance`) is
-/// weak: everything else - `"heuristic-path-detector"`, and any source
-/// string this build does not specifically recognize (a future
-/// `"manual"`/user-override source, for example) - is treated as at
-/// least as strong, so a folder guess can never quietly replace a
-/// stronger or manual assignment, while two assignments from the same
-/// tier can still freely replace each other (matching the existing
-/// heuristic-vs-heuristic reassignment behavior from before this
-/// function existed).
+/// replace the current one, in three tiers:
+///
+/// 1. `"folder_alias"` (the generic folder-name fallback in
+///    `crate::detect_platform_with_provenance`) - weakest, since it is
+///    the least specific signal.
+/// 2. Everything else this build does not specifically recognize,
+///    including `"heuristic-path-detector"` - the middle, "automatic
+///    detection" tier. Two assignments from this tier can still freely
+///    replace each other (matching the existing heuristic-vs-heuristic
+///    reassignment behavior from before three tiers existed).
+/// 3. [`MANUAL_PLATFORM_SOURCE`] - strongest: a deliberate user choice.
+///    Neither `"folder_alias"` nor `"heuristic-path-detector"` (nor
+///    anything else in tier 2) can ever silently replace it; only
+///    another manual assignment (via [`Database::set_manual_platform`])
+///    can.
 fn provenance_priority(source: &str) -> u8 {
     match source {
         "folder_alias" => 0,
+        MANUAL_PLATFORM_SOURCE => 2,
         _ => 1,
     }
 }
@@ -849,15 +887,45 @@ impl Database {
     /// every scan re-confirming the same guess.
     ///
     /// A new assignment whose `source` is *weaker* than the current
-    /// assignment's `source` (see [`provenance_priority`]) is also a
-    /// no-op: today this means a `"folder_alias"` guess can never replace
-    /// an existing assignment made any other way (including a future
-    /// manual/user-override source this build does not specifically
-    /// recognize - `provenance_priority` treats every unrecognized source
-    /// as strong, not weak, so it is never silently overwritten by a
-    /// folder guess either). Otherwise the previous current row (if any)
-    /// is flipped to not-current and a new row is inserted, preserving
-    /// full history.
+    /// assignment's `source` (see [`provenance_priority`]'s three tiers)
+    /// never becomes current: a `"folder_alias"` guess can never replace
+    /// an existing `"heuristic-path-detector"` or [`MANUAL_PLATFORM_SOURCE`]
+    /// assignment, and neither `"folder_alias"` nor
+    /// `"heuristic-path-detector"` can ever replace a manual assignment -
+    /// only [`Self::set_manual_platform`] can knowingly replace one
+    /// manual choice with another.
+    ///
+    /// While the current assignment is manual specifically, any automatic
+    /// result (`source` is not [`MANUAL_PLATFORM_SOURCE`]) is always
+    /// *recorded*, as a non-current row, rather than silently discarded -
+    /// checked first, unconditionally, before the "unchanged platform" or
+    /// priority checks below, so this applies even when `platform`
+    /// happens to already equal the current manual platform's text.
+    /// Discarding it instead would lose the true latest automatic
+    /// detection, and [`Self::clear_manual_platform`] would restore a
+    /// stale pre-manual result instead of it once the manual override is
+    /// removed. Recording is itself a no-op if it exactly matches the
+    /// most recent existing automatic row (by row id, not `assigned_at` -
+    /// a stable, collision-proof tiebreaker even when two rows share a
+    /// timestamp), so repeated scans reporting the same unchanged
+    /// automatic result never grow history. This shadow row is inserted
+    /// with `is_current = 0` directly - it never becomes current while
+    /// manual is active, even momentarily. Blocked results that lose to a
+    /// *non-manual* current assignment (`"folder_alias"` losing to
+    /// `"heuristic-path-detector"`, for example) are still a plain no-op:
+    /// nothing currently reads shadowed history for that case, and
+    /// recording every losing automatic guess there would grow history
+    /// unboundedly for no consumer.
+    ///
+    /// If `platform` already matches the current assignment, this is a
+    /// no-op, to avoid growing history with every scan re-confirming the
+    /// same guess. Otherwise (the new source is not weaker than the
+    /// current one) the previous current row (if any) is flipped to
+    /// not-current and a new row is inserted, preserving full history.
+    /// This method is what every scan calls (via [`scan_and_persist`]) -
+    /// a deliberate user override goes through
+    /// [`Self::set_manual_platform`]/[`Self::clear_manual_platform`]
+    /// instead, never this one directly.
     pub fn assign_platform(
         &mut self,
         archive_id: i64,
@@ -879,6 +947,18 @@ impl Database {
             .map_err(|error| db_error("failed to look up current platform assignment", error))?;
 
         if let Some((current_platform, current_source)) = &current {
+            // Checked first, and unconditionally (even if `platform`
+            // happens to equal `current_platform`): while manual is
+            // current, any automatic result must be shadow-recorded so
+            // `clear_manual_platform` always exposes the true latest
+            // automatic state, never a stale pre-manual one - including
+            // the case where the latest automatic result now
+            // coincidentally matches the manual platform's text, which
+            // would otherwise hit the "no-op if unchanged" check below
+            // and never get recorded at all.
+            if current_source == MANUAL_PLATFORM_SOURCE && source != MANUAL_PLATFORM_SOURCE {
+                return self.record_shadow_automatic_assignment(archive_id, platform, source);
+            }
             if current_platform == platform {
                 return Ok(());
             }
@@ -905,6 +985,266 @@ impl Database {
         tx.commit()
             .map_err(|error| db_error("failed to commit assign_platform", error))?;
         Ok(())
+    }
+
+    /// Records `platform`/`source` as a non-current historical row for
+    /// `archive_id` - the "remember the true latest automatic result even
+    /// though a manual assignment currently outranks it" step of
+    /// [`Self::assign_platform`]. A no-op if it exactly matches the most
+    /// recent existing non-manual row already (ordered by row id, the
+    /// stable tiebreaker), so this never grows history for an unchanged
+    /// repeated scan result. Never touches `is_current` for any row - the
+    /// currently-active manual assignment is left completely alone.
+    fn record_shadow_automatic_assignment(
+        &mut self,
+        archive_id: i64,
+        platform: &str,
+        source: &str,
+    ) -> Result<()> {
+        let latest_automatic: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT platform, source FROM platform_assignments \
+                 WHERE archive_id = ?1 AND source != ?2 \
+                 ORDER BY id DESC LIMIT 1",
+                params![archive_id, MANUAL_PLATFORM_SOURCE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                db_error(
+                    "failed to look up latest shadow automatic assignment",
+                    error,
+                )
+            })?;
+        if latest_automatic
+            .as_ref()
+            .is_some_and(|(latest_platform, latest_source)| {
+                latest_platform == platform && latest_source == source
+            })
+        {
+            return Ok(());
+        }
+
+        self.connection
+            .execute(
+                "INSERT INTO platform_assignments (archive_id, platform, source, is_current, assigned_at) \
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params![archive_id, platform, source, now_utc_string()],
+            )
+            .map_err(|error| db_error("failed to record shadow automatic assignment", error))?;
+        Ok(())
+    }
+
+    /// Reads `archive_id`'s current (`is_current = 1`) platform assignment,
+    /// if any - the shared read step behind [`Self::set_manual_platform`]
+    /// and [`Self::clear_manual_platform`].
+    fn current_platform_assignment(&self, archive_id: i64) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT platform, source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to look up current platform assignment", error))
+    }
+
+    /// Looks up the current `archives.id` for the archive whose
+    /// `absolute_path_cached` exactly matches `path` (exact bytes - never
+    /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).
+    /// `absolute_path_cached` is not itself the identity SQLite enforces
+    /// uniqueness on (that is `(source_folder_id, relative_path)` - see
+    /// the migration), but is derived from it and kept in sync by every
+    /// [`Self::upsert_archive`] call, so in practice it is unique too;
+    /// this still defensively errors rather than guessing if more than
+    /// one row somehow matches, instead of silently acting on the wrong
+    /// archive. `Ok(None)` means no persisted archive has this path -
+    /// not yet scanned into the library database, for example.
+    pub fn find_archive_id_by_absolute_path(&self, path: &Path) -> Result<Option<i64>> {
+        let path_bytes = path.as_os_str().as_bytes();
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id FROM archives WHERE absolute_path_cached = ?1")
+            .map_err(|error| db_error("failed to prepare archive path lookup", error))?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![path_bytes], |row| row.get(0))
+            .map_err(|error| db_error("failed to look up archive by path", error))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| db_error("failed to read archive path lookup", error))?;
+
+        match ids.len() {
+            0 => Ok(None),
+            1 => Ok(Some(ids[0])),
+            _ => Err(ArchiveFsError::Database(format!(
+                "{} matches more than one archive row - this indicates a data inconsistency",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Sets `platform` as a manual, user-chosen platform assignment for
+    /// `archive_id` - the highest-priority provenance
+    /// ([`MANUAL_PLATFORM_SOURCE`], see [`provenance_priority`]), so a
+    /// later scan's automatic detection (`"heuristic-path-detector"` or
+    /// `"folder_alias"`, via [`Self::assign_platform`]) can never
+    /// silently overwrite it. Unlike `assign_platform`, this is a direct,
+    /// deliberate user action: it is never blocked by provenance priority
+    /// (manual is already the highest tier, and this call is itself how a
+    /// user replaces one manual choice with another) - it only no-ops
+    /// when `platform` already matches the current manual assignment
+    /// exactly, to avoid growing history with a redundant re-confirmation.
+    ///
+    /// Returns the assignment immediately before and after this call, so
+    /// callers (CLI/GUI) can show exactly what changed without a second
+    /// query.
+    ///
+    /// Rejects `platform` if it is empty or whitespace-only (after
+    /// trimming) - the exact stored spelling is not otherwise normalized
+    /// (`--custom`/free-text callers get exactly what they typed), but an
+    /// effectively-blank value is never a meaningful manual choice and
+    /// would render as indistinguishable from "no assignment" everywhere
+    /// this is displayed. Enforced here, not just in the CLI/GUI layers
+    /// that currently call this, so every future caller gets the same
+    /// guarantee for free.
+    pub fn set_manual_platform(
+        &mut self,
+        archive_id: i64,
+        platform: &str,
+    ) -> Result<PlatformAssignmentChange> {
+        if platform.trim().is_empty() {
+            return Err(ArchiveFsError::Database(
+                "manual platform must not be empty or whitespace-only".to_string(),
+            ));
+        }
+
+        let current = self.current_platform_assignment(archive_id)?;
+        let (old_platform, old_source) = split_assignment(current);
+
+        if old_platform.as_deref() == Some(platform)
+            && old_source.as_deref() == Some(MANUAL_PLATFORM_SOURCE)
+        {
+            return Ok(PlatformAssignmentChange {
+                old_platform: old_platform.clone(),
+                old_source: old_source.clone(),
+                new_platform: old_platform,
+                new_source: old_source,
+            });
+        }
+
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|error| db_error("failed to start set_manual_platform transaction", error))?;
+        tx.execute(
+            "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1",
+            params![archive_id],
+        )
+        .map_err(|error| db_error("failed to retire previous platform assignment", error))?;
+        tx.execute(
+            "INSERT INTO platform_assignments (archive_id, platform, source, is_current, assigned_at) \
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![archive_id, platform, MANUAL_PLATFORM_SOURCE, now_utc_string()],
+        )
+        .map_err(|error| db_error("failed to insert manual platform assignment", error))?;
+        tx.commit()
+            .map_err(|error| db_error("failed to commit set_manual_platform", error))?;
+
+        Ok(PlatformAssignmentChange {
+            old_platform,
+            old_source,
+            new_platform: Some(platform.to_string()),
+            new_source: Some(MANUAL_PLATFORM_SOURCE.to_string()),
+        })
+    }
+
+    /// Clears a manual platform assignment for `archive_id`: retires the
+    /// current (manual) row and, in the same transaction, immediately
+    /// restores the most recent automatic assignment still in history
+    /// (any row whose `source` is not [`MANUAL_PLATFORM_SOURCE`]) as
+    /// current again - the exact same historical row, not a fresh
+    /// duplicate, so history does not grow just from toggling manual on
+    /// and off. This is what makes the latest automatic result available
+    /// right away, without waiting for the next scan: a scan is only
+    /// ever needed to *discover a change*, never to make an
+    /// already-known automatic result current again.
+    ///
+    /// If no automatic assignment was ever recorded for this archive,
+    /// there is nothing to restore - it becomes current-less (`Unknown`)
+    /// until the next scan finds one, exactly as before.
+    ///
+    /// A no-op if there is no current assignment, or the current
+    /// assignment is not manual: this never touches an assignment made a
+    /// different way, mirroring `assign_platform`'s "never silently
+    /// overwrite or remove a non-matching provenance" philosophy. In
+    /// both the no-op and the actual-clear case, the returned
+    /// [`PlatformAssignmentChange`] reflects exactly what happened -
+    /// compare `old_source` to `Some(MANUAL_PLATFORM_SOURCE)` to tell
+    /// them apart.
+    pub fn clear_manual_platform(&mut self, archive_id: i64) -> Result<PlatformAssignmentChange> {
+        let current = self.current_platform_assignment(archive_id)?;
+        let (old_platform, old_source) = split_assignment(current);
+
+        if old_source.as_deref() != Some(MANUAL_PLATFORM_SOURCE) {
+            return Ok(PlatformAssignmentChange {
+                old_platform: old_platform.clone(),
+                old_source: old_source.clone(),
+                new_platform: old_platform,
+                new_source: old_source,
+            });
+        }
+
+        let latest_automatic: Option<(i64, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT id, platform, source FROM platform_assignments \
+                 WHERE archive_id = ?1 AND source != ?2 \
+                 ORDER BY id DESC LIMIT 1",
+                params![archive_id, MANUAL_PLATFORM_SOURCE],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                db_error(
+                    "failed to look up latest automatic platform assignment",
+                    error,
+                )
+            })?;
+
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error("failed to start clear_manual_platform transaction", error)
+        })?;
+        tx.execute(
+            "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1",
+            params![archive_id],
+        )
+        .map_err(|error| db_error("failed to clear manual platform assignment", error))?;
+
+        let (new_platform, new_source) = match &latest_automatic {
+            Some((row_id, platform, source)) => {
+                tx.execute(
+                    "UPDATE platform_assignments SET is_current = 1 WHERE id = ?1",
+                    params![row_id],
+                )
+                .map_err(|error| {
+                    db_error(
+                        "failed to restore latest automatic platform assignment",
+                        error,
+                    )
+                })?;
+                (Some(platform.clone()), Some(source.clone()))
+            }
+            None => (None, None),
+        };
+        tx.commit()
+            .map_err(|error| db_error("failed to commit clear_manual_platform", error))?;
+
+        Ok(PlatformAssignmentChange {
+            old_platform,
+            old_source,
+            new_platform,
+            new_source,
+        })
     }
 
     /// Marks every `archives` row under `source_folder_id` that is not in
@@ -1029,7 +1369,7 @@ impl Database {
             .prepare(
                 "SELECT a.id, a.source_folder_id, a.relative_path, a.absolute_path_cached, \
                  a.archive_kind, a.display_name, a.normalized_name, a.size_bytes, \
-                 a.modified_time_unix_seconds, p.platform, a.last_known_health, \
+                 a.modified_time_unix_seconds, p.platform, p.source, a.last_known_health, \
                  a.last_verified_missing_at \
                  FROM archives a \
                  LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
@@ -1053,8 +1393,9 @@ impl Database {
                     size_bytes: size_bytes.map(|value| value as u64),
                     modified_time_unix_seconds: row.get(8)?,
                     platform: row.get(9)?,
-                    last_known_health: row.get(10)?,
-                    last_verified_missing_at: row.get(11)?,
+                    platform_source: row.get(10)?,
+                    last_known_health: row.get(11)?,
+                    last_verified_missing_at: row.get(12)?,
                 })
             })
             .map_err(|error| db_error("failed to query archives", error))?;
@@ -1838,6 +2179,54 @@ mod tests {
     }
 
     #[test]
+    fn manual_platform_survives_the_archive_going_missing_and_reappearing() {
+        // platform_assignments is keyed by the stable archives.id, never
+        // touched by mark_unseen_archives_missing or upsert_archive's
+        // Restored path - going missing and reappearing must not affect
+        // a manual assignment at all, since database identity
+        // (source_folder_id, relative_path) never changes.
+        let root = temp_dir("manual-survives-missing-and-restored");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        fs::remove_file(&archive_path).unwrap();
+        scan_and_persist(&mut database, &config, "scan-while-missing").unwrap();
+        let archives = database.load_archives().unwrap();
+        let missing_archive = find_archive(&archives, "mystery.zip");
+        assert!(missing_archive.last_verified_missing_at.is_some());
+        assert_eq!(missing_archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            missing_archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        fs::write(&archive_path, b"contents").unwrap();
+        scan_and_persist(&mut database, &config, "scan-after-restore").unwrap();
+        let archives = database.load_archives().unwrap();
+        let restored_archive = find_archive(&archives, "mystery.zip");
+        assert!(restored_archive.last_verified_missing_at.is_none());
+        assert_eq!(
+            restored_archive.id, archive_id,
+            "database identity must be unchanged"
+        );
+        assert_eq!(restored_archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            restored_archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn fail_scan_run_does_not_touch_archives() {
         let root = temp_dir("fail-scan-run-isolated");
         let source = root.join("source");
@@ -2092,11 +2481,11 @@ mod tests {
         let archives = database.load_archives().unwrap();
         let archive_id = find_archive(&archives, "msx2/game.zip").id;
 
-        // Simulate a stronger correction - a hypothetical future "manual"
-        // source is exactly the kind of assignment provenance_priority
-        // must never let a folder guess quietly replace.
+        // A manual assignment is exactly the kind of assignment
+        // provenance_priority must never let a folder guess quietly
+        // replace.
         database
-            .assign_platform(archive_id, Some("CustomPlatform"), "manual")
+            .set_manual_platform(archive_id, "CustomPlatform")
             .unwrap();
 
         // A later folder_alias guess - even one that disagrees - must be
@@ -2108,16 +2497,10 @@ mod tests {
         let archives = database.load_archives().unwrap();
         let archive = find_archive(&archives, "msx2/game.zip");
         assert_eq!(archive.platform.as_deref(), Some("CustomPlatform"));
-
-        let source_column: String = database
-            .connection
-            .query_row(
-                "SELECT source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
-                params![archive.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(source_column, "manual");
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2148,6 +2531,702 @@ mod tests {
         let archives = database.load_archives().unwrap();
         let archive = find_archive(&archives, "msx2/game.zip");
         assert_eq!(archive.platform.as_deref(), Some("Corrected"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------
+    // Manual platform assignment.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_manual_platform_creates_a_new_manual_assignment() {
+        let root = temp_dir("set-manual-platform-new");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+
+        let change = database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        assert_eq!(change.old_platform, None);
+        assert_eq!(change.old_source, None);
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.new_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_manual_platform_rejects_empty_or_whitespace_only_text() {
+        let root = temp_dir("set-manual-platform-empty");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+
+        assert!(database.set_manual_platform(archive_id, "").is_err());
+        assert!(database.set_manual_platform(archive_id, "   ").is_err());
+        assert!(database.set_manual_platform(archive_id, "\t\n").is_err());
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "mystery.zip").platform,
+            None,
+            "a rejected empty/whitespace platform must not be stored"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_manual_platform_replaces_one_manual_assignment_with_another() {
+        let root = temp_dir("set-manual-platform-replace");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database.set_manual_platform(archive_id, "N64").unwrap();
+
+        let change = database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        assert_eq!(change.old_platform.as_deref(), Some("N64"));
+        assert_eq!(change.old_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.new_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 2,
+            "both manual assignments must remain in history, only one current"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_manual_platform_with_the_same_value_is_a_no_op() {
+        let root = temp_dir("set-manual-platform-idempotent");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 1,
+            "re-confirming the same manual platform must not grow history"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clear_manual_platform_retires_it_cleanly() {
+        let root = temp_dir("clear-manual-platform");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+
+        assert_eq!(change.old_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.old_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+        assert_eq!(change.new_platform, None);
+        assert_eq!(change.new_source, None);
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert_eq!(
+            archive.platform, None,
+            "clearing manual must leave no current assignment, not a sentinel"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clearing_manual_immediately_restores_the_latest_automatic_result_without_a_rescan() {
+        let root = temp_dir("clear-manual-immediate-restore");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "msx2/game.zip").id;
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "msx2/game.zip")
+                .platform
+                .as_deref(),
+            Some("MSX2")
+        );
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+
+        // No `scan_and_persist` call anywhere in this test - the automatic
+        // result must be current immediately from the clear call alone.
+        assert_eq!(change.new_platform.as_deref(), Some("MSX2"));
+        assert_eq!(change.new_source.as_deref(), Some("folder_alias"));
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("MSX2"));
+        assert_eq!(archive.platform_source.as_deref(), Some("folder_alias"));
+
+        // The restored row is the original history entry, not a fresh
+        // duplicate - only 2 rows total (folder_alias + manual).
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_count, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clear_manual_platform_is_a_no_op_when_current_assignment_is_not_manual() {
+        let root = temp_dir("clear-manual-platform-not-manual");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "msx2/game.zip").id;
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+
+        assert_eq!(change.old_platform.as_deref(), Some("MSX2"));
+        assert_eq!(change.old_source.as_deref(), Some("folder_alias"));
+        assert_eq!(
+            change.new_platform, change.old_platform,
+            "a no-op clear must report the unchanged state as both old and new"
+        );
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(
+            archive.platform.as_deref(),
+            Some("MSX2"),
+            "the existing folder_alias assignment must be untouched"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_manual_assignment_is_not_overwritten_by_automatic_heuristic_detection() {
+        let root = temp_dir("manual-outranks-heuristic");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "007 Legends.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "007 Legends.zip").id;
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "007 Legends.zip")
+                .platform
+                .as_deref(),
+            Some("Xbox360"),
+            "sanity check: the title heuristic detects Xbox360 before any manual correction"
+        );
+
+        database.set_manual_platform(archive_id, "PC").unwrap();
+
+        // Before this task, "heuristic-path-detector" and "manual" shared
+        // the same priority tier, so this call would have silently won -
+        // it must now be blocked exactly like a folder_alias guess is.
+        database
+            .assign_platform(archive_id, Some("Xbox360"), "heuristic-path-detector")
+            .unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "007 Legends.zip");
+        assert_eq!(archive.platform.as_deref(), Some("PC"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rescan_with_no_detected_platform_still_preserves_manual_platform() {
+        // An archive with no filename hint and no platform folder - a
+        // scan never detects anything for it (`platform: None`), which
+        // `assign_platform` treats as "nothing to say", not "clear the
+        // existing assignment" - manual must survive every such rescan.
+        let root = temp_dir("manual-survives-undetected-rescan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "mystery.zip").platform,
+            None,
+            "sanity check: nothing is auto-detected for a filename with no hints"
+        );
+
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+        scan_and_persist(&mut database, &config, "rescan-1").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-2").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_archive_id_by_absolute_path_matches_exact_bytes_and_rejects_no_match() {
+        let root = temp_dir("find-archive-id-by-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let expected_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+
+        assert_eq!(
+            database
+                .find_archive_id_by_absolute_path(&archive_path)
+                .unwrap(),
+            Some(expected_id)
+        );
+        assert_eq!(
+            database
+                .find_archive_id_by_absolute_path(&source.join("does-not-exist.zip"))
+                .unwrap(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_archive_path_can_be_manually_assigned_on_unix() {
+        let root = temp_dir("manual-platform-non-utf8");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        fs::create_dir_all(&source).unwrap();
+        // "fo<invalid byte>o.zip" - never valid UTF-8 on its own.
+        let mut invalid_name = b"fo".to_vec();
+        invalid_name.push(0x80);
+        invalid_name.extend_from_slice(b"o.zip");
+        let archive_path = source.join(OsString::from_vec(invalid_name));
+        assert!(
+            archive_path.to_str().is_none(),
+            "test path must actually be invalid UTF-8"
+        );
+        fs::write(&archive_path, b"contents").unwrap();
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archive_id = database
+            .find_archive_id_by_absolute_path(&archive_path)
+            .unwrap()
+            .expect("the non-UTF-8 archive must have been scanned and found by exact path bytes");
+        let change = database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+
+        let archives = database.load_archives().unwrap();
+        let archive = archives
+            .iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.absolute_path, archive_path);
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clearing_manual_exposes_the_latest_automatic_result_even_when_it_changed_while_manual_was_active()
+     {
+        // Reproduction for the reported stale-automatic-detection flaw:
+        // 1. automatic A ("Xbox360", via a title heuristic).
+        // 2. manual M ("GameCube").
+        // 3. the *same* archive identity's automatic detection changes to
+        //    B ("Corrected") - simulated the same way the existing
+        //    `a_stronger_source_can_still_replace_an_existing_folder_alias_guess`
+        //    test simulates a later scan's detector disagreeing with an
+        //    earlier one, via a direct `assign_platform` call (real
+        //    end-to-end rescans cannot change platform detection for a
+        //    fixed identity, since path *is* the identity here - see
+        //    `rename_behaves_as_old_missing_plus_new_present`). While
+        //    manual is still current, B must never become current, but it
+        //    must still be recorded so it is not lost.
+        // 4. manual M must remain the effective/current platform.
+        // 5. clear the manual assignment.
+        // 6. the effective platform must become B ("Corrected"), not
+        //    stale A ("Xbox360").
+        let root = temp_dir("stale-automatic-clear");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "007 Legends.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "007 Legends.zip").id;
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "007 Legends.zip")
+                .platform
+                .as_deref(),
+            Some("Xbox360"),
+            "step 1: sanity check - automatic A is Xbox360"
+        );
+
+        // step 2: manual M.
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        // step 3: the automatic detector now reports B ("Corrected") for
+        // this same archive - blocked from becoming current by manual,
+        // but must still be recorded, not silently discarded.
+        database
+            .assign_platform(archive_id, Some("Corrected"), "heuristic-path-detector")
+            .unwrap();
+
+        // step 4: manual M must remain the effective/current platform -
+        // the automatic B must never become current while manual is active.
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "007 Legends.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        // step 5: clear the manual assignment.
+        let change = database.clear_manual_platform(archive_id).unwrap();
+
+        // step 6: the effective platform must become B ("Corrected"), not
+        // stale A ("Xbox360") - this is the crux of the reported flaw.
+        assert_eq!(
+            change.new_platform.as_deref(),
+            Some("Corrected"),
+            "clearing manual must expose the LATEST automatic result (B), \
+             not a stale pre-manual automatic result (A)"
+        );
+        assert_eq!(
+            change.new_source.as_deref(),
+            Some("heuristic-path-detector")
+        );
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "007 Legends.zip");
+        assert_eq!(archive.platform.as_deref(), Some("Corrected"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repeated_scans_with_the_same_shadow_automatic_value_do_not_duplicate_history() {
+        let root = temp_dir("stale-automatic-no-duplicate-history");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "n64/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "n64/game.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        // Three rescans in a row while manual is active, all reporting
+        // the same unchanged automatic guess (N64, from the folder) -
+        // must not grow history on every scan.
+        scan_and_persist(&mut database, &config, "rescan-1").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-2").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-3").unwrap();
+
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 2,
+            "folder_alias (N64, from the initial scan) + manual (GameCube) - \
+             three repeat scans reporting the same N64 guess must not add rows"
+        );
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+        assert_eq!(change.new_platform.as_deref(), Some("N64"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn automatic_result_coinciding_with_the_manual_platform_text_is_still_shadow_recorded() {
+        // A subtler variant of the same stale-automatic flaw: if the
+        // latest automatic result happens to share the same *text* as
+        // the current manual platform, the "no-op if platform is
+        // unchanged" fast path must not suppress recording it - clearing
+        // manual afterward must expose that coincidental match, not a
+        // stale earlier automatic guess.
+        let root = temp_dir("stale-automatic-coincidental-match");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery.zip").id;
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        // The automatic detector now reports "GameCube" too - the exact
+        // same text as the active manual assignment.
+        database
+            .assign_platform(archive_id, Some("GameCube"), "heuristic-path-detector")
+            .unwrap();
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+
+        assert_eq!(
+            change.new_platform.as_deref(),
+            Some("GameCube"),
+            "the coincidentally-matching automatic result must have been recorded, \
+             not silently dropped by the unchanged-platform fast path"
+        );
+        assert_eq!(
+            change.new_source.as_deref(),
+            Some("heuristic-path-detector")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clearing_manual_falls_back_to_the_last_known_automatic_result_when_a_rescan_detects_nothing()
+    {
+        // 1. automatic A.
+        // 2. manual M.
+        // 3. a rescan of this same identity reports no detected platform
+        //    at all (not even a weaker guess) - `assign_platform`'s
+        //    existing "`platform: None` is a no-op" rule (it never
+        //    overwrites or removes an existing assignment) already means
+        //    nothing at all is recorded for this scan.
+        // 4. clear manual.
+        // 5. the fallback is explicitly the last known automatic result
+        //    (A) - there is no newer automatic information to prefer.
+        let root = temp_dir("stale-automatic-nothing-detected");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "n64/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "n64/game.zip").id;
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "n64/game.zip")
+                .platform
+                .as_deref(),
+            Some("N64"),
+            "sanity check: automatic A is N64"
+        );
+        database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+
+        // step 3: the automatic detector reports nothing for this scan.
+        database
+            .assign_platform(archive_id, None, "heuristic-path-detector")
+            .unwrap();
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "n64/game.zip").platform.as_deref(),
+            Some("GameCube"),
+            "manual must remain current through a scan that detects nothing"
+        );
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+
+        assert_eq!(
+            change.new_platform.as_deref(),
+            Some("N64"),
+            "with nothing new detected, the explicit fallback is the last known automatic result"
+        );
+        assert_eq!(change.new_source.as_deref(), Some("folder_alias"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_gamecube_assignment_for_luigis_mansion_survives_rescan_and_automatic_detection() {
+        // Reproduces the exact scenario in requirement 6: a genuinely
+        // GameCube game misfiled under an "n64" folder (which the
+        // folder-alias fallback would otherwise confidently, and
+        // wrongly, detect as N64 on every scan).
+        let root = temp_dir("manual-platform-survives-rescan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "n64/Luigis_Mansion_[hexrom.com].zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive_id = find_archive(&archives, "n64/Luigis_Mansion_[hexrom.com].zip").id;
+        assert_eq!(
+            find_archive(&archives, "n64/Luigis_Mansion_[hexrom.com].zip")
+                .platform
+                .as_deref(),
+            Some("N64"),
+            "sanity check: folder_alias detects N64 before any manual correction"
+        );
+
+        let change = database
+            .set_manual_platform(archive_id, "GameCube")
+            .unwrap();
+        assert_eq!(change.old_platform.as_deref(), Some("N64"));
+        assert_eq!(change.old_source.as_deref(), Some("folder_alias"));
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.new_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+
+        // Rescan repeatedly - the folder still says n64/, so automatic
+        // detection keeps trying to reassign "N64" every time, and must
+        // keep losing to the manual assignment (proves both "folder_alias
+        // cannot overwrite manual" and "manual survives rescan").
+        scan_and_persist(&mut database, &config, "rescan-1").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-2").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "n64/Luigis_Mansion_[hexrom.com].zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        // Assignment history remains intact: the original folder_alias
+        // row from the initial scan is still present, only not current.
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 2,
+            "the original folder_alias row must remain in history, not be deleted"
+        );
+
+        // Clearing manual immediately restores the last known automatic
+        // result (N64, from the initial scan) - no rescan required.
+        let clear_change = database.clear_manual_platform(archive_id).unwrap();
+        assert_eq!(
+            clear_change.old_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+        assert_eq!(clear_change.new_platform.as_deref(), Some("N64"));
+        assert_eq!(clear_change.new_source.as_deref(), Some("folder_alias"));
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "n64/Luigis_Mansion_[hexrom.com].zip")
+                .platform
+                .as_deref(),
+            Some("N64"),
+            "the automatic result must be current immediately, before any rescan"
+        );
+
+        scan_and_persist(&mut database, &config, "rescan-after-clear").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "n64/Luigis_Mansion_[hexrom.com].zip");
+        assert_eq!(
+            archive.platform.as_deref(),
+            Some("N64"),
+            "clearing manual must let automatic detection resume"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

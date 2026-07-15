@@ -14,10 +14,12 @@ use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
     ArchiveStatus, ArchiveUnmountSession, CatalogueStats, CompletedScanSummary, Config,
     ConfigIdentity, Database, DatabaseHealth, DoctorReport, DoctorStatus, LazyUnmountCleanupResult,
-    MountOneOutcome, MountState, PersistedArchive, ScanPersistSummary, SetupDiagnosticStatus,
-    SetupDiagnostics, UnmountOneOutcome, check_database_health, cleanup_selected_mount_tree,
-    create_configured_mount_root_default, create_starter_config_default, default_config_path,
-    default_database_path, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    MANUAL_PLATFORM_SOURCE, MountOneOutcome, MountState, PersistedArchive,
+    PlatformAssignmentChange, ScanPersistSummary, SetupDiagnosticStatus, SetupDiagnostics,
+    UnmountOneOutcome, canonical_platform_names, check_database_health,
+    cleanup_selected_mount_tree, create_configured_mount_root_default,
+    create_starter_config_default, default_config_path, default_database_path,
+    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
     load_read_only_snapshot_default, mount_one_archive_path, remount_one_archive_path,
     run_setup_diagnostics_default, scan_and_persist, unmount_one_archive_path,
 };
@@ -47,6 +49,7 @@ enum ActivityAction {
     Diagnostics,
     Setup,
     LibraryDatabase,
+    PlatformAssignment,
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -63,6 +66,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Diagnostics => "Diagnostics",
             Self::Setup => "Setup",
             Self::LibraryDatabase => "Library database",
+            Self::PlatformAssignment => "Platform assignment",
         })
     }
 }
@@ -1230,6 +1234,29 @@ struct RunningSetupAction {
     receiver: Receiver<Result<String, String>>,
 }
 
+/// One manual platform assignment change requested from the selected
+/// archive's details panel - see `show_selected_archive`. Metadata-only:
+/// unlike mount/unmount, this never depends on `latest_generation_actions_safe`
+/// and is available for a cache-only/missing row exactly as for a live
+/// one, since it only ever touches the library database, never the
+/// filesystem or a mount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PlatformAction {
+    Set(String),
+    Clear,
+}
+
+struct RunningPlatformAction {
+    archive_path: PathBuf,
+    receiver: Receiver<Result<PlatformAssignmentChange, String>>,
+}
+
+/// Sentinel `platform_choice` value meaning "let the user type a custom
+/// platform" - the GUI's escape hatch, mirroring the CLI's `--custom`
+/// flag. Never itself sent as a platform value; `resolved_platform_choice`
+/// substitutes the free-text field's contents instead.
+const CUSTOM_PLATFORM_CHOICE: &str = "Custom...";
+
 struct ArchiveFsApp {
     state: LoadState,
     filter: String,
@@ -1264,6 +1291,9 @@ struct ArchiveFsApp {
     database_state: DatabaseState,
     database_generation: DatabaseGeneration,
     library_filters: LibraryRowFilters,
+    platform_action: Option<RunningPlatformAction>,
+    platform_choice: Option<String>,
+    platform_custom_text: String,
 }
 
 impl ArchiveFsApp {
@@ -1318,6 +1348,9 @@ impl ArchiveFsApp {
             snapshot_stale: false,
             refresh_generation: generation,
             snapshot_generation: None,
+            platform_action: None,
+            platform_choice: None,
+            platform_custom_text: String::new(),
         }
     }
 
@@ -1691,6 +1724,108 @@ impl ArchiveFsApp {
                         more_information: None,
                     });
                 }
+            }
+        }
+    }
+
+    /// Whether a new platform-assignment action may start: not already
+    /// running one, and not in the middle of a database load/scan (the
+    /// same "one database writer at a time" convention `start_database_action`'s
+    /// own UI already enforces by disabling its buttons while loading -
+    /// see `show_database_panel`). This never touches `is_busy()`/mount
+    /// safety - platform assignment is metadata-only and deliberately
+    /// independent of it.
+    fn platform_action_available(&self) -> bool {
+        self.platform_action.is_none() && !self.database_state.is_loading()
+    }
+
+    fn start_platform_action(
+        &mut self,
+        context: egui::Context,
+        archive_path: PathBuf,
+        action: PlatformAction,
+    ) {
+        if !self.platform_action_available() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::PlatformAssignment,
+            Some(archive_path.clone()),
+            ActivityOutcome::Started,
+            match &action {
+                PlatformAction::Set(platform) => format!("Setting platform to {platform}."),
+                PlatformAction::Clear => "Clearing manual platform.".to_string(),
+            },
+        ));
+        self.platform_action = Some(RunningPlatformAction {
+            archive_path: archive_path.clone(),
+            receiver,
+        });
+        thread::spawn(move || {
+            let result =
+                apply_platform_action(&archive_path, &action).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_platform_action(&mut self, context: &egui::Context) {
+        let result = self.platform_action.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.archive_path.clone(), result))
+        });
+        let Some((archive_path, result)) = result else {
+            return;
+        };
+        self.platform_action = None;
+        match result {
+            Ok(change) => {
+                let message = format!(
+                    "Platform changed from {} to {}.",
+                    describe_platform_assignment(
+                        change.old_platform.as_deref(),
+                        change.old_source.as_deref()
+                    ),
+                    describe_platform_assignment(
+                        change.new_platform.as_deref(),
+                        change.new_source.as_deref()
+                    )
+                );
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::PlatformAssignment,
+                    Some(archive_path),
+                    ActivityOutcome::Completed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+                // Refresh only the cached database row - never the live
+                // snapshot (self.state), which this action never touches.
+                self.start_database_action(context.clone(), false);
+            }
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::PlatformAssignment,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
             }
         }
     }
@@ -2464,6 +2599,10 @@ enum AppOperationRequest {
         items: Vec<UnmountAllItem>,
         cleanup_after_unmount: bool,
     },
+    PlatformAssignment {
+        archive_path: PathBuf,
+        action: PlatformAction,
+    },
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -2570,6 +2709,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_database_load(context);
         self.poll_diagnostics();
         self.poll_setup_action(context);
+        self.poll_platform_action(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
@@ -2770,6 +2910,9 @@ impl eframe::App for ArchiveFsApp {
                             history: &mut self.history,
                             cached: self.database_state.snapshot(),
                             library_filters: &mut self.library_filters,
+                            platform_choice: &mut self.platform_choice,
+                            platform_custom_text: &mut self.platform_custom_text,
+                            platform_busy: self.platform_action.is_some(),
                         },
                     );
                 }
@@ -2837,6 +2980,12 @@ impl eframe::App for ArchiveFsApp {
                     cleanup_after_unmount,
                 } => {
                     self.start_unmount_all(context.clone(), items, cleanup_after_unmount);
+                }
+                AppOperationRequest::PlatformAssignment {
+                    archive_path,
+                    action,
+                } => {
+                    self.start_platform_action(context.clone(), archive_path, action);
                 }
             }
         }
@@ -2906,6 +3055,57 @@ fn load_data() -> LoadResult {
     load_read_only_snapshot_default()
         .map(LoadedData::from_snapshot)
         .map_err(|error| error.to_string())
+}
+
+/// Opens the default library database and applies one `PlatformAction`
+/// to the archive at `archive_path` - the production entry point run on
+/// the background thread `ArchiveFsApp::start_platform_action` spawns.
+/// See [`apply_platform_action_at`] (the testable core, taking an
+/// explicit database path - mirrors `load_database_snapshot`/
+/// `load_database_snapshot_at`) for the actual logic.
+fn apply_platform_action(
+    archive_path: &Path,
+    action: &PlatformAction,
+) -> archivefs_core::Result<PlatformAssignmentChange> {
+    let database_path = default_database_path()?;
+    apply_platform_action_at(&database_path, archive_path, action)
+}
+
+/// Resolves `archive_path` to a stable persisted archive id by exact
+/// path bytes first (never a lossy display string - see
+/// `Database::find_archive_id_by_absolute_path`), then applies `action`.
+/// Errors clearly if the archive is not yet in the library database
+/// (nothing to assign a platform to) rather than silently doing nothing.
+fn apply_platform_action_at(
+    database_path: &Path,
+    archive_path: &Path,
+    action: &PlatformAction,
+) -> archivefs_core::Result<PlatformAssignmentChange> {
+    let mut database = Database::open_or_create(database_path)?;
+    let archive_id = database
+        .find_archive_id_by_absolute_path(archive_path)?
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "{} is not yet in the library database - run a library scan first",
+                archive_path.display()
+            ))
+        })?;
+    match action {
+        PlatformAction::Set(platform) => database.set_manual_platform(archive_id, platform),
+        PlatformAction::Clear => database.clear_manual_platform(archive_id),
+    }
+}
+
+/// Formats a platform assignment for display as `"<platform>
+/// (<provenance>)"`, or `"Unknown"` when there is none - the same shape
+/// as the CLI's `format_platform_and_source`, kept as a small separate
+/// copy here rather than a shared crate dependency between the two
+/// binaries for two lines of formatting.
+fn describe_platform_assignment(platform: Option<&str>, source: Option<&str>) -> String {
+    match (platform, source) {
+        (Some(platform), Some(source)) => format!("{platform} ({source})"),
+        _ => "Unknown".to_string(),
+    }
 }
 
 fn perform_archive_action(
@@ -3628,6 +3828,9 @@ struct LoadedViewState<'a> {
     history: &'a mut OperationHistory,
     cached: Option<&'a CachedLibrarySnapshot>,
     library_filters: &'a mut LibraryRowFilters,
+    platform_choice: &'a mut Option<String>,
+    platform_custom_text: &'a mut String,
+    platform_busy: bool,
 }
 
 fn show_loaded_data(
@@ -3659,6 +3862,9 @@ fn show_loaded_data(
         cached,
         library_filters,
         history,
+        platform_choice,
+        platform_custom_text,
+        platform_busy,
     } = view_state;
     let mut requested_action = None;
     let pending_count = data.stats.pending_count;
@@ -3867,9 +4073,10 @@ fn show_loaded_data(
             });
     }
 
-    if let Some(request) = show_selected_archive(
+    let (operation_request, platform_request) = show_selected_archive(
         ui,
         selected_record(&data.records, selected_archive.as_deref()),
+        selected_persisted_archive(cached, selected_archive.as_deref()),
         SelectedArchiveViewState {
             operation,
             busy,
@@ -3879,9 +4086,19 @@ fn show_loaded_data(
             lazy_unmount_offers,
             remount_offers,
             cleanup_after_unmount,
+            platform_choice,
+            platform_custom_text,
+            platform_busy,
         },
-    ) {
+    );
+    if let Some(request) = operation_request {
         requested_action = Some(AppOperationRequest::Archive(request));
+    }
+    if let Some((archive_path, action)) = platform_request {
+        requested_action = Some(AppOperationRequest::PlatformAssignment {
+            archive_path,
+            action,
+        });
     }
 
     if let Some(archive_path) = confirm_lazy_unmount.clone() {
@@ -4141,6 +4358,8 @@ fn show_loaded_data(
         });
     if let Some(index) = clicked_index {
         *selected_archive = Some(merged_rows[index].path.clone());
+        *platform_choice = None;
+        platform_custom_text.clear();
     }
 
     requested_action
@@ -4257,6 +4476,41 @@ fn selected_row_index(rows: &[ArchiveRow], selected_archive: Option<&Path>) -> O
     rows.iter().position(|row| row.path == selected_archive)
 }
 
+/// The persisted database row backing the selected archive, if the
+/// library database knows about it - live or cache-only alike, unlike
+/// `selected_record` (live only). This is what makes manual platform
+/// assignment available for a cache-only/missing row: it is metadata
+/// only, never a mount action, so it does not need `selected_record`'s
+/// live-only restriction. Matches by exact path bytes (`PersistedArchive::absolute_path`),
+/// never a lossy display string.
+fn selected_persisted_archive<'a>(
+    cached: Option<&'a CachedLibrarySnapshot>,
+    selected_archive: Option<&Path>,
+) -> Option<&'a PersistedArchive> {
+    let selected_archive = selected_archive?;
+    cached?
+        .archives
+        .iter()
+        .find(|persisted| persisted.absolute_path == selected_archive)
+}
+
+/// Resolves the platform text a "Set Platform" click should apply:
+/// `platform_custom_text` (trimmed, rejecting empty) when
+/// `CUSTOM_PLATFORM_CHOICE` is selected, otherwise the selected
+/// canonical name directly. `None` means nothing valid to apply yet
+/// (no selection, or an empty custom field) - the caller uses this to
+/// keep "Set Platform" disabled.
+fn resolved_platform_choice<'a>(choice: Option<&'a str>, custom_text: &'a str) -> Option<&'a str> {
+    match choice {
+        Some(CUSTOM_PLATFORM_CHOICE) => {
+            let trimmed = custom_text.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }
+        Some(name) => Some(name),
+        None => None,
+    }
+}
+
 fn available_action(mount_state: MountState) -> ArchiveAction {
     match mount_state {
         MountState::Mounted => ArchiveAction::Unmount,
@@ -4340,13 +4594,17 @@ struct SelectedArchiveViewState<'a> {
     lazy_unmount_offers: &'a HashSet<PathBuf>,
     remount_offers: &'a HashSet<PathBuf>,
     cleanup_after_unmount: &'a mut bool,
+    platform_choice: &'a mut Option<String>,
+    platform_custom_text: &'a mut String,
+    platform_busy: bool,
 }
 
 fn show_selected_archive(
     ui: &mut egui::Ui,
     record: Option<&ArchiveRecord>,
+    persisted: Option<&PersistedArchive>,
     view_state: SelectedArchiveViewState<'_>,
-) -> Option<OperationRequest> {
+) -> (Option<OperationRequest>, Option<(PathBuf, PlatformAction)>) {
     let SelectedArchiveViewState {
         operation,
         busy,
@@ -4356,12 +4614,41 @@ fn show_selected_archive(
         lazy_unmount_offers,
         remount_offers,
         cleanup_after_unmount,
+        platform_choice,
+        platform_custom_text,
+        platform_busy,
     } = view_state;
     let mut request = None;
+    let mut platform_request = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong("Selected archive");
-        let Some(record) = record else {
+        if record.is_none() && persisted.is_none() {
             ui.label("Select an archive row to view details.");
+            return;
+        }
+
+        let Some(record) = record else {
+            if let Some(persisted) = persisted {
+                ui.label(format!(
+                    "Archive path: {}",
+                    persisted.absolute_path.display()
+                ));
+                ui.label(
+                    "Known to the library database, not confirmed by the latest live snapshot. \
+                     Mount/unmount actions are unavailable until it is - platform assignment \
+                     below is metadata only and unaffected.",
+                );
+            }
+            let action = show_platform_section(
+                ui,
+                persisted,
+                platform_choice,
+                platform_custom_text,
+                platform_busy,
+            );
+            if let (Some(persisted), Some(action)) = (persisted, action) {
+                platform_request = Some((persisted.absolute_path.clone(), action));
+            }
             return;
         };
 
@@ -4491,8 +4778,99 @@ fn show_selected_archive(
                 });
             }
         });
+
+        let action = show_platform_section(
+            ui,
+            persisted,
+            platform_choice,
+            platform_custom_text,
+            platform_busy,
+        );
+        if let Some(action) = action {
+            platform_request = Some((record.mount_plan.archive.path.clone(), action));
+        }
     });
-    request
+    (request, platform_request)
+}
+
+/// Renders the "Set platform" / "Clear manual platform" controls tucked
+/// into the selected-archive details - available whenever `persisted` is
+/// `Some` (the library database knows this archive), live or cache-only
+/// row alike, since this is metadata only, never a mount action (see
+/// `show_selected_archive`'s two call sites above). Uses
+/// `canonical_platform_names` (the same central list the CLI's
+/// `library-set-platform` validates against - never a second,
+/// independently-drifting list here), with `CUSTOM_PLATFORM_CHOICE` as
+/// the escape hatch for a platform not in that list, mirroring the CLI's
+/// `--custom` flag.
+fn show_platform_section(
+    ui: &mut egui::Ui,
+    persisted: Option<&PersistedArchive>,
+    platform_choice: &mut Option<String>,
+    platform_custom_text: &mut String,
+    platform_busy: bool,
+) -> Option<PlatformAction> {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.strong("Platform");
+    let Some(persisted) = persisted else {
+        ui.label(
+            "Not yet in the library database. Run a library scan to enable platform assignment.",
+        );
+        return None;
+    };
+
+    ui.label(format!(
+        "Current: {}",
+        describe_platform_assignment(
+            persisted.platform.as_deref(),
+            persisted.platform_source.as_deref()
+        )
+    ));
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("platform_choice_combo")
+            .selected_text(platform_choice.as_deref().unwrap_or("Select platform..."))
+            .show_ui(ui, |ui| {
+                for name in canonical_platform_names() {
+                    ui.selectable_value(platform_choice, Some(name.to_string()), name);
+                }
+                ui.selectable_value(
+                    platform_choice,
+                    Some(CUSTOM_PLATFORM_CHOICE.to_string()),
+                    CUSTOM_PLATFORM_CHOICE,
+                );
+            });
+        if platform_choice.as_deref() == Some(CUSTOM_PLATFORM_CHOICE) {
+            ui.text_edit_singleline(platform_custom_text);
+        }
+    });
+    let resolved = resolved_platform_choice(platform_choice.as_deref(), platform_custom_text)
+        .map(str::to_string);
+    let mut platform_request = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !platform_busy && resolved.is_some(),
+                egui::Button::new("Set Platform"),
+            )
+            .clicked()
+            && let Some(platform) = resolved
+        {
+            platform_request = Some(PlatformAction::Set(platform));
+        }
+        if persisted.platform_source.as_deref() == Some(MANUAL_PLATFORM_SOURCE)
+            && ui
+                .add_enabled(!platform_busy, egui::Button::new("Clear Manual Platform"))
+                .clicked()
+        {
+            platform_request = Some(PlatformAction::Clear);
+        }
+        if platform_busy {
+            ui.spinner();
+            ui.label("Updating platform...");
+        }
+    });
+    platform_request
 }
 
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -4644,6 +5022,9 @@ mod tests {
             snapshot_stale: false,
             refresh_generation: RefreshGeneration::INITIAL,
             snapshot_generation: Some(RefreshGeneration::INITIAL),
+            platform_action: None,
+            platform_choice: None,
+            platform_custom_text: String::new(),
         }
     }
 
@@ -4795,8 +5176,23 @@ mod tests {
             size_bytes: Some(1024),
             modified_time_unix_seconds: Some(0),
             platform: None,
+            platform_source: None,
             last_known_health: "Pending".to_string(),
             last_verified_missing_at: missing.then(|| "2026-01-01T00:00:00Z".to_string()),
+        }
+    }
+
+    fn persisted_archive_with_platform(
+        path: PathBuf,
+        id: i64,
+        platform: &str,
+        source: &str,
+    ) -> PersistedArchive {
+        PersistedArchive {
+            platform: Some(platform.to_string()),
+            platform_source: Some(source.to_string()),
+            id,
+            ..persisted_archive(path, false)
         }
     }
 
@@ -7106,5 +7502,254 @@ mod tests {
         assert!(!filters.matches(&row_with_origin(RowOrigin::CachedMissing, true)));
         assert!(filters.matches(&row_with_origin(RowOrigin::CachedMissing, false)));
         assert!(!filters.matches(&row_with_origin(RowOrigin::Live, false)));
+    }
+
+    // -------------------------------------------------------------
+    // Manual platform assignment.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn resolved_platform_choice_uses_canonical_selection_or_trimmed_custom_text() {
+        assert_eq!(
+            resolved_platform_choice(Some("GameCube"), ""),
+            Some("GameCube")
+        );
+        assert_eq!(resolved_platform_choice(None, "anything"), None);
+        assert_eq!(
+            resolved_platform_choice(Some(CUSTOM_PLATFORM_CHOICE), "  NeoGeo64  "),
+            Some("NeoGeo64")
+        );
+        assert_eq!(
+            resolved_platform_choice(Some(CUSTOM_PLATFORM_CHOICE), "   "),
+            None,
+            "blank custom text must not resolve to an empty platform"
+        );
+    }
+
+    #[test]
+    fn selected_persisted_archive_finds_a_cache_only_missing_row() {
+        let path = PathBuf::from("/roms/mystery.zip");
+        let snapshot = cached_snapshot(vec![persisted_archive(path.clone(), true)]);
+
+        assert_eq!(
+            selected_persisted_archive(Some(&snapshot), Some(&path)),
+            Some(&snapshot.archives[0]),
+            "a cache-only/missing row must still be classifiable - it is metadata only, not a mount action"
+        );
+        assert_eq!(selected_persisted_archive(Some(&snapshot), None), None);
+        assert_eq!(
+            selected_persisted_archive(Some(&snapshot), Some(Path::new("/roms/other.zip"))),
+            None
+        );
+        assert_eq!(selected_persisted_archive(None, Some(&path)), None);
+    }
+
+    #[test]
+    fn platform_action_available_requires_no_running_action_or_database_load() {
+        let mut app = app_for_operation_tests();
+        assert!(app.platform_action_available());
+
+        let (_sender, receiver) = mpsc::channel();
+        app.platform_action = Some(RunningPlatformAction {
+            archive_path: PathBuf::from("/roms/game.zip"),
+            receiver,
+        });
+        assert!(!app.platform_action_available());
+        app.platform_action = None;
+
+        let (_sender, receiver) = mpsc::channel();
+        app.database_state = DatabaseState::Loading {
+            generation: DatabaseGeneration::INITIAL,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+        assert!(!app.platform_action_available());
+    }
+
+    #[test]
+    fn poll_platform_action_success_refreshes_the_database_cache_asynchronously() {
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/n64/Luigis_Mansion.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.platform_action = Some(RunningPlatformAction {
+            archive_path: archive_path.clone(),
+            receiver,
+        });
+        sender
+            .send(Ok(PlatformAssignmentChange {
+                old_platform: Some("N64".to_string()),
+                old_source: Some("folder_alias".to_string()),
+                new_platform: Some("GameCube".to_string()),
+                new_source: Some(MANUAL_PLATFORM_SOURCE.to_string()),
+            }))
+            .unwrap();
+
+        app.poll_platform_action(&egui::Context::default());
+
+        assert!(app.platform_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(feedback.succeeded);
+        assert!(feedback.message.contains("N64 (folder_alias)"));
+        assert!(feedback.message.contains("GameCube (manual)"));
+        assert!(
+            app.history
+                .entries()
+                .any(
+                    |entry| entry.archive_path.as_deref() == Some(archive_path.as_path())
+                        && entry.outcome == ActivityOutcome::Completed
+                ),
+        );
+        // Refreshing the cache is asynchronous - poll_platform_action only
+        // starts a new background database load, it does not block
+        // waiting for it, and the live snapshot is untouched.
+        assert!(app.database_state.is_loading());
+        assert!(matches!(app.state, LoadState::Ready(_)));
+    }
+
+    #[test]
+    fn poll_platform_action_failure_preserves_the_cached_row_and_shows_the_error() {
+        let mut app = app_for_operation_tests();
+        let stale_snapshot = cached_snapshot(vec![persisted_archive_with_platform(
+            PathBuf::from("/roms/mystery.zip"),
+            1,
+            "N64",
+            "folder_alias",
+        )]);
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(stale_snapshot.clone()),
+            last_scan_summary: None,
+        };
+        let archive_path = PathBuf::from("/roms/mystery.zip");
+        let (sender, receiver) = mpsc::channel();
+        app.platform_action = Some(RunningPlatformAction {
+            archive_path: archive_path.clone(),
+            receiver,
+        });
+        sender
+            .send(Err(
+                "mystery.zip is not yet in the library database".to_string()
+            ))
+            .unwrap();
+
+        app.poll_platform_action(&egui::Context::default());
+
+        assert!(app.platform_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(!feedback.succeeded);
+        assert!(feedback.message.contains("not yet in the library database"));
+        assert!(
+            app.history
+                .entries()
+                .any(
+                    |entry| entry.archive_path.as_deref() == Some(archive_path.as_path())
+                        && entry.outcome == ActivityOutcome::Failed
+                ),
+        );
+        // A failure must never trigger a database reload - the existing
+        // cached row is left exactly as it was.
+        match &app.database_state {
+            DatabaseState::Ready { snapshot, .. } => {
+                assert_eq!(snapshot.archives, stale_snapshot.archives);
+                assert_eq!(snapshot.database_path, stale_snapshot.database_path);
+            }
+            other => panic!(
+                "expected the stale Ready snapshot to survive untouched, got status {}",
+                other.status_label()
+            ),
+        }
+    }
+
+    #[test]
+    fn apply_platform_action_sets_and_clears_a_manual_platform() {
+        let dir = database_test_dir("apply-platform-set-clear");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        let archive_path = write_archive_file(&source, "n64/Luigis_Mansion.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+
+        let change = apply_platform_action_at(
+            &database_path,
+            &archive_path,
+            &PlatformAction::Set("GameCube".to_string()),
+        )
+        .unwrap();
+        assert_eq!(change.old_platform.as_deref(), Some("N64"));
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+        assert_eq!(change.new_source.as_deref(), Some(MANUAL_PLATFORM_SOURCE));
+
+        let clear_change =
+            apply_platform_action_at(&database_path, &archive_path, &PlatformAction::Clear)
+                .unwrap();
+        // Immediate exposure of the automatic result, no rescan involved.
+        assert_eq!(clear_change.new_platform.as_deref(), Some("N64"));
+        assert_eq!(clear_change.new_source.as_deref(), Some("folder_alias"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_platform_action_errors_clearly_when_not_yet_scanned() {
+        let dir = database_test_dir("apply-platform-not-scanned");
+        let database_path = dir.join("library.sqlite3");
+        Database::open_or_create(&database_path).unwrap();
+
+        let error = apply_platform_action_at(
+            &database_path,
+            Path::new("/roms/never-scanned.zip"),
+            &PlatformAction::Set("GameCube".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not yet in the library database")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn apply_platform_action_assigns_a_non_utf8_archive_path_on_unix() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = database_test_dir("apply-platform-non-utf8");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut invalid_name = b"fo".to_vec();
+        invalid_name.push(0x80);
+        invalid_name.extend_from_slice(b"o.zip");
+        let archive_path = source.join(OsString::from_vec(invalid_name));
+        assert!(
+            archive_path.to_str().is_none(),
+            "test path must actually be invalid UTF-8"
+        );
+        std::fs::write(&archive_path, b"contents").unwrap();
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+
+        let change = apply_platform_action_at(
+            &database_path,
+            &archive_path,
+            &PlatformAction::Set("GameCube".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 mod database;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, CatalogueStats,
-    CompletedScanSummary, Database, DatabaseHealth, PersistedArchive, RegisteredSourceFolder,
-    ScanPersistSummary, ScanRunCounts, check_database_health, default_database_path,
-    latest_schema_version, scan_and_persist,
+    CompletedScanSummary, Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, PersistedArchive,
+    PlatformAssignmentChange, RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts,
+    check_database_health, default_database_path, latest_schema_version, scan_and_persist,
 };
 
 #[derive(Debug)]
@@ -2791,6 +2791,26 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("msdos", "DOS"),
     ("scummvm", "ScummVM"),
 ];
+
+/// Every canonical platform name this build recognises via the
+/// folder-alias system (`FOLDER_PLATFORM_ALIASES`), deduplicated and
+/// sorted. This is the single source of truth for "known platform" used
+/// by manual platform assignment (`Database::set_manual_platform`) and
+/// its CLI/GUI callers - neither the CLI nor the GUI maintains a second,
+/// independently-drifting platform list. Does not include the small set
+/// of platform names only ever produced by the filename/title heuristic
+/// in `detect_platform_from_known_heuristics` (for example `"PC"` and
+/// `"Nintendo3DS"`) - those are ad hoc title matches, not part of the
+/// structured alias table this function draws from.
+pub fn canonical_platform_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = FOLDER_PLATFORM_ALIASES
+        .iter()
+        .map(|(_, canonical)| *canonical)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
 
 /// Canonical platform name for one already-lossy-stringified path
 /// component, if it exactly matches a known folder alias after
@@ -6609,6 +6629,32 @@ mod tests {
                 detect_platform(format!("{root}/{folder}/Game.zip"), root),
                 Some((*expected_platform).to_string()),
                 "folder {folder:?} should detect {expected_platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_platform_names_are_sorted_deduplicated_and_include_new_aliases() {
+        let names = canonical_platform_names();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, sorted,
+            "canonical_platform_names must already be sorted"
+        );
+
+        let mut deduplicated = names.clone();
+        deduplicated.dedup();
+        assert_eq!(
+            names.len(),
+            deduplicated.len(),
+            "canonical_platform_names must not contain duplicates"
+        );
+
+        for expected in ["NeoGeo64", "NGage", "GameCube", "MSX2", "Xbox360"] {
+            assert!(
+                names.contains(&expected),
+                "{expected:?} should be a canonical platform name"
             );
         }
     }
