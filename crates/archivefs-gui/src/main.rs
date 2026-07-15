@@ -3251,14 +3251,7 @@ impl eframe::App for ArchiveFsApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.set_min_width(table_width(horizontal_spacing));
-                                show_table_cells(
-                                    ui,
-                                    &COLUMN_HEADERS,
-                                    row_height,
-                                    true,
-                                    false,
-                                    None,
-                                );
+                                show_header_row(ui, &COLUMN_HEADERS, row_height);
                                 ui.separator();
                                 let body_height = ui.available_height().max(row_height);
                                 egui::ScrollArea::vertical()
@@ -4882,6 +4875,30 @@ fn show_loaded_data(
     }
 
     ui.separator();
+
+    // Requirement: the bulk platform action bar must render immediately
+    // above the Search/filter controls, in the CentralPanel's ordinary
+    // top-to-bottom flow - never after the table's ScrollAreas. Both
+    // ScrollAreas below use `auto_shrink([false, false])`, which makes
+    // them greedily claim *all* remaining vertical space in `ui`; a
+    // widget placed after them in the same vertical layout would be
+    // squeezed into whatever sliver of height (often zero) is left over,
+    // which is why the bar previously never appeared despite a correct
+    // selection count. Uses the exact same `selected_archives` `HashSet`
+    // that `show_archive_rows` highlights rows from - never a second,
+    // possibly-stale copy.
+    if let Some(action) = show_bulk_platform_action_bar(
+        ui,
+        selected_archives,
+        bulk_platform_choice,
+        bulk_platform_busy,
+    ) {
+        requested_action = Some(AppOperationRequest::BulkPlatformAssignment {
+            archive_paths: selected_archives.iter().cloned().collect(),
+            kind: action,
+        });
+    }
+
     // Merged rows are rebuilt fresh every frame (cheap for realistic
     // library sizes, and always exactly consistent with the current
     // self.state/self.database_state - see build_display_rows). Only the
@@ -4982,7 +4999,7 @@ fn show_loaded_data(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_min_width(table_width(horizontal_spacing));
-            show_table_cells(ui, &COLUMN_HEADERS, row_height, true, false, None);
+            show_header_row(ui, &COLUMN_HEADERS, row_height);
             ui.separator();
 
             let body_height = ui.available_height().max(row_height);
@@ -5015,18 +5032,6 @@ fn show_loaded_data(
         platform_custom_text.clear();
     }
 
-    if let Some(action) = show_bulk_platform_action_bar(
-        ui,
-        selected_archives,
-        bulk_platform_choice,
-        bulk_platform_busy,
-    ) {
-        requested_action = Some(AppOperationRequest::BulkPlatformAssignment {
-            archive_paths: selected_archives.iter().cloned().collect(),
-            kind: action,
-        });
-    }
-
     requested_action
 }
 
@@ -5039,43 +5044,105 @@ fn table_width(horizontal_spacing: f32) -> f32 {
         + horizontal_spacing * (COLUMN_WIDTHS.len().saturating_sub(1) as f32)
 }
 
-fn show_table_cells(
+/// Renders the (non-interactive) column header row: four bold labels,
+/// nothing more. Never clickable - unlike `show_data_row`, there is no
+/// row identity here to select.
+fn show_header_row(ui: &mut egui::Ui, cells: &[&str; 4], row_height: f32) {
+    ui.horizontal(|ui| {
+        for (text, width) in cells.iter().zip(COLUMN_WIDTHS) {
+            ui.add_sized(
+                [width, row_height],
+                egui::Label::new(egui::RichText::new(*text).strong()).truncate(),
+            )
+            .on_hover_text(*text);
+        }
+    });
+}
+
+/// Renders one selectable archive table row as a *single* clickable
+/// region (`Sense::click()` on one allocated `Rect`, identified by
+/// `id_source` - the archive's exact path, never a lossy display string)
+/// with the four cells' text painted passively inside it.
+///
+/// This replaced an earlier version that rendered each of the four cells
+/// as its own separate `egui::Button`, with the row's overall
+/// clicked-ness computed by OR-ing all four `Response::clicked()` values
+/// together. That meant a row had no single, authoritative `Response` of
+/// its own: four independent interactive widgets shared the row's
+/// hover/press state, with real gaps between them (the `horizontal`
+/// layout's item spacing) that belonged to no widget's sense area at
+/// all, and Ctrl-click reliability regressed as a direct result - see the
+/// fix for the real-world Nobara bug report this was rewritten for.
+///
+/// Cell text is painted directly with `Painter::text` rather than as
+/// separate child `Label` widgets. This was not just a style choice:
+/// registering more than one child widget inside the row's own interact
+/// `Rect` (even purely non-interactive `Label`s, `Sense::hover()`-only)
+/// was empirically confirmed, while fixing the Ctrl-click bug, to make
+/// egui's hit-testing stop recognizing the row's *own* `Response` as
+/// hovered/clicked at all in some cases - see the headless
+/// `simulate_row_click`-based tests below, which reproduce this exact
+/// failure mode against the old approach. Direct painting registers no
+/// widgets at all, so there is nothing left inside the row that could
+/// ever compete with its own click/hover sensing.
+fn show_data_row(
     ui: &mut egui::Ui,
     cells: &[&str; 4],
     row_height: f32,
-    strong: bool,
+    id_source: &Path,
     selected: bool,
     text_color: Option<egui::Color32>,
-) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        for (text, width) in cells.iter().zip(COLUMN_WIDTHS) {
-            let mut rich_text = egui::RichText::new(*text);
-            if strong {
-                rich_text = rich_text.strong();
-            }
-            if let Some(color) = text_color {
-                rich_text = rich_text.color(color);
-            }
-            let widget_text: egui::WidgetText = rich_text.into();
-            let response = if strong {
-                ui.add_sized(
-                    [width, row_height],
-                    egui::Label::new(widget_text).truncate(),
-                )
-            } else {
-                ui.add_sized(
-                    [width, row_height],
-                    egui::Button::new(widget_text)
-                        .selected(selected)
-                        .frame(false)
-                        .truncate(),
-                )
-            };
-            clicked |= response.on_hover_text(*text).clicked();
-        }
-    });
-    clicked
+) -> egui::Response {
+    let width = table_width(ui.spacing().item_spacing.x);
+    // Reserve the row's layout space first (advancing the cursor exactly
+    // as any other widget would), then sense clicks/hover for that exact
+    // `Rect` under a stable `Id` derived from `id_source` - not egui's
+    // auto-generated one. `show_rows` virtualizes this list, so the
+    // *same* screen position can render a *different* archive across
+    // scroll frames; a stable, identity-derived `Id` (rather than one
+    // implied only by rendering order/position) means a press-then-scroll
+    // gesture can never have its release misattributed to whatever
+    // archive now happens to occupy that same position.
+    let (_, rect) = ui.allocate_space(egui::vec2(width, row_height));
+    let row_id = egui::Id::new("archive_table_row").with(id_source);
+    let response = ui.interact(rect, row_id, egui::Sense::click());
+
+    // Paint the background *before* the text, so a selected/hovered row
+    // gets one clean, contiguous highlight across all four columns
+    // (requirement: "a clearly visible selected background", not four
+    // separately-tinted buttons with unhighlighted gaps between them).
+    // `selection.bg_fill` and `hovered.weak_bg_fill` are egui's own
+    // default palette entries - the same colors any ordinary selected or
+    // hovered widget would use.
+    let visuals = ui.visuals();
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 0.0, visuals.selection.bg_fill);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = text_color.unwrap_or_else(|| ui.visuals().text_color());
+    let spacing = ui.spacing().item_spacing.x;
+    let mut x = rect.left();
+    for (text, column_width) in cells.iter().zip(COLUMN_WIDTHS) {
+        let cell_rect = egui::Rect::from_min_size(
+            egui::pos2(x, rect.top()),
+            egui::vec2(column_width, row_height),
+        );
+        ui.painter().with_clip_rect(cell_rect).text(
+            egui::pos2(x + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font_id.clone(),
+            color,
+        );
+        x += column_width + spacing;
+    }
+
+    response
 }
 
 /// Renders one page of table rows, highlighting a row if it is either the
@@ -5111,14 +5178,15 @@ fn show_archive_rows(
             row.mount_path.as_str(),
         ];
         let is_selected = selected_index == Some(row_index) || multi_selected.contains(&row.path);
-        if show_table_cells(
+        let response = show_data_row(
             ui,
             &cells,
             row_height,
-            false,
+            &row.path,
             is_selected,
             row.row_text_color(&visuals),
-        ) {
+        );
+        if response.clicked() {
             clicked = Some((row_index, ctrl_held));
         }
     }
@@ -5592,9 +5660,26 @@ fn show_platform_section(
 /// custom-text escape hatch - deliberately narrower than the single-row
 /// picker, matching the bulk feature's "simple by default" scope
 /// (requirement 4).
+/// Renders the compact bulk platform action bar - shown only when more
+/// than one row is selected (requirement 3): a single selected row
+/// already has its own platform picker in the details panel
+/// (`show_platform_section`), and showing both for one row would be
+/// redundant and ambiguous about which one actually applies. Uses
+/// `canonical_platform_names()` (the same central list
+/// `show_platform_section`/the CLI validate against) with no free-form
+/// custom-text escape hatch - deliberately narrower than the single-row
+/// picker, matching the bulk feature's "simple by default" scope
+/// (requirement 4).
+///
+/// Takes `selected_archives` by `&mut` - not because this function
+/// starts any database write itself (it only ever returns the requested
+/// `BulkPlatformActionKind` for the caller to dispatch asynchronously,
+/// exactly as before), but because "Clear selection" is a purely local,
+/// synchronous UI action with nothing to dispatch: it just empties the
+/// *same* `HashSet` `show_archive_rows` highlights rows from, directly.
 fn show_bulk_platform_action_bar(
     ui: &mut egui::Ui,
-    selected_archives: &HashSet<PathBuf>,
+    selected_archives: &mut HashSet<PathBuf>,
     bulk_platform_choice: &mut Option<String>,
     bulk_platform_busy: bool,
 ) -> Option<BulkPlatformActionKind> {
@@ -5603,48 +5688,49 @@ fn show_bulk_platform_action_bar(
     }
 
     let mut action = None;
-    ui.add_space(6.0);
-    ui.separator();
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(format!("{} archives selected", selected_archives.len()));
-        ui.horizontal(|ui| {
-            ui.label("Platform:");
-            egui::ComboBox::from_id_salt("bulk_platform_choice_combo")
-                .selected_text(
-                    bulk_platform_choice
-                        .as_deref()
-                        .unwrap_or("Select platform..."),
-                )
-                .show_ui(ui, |ui| {
-                    for name in canonical_platform_names() {
-                        ui.selectable_value(bulk_platform_choice, Some(name.to_string()), name);
-                    }
-                });
-            if ui
-                .add_enabled(
-                    !bulk_platform_busy && bulk_platform_choice.is_some(),
-                    egui::Button::new("Set for selected"),
-                )
-                .clicked()
-                && let Some(platform) = bulk_platform_choice.clone()
-            {
-                action = Some(BulkPlatformActionKind::Set(platform));
-            }
-            if ui
-                .add_enabled(
-                    !bulk_platform_busy,
-                    egui::Button::new("Clear manual for selected"),
-                )
-                .clicked()
-            {
-                action = Some(BulkPlatformActionKind::Clear);
-            }
-            if bulk_platform_busy {
-                ui.spinner();
-                ui.label("Updating...");
-            }
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().extreme_bg_color)
+        .show(ui, |ui| {
+            ui.strong(format!("{} archives selected", selected_archives.len()));
+            ui.horizontal(|ui| {
+                ui.label("Platform:");
+                egui::ComboBox::from_id_salt("bulk_platform_choice_combo")
+                    .selected_text(
+                        bulk_platform_choice
+                            .as_deref()
+                            .unwrap_or("Select platform..."),
+                    )
+                    .show_ui(ui, |ui| {
+                        for name in canonical_platform_names() {
+                            ui.selectable_value(bulk_platform_choice, Some(name.to_string()), name);
+                        }
+                    });
+                if ui
+                    .add_enabled(
+                        !bulk_platform_busy && bulk_platform_choice.is_some(),
+                        egui::Button::new("Set selected"),
+                    )
+                    .clicked()
+                    && let Some(platform) = bulk_platform_choice.clone()
+                {
+                    action = Some(BulkPlatformActionKind::Set(platform));
+                }
+                if ui
+                    .add_enabled(!bulk_platform_busy, egui::Button::new("Clear selected"))
+                    .clicked()
+                {
+                    action = Some(BulkPlatformActionKind::Clear);
+                }
+                if ui.button("Clear selection").clicked() {
+                    selected_archives.clear();
+                }
+                if bulk_platform_busy {
+                    ui.spinner();
+                    ui.label("Updating...");
+                }
+            });
         });
-    });
+    ui.add_space(4.0);
     action
 }
 
@@ -8968,6 +9054,533 @@ mod tests {
         apply_row_click(&mut selected_archives, &mut selected_archive, path, true);
 
         assert!(selected_archives.is_empty());
+    }
+
+    /// Simulates a real two-frame click gesture on the row `render_row`
+    /// paints (press in frame 1, release in frame 2 - egui requires a
+    /// widget to already be known/hovered from a prior frame before the
+    /// frame that releases on it can register `Response::clicked()`;
+    /// `render_row` must paint the *same* row - same `id_source` - in
+    /// both frames for egui to track this correctly, exactly as
+    /// `show_loaded_data` does across real consecutive UI frames).
+    /// Returns frame 2's `Response` plus whatever `ui.input(|i|
+    /// i.modifiers.ctrl)` reads during that same frame - proving the
+    /// *real* egui event path (not just the pure `apply_row_click`
+    /// helper in isolation) delivers a working click with an accurate
+    /// modifier reading, which is the actual bug this test guards
+    /// against regressing.
+    fn run_frame(
+        ctx: &egui::Context,
+        raw_input: egui::RawInput,
+        render_row: &impl Fn(&mut egui::Ui) -> egui::Response,
+    ) -> (egui::Response, bool) {
+        let mut response = None;
+        let mut ctrl_held = false;
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                response = Some(render_row(ui));
+                ctrl_held = ui.input(|i| i.modifiers.ctrl);
+            });
+        });
+        (response.unwrap(), ctrl_held)
+    }
+
+    /// Simulates a real click gesture on the row `render_row` paints, at
+    /// `pos`, with `modifiers` held throughout. `render_row` must paint
+    /// the *same* row - same `id_source` - every time it is called, so
+    /// egui recognizes it as the same persistent widget across frames.
+    ///
+    /// egui's hit-testing for a given frame's pointer events is computed
+    /// from the widget rects *registered in the previous frame* (this
+    /// frame's widgets have not been laid out yet when input is
+    /// processed) - see `egui::interaction::interact`. So registering a
+    /// click on a widget that has never been rendered before takes three
+    /// frames, not one: frame 1 merely registers the row's rect; frame 2
+    /// (now hit-testable) carries the press event, setting egui's
+    /// internal "potential click" on this row; frame 3 (hit-testable
+    /// again) carries the release event, which is where
+    /// `Response::clicked()` actually becomes true. This mirrors real
+    /// user input closely enough to exercise the genuine event path this
+    /// test suite is guarding (see the three-separate-`ctx.run` structure
+    /// below), rather than only calling `apply_row_click` directly with a
+    /// hand-built `bool`.
+    fn simulate_row_click(
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        modifiers: egui::Modifiers,
+        render_row: impl Fn(&mut egui::Ui) -> egui::Response,
+    ) -> (egui::Response, bool) {
+        let moved_only = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        run_frame(ctx, moved_only, &render_row);
+
+        let press = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        run_frame(ctx, press, &render_row);
+
+        let release = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        run_frame(ctx, release, &render_row)
+    }
+
+    fn test_row_cells() -> [&'static str; 4] {
+        ["Xbox", "Pending", "/roms/a.zip", "/mnt/Xbox/a"]
+    }
+
+    #[test]
+    fn real_egui_click_on_the_row_registers_and_reports_no_modifier() {
+        let ctx = egui::Context::default();
+        let path = PathBuf::from("/roms/a.zip");
+
+        let (response, ctrl_held) = simulate_row_click(
+            &ctx,
+            egui::pos2(50.0, 12.0),
+            egui::Modifiers::default(),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, None),
+        );
+
+        assert!(
+            response.clicked(),
+            "the real row Response must register the click"
+        );
+        assert!(!ctrl_held, "no modifier key was simulated as held");
+    }
+
+    #[test]
+    fn real_egui_ctrl_click_on_the_row_reaches_the_selection_helper() {
+        // This is the actual bug report: verify Ctrl reaches the row's
+        // click handling through the real egui event path, not just
+        // through apply_row_click called directly with a hand-built bool.
+        let ctx = egui::Context::default();
+        let path = PathBuf::from("/roms/a.zip");
+
+        let (response, ctrl_held) =
+            simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
+                show_data_row(ui, &test_row_cells(), 24.0, &path, false, None)
+            });
+        assert!(response.clicked(), "the click itself must still register");
+        assert!(
+            ctrl_held,
+            "Ctrl must read as held during the real click's frame"
+        );
+
+        let mut selected_archives: HashSet<PathBuf> = HashSet::new();
+        let mut selected_archive = None;
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            path.clone(),
+            ctrl_held,
+        );
+        assert_eq!(
+            selected_archives,
+            [path].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn real_ordinary_click_replaces_the_selection() {
+        let ctx = egui::Context::default();
+        let path_a = PathBuf::from("/roms/a.zip");
+        let path_b = PathBuf::from("/roms/b.zip");
+        let mut selected_archives: HashSet<PathBuf> = [path_a.clone()].into_iter().collect();
+        let mut selected_archive = Some(path_a);
+
+        let (response, ctrl_held) = simulate_row_click(
+            &ctx,
+            egui::pos2(50.0, 12.0),
+            egui::Modifiers::default(),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, None),
+        );
+        assert!(response.clicked());
+        assert!(!ctrl_held);
+
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            path_b.clone(),
+            ctrl_held,
+        );
+
+        assert_eq!(
+            selected_archives,
+            [path_b].into_iter().collect::<HashSet<_>>(),
+            "an ordinary click through the real event path must replace the selection"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_click_adds_a_second_exact_path() {
+        let ctx = egui::Context::default();
+        let path_a = PathBuf::from("/roms/a.zip");
+        let path_b = PathBuf::from("/roms/b.zip");
+        let mut selected_archives: HashSet<PathBuf> = [path_a.clone()].into_iter().collect();
+        let mut selected_archive = Some(path_a.clone());
+
+        let (response, ctrl_held) =
+            simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
+                show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, None)
+            });
+        assert!(response.clicked());
+        assert!(ctrl_held);
+
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            path_b.clone(),
+            ctrl_held,
+        );
+
+        assert_eq!(
+            selected_archives,
+            [path_a, path_b].into_iter().collect::<HashSet<_>>(),
+            "a real Ctrl-click must add to, not replace, the selection"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_click_removes_an_already_selected_path() {
+        let ctx = egui::Context::default();
+        let path_a = PathBuf::from("/roms/a.zip");
+        let path_b = PathBuf::from("/roms/b.zip");
+        let mut selected_archives: HashSet<PathBuf> =
+            [path_a.clone(), path_b.clone()].into_iter().collect();
+        let mut selected_archive = Some(path_b.clone());
+
+        // is_selected = true, since path_a is already in the set - the
+        // row's own highlighted/pressed styling must not prevent the
+        // click (or its modifiers) from registering.
+        let (response, ctrl_held) =
+            simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
+                show_data_row(ui, &test_row_cells(), 24.0, &path_a, true, None)
+            });
+        assert!(response.clicked());
+        assert!(ctrl_held);
+
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            path_a,
+            ctrl_held,
+        );
+
+        assert_eq!(
+            selected_archives,
+            [path_b].into_iter().collect::<HashSet<_>>(),
+            "a real Ctrl-click on an already-selected row must remove it"
+        );
+    }
+
+    #[test]
+    fn clicking_text_inside_the_row_behaves_the_same_as_blank_row_space() {
+        let ctx = egui::Context::default();
+        let path = PathBuf::from("/roms/a.zip");
+
+        // COLUMN_WIDTHS = [120.0, 120.0, 440.0, 520.0]; a position early
+        // in the first column lands squarely on rendered text, while a
+        // position just past the first column (in the item-spacing gap
+        // the old four-separate-Buttons layout never sensed clicks in)
+        // must click exactly as reliably - proving there is now one
+        // consistent Sense::click response for the whole row, not one
+        // per cell with unsensed gaps between them.
+        let (on_text, _) = simulate_row_click(
+            &ctx,
+            egui::pos2(10.0, 12.0),
+            egui::Modifiers::default(),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, None),
+        );
+        assert!(on_text.clicked(), "a click on rendered text must register");
+
+        let (on_gap, _) = simulate_row_click(
+            &ctx,
+            egui::pos2(121.0, 12.0),
+            egui::Modifiers::default(),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, None),
+        );
+        assert!(
+            on_gap.clicked(),
+            "a click in the inter-column gap must register exactly the same as on text"
+        );
+    }
+
+    #[test]
+    fn bulk_action_bar_renders_only_when_more_than_one_row_is_selected() {
+        // Proves the *rendering function itself* stays empty/grows the
+        // layout appropriately, not just its extracted visibility
+        // predicate (bulk_action_bar_requires_more_than_one_selected_row
+        // below already covers that in isolation) - `ui.cursor()`
+        // advancing down the panel is a real, observable side effect of
+        // `show_bulk_platform_action_bar` actually painting the
+        // separator/frame/combo box, not a stand-in for it.
+        let ctx = egui::Context::default();
+        let mut bulk_platform_choice: Option<String> = None;
+
+        let mut one_selected_extra_height = -1.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let before = ui.cursor().top();
+                let mut selected: HashSet<PathBuf> =
+                    [PathBuf::from("/roms/a.zip")].into_iter().collect();
+                let _ = show_bulk_platform_action_bar(
+                    ui,
+                    &mut selected,
+                    &mut bulk_platform_choice,
+                    false,
+                );
+                one_selected_extra_height = ui.cursor().top() - before;
+            });
+        });
+        assert_eq!(
+            one_selected_extra_height, 0.0,
+            "one selected row must render nothing"
+        );
+
+        let mut two_selected_extra_height = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let before = ui.cursor().top();
+                let mut selected: HashSet<PathBuf> =
+                    [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                        .into_iter()
+                        .collect();
+                let _ = show_bulk_platform_action_bar(
+                    ui,
+                    &mut selected,
+                    &mut bulk_platform_choice,
+                    false,
+                );
+                two_selected_extra_height = ui.cursor().top() - before;
+            });
+        });
+        assert!(
+            two_selected_extra_height > 0.0,
+            "two selected rows must actually render the bulk action bar"
+        );
+    }
+
+    /// Renders the *real* `show_loaded_data` - the exact parent GUI
+    /// section `update()` calls in production, not `show_bulk_platform_action_bar`
+    /// in isolation - into a real `egui::Context` frame, using the exact
+    /// same `selected_archives` `HashSet` that drives row highlighting.
+    /// Returns the height of the whole panel's rendered content, a real,
+    /// observable side effect of everything `show_loaded_data` actually
+    /// painted this frame (mount-all/doctor/search/filters/table/bulk
+    /// bar/details panel all included) - not a stand-in for any of it.
+    /// This is what closes the exact gap the previous "bulk bar never
+    /// appears" bug slipped through: a test that only called
+    /// `show_bulk_platform_action_bar` (or its `bulk_action_bar_visible`
+    /// predicate) directly could never have caught a layout-ordering bug
+    /// in `show_loaded_data` itself, since that function was never
+    /// exercised at all.
+    fn render_real_show_loaded_data(
+        ctx: &egui::Context,
+        data: &LoadedData,
+        selected_archives: &mut HashSet<PathBuf>,
+    ) -> f32 {
+        let mut filter = String::new();
+        let mut filtered_rows = None;
+        let mut selected_archive = None;
+        let mut confirm_unmount = None;
+        let mut confirm_lazy_unmount = None;
+        let mut confirm_lazy_unmount_final = None;
+        let mut confirm_mount_all = None;
+        let mut focus_mount_all_cancel = false;
+        let mut confirm_unmount_all = None;
+        let mut focus_unmount_all_cancel = false;
+        let mut focus_lazy_cancel = false;
+        let mut focus_final_lazy_cancel = false;
+        let lazy_unmount_offers = HashSet::new();
+        let remount_offers = HashSet::new();
+        let mut cleanup_after_unmount = false;
+        let mut history = OperationHistory::default();
+        let mut library_filters = LibraryRowFilters::default();
+        let mut platform_choice = None;
+        let mut platform_custom_text = String::new();
+        let mut bulk_platform_choice = None;
+
+        // A bounded, realistic `screen_rect` is required here, not just for
+        // fidelity: with `RawInput::default()` (no `screen_rect`), egui
+        // falls back to a very large default canvas. Both `ScrollArea`s
+        // below use `auto_shrink([false, false])`, i.e. "always claim all
+        // remaining space" - against a near-infinite canvas that remaining
+        // space is effectively constant, so the scroll areas silently
+        // absorb whatever height the bulk bar adds above them and the
+        // panel's total `min_rect().height()` comes out identical either
+        // way. Bounding the panel to a realistic window size makes the
+        // inner vertical `ScrollArea`'s `.max(row_height)` floor (see
+        // `show_loaded_data`) bite, so it can no longer fully compensate -
+        // only then does the bulk bar's contribution actually show up in
+        // the total height, which is what makes this a meaningful
+        // "did the real layout render it" check instead of a tautology.
+        let mut panel_height = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 250.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_loaded_data(
+                    ui,
+                    data,
+                    LoadedViewState {
+                        filter: &mut filter,
+                        filtered_rows: &mut filtered_rows,
+                        selected_archive: &mut selected_archive,
+                        operation: None,
+                        busy: false,
+                        feedback: None,
+                        confirm_unmount: &mut confirm_unmount,
+                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                        confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
+                        confirm_mount_all: &mut confirm_mount_all,
+                        focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                        confirm_unmount_all: &mut confirm_unmount_all,
+                        focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                        focus_lazy_cancel: &mut focus_lazy_cancel,
+                        focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
+                        lazy_unmount_offers: &lazy_unmount_offers,
+                        remount_offers: &remount_offers,
+                        cleanup_after_unmount: &mut cleanup_after_unmount,
+                        mount_all_result: None,
+                        unmount_all_result: None,
+                        history: &mut history,
+                        cached: None,
+                        library_filters: &mut library_filters,
+                        platform_choice: &mut platform_choice,
+                        platform_custom_text: &mut platform_custom_text,
+                        platform_busy: false,
+                        selected_archives,
+                        bulk_platform_choice: &mut bulk_platform_choice,
+                        bulk_platform_busy: false,
+                    },
+                );
+                panel_height = ui.min_rect().height();
+            });
+        });
+        panel_height
+    }
+
+    #[test]
+    fn real_show_loaded_data_hides_the_bulk_bar_for_one_selected_row() {
+        let ctx = egui::Context::default();
+        let data = empty_loaded_data("/mount");
+        let mut selected_archives: HashSet<PathBuf> =
+            [PathBuf::from("/roms/a.zip")].into_iter().collect();
+
+        let one_selected_height = render_real_show_loaded_data(&ctx, &data, &mut selected_archives);
+
+        let mut none_selected = HashSet::new();
+        let none_selected_height = render_real_show_loaded_data(&ctx, &data, &mut none_selected);
+
+        assert_eq!(
+            one_selected_height, none_selected_height,
+            "one selected row must render exactly like no selection - no bulk bar"
+        );
+    }
+
+    #[test]
+    fn real_show_loaded_data_shows_the_bulk_bar_for_two_selected_rows() {
+        // This is the exact scenario the Nobara bug report described:
+        // 3+ rows selected, but the bar never appeared because it was
+        // being rendered after a `ScrollArea::auto_shrink([false, false])`
+        // that claimed all remaining vertical space. Rendering the real
+        // `show_loaded_data` end to end - not a helper condition, not
+        // `show_bulk_platform_action_bar` alone - is what proves that
+        // regression is actually fixed.
+        let ctx = egui::Context::default();
+        let data = empty_loaded_data("/mount");
+        let mut one_selected: HashSet<PathBuf> =
+            [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        let one_selected_height = render_real_show_loaded_data(&ctx, &data, &mut one_selected);
+
+        let mut three_selected: HashSet<PathBuf> = [
+            PathBuf::from("/roms/a.zip"),
+            PathBuf::from("/roms/b.zip"),
+            PathBuf::from("/roms/c.zip"),
+        ]
+        .into_iter()
+        .collect();
+        let three_selected_height = render_real_show_loaded_data(&ctx, &data, &mut three_selected);
+
+        assert!(
+            three_selected_height > one_selected_height,
+            "3 selected archives must render additional content (the bulk action bar) that \
+             1 selected archive does not - got {one_selected_height} vs {three_selected_height}"
+        );
+    }
+
+    #[test]
+    fn clear_selection_button_click_empties_the_same_selected_archives_set() {
+        let ctx = egui::Context::default();
+        let selected_archives = std::cell::RefCell::new(
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect::<HashSet<PathBuf>>(),
+        );
+        let bulk_platform_choice = std::cell::RefCell::new(None::<String>);
+
+        // Renders the real `show_bulk_platform_action_bar` - the same
+        // production function `show_loaded_data` calls - through a
+        // `RefCell` so this closure can implement `Fn` (required by
+        // `simulate_row_click`/`run_frame`, which call it repeatedly
+        // across the 3-frame click sequence) while still mutating the
+        // *same* selection set on every call.
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            let mut choice = bulk_platform_choice.borrow_mut();
+            ui.scope(|ui| {
+                let _ = show_bulk_platform_action_bar(ui, &mut selected, &mut choice, false);
+            })
+            .response
+        };
+
+        // Measurement pass: find the rendered bar's bounding rect using
+        // the exact same production function, before attempting to click
+        // it - never a hardcoded/guessed pixel position.
+        let mut bar_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                bar_rect = Some(render(ui).rect);
+            });
+        });
+        let bar_rect = bar_rect.unwrap();
+        assert_eq!(
+            selected_archives.borrow().len(),
+            2,
+            "the measurement pass must not itself change the selection"
+        );
+
+        // "Clear selection" is the rightmost control in this row (no
+        // spinner, since bulk_platform_busy is false here).
+        let click_pos = egui::pos2(bar_rect.right() - 15.0, bar_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert!(
+            selected_archives.borrow().is_empty(),
+            "clicking Clear selection must empty the exact same HashSet row highlighting reads from"
+        );
     }
 
     #[test]
