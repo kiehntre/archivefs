@@ -12,12 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
-    ArchiveStatus, ArchiveUnmountSession, CatalogueStats, CompletedScanSummary, Config,
-    ConfigIdentity, Database, DatabaseHealth, DoctorReport, DoctorStatus, LazyUnmountCleanupResult,
-    MANUAL_PLATFORM_SOURCE, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, ScanPersistSummary, SetupDiagnosticStatus, SetupDiagnostics,
-    UnmountOneOutcome, canonical_platform_names, check_database_health,
-    cleanup_selected_mount_tree, create_configured_mount_root_default,
+    ArchiveStatus, ArchiveUnmountSession, BulkPlatformAssignmentResult, CatalogueStats,
+    CompletedScanSummary, Config, ConfigIdentity, Database, DatabaseHealth, DoctorReport,
+    DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MountOneOutcome, MountState,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    SetupDiagnosticStatus, SetupDiagnostics, UnmountOneOutcome, canonical_platform_names,
+    check_database_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
     latest_schema_version, lazy_unmount_one_archive_path_with_progress,
     load_read_only_snapshot_default, mount_one_archive_path,
@@ -51,6 +51,7 @@ enum ActivityAction {
     Setup,
     LibraryDatabase,
     PlatformAssignment,
+    BulkPlatformAssignment,
     PlatformAliasManagement,
 }
 
@@ -69,6 +70,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Setup => "Setup",
             Self::LibraryDatabase => "Library database",
             Self::PlatformAssignment => "Platform assignment",
+            Self::BulkPlatformAssignment => "Bulk platform assignment",
             Self::PlatformAliasManagement => "Platform alias management",
         })
     }
@@ -1308,6 +1310,39 @@ struct RunningPlatformAction {
     receiver: Receiver<Result<PlatformAssignmentChange, String>>,
 }
 
+/// One bulk manual platform assignment change requested from the compact
+/// "N archives selected" action bar - see `show_bulk_platform_action_bar`.
+/// Metadata-only, exactly like `PlatformAction`: never depends on
+/// `latest_generation_actions_safe`, never touches the filesystem or a
+/// mount. Deliberately narrower than `PlatformAction`: no free-form
+/// custom-text escape hatch (only `canonical_platform_names()`), matching
+/// the bulk feature's "simple by default" scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BulkPlatformActionKind {
+    Set(String),
+    Clear,
+}
+
+/// The outcome of one bulk platform action applied at the GUI layer:
+/// [`BulkPlatformAssignmentResult`] (archive-id-keyed, from the database
+/// bulk API) plus how many of the *selected paths* never resolved to any
+/// database archive id at all (a live-only/not-yet-scanned row, for
+/// example) - a GUI-specific concern the database bulk API cannot see,
+/// since it only ever receives ids. Kept as a separate, GUI-local
+/// wrapper rather than adding a field to the shared core type, which the
+/// CLI also uses and has no such "started from an exact PathBuf
+/// selection" concept.
+struct BulkPlatformActionOutcome {
+    result: BulkPlatformAssignmentResult,
+    unresolved_paths: usize,
+}
+
+struct RunningBulkPlatformAction {
+    kind: BulkPlatformActionKind,
+    requested_paths: usize,
+    receiver: Receiver<Result<BulkPlatformActionOutcome, String>>,
+}
+
 /// Sentinel `platform_choice` value meaning "let the user type a custom
 /// platform" - the GUI's escape hatch, mirroring the CLI's `--custom`
 /// flag. Never itself sent as a platform value; `resolved_platform_choice`
@@ -1369,6 +1404,17 @@ struct ArchiveFsApp {
     alias_action: Option<RunningAliasAction>,
     new_alias_text: String,
     new_alias_platform_choice: Option<String>,
+    /// The exact-identity multi-selection (requirement 1): every
+    /// currently multi-selected row's `ArchiveRow::path`. Never row
+    /// indices - see `prune_selection` for how this survives a
+    /// filter/reload without pointing at the wrong archive.
+    /// `selected_archive` (above) remains, unchanged, the single
+    /// "focused" row driving the details panel; this is a separate,
+    /// additive overlay used only for row highlighting and the bulk
+    /// action bar.
+    selected_archives: HashSet<PathBuf>,
+    bulk_platform_action: Option<RunningBulkPlatformAction>,
+    bulk_platform_choice: Option<String>,
 }
 
 impl ArchiveFsApp {
@@ -1429,6 +1475,9 @@ impl ArchiveFsApp {
             alias_action: None,
             new_alias_text: String::new(),
             new_alias_platform_choice: None,
+            selected_archives: HashSet::new(),
+            bulk_platform_action: None,
+            bulk_platform_choice: None,
         }
     }
 
@@ -1496,6 +1545,7 @@ impl ArchiveFsApp {
                         self.database_state.snapshot(),
                     );
                     self.filtered_rows = matching_row_indices(&merged, &self.filter);
+                    self.prune_selection(&merged);
                     self.history.record(HistoryEntry::new(
                         ActivityAction::Refresh,
                         None,
@@ -1663,6 +1713,28 @@ impl ArchiveFsApp {
             let merged =
                 build_display_rows(&data.records, &data.rows, self.database_state.snapshot());
             self.filtered_rows = matching_row_indices(&merged, &self.filter);
+            self.prune_selection(&merged);
+        }
+    }
+
+    /// Removes any exact-identity entry from `selected_archives` - and
+    /// clears `selected_archive` if it was the one that vanished - that
+    /// no longer names any row in `merged_rows`, the just-recomputed
+    /// live+cache catalogue (requirement 7: "remove selections that no
+    /// longer exist in the loaded catalogue"). Called from both
+    /// `poll_load` and `poll_database_load`, right where each already
+    /// recomputes `filtered_rows` against the same merged list, so
+    /// selection state is never one step behind what is actually on
+    /// screen. Compares exact `PathBuf` identity only, never a lossy
+    /// display string, and never touches row indices - there are none to
+    /// go stale here in the first place.
+    fn prune_selection(&mut self, merged_rows: &[ArchiveRow]) {
+        self.selected_archives
+            .retain(|path| merged_rows.iter().any(|row| &row.path == path));
+        if let Some(selected) = &self.selected_archive
+            && !merged_rows.iter().any(|row| &row.path == selected)
+        {
+            self.selected_archive = None;
         }
     }
 
@@ -1807,14 +1879,25 @@ impl ArchiveFsApp {
     }
 
     /// Whether a new platform-assignment action may start: not already
-    /// running one, and not in the middle of a database load/scan (the
-    /// same "one database writer at a time" convention `start_database_action`'s
-    /// own UI already enforces by disabling its buttons while loading -
-    /// see `show_database_panel`). This never touches `is_busy()`/mount
-    /// safety - platform assignment is metadata-only and deliberately
-    /// independent of it.
+    /// running one (single-row *or* bulk - only one platform-metadata
+    /// writer at a time, since both ultimately write the same
+    /// `platform_assignments` table), and not in the middle of a database
+    /// load/scan (the same "one database writer at a time" convention
+    /// `start_database_action`'s own UI already enforces by disabling its
+    /// buttons while loading - see `show_database_panel`). This never
+    /// touches `is_busy()`/mount safety - platform assignment is
+    /// metadata-only and deliberately independent of it.
     fn platform_action_available(&self) -> bool {
-        self.platform_action.is_none() && !self.database_state.is_loading()
+        self.platform_action.is_none()
+            && self.bulk_platform_action.is_none()
+            && !self.database_state.is_loading()
+    }
+
+    /// The bulk counterpart to `platform_action_available` - see its doc
+    /// comment for why single-row and bulk platform actions share one
+    /// "no concurrent writer" gate.
+    fn bulk_platform_action_available(&self) -> bool {
+        self.platform_action_available()
     }
 
     fn start_platform_action(
@@ -1904,6 +1987,127 @@ impl ArchiveFsApp {
                     warning: None,
                     more_information: None,
                 });
+            }
+        }
+    }
+
+    /// Starts a bulk platform action for every archive in
+    /// `archive_paths` (the current multi-selection - see
+    /// `show_bulk_platform_action_bar`) on a background thread, exactly
+    /// like `start_platform_action` for a single archive. A no-op if
+    /// `archive_paths` is empty or a platform-metadata write is already
+    /// in progress (`bulk_platform_action_available`).
+    fn start_bulk_platform_action(
+        &mut self,
+        context: egui::Context,
+        archive_paths: Vec<PathBuf>,
+        kind: BulkPlatformActionKind,
+    ) {
+        if !self.bulk_platform_action_available() || archive_paths.is_empty() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let requested_paths = archive_paths.len();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::BulkPlatformAssignment,
+            None,
+            ActivityOutcome::Started,
+            match &kind {
+                BulkPlatformActionKind::Set(platform) => format!(
+                    "Setting platform to {platform} for {requested_paths} selected archives."
+                ),
+                BulkPlatformActionKind::Clear => {
+                    format!("Clearing manual platform for {requested_paths} selected archives.")
+                }
+            },
+        ));
+        self.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: kind.clone(),
+            requested_paths,
+            receiver,
+        });
+        thread::spawn(move || {
+            let result = apply_bulk_platform_action(&archive_paths, &kind)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Mirrors `poll_platform_action`: on success, refreshes only the
+    /// cached database snapshot (never the live archive snapshot, never a
+    /// scan - see `start_database_action(.., false)`). The actual
+    /// selection pruning (requirement 7's "remove selections that no
+    /// longer exist in the loaded catalogue") happens once that reload
+    /// settles, in `poll_load`/`poll_database_load` via `prune_selection`,
+    /// not here, since the reload is itself asynchronous and has not
+    /// necessarily completed yet when this returns.
+    fn poll_bulk_platform_action(&mut self, context: &egui::Context) {
+        let result = self.bulk_platform_action.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.kind.clone(), running.requested_paths, result))
+        });
+        let Some((kind, requested_paths, result)) = result else {
+            return;
+        };
+        self.bulk_platform_action = None;
+        match result {
+            Ok(outcome) => {
+                let action_word = match &kind {
+                    BulkPlatformActionKind::Set(platform) => format!("set to {platform}"),
+                    BulkPlatformActionKind::Clear => "cleared".to_string(),
+                };
+                let mut message = format!(
+                    "Platform {action_word} for {} of {requested_paths} selected archive(s) ({} unchanged, {} missing from the database",
+                    outcome.result.changed,
+                    outcome.result.unchanged,
+                    outcome.result.missing.len(),
+                );
+                if outcome.unresolved_paths > 0 {
+                    message.push_str(&format!(
+                        ", {} not yet scanned into the database",
+                        outcome.unresolved_paths
+                    ));
+                }
+                message.push(')');
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::BulkPlatformAssignment,
+                    None,
+                    ActivityOutcome::Completed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+                // Refresh only the cached database row - never the live
+                // snapshot (self.state), which this action never touches.
+                self.start_database_action(context.clone(), false);
+            }
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::BulkPlatformAssignment,
+                    None,
+                    ActivityOutcome::Failed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+                // Deliberately does not touch database_state or
+                // selected_archives - requirement 8: a failed bulk action
+                // must preserve both the prior cached rows and the
+                // selection exactly as they were.
             }
         }
     }
@@ -2792,6 +2996,10 @@ enum AppOperationRequest {
         archive_path: PathBuf,
         action: PlatformAction,
     },
+    BulkPlatformAssignment {
+        archive_paths: Vec<PathBuf>,
+        kind: BulkPlatformActionKind,
+    },
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -2899,6 +3107,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_diagnostics();
         self.poll_setup_action(context);
         self.poll_platform_action(context);
+        self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
@@ -3071,6 +3280,7 @@ impl eframe::App for ArchiveFsApp {
                                                 row_range,
                                                 row_height,
                                                 None,
+                                                &HashSet::new(),
                                             );
                                         },
                                     );
@@ -3117,6 +3327,9 @@ impl eframe::App for ArchiveFsApp {
                             platform_choice: &mut self.platform_choice,
                             platform_custom_text: &mut self.platform_custom_text,
                             platform_busy: self.platform_action.is_some(),
+                            selected_archives: &mut self.selected_archives,
+                            bulk_platform_choice: &mut self.bulk_platform_choice,
+                            bulk_platform_busy: self.bulk_platform_action.is_some(),
                         },
                     );
                 }
@@ -3190,6 +3403,12 @@ impl eframe::App for ArchiveFsApp {
                     action,
                 } => {
                     self.start_platform_action(context.clone(), archive_path, action);
+                }
+                AppOperationRequest::BulkPlatformAssignment {
+                    archive_paths,
+                    kind,
+                } => {
+                    self.start_bulk_platform_action(context.clone(), archive_paths, kind);
                 }
             }
         }
@@ -3298,6 +3517,60 @@ fn apply_platform_action_at(
         PlatformAction::Set(platform) => database.set_manual_platform(archive_id, platform),
         PlatformAction::Clear => database.clear_manual_platform(archive_id),
     }
+}
+
+/// Opens the default library database and applies one
+/// `BulkPlatformActionKind` to `archive_paths` - the production entry
+/// point run on the background thread `ArchiveFsApp::start_bulk_platform_action`
+/// spawns. See [`apply_bulk_platform_action_at`] (the testable core,
+/// mirrors `apply_platform_action`/`apply_platform_action_at`) for the
+/// actual logic.
+fn apply_bulk_platform_action(
+    archive_paths: &[PathBuf],
+    kind: &BulkPlatformActionKind,
+) -> archivefs_core::Result<BulkPlatformActionOutcome> {
+    let database_path = default_database_path()?;
+    apply_bulk_platform_action_at(&database_path, archive_paths, kind)
+}
+
+/// Resolves every path in `archive_paths` to a stable persisted archive
+/// id by exact path bytes (never a lossy display string - see
+/// `Database::find_archive_id_by_absolute_path`), then applies `kind` to
+/// every id that resolved in one database transaction (see
+/// `Database::set_manual_platform_for_archives`/
+/// `clear_manual_platform_for_archives`). Unlike the single-row
+/// `apply_platform_action_at`, a path that does not resolve to any
+/// database archive id (a live-only/not-yet-scanned row, for example) is
+/// not a hard error here - it is counted in the returned
+/// `BulkPlatformActionOutcome::unresolved_paths` instead, so one
+/// unresolvable row in a large selection never blocks every other,
+/// resolvable row in the same selection from being updated. This mirrors
+/// the database bulk API's own "skip and report, don't abort" policy for
+/// an archive id that turns out not to exist.
+fn apply_bulk_platform_action_at(
+    database_path: &Path,
+    archive_paths: &[PathBuf],
+    kind: &BulkPlatformActionKind,
+) -> archivefs_core::Result<BulkPlatformActionOutcome> {
+    let mut database = Database::open_or_create(database_path)?;
+    let mut ids = Vec::with_capacity(archive_paths.len());
+    let mut unresolved_paths = 0usize;
+    for path in archive_paths {
+        match database.find_archive_id_by_absolute_path(path)? {
+            Some(id) => ids.push(id),
+            None => unresolved_paths += 1,
+        }
+    }
+    let result = match kind {
+        BulkPlatformActionKind::Set(platform) => {
+            database.set_manual_platform_for_archives(&ids, platform)?
+        }
+        BulkPlatformActionKind::Clear => database.clear_manual_platform_for_archives(&ids)?,
+    };
+    Ok(BulkPlatformActionOutcome {
+        result,
+        unresolved_paths,
+    })
 }
 
 /// Opens the default library database and applies one `AliasAction` -
@@ -4182,6 +4455,9 @@ struct LoadedViewState<'a> {
     platform_choice: &'a mut Option<String>,
     platform_custom_text: &'a mut String,
     platform_busy: bool,
+    selected_archives: &'a mut HashSet<PathBuf>,
+    bulk_platform_choice: &'a mut Option<String>,
+    bulk_platform_busy: bool,
 }
 
 fn show_loaded_data(
@@ -4216,6 +4492,9 @@ fn show_loaded_data(
         platform_choice,
         platform_custom_text,
         platform_busy,
+        selected_archives,
+        bulk_platform_choice,
+        bulk_platform_busy,
     } = view_state;
     let mut requested_action = None;
     let pending_count = data.stats.pending_count;
@@ -4697,7 +4976,7 @@ fn show_loaded_data(
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
     let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
-    let mut clicked_index = None;
+    let mut clicked = None;
     egui::ScrollArea::horizontal()
         .id_salt("archive_status_horizontal")
         .auto_shrink([false, false])
@@ -4712,20 +4991,40 @@ fn show_loaded_data(
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_height, visible_count, |ui, row_range| {
-                    clicked_index = show_archive_rows(
+                    clicked = show_archive_rows(
                         ui,
                         &merged_rows,
                         Some(&visible_indices),
                         row_range,
                         row_height,
                         selected_index,
+                        selected_archives,
                     );
                 });
         });
-    if let Some(index) = clicked_index {
-        *selected_archive = Some(merged_rows[index].path.clone());
+    // Requirement 2: an ordinary click replaces the whole selection with
+    // just this row; a Ctrl-click toggles only this row, leaving every
+    // other currently-selected row untouched. Either way the details
+    // panel's "focused" row (selected_archive) becomes whatever was just
+    // clicked, and its platform picker resets - it must never keep
+    // showing a choice made for a different, previously-focused archive.
+    if let Some((index, ctrl_held)) = clicked {
+        let path = merged_rows[index].path.clone();
+        apply_row_click(selected_archives, selected_archive, path, ctrl_held);
         *platform_choice = None;
         platform_custom_text.clear();
+    }
+
+    if let Some(action) = show_bulk_platform_action_bar(
+        ui,
+        selected_archives,
+        bulk_platform_choice,
+        bulk_platform_busy,
+    ) {
+        requested_action = Some(AppOperationRequest::BulkPlatformAssignment {
+            archive_paths: selected_archives.iter().cloned().collect(),
+            kind: action,
+        });
     }
 
     requested_action
@@ -4779,6 +5078,15 @@ fn show_table_cells(
     clicked
 }
 
+/// Renders one page of table rows, highlighting a row if it is either the
+/// single "focused" row (`selected_index`) or a member of the multi-select
+/// set (`multi_selected` - exact `ArchiveRow::path` identity, never a row
+/// index). Returns `Some((row_index, ctrl_held))` for the row clicked
+/// this frame, if any - `ctrl_held` is read once, from the same frame's
+/// input state every row in this call shares, so the caller can
+/// distinguish an ordinary click (replace the selection) from a
+/// Ctrl-click (toggle just this row) without this function needing to
+/// know anything about selection semantics itself.
 fn show_archive_rows(
     ui: &mut egui::Ui,
     rows: &[ArchiveRow],
@@ -4786,9 +5094,11 @@ fn show_archive_rows(
     row_range: Range<usize>,
     row_height: f32,
     selected_index: Option<usize>,
-) -> Option<usize> {
-    let mut clicked_index = None;
+    multi_selected: &HashSet<PathBuf>,
+) -> Option<(usize, bool)> {
+    let mut clicked = None;
     let visuals = ui.visuals().clone();
+    let ctrl_held = ui.input(|input| input.modifiers.ctrl);
     for visible_index in row_range {
         let row_index = filtered_rows
             .map(|indices| indices[visible_index])
@@ -4800,18 +5110,19 @@ fn show_archive_rows(
             row.archive_path.as_str(),
             row.mount_path.as_str(),
         ];
+        let is_selected = selected_index == Some(row_index) || multi_selected.contains(&row.path);
         if show_table_cells(
             ui,
             &cells,
             row_height,
             false,
-            selected_index == Some(row_index),
+            is_selected,
             row.row_text_color(&visuals),
         ) {
-            clicked_index = Some(row_index);
+            clicked = Some((row_index, ctrl_held));
         }
     }
-    clicked_index
+    clicked
 }
 
 fn selected_record<'a>(
@@ -4840,6 +5151,38 @@ fn selected_record_index(
 fn selected_row_index(rows: &[ArchiveRow], selected_archive: Option<&Path>) -> Option<usize> {
     let selected_archive = selected_archive?;
     rows.iter().position(|row| row.path == selected_archive)
+}
+
+/// Applies one row click to the selection state - requirement 2's exact
+/// semantics. An ordinary click (`ctrl_held = false`) replaces the whole
+/// multi-selection with just `path`; a Ctrl-click toggles only `path`,
+/// leaving every other currently-selected row untouched. Either way,
+/// `selected_archive` (the details panel's "focused" row) becomes
+/// `path`. Factored out from `show_loaded_data`'s row-click handling so
+/// it is directly testable without an `egui::Ui`.
+fn apply_row_click(
+    selected_archives: &mut HashSet<PathBuf>,
+    selected_archive: &mut Option<PathBuf>,
+    path: PathBuf,
+    ctrl_held: bool,
+) {
+    if ctrl_held {
+        if !selected_archives.remove(&path) {
+            selected_archives.insert(path.clone());
+        }
+    } else {
+        selected_archives.clear();
+        selected_archives.insert(path.clone());
+    }
+    *selected_archive = Some(path);
+}
+
+/// Whether the compact bulk platform action bar should be shown -
+/// requirement 3: only when more than one row is selected. Factored out
+/// as its own pure predicate (mirroring `mount_all_available`) so the
+/// condition is directly testable without an `egui::Ui`.
+fn bulk_action_bar_visible(selected_archives: &HashSet<PathBuf>) -> bool {
+    selected_archives.len() > 1
 }
 
 /// The persisted database row backing the selected archive, if the
@@ -5239,6 +5582,72 @@ fn show_platform_section(
     platform_request
 }
 
+/// Renders the compact bulk platform action bar - shown only when more
+/// than one row is selected (requirement 3): a single selected row
+/// already has its own platform picker in the details panel
+/// (`show_platform_section`), and showing both for one row would be
+/// redundant and ambiguous about which one actually applies. Uses
+/// `canonical_platform_names()` (the same central list
+/// `show_platform_section`/the CLI validate against) with no free-form
+/// custom-text escape hatch - deliberately narrower than the single-row
+/// picker, matching the bulk feature's "simple by default" scope
+/// (requirement 4).
+fn show_bulk_platform_action_bar(
+    ui: &mut egui::Ui,
+    selected_archives: &HashSet<PathBuf>,
+    bulk_platform_choice: &mut Option<String>,
+    bulk_platform_busy: bool,
+) -> Option<BulkPlatformActionKind> {
+    if !bulk_action_bar_visible(selected_archives) {
+        return None;
+    }
+
+    let mut action = None;
+    ui.add_space(6.0);
+    ui.separator();
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(format!("{} archives selected", selected_archives.len()));
+        ui.horizontal(|ui| {
+            ui.label("Platform:");
+            egui::ComboBox::from_id_salt("bulk_platform_choice_combo")
+                .selected_text(
+                    bulk_platform_choice
+                        .as_deref()
+                        .unwrap_or("Select platform..."),
+                )
+                .show_ui(ui, |ui| {
+                    for name in canonical_platform_names() {
+                        ui.selectable_value(bulk_platform_choice, Some(name.to_string()), name);
+                    }
+                });
+            if ui
+                .add_enabled(
+                    !bulk_platform_busy && bulk_platform_choice.is_some(),
+                    egui::Button::new("Set for selected"),
+                )
+                .clicked()
+                && let Some(platform) = bulk_platform_choice.clone()
+            {
+                action = Some(BulkPlatformActionKind::Set(platform));
+            }
+            if ui
+                .add_enabled(
+                    !bulk_platform_busy,
+                    egui::Button::new("Clear manual for selected"),
+                )
+                .clicked()
+            {
+                action = Some(BulkPlatformActionKind::Clear);
+            }
+            if bulk_platform_busy {
+                ui.spinner();
+                ui.label("Updating...");
+            }
+        });
+    });
+    action
+}
+
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.strong(label);
     ui.label(value);
@@ -5394,6 +5803,9 @@ mod tests {
             alias_action: None,
             new_alias_text: String::new(),
             new_alias_platform_choice: None,
+            selected_archives: HashSet::new(),
+            bulk_platform_action: None,
+            bulk_platform_choice: None,
         }
     }
 
@@ -8488,6 +8900,444 @@ mod tests {
         .unwrap();
 
         assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -------------------------------------------------------------
+    // Bulk manual platform assignment
+    // -------------------------------------------------------------
+
+    #[test]
+    fn single_click_replaces_the_whole_selection_with_one_row() {
+        let mut selected_archives: HashSet<PathBuf> =
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect();
+        let mut selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        let clicked = PathBuf::from("/roms/c.zip");
+
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            clicked.clone(),
+            false,
+        );
+
+        assert_eq!(selected_archives, [clicked.clone()].into_iter().collect());
+        assert_eq!(selected_archive, Some(clicked));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_individual_rows_without_touching_others() {
+        let path_a = PathBuf::from("/roms/a.zip");
+        let path_b = PathBuf::from("/roms/b.zip");
+        let mut selected_archives: HashSet<PathBuf> = [path_a.clone()].into_iter().collect();
+        let mut selected_archive = Some(path_a.clone());
+
+        // Ctrl-click an unselected row: added, path_a untouched.
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            path_b.clone(),
+            true,
+        );
+        assert_eq!(
+            selected_archives,
+            [path_a.clone(), path_b.clone()].into_iter().collect()
+        );
+        assert_eq!(selected_archive, Some(path_b.clone()));
+
+        // Ctrl-click an already-selected row: removed, the other stays.
+        apply_row_click(
+            &mut selected_archives,
+            &mut selected_archive,
+            path_a.clone(),
+            true,
+        );
+        assert_eq!(selected_archives, [path_b].into_iter().collect());
+        assert_eq!(selected_archive, Some(path_a));
+    }
+
+    #[test]
+    fn ctrl_click_can_deselect_the_last_remaining_row() {
+        let path = PathBuf::from("/roms/a.zip");
+        let mut selected_archives: HashSet<PathBuf> = [path.clone()].into_iter().collect();
+        let mut selected_archive = Some(path.clone());
+
+        apply_row_click(&mut selected_archives, &mut selected_archive, path, true);
+
+        assert!(selected_archives.is_empty());
+    }
+
+    #[test]
+    fn bulk_action_bar_requires_more_than_one_selected_row() {
+        let mut selected: HashSet<PathBuf> = HashSet::new();
+        assert!(!bulk_action_bar_visible(&selected));
+
+        selected.insert(PathBuf::from("/roms/a.zip"));
+        assert!(!bulk_action_bar_visible(&selected));
+
+        selected.insert(PathBuf::from("/roms/b.zip"));
+        assert!(bulk_action_bar_visible(&selected));
+    }
+
+    #[test]
+    fn prune_selection_uses_the_full_catalogue_not_the_filtered_view() {
+        // A selected archive a text filter would currently hide must
+        // still count as "in the loaded catalogue" - filtering must never
+        // silently deselect a row, only change what is visible.
+        let mut app = app_for_operation_tests();
+        let path_a = PathBuf::from("/roms/a.zip");
+        let path_b = PathBuf::from("/roms/b.zip");
+        app.selected_archives = [path_a.clone(), path_b.clone()].into_iter().collect();
+        let record_a = record_at(path_a, MountState::Pending);
+        let record_b = record_at(path_b, MountState::Pending);
+        let rows = vec![row_for(&record_a), row_for(&record_b)];
+
+        app.prune_selection(&rows);
+
+        assert_eq!(
+            app.selected_archives.len(),
+            2,
+            "both selected rows are still in the catalogue"
+        );
+    }
+
+    #[test]
+    fn prune_selection_removes_a_vanished_selection_and_clears_the_focused_row() {
+        let mut app = app_for_operation_tests();
+        let still_present = PathBuf::from("/roms/a.zip");
+        let vanished = PathBuf::from("/roms/b.zip");
+        app.selected_archives = [still_present.clone(), vanished.clone()]
+            .into_iter()
+            .collect();
+        app.selected_archive = Some(vanished.clone());
+        let record = record_at(still_present.clone(), MountState::Pending);
+        let rows = vec![row_for(&record)];
+
+        app.prune_selection(&rows);
+
+        assert_eq!(
+            app.selected_archives,
+            [still_present].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            app.selected_archive, None,
+            "the focused row must be cleared once it no longer exists in the catalogue"
+        );
+    }
+
+    #[test]
+    fn bulk_platform_action_available_requires_no_running_action_or_database_load() {
+        let mut app = app_for_operation_tests();
+        assert!(app.bulk_platform_action_available());
+
+        let (_sender, receiver) = mpsc::channel();
+        app.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: BulkPlatformActionKind::Clear,
+            requested_paths: 2,
+            receiver,
+        });
+        assert!(!app.bulk_platform_action_available());
+        app.bulk_platform_action = None;
+
+        let (_sender, receiver) = mpsc::channel();
+        app.database_state = DatabaseState::Loading {
+            generation: DatabaseGeneration::INITIAL,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+        assert!(!app.bulk_platform_action_available());
+    }
+
+    #[test]
+    fn single_and_bulk_platform_actions_are_mutually_exclusive() {
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        app.platform_action = Some(RunningPlatformAction {
+            archive_path: PathBuf::from("/roms/a.zip"),
+            receiver,
+        });
+
+        assert!(
+            !app.bulk_platform_action_available(),
+            "a running single-row platform action must block a new bulk one"
+        );
+
+        app.platform_action = None;
+        let (_sender, receiver) = mpsc::channel();
+        app.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: BulkPlatformActionKind::Clear,
+            requested_paths: 2,
+            receiver,
+        });
+
+        assert!(
+            !app.platform_action_available(),
+            "a running bulk platform action must block a new single-row one"
+        );
+    }
+
+    #[test]
+    fn bulk_platform_action_never_affects_is_busy_or_mount_availability() {
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        app.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: BulkPlatformActionKind::Set("GameCube".to_string()),
+            requested_paths: 3,
+            receiver,
+        });
+
+        assert!(
+            !app.is_busy(),
+            "bulk platform assignment is metadata-only and must never enter the mount busy state"
+        );
+    }
+
+    #[test]
+    fn bulk_platform_action_does_not_block_on_a_slow_background_worker() {
+        // Mirrors scan_library_action_does_not_block_on_a_slow_background_worker:
+        // never calls the real start_bulk_platform_action/apply_bulk_platform_action
+        // (which would touch the real default database path) - drives the
+        // same Loading-equivalent state by hand and proves poll_bulk_platform_action's
+        // use of try_recv (not recv) never blocks the UI thread.
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        app.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: BulkPlatformActionKind::Clear,
+            requested_paths: 5,
+            receiver,
+        });
+
+        app.poll_bulk_platform_action(&egui::Context::default());
+
+        assert!(app.bulk_platform_action.is_some());
+    }
+
+    #[test]
+    fn poll_bulk_platform_action_success_refreshes_the_database_cache_asynchronously() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        app.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: BulkPlatformActionKind::Set("GameCube".to_string()),
+            requested_paths: 3,
+            receiver,
+        });
+        sender
+            .send(Ok(BulkPlatformActionOutcome {
+                result: BulkPlatformAssignmentResult {
+                    requested: 3,
+                    changed: 2,
+                    unchanged: 1,
+                    missing: Vec::new(),
+                },
+                unresolved_paths: 0,
+            }))
+            .unwrap();
+
+        app.poll_bulk_platform_action(&egui::Context::default());
+
+        assert!(app.bulk_platform_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(feedback.succeeded);
+        assert!(feedback.message.contains("GameCube"));
+        assert!(
+            feedback.message.contains('2'),
+            "must mention the changed count"
+        );
+        assert!(app.history.entries().any(|entry| entry.action
+            == ActivityAction::BulkPlatformAssignment
+            && entry.outcome == ActivityOutcome::Completed));
+        // Refreshing the cache is asynchronous - poll_bulk_platform_action
+        // only starts a new background database load, it does not block
+        // waiting for it, and the live snapshot is untouched.
+        assert!(app.database_state.is_loading());
+        assert!(matches!(app.state, LoadState::Ready(_)));
+    }
+
+    #[test]
+    fn poll_bulk_platform_action_failure_preserves_the_cached_row_and_selection() {
+        let mut app = app_for_operation_tests();
+        let stale_snapshot = cached_snapshot(vec![persisted_archive_with_platform(
+            PathBuf::from("/roms/a.zip"),
+            1,
+            "N64",
+            "folder_alias",
+        )]);
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(stale_snapshot.clone()),
+            last_scan_summary: None,
+        };
+        let selected: HashSet<PathBuf> =
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect();
+        app.selected_archives = selected.clone();
+        let (sender, receiver) = mpsc::channel();
+        app.bulk_platform_action = Some(RunningBulkPlatformAction {
+            kind: BulkPlatformActionKind::Set("GameCube".to_string()),
+            requested_paths: 2,
+            receiver,
+        });
+        sender.send(Err("database is locked".to_string())).unwrap();
+
+        app.poll_bulk_platform_action(&egui::Context::default());
+
+        assert!(app.bulk_platform_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(!feedback.succeeded);
+        assert!(feedback.message.contains("database is locked"));
+        assert!(app.history.entries().any(|entry| entry.action
+            == ActivityAction::BulkPlatformAssignment
+            && entry.outcome == ActivityOutcome::Failed));
+        // Requirement 8: a failed bulk action must preserve both the
+        // prior cached rows and the selection exactly as they were.
+        match &app.database_state {
+            DatabaseState::Ready { snapshot, .. } => {
+                assert_eq!(snapshot.archives, stale_snapshot.archives);
+                assert_eq!(snapshot.database_path, stale_snapshot.database_path);
+            }
+            other => panic!(
+                "expected the cached snapshot to survive untouched, got status {}",
+                other.status_label()
+            ),
+        }
+        assert_eq!(app.selected_archives, selected);
+    }
+
+    #[test]
+    fn apply_bulk_platform_action_at_sets_platform_for_every_selected_archive() {
+        let dir = database_test_dir("apply-bulk-set");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        let path_a = write_archive_file(&source, "a.zip", b"a");
+        let path_b = write_archive_file(&source, "b.zip", b"b");
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+
+        let outcome = apply_bulk_platform_action_at(
+            &database_path,
+            &[path_a, path_b],
+            &BulkPlatformActionKind::Set("GameCube".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.result.requested, 2);
+        assert_eq!(outcome.result.changed, 2);
+        assert_eq!(outcome.unresolved_paths, 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_bulk_platform_action_at_reports_unresolved_paths_separately_from_missing_ids() {
+        let dir = database_test_dir("apply-bulk-unresolved");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        let path_a = write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+        // A live-only row never scanned into the database at all - a
+        // fundamentally different situation from a stale archive id, and
+        // must be reported separately (unresolved_paths), never silently
+        // treated as if it were a "missing" database id.
+        let never_scanned = source.join("never-scanned.zip");
+
+        let outcome = apply_bulk_platform_action_at(
+            &database_path,
+            &[path_a, never_scanned],
+            &BulkPlatformActionKind::Set("GameCube".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.result.requested, 1);
+        assert_eq!(outcome.result.changed, 1);
+        assert!(outcome.result.missing.is_empty());
+        assert_eq!(outcome.unresolved_paths, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_bulk_platform_action_at_clears_and_restores_fallback() {
+        let dir = database_test_dir("apply-bulk-clear");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        let path_a = write_archive_file(&source, "msx2/game.zip", b"a");
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+        apply_bulk_platform_action_at(
+            &database_path,
+            std::slice::from_ref(&path_a),
+            &BulkPlatformActionKind::Set("GameCube".to_string()),
+        )
+        .unwrap();
+
+        let outcome = apply_bulk_platform_action_at(
+            &database_path,
+            &[path_a],
+            &BulkPlatformActionKind::Clear,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.result.changed, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn apply_bulk_platform_action_at_works_for_non_utf8_archive_paths_on_unix() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = database_test_dir("apply-bulk-non-utf8");
+        let source = dir.join("source");
+        let mount = dir.join("mount");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut invalid_name = b"fo".to_vec();
+        invalid_name.push(0x80);
+        invalid_name.extend_from_slice(b"o.zip");
+        let archive_path = source.join(OsString::from_vec(invalid_name));
+        assert!(
+            archive_path.to_str().is_none(),
+            "test path must actually be invalid UTF-8"
+        );
+        std::fs::write(&archive_path, b"contents").unwrap();
+        let other_path = write_archive_file(&source, "other.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let database_path = dir.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            scan_and_persist(&mut database, &config, "test").unwrap();
+        }
+
+        let outcome = apply_bulk_platform_action_at(
+            &database_path,
+            &[archive_path, other_path],
+            &BulkPlatformActionKind::Set("GameCube".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.result.changed, 2,
+            "a non-UTF-8 archive path must resolve to its exact archive, not be silently dropped"
+        );
+        assert_eq!(outcome.unresolved_paths, 0);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

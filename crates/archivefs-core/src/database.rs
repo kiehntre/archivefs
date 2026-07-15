@@ -529,6 +529,33 @@ pub struct PlatformAssignmentChange {
     pub new_source: Option<String>,
 }
 
+/// The result of one [`Database::set_manual_platform_for_archives`] or
+/// [`Database::clear_manual_platform_for_archives`] call.
+///
+/// `requested` counts *distinct* archive ids after deduplication - a
+/// duplicate id in the input never inflates this count and never
+/// produces a second history row (see both methods' doc comments).
+/// `changed` and `unchanged` count exactly one of the two ways processing
+/// a distinct, existing id can go: `changed` means a new
+/// `platform_assignments` row became current for that archive; `unchanged`
+/// means the archive already had the effective result the caller asked
+/// for, so nothing was written (matching `set_manual_platform`/
+/// `clear_manual_platform`'s existing per-row no-op behavior exactly -
+/// see `Database::set_manual_platform_for_archives` for the precise
+/// conditions).
+/// `missing` lists every requested id that does not name any archive in
+/// this database, in the order first requested - never silently dropped,
+/// and never cause the ids that *do* exist to go unprocessed (see the
+/// "missing-id policy" note on `set_manual_platform_for_archives`).
+/// `requested == changed + unchanged + missing.len()` always holds.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct BulkPlatformAssignmentResult {
+    pub requested: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+    pub missing: Vec<i64>,
+}
+
 /// One persisted custom platform folder alias (`platform_aliases` table -
 /// see [`Database::add_platform_alias`]). `alias` is the user's original
 /// typed text (trimmed), kept only for display; matching and uniqueness
@@ -1311,6 +1338,243 @@ impl Database {
             new_platform,
             new_source,
         })
+    }
+
+    /// Deduplicates `archive_ids`, preserving the order of first
+    /// occurrence - the shared first step of
+    /// [`Self::set_manual_platform_for_archives`] and
+    /// [`Self::clear_manual_platform_for_archives`], so a duplicate id in
+    /// the caller's selection (for example the same archive reachable by
+    /// both `--id` and `--path` on the CLI, or a GUI multi-selection that
+    /// somehow contains a repeat) is processed - and can produce at most
+    /// one history row - exactly once.
+    fn deduplicate_archive_ids(archive_ids: &[i64]) -> Vec<i64> {
+        let mut seen = HashSet::new();
+        archive_ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
+
+    /// Sets `platform` as a manual, user-chosen platform assignment for
+    /// every archive in `archive_ids` in a single transaction - the batch
+    /// counterpart to [`Self::set_manual_platform`]. Every existing
+    /// caller of the single-row method is unaffected by this one; it does
+    /// not call or delegate to it (a loop calling `set_manual_platform`
+    /// would open one transaction per archive, which this exists
+    /// specifically to avoid).
+    ///
+    /// Per-archive precedence is identical to `set_manual_platform`: a
+    /// manual assignment always wins over automatic detection
+    /// (`provenance_priority`'s top tier), and this call itself never
+    /// blocks on priority - it *is* how a user replaces one manual choice
+    /// with another, in bulk. An archive already carrying this exact
+    /// manual platform is counted `unchanged`, not `changed` -
+    /// re-confirming the same value never grows history.
+    ///
+    /// Missing-id policy (deliberately atomic-but-not-all-or-nothing): an
+    /// id in `archive_ids` that does not name any archive in this
+    /// database is skipped and reported in the result's `missing` list,
+    /// rather than aborting the whole call - a stale id must not prevent
+    /// every other, valid id in the same batch from being updated. What
+    /// *is* atomic is the set of writes actually performed: they all
+    /// happen in one transaction, so a genuine failure partway through
+    /// (a database error, not a missing id) rolls every one of them back
+    /// - see `bulk_set_manual_platform_transaction_rolls_back_on_failure`.
+    ///
+    /// Rejects `platform` if it is empty or whitespace-only, exactly like
+    /// `set_manual_platform` - checked once, up front, before any row is
+    /// touched, so an invalid platform never partially applies.
+    pub fn set_manual_platform_for_archives(
+        &mut self,
+        archive_ids: &[i64],
+        platform: &str,
+    ) -> Result<BulkPlatformAssignmentResult> {
+        if platform.trim().is_empty() {
+            return Err(ArchiveFsError::Database(
+                "manual platform must not be empty or whitespace-only".to_string(),
+            ));
+        }
+
+        let ids = Self::deduplicate_archive_ids(archive_ids);
+        let mut result = BulkPlatformAssignmentResult {
+            requested: ids.len(),
+            ..BulkPlatformAssignmentResult::default()
+        };
+
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error(
+                "failed to start set_manual_platform_for_archives transaction",
+                error,
+            )
+        })?;
+        let now = now_utc_string();
+
+        for archive_id in &ids {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM archives WHERE id = ?1",
+                    params![archive_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to check archive existence", error))?
+                .is_some();
+            if !exists {
+                result.missing.push(*archive_id);
+                continue;
+            }
+
+            let current: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT platform, source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                    params![archive_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to look up current platform assignment", error))?;
+
+            if current
+                .as_ref()
+                .is_some_and(|(current_platform, current_source)| {
+                    current_platform == platform && current_source == MANUAL_PLATFORM_SOURCE
+                })
+            {
+                result.unchanged += 1;
+                continue;
+            }
+
+            tx.execute(
+                "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+            )
+            .map_err(|error| db_error("failed to retire previous platform assignment", error))?;
+            tx.execute(
+                "INSERT INTO platform_assignments (archive_id, platform, source, is_current, assigned_at) \
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+                params![archive_id, platform, MANUAL_PLATFORM_SOURCE, now],
+            )
+            .map_err(|error| db_error("failed to insert manual platform assignment", error))?;
+            result.changed += 1;
+        }
+
+        tx.commit().map_err(|error| {
+            db_error("failed to commit set_manual_platform_for_archives", error)
+        })?;
+        Ok(result)
+    }
+
+    /// Clears a manual platform assignment for every archive in
+    /// `archive_ids` in a single transaction - the batch counterpart to
+    /// [`Self::clear_manual_platform`], which it does not call or
+    /// delegate to (see [`Self::set_manual_platform_for_archives`]'s doc
+    /// comment for why - the same reasoning applies here).
+    ///
+    /// Per archive, this is identical to `clear_manual_platform`: an
+    /// archive whose current assignment is not manual (no assignment at
+    /// all, or an automatic one) is a no-op, counted `unchanged` - never
+    /// touches an assignment made a different way. An archive whose
+    /// current assignment *is* manual has it retired and, in the same
+    /// transaction, the most recent automatic assignment still in this
+    /// archive's history (any row whose source is not
+    /// [`MANUAL_PLATFORM_SOURCE`] - this already includes
+    /// [`CUSTOM_FOLDER_ALIAS_SOURCE`] results, so a custom alias fallback
+    /// is restored exactly like any other automatic source) restored as
+    /// current immediately, without needing a rescan; if there is no such
+    /// row, the archive becomes current-less (`Unknown`), exactly as
+    /// `clear_manual_platform` already behaves. Counted `changed`.
+    ///
+    /// Missing-id policy is identical to
+    /// [`Self::set_manual_platform_for_archives`]: a stale id is skipped
+    /// and reported in `missing`, never aborting the rest of the batch;
+    /// the writes that do happen are still one atomic transaction.
+    pub fn clear_manual_platform_for_archives(
+        &mut self,
+        archive_ids: &[i64],
+    ) -> Result<BulkPlatformAssignmentResult> {
+        let ids = Self::deduplicate_archive_ids(archive_ids);
+        let mut result = BulkPlatformAssignmentResult {
+            requested: ids.len(),
+            ..BulkPlatformAssignmentResult::default()
+        };
+
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error(
+                "failed to start clear_manual_platform_for_archives transaction",
+                error,
+            )
+        })?;
+
+        for archive_id in &ids {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM archives WHERE id = ?1",
+                    params![archive_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to check archive existence", error))?
+                .is_some();
+            if !exists {
+                result.missing.push(*archive_id);
+                continue;
+            }
+
+            let current_source: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                    params![archive_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to look up current platform assignment", error))?;
+
+            if current_source.as_deref() != Some(MANUAL_PLATFORM_SOURCE) {
+                result.unchanged += 1;
+                continue;
+            }
+
+            tx.execute(
+                "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+            )
+            .map_err(|error| db_error("failed to clear manual platform assignment", error))?;
+
+            let latest_automatic_row_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM platform_assignments \
+                     WHERE archive_id = ?1 AND source != ?2 \
+                     ORDER BY id DESC LIMIT 1",
+                    params![archive_id, MANUAL_PLATFORM_SOURCE],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    db_error(
+                        "failed to look up latest automatic platform assignment",
+                        error,
+                    )
+                })?;
+            if let Some(row_id) = latest_automatic_row_id {
+                tx.execute(
+                    "UPDATE platform_assignments SET is_current = 1 WHERE id = ?1",
+                    params![row_id],
+                )
+                .map_err(|error| {
+                    db_error(
+                        "failed to restore latest automatic platform assignment",
+                        error,
+                    )
+                })?;
+            }
+            result.changed += 1;
+        }
+
+        tx.commit().map_err(|error| {
+            db_error("failed to commit clear_manual_platform_for_archives", error)
+        })?;
+        Ok(result)
     }
 
     /// Adds a persistent custom platform folder alias: `alias` is a
@@ -4023,6 +4287,435 @@ mod tests {
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
 
         assert!(!database.remove_platform_alias("does-not-exist").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------
+    // Bulk manual platform assignment
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bulk_set_manual_platform_changes_every_selected_archive() {
+        let root = temp_dir("bulk-set-changes-all");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        write_archive_file(&source, "b.zip", b"b");
+        write_archive_file(&source, "c.zip", b"c");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let ids: Vec<i64> = ["a.zip", "b.zip", "c.zip"]
+            .iter()
+            .map(|name| find_archive(&archives, name).id)
+            .collect();
+
+        let result = database
+            .set_manual_platform_for_archives(&ids, "GameCube")
+            .unwrap();
+
+        assert_eq!(result.requested, 3);
+        assert_eq!(result.changed, 3);
+        assert_eq!(result.unchanged, 0);
+        assert!(result.missing.is_empty());
+
+        let archives = database.load_archives().unwrap();
+        for name in ["a.zip", "b.zip", "c.zip"] {
+            let archive = find_archive(&archives, name);
+            assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+            assert_eq!(
+                archive.platform_source.as_deref(),
+                Some(MANUAL_PLATFORM_SOURCE)
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_set_manual_platform_transaction_rolls_back_on_failure() {
+        let root = temp_dir("bulk-set-rollback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        write_archive_file(&source, "b.zip", b"b");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let id_a = find_archive(&archives, "a.zip").id;
+        let id_b = find_archive(&archives, "b.zip").id;
+
+        // A trigger that makes the *second* archive's insert fail, after
+        // the first has already (uncommitted) succeeded within the same
+        // transaction - proving the whole batch rolls back together, not
+        // just the row that actually failed.
+        database
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_archive_b BEFORE INSERT ON platform_assignments \
+                 WHEN NEW.archive_id = {id_b} \
+                 BEGIN SELECT RAISE(ABORT, 'forced failure for test'); END;"
+            ))
+            .unwrap();
+
+        let before = database.load_archives().unwrap();
+        let before_a = find_archive(&before, "a.zip").clone();
+        let before_b = find_archive(&before, "b.zip").clone();
+
+        let result = database.set_manual_platform_for_archives(&[id_a, id_b], "GameCube");
+
+        assert!(
+            result.is_err(),
+            "the forced failure must propagate as an error"
+        );
+        let after = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&after, "a.zip"),
+            &before_a,
+            "the row processed before the failure must be rolled back too, not partially applied"
+        );
+        assert_eq!(find_archive(&after, "b.zip"), &before_b);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_set_manual_platform_deduplicates_ids_without_duplicating_history() {
+        let root = temp_dir("bulk-set-dedup");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "a.zip").id;
+
+        let result = database
+            .set_manual_platform_for_archives(&[archive_id, archive_id, archive_id], "GameCube")
+            .unwrap();
+
+        assert_eq!(
+            result.requested, 1,
+            "requested must reflect distinct ids after deduplication"
+        );
+        assert_eq!(result.changed, 1);
+
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 1,
+            "a duplicated id in one bulk call must not duplicate history"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_set_manual_platform_with_the_same_value_reports_unchanged() {
+        let root = temp_dir("bulk-set-unchanged");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        write_archive_file(&source, "b.zip", b"b");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let id_a = find_archive(&archives, "a.zip").id;
+        let id_b = find_archive(&archives, "b.zip").id;
+        database
+            .set_manual_platform_for_archives(&[id_a, id_b], "GameCube")
+            .unwrap();
+
+        let result = database
+            .set_manual_platform_for_archives(&[id_a, id_b], "GameCube")
+            .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.unchanged, 2);
+
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![id_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 1,
+            "re-confirming the same manual platform in bulk must not grow history"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_set_manual_platform_reports_missing_ids_without_failing_the_batch() {
+        let root = temp_dir("bulk-set-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let real_id = find_archive(&database.load_archives().unwrap(), "a.zip").id;
+        let missing_id = real_id + 999_999;
+
+        let result = database
+            .set_manual_platform_for_archives(&[real_id, missing_id], "GameCube")
+            .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.changed, 1, "the valid id must still be processed");
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(result.missing, vec![missing_id]);
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "a.zip").platform.as_deref(),
+            Some("GameCube"),
+            "a stale id elsewhere in the batch must not prevent the valid id from being updated"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_clear_manual_platform_restores_each_archives_latest_automatic_fallback() {
+        let root = temp_dir("bulk-clear-restores-fallback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"a");
+        write_archive_file(&source, "neogeo/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let id_msx2 = find_archive(&archives, "msx2/game.zip").id;
+        let id_neogeo = find_archive(&archives, "neogeo/game.zip").id;
+        database
+            .set_manual_platform_for_archives(&[id_msx2, id_neogeo], "GameCube")
+            .unwrap();
+
+        let result = database
+            .clear_manual_platform_for_archives(&[id_msx2, id_neogeo])
+            .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.changed, 2);
+        assert_eq!(result.unchanged, 0);
+        assert!(result.missing.is_empty());
+
+        // No rescan anywhere in this test - each archive's own latest
+        // automatic result must be current immediately, not a shared or
+        // averaged value.
+        let archives = database.load_archives().unwrap();
+        let msx2 = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(msx2.platform.as_deref(), Some("MSX2"));
+        assert_eq!(msx2.platform_source.as_deref(), Some("folder_alias"));
+        let neogeo = find_archive(&archives, "neogeo/game.zip");
+        assert_eq!(neogeo.platform.as_deref(), Some("NeoGeo"));
+        assert_eq!(neogeo.platform_source.as_deref(), Some("folder_alias"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_clear_manual_platform_on_non_manual_rows_is_a_no_op() {
+        let root = temp_dir("bulk-clear-non-manual-noop");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"a"); // automatic (folder_alias)
+        write_archive_file(&source, "mystery.zip", b"b"); // no assignment at all
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        let id_msx2 = find_archive(&archives, "msx2/game.zip").id;
+        let id_mystery = find_archive(&archives, "mystery.zip").id;
+        let before = database.load_archives().unwrap();
+        let before_msx2 = find_archive(&before, "msx2/game.zip").clone();
+        let before_mystery = find_archive(&before, "mystery.zip").clone();
+
+        let result = database
+            .clear_manual_platform_for_archives(&[id_msx2, id_mystery])
+            .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.unchanged, 2);
+        let after = database.load_archives().unwrap();
+        assert_eq!(find_archive(&after, "msx2/game.zip"), &before_msx2);
+        assert_eq!(find_archive(&after, "mystery.zip"), &before_mystery);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_manual_precedence_survives_a_rescan() {
+        let root = temp_dir("bulk-manual-precedence-survives-rescan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "msx2/game.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "msx2/game.zip").id;
+        database
+            .set_manual_platform_for_archives(&[archive_id], "GameCube")
+            .unwrap();
+
+        // A rescan re-detects "MSX2" via the folder alias every time, but
+        // must never be allowed to silently replace the bulk manual
+        // assignment - same precedence guarantee as the single-row API.
+        scan_and_persist(&mut database, &config, "rescan").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "msx2/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_clear_restores_a_custom_alias_fallback_correctly() {
+        let root = temp_dir("bulk-clear-restores-custom-alias");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "gc/game.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("gc", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "gc/game.zip").id;
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "gc/game.zip")
+                .platform_source
+                .as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
+        );
+        database
+            .set_manual_platform_for_archives(&[archive_id], "N64")
+            .unwrap();
+
+        let result = database
+            .clear_manual_platform_for_archives(&[archive_id])
+            .unwrap();
+
+        assert_eq!(result.changed, 1);
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "gc/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE),
+            "clearing bulk-manual must restore the custom alias fallback, not just any automatic result"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bulk_set_and_clear_work_for_non_utf8_archive_identities() {
+        let root = temp_dir("bulk-non-utf8-identity");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        fs::create_dir_all(&source).unwrap();
+        let non_utf8_name =
+            OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f, b'.', b'z', b'i', b'p']);
+        assert!(non_utf8_name.to_str().is_none());
+        fs::write(source.join(&non_utf8_name), b"contents").unwrap();
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        let archive_id = archives[0].id;
+        assert_eq!(archives[0].relative_path, PathBuf::from(&non_utf8_name));
+
+        let set_result = database
+            .set_manual_platform_for_archives(&[archive_id], "GameCube")
+            .unwrap();
+        assert_eq!(set_result.changed, 1);
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives[0].platform.as_deref(), Some("GameCube"));
+        // The exact non-UTF-8 path bytes must still round-trip perfectly -
+        // bulk operations dispatch purely by archive id and never touch
+        // path bytes at all.
+        assert_eq!(archives[0].relative_path, PathBuf::from(&non_utf8_name));
+
+        let clear_result = database
+            .clear_manual_platform_for_archives(&[archive_id])
+            .unwrap();
+        assert_eq!(clear_result.changed, 1);
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives[0].platform, None);
+        assert_eq!(archives[0].relative_path, PathBuf::from(&non_utf8_name));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_set_manual_platform_rejects_empty_platform_before_writing_anything() {
+        let root = temp_dir("bulk-set-rejects-empty");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "a.zip").id;
+
+        assert!(
+            database
+                .set_manual_platform_for_archives(&[archive_id], "   ")
+                .is_err()
+        );
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(find_archive(&archives, "a.zip").platform, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_clear_manual_platform_reports_missing_ids_too() {
+        let root = temp_dir("bulk-clear-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let real_id = find_archive(&database.load_archives().unwrap(), "a.zip").id;
+        database
+            .set_manual_platform_for_archives(&[real_id], "GameCube")
+            .unwrap();
+        let missing_id = real_id + 999_999;
+
+        let result = database
+            .clear_manual_platform_for_archives(&[real_id, missing_id])
+            .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.changed, 1);
+        assert_eq!(result.missing, vec![missing_id]);
 
         let _ = fs::remove_dir_all(&root);
     }

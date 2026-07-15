@@ -5,10 +5,10 @@ use std::sync::OnceLock;
 
 use archivefs_core::{
     ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveInfo,
-    ArchiveScanner, ArchiveStats, ArchiveStatus, CatalogueStats, CompletedScanSummary, Config,
-    ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth, DoctorReport,
-    DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector, MountPlan,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult, CatalogueStats,
+    CompletedScanSummary, Config, ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth,
+    DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
+    MountPlan, PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
     WatchRebuildSummary, build_and_write_archive_index, canonical_platform_names,
     check_archive_index_freshness, check_database_health, clean_mount_root,
     cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
@@ -328,6 +328,54 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_platform_change_json(&change)?;
             } else {
                 print_library_platform_change("Clear Platform", &change);
+            }
+        }
+        "library-set-platform-bulk" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let custom = extract_flag(&mut input_args, "--custom");
+            let ids = extract_repeated_id_flags(&mut input_args)?;
+            let paths = extract_repeated_path_flags(&mut input_args)?;
+            let Some(platform) = input_args.pop() else {
+                return Err(
+                    "library-set-platform-bulk requires a platform, e.g. archivefs-cli library-set-platform-bulk --id 1 --id 2 GameCube"
+                        .into(),
+                );
+            };
+            if !input_args.is_empty() {
+                return Err(
+                    "library-set-platform-bulk does not accept a free-text query - use --id/--path"
+                        .into(),
+                );
+            }
+            require_at_least_one_bulk_selector("library-set-platform-bulk", &ids, &paths)?;
+            let platform = resolve_platform_argument(platform, custom)?;
+            let database_path = default_database_path()?;
+            let summary = run_library_set_platform_bulk(&database_path, &ids, &paths, &platform)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print_bulk_platform_change("Set Platform (bulk)", &summary);
+            }
+        }
+        "library-clear-platform-bulk" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let ids = extract_repeated_id_flags(&mut input_args)?;
+            let paths = extract_repeated_path_flags(&mut input_args)?;
+            if !input_args.is_empty() {
+                return Err(
+                    "library-clear-platform-bulk does not accept a free-text query - use --id/--path"
+                        .into(),
+                );
+            }
+            require_at_least_one_bulk_selector("library-clear-platform-bulk", &ids, &paths)?;
+            let database_path = default_database_path()?;
+            let summary = run_library_clear_platform_bulk(&database_path, &ids, &paths)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print_bulk_platform_change("Clear Platform (bulk)", &summary);
             }
         }
         "platform-alias-list" => {
@@ -1310,6 +1358,155 @@ fn extract_path_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+/// Removes every `--id <value>` occurrence from `args`, returning the
+/// parsed ids in the order given - the bulk counterpart to
+/// [`extract_id_flag`], which only ever handles (and requires) a single
+/// occurrence. Used by `library-set-platform-bulk`/
+/// `library-clear-platform-bulk`, where repeating `--id` is the normal,
+/// expected way to select more than one archive.
+fn extract_repeated_id_flags(
+    args: &mut Vec<String>,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let mut ids = Vec::new();
+    while let Some(position) = args.iter().position(|arg| arg == "--id") {
+        if position + 1 >= args.len() {
+            return Err("--id requires a value".into());
+        }
+        let value = args.remove(position + 1);
+        args.remove(position);
+        let id = value
+            .parse::<i64>()
+            .map_err(|_| format!("--id value '{value}' is not a valid archive id"))?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Removes every `--path <value>` occurrence from `args`, returning the
+/// parsed paths unchanged (exact bytes) in the order given - the bulk
+/// counterpart to [`extract_path_flag`]. See [`extract_repeated_id_flags`].
+fn extract_repeated_path_flags(
+    args: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::new();
+    while let Some(position) = args.iter().position(|arg| arg == "--path") {
+        if position + 1 >= args.len() {
+            return Err("--path requires a value".into());
+        }
+        let value = args.remove(position + 1);
+        args.remove(position);
+        paths.push(PathBuf::from(value));
+    }
+    Ok(paths)
+}
+
+/// Resolves the archive ids `library-set-platform-bulk`/
+/// `library-clear-platform-bulk` should act on: `ids` are passed through
+/// as-is (an id that does not exist is reported in the database bulk
+/// call's own `missing` list, not rejected here - see
+/// `Database::set_manual_platform_for_archives`'s missing-id policy);
+/// each `paths` entry is resolved to its exact archive id via
+/// `Database::find_archive_id_by_absolute_path` and must resolve - an
+/// unresolvable path is an immediate, hard error, mirroring
+/// `library-set-platform --path`'s existing exact-path behavior (a bad
+/// path is a caller mistake at the CLI layer, not a "missing id" the
+/// database layer should have to reason about). The two lists are simply
+/// concatenated, not deduplicated here - `Database::set_manual_platform_for_archives`/
+/// `clear_manual_platform_for_archives` already deduplicate by id, so a
+/// path and an `--id` that happen to name the same archive are still
+/// only ever processed once.
+fn resolve_bulk_target_ids(
+    database: &Database,
+    ids: &[i64],
+    paths: &[PathBuf],
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let mut resolved: Vec<i64> = ids.to_vec();
+    for path in paths {
+        let id = database
+            .find_archive_id_by_absolute_path(path)?
+            .ok_or_else(|| format!("no archive found with exact path {}", path.display()))?;
+        resolved.push(id);
+    }
+    Ok(resolved)
+}
+
+/// Requires at least one `--id`/`--path` for `command` - the bulk
+/// counterpart to [`resolve_target_selector`]'s "no selector given"
+/// check, factored out the same way for direct testability. Bulk
+/// commands never accept a free-text query, so an empty `ids` and
+/// `paths` together is the only ambiguity to guard against here.
+fn require_at_least_one_bulk_selector(
+    command: &str,
+    ids: &[i64],
+    paths: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if ids.is_empty() && paths.is_empty() {
+        Err(format!("{command} requires at least one --id or --path").into())
+    } else {
+        Ok(())
+    }
+}
+
+/// `library-set-platform-bulk`'s testable core: resolves every target id
+/// (see [`resolve_bulk_target_ids`]), then sets `platform` as their
+/// manual assignment in one transaction - see
+/// [`Database::set_manual_platform_for_archives`].
+fn run_library_set_platform_bulk(
+    database_path: &Path,
+    ids: &[i64],
+    paths: &[PathBuf],
+    platform: &str,
+) -> Result<BulkPlatformAssignmentResult, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err(format!(
+            "No library database found at {}. Run: archivefs-cli library-scan",
+            database_path.display()
+        )
+        .into());
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    let target_ids = resolve_bulk_target_ids(&database, ids, paths)?;
+    Ok(database.set_manual_platform_for_archives(&target_ids, platform)?)
+}
+
+/// `library-clear-platform-bulk`'s testable core - see
+/// [`run_library_set_platform_bulk`] and
+/// [`Database::clear_manual_platform_for_archives`].
+fn run_library_clear_platform_bulk(
+    database_path: &Path,
+    ids: &[i64],
+    paths: &[PathBuf],
+) -> Result<BulkPlatformAssignmentResult, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err(format!(
+            "No library database found at {}. Run: archivefs-cli library-scan",
+            database_path.display()
+        )
+        .into());
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    let target_ids = resolve_bulk_target_ids(&database, ids, paths)?;
+    Ok(database.clear_manual_platform_for_archives(&target_ids)?)
+}
+
+fn print_bulk_platform_change(action: &str, summary: &BulkPlatformAssignmentResult) {
+    println!("ArchiveFS Library {action}");
+    println!("Requested: {}", summary.requested);
+    println!("Changed: {}", summary.changed);
+    println!("Unchanged: {}", summary.unchanged);
+    if summary.missing.is_empty() {
+        println!("Missing: none");
+    } else {
+        let missing = summary
+            .missing
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Missing: {missing}");
+    }
+}
+
 fn print_library_platform_change(action: &str, change: &LibraryPlatformChangeView) {
     println!("ArchiveFS Library {action}");
     println!("Path: {}", change.path.display());
@@ -1727,6 +1924,12 @@ fn print_help() {
         "  library-set-platform   Manually assign an archive's platform (outranks automatic detection)"
     );
     println!("  library-clear-platform Clear a manual platform assignment");
+    println!(
+        "  library-set-platform-bulk   Manually assign a platform to several archives at once"
+    );
+    println!(
+        "  library-clear-platform-bulk Clear manual platform assignments from several archives at once"
+    );
     println!("  platform-alias-list    List persistent custom folder-name platform aliases");
     println!(
         "  platform-alias-add     Add a custom folder-name platform alias (applies on next scan)"
@@ -1749,6 +1952,11 @@ fn print_help() {
     println!("  archivefs library-set-platform --id 42 GameCube");
     println!("  archivefs library-set-platform --path /roms/n64/Luigis_Mansion.zip GameCube");
     println!("  archivefs library-clear-platform \"Luigi's Mansion\"");
+    println!("  archivefs library-set-platform-bulk --id 1 --id 2 --id 3 GameCube");
+    println!(
+        "  archivefs library-set-platform-bulk --path /roms/n64/a.zip --path /roms/n64/b.zip N64"
+    );
+    println!("  archivefs library-clear-platform-bulk --id 1 --id 2 --id 3");
     println!("  archivefs platform-alias-list");
     println!("  archivefs platform-alias-add gc GameCube");
     println!("  archivefs platform-alias-remove gc");
@@ -3180,6 +3388,368 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -------------------------------------------------------------
+    // library-set-platform-bulk / library-clear-platform-bulk
+    // -------------------------------------------------------------
+
+    #[test]
+    fn extract_repeated_id_flags_collects_every_occurrence_in_order() {
+        let mut args = vec![
+            "--id".to_string(),
+            "1".to_string(),
+            "GameCube".to_string(),
+            "--id".to_string(),
+            "2".to_string(),
+            "--id".to_string(),
+            "3".to_string(),
+        ];
+
+        let ids = extract_repeated_id_flags(&mut args).unwrap();
+
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(args, vec!["GameCube".to_string()]);
+    }
+
+    #[test]
+    fn extract_repeated_id_flags_rejects_an_invalid_value() {
+        let mut args = vec!["--id".to_string(), "not-a-number".to_string()];
+        assert!(extract_repeated_id_flags(&mut args).is_err());
+    }
+
+    #[test]
+    fn extract_repeated_id_flags_requires_a_value() {
+        let mut args = vec!["--id".to_string()];
+        assert!(extract_repeated_id_flags(&mut args).is_err());
+    }
+
+    #[test]
+    fn extract_repeated_path_flags_collects_every_occurrence_in_order() {
+        let mut args = vec![
+            "--path".to_string(),
+            "/roms/a.zip".to_string(),
+            "--path".to_string(),
+            "/roms/b.zip".to_string(),
+        ];
+
+        let paths = extract_repeated_path_flags(&mut args).unwrap();
+
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+        );
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn library_set_platform_bulk_changes_every_selected_archive() {
+        let root = temp_dir("bulk-set-changes-every-archive");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a.zip", b"a");
+        write_archive_file(&source, "b.zip", b"b");
+        write_archive_file(&source, "c.zip", b"c");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+
+        let summary = run_library_set_platform_bulk(&database_path, &ids, &[], "GameCube").unwrap();
+
+        assert_eq!(summary.requested, 3);
+        assert_eq!(summary.changed, 3);
+        assert_eq!(summary.unchanged, 0);
+        assert!(summary.missing.is_empty());
+        let entries = build_library_entries(&database_path, false).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.platform.as_deref() == Some("GameCube"))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_bulk_by_repeated_path_resolves_exact_archives() {
+        let root = temp_dir("bulk-set-by-repeated-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let path_a = write_archive_file(&source, "collection-a/game.zip", b"a");
+        let path_b = write_archive_file(&source, "collection-b/game.zip", b"b");
+        write_archive_file(&source, "collection-c/game.zip", b"c");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let summary = run_library_set_platform_bulk(
+            &database_path,
+            &[],
+            &[path_a.clone(), path_b.clone()],
+            "GameCube",
+        )
+        .unwrap();
+
+        assert_eq!(summary.requested, 2);
+        assert_eq!(summary.changed, 2);
+        let entries = build_library_entries(&database_path, false).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.path == path_a)
+                .unwrap()
+                .platform
+                .as_deref(),
+            Some("GameCube")
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.path == path_b)
+                .unwrap()
+                .platform
+                .as_deref(),
+            Some("GameCube")
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.path.to_string_lossy().contains("collection-c"))
+                .unwrap()
+                .platform,
+            None,
+            "an archive not named by --id or --path must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_bulk_combines_id_and_path_selectors_deterministically() {
+        let root = temp_dir("bulk-set-mixed-selectors");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a.zip", b"a");
+        let path_b = write_archive_file(&source, "b.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let id_a = entries
+            .iter()
+            .find(|e| e.path.to_string_lossy().ends_with("a.zip"))
+            .unwrap()
+            .id;
+
+        let summary =
+            run_library_set_platform_bulk(&database_path, &[id_a], &[path_b], "GameCube").unwrap();
+
+        assert_eq!(summary.requested, 2);
+        assert_eq!(summary.changed, 2);
+        let entries = build_library_entries(&database_path, false).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.platform.as_deref() == Some("GameCube")),
+            "an --id and a --path naming different archives must both be applied"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_bulk_deduplicates_an_id_and_path_naming_the_same_archive() {
+        let root = temp_dir("bulk-set-dedup-id-and-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let path_a = write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let id_a = build_library_entries(&database_path, false).unwrap()[0].id;
+
+        let summary =
+            run_library_set_platform_bulk(&database_path, &[id_a], &[path_a], "GameCube").unwrap();
+
+        assert_eq!(
+            summary.requested, 1,
+            "an --id and a --path naming the same archive must resolve to one request"
+        );
+        assert_eq!(summary.changed, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_bulk_reports_missing_ids_without_failing() {
+        let root = temp_dir("bulk-set-missing-id");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let real_id = build_library_entries(&database_path, false).unwrap()[0].id;
+        let missing_id = real_id + 999_999;
+
+        let summary =
+            run_library_set_platform_bulk(&database_path, &[real_id, missing_id], &[], "GameCube")
+                .unwrap();
+
+        assert_eq!(summary.changed, 1);
+        assert_eq!(summary.missing, vec![missing_id]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_set_platform_bulk_by_unresolvable_path_is_a_clear_error() {
+        let root = temp_dir("bulk-set-unresolvable-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let error = run_library_set_platform_bulk(
+            &database_path,
+            &[],
+            &[PathBuf::from("/does/not/exist.zip")],
+            "GameCube",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no archive found"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_clear_platform_bulk_restores_each_archives_own_fallback() {
+        let root = temp_dir("bulk-clear-restores-fallback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "msx2/game.zip", b"a");
+        write_archive_file(&source, "neogeo/game.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+        run_library_set_platform_bulk(&database_path, &ids, &[], "GameCube").unwrap();
+
+        let summary = run_library_clear_platform_bulk(&database_path, &ids, &[]).unwrap();
+
+        assert_eq!(summary.changed, 2);
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let msx2 = entries
+            .iter()
+            .find(|e| e.path.to_string_lossy().contains("msx2"))
+            .unwrap();
+        assert_eq!(msx2.platform.as_deref(), Some("MSX2"));
+        let neogeo = entries
+            .iter()
+            .find(|e| e.path.to_string_lossy().contains("neogeo"))
+            .unwrap();
+        assert_eq!(neogeo.platform.as_deref(), Some("NeoGeo"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_platform_commands_never_trigger_a_scan() {
+        let root = temp_dir("bulk-no-scan-side-effect");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let id_a = build_library_entries(&database_path, false).unwrap()[0].id;
+
+        // A newly-appearing archive on disk must remain invisible to the
+        // library database after bulk set/clear - proof neither command
+        // walks the filesystem or calls scan_and_persist.
+        write_archive_file(&source, "new-archive.zip", b"new");
+
+        run_library_set_platform_bulk(&database_path, &[id_a], &[], "GameCube").unwrap();
+        run_library_clear_platform_bulk(&database_path, &[id_a], &[]).unwrap();
+
+        let entries = build_library_entries(&database_path, false).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "bulk platform commands must never discover new archives via a scan"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_json_summary_has_the_expected_shape() {
+        let root = temp_dir("bulk-json-shape");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a.zip", b"a");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        let id_a = build_library_entries(&database_path, false).unwrap()[0].id;
+        let missing_id = id_a + 999_999;
+
+        let summary =
+            run_library_set_platform_bulk(&database_path, &[id_a, missing_id], &[], "GameCube")
+                .unwrap();
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(json["requested"], 2);
+        assert_eq!(json["changed"], 1);
+        assert_eq!(json["unchanged"], 0);
+        assert_eq!(json["missing"], serde_json::json!([missing_id]));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_platform_argument_still_validates_canonical_names_for_bulk() {
+        // library-set-platform-bulk reuses resolve_platform_argument
+        // directly - no separate, independently-drifting validation.
+        assert!(resolve_platform_argument("NotARealPlatform".to_string(), false).is_err());
+        assert_eq!(
+            resolve_platform_argument("gamecube".to_string(), false).unwrap(),
+            "GameCube"
+        );
+        assert_eq!(
+            resolve_platform_argument("AnythingAtAll".to_string(), true).unwrap(),
+            "AnythingAtAll"
+        );
+    }
+
+    #[test]
+    fn require_at_least_one_bulk_selector_rejects_an_empty_selection() {
+        let error =
+            require_at_least_one_bulk_selector("library-set-platform-bulk", &[], &[]).unwrap_err();
+        assert!(error.to_string().contains("at least one --id or --path"));
+    }
+
+    #[test]
+    fn require_at_least_one_bulk_selector_accepts_an_id_alone() {
+        assert!(require_at_least_one_bulk_selector("library-set-platform-bulk", &[1], &[]).is_ok());
+    }
+
+    #[test]
+    fn require_at_least_one_bulk_selector_accepts_a_path_alone() {
+        assert!(
+            require_at_least_one_bulk_selector(
+                "library-set-platform-bulk",
+                &[],
+                &[PathBuf::from("/roms/a.zip")]
+            )
+            .is_ok()
+        );
     }
 
     // -------------------------------------------------------------
