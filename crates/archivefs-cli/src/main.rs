@@ -342,6 +342,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_watch_rebuild,
             )?;
         }
+        // `--version`/`-V` are recognised only in the command position -
+        // exactly the same scope `--help`/`-h` already have (neither is
+        // special-cased inside any individual subcommand's own argument
+        // parsing, here or anywhere else in this file). Any trailing
+        // `cli.args` (e.g. `archivefs-cli --version library-list`) are
+        // ignored rather than rejected: `print_version` never reads
+        // `args`, so this deliberately mirrors how `--help`/`-h` already
+        // silently ignore trailing arguments today - "version wins and
+        // exits" is the simplest behaviour consistent with this existing
+        // hand-written parser, not an oversight.
+        "--version" | "-V" => print_version(),
         "help" | "-h" | "--help" => print_help(),
         unknown => {
             print_help();
@@ -1575,6 +1586,19 @@ fn format_statuses_json(statuses: &[ArchiveStatus]) -> Result<String, serde_json
     serde_json::to_string_pretty(statuses)
 }
 
+/// The exact one-line text `--version`/`-V` print - `env!("CARGO_PKG_VERSION")`
+/// is a compile-time constant Cargo derives from this crate's resolved
+/// `Cargo.toml` version (workspace inheritance included), so this never
+/// invokes git, parses tags, reads a file at runtime, or duplicates the
+/// version as a separate literal anywhere in this source.
+fn version_line() -> String {
+    format!("archivefs-cli {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn print_version() {
+    println!("{}", version_line());
+}
+
 fn print_help() {
     println!("archivefs [--verbose|-v] [--debug] <command>");
     println!();
@@ -1609,6 +1633,7 @@ fn print_help() {
     println!("  library-clear-platform Clear a manual platform assignment");
     println!();
     println!("Examples:");
+    println!("  archivefs --version");
     println!("  archivefs doctor");
     println!("  archivefs config-check");
     println!("  archivefs status --json");
@@ -2009,6 +2034,162 @@ mod tests {
         assert_eq!(args.log_level, log::LevelFilter::Debug);
         assert_eq!(args.command, "mount-one");
         assert_eq!(args.args, vec!["Test".to_string(), "Game".to_string()]);
+    }
+
+    // -------------------------------------------------------------
+    // --version / -V
+    // -------------------------------------------------------------
+
+    #[test]
+    fn parse_cli_args_recognizes_long_version_flag() {
+        let args = parse_cli_args(["--version"].into_iter().map(str::to_string));
+
+        assert_eq!(args.command, "--version");
+        assert!(args.args.is_empty());
+    }
+
+    #[test]
+    fn parse_cli_args_recognizes_short_version_flag() {
+        let args = parse_cli_args(["-V"].into_iter().map(str::to_string));
+
+        assert_eq!(args.command, "-V");
+        assert!(args.args.is_empty());
+    }
+
+    #[test]
+    fn parse_cli_args_still_recognizes_help_flags() {
+        // Unaffected by adding --version/-V: parse_cli_args itself was
+        // not changed, only a new match arm in run().
+        assert_eq!(
+            parse_cli_args(["--help"].into_iter().map(str::to_string)).command,
+            "--help"
+        );
+        assert_eq!(
+            parse_cli_args(["-h"].into_iter().map(str::to_string)).command,
+            "-h"
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_leaves_ordinary_commands_unaffected() {
+        let args = parse_cli_args(["scan"].into_iter().map(str::to_string));
+
+        assert_eq!(args.command, "scan");
+        assert!(args.args.is_empty());
+    }
+
+    #[test]
+    fn version_flag_trailing_extra_command_is_ignored_deterministically() {
+        // "version wins and exits": documented at the run() match arm.
+        // --version is the command token, and the trailing "library-list"
+        // is simply never read - print_version never touches cli.args -
+        // exactly like --help already behaves with trailing garbage
+        // today. The parse itself is deterministic either way.
+        let args = parse_cli_args(
+            ["--version", "library-list"]
+                .into_iter()
+                .map(str::to_string),
+        );
+
+        assert_eq!(args.command, "--version");
+        assert_eq!(args.args, vec!["library-list".to_string()]);
+    }
+
+    #[test]
+    fn version_flag_after_a_command_is_not_treated_as_a_global_request() {
+        // --version/-V are recognised only in the command position - the
+        // same scope --help/-h already have. Here "library-list" is the
+        // command, and "--version" is just an (unused-by-library-list)
+        // trailing argument, not a version request.
+        let args = parse_cli_args(
+            ["library-list", "--version"]
+                .into_iter()
+                .map(str::to_string),
+        );
+
+        assert_eq!(args.command, "library-list");
+        assert_eq!(args.args, vec!["--version".to_string()]);
+    }
+
+    #[test]
+    fn version_line_contains_the_cargo_package_version() {
+        assert!(version_line().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn version_line_is_exactly_one_concise_line() {
+        let line = version_line();
+
+        assert!(!line.contains('\n'));
+        assert_eq!(line, format!("archivefs-cli {}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn version_output_requires_no_config_or_database_access() {
+        // version_line is a pure function of compile-time constants only
+        // - no Config::load_default, no default_database_path, no
+        // filesystem or database I/O. Every other command's tests in
+        // this file set up a temp_dir/config_for/database_path first;
+        // this one deliberately does not, proving by construction that
+        // none of that is needed here.
+        assert!(!version_line().is_empty());
+    }
+
+    #[test]
+    fn all_workspace_crates_resolve_to_the_same_version() {
+        // Asks Cargo itself, rather than parsing Cargo.toml text: `cargo
+        // metadata` performs the same workspace-inheritance resolution
+        // (`version.workspace = true`) that a real build uses, so this
+        // can't be fooled by formatting/whitespace and needs no ad-hoc
+        // TOML string matching. This shells out to `cargo` from a test
+        // (not from the shipped binary), so it doesn't conflict with
+        // version_output_requires_no_config_or_database_access above or
+        // with print_version() avoiding runtime Cargo.toml/git access.
+        let workspace_manifest =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .arg("--manifest-path")
+            .arg(&workspace_manifest)
+            .output()
+            .expect("failed to run `cargo metadata`");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("cargo metadata did not print JSON");
+
+        let mut versions = std::collections::BTreeMap::new();
+        for pkg in metadata["packages"]
+            .as_array()
+            .expect("metadata.packages should be an array")
+        {
+            let name = pkg["name"].as_str().expect("package.name");
+            if matches!(name, "archivefs-core" | "archivefs-cli" | "archivefs-gui") {
+                let version = pkg["version"]
+                    .as_str()
+                    .expect("package.version")
+                    .to_string();
+                versions.insert(name.to_string(), version);
+            }
+        }
+
+        assert_eq!(
+            versions.len(),
+            3,
+            "expected archivefs-core, archivefs-cli and archivefs-gui in `cargo metadata` output, got: {versions:?}"
+        );
+
+        let distinct: std::collections::BTreeSet<&String> = versions.values().collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "workspace crates report different versions: {versions:?}"
+        );
     }
 
     // -------------------------------------------------------------
