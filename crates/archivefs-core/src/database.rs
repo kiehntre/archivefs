@@ -33,6 +33,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
+    canonical_platform_names, normalize_path_segment,
 };
 
 /// Resolves the default library database path:
@@ -67,11 +68,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "initial schema: schema_migrations, source_folders, archives, scan_runs, archive_scan_observations, platform_assignments",
-    sql: include_str!("migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "initial schema: schema_migrations, source_folders, archives, scan_runs, archive_scan_observations, platform_assignments",
+        sql: include_str!("migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        description: "add platform_aliases: persistent custom folder-name -> canonical platform mappings",
+        sql: include_str!("migrations/0002_platform_aliases.sql"),
+    },
+];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
     migrations
@@ -521,6 +529,32 @@ pub struct PlatformAssignmentChange {
     pub new_source: Option<String>,
 }
 
+/// One persisted custom platform folder alias (`platform_aliases` table -
+/// see [`Database::add_platform_alias`]). `alias` is the user's original
+/// typed text (trimmed), kept only for display; matching and uniqueness
+/// always go through `normalized_alias`. `platform` is always a
+/// canonical name from `canonical_platform_names()`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformAlias {
+    pub id: i64,
+    pub alias: String,
+    pub normalized_alias: String,
+    pub platform: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn platform_alias_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlatformAlias> {
+    Ok(PlatformAlias {
+        id: row.get(0)?,
+        alias: row.get(1)?,
+        normalized_alias: row.get(2)?,
+        platform: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
 fn split_assignment(assignment: Option<(String, String)>) -> (Option<String>, Option<String>) {
     match assignment {
         Some((platform, source)) => (Some(platform), Some(source)),
@@ -553,27 +587,44 @@ fn db_error(context: &str, error: rusqlite::Error) -> ArchiveFsError {
 /// and retired (without a replacement) by [`Database::clear_manual_platform`].
 pub const MANUAL_PLATFORM_SOURCE: &str = "manual";
 
+/// The `platform_assignments.source` value for a match against a
+/// persisted, user-defined `platform_aliases` row - see
+/// [`Database::add_platform_alias`]. Ranked above the built-in
+/// `"folder_alias"` table and the filename/path heuristic (a deliberate
+/// user-configured mapping is more specific than either), but below
+/// [`MANUAL_PLATFORM_SOURCE`] (a single archive's explicit override still
+/// wins) - see [`provenance_priority`].
+pub const CUSTOM_FOLDER_ALIAS_SOURCE: &str = "custom_folder_alias";
+
 /// Relative strength of a `platform_assignments.source` value, used by
 /// [`Database::assign_platform`] to decide whether a new assignment may
-/// replace the current one, in three tiers:
+/// replace the current one, in four tiers (weakest to strongest):
 ///
-/// 1. `"folder_alias"` (the generic folder-name fallback in
+/// 1. `"folder_alias"` (the generic, code-shipped folder-name fallback in
 ///    `crate::detect_platform_with_provenance`) - weakest, since it is
 ///    the least specific signal.
 /// 2. Everything else this build does not specifically recognize,
-///    including `"heuristic-path-detector"` - the middle, "automatic
-///    detection" tier. Two assignments from this tier can still freely
-///    replace each other (matching the existing heuristic-vs-heuristic
-///    reassignment behavior from before three tiers existed).
-/// 3. [`MANUAL_PLATFORM_SOURCE`] - strongest: a deliberate user choice.
-///    Neither `"folder_alias"` nor `"heuristic-path-detector"` (nor
-///    anything else in tier 2) can ever silently replace it; only
-///    another manual assignment (via [`Database::set_manual_platform`])
-///    can.
+///    including `"heuristic-path-detector"` - the "automatic detection"
+///    tier. Two assignments from this tier can still freely replace each
+///    other (matching the existing heuristic-vs-heuristic reassignment
+///    behavior from before more tiers existed).
+/// 3. [`CUSTOM_FOLDER_ALIAS_SOURCE`] - a persisted, user-defined folder
+///    alias. Outranks both the built-in folder alias table and the
+///    filename/path heuristic (required precedence: manual > custom
+///    alias > heuristic > built-in alias), but never a manual assignment.
+///    Unlike the two tiers below it, this source's evidence can change
+///    out from under a scan (an alias can be added, edited, or removed
+///    between scans) - see [`Database::retire_stale_custom_alias_assignment`]
+///    for how a stale current assignment sourced from a since-removed
+///    alias is un-stuck, which `provenance_priority` alone cannot do.
+/// 4. [`MANUAL_PLATFORM_SOURCE`] - strongest: a deliberate user choice.
+///    Nothing in tiers 1-3 can ever silently replace it; only another
+///    manual assignment (via [`Database::set_manual_platform`]) can.
 fn provenance_priority(source: &str) -> u8 {
     match source {
         "folder_alias" => 0,
-        MANUAL_PLATFORM_SOURCE => 2,
+        CUSTOM_FOLDER_ALIAS_SOURCE => 2,
+        MANUAL_PLATFORM_SOURCE => 3,
         _ => 1,
     }
 }
@@ -1262,6 +1313,213 @@ impl Database {
         })
     }
 
+    /// Adds a persistent custom platform folder alias: `alias` is a
+    /// single folder name (never a path), and `platform` must
+    /// case-insensitively match one of [`canonical_platform_names`] - the
+    /// canonical spelling is what actually gets stored, never the
+    /// caller's casing, matching `library-set-platform`'s existing
+    /// canonical-matching convention. Unlike manual platform assignment,
+    /// there is no free-form `--custom` escape hatch here: a mistyped
+    /// alias platform would silently misclassify every archive under a
+    /// matching folder, so this first version keeps aliases limited to
+    /// known platforms.
+    ///
+    /// `alias` is normalized with [`normalize_path_segment`] - the same
+    /// ASCII-alphanumeric-only, lowercased normalization the built-in
+    /// folder alias table already uses, so `"GC"`, `"gc"`, `"g-c"`, and
+    /// `"g_c"` all key to the same stored alias. Rejected (returning
+    /// `Err`, nothing written) if `alias` contains a `/` (a folder alias
+    /// must name exactly one folder, never a path) or normalizes to an
+    /// empty string (for example `"---"` or whitespace-only input).
+    ///
+    /// Deterministic duplicate behaviour: if an alias already exists with
+    /// the same *normalized* form, this call returns a clear `Err`
+    /// rather than silently overwriting it - a caller who wants to
+    /// change an existing alias's platform must
+    /// [`Self::remove_platform_alias`] it first, then add the
+    /// replacement. This is the CLI-visible contract
+    /// (`platform-alias-add` on an already-known alias is a clear
+    /// duplicate error, never a silent update).
+    ///
+    /// Never triggers a rescan - see `crate::database::scan_and_persist`
+    /// for where a newly added alias actually takes effect.
+    pub fn add_platform_alias(&mut self, alias: &str, platform: &str) -> Result<PlatformAlias> {
+        if alias.contains('/') {
+            return Err(ArchiveFsError::Database(
+                "platform alias must be a single folder name, not a path (it must not contain '/')"
+                    .to_string(),
+            ));
+        }
+
+        let normalized_alias = normalize_path_segment(alias);
+        if normalized_alias.is_empty() {
+            return Err(ArchiveFsError::Database(
+                "platform alias must contain at least one letter or digit".to_string(),
+            ));
+        }
+
+        let canonical_platform = canonical_platform_names()
+            .into_iter()
+            .find(|canonical| canonical.eq_ignore_ascii_case(platform))
+            .ok_or_else(|| {
+                ArchiveFsError::Database(format!(
+                    "'{platform}' is not a known platform; known platforms: {}",
+                    canonical_platform_names().join(", ")
+                ))
+            })?;
+
+        let already_exists: bool = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM platform_aliases WHERE normalized_alias = ?1",
+                params![normalized_alias],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to look up existing platform alias", error))?
+            .is_some();
+        if already_exists {
+            return Err(ArchiveFsError::Database(format!(
+                "a platform alias for '{normalized_alias}' already exists; remove it first \
+                 (remove_platform_alias/platform-alias-remove) before adding a different mapping"
+            )));
+        }
+
+        let display_alias = alias.trim();
+        let now = now_utc_string();
+        self.connection
+            .execute(
+                "INSERT INTO platform_aliases (alias, normalized_alias, platform, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![display_alias, normalized_alias, canonical_platform, now],
+            )
+            .map_err(|error| db_error("failed to insert platform alias", error))?;
+
+        self.read_platform_alias(self.connection.last_insert_rowid())
+    }
+
+    fn read_platform_alias(&self, id: i64) -> Result<PlatformAlias> {
+        self.connection
+            .query_row(
+                "SELECT id, alias, normalized_alias, platform, created_at, updated_at \
+                 FROM platform_aliases WHERE id = ?1",
+                params![id],
+                platform_alias_from_row,
+            )
+            .map_err(|error| db_error("failed to read back platform alias", error))
+    }
+
+    /// Every persisted custom platform alias, ordered by `normalized_alias`
+    /// for a stable, deterministic listing - SQLite does not otherwise
+    /// guarantee row order without an explicit `ORDER BY`.
+    pub fn list_platform_aliases(&self) -> Result<Vec<PlatformAlias>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, alias, normalized_alias, platform, created_at, updated_at \
+                 FROM platform_aliases ORDER BY normalized_alias",
+            )
+            .map_err(|error| db_error("failed to prepare platform alias listing", error))?;
+        stmt.query_map([], platform_alias_from_row)
+            .map_err(|error| db_error("failed to list platform aliases", error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| db_error("failed to read platform alias rows", error))
+    }
+
+    /// Removes the custom platform alias whose normalized form exactly
+    /// matches `alias` (run through the same [`normalize_path_segment`]
+    /// normalization [`Self::add_platform_alias`] uses). Returns whether
+    /// a row was actually removed: `Ok(false)` for "no such alias" is not
+    /// an error - matching [`Self::clear_manual_platform`]'s "no-op, not
+    /// a failure" treatment of an already-absent state - so a caller
+    /// wanting a hard error for "unknown alias" (the CLI, for a clear
+    /// user-facing message) checks the returned bool itself.
+    ///
+    /// Never triggers a rescan: any archive whose current assignment came
+    /// from this alias keeps that assignment until a later scan
+    /// recomputes it (see `crate::database::scan_and_persist` and
+    /// [`Self::retire_stale_custom_alias_assignment`]).
+    pub fn remove_platform_alias(&mut self, alias: &str) -> Result<bool> {
+        let normalized_alias = normalize_path_segment(alias);
+        let removed = self
+            .connection
+            .execute(
+                "DELETE FROM platform_aliases WHERE normalized_alias = ?1",
+                params![normalized_alias],
+            )
+            .map_err(|error| db_error("failed to remove platform alias", error))?;
+        Ok(removed > 0)
+    }
+
+    /// Looks up the canonical platform for one already-lossy-stringified
+    /// folder name (a single path component, never a full path) against
+    /// the persisted custom alias table, normalizing with the same
+    /// [`normalize_path_segment`] [`Self::add_platform_alias`] and the
+    /// built-in folder alias table both use. `None` means no custom
+    /// alias matches this component - callers still need to fall back
+    /// through the existing heuristic/built-in-alias tiers themselves
+    /// (see [`provenance_priority`]). Never mutates, and never triggers a
+    /// scan.
+    pub fn lookup_custom_platform_alias(&self, folder_component: &str) -> Result<Option<String>> {
+        let normalized = normalize_path_segment(folder_component);
+        self.connection
+            .query_row(
+                "SELECT platform FROM platform_aliases WHERE normalized_alias = ?1",
+                params![normalized],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to look up custom platform alias", error))
+    }
+
+    /// Un-sticks a stale [`CUSTOM_FOLDER_ALIAS_SOURCE`] current
+    /// assignment whose alias no longer matches this scan. Called by
+    /// `persist_one_folder` immediately before [`Self::assign_platform`],
+    /// only when this scan's custom-alias lookup for the archive found
+    /// nothing.
+    ///
+    /// `assign_platform`'s general provenance-priority blocking (a
+    /// lower-tier automatic source can never silently replace a
+    /// higher-tier one - see [`provenance_priority`]) is correct for the
+    /// built-in `"folder_alias"`/`"heuristic-path-detector"` tiers, which
+    /// are derived from fixed, code-shipped tables that cannot themselves
+    /// change between scans - a scan finding a different (or no) result
+    /// there really is just noise, not evidence the previous detection
+    /// was wrong. A [`CUSTOM_FOLDER_ALIAS_SOURCE`] result is different:
+    /// it is derived from user-editable, removable data, so "this scan's
+    /// custom-alias lookup no longer matches" is real evidence the
+    /// previous result is stale.
+    ///
+    /// If the archive's current assignment is [`CUSTOM_FOLDER_ALIAS_SOURCE`],
+    /// retires that current row (without inserting a replacement), so the
+    /// immediately-following `assign_platform` call sees no current
+    /// assignment and freely sets this scan's heuristic/built-in-alias/
+    /// Unknown result instead - including Unknown, if nothing else
+    /// matches either, since `assign_platform` never itself clears a
+    /// current assignment down to nothing. A no-op for every other
+    /// current source, including manual: this never touches a manual
+    /// assignment - shadow-recording the latest automatic fallback while
+    /// manual is active is handled entirely by `assign_platform`'s
+    /// existing logic, unaffected by this method.
+    fn retire_stale_custom_alias_assignment(&mut self, archive_id: i64) -> Result<()> {
+        let current = self.current_platform_assignment(archive_id)?;
+        if current.as_ref().map(|(_, source)| source.as_str()) != Some(CUSTOM_FOLDER_ALIAS_SOURCE) {
+            return Ok(());
+        }
+        self.connection
+            .execute(
+                "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to retire stale custom platform alias assignment",
+                    error,
+                )
+            })?;
+        Ok(())
+    }
+
     /// Marks every `archives` row under `source_folder_id` that is not in
     /// `seen_archive_ids` and not already missing as missing
     /// (`last_verified_missing_at` set to now), recording a `missing`
@@ -1657,21 +1915,68 @@ fn persist_one_folder(
                 .modified_time
                 .and_then(system_time_to_unix_seconds),
         )?;
-        database.assign_platform(
-            outcome.archive_id,
-            archive.identity.platform.as_deref(),
-            archive
-                .identity
-                .platform_provenance
-                .map(PlatformProvenance::as_source_str)
-                .unwrap_or("heuristic-path-detector"),
-        )?;
+
+        // Required precedence: manual > custom folder alias > heuristic >
+        // built-in folder alias > unknown. `archive.identity.platform`/
+        // `platform_provenance` already resolved the heuristic/built-in
+        // tiers (in `detect_platform_with_provenance`, which has no
+        // database access and so cannot itself see custom aliases) - a
+        // custom alias match here unconditionally outranks whatever that
+        // already found. `assign_platform` still has the final say via
+        // `provenance_priority` (for example, never silently replacing a
+        // manual assignment).
+        let custom_alias_platform =
+            find_custom_platform_alias(database, &archive.path, &archive.identity.source_root)?;
+        let (platform, source): (Option<String>, &str) = match &custom_alias_platform {
+            Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
+            None => {
+                database.retire_stale_custom_alias_assignment(outcome.archive_id)?;
+                (
+                    archive.identity.platform.clone(),
+                    archive
+                        .identity
+                        .platform_provenance
+                        .map(PlatformProvenance::as_source_str)
+                        .unwrap_or("heuristic-path-detector"),
+                )
+            }
+        };
+        database.assign_platform(outcome.archive_id, platform.as_deref(), source)?;
     }
 
     counts.archives_missing =
         database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
 
     Ok(counts)
+}
+
+/// Finds the nearest custom platform alias match for `path` (an archive
+/// discovered under `source_root`), walking directory components from
+/// the archive's nearest containing folder upward to (but never beyond)
+/// `source_root` - the nearest matching parent wins, mirroring the
+/// built-in folder alias walk (`detect_platform_from_folder_alias`)
+/// exactly, but consulting the persisted `platform_aliases` table (via
+/// [`Database::lookup_custom_platform_alias`]) instead of the built-in
+/// `FOLDER_PLATFORM_ALIASES` table. The archive's own filename is
+/// excluded, same as the built-in walk.
+fn find_custom_platform_alias(
+    database: &Database,
+    path: &Path,
+    source_root: &Path,
+) -> Result<Option<String>> {
+    let Ok(relative) = path.strip_prefix(source_root) else {
+        return Ok(None);
+    };
+    let mut components: Vec<_> = relative.components().collect();
+    components.pop(); // the archive's own filename never counts as a folder.
+
+    for component in components.iter().rev() {
+        let segment = component.as_os_str().to_string_lossy();
+        if let Some(platform) = database.lookup_custom_platform_alias(&segment)? {
+            return Ok(Some(platform));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1941,14 +2246,14 @@ mod tests {
         let db_path = root.join("library.sqlite3");
 
         let first = Database::open_or_create(&db_path).unwrap();
-        assert_eq!(first.schema_version().unwrap(), 1);
+        assert_eq!(first.schema_version().unwrap(), latest_schema_version());
         first.close().unwrap();
 
         // Reopening a database that is already at the latest version must
-        // not try to re-run migration 1's CREATE TABLE statements (which
-        // would fail with "table already exists" if it did).
+        // not try to re-run any migration's CREATE TABLE statements
+        // (which would fail with "table already exists" if it did).
         let second = Database::open_or_create(&db_path).expect("reopening must be idempotent");
-        assert_eq!(second.schema_version().unwrap(), 1);
+        assert_eq!(second.schema_version().unwrap(), latest_schema_version());
 
         let migration_row_count: i64 = second
             .connection
@@ -1957,8 +2262,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            migration_row_count, 1,
-            "migration 1 must be recorded exactly once, not once per open"
+            migration_row_count,
+            MIGRATIONS.len() as i64,
+            "every migration must be recorded exactly once, not once per open"
         );
 
         second.close().unwrap();
@@ -1970,7 +2276,7 @@ mod tests {
         let root = temp_dir("schema-version-reporting");
         let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
 
-        assert_eq!(database.schema_version().unwrap(), 1);
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
 
         database.close().unwrap();
         let _ = fs::remove_dir_all(&root);
@@ -2158,7 +2464,7 @@ mod tests {
 
         assert!(health.database_exists);
         assert!(health.database_opens);
-        assert_eq!(health.schema_version, Some(1));
+        assert_eq!(health.schema_version, Some(latest_schema_version()));
         assert!(health.migrations_current);
         assert!(health.foreign_keys_enabled);
         assert!(health.error.is_none());
@@ -3525,6 +3831,491 @@ mod tests {
         let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
 
         assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------
+    // Custom platform folder aliases: migration/CRUD
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn migration_to_platform_aliases_preserves_existing_rows() {
+        // A database created and populated at schema version 1 (before
+        // platform_aliases existed) must upgrade to version 2 without
+        // losing anything already in it.
+        let root = temp_dir("platform-aliases-migration-preserves-rows");
+        let db_path = root.join("library.sqlite3");
+        {
+            let mut connection = open_connection(&db_path).unwrap();
+            apply_migrations(&mut connection, &MIGRATIONS[..1]).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO source_folders (path, first_seen_at, last_seen_in_config_at) \
+                     VALUES (?1, ?2, ?2)",
+                    params![b"/roms".as_slice(), now_utc_string()],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            schema_version(&open_connection(&db_path).unwrap()).unwrap(),
+            1
+        );
+
+        let database = Database::open_or_create(&db_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        let source_folder_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM source_folders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            source_folder_count, 1,
+            "the pre-migration source_folders row must survive the upgrade to platform_aliases"
+        );
+        assert!(database.list_platform_aliases().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_list_remove_platform_alias_round_trip() {
+        let root = temp_dir("platform-alias-round-trip");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let added = database.add_platform_alias("gc", "GameCube").unwrap();
+        assert_eq!(added.alias, "gc");
+        assert_eq!(added.normalized_alias, "gc");
+        assert_eq!(added.platform, "GameCube");
+
+        let listed = database.list_platform_aliases().unwrap();
+        assert_eq!(listed, vec![added]);
+
+        assert!(database.remove_platform_alias("gc").unwrap());
+        assert!(database.list_platform_aliases().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalized_alias_is_unique_regardless_of_original_casing_or_separators() {
+        let root = temp_dir("platform-alias-normalization-uniqueness");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let first = database.add_platform_alias("GC", "GameCube").unwrap();
+        assert_eq!(first.normalized_alias, "gc");
+
+        // Every other spelling variant of the same folder name must
+        // collide with the row above as a duplicate, not silently create
+        // a second row or update it - normalized_alias carries this
+        // table's uniqueness constraint.
+        for spelling in ["gc", "g-c", "g_c"] {
+            let error = database
+                .add_platform_alias(spelling, "GameCube")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("already exists"),
+                "{spelling} must be rejected as a duplicate of 'gc', got: {error}"
+            );
+        }
+
+        let listed = database.list_platform_aliases().unwrap();
+        assert_eq!(listed, vec![first]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_normalized_alias_is_rejected() {
+        let root = temp_dir("platform-alias-empty-normalized");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let error = database.add_platform_alias("---", "GameCube").unwrap_err();
+        assert!(error.to_string().contains("letter or digit"));
+        assert!(database.list_platform_aliases().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alias_containing_a_path_separator_is_rejected() {
+        let root = temp_dir("platform-alias-path-separator");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let error = database
+            .add_platform_alias("gc/extra", "GameCube")
+            .unwrap_err();
+        assert!(error.to_string().contains('/'));
+        assert!(database.list_platform_aliases().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_argument_is_matched_case_insensitively_and_canonical_spelling_is_stored() {
+        let root = temp_dir("platform-alias-canonical-spelling");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let alias = database.add_platform_alias("gc", "gamecube").unwrap();
+        assert_eq!(alias.platform, "GameCube");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_platform_argument_is_a_clear_error() {
+        let root = temp_dir("platform-alias-unknown-platform");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let error = database
+            .add_platform_alias("gc", "NotARealPlatform")
+            .unwrap_err();
+        assert!(error.to_string().contains("not a known platform"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adding_an_existing_normalized_alias_is_a_clear_deterministic_duplicate_error() {
+        let root = temp_dir("platform-alias-deterministic-duplicate");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let first = database.add_platform_alias("gc", "GameCube").unwrap();
+        let error = database.add_platform_alias("GC", "Wii").unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+        // The original row is left completely untouched by the failed
+        // duplicate add - not partially updated, not duplicated.
+        assert_eq!(database.list_platform_aliases().unwrap(), vec![first]);
+
+        // Removing it first and re-adding is the documented way to
+        // change an alias's platform.
+        assert!(database.remove_platform_alias("gc").unwrap());
+        let replaced = database.add_platform_alias("GC", "Wii").unwrap();
+        assert_eq!(replaced.platform, "Wii");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_list_order_is_stable_and_sorted_by_normalized_alias() {
+        let root = temp_dir("platform-alias-list-order");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        database.add_platform_alias("wii", "Wii").unwrap();
+        database.add_platform_alias("gc", "GameCube").unwrap();
+        database.add_platform_alias("n64", "N64").unwrap();
+
+        let first_listing = database.list_platform_aliases().unwrap();
+        let second_listing = database.list_platform_aliases().unwrap();
+        assert_eq!(first_listing, second_listing);
+        let normalized: Vec<&str> = first_listing
+            .iter()
+            .map(|alias| alias.normalized_alias.as_str())
+            .collect();
+        assert_eq!(normalized, vec!["gc", "n64", "wii"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_an_unknown_alias_is_a_clear_no_op_result() {
+        let root = temp_dir("platform-alias-remove-unknown");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        assert!(!database.remove_platform_alias("does-not-exist").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------
+    // Custom platform folder aliases: detection precedence
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn custom_alias_detects_platform_during_a_scan() {
+        let root = temp_dir("custom-alias-detects-platform");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "gc/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("gc", "GameCube").unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "gc/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn custom_alias_case_and_separator_normalization_matches_the_folder_name() {
+        let root = temp_dir("custom-alias-normalization");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "g_c/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("G-C", "GameCube").unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "g_c/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nearest_matching_custom_alias_parent_wins() {
+        let root = temp_dir("custom-alias-nearest-parent");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "outer/inner/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("outer", "Wii").unwrap();
+        database.add_platform_alias("inner", "WiiU").unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "outer/inner/game.zip");
+        assert_eq!(
+            archive.platform.as_deref(),
+            Some("WiiU"),
+            "the nearer 'inner' alias must win over the farther 'outer' one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn custom_alias_outranks_the_built_in_folder_alias_for_the_same_folder_name() {
+        // "n64" is already a built-in FOLDER_PLATFORM_ALIASES key (-> N64).
+        // A custom alias for the exact same folder name must win instead.
+        let root = temp_dir("custom-alias-outranks-built-in");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "n64/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("n64", "GameCube").unwrap();
+
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "n64/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn custom_alias_outranks_the_existing_filename_path_heuristic() {
+        // A folder literally named "xbox360" makes
+        // detect_platform_from_known_heuristics report Xbox360. A custom
+        // alias for that same folder name must still win, per the
+        // required precedence (custom alias ranks above the heuristic).
+        let root = temp_dir("custom-alias-outranks-heuristic");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "xbox360/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        // Sanity check: without a custom alias, the heuristic wins.
+        scan_and_persist(&mut database, &config, "before-alias").unwrap();
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "xbox360/game.zip")
+                .platform
+                .as_deref(),
+            Some("Xbox360"),
+            "sanity check: the heuristic detects Xbox360 before any custom alias exists"
+        );
+
+        database.add_platform_alias("xbox360", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "after-alias").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "xbox360/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_assignment_still_outranks_a_matching_custom_alias() {
+        let root = temp_dir("custom-alias-manual-outranks");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "gc/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("gc", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "gc/game.zip").id;
+
+        database.set_manual_platform(archive_id, "Wii").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-with-manual-active").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "gc/game.zip");
+        assert_eq!(archive.platform.as_deref(), Some("Wii"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_while_manual_is_active_shadow_records_the_custom_alias_fallback() {
+        let root = temp_dir("custom-alias-shadow-while-manual");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery/game.zip").id;
+        database.set_manual_platform(archive_id, "Wii").unwrap();
+
+        // The alias did not exist yet when manual was set - it only
+        // starts affecting this archive on the next scan, which must
+        // shadow-record it without disturbing the current manual value.
+        database.add_platform_alias("mystery", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-with-manual-active").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery/game.zip");
+        assert_eq!(
+            archive.platform.as_deref(),
+            Some("Wii"),
+            "manual must still be current"
+        );
+
+        let change = database.clear_manual_platform(archive_id).unwrap();
+        assert_eq!(
+            change.new_platform.as_deref(),
+            Some("GameCube"),
+            "clearing manual must expose the shadow-recorded custom-alias fallback"
+        );
+        assert_eq!(
+            change.new_source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_alias_and_rescanning_restores_the_built_in_alias_fallback() {
+        let root = temp_dir("custom-alias-removal-restores-built-in");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "n64/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("n64", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "with-alias").unwrap();
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "n64/game.zip")
+                .platform
+                .as_deref(),
+            Some("GameCube")
+        );
+
+        assert!(database.remove_platform_alias("n64").unwrap());
+        scan_and_persist(&mut database, &config, "after-removal").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "n64/game.zip");
+        assert_eq!(
+            archive.platform.as_deref(),
+            Some("N64"),
+            "removing the alias and rescanning must restore the built-in folder alias fallback"
+        );
+        assert_eq!(archive.platform_source.as_deref(), Some("folder_alias"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_alias_and_rescanning_restores_unknown_when_nothing_else_matches() {
+        let root = temp_dir("custom-alias-removal-restores-unknown");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("mystery", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "with-alias").unwrap();
+        assert_eq!(
+            find_archive(&database.load_archives().unwrap(), "mystery/game.zip")
+                .platform
+                .as_deref(),
+            Some("GameCube")
+        );
+
+        assert!(database.remove_platform_alias("mystery").unwrap());
+        scan_and_persist(&mut database, &config, "after-removal").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "mystery/game.zip");
+        assert_eq!(
+            archive.platform, None,
+            "with no built-in alias or heuristic match either, removal must restore Unknown"
+        );
+        assert!(persisted_archive_has_unknown_platform(archive));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repeated_scans_with_an_unchanged_custom_alias_do_not_duplicate_history() {
+        let root = temp_dir("custom-alias-no-duplicate-history");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "gc/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("gc", "GameCube").unwrap();
+
+        scan_and_persist(&mut database, &config, "scan-1").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "gc/game.zip").id;
+        scan_and_persist(&mut database, &config, "scan-2").unwrap();
+        scan_and_persist(&mut database, &config, "scan-3").unwrap();
+
+        let history_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history_count, 1,
+            "three scans reporting the same unchanged custom-alias result must not add rows"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

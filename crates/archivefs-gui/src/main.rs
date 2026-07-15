@@ -14,7 +14,7 @@ use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
     ArchiveStatus, ArchiveUnmountSession, CatalogueStats, CompletedScanSummary, Config,
     ConfigIdentity, Database, DatabaseHealth, DoctorReport, DoctorStatus, LazyUnmountCleanupResult,
-    MANUAL_PLATFORM_SOURCE, MountOneOutcome, MountState, PersistedArchive,
+    MANUAL_PLATFORM_SOURCE, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
     PlatformAssignmentChange, ScanPersistSummary, SetupDiagnosticStatus, SetupDiagnostics,
     UnmountOneOutcome, canonical_platform_names, check_database_health,
     cleanup_selected_mount_tree, create_configured_mount_root_default,
@@ -51,6 +51,7 @@ enum ActivityAction {
     Setup,
     LibraryDatabase,
     PlatformAssignment,
+    PlatformAliasManagement,
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -68,6 +69,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Setup => "Setup",
             Self::LibraryDatabase => "Library database",
             Self::PlatformAssignment => "Platform assignment",
+            Self::PlatformAliasManagement => "Platform alias management",
         })
     }
 }
@@ -1059,6 +1061,7 @@ struct CachedLibrarySnapshot {
     archives: Vec<PersistedArchive>,
     stats: CatalogueStats,
     last_completed_scan: Option<CompletedScanSummary>,
+    platform_aliases: Vec<PlatformAlias>,
 }
 
 enum DatabaseOutcome {
@@ -1272,12 +1275,14 @@ fn load_snapshot_from(
     let archives = database.load_archives().map_err(to_failed)?;
     let stats = database.catalogue_stats().map_err(to_failed)?;
     let last_completed_scan = database.latest_completed_scan().map_err(to_failed)?;
+    let platform_aliases = database.list_platform_aliases().map_err(to_failed)?;
     Ok(CachedLibrarySnapshot {
         database_path: database_path.to_path_buf(),
         schema_version,
         archives,
         stats,
         last_completed_scan,
+        platform_aliases,
     })
 }
 
@@ -1308,6 +1313,21 @@ struct RunningPlatformAction {
 /// flag. Never itself sent as a platform value; `resolved_platform_choice`
 /// substitutes the free-text field's contents instead.
 const CUSTOM_PLATFORM_CHOICE: &str = "Custom...";
+
+/// One custom-platform-alias database write requested from the "Custom
+/// Platform Aliases" panel - see `show_platform_aliases_panel`.
+/// Metadata-only, exactly like `PlatformAction`: never touches the
+/// filesystem or a mount, and never triggers a rescan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AliasAction {
+    Add { alias: String, platform: String },
+    Remove { alias: String },
+}
+
+struct RunningAliasAction {
+    action: AliasAction,
+    receiver: Receiver<Result<(), String>>,
+}
 
 struct ArchiveFsApp {
     state: LoadState,
@@ -1346,6 +1366,9 @@ struct ArchiveFsApp {
     platform_action: Option<RunningPlatformAction>,
     platform_choice: Option<String>,
     platform_custom_text: String,
+    alias_action: Option<RunningAliasAction>,
+    new_alias_text: String,
+    new_alias_platform_choice: Option<String>,
 }
 
 impl ArchiveFsApp {
@@ -1403,6 +1426,9 @@ impl ArchiveFsApp {
             platform_action: None,
             platform_choice: None,
             platform_custom_text: String::new(),
+            alias_action: None,
+            new_alias_text: String::new(),
+            new_alias_platform_choice: None,
         }
     }
 
@@ -1870,6 +1896,117 @@ impl ArchiveFsApp {
                     Some(archive_path),
                     ActivityOutcome::Failed,
                     message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+            }
+        }
+    }
+
+    /// Whether a new custom-platform-alias action may start: not already
+    /// running one, and not in the middle of a database load/scan - the
+    /// same "one database writer at a time" convention
+    /// `platform_action_available` already enforces for individual
+    /// archive platform assignment. This never touches `is_busy()`/mount
+    /// safety - alias management is metadata-only and deliberately
+    /// independent of it, exactly like platform assignment.
+    fn alias_action_available(&self) -> bool {
+        self.alias_action.is_none() && !self.database_state.is_loading()
+    }
+
+    fn start_alias_action(&mut self, context: egui::Context, action: AliasAction) {
+        if !self.alias_action_available() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::PlatformAliasManagement,
+            None,
+            ActivityOutcome::Started,
+            match &action {
+                AliasAction::Add { alias, platform } => {
+                    format!("Adding platform alias '{alias}' -> {platform}.")
+                }
+                AliasAction::Remove { alias } => format!("Removing platform alias '{alias}'."),
+            },
+        ));
+        self.alias_action = Some(RunningAliasAction {
+            action: action.clone(),
+            receiver,
+        });
+        thread::spawn(move || {
+            let result = apply_alias_action(&action).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Mirrors `poll_platform_action`: on success, refreshes only the
+    /// cached database snapshot (`platform_aliases` is now part of it;
+    /// see `load_snapshot_from`), never the live archive snapshot and
+    /// never a scan. On a successful add, clears the input fields so the
+    /// panel is ready for the next alias; a successful remove leaves
+    /// them untouched (there is nothing to clear).
+    fn poll_alias_action(&mut self, context: &egui::Context) {
+        let result = self.alias_action.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.action.clone(), result))
+        });
+        let Some((action, result)) = result else {
+            return;
+        };
+        self.alias_action = None;
+        match result {
+            Ok(()) => {
+                let message = match &action {
+                    AliasAction::Add { alias, platform } => {
+                        format!(
+                            "Alias added: '{alias}' -> {platform}. Run a library scan to apply it."
+                        )
+                    }
+                    AliasAction::Remove { alias } => {
+                        format!(
+                            "Alias removed: '{alias}'. Run a library scan to apply this change."
+                        )
+                    }
+                };
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::PlatformAliasManagement,
+                    None,
+                    ActivityOutcome::Completed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+                if matches!(action, AliasAction::Add { .. }) {
+                    self.new_alias_text.clear();
+                    self.new_alias_platform_choice = None;
+                }
+                self.start_database_action(context.clone(), false);
+            }
+            Err(message) => {
+                let action_label = match &action {
+                    AliasAction::Add { alias, .. } => format!("Add alias '{alias}'"),
+                    AliasAction::Remove { alias } => format!("Remove alias '{alias}'"),
+                };
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::PlatformAliasManagement,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("{action_label}: {message}"),
                 ));
                 self.feedback = Some(ActionFeedback {
                     succeeded: false,
@@ -2762,6 +2899,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_diagnostics();
         self.poll_setup_action(context);
         self.poll_platform_action(context);
+        self.poll_alias_action(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
@@ -2848,6 +2986,20 @@ impl eframe::App for ArchiveFsApp {
                         self.start_database_action(context.clone(), false);
                     }
                 }
+            }
+            let cached_aliases = self
+                .database_state
+                .snapshot()
+                .map(|snapshot| snapshot.platform_aliases.as_slice())
+                .unwrap_or(&[]);
+            if let Some(action) = show_platform_aliases_panel(
+                ui,
+                cached_aliases,
+                &mut self.new_alias_text,
+                &mut self.new_alias_platform_choice,
+                self.alias_action.is_some(),
+            ) {
+                self.start_alias_action(context.clone(), action);
             }
             ui.separator();
 
@@ -3146,6 +3298,41 @@ fn apply_platform_action_at(
         PlatformAction::Set(platform) => database.set_manual_platform(archive_id, platform),
         PlatformAction::Clear => database.clear_manual_platform(archive_id),
     }
+}
+
+/// Opens the default library database and applies one `AliasAction` -
+/// the production entry point run on the background thread
+/// `ArchiveFsApp::start_alias_action` spawns. See
+/// [`apply_alias_action_at`] (the testable core, taking an explicit
+/// database path - mirrors `apply_platform_action`/
+/// `apply_platform_action_at`) for the actual logic. Uses
+/// `Database::open_or_create` (creating the database if it does not
+/// exist yet) rather than requiring a pre-existing one: unlike manual
+/// platform assignment, an alias is not attached to any specific
+/// already-scanned archive, so there is nothing that requires the
+/// database - or a scan - to already exist first. This matches
+/// `library-scan`'s existing "open or create" write-command convention
+/// on the CLI side.
+fn apply_alias_action(action: &AliasAction) -> archivefs_core::Result<()> {
+    let database_path = default_database_path()?;
+    apply_alias_action_at(&database_path, action)
+}
+
+fn apply_alias_action_at(database_path: &Path, action: &AliasAction) -> archivefs_core::Result<()> {
+    let mut database = Database::open_or_create(database_path)?;
+    match action {
+        AliasAction::Add { alias, platform } => {
+            database.add_platform_alias(alias, platform)?;
+        }
+        AliasAction::Remove { alias } => {
+            if !database.remove_platform_alias(alias)? {
+                return Err(ArchiveFsError::Database(format!(
+                    "no platform alias matches '{alias}'"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Formats a platform assignment for display as `"<platform>
@@ -3854,6 +4041,118 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
             });
         });
     action
+}
+
+/// Renders the compact "Custom Platform Aliases" section: a collapsible
+/// list of persisted aliases (each with a Remove button), plus an
+/// alias-text field and a canonical-platform dropdown with an Add Alias
+/// button. Purely a view over `aliases` (already loaded off the UI
+/// thread as part of the cached database snapshot - see
+/// `CachedLibrarySnapshot::platform_aliases`) plus the two caller-owned
+/// input fields; never itself opens a database or blocks. `busy` (from
+/// `ArchiveFsApp::alias_action`) disables every control here while one
+/// alias action is already running, so two cannot overlap - it is
+/// deliberately independent of `is_busy()`/mount safety, exactly like
+/// the existing per-archive platform assignment controls.
+fn show_platform_aliases_panel(
+    ui: &mut egui::Ui,
+    aliases: &[PlatformAlias],
+    new_alias_text: &mut String,
+    new_alias_platform_choice: &mut Option<String>,
+    busy: bool,
+) -> Option<AliasAction> {
+    let mut action = None;
+    egui::CollapsingHeader::new("Custom Platform Aliases")
+        .id_salt("platform_aliases_panel")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                "Map a folder name to a platform (for example \"gc\" -> GameCube). Custom \
+                 aliases outrank built-in detection but never a manual archive assignment. \
+                 Changes take effect on the next library scan.",
+            );
+            ui.separator();
+
+            if aliases.is_empty() {
+                ui.label("No custom platform aliases defined.");
+            } else {
+                egui::Grid::new("platform_aliases_grid")
+                    .num_columns(3)
+                    .show(ui, |ui| {
+                        for alias in aliases {
+                            ui.label(&alias.alias);
+                            ui.label(&alias.platform);
+                            if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
+                                action = Some(AliasAction::Remove {
+                                    alias: alias.alias.clone(),
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Alias:");
+                ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(new_alias_text)
+                        .desired_width(120.0)
+                        .hint_text("gc"),
+                );
+                ui.label("Platform:");
+                egui::ComboBox::from_id_salt("platform_alias_choice_combo")
+                    .selected_text(
+                        new_alias_platform_choice
+                            .as_deref()
+                            .unwrap_or("Select platform..."),
+                    )
+                    .show_ui(ui, |ui| {
+                        for name in canonical_platform_names() {
+                            ui.selectable_value(
+                                new_alias_platform_choice,
+                                Some(name.to_string()),
+                                name,
+                            );
+                        }
+                    });
+
+                let resolved_action =
+                    resolved_new_alias_action(new_alias_text, new_alias_platform_choice.as_deref());
+                if ui
+                    .add_enabled(
+                        !busy && resolved_action.is_some(),
+                        egui::Button::new("Add Alias"),
+                    )
+                    .clicked()
+                {
+                    action = resolved_action;
+                }
+                if busy {
+                    ui.spinner();
+                }
+            });
+        });
+    action
+}
+
+/// The `AliasAction::Add` the Add Alias button constructs, factored out
+/// so it is directly testable (mirrors `resolved_platform_choice`'s
+/// existing convention for the per-archive platform editor). `None`
+/// exactly when the button itself would be disabled: `alias` trims to
+/// empty, or no platform has been chosen from the canonical-platform
+/// picker yet.
+fn resolved_new_alias_action(alias: &str, platform_choice: Option<&str>) -> Option<AliasAction> {
+    let trimmed_alias = alias.trim();
+    if trimmed_alias.is_empty() {
+        return None;
+    }
+    let platform = platform_choice?;
+    Some(AliasAction::Add {
+        alias: trimmed_alias.to_string(),
+        platform: platform.to_string(),
+    })
 }
 
 struct LoadedViewState<'a> {
@@ -5092,6 +5391,9 @@ mod tests {
             platform_action: None,
             platform_choice: None,
             platform_custom_text: String::new(),
+            alias_action: None,
+            new_alias_text: String::new(),
+            new_alias_platform_choice: None,
         }
     }
 
@@ -5280,6 +5582,7 @@ mod tests {
             archives,
             stats: empty_catalogue_stats(),
             last_completed_scan: None,
+            platform_aliases: Vec::new(),
         }
     }
 
@@ -8185,6 +8488,281 @@ mod tests {
         .unwrap();
 
         assert_eq!(change.new_platform.as_deref(), Some("GameCube"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -------------------------------------------------------------
+    // Custom Platform Aliases panel
+    // -------------------------------------------------------------
+
+    #[test]
+    fn alias_action_available_requires_no_running_action_or_database_load() {
+        let mut app = app_for_operation_tests();
+        assert!(app.alias_action_available());
+
+        let (_sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Remove {
+                alias: "gc".to_string(),
+            },
+            receiver,
+        });
+        assert!(!app.alias_action_available());
+        app.alias_action = None;
+
+        let (_sender, receiver) = mpsc::channel();
+        app.database_state = DatabaseState::Loading {
+            generation: DatabaseGeneration::INITIAL,
+            receiver,
+            previous: None,
+            scanning: false,
+        };
+        assert!(!app.alias_action_available());
+    }
+
+    #[test]
+    fn start_alias_action_does_not_start_a_second_concurrent_action() {
+        let mut app = app_for_operation_tests();
+        app.start_alias_action(
+            egui::Context::default(),
+            AliasAction::Add {
+                alias: "gc".to_string(),
+                platform: "GameCube".to_string(),
+            },
+        );
+        assert!(app.alias_action.is_some());
+        let first_action = app.alias_action.as_ref().unwrap().action.clone();
+
+        // A second alias action must not replace the first one's receiver
+        // - mirrors start_operation_rejects_a_second_operation_without_replacing_the_receiver's
+        // existing convention for the archive-action channel.
+        app.start_alias_action(
+            egui::Context::default(),
+            AliasAction::Remove {
+                alias: "wii".to_string(),
+            },
+        );
+        assert_eq!(app.alias_action.as_ref().unwrap().action, first_action);
+    }
+
+    #[test]
+    fn poll_alias_action_add_success_refreshes_the_cache_and_clears_the_input_fields() {
+        let mut app = app_for_operation_tests();
+        app.new_alias_text = "gc".to_string();
+        app.new_alias_platform_choice = Some("GameCube".to_string());
+        let (sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Add {
+                alias: "gc".to_string(),
+                platform: "GameCube".to_string(),
+            },
+            receiver,
+        });
+        sender.send(Ok(())).unwrap();
+
+        app.poll_alias_action(&egui::Context::default());
+
+        assert!(app.alias_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(feedback.succeeded);
+        assert!(feedback.message.contains("gc"));
+        assert!(feedback.message.contains("GameCube"));
+        assert!(feedback.message.contains("Run a library scan"));
+        assert!(
+            app.history
+                .entries()
+                .any(|entry| entry.outcome == ActivityOutcome::Completed
+                    && entry.action == ActivityAction::PlatformAliasManagement)
+        );
+        assert!(app.new_alias_text.is_empty());
+        assert!(app.new_alias_platform_choice.is_none());
+        // Asynchronous: only a new background database load is started,
+        // never blocked on, and the live snapshot is untouched.
+        assert!(app.database_state.is_loading());
+        assert!(matches!(app.state, LoadState::Ready(_)));
+    }
+
+    #[test]
+    fn poll_alias_action_remove_success_refreshes_the_cache() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Remove {
+                alias: "gc".to_string(),
+            },
+            receiver,
+        });
+        sender.send(Ok(())).unwrap();
+
+        app.poll_alias_action(&egui::Context::default());
+
+        assert!(app.alias_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(feedback.succeeded);
+        assert!(feedback.message.contains("gc"));
+        assert!(app.database_state.is_loading());
+    }
+
+    #[test]
+    fn poll_alias_action_failure_preserves_the_cached_aliases_and_shows_the_error() {
+        let mut app = app_for_operation_tests();
+        let stale_snapshot = cached_snapshot(Vec::new());
+        let mut stale_snapshot = stale_snapshot;
+        stale_snapshot.platform_aliases = vec![PlatformAlias {
+            id: 1,
+            alias: "gc".to_string(),
+            normalized_alias: "gc".to_string(),
+            platform: "GameCube".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(stale_snapshot.clone()),
+            last_scan_summary: None,
+        };
+        app.new_alias_text = "wii".to_string();
+        app.new_alias_platform_choice = Some("Wii".to_string());
+        let (sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Add {
+                alias: "wii".to_string(),
+                platform: "Wii".to_string(),
+            },
+            receiver,
+        });
+        sender
+            .send(Err("a platform alias for 'wii' already exists".to_string()))
+            .unwrap();
+
+        app.poll_alias_action(&egui::Context::default());
+
+        assert!(app.alias_action.is_none());
+        let feedback = app.feedback.as_ref().unwrap();
+        assert!(!feedback.succeeded);
+        assert!(feedback.message.contains("already exists"));
+        assert!(
+            app.history
+                .entries()
+                .any(|entry| entry.outcome == ActivityOutcome::Failed
+                    && entry.action == ActivityAction::PlatformAliasManagement)
+        );
+        // A failed add must not clear the input fields (the user should
+        // be able to see/correct what they typed) and must not touch the
+        // cached snapshot or trigger a database reload.
+        assert_eq!(app.new_alias_text, "wii");
+        assert_eq!(app.new_alias_platform_choice, Some("Wii".to_string()));
+        match &app.database_state {
+            DatabaseState::Ready { snapshot, .. } => {
+                assert_eq!(snapshot.platform_aliases, stale_snapshot.platform_aliases);
+            }
+            other => panic!(
+                "expected the stale Ready snapshot to survive untouched, got status {}",
+                other.status_label()
+            ),
+        }
+    }
+
+    #[test]
+    fn alias_action_is_independent_of_is_busy_and_mount_action_availability() {
+        // Alias management is metadata-only, exactly like per-archive
+        // platform assignment (platform_action): it must never appear in
+        // is_busy() (which gates mount/unmount exclusivity), and a
+        // running alias action must not disable mount/unmount actions.
+        let mut app = app_for_operation_tests();
+        let (_sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Remove {
+                alias: "gc".to_string(),
+            },
+            receiver,
+        });
+        assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn new_alias_action_uses_the_chosen_canonical_platform() {
+        for platform in canonical_platform_names() {
+            let action = resolved_new_alias_action("gc", Some(platform)).unwrap();
+            assert_eq!(
+                action,
+                AliasAction::Add {
+                    alias: "gc".to_string(),
+                    platform: platform.to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_new_alias_action_requires_a_non_empty_alias_and_a_chosen_platform() {
+        assert!(resolved_new_alias_action("gc", None).is_none());
+        assert!(resolved_new_alias_action("   ", Some("GameCube")).is_none());
+        assert!(resolved_new_alias_action("", Some("GameCube")).is_none());
+        assert_eq!(
+            resolved_new_alias_action("  gc  ", Some("GameCube")),
+            Some(AliasAction::Add {
+                alias: "gc".to_string(),
+                platform: "GameCube".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn apply_alias_action_add_list_remove_round_trip_and_duplicate_error() {
+        let dir = database_test_dir("apply-alias-round-trip");
+        let database_path = dir.join("library.sqlite3");
+
+        apply_alias_action_at(
+            &database_path,
+            &AliasAction::Add {
+                alias: "gc".to_string(),
+                platform: "GameCube".to_string(),
+            },
+        )
+        .unwrap();
+
+        let duplicate_error = apply_alias_action_at(
+            &database_path,
+            &AliasAction::Add {
+                alias: "GC".to_string(),
+                platform: "Wii".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(duplicate_error.to_string().contains("already exists"));
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.list_platform_aliases().unwrap().len(), 1);
+        drop(database);
+
+        apply_alias_action_at(
+            &database_path,
+            &AliasAction::Remove {
+                alias: "gc".to_string(),
+            },
+        )
+        .unwrap();
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert!(database.list_platform_aliases().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_alias_action_remove_unknown_alias_is_a_clear_error() {
+        let dir = database_test_dir("apply-alias-remove-unknown");
+        let database_path = dir.join("library.sqlite3");
+        Database::open_or_create(&database_path).unwrap();
+
+        let error = apply_alias_action_at(
+            &database_path,
+            &AliasAction::Remove {
+                alias: "does-not-exist".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no platform alias matches"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

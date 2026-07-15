@@ -8,14 +8,14 @@ use archivefs_core::{
     ArchiveScanner, ArchiveStats, ArchiveStatus, CatalogueStats, CompletedScanSummary, Config,
     ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth, DoctorReport,
     DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector, MountPlan,
-    PersistedArchive, PlatformAssignmentChange, ScanPersistSummary, WatchRebuildSummary,
-    build_and_write_archive_index, canonical_platform_names, check_archive_index_freshness,
-    check_database_health, clean_mount_root, cleanup_selected_mount_dir, current_archive_info,
-    current_archive_stats, current_statuses, default_database_path, default_index_path,
-    find_archive_index_entries, latest_schema_version, mount_archives, mount_one_archive,
-    persisted_archive_has_unknown_platform, read_default_archive_index, run_config_check_default,
-    run_doctor_default, scan_and_persist, summarize_archive_index, unmount_archives,
-    unmount_one_archive, watch_archive_index,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    WatchRebuildSummary, build_and_write_archive_index, canonical_platform_names,
+    check_archive_index_freshness, check_database_health, clean_mount_root,
+    cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
+    default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
+    mount_archives, mount_one_archive, persisted_archive_has_unknown_platform,
+    read_default_archive_index, run_config_check_default, run_doctor_default, scan_and_persist,
+    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
 };
 use serde::Serialize;
 
@@ -328,6 +328,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_platform_change_json(&change)?;
             } else {
                 print_library_platform_change("Clear Platform", &change);
+            }
+        }
+        "platform-alias-list" => {
+            let json = args.any(|arg| arg == "--json");
+            let database_path = default_database_path()?;
+            let aliases = list_platform_aliases_or_empty(&database_path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&aliases)?);
+            } else {
+                print_platform_aliases(&aliases);
+            }
+        }
+        "platform-alias-add" => {
+            let (json, alias, platform) = parse_platform_alias_add_args(args.collect())?;
+            let database_path = default_database_path()?;
+            let mut database = Database::open_or_create(&database_path)?;
+            let saved = database.add_platform_alias(&alias, &platform)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&saved)?);
+            } else {
+                print_platform_alias_saved(&saved);
+            }
+        }
+        "platform-alias-remove" => {
+            let Some(alias) = args.next() else {
+                return Err(
+                    "platform-alias-remove requires an alias, e.g. archivefs-cli platform-alias-remove gc"
+                        .into(),
+                );
+            };
+            let database_path = default_database_path()?;
+            let mut database = Database::open_or_create(&database_path)?;
+            if database.remove_platform_alias(&alias)? {
+                println!(
+                    "Removed platform alias '{alias}'. Run a library scan to apply this change."
+                );
+            } else {
+                return Err(format!("no platform alias matches '{alias}'").into());
             }
         }
         "clean" => {
@@ -960,6 +998,64 @@ fn format_library_entries_json(
     entries: &[LibraryArchiveView],
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(entries)
+}
+
+/// Loads every persisted custom platform alias for `platform-alias-list`.
+/// If no database file exists yet, this is an empty list (`Ok(vec![])`),
+/// not an error - mirroring `build_library_entries`'s existing "no
+/// database yet is not a failure" convention for a read-only listing
+/// command. Never creates the database and never scans.
+fn list_platform_aliases_or_empty(
+    database_path: &Path,
+) -> Result<Vec<PlatformAlias>, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Ok(Vec::new());
+    }
+    let database = Database::open_or_create(database_path)?;
+    Ok(database.list_platform_aliases()?)
+}
+
+fn print_platform_aliases(aliases: &[PlatformAlias]) {
+    if aliases.is_empty() {
+        println!("No custom platform aliases defined.");
+        return;
+    }
+
+    println!("ArchiveFS Platform Aliases\n");
+    for alias in aliases {
+        println!("  Alias: {}", alias.alias);
+        println!("  Platform: {}", alias.platform);
+        println!();
+    }
+}
+
+fn print_platform_alias_saved(alias: &PlatformAlias) {
+    println!(
+        "Saved platform alias '{}' -> {}.",
+        alias.alias, alias.platform
+    );
+    println!("Run a library scan to apply this change.");
+}
+
+/// `platform-alias-add`'s argument parsing, factored out so it is
+/// directly testable (mirrors this file's existing convention of
+/// factoring `run()` match-arm logic into a plain function rather than
+/// testing `run()` itself - see `resolve_platform_argument`,
+/// `resolve_target_selector`). Exactly two positional arguments
+/// (alias, platform) are required after `--json` is extracted; anything
+/// else (zero, one, or three or more) is a clear error.
+fn parse_platform_alias_add_args(
+    mut args: Vec<String>,
+) -> Result<(bool, String, String), Box<dyn std::error::Error>> {
+    let json = extract_flag(&mut args, "--json");
+    match args.as_slice() {
+        [alias, platform] => Ok((json, alias.clone(), platform.clone())),
+        _ => Err(
+            "platform-alias-add requires exactly an alias and a platform, e.g. \
+             archivefs-cli platform-alias-add gc GameCube"
+                .into(),
+        ),
+    }
 }
 
 fn format_library_entries(entries: &[LibraryArchiveView]) -> String {
@@ -1631,6 +1727,11 @@ fn print_help() {
         "  library-set-platform   Manually assign an archive's platform (outranks automatic detection)"
     );
     println!("  library-clear-platform Clear a manual platform assignment");
+    println!("  platform-alias-list    List persistent custom folder-name platform aliases");
+    println!(
+        "  platform-alias-add     Add a custom folder-name platform alias (applies on next scan)"
+    );
+    println!("  platform-alias-remove   Remove a custom folder-name platform alias");
     println!();
     println!("Examples:");
     println!("  archivefs --version");
@@ -1648,6 +1749,9 @@ fn print_help() {
     println!("  archivefs library-set-platform --id 42 GameCube");
     println!("  archivefs library-set-platform --path /roms/n64/Luigis_Mansion.zip GameCube");
     println!("  archivefs library-clear-platform \"Luigi's Mansion\"");
+    println!("  archivefs platform-alias-list");
+    println!("  archivefs platform-alias-add gc GameCube");
+    println!("  archivefs platform-alias-remove gc");
     println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
     println!("  archivefs mount-one \"007 Legends\"");
@@ -2304,7 +2408,7 @@ mod tests {
 
         assert!(output.starts_with("{\n"));
         assert_eq!(json["database_exists"], true);
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], latest_schema_version());
         assert_eq!(json["migrations_current"], true);
         assert_eq!(json["stats"]["total_archives"], 1);
         assert_eq!(json["last_completed_scan"]["archives_added"], 1);
@@ -3073,6 +3177,203 @@ mod tests {
             entries[0].platform.as_deref(),
             Some("MSX2"),
             "a non-manual assignment must be untouched by clear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -------------------------------------------------------------
+    // platform-alias-list / platform-alias-add / platform-alias-remove
+    // -------------------------------------------------------------
+
+    #[test]
+    fn platform_alias_add_args_parsing_requires_exactly_two_positional_args() {
+        let (json, alias, platform) = parse_platform_alias_add_args(
+            ["gc", "GameCube"].into_iter().map(str::to_string).collect(),
+        )
+        .unwrap();
+        assert!(!json);
+        assert_eq!(alias, "gc");
+        assert_eq!(platform, "GameCube");
+
+        let (json, alias, platform) = parse_platform_alias_add_args(
+            ["--json", "gc", "GameCube"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .unwrap();
+        assert!(json);
+        assert_eq!(alias, "gc");
+        assert_eq!(platform, "GameCube");
+
+        assert!(parse_platform_alias_add_args(vec!["gc".to_string()]).is_err());
+        assert!(parse_platform_alias_add_args(Vec::new()).is_err());
+        assert!(
+            parse_platform_alias_add_args(
+                ["gc", "GameCube", "extra"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn platform_alias_list_is_empty_and_successful_when_no_database_exists_yet() {
+        let root = temp_dir("platform-alias-list-no-database");
+        let database_path = root.join("does-not-exist.sqlite3");
+
+        let aliases = list_platform_aliases_or_empty(&database_path).unwrap();
+        assert!(aliases.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_add_list_remove_round_trip() {
+        let root = temp_dir("platform-alias-cli-round-trip");
+        let database_path = root.join("library.sqlite3");
+
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            database.add_platform_alias("gc", "GameCube").unwrap();
+        }
+
+        let listed = list_platform_aliases_or_empty(&database_path).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].alias, "gc");
+        assert_eq!(listed[0].platform, "GameCube");
+
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            assert!(database.remove_platform_alias("gc").unwrap());
+        }
+        assert!(
+            list_platform_aliases_or_empty(&database_path)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_list_json_shape_round_trips_through_serde() {
+        let root = temp_dir("platform-alias-json-shape");
+        let database_path = root.join("library.sqlite3");
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            database.add_platform_alias("gc", "GameCube").unwrap();
+        }
+
+        let aliases = list_platform_aliases_or_empty(&database_path).unwrap();
+        let json = serde_json::to_string_pretty(&aliases).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["alias"], "gc");
+        assert_eq!(parsed[0]["normalized_alias"], "gc");
+        assert_eq!(parsed[0]["platform"], "GameCube");
+        assert!(parsed[0]["id"].is_number());
+        assert!(parsed[0]["created_at"].is_string());
+        assert!(parsed[0]["updated_at"].is_string());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_add_duplicate_normalized_alias_is_a_clear_error() {
+        let root = temp_dir("platform-alias-cli-duplicate");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("gc", "GameCube").unwrap();
+
+        let error = database.add_platform_alias("GC", "Wii").unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_remove_unknown_alias_is_a_clear_error() {
+        let root = temp_dir("platform-alias-cli-remove-unknown");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        // `run()`'s "platform-alias-remove" match arm turns this `false`
+        // into `Err(format!("no platform alias matches '{alias}'"))` -
+        // exercised here at the level this file's other command handlers
+        // are tested at (the underlying, directly callable operation).
+        assert!(!database.remove_platform_alias("does-not-exist").unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_add_invalid_alias_is_a_clear_error() {
+        let root = temp_dir("platform-alias-cli-invalid-alias");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let empty = database.add_platform_alias("---", "GameCube").unwrap_err();
+        assert!(empty.to_string().contains("letter or digit"));
+
+        let path_like = database
+            .add_platform_alias("gc/extra", "GameCube")
+            .unwrap_err();
+        assert!(path_like.to_string().contains('/'));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_add_validates_against_canonical_platform_names() {
+        let root = temp_dir("platform-alias-cli-canonical-validation");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+
+        let error = database
+            .add_platform_alias("gc", "NotARealPlatform")
+            .unwrap_err();
+        assert!(error.to_string().contains("not a known platform"));
+
+        let saved = database.add_platform_alias("wii", "wii").unwrap();
+        assert_eq!(
+            saved.platform, "Wii",
+            "canonical spelling must be stored regardless of the caller's casing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn platform_alias_add_has_no_automatic_scan_side_effect() {
+        let root = temp_dir("platform-alias-cli-no-auto-scan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "n64/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial-scan").unwrap();
+        assert_eq!(
+            build_library_entries(&database_path, false).unwrap()[0]
+                .platform
+                .as_deref(),
+            Some("N64"),
+            "sanity check: the built-in folder alias detects N64 before any custom alias exists"
+        );
+
+        // Adding a custom alias for "n64" -> GameCube must not itself
+        // rescan/re-detect anything - the already-persisted archive's
+        // platform must stay exactly as the last scan left it until a
+        // new library-scan is run.
+        {
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            database.add_platform_alias("n64", "GameCube").unwrap();
+        }
+
+        let entries = build_library_entries(&database_path, false).unwrap();
+        assert_eq!(
+            entries[0].platform.as_deref(),
+            Some("N64"),
+            "platform-alias-add must not trigger an automatic rescan"
         );
 
         let _ = std::fs::remove_dir_all(&root);
