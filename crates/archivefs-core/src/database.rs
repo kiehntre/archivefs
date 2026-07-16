@@ -498,6 +498,9 @@ pub struct PersistedArchive {
     /// exactly when `platform` is `None`.
     pub platform_source: Option<String>,
     pub last_known_health: String,
+    /// Reliable timestamp updated whenever a successful scan observes this
+    /// archive. Retained while the row is missing for review display.
+    pub last_seen_at: String,
     pub last_verified_missing_at: Option<String>,
 }
 
@@ -582,6 +585,17 @@ pub struct BulkPlatformAssignmentResult {
     pub missing: Vec<i64>,
 }
 
+/// Result of atomically removing missing archive records from the catalogue.
+/// `requested` counts distinct archive ids after deduplication; every accepted
+/// id is removed, so a successful result always has `requested == removed`.
+/// Unknown or currently-present ids reject the operation before any delete.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct MissingArchiveRemovalResult {
+    pub requested: usize,
+    pub removed: usize,
+    pub archive_ids: Vec<i64>,
+}
+
 /// One persisted custom platform folder alias (`platform_aliases` table -
 /// see [`Database::add_platform_alias`]). `alias` is the user's original
 /// typed text (trimmed), kept only for display; matching and uniqueness
@@ -631,6 +645,13 @@ fn system_time_to_unix_seconds(time: SystemTime) -> Option<i64> {
 
 fn db_error(context: &str, error: rusqlite::Error) -> ArchiveFsError {
     ArchiveFsError::Database(format!("{context}: {error}"))
+}
+
+fn format_archive_ids(ids: &[i64]) -> String {
+    ids.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `platform_assignments.source` value for a manual (user-chosen)
@@ -1383,6 +1404,95 @@ impl Database {
             .collect()
     }
 
+    /// Removes the selected archive records only when every distinct id names
+    /// an archive already marked missing. Validation and all deletes happen in
+    /// one transaction: an unknown id, a present archive, or any SQLite error
+    /// rejects/rolls back the whole operation.
+    ///
+    /// The initial schema does not cascade archive deletion to its two child
+    /// tables, so related `platform_assignments` and
+    /// `archive_scan_observations` rows are deleted explicitly before the
+    /// parent. `scan_runs`, `platform_aliases`, source folders, and unrelated
+    /// archives are never deleted. This method performs database operations
+    /// only; it never accesses or mutates an archive path.
+    pub fn remove_missing_archives(
+        &mut self,
+        archive_ids: &[i64],
+    ) -> Result<MissingArchiveRemovalResult> {
+        let ids = Self::deduplicate_archive_ids(archive_ids);
+        if ids.is_empty() {
+            return Err(ArchiveFsError::Database(
+                "at least one archive id is required".to_string(),
+            ));
+        }
+
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error("failed to start remove_missing_archives transaction", error)
+        })?;
+        let mut unknown = Vec::new();
+        let mut present = Vec::new();
+        for archive_id in &ids {
+            let missing_at: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT last_verified_missing_at FROM archives WHERE id = ?1",
+                    params![archive_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to validate missing archive removal", error))?;
+            match missing_at {
+                None => unknown.push(*archive_id),
+                Some(None) => present.push(*archive_id),
+                Some(Some(_)) => {}
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(ArchiveFsError::Database(format!(
+                "archive id(s) not found: {}. No catalogue entries were removed",
+                format_archive_ids(&unknown)
+            )));
+        }
+        if !present.is_empty() {
+            return Err(ArchiveFsError::Database(format!(
+                "archive id(s) are currently present: {}. Only missing catalogue entries can be removed; no catalogue entries were removed",
+                format_archive_ids(&present)
+            )));
+        }
+
+        for archive_id in &ids {
+            tx.execute(
+                "DELETE FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove platform history for missing archive",
+                    error,
+                )
+            })?;
+            tx.execute(
+                "DELETE FROM archive_scan_observations WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove scan observations for missing archive",
+                    error,
+                )
+            })?;
+            tx.execute("DELETE FROM archives WHERE id = ?1", params![archive_id])
+                .map_err(|error| db_error("failed to remove missing archive", error))?;
+        }
+
+        tx.commit()
+            .map_err(|error| db_error("failed to commit remove_missing_archives", error))?;
+        Ok(MissingArchiveRemovalResult {
+            requested: ids.len(),
+            removed: ids.len(),
+            archive_ids: ids,
+        })
+    }
+
     /// Sets `platform` as a manual, user-chosen platform assignment for
     /// every archive in `archive_ids` in a single transaction - the batch
     /// counterpart to [`Self::set_manual_platform`]. Every existing
@@ -1933,7 +2043,7 @@ impl Database {
                 "SELECT a.id, a.source_folder_id, a.relative_path, a.absolute_path_cached, \
                  a.archive_kind, a.display_name, a.normalized_name, a.size_bytes, \
                  a.modified_time_unix_seconds, p.platform, p.source, a.last_known_health, \
-                 a.last_verified_missing_at \
+                 a.last_seen_at, a.last_verified_missing_at \
                  FROM archives a \
                  LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
                  ORDER BY a.id",
@@ -1958,7 +2068,8 @@ impl Database {
                     platform: row.get(9)?,
                     platform_source: row.get(10)?,
                     last_known_health: row.get(11)?,
-                    last_verified_missing_at: row.get(12)?,
+                    last_seen_at: row.get(12)?,
+                    last_verified_missing_at: row.get(13)?,
                 })
             })
             .map_err(|error| db_error("failed to query archives", error))?;
@@ -3065,6 +3176,287 @@ mod tests {
                 .is_none()
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_missing_archive_can_be_removed_with_its_related_rows() {
+        let root = temp_dir("remove-one-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "n64/gone.zip", b"gone");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+        fs::remove_file(&archive_path).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+
+        let result = database.remove_missing_archives(&[archive_id]).unwrap();
+
+        assert_eq!(result.requested, 1);
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.archive_ids, vec![archive_id]);
+        assert!(database.load_archives().unwrap().is_empty());
+        for table in ["platform_assignments", "archive_scan_observations"] {
+            let count: i64 = database
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE archive_id = ?1"),
+                    params![archive_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not retain an orphan row");
+        }
+        let foreign_key_errors: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bulk_missing_removal_deduplicates_and_preserves_unrelated_catalogue_state() {
+        let root = temp_dir("remove-missing-bulk");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let gone_a = write_archive_file(&source, "n64/a.zip", b"a");
+        let gone_b = write_archive_file(&source, "n64/b.zip", b"b");
+        write_archive_file(&source, "n64/keep.zip", b"keep");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("custom", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archives = database.load_archives().unwrap();
+        let id_a = find_archive(&archives, "n64/a.zip").id;
+        let id_b = find_archive(&archives, "n64/b.zip").id;
+        let keep_id = find_archive(&archives, "n64/keep.zip").id;
+        fs::remove_file(gone_a).unwrap();
+        fs::remove_file(gone_b).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+        let scan_runs_before: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))
+            .unwrap();
+
+        let result = database
+            .remove_missing_archives(&[id_a, id_b, id_a, id_b])
+            .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.removed, 2);
+        assert_eq!(result.archive_ids, vec![id_a, id_b]);
+        let remaining = database.load_archives().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, keep_id);
+        assert_eq!(database.list_platform_aliases().unwrap().len(), 1);
+        let scan_runs_after: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(scan_runs_after, scan_runs_before);
+        let keep_observations: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_scan_observations WHERE archive_id = ?1",
+                params![keep_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(keep_observations > 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn present_archive_removal_is_rejected_without_changes() {
+        let root = temp_dir("remove-present-rejected");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "game.zip", b"present");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+
+        let error = database.remove_missing_archives(&[archive_id]).unwrap_err();
+
+        assert!(error.to_string().contains("currently present"));
+        assert_eq!(database.load_archives().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mixed_present_and_missing_removal_is_fully_rejected() {
+        let root = temp_dir("remove-mixed-rejected");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let gone = write_archive_file(&source, "gone.zip", b"gone");
+        write_archive_file(&source, "present.zip", b"present");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archives = database.load_archives().unwrap();
+        let gone_id = find_archive(&archives, "gone.zip").id;
+        let present_id = find_archive(&archives, "present.zip").id;
+        fs::remove_file(gone).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+
+        let error = database
+            .remove_missing_archives(&[gone_id, present_id])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("currently present"));
+        assert_eq!(database.load_archives().unwrap().len(), 2);
+        assert!(
+            database
+                .load_archives()
+                .unwrap()
+                .iter()
+                .any(|archive| archive.id == gone_id)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_archive_ids_reject_missing_removal_before_any_delete() {
+        let root = temp_dir("remove-unknown-rejected");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let gone = write_archive_file(&source, "gone.zip", b"gone");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+        fs::remove_file(gone).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+
+        let error = database
+            .remove_missing_archives(&[archive_id, i64::MAX])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not found"));
+        assert_eq!(database.load_archives().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_removal_rolls_back_every_delete_on_database_failure() {
+        let root = temp_dir("remove-missing-rollback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let gone_a = write_archive_file(&source, "n64/a.zip", b"a");
+        let gone_b = write_archive_file(&source, "n64/b.zip", b"b");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archives = database.load_archives().unwrap();
+        let id_a = find_archive(&archives, "n64/a.zip").id;
+        let id_b = find_archive(&archives, "n64/b.zip").id;
+        fs::remove_file(gone_a).unwrap();
+        fs::remove_file(gone_b).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+        database
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_second_missing_delete BEFORE DELETE ON archives \
+                 WHEN OLD.id = {id_b} BEGIN SELECT RAISE(ABORT, 'simulated delete failure'); END;"
+            ))
+            .unwrap();
+        let assignments_before: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM platform_assignments", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let observations_before: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_scan_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(database.remove_missing_archives(&[id_a, id_b]).is_err());
+
+        assert_eq!(database.load_archives().unwrap().len(), 2);
+        let assignments_after: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM platform_assignments", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let observations_after: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_scan_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(assignments_after, assignments_before);
+        assert_eq!(observations_after, observations_before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_removal_accepts_non_utf8_exact_archive_identity() {
+        let root = temp_dir("remove-missing-non-utf8");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        fs::create_dir_all(&source).unwrap();
+        let archive_path = source.join(OsString::from_vec(vec![
+            b'g', 0x80, b'm', b'e', b'.', b'z', b'i', b'p',
+        ]));
+        fs::write(&archive_path, b"contents").unwrap();
+        assert!(archive_path.to_str().is_none());
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+        fs::remove_file(&archive_path).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+
+        assert_eq!(
+            database
+                .remove_missing_archives(&[archive_id])
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(database.load_archives().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_catalogue_removal_never_deletes_a_reappeared_unscanned_file() {
+        let root = temp_dir("remove-missing-filesystem-boundary");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "game.zip", b"original");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+        fs::remove_file(&archive_path).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+        fs::write(&archive_path, b"reappeared but not rescanned").unwrap();
+
+        database.remove_missing_archives(&[archive_id]).unwrap();
+
+        assert_eq!(
+            fs::read(&archive_path).unwrap(),
+            b"reappeared but not rescanned"
+        );
+        assert!(source.is_dir());
+        assert!(mount.parent().unwrap().is_dir());
         let _ = fs::remove_dir_all(&root);
     }
 

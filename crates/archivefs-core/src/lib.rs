@@ -19,10 +19,11 @@ mod database;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
-    Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, RegisteredSourceFolder,
-    ScanPersistSummary, ScanRunCounts, check_database_health, default_database_path,
-    latest_schema_version, persisted_archive_has_unknown_platform, scan_and_persist,
+    Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
+    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, check_database_health,
+    default_database_path, latest_schema_version, persisted_archive_has_unknown_platform,
+    scan_and_persist,
 };
 
 #[derive(Debug)]

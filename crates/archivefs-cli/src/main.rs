@@ -8,14 +8,15 @@ use archivefs_core::{
     ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult, CatalogueStats,
     CompletedScanSummary, Config, ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth,
     DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
-    MountPlan, PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
-    WatchRebuildSummary, build_and_write_archive_index, canonical_platform_names,
-    check_archive_index_freshness, check_database_health, clean_mount_root,
-    cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
-    default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
-    mount_archives, mount_one_archive, persisted_archive_has_unknown_platform,
-    read_default_archive_index, run_config_check_default, run_doctor_default, scan_and_persist,
-    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
+    MissingArchiveRemovalResult, MountPlan, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, ScanPersistSummary, WatchRebuildSummary,
+    build_and_write_archive_index, canonical_platform_names, check_archive_index_freshness,
+    check_database_health, clean_mount_root, cleanup_selected_mount_dir, current_archive_info,
+    current_archive_stats, current_statuses, default_database_path, default_index_path,
+    find_archive_index_entries, latest_schema_version, mount_archives, mount_one_archive,
+    persisted_archive_has_unknown_platform, read_default_archive_index, run_config_check_default,
+    run_doctor_default, scan_and_persist, summarize_archive_index, unmount_archives,
+    unmount_one_archive, watch_archive_index,
 };
 use serde::Serialize;
 
@@ -376,6 +377,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
                 print_bulk_platform_change("Clear Platform (bulk)", &summary);
+            }
+        }
+        "library-remove-missing" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let ids = extract_repeated_id_flags(&mut input_args)?;
+            let paths = extract_repeated_path_flags(&mut input_args)?;
+            if !input_args.is_empty() {
+                return Err(
+                    "library-remove-missing accepts only exact --id/--path selectors".into(),
+                );
+            }
+            require_at_least_one_bulk_selector("library-remove-missing", &ids, &paths)?;
+            let database_path = default_database_path()?;
+            let result = run_library_remove_missing(&database_path, &ids, &paths)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print!("{}", format_missing_removal(&result));
             }
         }
         "platform-alias-list" => {
@@ -1489,6 +1509,35 @@ fn run_library_clear_platform_bulk(
     Ok(database.clear_manual_platform_for_archives(&target_ids)?)
 }
 
+/// Removes catalogue rows selected only by exact persisted id/path. All paths
+/// are resolved before the database transaction begins; the core API then
+/// validates that every deduplicated id exists and is currently missing before
+/// deleting anything. This never scans and never accesses an archive file.
+fn run_library_remove_missing(
+    database_path: &Path,
+    ids: &[i64],
+    paths: &[PathBuf],
+) -> Result<MissingArchiveRemovalResult, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err(format!(
+            "No library database found at {}. Run: archivefs-cli library-scan",
+            database_path.display()
+        )
+        .into());
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    let target_ids = resolve_bulk_target_ids(&database, ids, paths)?;
+    Ok(database.remove_missing_archives(&target_ids)?)
+}
+
+fn format_missing_removal(result: &MissingArchiveRemovalResult) -> String {
+    format!(
+        "ArchiveFS Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nNo archive files or mounted contents were deleted.\n",
+        result.removed,
+        if result.removed == 1 { "y" } else { "ies" }
+    )
+}
+
 fn print_bulk_platform_change(action: &str, summary: &BulkPlatformAssignmentResult) {
     println!("ArchiveFS Library {action}");
     println!("Requested: {}", summary.requested);
@@ -1930,6 +1979,9 @@ fn print_help() {
     println!(
         "  library-clear-platform-bulk Clear manual platform assignments from several archives at once"
     );
+    println!(
+        "  library-remove-missing Remove missing catalogue entries by exact id/path (never deletes files)"
+    );
     println!("  platform-alias-list    List persistent custom folder-name platform aliases");
     println!(
         "  platform-alias-add     Add a custom folder-name platform alias (applies on next scan)"
@@ -1957,6 +2009,8 @@ fn print_help() {
         "  archivefs library-set-platform-bulk --path /roms/n64/a.zip --path /roms/n64/b.zip N64"
     );
     println!("  archivefs library-clear-platform-bulk --id 1 --id 2 --id 3");
+    println!("  archivefs library-remove-missing --id 12");
+    println!("  archivefs library-remove-missing --path /roms/missing.zip --id 13 --json");
     println!("  archivefs platform-alias-list");
     println!("  archivefs platform-alias-add gc GameCube");
     println!("  archivefs platform-alias-remove gc");
@@ -4169,6 +4223,205 @@ mod tests {
         let entries = build_library_entries(&database_path, false).unwrap();
         assert_eq!(entries[0].platform.as_deref(), Some("GameCube"));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_accepts_exact_id_and_exact_path_selectors() {
+        let root = temp_dir("cli-remove-missing-id-path");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let gone_by_id = write_archive_file(&source, "gone-id.zip", b"id");
+        let gone_by_path = write_archive_file(&source, "gone-path.zip", b"path");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let id = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("gone-id.zip"))
+            .unwrap()
+            .id;
+        std::fs::remove_file(&gone_by_id).unwrap();
+        std::fs::remove_file(&gone_by_path).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+
+        let by_id = run_library_remove_missing(&database_path, &[id], &[]).unwrap();
+        let by_path =
+            run_library_remove_missing(&database_path, &[], std::slice::from_ref(&gone_by_path))
+                .unwrap();
+
+        assert_eq!(by_id.removed, 1);
+        assert_eq!(by_path.removed, 1);
+        assert!(
+            build_library_entries(&database_path, false)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_bulk_deduplicates_combined_selectors() {
+        let root = temp_dir("cli-remove-missing-bulk");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let gone_a = write_archive_file(&source, "a.zip", b"a");
+        let gone_b = write_archive_file(&source, "b.zip", b"b");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let id_a = entries
+            .iter()
+            .find(|entry| entry.path == gone_a)
+            .unwrap()
+            .id;
+        let id_b = entries
+            .iter()
+            .find(|entry| entry.path == gone_b)
+            .unwrap()
+            .id;
+        std::fs::remove_file(&gone_a).unwrap();
+        std::fs::remove_file(&gone_b).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+
+        let result = run_library_remove_missing(
+            &database_path,
+            &[id_a, id_a, id_b],
+            std::slice::from_ref(&gone_b),
+        )
+        .unwrap();
+
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.removed, 2);
+        assert!(
+            build_library_entries(&database_path, false)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_rejects_present_and_mixed_selections_atomically() {
+        let root = temp_dir("cli-remove-missing-reject-present");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let gone = write_archive_file(&source, "gone.zip", b"gone");
+        write_archive_file(&source, "present.zip", b"present");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let gone_id = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("gone.zip"))
+            .unwrap()
+            .id;
+        let present_id = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("present.zip"))
+            .unwrap()
+            .id;
+        std::fs::remove_file(gone).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+
+        assert!(run_library_remove_missing(&database_path, &[present_id], &[]).is_err());
+        let mixed =
+            run_library_remove_missing(&database_path, &[gone_id, present_id], &[]).unwrap_err();
+
+        assert!(mixed.to_string().contains("currently present"));
+        assert_eq!(
+            build_library_entries(&database_path, false).unwrap().len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_reports_unknown_ids_and_paths_without_removing_valid_rows() {
+        let root = temp_dir("cli-remove-missing-unknown");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let gone = write_archive_file(&source, "gone.zip", b"gone");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let id = build_library_entries(&database_path, false).unwrap()[0].id;
+        std::fs::remove_file(gone).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+
+        let unknown_id =
+            run_library_remove_missing(&database_path, &[id, i64::MAX], &[]).unwrap_err();
+        let unknown_path =
+            run_library_remove_missing(&database_path, &[], &[source.join("never-scanned.zip")])
+                .unwrap_err();
+
+        assert!(unknown_id.to_string().contains("not found"));
+        assert!(
+            unknown_path
+                .to_string()
+                .contains("no archive found with exact path")
+        );
+        assert_eq!(
+            build_library_entries(&database_path, false).unwrap().len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_json_and_human_output_have_safe_compatible_shapes() {
+        let result = MissingArchiveRemovalResult {
+            requested: 2,
+            removed: 2,
+            archive_ids: vec![12, 13],
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["requested"], 2);
+        assert_eq!(json["removed"], 2);
+        assert_eq!(json["archive_ids"], serde_json::json!([12, 13]));
+        assert_eq!(json.as_object().unwrap().len(), 3);
+        let human = format_missing_removal(&result);
+        assert!(human.contains("Removed: 2 missing catalogue entries."));
+        assert!(human.contains("No archive files or mounted contents were deleted."));
+    }
+
+    #[test]
+    fn library_remove_missing_never_scans_or_alters_an_archive_file() {
+        let root = temp_dir("cli-remove-missing-no-filesystem");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let archive_path = write_archive_file(&source, "game.zip", b"initial");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let id = build_library_entries(&database_path, false).unwrap()[0].id;
+        std::fs::remove_file(&archive_path).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+        std::fs::write(&archive_path, b"reappeared").unwrap();
+        let database = Database::open_or_create(&database_path).unwrap();
+        let scan_id_before = database
+            .latest_completed_scan()
+            .unwrap()
+            .unwrap()
+            .scan_run_id;
+        database.close().unwrap();
+
+        run_library_remove_missing(&database_path, &[id], &[]).unwrap();
+
+        assert_eq!(std::fs::read(&archive_path).unwrap(), b"reappeared");
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(
+            database
+                .latest_completed_scan()
+                .unwrap()
+                .unwrap()
+                .scan_run_id,
+            scan_id_before
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

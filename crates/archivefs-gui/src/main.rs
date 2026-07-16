@@ -14,10 +14,10 @@ use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
     ArchiveStatus, ArchiveUnmountSession, BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE,
     CatalogueStats, CompletedScanSummary, Config, ConfigIdentity, Database, DatabaseHealth,
-    DoctorReport, DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MountOneOutcome,
-    MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
-    PlatformProvenanceDetails, ScanPersistSummary, SetupDiagnosticStatus, SetupDiagnostics,
-    UnmountOneOutcome, canonical_platform_names, check_database_health,
+    DoctorReport, DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE,
+    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, PlatformProvenanceDetails, ScanPersistSummary, SetupDiagnosticStatus,
+    SetupDiagnostics, UnmountOneOutcome, canonical_platform_names, check_database_health,
     cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
     latest_schema_version, lazy_unmount_one_archive_path_with_progress,
@@ -60,6 +60,7 @@ enum ActivityAction {
     PlatformAssignment,
     BulkPlatformAssignment,
     PlatformAliasManagement,
+    CatalogueCleanup,
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -79,6 +80,7 @@ impl std::fmt::Display for ActivityAction {
             Self::PlatformAssignment => "Platform assignment",
             Self::BulkPlatformAssignment => "Bulk platform assignment",
             Self::PlatformAliasManagement => "Platform alias management",
+            Self::CatalogueCleanup => "Catalogue cleanup",
         })
     }
 }
@@ -1376,6 +1378,11 @@ struct RunningAliasAction {
     receiver: Receiver<Result<(), String>>,
 }
 
+struct RunningMissingRemoval {
+    requested_paths: usize,
+    receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
+}
+
 struct ArchiveFsApp {
     state: LoadState,
     filter: String,
@@ -1414,6 +1421,8 @@ struct ArchiveFsApp {
     platform_choice: Option<String>,
     platform_custom_text: String,
     alias_action: Option<RunningAliasAction>,
+    missing_removal: Option<RunningMissingRemoval>,
+    confirm_remove_missing: Option<Vec<PathBuf>>,
     new_alias_text: String,
     new_alias_platform_choice: Option<String>,
     /// The exact-identity multi-selection (requirement 1): every
@@ -1496,6 +1505,8 @@ impl ArchiveFsApp {
             platform_choice: None,
             platform_custom_text: String::new(),
             alias_action: None,
+            missing_removal: None,
+            confirm_remove_missing: None,
             new_alias_text: String::new(),
             new_alias_platform_choice: None,
             selected_archives: HashSet::new(),
@@ -1605,6 +1616,9 @@ impl ArchiveFsApp {
     /// read-only reload). Never blocks the UI thread - mirrors
     /// `refresh`/`start_load` exactly.
     fn start_database_action(&mut self, context: egui::Context, run_scan_first: bool) {
+        if self.missing_removal.is_some() {
+            return;
+        }
         self.database_generation = self.database_generation.next();
         let generation = self.database_generation;
         let previous = match std::mem::replace(
@@ -1909,6 +1923,8 @@ impl ArchiveFsApp {
     fn platform_action_available(&self) -> bool {
         self.platform_action.is_none()
             && self.bulk_platform_action.is_none()
+            && self.alias_action.is_none()
+            && self.missing_removal.is_none()
             && !self.database_state.is_loading()
     }
 
@@ -2139,7 +2155,11 @@ impl ArchiveFsApp {
     /// safety - alias management is metadata-only and deliberately
     /// independent of it, exactly like platform assignment.
     fn alias_action_available(&self) -> bool {
-        self.alias_action.is_none() && !self.database_state.is_loading()
+        self.alias_action.is_none()
+            && self.platform_action.is_none()
+            && self.bulk_platform_action.is_none()
+            && self.missing_removal.is_none()
+            && !self.database_state.is_loading()
     }
 
     fn start_alias_action(&mut self, context: egui::Context, action: AliasAction) {
@@ -2230,6 +2250,86 @@ impl ArchiveFsApp {
                     None,
                     ActivityOutcome::Failed,
                     format!("{action_label}: {message}"),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+            }
+        }
+    }
+
+    fn missing_removal_action_available(&self) -> bool {
+        self.missing_removal.is_none()
+            && self.platform_action.is_none()
+            && self.bulk_platform_action.is_none()
+            && self.alias_action.is_none()
+            && matches!(self.database_state, DatabaseState::Ready { .. })
+    }
+
+    fn start_missing_removal(&mut self, context: egui::Context, archive_paths: Vec<PathBuf>) {
+        if !self.missing_removal_action_available() || archive_paths.is_empty() {
+            return;
+        }
+        let requested_paths = archive_paths.len();
+        let (sender, receiver) = mpsc::channel();
+        self.missing_removal = Some(RunningMissingRemoval {
+            requested_paths,
+            receiver,
+        });
+        thread::spawn(move || {
+            let result = apply_missing_removal(&archive_paths).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_missing_removal(&mut self, context: &egui::Context) {
+        let result = self.missing_removal.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.requested_paths, result))
+        });
+        let Some((requested_paths, result)) = result else {
+            return;
+        };
+        self.missing_removal = None;
+        match result {
+            Ok(result) => {
+                let message = format!(
+                    "Removed {} missing catalogue entr{}. No archive files were deleted.",
+                    result.removed,
+                    if result.removed == 1 { "y" } else { "ies" }
+                );
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CatalogueCleanup,
+                    None,
+                    ActivityOutcome::Completed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+                self.start_database_action(context.clone(), false);
+            }
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CatalogueCleanup,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!(
+                        "Could not remove {requested_paths} selected missing catalogue entr{}: {message}",
+                        if requested_paths == 1 { "y" } else { "ies" }
+                    ),
                 ));
                 self.feedback = Some(ActionFeedback {
                     succeeded: false,
@@ -3019,6 +3119,7 @@ enum AppOperationRequest {
         archive_paths: Vec<PathBuf>,
         kind: BulkPlatformActionKind,
     },
+    RemoveMissing(Vec<PathBuf>),
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -3128,6 +3229,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_platform_action(context);
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
+        self.poll_missing_removal(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
@@ -3142,6 +3244,7 @@ impl eframe::App for ArchiveFsApp {
             &self.diagnostics,
         );
         let archive_actions_blocked = busy || !actions_safe;
+        let missing_removal_available = self.missing_removal_action_available();
         if loading || diagnostics_loading || busy {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -3353,6 +3456,9 @@ impl eframe::App for ArchiveFsApp {
                             selected_archives: &mut self.selected_archives,
                             bulk_platform_choice: &mut self.bulk_platform_choice,
                             bulk_platform_busy: self.bulk_platform_action.is_some(),
+                            missing_removal_available,
+                            missing_removal_busy: self.missing_removal.is_some(),
+                            confirm_remove_missing: &mut self.confirm_remove_missing,
                             sort_field: &mut self.sort_field,
                             sort_ascending: &mut self.sort_ascending,
                             library_scroll_offset: &mut self.library_scroll_offset,
@@ -3435,6 +3541,9 @@ impl eframe::App for ArchiveFsApp {
                     kind,
                 } => {
                     self.start_bulk_platform_action(context.clone(), archive_paths, kind);
+                }
+                AppOperationRequest::RemoveMissing(archive_paths) => {
+                    self.start_missing_removal(context.clone(), archive_paths);
                 }
             }
         }
@@ -3632,6 +3741,39 @@ fn apply_alias_action_at(database_path: &Path, action: &AliasAction) -> archivef
         }
     }
     Ok(())
+}
+
+fn apply_missing_removal(
+    archive_paths: &[PathBuf],
+) -> archivefs_core::Result<MissingArchiveRemovalResult> {
+    let database_path = default_database_path()?;
+    apply_missing_removal_at(&database_path, archive_paths)
+}
+
+fn apply_missing_removal_at(
+    database_path: &Path,
+    archive_paths: &[PathBuf],
+) -> archivefs_core::Result<MissingArchiveRemovalResult> {
+    if !database_path.exists() {
+        return Err(ArchiveFsError::Database(format!(
+            "library database does not exist at {}",
+            database_path.display()
+        )));
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    let mut ids = Vec::with_capacity(archive_paths.len());
+    for path in archive_paths {
+        let archive_id = database
+            .find_archive_id_by_absolute_path(path)?
+            .ok_or_else(|| {
+                ArchiveFsError::Database(format!(
+                    "no archive found with exact stored path {}; nothing was removed",
+                    path.display()
+                ))
+            })?;
+        ids.push(archive_id);
+    }
+    database.remove_missing_archives(&ids)
 }
 
 /// Formats a platform assignment for display as `"<platform>
@@ -4570,9 +4712,64 @@ struct LoadedViewState<'a> {
     selected_archives: &'a mut HashSet<PathBuf>,
     bulk_platform_choice: &'a mut Option<String>,
     bulk_platform_busy: bool,
+    missing_removal_available: bool,
+    missing_removal_busy: bool,
+    confirm_remove_missing: &'a mut Option<Vec<PathBuf>>,
     sort_field: &'a mut Option<SortField>,
     sort_ascending: &'a mut bool,
     library_scroll_offset: &'a mut f32,
+}
+
+const REMOVE_MISSING_CANCEL_LABEL: &str = "Cancel";
+const REMOVE_MISSING_CONFIRM_LABEL: &str = "Remove Missing Entries";
+
+fn set_missing_review_mode(filters: &mut LibraryRowFilters, enabled: bool) {
+    filters.missing = enabled;
+    if enabled {
+        filters.present = false;
+        filters.awaiting_validation = false;
+    }
+}
+
+fn selected_missing_paths(
+    cached: Option<&CachedLibrarySnapshot>,
+    selected_archives: &HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    if selected_archives.is_empty() {
+        return Err("Select one or more missing catalogue entries first.".to_string());
+    }
+    let cached = cached.ok_or_else(|| "The library database is unavailable.".to_string())?;
+    let mut paths: Vec<PathBuf> = selected_archives.iter().cloned().collect();
+    paths.sort();
+    for path in &paths {
+        let archive = cached
+            .archives
+            .iter()
+            .find(|archive| archive.absolute_path == *path)
+            .ok_or_else(|| {
+                format!(
+                    "{} is not an exact stored catalogue path. Nothing was removed.",
+                    path.display()
+                )
+            })?;
+        if archive.last_verified_missing_at.is_none() {
+            return Err(format!(
+                "{} is currently present. Only missing catalogue entries can be removed; nothing was removed.",
+                path.display()
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+fn missing_removal_confirmation_text(count: usize) -> String {
+    format!(
+        "Remove {count} missing entr{} from the ArchiveFS catalogue?\n\n\
+         This removes only ArchiveFS database records.\n\
+         It will not delete archive files or mounted contents.\n\
+         Entries will return if the archives are found in a later scan.",
+        if count == 1 { "y" } else { "ies" }
+    )
 }
 
 fn show_loaded_data(
@@ -4610,6 +4807,9 @@ fn show_loaded_data(
         selected_archives,
         bulk_platform_choice,
         bulk_platform_busy,
+        missing_removal_available,
+        missing_removal_busy,
+        confirm_remove_missing,
         sort_field,
         sort_ascending,
         library_scroll_offset,
@@ -5033,6 +5233,69 @@ fn show_loaded_data(
     // events that actually change this merge (poll_load, poll_database_load),
     // not every frame - see ArchiveFsApp::poll_load/poll_database_load.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
+
+    let missing_count = merged_rows
+        .iter()
+        .filter(|row| row.origin == RowOrigin::CachedMissing)
+        .count();
+    let mut missing_only =
+        library_filters.missing && !library_filters.present && !library_filters.awaiting_validation;
+    let selected_missing = selected_missing_paths(cached, selected_archives);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Missing catalogue entries: {missing_count}"));
+        if ui
+            .checkbox(&mut missing_only, "Show missing only")
+            .changed()
+        {
+            set_missing_review_mode(library_filters, missing_only);
+        }
+        let enabled = missing_removal_available && selected_missing.is_ok();
+        let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
+        if !enabled && let Err(reason) = &selected_missing {
+            response.clone().on_hover_text(reason);
+        }
+        if response.clicked()
+            && let Ok(paths) = &selected_missing
+        {
+            *confirm_remove_missing = Some(paths.clone());
+        }
+        if missing_removal_busy {
+            ui.spinner();
+            ui.label("Removing catalogue entries...");
+        }
+    });
+
+    if let Some(paths) = confirm_remove_missing.clone() {
+        let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
+        egui::Window::new(format!(
+            "Remove {} missing catalogue entr{}?",
+            paths.len(),
+            if paths.len() == 1 { "y" } else { "ies" }
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(missing_removal_confirmation_text(paths.len()));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
+                    *confirm_remove_missing = None;
+                }
+                if ui
+                    .add_enabled(
+                        missing_removal_available && still_valid,
+                        egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
+                    )
+                    .clicked()
+                {
+                    requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
+                    *confirm_remove_missing = None;
+                }
+            });
+        });
+    }
 
     let mut filter_changed = false;
     ui.horizontal(|ui| {
@@ -5934,6 +6197,13 @@ fn show_selected_archive(
                     "Archive path: {}",
                     persisted.absolute_path.display()
                 ));
+                if persisted.last_verified_missing_at.is_some() {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Status: Missing from the latest successful source-folder scan",
+                    );
+                    ui.label(format!("Last seen: {}", persisted.last_seen_at));
+                }
                 ui.label(
                     "Known to the library database, not confirmed by the latest live snapshot. \
                      Mount/unmount actions are unavailable until it is - platform assignment \
@@ -6422,6 +6692,8 @@ mod tests {
             platform_choice: None,
             platform_custom_text: String::new(),
             alias_action: None,
+            missing_removal: None,
+            confirm_remove_missing: None,
             new_alias_text: String::new(),
             new_alias_platform_choice: None,
             selected_archives: HashSet::new(),
@@ -6621,6 +6893,7 @@ mod tests {
             platform: None,
             platform_source: None,
             last_known_health: "Pending".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: missing.then(|| "2026-01-01T00:00:00Z".to_string()),
         }
     }
@@ -6677,6 +6950,196 @@ mod tests {
 
     fn provenance_line_map(details: &PlatformProvenanceDetails) -> HashMap<&'static str, String> {
         platform_provenance_lines(details).into_iter().collect()
+    }
+
+    #[test]
+    fn missing_removal_selection_requires_missing_only_and_nonempty_selection() {
+        let missing_path = PathBuf::from("/roms/missing.zip");
+        let present_path = PathBuf::from("/roms/present.zip");
+        let mut missing = persisted_archive(missing_path.clone(), true);
+        missing.id = 1;
+        let mut present = persisted_archive(present_path.clone(), false);
+        present.id = 2;
+        let snapshot = cached_snapshot(vec![missing, present]);
+
+        assert!(selected_missing_paths(Some(&snapshot), &HashSet::new()).is_err());
+        assert_eq!(
+            selected_missing_paths(
+                Some(&snapshot),
+                &[missing_path.clone()].into_iter().collect()
+            )
+            .unwrap(),
+            vec![missing_path.clone()]
+        );
+        let mixed = selected_missing_paths(
+            Some(&snapshot),
+            &[missing_path, present_path].into_iter().collect(),
+        )
+        .unwrap_err();
+        assert!(mixed.contains("currently present"));
+        assert!(mixed.contains("nothing was removed"));
+    }
+
+    #[test]
+    fn missing_review_mode_reuses_filters_without_resetting_platform_filters() {
+        let mut filters = LibraryRowFilters {
+            present: true,
+            awaiting_validation: true,
+            known_platform: true,
+            ..LibraryRowFilters::default()
+        };
+
+        set_missing_review_mode(&mut filters, true);
+
+        assert!(filters.missing);
+        assert!(!filters.present);
+        assert!(!filters.awaiting_validation);
+        assert!(filters.known_platform);
+        set_missing_review_mode(&mut filters, false);
+        assert!(!filters.missing);
+        assert!(filters.known_platform);
+    }
+
+    #[test]
+    fn missing_removal_confirmation_is_explicit_about_catalogue_only_safety() {
+        let wording = missing_removal_confirmation_text(3);
+
+        assert!(wording.contains("Remove 3 missing entries from the ArchiveFS catalogue?"));
+        assert!(wording.contains("only ArchiveFS database records"));
+        assert!(wording.contains("will not delete archive files or mounted contents"));
+        assert!(wording.contains("return if the archives are found in a later scan"));
+        assert_eq!(REMOVE_MISSING_CANCEL_LABEL, "Cancel");
+        assert_eq!(REMOVE_MISSING_CONFIRM_LABEL, "Remove Missing Entries");
+    }
+
+    #[test]
+    fn apply_missing_removal_uses_exact_paths_and_rejects_a_mixed_selection() {
+        let root = database_test_dir("remove-missing-exact-paths");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let gone = write_archive_file(&source, "gone.zip", b"gone");
+        let present = write_archive_file(&source, "present.zip", b"present");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        scan_and_persist(&mut database, &config, "missing").unwrap();
+        database.close().unwrap();
+
+        let error =
+            apply_missing_removal_at(&database_path, &[gone.clone(), present.clone()]).unwrap_err();
+
+        assert!(error.to_string().contains("currently present"));
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.load_archives().unwrap().len(), 2);
+        database.close().unwrap();
+        assert_eq!(
+            apply_missing_removal_at(&database_path, &[gone])
+                .unwrap()
+                .removed,
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_removal_availability_requires_a_healthy_idle_database() {
+        let mut app = app_for_operation_tests();
+        assert!(!app.missing_removal_action_available());
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(cached_snapshot(Vec::new())),
+            last_scan_summary: None,
+        };
+        assert!(app.missing_removal_action_available());
+        let (_sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Remove {
+                alias: "busy".to_string(),
+            },
+            receiver,
+        });
+        assert!(!app.missing_removal_action_available());
+    }
+
+    #[test]
+    fn successful_missing_removal_records_one_activity_and_refreshes_without_resetting_view() {
+        let path = PathBuf::from("/roms/missing.zip");
+        let mut app = app_for_operation_tests();
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(cached_snapshot(vec![persisted_archive(path.clone(), true)])),
+            last_scan_summary: None,
+        };
+        app.selected_archives.insert(path.clone());
+        app.selected_archive = Some(path);
+        app.library_filters.missing = true;
+        app.sort_field = Some(SortField::ArchivePath);
+        app.sort_ascending = false;
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(MissingArchiveRemovalResult {
+                requested: 1,
+                removed: 1,
+                archive_ids: vec![1],
+            }))
+            .unwrap();
+        app.missing_removal = Some(RunningMissingRemoval {
+            requested_paths: 1,
+            receiver,
+        });
+
+        app.poll_missing_removal(&egui::Context::default());
+
+        assert!(matches!(app.database_state, DatabaseState::Loading { .. }));
+        let entries: Vec<_> = app.history.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, ActivityAction::CatalogueCleanup);
+        assert!(entries[0].message.contains("No archive files were deleted"));
+        assert!(app.library_filters.missing);
+        assert_eq!(app.sort_field, Some(SortField::ArchivePath));
+        assert!(!app.sort_ascending);
+    }
+
+    #[test]
+    fn failed_missing_removal_preserves_selection_cached_rows_filters_and_sort() {
+        let path = PathBuf::from("/roms/missing.zip");
+        let mut app = app_for_operation_tests();
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(cached_snapshot(vec![persisted_archive(path.clone(), true)])),
+            last_scan_summary: None,
+        };
+        app.selected_archives.insert(path.clone());
+        app.selected_archive = Some(path.clone());
+        app.library_filters.missing = true;
+        app.sort_field = Some(SortField::State);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err("simulated failure".to_string())).unwrap();
+        app.missing_removal = Some(RunningMissingRemoval {
+            requested_paths: 1,
+            receiver,
+        });
+
+        app.poll_missing_removal(&egui::Context::default());
+
+        assert!(matches!(app.database_state, DatabaseState::Ready { .. }));
+        assert_eq!(app.selected_archives, [path.clone()].into_iter().collect());
+        assert_eq!(app.selected_archive, Some(path));
+        assert!(app.library_filters.missing);
+        assert_eq!(app.sort_field, Some(SortField::State));
+        assert_eq!(app.database_state.snapshot().unwrap().archives.len(), 1);
+    }
+
+    #[test]
+    fn vanished_missing_selections_are_pruned_after_cache_refresh() {
+        let path = PathBuf::from("/roms/removed.zip");
+        let mut app = app_for_operation_tests();
+        app.selected_archives.insert(path.clone());
+        app.selected_archive = Some(path);
+
+        app.prune_selection(&[]);
+
+        assert!(app.selected_archives.is_empty());
+        assert!(app.selected_archive.is_none());
     }
 
     #[test]
@@ -10219,6 +10682,7 @@ mod tests {
             let mut platform_choice = None;
             let mut platform_custom_text = String::new();
             let mut bulk_platform_choice = None;
+            let mut confirm_remove_missing = None;
 
             let mut panel_height = 0.0;
             let _ = ctx.run(input, |ctx| {
@@ -10256,6 +10720,9 @@ mod tests {
                             selected_archives: &mut self.selected_archives,
                             bulk_platform_choice: &mut bulk_platform_choice,
                             bulk_platform_busy: false,
+                            missing_removal_available: false,
+                            missing_removal_busy: false,
+                            confirm_remove_missing: &mut confirm_remove_missing,
                             sort_field: &mut self.sort_field,
                             sort_ascending: &mut self.sort_ascending,
                             library_scroll_offset: &mut self.library_scroll_offset,
