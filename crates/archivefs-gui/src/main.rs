@@ -5325,7 +5325,7 @@ fn show_data_row(
         ui.painter().rect_stroke(
             rect.shrink(1.0),
             0.0,
-            egui::Stroke::new(2.0, visuals.warn_fg_color),
+            egui::Stroke::new(2.0_f32, visuals.warn_fg_color),
             egui::StrokeKind::Inside,
         );
     }
