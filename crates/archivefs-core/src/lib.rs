@@ -22,8 +22,8 @@ pub use database::{
     Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult,
     PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
     RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, check_database_health,
-    default_database_path, latest_schema_version, persisted_archive_has_unknown_platform,
-    scan_and_persist,
+    default_database_path, format_unix_timestamp_utc, latest_schema_version,
+    persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 #[derive(Debug)]
@@ -1898,6 +1898,39 @@ pub struct DuplicateEntry {
     pub archive_paths: Vec<PathBuf>,
 }
 
+/// Read-only duplicate information for catalogue-backed callers such as the
+/// GUI. This deliberately remains separate from the serialized CLI
+/// [`DuplicateReport`] so that enriching the GUI cannot change the existing
+/// human or JSON compatibility surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueDuplicateReport {
+    pub groups: Vec<CatalogueDuplicateGroup>,
+    pub archives_in_groups: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueDuplicateGroup {
+    pub normalized_title: String,
+    pub title: String,
+    pub platform: String,
+    pub reason: String,
+    pub entries: Vec<CatalogueDuplicateArchive>,
+    /// Sum of only the entry sizes which are actually known.
+    pub total_known_size_bytes: u128,
+    /// Makes a partial known-size sum explicit rather than implying it is a
+    /// complete byte total for the group.
+    pub entries_with_known_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueDuplicateArchive {
+    pub archive_id: i64,
+    pub path: PathBuf,
+    pub present: bool,
+    pub size_bytes: Option<u64>,
+    pub modified_time_unix_seconds: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DuplicateSeverity {
     Warning,
@@ -1926,7 +1959,7 @@ impl DuplicateDetector for FilenameDuplicateDetector {
 
         for record in records {
             let platform = duplicate_record_platform(record);
-            let name = safe_mount_name(&record.mount_plan.archive.path).to_lowercase();
+            let name = duplicate_normalized_name(&record.mount_plan.archive.path);
             groups
                 .entry((platform, name))
                 .or_default()
@@ -1956,6 +1989,77 @@ impl DuplicateDetector for FilenameDuplicateDetector {
             archives_checked: records.len(),
             entries,
         })
+    }
+}
+
+fn duplicate_normalized_name(path: &Path) -> String {
+    safe_mount_name(path).to_lowercase()
+}
+
+/// Builds deterministic likely-duplicate groups from already-loaded catalogue
+/// rows without reading or changing the filesystem. The grouping key is the
+/// same normalized filename plus effective-platform key used by
+/// [`FilenameDuplicateDetector`]. Missing state and metadata are display
+/// attributes, never grouping inputs.
+pub fn catalogue_filename_duplicates(archives: &[PersistedArchive]) -> CatalogueDuplicateReport {
+    let mut grouped = BTreeMap::<(String, String), Vec<&PersistedArchive>>::new();
+    for archive in archives {
+        let platform = archive
+            .platform
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let normalized_title = duplicate_normalized_name(&archive.absolute_path);
+        grouped
+            .entry((platform, normalized_title))
+            .or_default()
+            .push(archive);
+    }
+
+    let groups = grouped
+        .into_iter()
+        .filter_map(|((platform, normalized_title), mut archives)| {
+            if archives.len() < 2 {
+                return None;
+            }
+            archives.sort_by(|left, right| left.absolute_path.cmp(&right.absolute_path));
+            let title = archives
+                .first()
+                .map(|archive| archive.display_name.clone())
+                .unwrap_or_else(|| normalized_title.clone());
+            let entries_with_known_size = archives
+                .iter()
+                .filter(|archive| archive.size_bytes.is_some())
+                .count();
+            let total_known_size_bytes = archives
+                .iter()
+                .filter_map(|archive| archive.size_bytes)
+                .map(u128::from)
+                .sum();
+            let entries = archives
+                .into_iter()
+                .map(|archive| CatalogueDuplicateArchive {
+                    archive_id: archive.id,
+                    path: archive.absolute_path.clone(),
+                    present: archive.last_verified_missing_at.is_none(),
+                    size_bytes: archive.size_bytes,
+                    modified_time_unix_seconds: archive.modified_time_unix_seconds,
+                })
+                .collect();
+            Some(CatalogueDuplicateGroup {
+                normalized_title,
+                title,
+                platform,
+                reason: "Matching normalized filename and platform".to_string(),
+                entries,
+                total_known_size_bytes,
+                entries_with_known_size,
+            })
+        })
+        .collect::<Vec<_>>();
+    let archives_in_groups = groups.iter().map(|group| group.entries.len()).sum();
+    CatalogueDuplicateReport {
+        groups,
+        archives_in_groups,
     }
 }
 
@@ -5705,6 +5809,99 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_duplicates_share_filename_detector_grouping_rules() {
+        let archives = vec![
+            persisted_duplicate_archive(1, "/roms/a/Halo 3.zip", Some("Xbox"), true, Some(10)),
+            persisted_duplicate_archive(2, "/roms/b/Halo_3.7z", Some("Xbox"), true, Some(20)),
+            persisted_duplicate_archive(3, "/roms/c/Halo 3.rar", Some("Xbox360"), true, Some(30)),
+            persisted_duplicate_archive(4, "/roms/d/Fable.zip", Some("Xbox"), true, Some(40)),
+        ];
+
+        let report = catalogue_filename_duplicates(&archives);
+
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.archives_in_groups, 2);
+        assert_eq!(report.groups[0].normalized_title, "halo_3");
+        assert_eq!(report.groups[0].platform, "Xbox");
+        assert_eq!(
+            report.groups[0].reason,
+            "Matching normalized filename and platform"
+        );
+        assert_eq!(
+            report.groups[0]
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/roms/a/Halo 3.zip"),
+                PathBuf::from("/roms/b/Halo_3.7z")
+            ]
+        );
+    }
+
+    #[test]
+    fn catalogue_duplicates_keep_present_missing_and_partial_size_truthful() {
+        let archives = vec![
+            persisted_duplicate_archive(1, "/roms/a/Game.zip", Some("Amiga"), true, Some(10)),
+            persisted_duplicate_archive(2, "/roms/b/Game.7z", Some("Amiga"), false, None),
+            persisted_duplicate_archive(3, "/roms/c/Game.rar", Some("Amiga"), true, Some(30)),
+        ];
+
+        let group = &catalogue_filename_duplicates(&archives).groups[0];
+
+        assert_eq!(group.entries.len(), 3);
+        assert_eq!(
+            group.entries.iter().filter(|entry| entry.present).count(),
+            2
+        );
+        assert_eq!(group.entries_with_known_size, 2);
+        assert_eq!(group.total_known_size_bytes, 40);
+    }
+
+    #[test]
+    fn catalogue_duplicate_order_is_deterministic_across_reloads() {
+        let archives = vec![
+            persisted_duplicate_archive(4, "/z/Zelda.7z", Some("NES"), true, Some(1)),
+            persisted_duplicate_archive(3, "/a/Zelda.zip", Some("NES"), true, Some(2)),
+            persisted_duplicate_archive(2, "/z/Alpha.7z", Some("SNES"), true, Some(3)),
+            persisted_duplicate_archive(1, "/a/Alpha.zip", Some("SNES"), true, Some(4)),
+        ];
+
+        let first = catalogue_filename_duplicates(&archives);
+        let second = catalogue_filename_duplicates(&archives.clone());
+
+        assert_eq!(first, second);
+        assert_eq!(first.groups[0].normalized_title, "zelda");
+        assert_eq!(first.groups[1].normalized_title, "alpha");
+        assert_eq!(
+            first.groups[0].entries[0].path,
+            PathBuf::from("/a/Zelda.zip")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalogue_duplicates_preserve_non_utf8_exact_paths_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut first = PathBuf::from("/roms/a");
+        first.push(std::ffi::OsString::from_vec(b"Game\x80.zip".to_vec()));
+        let mut second = PathBuf::from("/roms/b");
+        second.push(std::ffi::OsString::from_vec(b"Game\x80.7z".to_vec()));
+        let archives = vec![
+            persisted_duplicate_archive_path(1, first.clone(), Some("PC"), true, None),
+            persisted_duplicate_archive_path(2, second.clone(), Some("PC"), true, None),
+        ];
+
+        let report = catalogue_filename_duplicates(&archives);
+
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].entries[0].path, first);
+        assert_eq!(report.groups[0].entries[1].path, second);
+    }
+
+    #[test]
     fn empty_duplicate_detector_returns_empty_report_for_empty_input() {
         let detector = EmptyDuplicateDetector;
 
@@ -7805,6 +8002,47 @@ mod tests {
             metadata,
             ArchiveHealth::Pending,
         )
+    }
+
+    fn persisted_duplicate_archive(
+        id: i64,
+        path: &str,
+        platform: Option<&str>,
+        present: bool,
+        size_bytes: Option<u64>,
+    ) -> PersistedArchive {
+        persisted_duplicate_archive_path(id, PathBuf::from(path), platform, present, size_bytes)
+    }
+
+    fn persisted_duplicate_archive_path(
+        id: i64,
+        path: PathBuf,
+        platform: Option<&str>,
+        present: bool,
+        size_bytes: Option<u64>,
+    ) -> PersistedArchive {
+        PersistedArchive {
+            id,
+            source_folder_id: 1,
+            relative_path: path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.clone()),
+            absolute_path: path.clone(),
+            archive_kind: path
+                .extension()
+                .map(|extension| extension.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            display_name: archive_title(&path),
+            normalized_name: duplicate_normalized_name(&path),
+            size_bytes,
+            modified_time_unix_seconds: Some(1_700_000_000),
+            platform: platform.map(str::to_string),
+            platform_source: platform.map(|_| "heuristic-path-detector".to_string()),
+            last_known_health: "Pending".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            last_verified_missing_at: (!present).then(|| "2026-01-02T00:00:00Z".to_string()),
+        }
     }
 
     fn archive_with_platform(path: &str, platform: Option<&str>) -> Archive {

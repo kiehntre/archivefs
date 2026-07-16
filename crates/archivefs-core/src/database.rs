@@ -342,7 +342,7 @@ fn now_utc_string() -> String {
 /// locale handling), and this project already prefers small hand-written
 /// parsing/formatting over a general-purpose crate for a narrow,
 /// well-defined need (see the config parser in `lib.rs`).
-fn format_unix_timestamp_utc(unix_seconds: i64) -> String {
+pub fn format_unix_timestamp_utc(unix_seconds: i64) -> String {
     let days = unix_seconds.div_euclid(86_400);
     let seconds_of_day = unix_seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -3111,6 +3111,33 @@ mod tests {
             "a repeat scan must not duplicate the archive row"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn catalogue_duplicate_groups_remain_stable_after_database_reload() {
+        let root = temp_dir("duplicate-groups-stable-reload");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a/Game.zip", b"first");
+        write_archive_file(&source, "b/Game.7z", b"second");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let before = crate::catalogue_filename_duplicates(&database.load_archives().unwrap());
+        drop(database);
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        let after = crate::catalogue_filename_duplicates(&database.load_archives().unwrap());
+
+        assert_eq!(before, after);
+        assert_eq!(after.groups.len(), 1);
+        assert_eq!(after.groups[0].entries.len(), 2);
+        assert_ne!(
+            after.groups[0].entries[0].path,
+            after.groups[0].entries[1].path
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

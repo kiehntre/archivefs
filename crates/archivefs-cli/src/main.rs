@@ -4,12 +4,12 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use archivefs_core::{
-    ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary, ArchiveInfo,
-    ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult, CatalogueStats,
-    CompletedScanSummary, Config, ConfigCheckReport, ConfigCheckStatus, Database, DatabaseHealth,
-    DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
-    MissingArchiveRemovalResult, MountPlan, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, ScanPersistSummary, WatchRebuildSummary,
+    ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
+    ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
+    CatalogueStats, CompletedScanSummary, Config, ConfigCheckReport, ConfigCheckStatus, Database,
+    DatabaseHealth, DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport,
+    FilenameDuplicateDetector, MissingArchiveRemovalResult, MountPlan, PersistedArchive,
+    PlatformAlias, PlatformAssignmentChange, ScanPersistSummary, WatchRebuildSummary,
     build_and_write_archive_index, canonical_platform_names, check_archive_index_freshness,
     check_database_health, clean_mount_root, cleanup_selected_mount_dir, current_archive_info,
     current_archive_stats, current_statuses, default_database_path, default_index_path,
@@ -167,10 +167,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "duplicates" => {
             let json = args.any(|arg| arg == "--json");
             let config = Config::load_default()?;
-            let scanner = ArchiveScanner::new(&config);
-            let records = scanner.archive_records()?;
-            let detector = FilenameDuplicateDetector;
-            let report = detector.detect_duplicates(&records)?;
+            let report = build_duplicate_report(&config)?;
             if json {
                 print_duplicate_report_json(&report)?;
             } else {
@@ -1706,6 +1703,12 @@ fn print_duplicate_report(report: &DuplicateReport) {
     print!("{}", format_duplicate_report(report));
 }
 
+fn build_duplicate_report(config: &Config) -> Result<DuplicateReport, ArchiveFsError> {
+    let scanner = ArchiveScanner::new(config);
+    let records = scanner.archive_records()?;
+    FilenameDuplicateDetector.detect_duplicates(&records)
+}
+
 fn print_duplicate_report_json(report: &DuplicateReport) -> Result<(), serde_json::Error> {
     println!("{}", format_duplicate_report_json(report)?);
     Ok(())
@@ -2237,6 +2240,98 @@ mod tests {
         assert!(output.contains("007_legends"));
         assert!(output.contains("/roms/xbox360/007 Legends.zip"));
         assert!(output.contains("/roms/imports/007 Legends.7z"));
+    }
+
+    #[test]
+    fn duplicate_human_output_remains_exactly_compatible() {
+        let report = DuplicateReport {
+            detector: "filename".to_string(),
+            archives_checked: 2,
+            entries: vec![DuplicateEntry {
+                platform: "Xbox360".to_string(),
+                severity: archivefs_core::DuplicateSeverity::Warning,
+                reason: "same normalized archive name '007_legends' on platform 'Xbox360'"
+                    .to_string(),
+                archive_paths: vec![
+                    PathBuf::from("/roms/xbox360/007 Legends.zip"),
+                    PathBuf::from("/roms/imports/007 Legends.7z"),
+                ],
+            }],
+        };
+
+        assert_eq!(
+            format_duplicate_report(&report),
+            concat!(
+                "ArchiveFS Duplicates\n\n",
+                "Summary:\n",
+                "  Records checked: 2\n",
+                "  Duplicate groups found: 1\n",
+                "\nDuplicate groups:\n",
+                "  Group 1:\n",
+                "    Platform: Xbox360\n",
+                "    Severity: Warning\n",
+                "    Reason: same normalized archive name '007_legends' on platform 'Xbox360'\n",
+                "    Archives:\n",
+                "      /roms/xbox360/007 Legends.zip\n",
+                "      /roms/imports/007 Legends.7z\n",
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_json_keeps_the_existing_top_level_and_entry_fields() {
+        let report = DuplicateReport {
+            detector: "filename".to_string(),
+            archives_checked: 2,
+            entries: vec![DuplicateEntry {
+                platform: "Xbox360".to_string(),
+                severity: archivefs_core::DuplicateSeverity::Warning,
+                reason: "same normalized archive name 'game' on platform 'Xbox360'".to_string(),
+                archive_paths: vec![PathBuf::from("/a/Game.zip"), PathBuf::from("/b/Game.7z")],
+            }],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&format_duplicate_report_json(&report).unwrap()).unwrap();
+        let mut top_level = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        top_level.sort();
+        let mut entry = json["entries"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        entry.sort();
+
+        assert_eq!(top_level, ["archives_checked", "detector", "entries"]);
+        assert_eq!(entry, ["archive_paths", "platform", "reason", "severity"]);
+    }
+
+    #[test]
+    fn duplicate_report_reads_archives_without_writing_files_or_catalogue() {
+        let root = temp_dir("duplicates-read-only");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let first = write_archive_file(&source, "Game.zip", b"first archive");
+        let second = write_archive_file(&source, "Game.7z", b"second archive");
+        let config = config_for(&source, &mount);
+        let before = [
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap(),
+        ];
+
+        let report = build_duplicate_report(&config).unwrap();
+
+        assert_eq!(report.archives_checked, 2);
+        assert_eq!(std::fs::read(&first).unwrap(), before[0]);
+        assert_eq!(std::fs::read(&second).unwrap(), before[1]);
+        assert!(!root.join("library.sqlite3").exists());
+        assert!(!mount.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

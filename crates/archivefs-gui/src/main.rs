@@ -13,14 +13,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
     ArchiveStatus, ArchiveUnmountSession, BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE,
-    CatalogueStats, CompletedScanSummary, Config, ConfigIdentity, Database, DatabaseHealth,
-    DoctorReport, DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE,
-    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, ScanPersistSummary, SetupDiagnosticStatus,
-    SetupDiagnostics, UnmountOneOutcome, canonical_platform_names, check_database_health,
-    cleanup_selected_mount_tree, create_configured_mount_root_default,
+    CatalogueDuplicateArchive, CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats,
+    CompletedScanSummary, Config, ConfigIdentity, Database, DatabaseHealth, DoctorReport,
+    DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult,
+    MountOneOutcome, MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
+    PlatformProvenanceDetails, ScanPersistSummary, SetupDiagnosticStatus, SetupDiagnostics,
+    UnmountOneOutcome, canonical_platform_names, catalogue_filename_duplicates,
+    check_database_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
-    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    format_unix_timestamp_utc, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
     load_read_only_snapshot_default, mount_one_archive_path,
     persisted_archive_has_unknown_platform, remount_one_archive_path,
     run_setup_diagnostics_default, scan_and_persist, unmount_one_archive_path,
@@ -1074,6 +1075,10 @@ struct CachedLibrarySnapshot {
     stats: CatalogueStats,
     last_completed_scan: Option<CompletedScanSummary>,
     platform_aliases: Vec<PlatformAlias>,
+    /// Computed once on the database worker whenever this snapshot is
+    /// loaded. Rendering only filters/sorts these cached groups; it never
+    /// reruns duplicate detection per frame.
+    duplicate_report: CatalogueDuplicateReport,
 }
 
 enum DatabaseOutcome {
@@ -1291,6 +1296,7 @@ fn load_snapshot_from(
     let stats = database.catalogue_stats().map_err(to_failed)?;
     let last_completed_scan = database.latest_completed_scan().map_err(to_failed)?;
     let platform_aliases = database.list_platform_aliases().map_err(to_failed)?;
+    let duplicate_report = catalogue_filename_duplicates(&archives);
     Ok(CachedLibrarySnapshot {
         database_path: database_path.to_path_buf(),
         schema_version,
@@ -1299,6 +1305,7 @@ fn load_snapshot_from(
         stats,
         last_completed_scan,
         platform_aliases,
+        duplicate_report,
     })
 }
 
@@ -1383,6 +1390,58 @@ struct RunningMissingRemoval {
     receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DuplicateReviewFilters {
+    search: String,
+    platform: Option<String>,
+    include_missing: bool,
+    more_than_two: bool,
+}
+
+impl DuplicateReviewFilters {
+    fn initial() -> Self {
+        Self {
+            include_missing: true,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DuplicateSortField {
+    #[default]
+    Title,
+    Platform,
+    Entries,
+    KnownSize,
+}
+
+impl std::fmt::Display for DuplicateSortField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Title => "Title",
+            Self::Platform => "Platform",
+            Self::Entries => "Number of entries",
+            Self::KnownSize => "Total known size",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DuplicateGroupIdentity {
+    normalized_title: String,
+    platform: String,
+}
+
+impl From<&CatalogueDuplicateGroup> for DuplicateGroupIdentity {
+    fn from(group: &CatalogueDuplicateGroup) -> Self {
+        Self {
+            normalized_title: group.normalized_title.clone(),
+            platform: group.platform.clone(),
+        }
+    }
+}
+
 struct ArchiveFsApp {
     state: LoadState,
     filter: String,
@@ -1447,6 +1506,12 @@ struct ArchiveFsApp {
     /// override it to bring the newly-focused row into view. See
     /// `compute_scroll_offset_for_focus`.
     library_scroll_offset: f32,
+    show_duplicate_review: bool,
+    duplicate_filters: DuplicateReviewFilters,
+    duplicate_sort_field: DuplicateSortField,
+    duplicate_sort_ascending: bool,
+    selected_duplicate_group: Option<DuplicateGroupIdentity>,
+    selected_duplicate_archive: Option<PathBuf>,
 }
 
 impl ArchiveFsApp {
@@ -1515,6 +1580,12 @@ impl ArchiveFsApp {
             sort_field: None,
             sort_ascending: true,
             library_scroll_offset: 0.0,
+            show_duplicate_review: false,
+            duplicate_filters: DuplicateReviewFilters::initial(),
+            duplicate_sort_field: DuplicateSortField::Title,
+            duplicate_sort_ascending: true,
+            selected_duplicate_group: None,
+            selected_duplicate_archive: None,
         }
     }
 
@@ -1734,6 +1805,16 @@ impl ArchiveFsApp {
                 DatabaseState::Error { message, previous }
             }
         };
+
+        let duplicate_report = self
+            .database_state
+            .snapshot()
+            .map(|snapshot| snapshot.duplicate_report.clone());
+        prune_duplicate_review_selection(
+            &mut self.selected_duplicate_group,
+            &mut self.selected_duplicate_archive,
+            duplicate_report.as_ref(),
+        );
 
         // The merged row set may have just changed (a cache reload/scan
         // just settled) - recompute the cached filtered-index list against
@@ -3268,6 +3349,21 @@ impl eframe::App for ArchiveFsApp {
                     {
                         self.refresh(context);
                     }
+                    let duplicate_label = if self.show_duplicate_review {
+                        "Back to Library"
+                    } else {
+                        "Duplicate Review"
+                    };
+                    if ui
+                        .add_enabled(
+                            self.database_state.snapshot().is_some(),
+                            egui::Button::new(duplicate_label),
+                        )
+                        .clicked()
+                    {
+                        self.show_duplicate_review = !self.show_duplicate_review;
+                        self.show_diagnostics = false;
+                    }
                     if loading || busy {
                         ui.spinner();
                     }
@@ -3333,6 +3429,23 @@ impl eframe::App for ArchiveFsApp {
                 self.start_alias_action(context.clone(), action);
             }
             ui.separator();
+
+            if self.show_duplicate_review
+                && let Some(snapshot) = self.database_state.snapshot()
+            {
+                if show_duplicate_review_panel(
+                    ui,
+                    &snapshot.duplicate_report,
+                    &mut self.duplicate_filters,
+                    &mut self.duplicate_sort_field,
+                    &mut self.duplicate_sort_ascending,
+                    &mut self.selected_duplicate_group,
+                    &mut self.selected_duplicate_archive,
+                ) {
+                    self.show_duplicate_review = false;
+                }
+                return;
+            }
 
             match &self.state {
                 LoadState::Loading { .. } => {
@@ -4682,6 +4795,371 @@ fn resolved_new_alias_action(alias: &str, platform_choice: Option<&str>) -> Opti
     })
 }
 
+fn duplicate_visible_entries(
+    group: &CatalogueDuplicateGroup,
+    include_missing: bool,
+) -> Vec<&CatalogueDuplicateArchive> {
+    group
+        .entries
+        .iter()
+        .filter(|entry| include_missing || entry.present)
+        .collect()
+}
+
+fn duplicate_group_matches(
+    group: &CatalogueDuplicateGroup,
+    filters: &DuplicateReviewFilters,
+) -> bool {
+    if filters
+        .platform
+        .as_deref()
+        .is_some_and(|platform| platform != group.platform)
+    {
+        return false;
+    }
+    let entries = duplicate_visible_entries(group, filters.include_missing);
+    if entries.len() < 2 || (filters.more_than_two && entries.len() <= 2) {
+        return false;
+    }
+    let search = filters.search.trim().to_lowercase();
+    search.is_empty()
+        || group.title.to_lowercase().contains(&search)
+        || group.normalized_title.contains(&search)
+        || entries.iter().any(|entry| {
+            entry
+                .path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&search)
+        })
+}
+
+fn visible_duplicate_group_indices(
+    report: &CatalogueDuplicateReport,
+    filters: &DuplicateReviewFilters,
+    sort_field: DuplicateSortField,
+    ascending: bool,
+) -> Vec<usize> {
+    let mut indices = report
+        .groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, group)| duplicate_group_matches(group, filters).then_some(index))
+        .collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        let left_group = &report.groups[*left];
+        let right_group = &report.groups[*right];
+        let left_entries = duplicate_visible_entries(left_group, filters.include_missing);
+        let right_entries = duplicate_visible_entries(right_group, filters.include_missing);
+        let ordering = match sort_field {
+            DuplicateSortField::Title => left_group
+                .normalized_title
+                .cmp(&right_group.normalized_title),
+            DuplicateSortField::Platform => left_group.platform.cmp(&right_group.platform),
+            DuplicateSortField::Entries => left_entries.len().cmp(&right_entries.len()),
+            DuplicateSortField::KnownSize => {
+                visible_known_size(&left_entries).cmp(&visible_known_size(&right_entries))
+            }
+        }
+        .then_with(|| {
+            left_group
+                .normalized_title
+                .cmp(&right_group.normalized_title)
+        })
+        .then_with(|| left_group.platform.cmp(&right_group.platform));
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+    indices
+}
+
+fn visible_known_size(entries: &[&CatalogueDuplicateArchive]) -> u128 {
+    entries
+        .iter()
+        .filter_map(|entry| entry.size_bytes)
+        .map(u128::from)
+        .sum()
+}
+
+fn prune_duplicate_review_selection(
+    selected_group: &mut Option<DuplicateGroupIdentity>,
+    selected_archive: &mut Option<PathBuf>,
+    report: Option<&CatalogueDuplicateReport>,
+) {
+    let selected_group_still_exists = selected_group.as_ref().is_some_and(|selected| {
+        report.is_some_and(|report| {
+            report
+                .groups
+                .iter()
+                .any(|group| DuplicateGroupIdentity::from(group) == *selected)
+        })
+    });
+    if !selected_group_still_exists {
+        *selected_group = None;
+        *selected_archive = None;
+        return;
+    }
+    let selected_archive_still_exists = selected_archive.as_ref().is_none_or(|path| {
+        report.is_some_and(|report| {
+            report.groups.iter().any(|group| {
+                selected_group.as_ref() == Some(&DuplicateGroupIdentity::from(group))
+                    && group.entries.iter().any(|entry| entry.path == *path)
+            })
+        })
+    });
+    if !selected_archive_still_exists {
+        *selected_archive = None;
+    }
+}
+
+fn show_duplicate_review_panel(
+    ui: &mut egui::Ui,
+    report: &CatalogueDuplicateReport,
+    filters: &mut DuplicateReviewFilters,
+    sort_field: &mut DuplicateSortField,
+    sort_ascending: &mut bool,
+    selected_group: &mut Option<DuplicateGroupIdentity>,
+    selected_archive: &mut Option<PathBuf>,
+) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.heading("Duplicate Review");
+        ui.label("Review only — ArchiveFS will not change archive files here.");
+        if ui.button("Back to Library").clicked() {
+            close = true;
+        }
+    });
+    ui.label("Groups are likely duplicates, not claims that files are byte-identical.");
+    ui.add_space(6.0);
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Search title or exact path:");
+        ui.add(
+            egui::TextEdit::singleline(&mut filters.search)
+                .id_salt("archivefs_duplicate_search")
+                .desired_width(260.0),
+        );
+        ui.checkbox(&mut filters.include_missing, "Include missing entries");
+        ui.checkbox(&mut filters.more_than_two, "More than two entries");
+    });
+
+    let mut platforms = report
+        .groups
+        .iter()
+        .map(|group| group.platform.as_str())
+        .collect::<Vec<_>>();
+    platforms.sort_unstable();
+    platforms.dedup();
+    ui.horizontal(|ui| {
+        ui.label("Platform:");
+        egui::ComboBox::from_id_salt("duplicate_platform_filter")
+            .selected_text(filters.platform.as_deref().unwrap_or("All platforms"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filters.platform, None, "All platforms");
+                for platform in platforms {
+                    ui.selectable_value(
+                        &mut filters.platform,
+                        Some(platform.to_string()),
+                        platform,
+                    );
+                }
+            });
+        ui.label("Sort by:");
+        egui::ComboBox::from_id_salt("duplicate_sort")
+            .selected_text(sort_field.to_string())
+            .show_ui(ui, |ui| {
+                for field in [
+                    DuplicateSortField::Title,
+                    DuplicateSortField::Platform,
+                    DuplicateSortField::Entries,
+                    DuplicateSortField::KnownSize,
+                ] {
+                    ui.selectable_value(sort_field, field, field.to_string());
+                }
+            });
+        ui.checkbox(sort_ascending, "Ascending");
+    });
+
+    let visible = visible_duplicate_group_indices(report, filters, *sort_field, *sort_ascending);
+    let visible_entry_count = visible
+        .iter()
+        .map(|index| {
+            duplicate_visible_entries(&report.groups[*index], filters.include_missing).len()
+        })
+        .sum::<usize>();
+    ui.horizontal_wrapped(|ui| {
+        summary_value(ui, "Duplicate groups", visible.len());
+        summary_value(ui, "Archive entries involved", visible_entry_count);
+        if !filters.include_missing {
+            ui.label("Present entries only");
+        }
+    });
+    ui.separator();
+
+    if visible.is_empty() {
+        ui.label("No likely duplicate groups match the current review filters.");
+        return close;
+    }
+
+    ui.strong("Likely duplicate groups");
+    egui::ScrollArea::vertical()
+        .id_salt("duplicate_group_list")
+        .max_height(180.0)
+        .show(ui, |ui| {
+            for index in &visible {
+                let group = &report.groups[*index];
+                let identity = DuplicateGroupIdentity::from(group);
+                let entry_count = duplicate_visible_entries(group, filters.include_missing).len();
+                let selected = selected_group.as_ref() == Some(&identity);
+                if ui
+                    .selectable_label(
+                        selected,
+                        format!(
+                            "{} — {} — {} entries",
+                            group.title, group.platform, entry_count
+                        ),
+                    )
+                    .clicked()
+                {
+                    *selected_group = Some(identity);
+                    *selected_archive = None;
+                }
+            }
+        });
+
+    let Some(group) = selected_group.as_ref().and_then(|selected| {
+        visible
+            .iter()
+            .map(|index| &report.groups[*index])
+            .find(|group| DuplicateGroupIdentity::from(*group) == *selected)
+    }) else {
+        ui.label("Select a likely duplicate group to inspect every archive in it.");
+        return close;
+    };
+    let entries = duplicate_visible_entries(group, filters.include_missing);
+    if entries.len() < 2 {
+        ui.label("The selected group is hidden by the current entry filters.");
+        return close;
+    }
+
+    ui.separator();
+    ui.strong("Likely duplicate group");
+    egui::Grid::new("duplicate_group_details")
+        .num_columns(2)
+        .show(ui, |ui| {
+            detail_row(ui, "Title", &group.title);
+            detail_row(ui, "Platform", &group.platform);
+            detail_row(ui, "Entries", &entries.len().to_string());
+            detail_row(ui, "Method", "Filename and platform");
+            detail_row(ui, "Reason", &group.reason);
+            let known_count = entries
+                .iter()
+                .filter(|entry| entry.size_bytes.is_some())
+                .count();
+            detail_row(
+                ui,
+                "Total known size",
+                &format!(
+                    "{} ({} of {} entries known)",
+                    format_known_size(visible_known_size(&entries)),
+                    known_count,
+                    entries.len()
+                ),
+            );
+        });
+
+    ui.add_space(4.0);
+    for entry in entries {
+        let is_selected = selected_archive.as_ref() == Some(&entry.path);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if ui
+                .selectable_label(is_selected, entry.path.display().to_string())
+                .on_hover_text(entry.path.display().to_string())
+                .clicked()
+            {
+                *selected_archive = Some(entry.path.clone());
+            }
+            let state = if entry.present { "Present" } else { "Missing" };
+            let color = if entry.present {
+                ui.visuals().text_color()
+            } else {
+                ui.visuals().warn_fg_color
+            };
+            ui.colored_label(color, state);
+            ui.label(format!("Size: {}", format_duplicate_size(entry.size_bytes)));
+            ui.label(format!(
+                "Modified time: {}",
+                format_modified_time(entry.modified_time_unix_seconds)
+            ));
+        });
+    }
+
+    if let Some(path) = selected_archive.as_ref()
+        && let Some(entry) = group.entries.iter().find(|entry| entry.path == *path)
+    {
+        ui.separator();
+        ui.strong("Selected duplicate archive");
+        egui::Grid::new("selected_duplicate_archive_details")
+            .num_columns(2)
+            .show(ui, |ui| {
+                detail_row(ui, "Exact archive path", &entry.path.display().to_string());
+                detail_row(ui, "Platform", &group.platform);
+                detail_row(
+                    ui,
+                    "State",
+                    if entry.present { "Present" } else { "Missing" },
+                );
+                detail_row(ui, "Size", &format_duplicate_size(entry.size_bytes));
+                detail_row(
+                    ui,
+                    "Modified time",
+                    &format_modified_time(entry.modified_time_unix_seconds),
+                );
+            });
+    }
+    close
+}
+
+fn format_known_size(size_bytes: u128) -> String {
+    format_byte_count(size_bytes)
+}
+
+fn format_duplicate_size(size_bytes: Option<u64>) -> String {
+    size_bytes
+        .map(|size| format_byte_count(u128::from(size)))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn format_byte_count(size_bytes: u128) -> String {
+    const KIB: u128 = 1024;
+    const MIB: u128 = KIB * 1024;
+    const GIB: u128 = MIB * 1024;
+    const TIB: u128 = GIB * 1024;
+    let (unit_size, unit_name) = if size_bytes >= TIB {
+        (TIB, "TiB")
+    } else if size_bytes >= GIB {
+        (GIB, "GiB")
+    } else if size_bytes >= MIB {
+        (MIB, "MiB")
+    } else if size_bytes >= KIB {
+        (KIB, "KiB")
+    } else {
+        return format!("{size_bytes} bytes");
+    };
+    let whole = size_bytes / unit_size;
+    let tenth = (size_bytes % unit_size) * 10 / unit_size;
+    format!("{whole}.{tenth} {unit_name} ({size_bytes} bytes)")
+}
+
+fn format_modified_time(seconds: Option<i64>) -> String {
+    seconds
+        .map(format_unix_timestamp_utc)
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
 struct LoadedViewState<'a> {
     filter: &'a mut String,
     filtered_rows: &'a mut Option<Vec<usize>>,
@@ -5379,18 +5857,7 @@ fn show_loaded_data(
     }
     let visible_count = visible_indices.len();
 
-    ui.horizontal(|ui| {
-        ui.label(format!(
-            "Showing {} of {} archives",
-            visible_count,
-            merged_rows.len()
-        ));
-        ui.separator();
-        // Milestone requirement 3: always visible, unlike the bulk action
-        // bar (2+ selections only) - a single selection is otherwise only
-        // shown via the selected row's background colour.
-        ui.label(selection_status_text(selected_archives.len()));
-    });
+    show_selection_controls_row(ui, &merged_rows, &visible_indices, selected_archives);
     ui.add_space(4.0);
 
     // Milestone requirement 1: Escape / Ctrl+A / arrow-key navigation.
@@ -5814,6 +6281,15 @@ fn bulk_action_bar_visible(selected_archives: &HashSet<PathBuf>) -> bool {
     selected_archives.len() > 1
 }
 
+/// Whether "Select all visible" should be enabled - requirement 6:
+/// disabled whenever the current search/filters leave zero library rows
+/// visible. Factored out as its own pure predicate (mirroring
+/// `mount_all_available`/`bulk_action_bar_visible`) so it is directly
+/// testable without an `egui::Ui`.
+fn select_all_visible_button_enabled(visible_count: usize) -> bool {
+    visible_count > 0
+}
+
 /// A compact, always-visible summary of the multi-selection's size -
 /// milestone requirement 3. Shown unconditionally, unlike
 /// `show_bulk_platform_action_bar` (2+ rows only), so a single selected
@@ -5825,6 +6301,54 @@ fn selection_status_text(selected_count: usize) -> String {
         1 => "1 archive selected".to_string(),
         n => format!("{n} archives selected"),
     }
+}
+
+/// Renders the "Showing X of Y archives" / selection-status / "Select all
+/// visible" row - the ordinary-library selection controls that sit above
+/// the table, next to the always-visible `selection_status_text` label
+/// (see that function's doc comment) and near the bulk action bar's
+/// "Clear selected"/"Clear selection" (`show_bulk_platform_action_bar`).
+/// Factored out from `show_loaded_data` (mirroring
+/// `show_bulk_platform_action_bar`) so it can be rendered and click-tested
+/// standalone.
+///
+/// v0.4.2-alpha follow-up requirement: "Select all visible" is a
+/// mouse-only equivalent of Ctrl+A. It calls `select_all_visible` with
+/// this same frame's own `merged_rows`/`visible_indices` - the exact same
+/// helper and inputs the Ctrl+A handler in `show_loaded_data` dispatches
+/// to - so there is no second selection implementation to drift out of
+/// sync with search/filters/sort. Disabled whenever zero rows are
+/// currently visible; clicking it while every visible row is already
+/// selected is a no-op rebuild of the identical `HashSet`.
+fn show_selection_controls_row(
+    ui: &mut egui::Ui,
+    merged_rows: &[ArchiveRow],
+    visible_indices: &[usize],
+    selected_archives: &mut HashSet<PathBuf>,
+) {
+    let visible_count = visible_indices.len();
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "Showing {} of {} archives",
+            visible_count,
+            merged_rows.len()
+        ));
+        ui.separator();
+        // Milestone requirement 3: always visible, unlike the bulk action
+        // bar (2+ selections only) - a single selection is otherwise only
+        // shown via the selected row's background colour.
+        ui.label(selection_status_text(selected_archives.len()));
+        ui.separator();
+        if ui
+            .add_enabled(
+                select_all_visible_button_enabled(visible_count),
+                egui::Button::new("Select all visible"),
+            )
+            .clicked()
+        {
+            *selected_archives = select_all_visible(merged_rows, visible_indices);
+        }
+    });
 }
 
 const EMPTY_LIBRARY_MESSAGE: &str =
@@ -6702,6 +7226,12 @@ mod tests {
             sort_field: None,
             sort_ascending: true,
             library_scroll_offset: 0.0,
+            show_duplicate_review: false,
+            duplicate_filters: DuplicateReviewFilters::initial(),
+            duplicate_sort_field: DuplicateSortField::Title,
+            duplicate_sort_ascending: true,
+            selected_duplicate_group: None,
+            selected_duplicate_archive: None,
         }
     }
 
@@ -6937,6 +7467,7 @@ mod tests {
                 )
             })
             .collect();
+        let duplicate_report = catalogue_filename_duplicates(&archives);
         CachedLibrarySnapshot {
             database_path: PathBuf::from("/config/library.sqlite3"),
             schema_version: latest_schema_version(),
@@ -6945,7 +7476,300 @@ mod tests {
             stats: empty_catalogue_stats(),
             last_completed_scan: None,
             platform_aliases: Vec::new(),
+            duplicate_report,
         }
+    }
+
+    fn duplicate_catalogue_for_gui() -> Vec<PersistedArchive> {
+        let mut first = persisted_archive_with_platform(
+            PathBuf::from("/roms/a/Sonic the Hedgehog.zip"),
+            1,
+            "Mega Drive",
+            "heuristic-path-detector",
+        );
+        first.display_name = "Sonic the Hedgehog".to_string();
+        let mut second = persisted_archive_with_platform(
+            PathBuf::from("/backup/Sonic the Hedgehog.7z"),
+            2,
+            "Mega Drive",
+            "heuristic-path-detector",
+        );
+        second.display_name = "Sonic the Hedgehog".to_string();
+        second.size_bytes = Some(2048);
+        second.last_verified_missing_at = Some("2026-02-01T00:00:00Z".to_string());
+        let mut third = persisted_archive_with_platform(
+            PathBuf::from("/roms/a/Another Game.zip"),
+            3,
+            "SNES",
+            "heuristic-path-detector",
+        );
+        third.display_name = "Another Game".to_string();
+        let mut fourth = persisted_archive_with_platform(
+            PathBuf::from("/backup/Another_Game.7z"),
+            4,
+            "SNES",
+            "heuristic-path-detector",
+        );
+        fourth.display_name = "Another Game".to_string();
+        vec![first, second, third, fourth]
+    }
+
+    #[test]
+    fn duplicate_review_filters_count_groups_entries_and_exact_paths() {
+        let report = catalogue_filename_duplicates(&duplicate_catalogue_for_gui());
+        let mut filters = DuplicateReviewFilters::initial();
+
+        let all =
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Title, true);
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter()
+                .map(|index| report.groups[*index].entries.len())
+                .sum::<usize>(),
+            4
+        );
+        assert!(report.groups.iter().any(|group| {
+            group
+                .entries
+                .iter()
+                .any(|entry| entry.path == Path::new("/backup/Sonic the Hedgehog.7z"))
+        }));
+
+        filters.search = "/backup/sonic".to_string();
+        let searched =
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Title, true);
+        assert_eq!(searched.len(), 1);
+        assert_eq!(report.groups[searched[0]].platform, "Mega Drive");
+
+        filters.search.clear();
+        filters.platform = Some("SNES".to_string());
+        assert_eq!(
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Title, true)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_review_include_missing_and_more_than_two_filters_are_truthful() {
+        let mut archives = duplicate_catalogue_for_gui();
+        let mut third_sonic = persisted_archive_with_platform(
+            PathBuf::from("/old/Sonic the Hedgehog.rar"),
+            5,
+            "Mega Drive",
+            "heuristic-path-detector",
+        );
+        third_sonic.last_verified_missing_at = Some("2026-02-02T00:00:00Z".to_string());
+        archives.push(third_sonic);
+        let report = catalogue_filename_duplicates(&archives);
+        let mut filters = DuplicateReviewFilters::initial();
+        filters.more_than_two = true;
+        assert_eq!(
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Entries, true)
+                .len(),
+            1
+        );
+
+        filters.include_missing = false;
+        assert!(
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Entries, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_review_sorting_is_deterministic_with_stable_tiebreakers() {
+        let report = catalogue_filename_duplicates(&duplicate_catalogue_for_gui());
+        let filters = DuplicateReviewFilters::initial();
+        let first =
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Entries, true);
+        let second =
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Entries, true);
+        assert_eq!(first, second);
+        assert_eq!(report.groups[first[0]].normalized_title, "another_game");
+        let descending =
+            visible_duplicate_group_indices(&report, &filters, DuplicateSortField::Title, false);
+        assert_eq!(
+            report.groups[descending[0]].normalized_title,
+            "sonic_the_hedgehog"
+        );
+    }
+
+    #[test]
+    fn duplicate_review_state_is_separate_from_library_state_and_activity() {
+        let mut app = app_for_operation_tests();
+        app.filter = "ordinary search".to_string();
+        app.library_filters.missing = true;
+        app.sort_field = Some(SortField::State);
+        app.selected_archive = Some(PathBuf::from("/roms/library.zip"));
+        let history_len = app.history.entries.len();
+
+        app.show_duplicate_review = true;
+        app.duplicate_filters.search = "sonic".to_string();
+        app.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
+        app.show_duplicate_review = false;
+
+        assert_eq!(app.filter, "ordinary search");
+        assert!(app.library_filters.missing);
+        assert_eq!(app.sort_field, Some(SortField::State));
+        assert_eq!(
+            app.selected_archive,
+            Some(PathBuf::from("/roms/library.zip"))
+        );
+        assert_eq!(app.history.entries.len(), history_len);
+    }
+
+    #[test]
+    fn duplicate_cache_rebuilds_after_platform_change_and_catalogue_cleanup() {
+        let archives = duplicate_catalogue_for_gui();
+        let original = cached_snapshot(archives.clone());
+        assert_eq!(original.duplicate_report.groups.len(), 2);
+
+        let mut platform_changed = archives.clone();
+        platform_changed[1].platform = Some("Master System".to_string());
+        let regrouped = cached_snapshot(platform_changed);
+        assert_eq!(regrouped.duplicate_report.groups.len(), 1);
+
+        let cleaned = cached_snapshot(archives.into_iter().skip(1).collect());
+        assert_eq!(cleaned.duplicate_report.groups.len(), 1);
+        assert!(
+            cleaned
+                .duplicate_report
+                .groups
+                .iter()
+                .all(|group| group.normalized_title != "sonic_the_hedgehog")
+        );
+    }
+
+    #[test]
+    fn duplicate_refresh_prunes_only_vanished_duplicate_selections() {
+        let report = catalogue_filename_duplicates(&duplicate_catalogue_for_gui());
+        let sonic = report
+            .groups
+            .iter()
+            .find(|group| group.normalized_title == "sonic_the_hedgehog")
+            .unwrap();
+        let mut selected_group = Some(DuplicateGroupIdentity::from(sonic));
+        let mut selected_archive = Some(sonic.entries[0].path.clone());
+        let remaining = CatalogueDuplicateReport {
+            groups: report
+                .groups
+                .into_iter()
+                .filter(|group| group.normalized_title != "sonic_the_hedgehog")
+                .collect(),
+            archives_in_groups: 2,
+        };
+
+        prune_duplicate_review_selection(
+            &mut selected_group,
+            &mut selected_archive,
+            Some(&remaining),
+        );
+
+        assert!(selected_group.is_none());
+        assert!(selected_archive.is_none());
+    }
+
+    #[test]
+    fn duplicate_display_wording_is_review_only_and_metadata_is_explicit() {
+        let report = catalogue_filename_duplicates(&duplicate_catalogue_for_gui());
+        let group = report
+            .groups
+            .iter()
+            .find(|group| group.platform == "Mega Drive")
+            .unwrap();
+        assert_eq!(group.reason, "Matching normalized filename and platform");
+        assert!(
+            group
+                .entries
+                .iter()
+                .map(|entry| format_duplicate_size(entry.size_bytes))
+                .any(|size| size == "1.0 KiB (1024 bytes)")
+        );
+        assert_eq!(format_duplicate_size(None), "Unknown");
+        assert_eq!(format_modified_time(None), "Unknown");
+        assert_eq!(format_modified_time(Some(0)), "1970-01-01T00:00:00Z");
+        assert!(group.entries.iter().any(|entry| entry.present));
+        assert!(group.entries.iter().any(|entry| !entry.present));
+    }
+
+    #[test]
+    fn real_duplicate_review_renders_paths_states_details_and_no_deletion_controls() {
+        fn collect_text(shape: &egui::Shape, output: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    output.push_str(&text.galley.job.text);
+                    output.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let report = catalogue_filename_duplicates(&duplicate_catalogue_for_gui());
+        let group = report
+            .groups
+            .iter()
+            .find(|group| group.platform == "Mega Drive")
+            .unwrap();
+        let mut filters = DuplicateReviewFilters::initial();
+        filters.platform = Some("Mega Drive".to_string());
+        let mut sort_field = DuplicateSortField::Title;
+        let mut ascending = true;
+        let mut selected_group = Some(DuplicateGroupIdentity::from(group));
+        let mut selected_archive = Some(group.entries[0].path.clone());
+        let context = egui::Context::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 1400.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ = show_duplicate_review_panel(
+                        ui,
+                        &report,
+                        &mut filters,
+                        &mut sort_field,
+                        &mut ascending,
+                        &mut selected_group,
+                        &mut selected_archive,
+                    );
+                });
+            },
+        );
+        let mut painted_text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut painted_text);
+        }
+
+        for expected in [
+            "Duplicate Review",
+            "Likely duplicate group",
+            "Filename and platform",
+            "Matching normalized filename and platform",
+            "/backup/Sonic the Hedgehog.7z",
+            "/roms/a/Sonic the Hedgehog.zip",
+            "Present",
+            "Missing",
+            "Mega Drive",
+            "Selected duplicate archive",
+            "Exact archive path",
+        ] {
+            assert!(
+                painted_text.contains(expected),
+                "expected rendered duplicate-review text {expected:?}, got:\n{painted_text}"
+            );
+        }
+        assert!(!painted_text.contains("Remove Missing Entries"));
+        assert!(!painted_text.contains("Delete"));
     }
 
     fn provenance_line_map(details: &PlatformProvenanceDetails) -> HashMap<&'static str, String> {
@@ -10923,6 +11747,403 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>(),
             "Ctrl+A must select exactly the visible rows, never the filtered-out one"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.4.2-alpha follow-up: explicit "Select all visible" button.
+    // -----------------------------------------------------------------
+
+    fn row_with_fields_and_origin(path: &str, origin: RowOrigin) -> ArchiveRow {
+        let mut row = row_with_fields(path, "SNES", "state", path, path);
+        row.origin = origin;
+        row
+    }
+
+    #[test]
+    fn select_all_visible_button_enabled_requires_at_least_one_visible_row() {
+        assert!(!select_all_visible_button_enabled(0));
+        assert!(select_all_visible_button_enabled(1));
+        assert!(select_all_visible_button_enabled(3));
+    }
+
+    #[test]
+    fn select_all_visible_button_click_selects_all_currently_visible_rows() {
+        let ctx = egui::Context::default();
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+            row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+        ];
+        let visible_indices = vec![0usize, 1usize, 2usize];
+        let selected_archives = std::cell::RefCell::new(HashSet::<PathBuf>::new());
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            ui.scope(|ui| {
+                show_selection_controls_row(ui, &merged_rows, &visible_indices, &mut selected);
+            })
+            .response
+        };
+
+        // Measurement pass: locate the rendered row's bounding rect via the
+        // real production function, before attempting to click it.
+        let mut row_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row_rect = Some(render(ui).rect);
+            });
+        });
+        let row_rect = row_rect.unwrap();
+        assert!(
+            selected_archives.borrow().is_empty(),
+            "the measurement pass must not itself change the selection"
+        );
+
+        // "Select all visible" is the rightmost control in this row.
+        let click_pos = egui::pos2(row_rect.right() - 15.0, row_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert_eq!(
+            *selected_archives.borrow(),
+            [
+                PathBuf::from("/roms/a.zip"),
+                PathBuf::from("/roms/b.zip"),
+                PathBuf::from("/roms/c.zip"),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            "clicking Select all visible must select every currently visible row"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_button_click_never_selects_hidden_filtered_rows() {
+        let ctx = egui::Context::default();
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+            row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+        ];
+        // Row 1 (b.zip) is filtered out - only positions 0 and 2 are
+        // currently visible.
+        let visible_indices = vec![0usize, 2usize];
+        // b.zip was selected before the filter hid it (e.g. a leftover
+        // selection from before the current search) - the button must
+        // drop it, not merely fail to add it.
+        let selected_archives = std::cell::RefCell::new(
+            [PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect::<HashSet<PathBuf>>(),
+        );
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            ui.scope(|ui| {
+                show_selection_controls_row(ui, &merged_rows, &visible_indices, &mut selected);
+            })
+            .response
+        };
+
+        let mut row_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row_rect = Some(render(ui).rect);
+            });
+        });
+        let row_rect = row_rect.unwrap();
+
+        let click_pos = egui::pos2(row_rect.right() - 15.0, row_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert_eq!(
+            *selected_archives.borrow(),
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "hidden b.zip must never end up selected, even though it was selected before \
+             the current filter hid it"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_button_click_selects_only_search_filtered_rows() {
+        let merged_rows = vec![
+            row_with_fields("/roms/alpha.zip", "SNES", "Live", "alpha.zip", "/mnt/a"),
+            row_with_fields("/roms/bravo.zip", "GBA", "Live", "bravo.zip", "/mnt/b"),
+            row_with_fields("/roms/charlie.zip", "SNES", "Live", "charlie.zip", "/mnt/c"),
+        ];
+        // Mirrors the exact state right after a real search-filter frame
+        // (see `real_ctrl_a_selects_only_the_currently_visible_filtered_rows`):
+        // only positions 0 and 2 currently pass the search text, computed
+        // the same way `show_loaded_data` derives `visible_indices` from
+        // `filtered_rows` when no checkbox filter is active.
+        let filtered_rows: Option<Vec<usize>> = Some(vec![0usize, 2usize]);
+        let library_filters = LibraryRowFilters::default();
+        let base_indices = filtered_rows
+            .clone()
+            .unwrap_or_else(|| (0..merged_rows.len()).collect());
+        let visible_indices: Vec<usize> = if library_filters.is_active() {
+            base_indices
+                .into_iter()
+                .filter(|&index| library_filters.matches(&merged_rows[index]))
+                .collect()
+        } else {
+            base_indices
+        };
+
+        let ctx = egui::Context::default();
+        let selected_archives = std::cell::RefCell::new(HashSet::<PathBuf>::new());
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            ui.scope(|ui| {
+                show_selection_controls_row(ui, &merged_rows, &visible_indices, &mut selected);
+            })
+            .response
+        };
+
+        let mut row_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row_rect = Some(render(ui).rect);
+            });
+        });
+        let row_rect = row_rect.unwrap();
+
+        let click_pos = egui::pos2(row_rect.right() - 15.0, row_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert_eq!(
+            *selected_archives.borrow(),
+            [
+                PathBuf::from("/roms/alpha.zip"),
+                PathBuf::from("/roms/charlie.zip"),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            "only the archives that survive the current search text must be selected"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_button_click_selects_only_missing_only_filtered_rows() {
+        let merged_rows = vec![
+            row_with_fields_and_origin("/roms/present.zip", RowOrigin::Live),
+            row_with_fields_and_origin("/roms/missing-a.zip", RowOrigin::CachedMissing),
+            row_with_fields_and_origin("/roms/missing-b.zip", RowOrigin::CachedMissing),
+        ];
+        // Mirrors `show_loaded_data`'s own `visible_indices` derivation
+        // with the "Missing" checkbox filter active and no search text.
+        let library_filters = LibraryRowFilters {
+            missing: true,
+            ..LibraryRowFilters::default()
+        };
+        let base_indices: Vec<usize> = (0..merged_rows.len()).collect();
+        let visible_indices: Vec<usize> = base_indices
+            .into_iter()
+            .filter(|&index| library_filters.matches(&merged_rows[index]))
+            .collect();
+
+        let ctx = egui::Context::default();
+        let selected_archives = std::cell::RefCell::new(HashSet::<PathBuf>::new());
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            ui.scope(|ui| {
+                show_selection_controls_row(ui, &merged_rows, &visible_indices, &mut selected);
+            })
+            .response
+        };
+
+        let mut row_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row_rect = Some(render(ui).rect);
+            });
+        });
+        let row_rect = row_rect.unwrap();
+
+        let click_pos = egui::pos2(row_rect.right() - 15.0, row_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert_eq!(
+            *selected_archives.borrow(),
+            [
+                PathBuf::from("/roms/missing-a.zip"),
+                PathBuf::from("/roms/missing-b.zip"),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            "with 'Show missing only' active, the present row must never be selected"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_button_click_does_nothing_when_zero_rows_are_visible() {
+        let ctx = egui::Context::default();
+        let merged_rows = vec![row_with_fields(
+            "/roms/a.zip",
+            "SNES",
+            "Live",
+            "a.zip",
+            "/mnt/a",
+        )];
+        // The current search/filters hide every row.
+        let visible_indices: Vec<usize> = Vec::new();
+        let selected_archives = std::cell::RefCell::new(HashSet::<PathBuf>::new());
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            ui.scope(|ui| {
+                show_selection_controls_row(ui, &merged_rows, &visible_indices, &mut selected);
+            })
+            .response
+        };
+
+        let mut row_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row_rect = Some(render(ui).rect);
+            });
+        });
+        let row_rect = row_rect.unwrap();
+
+        let click_pos = egui::pos2(row_rect.right() - 15.0, row_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert!(
+            selected_archives.borrow().is_empty(),
+            "the disabled button must ignore the click when zero rows are visible"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_button_click_is_idempotent_when_already_fully_selected() {
+        let ctx = egui::Context::default();
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+        ];
+        let visible_indices = vec![0usize, 1usize];
+        let already_selected: HashSet<PathBuf> =
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect();
+        let selected_archives = std::cell::RefCell::new(already_selected.clone());
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            let mut selected = selected_archives.borrow_mut();
+            ui.scope(|ui| {
+                show_selection_controls_row(ui, &merged_rows, &visible_indices, &mut selected);
+            })
+            .response
+        };
+
+        let mut row_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row_rect = Some(render(ui).rect);
+            });
+        });
+        let row_rect = row_rect.unwrap();
+
+        let click_pos = egui::pos2(row_rect.right() - 15.0, row_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert_eq!(
+            *selected_archives.borrow(),
+            already_selected,
+            "clicking Select all visible while every visible row is already selected must \
+             leave the selection unchanged"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_a_keyboard_selection_is_unchanged_by_the_selection_controls_refactor() {
+        // Guards against the "Select all visible" button's introduction -
+        // and the resulting factoring of the selection-controls row into
+        // `show_selection_controls_row` - having disturbed Ctrl+A, which
+        // dispatches to the exact same `select_all_visible` helper from
+        // `show_loaded_data` directly (see `real_ctrl_a_selects_only_the_currently_visible_filtered_rows`
+        // for the original coverage this mirrors).
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "alpha.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "GBA", "Live", "bravo.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "SNES", "Live", "charlie.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.filtered_rows = Some(vec![0usize, 2usize]);
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::A, egui::Modifiers::CTRL),
+        );
+
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+                .into_iter()
+                .collect(),
+            "Ctrl+A must still select exactly the visible rows after adding the button"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_button_click_never_touches_duplicate_review_selection() {
+        let mut app = app_for_operation_tests();
+        // Duplicate Review's own independent selection.
+        app.selected_duplicate_group = Some(DuplicateGroupIdentity {
+            normalized_title: "sonic_the_hedgehog".to_string(),
+            platform: "Genesis".to_string(),
+        });
+        app.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
+
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+        ];
+        let visible_indices = vec![0usize, 1usize];
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_selection_controls_row(
+                    ui,
+                    &merged_rows,
+                    &visible_indices,
+                    &mut app.selected_archives,
+                );
+            });
+        });
+        // A direct call proves the button's own code path, not just its
+        // rendering, is exercised - `show_selection_controls_row` only
+        // ever receives `&mut app.selected_archives`, never the duplicate
+        // fields, so it is structurally unable to touch them.
+        app.selected_archives = select_all_visible(&merged_rows, &visible_indices);
+
+        assert_eq!(
+            app.selected_archives,
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect(),
+            "the ordinary-library selection must still update normally"
+        );
+        assert_eq!(
+            app.selected_duplicate_group,
+            Some(DuplicateGroupIdentity {
+                normalized_title: "sonic_the_hedgehog".to_string(),
+                platform: "Genesis".to_string(),
+            }),
+            "Duplicate Review's selected group must remain untouched"
+        );
+        assert_eq!(
+            app.selected_duplicate_archive,
+            Some(PathBuf::from("/backup/Sonic.7z")),
+            "Duplicate Review's selected archive must remain untouched"
         );
     }
 
