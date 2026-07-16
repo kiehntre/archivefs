@@ -2697,6 +2697,25 @@ mod tests {
         assert_eq!(json["archives_new"], 1);
         assert_eq!(json["source_folders_succeeded"], 1);
         assert_eq!(json["folder_errors"].as_array().unwrap().len(), 0);
+        let object = json.as_object().unwrap();
+        for field in [
+            "scan_run_id",
+            "source_folders_attempted",
+            "source_folders_succeeded",
+            "source_folders_failed",
+            "archives_new",
+            "archives_changed",
+            "archives_restored",
+            "archives_unchanged",
+            "archives_missing",
+            "folder_errors",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "existing JSON field {field} must remain"
+            );
+        }
+        assert_eq!(object.len(), 10, "scan JSON compatibility surface changed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

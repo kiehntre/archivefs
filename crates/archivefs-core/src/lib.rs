@@ -17,12 +17,12 @@ use sha2::{Digest, Sha256};
 
 mod database;
 pub use database::{
-    ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, BulkPlatformAssignmentResult,
-    CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary, Database, DatabaseHealth,
-    MANUAL_PLATFORM_SOURCE, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
-    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, check_database_health,
-    default_database_path, latest_schema_version, persisted_archive_has_unknown_platform,
-    scan_and_persist,
+    ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
+    BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
+    Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, PlatformProvenanceDetails, RegisteredSourceFolder,
+    ScanPersistSummary, ScanRunCounts, check_database_health, default_database_path,
+    latest_schema_version, persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 #[derive(Debug)]
@@ -2611,6 +2611,17 @@ pub struct PlatformDetection {
     pub provenance: PlatformProvenance,
 }
 
+/// A platform detection plus the human-meaningful folder component that
+/// supplied a built-in alias match. Heuristic detections intentionally have
+/// no matched folder: their evidence may come from a filename, title, or path
+/// segment and should not be presented as a folder-alias match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedPlatformDetection {
+    pub platform: String,
+    pub provenance: PlatformProvenance,
+    pub matched_folder: Option<String>,
+}
+
 /// Detects a platform for `path` (an archive discovered under
 /// `source_root`), discarding provenance - the stable public entry point
 /// every existing caller (`ArchiveIdentity::from_path`,
@@ -2638,20 +2649,38 @@ pub fn detect_platform_with_provenance(
     path: impl AsRef<Path>,
     source_root: impl AsRef<Path>,
 ) -> Option<PlatformDetection> {
+    detect_platform_with_details(path, source_root).map(|detection| PlatformDetection {
+        platform: detection.platform,
+        provenance: detection.provenance,
+    })
+}
+
+/// Detects a platform with enough detail for a human-readable provenance
+/// explanation. This preserves [`detect_platform_with_provenance`]'s exact
+/// precedence and result while retaining the matched folder text for its
+/// built-in-alias fallback.
+pub fn detect_platform_with_details(
+    path: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+) -> Option<DetailedPlatformDetection> {
     let path = path.as_ref();
     let source_root = source_root.as_ref();
 
     if let Some(platform) = detect_platform_from_known_heuristics(path, source_root) {
-        return Some(PlatformDetection {
+        return Some(DetailedPlatformDetection {
             platform,
             provenance: PlatformProvenance::Heuristic,
+            matched_folder: None,
         });
     }
 
-    detect_platform_from_folder_alias(path, source_root).map(|platform| PlatformDetection {
-        platform: platform.to_string(),
-        provenance: PlatformProvenance::FolderAlias,
-    })
+    detect_platform_from_folder_alias_with_match(path, source_root).map(
+        |(platform, matched_folder)| DetailedPlatformDetection {
+            platform: platform.to_string(),
+            provenance: PlatformProvenance::FolderAlias,
+            matched_folder: Some(matched_folder),
+        },
+    )
 }
 
 /// The original `detect_platform` heuristic, unchanged: a small set of
@@ -2839,15 +2868,19 @@ fn folder_platform_alias(segment: &str) -> Option<&'static str> {
 /// is a best-effort display guess, not an identity or reconciliation key,
 /// so a lossy conversion on a non-UTF-8 path component is safe and simply
 /// yields no match rather than panicking.
-fn detect_platform_from_folder_alias(path: &Path, source_root: &Path) -> Option<&'static str> {
+fn detect_platform_from_folder_alias_with_match(
+    path: &Path,
+    source_root: &Path,
+) -> Option<(&'static str, String)> {
     let relative = path.strip_prefix(source_root).ok()?;
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components
-        .iter()
-        .rev()
-        .find_map(|component| folder_platform_alias(&component.as_os_str().to_string_lossy()))
+    components.iter().rev().find_map(|component| {
+        let matched_folder = component.as_os_str().to_string_lossy();
+        folder_platform_alias(&matched_folder)
+            .map(|platform| (platform, matched_folder.into_owned()))
+    })
 }
 
 fn normalize_path_segment(segment: &str) -> String {
@@ -6527,6 +6560,14 @@ mod tests {
         .expect("folder alias should detect MSX2");
         assert_eq!(folder_alias.provenance, PlatformProvenance::FolderAlias);
         assert_eq!(folder_alias.provenance.as_source_str(), "folder_alias");
+
+        let detailed = detect_platform_with_details(
+            "/home/davedap/Archives/msx2/Game.zip",
+            "/home/davedap/Archives",
+        )
+        .expect("detailed folder alias detection should succeed");
+        assert_eq!(detailed.platform, "MSX2");
+        assert_eq!(detailed.matched_folder.as_deref(), Some("msx2"));
     }
 
     #[test]
@@ -6557,6 +6598,7 @@ mod tests {
         );
 
         assert_eq!(detect_platform(&path, &root), None);
+        assert_eq!(detect_platform_with_details(&path, &root), None);
     }
 
     #[test]

@@ -12,12 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::{
     ArchiveFsError, ArchiveKind, ArchiveMountSession, ArchiveRecord, ArchiveSnapshot, ArchiveStats,
-    ArchiveStatus, ArchiveUnmountSession, BulkPlatformAssignmentResult, CatalogueStats,
-    CompletedScanSummary, Config, ConfigIdentity, Database, DatabaseHealth, DoctorReport,
-    DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MountOneOutcome, MountState,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
-    SetupDiagnosticStatus, SetupDiagnostics, UnmountOneOutcome, canonical_platform_names,
-    check_database_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
+    ArchiveStatus, ArchiveUnmountSession, BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE,
+    CatalogueStats, CompletedScanSummary, Config, ConfigIdentity, Database, DatabaseHealth,
+    DoctorReport, DoctorStatus, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MountOneOutcome,
+    MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
+    PlatformProvenanceDetails, ScanPersistSummary, SetupDiagnosticStatus, SetupDiagnostics,
+    UnmountOneOutcome, canonical_platform_names, check_database_health,
+    cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
     latest_schema_version, lazy_unmount_one_archive_path_with_progress,
     load_read_only_snapshot_default, mount_one_archive_path,
@@ -1067,6 +1068,7 @@ struct CachedLibrarySnapshot {
     database_path: PathBuf,
     schema_version: i64,
     archives: Vec<PersistedArchive>,
+    platform_details: HashMap<i64, PlatformProvenanceDetails>,
     stats: CatalogueStats,
     last_completed_scan: Option<CompletedScanSummary>,
     platform_aliases: Vec<PlatformAlias>,
@@ -1281,6 +1283,9 @@ fn load_snapshot_from(
     };
     let schema_version = database.schema_version().map_err(to_failed)?;
     let archives = database.load_archives().map_err(to_failed)?;
+    let platform_details = database
+        .load_platform_provenance_details(&archives)
+        .map_err(to_failed)?;
     let stats = database.catalogue_stats().map_err(to_failed)?;
     let last_completed_scan = database.latest_completed_scan().map_err(to_failed)?;
     let platform_aliases = database.list_platform_aliases().map_err(to_failed)?;
@@ -1288,6 +1293,7 @@ fn load_snapshot_from(
         database_path: database_path.to_path_buf(),
         schema_version,
         archives,
+        platform_details,
         stats,
         last_completed_scan,
         platform_aliases,
@@ -1691,14 +1697,7 @@ impl ArchiveFsApp {
                     ActivityAction::LibraryDatabase,
                     None,
                     ActivityOutcome::Completed,
-                    format!(
-                        "Library scan complete: {} new, {} changed, {} restored, {} missing, {} folder error(s).",
-                        scan_summary.counts.archives_added,
-                        scan_summary.counts.archives_changed,
-                        scan_summary.counts.archives_restored,
-                        scan_summary.counts.archives_missing,
-                        scan_summary.folder_errors.len(),
-                    ),
+                    format_scan_activity(&scan_summary),
                 ));
                 DatabaseState::Ready {
                     snapshot: Box::new(snapshot),
@@ -3647,6 +3646,99 @@ fn describe_platform_assignment(platform: Option<&str>, source: Option<&str>) ->
     }
 }
 
+fn platform_source_label(source: Option<&str>) -> &'static str {
+    match source {
+        Some(MANUAL_PLATFORM_SOURCE) => "Manual assignment",
+        Some(CUSTOM_FOLDER_ALIAS_SOURCE) => "Custom folder alias",
+        Some("folder_alias") => "Built-in folder alias",
+        Some("heuristic-path-detector") => "Filename/path heuristic",
+        Some(_) => "Automatic detection",
+        None => "Unknown",
+    }
+}
+
+fn platform_provenance_lines(details: &PlatformProvenanceDetails) -> Vec<(&'static str, String)> {
+    let mut lines = vec![
+        (
+            "Platform",
+            details.platform.as_deref().unwrap_or("Unknown").to_string(),
+        ),
+        (
+            "Source",
+            platform_source_label(details.source.as_deref()).to_string(),
+        ),
+    ];
+
+    match (
+        details.source.as_deref(),
+        details.matched_component.as_ref(),
+    ) {
+        (Some(CUSTOM_FOLDER_ALIAS_SOURCE), Some(matched)) => {
+            lines.push(("Matched alias", matched.clone()));
+        }
+        (Some("folder_alias"), Some(matched)) => {
+            lines.push(("Matched folder", matched.clone()));
+        }
+        _ => {}
+    }
+
+    if details.source.as_deref() == Some(MANUAL_PLATFORM_SOURCE) {
+        let fallback = details.automatic_fallback.as_ref();
+        lines.push((
+            "Automatic fallback",
+            fallback
+                .map(|fallback| fallback.platform.clone())
+                .unwrap_or_else(|| "Unknown".to_string()),
+        ));
+        if let Some(fallback) = fallback {
+            lines.push((
+                "Fallback source",
+                platform_source_label(Some(&fallback.source)).to_string(),
+            ));
+            match (
+                fallback.source.as_str(),
+                fallback.matched_component.as_ref(),
+            ) {
+                (CUSTOM_FOLDER_ALIAS_SOURCE, Some(matched)) => {
+                    lines.push(("Fallback matched alias", matched.clone()));
+                }
+                ("folder_alias", Some(matched)) => {
+                    lines.push(("Fallback matched folder", matched.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    lines
+}
+
+fn format_scan_completion(summary: &ScanPersistSummary) -> String {
+    format!(
+        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {}\nRestored: {}\nNewly missing: {}\nUnchanged: {}\nErrors: {}",
+        summary.counts.archives_seen,
+        summary.counts.archives_added,
+        summary.counts.archives_changed,
+        summary.counts.archives_restored,
+        summary.counts.archives_missing,
+        summary.counts.archives_unchanged,
+        summary.folder_errors.len(),
+    )
+}
+
+fn format_scan_activity(summary: &ScanPersistSummary) -> String {
+    format!(
+        "Scan completed: seen {}, added {}, updated {}, restored {}, newly missing {}, unchanged {}, errors {}.",
+        summary.counts.archives_seen,
+        summary.counts.archives_added,
+        summary.counts.archives_changed,
+        summary.counts.archives_restored,
+        summary.counts.archives_missing,
+        summary.counts.archives_unchanged,
+        summary.folder_errors.len(),
+    )
+}
+
 fn perform_archive_action(
     action: ArchiveAction,
     archive_path: &Path,
@@ -4259,14 +4351,7 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
                     } = state
                     {
                         ui.strong("Last scan (this session)");
-                        ui.label(format!(
-                            "{} new, {} changed, {} restored, {} missing, {} folder error(s)",
-                            summary.counts.archives_added,
-                            summary.counts.archives_changed,
-                            summary.counts.archives_restored,
-                            summary.counts.archives_missing,
-                            summary.folder_errors.len(),
-                        ));
+                        ui.label(format_scan_completion(summary));
                         ui.end_row();
                     }
 
@@ -4736,10 +4821,12 @@ fn show_loaded_data(
             });
     }
 
+    let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let (operation_request, platform_request) = show_selected_archive(
         ui,
         selected_record(&data.records, selected_archive.as_deref()),
-        selected_persisted_archive(cached, selected_archive.as_deref()),
+        selected_persisted,
+        selected_platform_details(cached, selected_persisted),
         SelectedArchiveViewState {
             operation,
             busy,
@@ -5700,6 +5787,13 @@ fn selected_persisted_archive<'a>(
         .find(|persisted| persisted.absolute_path == selected_archive)
 }
 
+fn selected_platform_details<'a>(
+    cached: Option<&'a CachedLibrarySnapshot>,
+    persisted: Option<&PersistedArchive>,
+) -> Option<&'a PlatformProvenanceDetails> {
+    cached?.platform_details.get(&persisted?.id)
+}
+
 /// Resolves the platform text a "Set Platform" click should apply:
 /// `platform_custom_text` (trimmed, rejecting empty) when
 /// `CUSTOM_PLATFORM_CHOICE` is selected, otherwise the selected
@@ -5809,6 +5903,7 @@ fn show_selected_archive(
     ui: &mut egui::Ui,
     record: Option<&ArchiveRecord>,
     persisted: Option<&PersistedArchive>,
+    platform_details: Option<&PlatformProvenanceDetails>,
     view_state: SelectedArchiveViewState<'_>,
 ) -> (Option<OperationRequest>, Option<(PathBuf, PlatformAction)>) {
     let SelectedArchiveViewState {
@@ -5848,6 +5943,7 @@ fn show_selected_archive(
             let action = show_platform_section(
                 ui,
                 persisted,
+                platform_details,
                 platform_choice,
                 platform_custom_text,
                 platform_busy,
@@ -5988,6 +6084,7 @@ fn show_selected_archive(
         let action = show_platform_section(
             ui,
             persisted,
+            platform_details,
             platform_choice,
             platform_custom_text,
             platform_busy,
@@ -6012,6 +6109,7 @@ fn show_selected_archive(
 fn show_platform_section(
     ui: &mut egui::Ui,
     persisted: Option<&PersistedArchive>,
+    platform_details: Option<&PlatformProvenanceDetails>,
     platform_choice: &mut Option<String>,
     platform_custom_text: &mut String,
     platform_busy: bool,
@@ -6026,13 +6124,21 @@ fn show_platform_section(
         return None;
     };
 
-    ui.label(format!(
-        "Current: {}",
-        describe_platform_assignment(
-            persisted.platform.as_deref(),
-            persisted.platform_source.as_deref()
-        )
-    ));
+    let fallback_details;
+    let details = if let Some(details) = platform_details {
+        details
+    } else {
+        fallback_details = PlatformProvenanceDetails {
+            platform: persisted.platform.clone(),
+            source: persisted.platform_source.clone(),
+            matched_component: None,
+            automatic_fallback: None,
+        };
+        &fallback_details
+    };
+    for (label, value) in platform_provenance_lines(details) {
+        ui.label(format!("{label}: {value}"));
+    }
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("platform_choice_combo")
             .selected_text(platform_choice.as_deref().unwrap_or("Select platform..."))
@@ -6544,14 +6650,152 @@ mod tests {
     }
 
     fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
+        let platform_details = archives
+            .iter()
+            .map(|archive| {
+                (
+                    archive.id,
+                    PlatformProvenanceDetails {
+                        platform: archive.platform.clone(),
+                        source: archive.platform_source.clone(),
+                        matched_component: None,
+                        automatic_fallback: None,
+                    },
+                )
+            })
+            .collect();
         CachedLibrarySnapshot {
             database_path: PathBuf::from("/config/library.sqlite3"),
             schema_version: latest_schema_version(),
             archives,
+            platform_details,
             stats: empty_catalogue_stats(),
             last_completed_scan: None,
             platform_aliases: Vec::new(),
         }
+    }
+
+    fn provenance_line_map(details: &PlatformProvenanceDetails) -> HashMap<&'static str, String> {
+        platform_provenance_lines(details).into_iter().collect()
+    }
+
+    #[test]
+    fn manual_platform_provenance_uses_human_wording_and_unknown_fallback() {
+        let details = PlatformProvenanceDetails {
+            platform: Some("GameCube".to_string()),
+            source: Some(MANUAL_PLATFORM_SOURCE.to_string()),
+            matched_component: None,
+            automatic_fallback: None,
+        };
+
+        let lines = provenance_line_map(&details);
+        assert_eq!(lines["Platform"], "GameCube");
+        assert_eq!(lines["Source"], "Manual assignment");
+        assert_eq!(lines["Automatic fallback"], "Unknown");
+    }
+
+    #[test]
+    fn manual_platform_provenance_shows_the_correct_detailed_automatic_fallback() {
+        let details = PlatformProvenanceDetails {
+            platform: Some("GameCube".to_string()),
+            source: Some(MANUAL_PLATFORM_SOURCE.to_string()),
+            matched_component: None,
+            automatic_fallback: Some(archivefs_core::AutomaticPlatformDetails {
+                platform: "Amiga CD32".to_string(),
+                source: CUSTOM_FOLDER_ALIAS_SOURCE.to_string(),
+                matched_component: Some("am".to_string()),
+            }),
+        };
+
+        let lines = provenance_line_map(&details);
+        assert_eq!(lines["Source"], "Manual assignment");
+        assert_eq!(lines["Automatic fallback"], "Amiga CD32");
+        assert_eq!(lines["Fallback source"], "Custom folder alias");
+        assert_eq!(lines["Fallback matched alias"], "am");
+    }
+
+    #[test]
+    fn custom_and_built_in_alias_provenance_show_their_matches() {
+        let custom = PlatformProvenanceDetails {
+            platform: Some("Amiga CD32".to_string()),
+            source: Some(CUSTOM_FOLDER_ALIAS_SOURCE.to_string()),
+            matched_component: Some("am".to_string()),
+            automatic_fallback: None,
+        };
+        let built_in = PlatformProvenanceDetails {
+            platform: Some("Intellivision".to_string()),
+            source: Some("folder_alias".to_string()),
+            matched_component: Some("intellivision".to_string()),
+            automatic_fallback: None,
+        };
+
+        let custom_lines = provenance_line_map(&custom);
+        assert_eq!(custom_lines["Source"], "Custom folder alias");
+        assert_eq!(custom_lines["Matched alias"], "am");
+        let built_in_lines = provenance_line_map(&built_in);
+        assert_eq!(built_in_lines["Source"], "Built-in folder alias");
+        assert_eq!(built_in_lines["Matched folder"], "intellivision");
+    }
+
+    #[test]
+    fn heuristic_and_unknown_provenance_are_clear_and_never_show_raw_sources() {
+        let heuristic = PlatformProvenanceDetails {
+            platform: Some("MSX".to_string()),
+            source: Some("heuristic-path-detector".to_string()),
+            matched_component: None,
+            automatic_fallback: None,
+        };
+        let unknown = PlatformProvenanceDetails {
+            platform: None,
+            source: None,
+            matched_component: None,
+            automatic_fallback: None,
+        };
+
+        let heuristic_lines = provenance_line_map(&heuristic);
+        assert_eq!(heuristic_lines["Source"], "Filename/path heuristic");
+        assert!(
+            !platform_provenance_lines(&heuristic)
+                .iter()
+                .any(|(_, value)| value.contains("heuristic-path-detector"))
+        );
+        let unknown_lines = provenance_line_map(&unknown);
+        assert_eq!(unknown_lines["Platform"], "Unknown");
+        assert_eq!(unknown_lines["Source"], "Unknown");
+    }
+
+    #[test]
+    fn scan_completion_and_activity_use_every_truthful_non_overlapping_count() {
+        let summary = ScanPersistSummary {
+            scan_run_id: 42,
+            counts: archivefs_core::ScanRunCounts {
+                archives_seen: 1_236,
+                archives_added: 3,
+                archives_changed: 2,
+                archives_restored: 1,
+                archives_unchanged: 1_230,
+                archives_updated: 3,
+                archives_missing: 4,
+                errors_count: 1,
+                source_folders_scanned: 2,
+            },
+            folder_errors: vec![(PathBuf::from("/offline"), "unavailable".to_string())],
+        };
+
+        assert_eq!(
+            format_scan_completion(&summary),
+            "Scan completed\nSeen: 1236\nAdded: 3\nUpdated: 2\nRestored: 1\nNewly missing: 4\nUnchanged: 1230\nErrors: 1"
+        );
+        let activity = format_scan_activity(&summary);
+        assert_eq!(
+            activity,
+            "Scan completed: seen 1236, added 3, updated 2, restored 1, newly missing 4, unchanged 1230, errors 1."
+        );
+        assert_eq!(
+            activity.lines().count(),
+            1,
+            "activity must stay one concise entry"
+        );
     }
 
     #[test]

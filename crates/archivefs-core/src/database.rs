@@ -21,7 +21,7 @@
 //! This module uses `std::os::unix::ffi` to store and read back exact path
 //! bytes, so it - like the rest of this Linux-first project - is Unix-only.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -33,7 +33,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
-    canonical_platform_names, normalize_path_segment,
+    canonical_platform_names, detect_platform_with_details, normalize_path_segment,
 };
 
 /// Resolves the default library database path:
@@ -499,6 +499,32 @@ pub struct PersistedArchive {
     pub platform_source: Option<String>,
     pub last_known_health: String,
     pub last_verified_missing_at: Option<String>,
+}
+
+/// One automatically detected platform and the path evidence retained for a
+/// human-readable explanation. `matched_component` is populated only for a
+/// custom or built-in folder alias; heuristic detections deliberately leave it
+/// empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticPlatformDetails {
+    pub platform: String,
+    pub source: String,
+    pub matched_component: Option<String>,
+}
+
+/// Read-time provenance details for one archive. The effective assignment is
+/// copied from the current assignment row, while `automatic_fallback` is the
+/// latest recorded non-manual assignment: exactly the row
+/// [`Database::clear_manual_platform`] would restore. Path evidence is
+/// recomputed only to attach a matching alias/folder label, never to invent a
+/// different fallback before a scan has recorded it. No schema change is
+/// required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformProvenanceDetails {
+    pub platform: Option<String>,
+    pub source: Option<String>,
+    pub matched_component: Option<String>,
+    pub automatic_fallback: Option<AutomaticPlatformDetails>,
 }
 
 /// Whether `archive`'s *effective* platform (manual assignment if one is
@@ -1941,6 +1967,110 @@ impl Database {
             .map_err(|error| db_error("failed to read archives", error))
     }
 
+    /// Builds display-oriented provenance details for already-loaded archive
+    /// rows without changing their effective assignments. Source roots and
+    /// custom aliases are loaded once. A manual row's fallback comes from the
+    /// same latest automatic history row that `clear_manual_platform`
+    /// restores, so display and behavior cannot disagree. Current path and
+    /// alias evidence is used only to attach a matched component when it
+    /// agrees with that recorded assignment.
+    pub fn load_platform_provenance_details(
+        &self,
+        archives: &[PersistedArchive],
+    ) -> Result<HashMap<i64, PlatformProvenanceDetails>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id, path FROM source_folders")
+            .map_err(|error| db_error("failed to prepare source folders for provenance", error))?;
+        let source_roots = stmt
+            .query_map([], |row| {
+                let path_bytes: Vec<u8> = row.get(1)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    PathBuf::from(OsString::from_vec(path_bytes)),
+                ))
+            })
+            .map_err(|error| db_error("failed to query source folders for provenance", error))?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(|error| db_error("failed to read source folders for provenance", error))?;
+        let aliases = self.list_platform_aliases()?;
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT p.archive_id, p.platform, p.source \
+                 FROM platform_assignments p \
+                 WHERE p.source != ?1 AND p.id = (\
+                     SELECT MAX(latest.id) FROM platform_assignments latest \
+                     WHERE latest.archive_id = p.archive_id AND latest.source != ?1\
+                 )",
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to prepare automatic platform fallbacks for provenance",
+                    error,
+                )
+            })?;
+        let latest_automatic = stmt
+            .query_map(params![MANUAL_PLATFORM_SOURCE], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                ))
+            })
+            .map_err(|error| {
+                db_error(
+                    "failed to query automatic platform fallbacks for provenance",
+                    error,
+                )
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(|error| {
+                db_error(
+                    "failed to read automatic platform fallbacks for provenance",
+                    error,
+                )
+            })?;
+
+        let mut details = HashMap::with_capacity(archives.len());
+        for archive in archives {
+            let detected_now =
+                source_roots
+                    .get(&archive.source_folder_id)
+                    .and_then(|source_root| {
+                        automatic_platform_details(&aliases, &archive.absolute_path, source_root)
+                    });
+            let matched_component = detected_now
+                .as_ref()
+                .filter(|automatic| {
+                    archive.platform.as_deref() == Some(automatic.platform.as_str())
+                        && archive.platform_source.as_deref() == Some(automatic.source.as_str())
+                })
+                .and_then(|automatic| automatic.matched_component.clone());
+            let automatic_fallback = latest_automatic.get(&archive.id).map(|(platform, source)| {
+                let matched_component = detected_now
+                    .as_ref()
+                    .filter(|detected| detected.platform == *platform && detected.source == *source)
+                    .and_then(|detected| detected.matched_component.clone());
+                AutomaticPlatformDetails {
+                    platform: platform.clone(),
+                    source: source.clone(),
+                    matched_component,
+                }
+            });
+
+            details.insert(
+                archive.id,
+                PlatformProvenanceDetails {
+                    platform: archive.platform.clone(),
+                    source: archive.platform_source.clone(),
+                    matched_component,
+                    automatic_fallback,
+                },
+            );
+        }
+        Ok(details)
+    }
+
     /// Aggregate counts over the whole catalogue: total archives, how many
     /// are currently present vs. missing, and how many have a current
     /// platform assignment vs. none. Computed with a single SQL aggregate
@@ -2241,6 +2371,49 @@ fn find_custom_platform_alias(
         }
     }
     Ok(None)
+}
+
+fn automatic_platform_details(
+    aliases: &[PlatformAlias],
+    path: &Path,
+    source_root: &Path,
+) -> Option<AutomaticPlatformDetails> {
+    if let Some((platform, matched_alias)) =
+        find_custom_platform_alias_in(aliases, path, source_root)
+    {
+        return Some(AutomaticPlatformDetails {
+            platform,
+            source: CUSTOM_FOLDER_ALIAS_SOURCE.to_string(),
+            matched_component: Some(matched_alias),
+        });
+    }
+
+    detect_platform_with_details(path, source_root).map(|detection| AutomaticPlatformDetails {
+        platform: detection.platform,
+        source: detection.provenance.as_source_str().to_string(),
+        matched_component: detection.matched_folder,
+    })
+}
+
+fn find_custom_platform_alias_in(
+    aliases: &[PlatformAlias],
+    path: &Path,
+    source_root: &Path,
+) -> Option<(String, String)> {
+    let relative = path.strip_prefix(source_root).ok()?;
+    let mut components: Vec<_> = relative.components().collect();
+    components.pop();
+
+    for component in components.iter().rev() {
+        let normalized = normalize_path_segment(&component.as_os_str().to_string_lossy());
+        if let Some(alias) = aliases
+            .iter()
+            .find(|alias| alias.normalized_alias == normalized)
+        {
+            return Some((alias.platform.clone(), alias.alias.clone()));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2782,6 +2955,9 @@ mod tests {
 
         assert_eq!(summary.counts.archives_seen, 1);
         assert_eq!(summary.counts.archives_added, 1);
+        assert_eq!(summary.counts.archives_changed, 0);
+        assert_eq!(summary.counts.archives_restored, 0);
+        assert_eq!(summary.counts.archives_unchanged, 0);
         assert_eq!(summary.counts.archives_updated, 0);
         assert_eq!(summary.counts.archives_missing, 0);
         assert!(summary.folder_errors.is_empty());
@@ -2811,6 +2987,9 @@ mod tests {
 
         assert_eq!(second.counts.archives_seen, 1);
         assert_eq!(second.counts.archives_added, 0);
+        assert_eq!(second.counts.archives_changed, 0);
+        assert_eq!(second.counts.archives_restored, 0);
+        assert_eq!(second.counts.archives_unchanged, 1);
         assert_eq!(second.counts.archives_updated, 0);
         assert_eq!(second.counts.archives_missing, 0);
 
@@ -2839,6 +3018,9 @@ mod tests {
         let summary = scan_and_persist(&mut database, &config, "test").unwrap();
 
         assert_eq!(summary.counts.archives_added, 0);
+        assert_eq!(summary.counts.archives_changed, 1);
+        assert_eq!(summary.counts.archives_restored, 0);
+        assert_eq!(summary.counts.archives_unchanged, 0);
         assert_eq!(summary.counts.archives_updated, 1);
 
         let archives = database.load_archives().unwrap();
@@ -2866,6 +3048,8 @@ mod tests {
         let summary = scan_and_persist(&mut database, &config, "test").unwrap();
 
         assert_eq!(summary.counts.archives_missing, 1);
+        assert_eq!(summary.counts.archives_seen, 1);
+        assert_eq!(summary.counts.archives_unchanged, 1);
         assert!(summary.folder_errors.is_empty());
 
         let archives = database.load_archives().unwrap();
@@ -2915,7 +3099,11 @@ mod tests {
         );
 
         fs::write(&archive_path, b"contents").unwrap();
-        scan_and_persist(&mut database, &config, "scan-after-restore").unwrap();
+        let restored_summary =
+            scan_and_persist(&mut database, &config, "scan-after-restore").unwrap();
+        assert_eq!(restored_summary.counts.archives_restored, 1);
+        assert_eq!(restored_summary.counts.archives_changed, 0);
+        assert_eq!(restored_summary.counts.archives_updated, 1);
         let archives = database.load_archives().unwrap();
         let restored_archive = find_archive(&archives, "mystery.zip");
         assert!(restored_archive.last_verified_missing_at.is_none());
@@ -2999,6 +3187,9 @@ mod tests {
         assert_eq!(second.folder_errors[0].0, source_a);
         // source_b still scanned normally and reported no changes.
         assert_eq!(second.counts.source_folders_scanned, 1);
+        assert_eq!(second.counts.archives_seen, 1);
+        assert_eq!(second.counts.archives_unchanged, 1);
+        assert_eq!(second.counts.errors_count, 1);
         assert_eq!(second.counts.archives_missing, 0);
 
         let archives = database.load_archives().unwrap();
@@ -5008,6 +5199,155 @@ mod tests {
         assert_eq!(
             history_count, 1,
             "three scans reporting the same unchanged custom-alias result must not add rows"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provenance_details_follow_effective_precedence_and_explain_each_automatic_tier() {
+        let root = temp_dir("provenance-details-all-tiers");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "am/game.zip", b"custom");
+        write_archive_file(&source, "intellivision/game.zip", b"built-in");
+        write_archive_file(&source, "xbox360/game.zip", b"heuristic");
+        write_archive_file(&source, "mystery/game.zip", b"unknown");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("am", "AmigaCD32").unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        let details = database
+            .load_platform_provenance_details(&archives)
+            .unwrap();
+        let custom = find_archive(&archives, "am/game.zip");
+        let built_in = find_archive(&archives, "intellivision/game.zip");
+        let heuristic = find_archive(&archives, "xbox360/game.zip");
+        let unknown = find_archive(&archives, "mystery/game.zip");
+
+        assert_eq!(
+            details[&custom.id].source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
+        );
+        assert_eq!(details[&custom.id].matched_component.as_deref(), Some("am"));
+        assert_eq!(
+            details[&built_in.id].source.as_deref(),
+            Some("folder_alias")
+        );
+        assert_eq!(
+            details[&built_in.id].matched_component.as_deref(),
+            Some("intellivision")
+        );
+        assert_eq!(
+            details[&heuristic.id].source.as_deref(),
+            Some("heuristic-path-detector")
+        );
+        assert_eq!(details[&heuristic.id].matched_component, None);
+        assert_eq!(details[&unknown.id].platform, None);
+        assert_eq!(details[&unknown.id].source, None);
+
+        database.set_manual_platform(custom.id, "GameCube").unwrap();
+        database
+            .set_manual_platform(unknown.id, "GameCube")
+            .unwrap();
+        let archives = database.load_archives().unwrap();
+        let details = database
+            .load_platform_provenance_details(&archives)
+            .unwrap();
+        let custom_manual = &details[&custom.id];
+        assert_eq!(
+            custom_manual.source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE),
+            "manual must remain the effective source above the custom alias"
+        );
+        assert_eq!(
+            custom_manual
+                .automatic_fallback
+                .as_ref()
+                .map(|fallback| fallback.platform.as_str()),
+            Some("AmigaCD32")
+        );
+        assert_eq!(
+            custom_manual
+                .automatic_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.matched_component.as_deref()),
+            Some("am")
+        );
+        assert_eq!(details[&unknown.id].automatic_fallback, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_provenance_matches_the_fallback_clear_would_restore() {
+        let root = temp_dir("provenance-details-clear-fallback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "mystery/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("mystery", "GameCube").unwrap();
+        scan_and_persist(&mut database, &config, "with-alias").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "mystery/game.zip").id;
+        database.set_manual_platform(archive_id, "Wii").unwrap();
+        assert!(database.remove_platform_alias("mystery").unwrap());
+
+        let archives = database.load_archives().unwrap();
+        let details = database
+            .load_platform_provenance_details(&archives)
+            .unwrap();
+        assert_eq!(details[&archive_id].platform.as_deref(), Some("Wii"));
+        assert_eq!(
+            details[&archive_id].source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+        let fallback = details[&archive_id].automatic_fallback.as_ref().unwrap();
+        assert_eq!(fallback.platform, "GameCube");
+        assert_eq!(fallback.source, CUSTOM_FOLDER_ALIAS_SOURCE);
+        assert_eq!(
+            fallback.matched_component, None,
+            "an alias removed since the last scan must not be presented as a current path match"
+        );
+        let cleared = database.clear_manual_platform(archive_id).unwrap();
+        assert_eq!(
+            cleared.new_platform.as_deref(),
+            Some(fallback.platform.as_str())
+        );
+        assert_eq!(
+            cleared.new_source.as_deref(),
+            Some(fallback.source.as_str())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provenance_details_do_not_panic_for_non_utf8_paths() {
+        let root = temp_dir("provenance-details-non-utf8");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let folder = OsString::from_vec(vec![b'a', 0x80, b'm']);
+        let archive_path = source.join(folder).join("game.zip");
+        fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        fs::write(&archive_path, b"contents").unwrap();
+        assert!(archive_path.to_str().is_none());
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database.add_platform_alias("am", "AmigaCD32").unwrap();
+        scan_and_persist(&mut database, &config, "non-utf8").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives[0].absolute_path, archive_path);
+        let details = database
+            .load_platform_provenance_details(&archives)
+            .unwrap();
+        assert_eq!(
+            details[&archives[0].id].source.as_deref(),
+            Some(CUSTOM_FOLDER_ALIAS_SOURCE)
         );
 
         let _ = fs::remove_dir_all(&root);
