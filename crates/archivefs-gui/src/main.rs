@@ -28,6 +28,12 @@ use eframe::egui;
 
 const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
 const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
+/// A fixed, explicit `egui::Id` for the library search box - not for any
+/// production behaviour, but so tests can give it real keyboard focus
+/// via `Memory::request_focus` deterministically, without depending on
+/// egui's position-derived auto-id (see the milestone requirement that
+/// keyboard shortcuts must be ignored while this field has focus).
+const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 const HISTORY_LIMIT: usize = 50;
 const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
 const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
@@ -1415,6 +1421,17 @@ struct ArchiveFsApp {
     selected_archives: HashSet<PathBuf>,
     bulk_platform_action: Option<RunningBulkPlatformAction>,
     bulk_platform_choice: Option<String>,
+    /// The library table's current column sort - milestone requirement
+    /// 2. `None` means unsorted / natural (merge) order.
+    sort_field: Option<SortField>,
+    sort_ascending: bool,
+    /// The library table's vertical `ScrollArea` offset as of the end of
+    /// the last frame - tracked here (rather than trusted to egui's own
+    /// persisted-by-`Id` scroll state) so keyboard focus movement can read
+    /// last frame's position *before* deciding whether this frame needs to
+    /// override it to bring the newly-focused row into view. See
+    /// `compute_scroll_offset_for_focus`.
+    library_scroll_offset: f32,
 }
 
 impl ArchiveFsApp {
@@ -1478,6 +1495,9 @@ impl ArchiveFsApp {
             selected_archives: HashSet::new(),
             bulk_platform_action: None,
             bulk_platform_choice: None,
+            sort_field: None,
+            sort_ascending: true,
+            library_scroll_offset: 0.0,
         }
     }
 
@@ -3251,7 +3271,18 @@ impl eframe::App for ArchiveFsApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.set_min_width(table_width(horizontal_spacing));
-                                show_header_row(ui, &COLUMN_HEADERS, row_height);
+                                // This cache-only loading preview has no sort
+                                // state of its own to wire up (it disappears
+                                // the moment the live snapshot loads) - the
+                                // headers render inertly, unsorted.
+                                let _ = show_header_row(
+                                    ui,
+                                    &COLUMN_HEADERS,
+                                    &COLUMN_SORT_FIELDS,
+                                    row_height,
+                                    None,
+                                    true,
+                                );
                                 ui.separator();
                                 let body_height = ui.available_height().max(row_height);
                                 egui::ScrollArea::vertical()
@@ -3323,6 +3354,9 @@ impl eframe::App for ArchiveFsApp {
                             selected_archives: &mut self.selected_archives,
                             bulk_platform_choice: &mut self.bulk_platform_choice,
                             bulk_platform_busy: self.bulk_platform_action.is_some(),
+                            sort_field: &mut self.sort_field,
+                            sort_ascending: &mut self.sort_ascending,
+                            library_scroll_offset: &mut self.library_scroll_offset,
                         },
                     );
                 }
@@ -4451,6 +4485,9 @@ struct LoadedViewState<'a> {
     selected_archives: &'a mut HashSet<PathBuf>,
     bulk_platform_choice: &'a mut Option<String>,
     bulk_platform_busy: bool,
+    sort_field: &'a mut Option<SortField>,
+    sort_ascending: &'a mut bool,
+    library_scroll_offset: &'a mut f32,
 }
 
 fn show_loaded_data(
@@ -4488,6 +4525,9 @@ fn show_loaded_data(
         selected_archives,
         bulk_platform_choice,
         bulk_platform_busy,
+        sort_field,
+        sort_ascending,
+        library_scroll_offset,
     } = view_state;
     let mut requested_action = None;
     let pending_count = data.stats.pending_count;
@@ -4913,6 +4953,7 @@ fn show_loaded_data(
         filter_changed |= ui
             .add(
                 egui::TextEdit::singleline(filter)
+                    .id(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID))
                     .hint_text("archive, mount path, platform, or state")
                     .desired_width(360.0),
             )
@@ -4972,7 +5013,7 @@ fn show_loaded_data(
     let base_indices: Vec<usize> = filtered_rows
         .clone()
         .unwrap_or_else(|| (0..merged_rows.len()).collect());
-    let visible_indices: Vec<usize> = if library_filters.is_active() {
+    let mut visible_indices: Vec<usize> = if library_filters.is_active() {
         base_indices
             .into_iter()
             .filter(|&index| library_filters.matches(&merged_rows[index]))
@@ -4980,56 +5021,171 @@ fn show_loaded_data(
     } else {
         base_indices
     };
+    // Milestone requirement 2: sorting reorders only this filtered index
+    // list, never `merged_rows`/`data.records`/`data.rows` themselves, so
+    // it can never mutate database order or archive identity.
+    if let Some(field) = *sort_field {
+        sort_visible_indices(&merged_rows, &mut visible_indices, field, *sort_ascending);
+    }
     let visible_count = visible_indices.len();
-    ui.label(format!(
-        "Showing {} of {} archives",
-        visible_count,
-        merged_rows.len()
-    ));
+
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "Showing {} of {} archives",
+            visible_count,
+            merged_rows.len()
+        ));
+        ui.separator();
+        // Milestone requirement 3: always visible, unlike the bulk action
+        // bar (2+ selections only) - a single selection is otherwise only
+        // shown via the selected row's background colour.
+        ui.label(selection_status_text(selected_archives.len()));
+    });
     ui.add_space(4.0);
+
+    // Milestone requirement 1: Escape / Ctrl+A / arrow-key navigation.
+    // Gated on `keyboard_shortcuts_blocked_by_focus` so typing Ctrl+A to
+    // select all text in the Search box (or navigating an open platform
+    // ComboBox with the arrow keys) is never hijacked into a table
+    // selection change.
+    // Set whenever this frame's arrow-key handling below actually moves
+    // focus - names the newly-focused row's position in `visible_indices`
+    // so the vertical `ScrollArea` built further down can scroll it into
+    // view (Ctrl+Up/Down's "does not visibly move" fix: focus moving among
+    // an existing multi-selection paints no different fill/border at all
+    // unless it also happens to leave the visible viewport, so this alone
+    // is not the fix - see `show_data_row`'s `focused` stroke for that
+    // half - but a focus change that scrolls off-screen must still scroll
+    // back into view).
+    let mut requested_scroll_pos: Option<usize> = None;
+    if !keyboard_shortcuts_blocked_by_focus(ui.ctx()) {
+        let (escape_pressed, select_all_pressed, arrow_down_pressed, arrow_up_pressed, ctrl_held) =
+            ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Escape),
+                    input.modifiers.ctrl && input.key_pressed(egui::Key::A),
+                    input.key_pressed(egui::Key::ArrowDown),
+                    input.key_pressed(egui::Key::ArrowUp),
+                    input.modifiers.ctrl,
+                )
+            });
+
+        if escape_pressed {
+            selected_archives.clear();
+        }
+        if select_all_pressed {
+            *selected_archives = select_all_visible(&merged_rows, &visible_indices);
+        }
+        if arrow_down_pressed || arrow_up_pressed {
+            let direction = if arrow_down_pressed {
+                ArrowDirection::Down
+            } else {
+                ArrowDirection::Up
+            };
+            if let Some(new_focus) = next_focus_in_visible_order(
+                &merged_rows,
+                &visible_indices,
+                selected_archive.as_deref(),
+                direction,
+            ) {
+                apply_arrow_focus_change(
+                    selected_archives,
+                    selected_archive,
+                    new_focus.clone(),
+                    ctrl_held,
+                );
+                requested_scroll_pos = visible_indices
+                    .iter()
+                    .position(|&index| merged_rows[index].path == new_focus);
+            }
+        }
+    }
+
     let row_height = fixed_row_height(
         ui.text_style_height(&egui::TextStyle::Body),
         ui.spacing().interact_size.y,
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
     let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
-    let mut clicked = None;
-    egui::ScrollArea::horizontal()
-        .id_salt("archive_status_horizontal")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.set_min_width(table_width(horizontal_spacing));
-            show_header_row(ui, &COLUMN_HEADERS, row_height);
-            ui.separator();
 
-            let body_height = ui.available_height().max(row_height);
-            egui::ScrollArea::vertical()
-                .id_salt("archive_status_vertical")
-                .max_height(body_height)
+    // Milestone requirement 4: never show an empty table with no
+    // explanation - distinguish "the library itself is empty" from "the
+    // library has archives, but the current search/filters hide all of
+    // them".
+    match library_table_message(merged_rows.is_empty(), visible_count) {
+        Some(LibraryTableMessage::EmptyLibrary) => {
+            ui.label(EMPTY_LIBRARY_MESSAGE);
+        }
+        Some(LibraryTableMessage::NoFilterResults) => {
+            ui.label(ZERO_FILTER_RESULTS_MESSAGE);
+        }
+        None => {
+            let mut clicked = None;
+            egui::ScrollArea::horizontal()
+                .id_salt("archive_status_horizontal")
                 .auto_shrink([false, false])
-                .show_rows(ui, row_height, visible_count, |ui, row_range| {
-                    clicked = show_archive_rows(
+                .show(ui, |ui| {
+                    ui.set_min_width(table_width(horizontal_spacing));
+                    if let Some(clicked_field) = show_header_row(
                         ui,
-                        &merged_rows,
-                        Some(&visible_indices),
-                        row_range,
+                        &COLUMN_HEADERS,
+                        &COLUMN_SORT_FIELDS,
                         row_height,
-                        selected_index,
-                        selected_archives,
+                        *sort_field,
+                        *sort_ascending,
+                    ) {
+                        apply_header_click(sort_field, sort_ascending, clicked_field);
+                    }
+                    ui.separator();
+
+                    let body_height = ui.available_height().max(row_height);
+                    let mut vertical_scroll_area = egui::ScrollArea::vertical()
+                        .id_salt("archive_status_vertical")
+                        .max_height(body_height)
+                        .auto_shrink([false, false]);
+                    if let Some(pos) = requested_scroll_pos {
+                        let row_stride = row_height + ui.spacing().item_spacing.y;
+                        vertical_scroll_area = vertical_scroll_area.vertical_scroll_offset(
+                            compute_scroll_offset_for_focus(
+                                pos,
+                                row_stride,
+                                *library_scroll_offset,
+                                body_height,
+                            ),
+                        );
+                    }
+                    let scroll_output = vertical_scroll_area.show_rows(
+                        ui,
+                        row_height,
+                        visible_count,
+                        |ui, row_range| {
+                            clicked = show_archive_rows(
+                                ui,
+                                &merged_rows,
+                                Some(&visible_indices),
+                                row_range,
+                                row_height,
+                                selected_index,
+                                selected_archives,
+                            );
+                        },
                     );
+                    *library_scroll_offset = scroll_output.state.offset.y;
                 });
-        });
-    // Requirement 2: an ordinary click replaces the whole selection with
-    // just this row; a Ctrl-click toggles only this row, leaving every
-    // other currently-selected row untouched. Either way the details
-    // panel's "focused" row (selected_archive) becomes whatever was just
-    // clicked, and its platform picker resets - it must never keep
-    // showing a choice made for a different, previously-focused archive.
-    if let Some((index, ctrl_held)) = clicked {
-        let path = merged_rows[index].path.clone();
-        apply_row_click(selected_archives, selected_archive, path, ctrl_held);
-        *platform_choice = None;
-        platform_custom_text.clear();
+            // Requirement 2: an ordinary click replaces the whole selection
+            // with just this row; a Ctrl-click toggles only this row,
+            // leaving every other currently-selected row untouched. Either
+            // way the details panel's "focused" row (selected_archive)
+            // becomes whatever was just clicked, and its platform picker
+            // resets - it must never keep showing a choice made for a
+            // different, previously-focused archive.
+            if let Some((index, ctrl_held)) = clicked {
+                let path = merged_rows[index].path.clone();
+                apply_row_click(selected_archives, selected_archive, path, ctrl_held);
+                *platform_choice = None;
+                platform_custom_text.clear();
+            }
+        }
     }
 
     requested_action
@@ -5044,19 +5200,54 @@ fn table_width(horizontal_spacing: f32) -> f32 {
         + horizontal_spacing * (COLUMN_WIDTHS.len().saturating_sub(1) as f32)
 }
 
-/// Renders the (non-interactive) column header row: four bold labels,
-/// nothing more. Never clickable - unlike `show_data_row`, there is no
-/// row identity here to select.
-fn show_header_row(ui: &mut egui::Ui, cells: &[&str; 4], row_height: f32) {
+/// Renders the column header row - milestone requirement 2: each cell is
+/// its own small, borderless `Button`, clickable to select/toggle that
+/// column's sort. This is a separate function from `show_data_row` and
+/// renders outside any data row's own click-sensing `Rect`, so it does
+/// not touch the Painter-based single-clickable-region row fix at all;
+/// unlike a data row, there is no archive identity here that a second
+/// child widget could ever steal a click from.
+///
+/// `sort_field`/`sort_ascending` describe the *current* sort (`None`
+/// means unsorted / natural order); the active column's label gets a
+/// small arrow suffix showing its direction. Returns the column whose
+/// header was clicked this frame, if any - the caller decides whether
+/// that selects a new sort field or toggles the existing one.
+fn show_header_row(
+    ui: &mut egui::Ui,
+    cells: &[&str; 4],
+    fields: &[SortField; 4],
+    row_height: f32,
+    sort_field: Option<SortField>,
+    sort_ascending: bool,
+) -> Option<SortField> {
+    let mut clicked_field = None;
     ui.horizontal(|ui| {
-        for (text, width) in cells.iter().zip(COLUMN_WIDTHS) {
-            ui.add_sized(
-                [width, row_height],
-                egui::Label::new(egui::RichText::new(*text).strong()).truncate(),
-            )
-            .on_hover_text(*text);
+        for ((text, width), field) in cells.iter().zip(COLUMN_WIDTHS).zip(fields.iter().copied()) {
+            let label = if sort_field == Some(field) {
+                format!(
+                    "{text} {}",
+                    if sort_ascending {
+                        "\u{25B2}"
+                    } else {
+                        "\u{25BC}"
+                    }
+                )
+            } else {
+                (*text).to_string()
+            };
+            let response = ui
+                .add_sized(
+                    [width, row_height],
+                    egui::Button::new(egui::RichText::new(label).strong()).frame(false),
+                )
+                .on_hover_text(*text);
+            if response.clicked() {
+                clicked_field = Some(field);
+            }
         }
     });
+    clicked_field
 }
 
 /// Renders one selectable archive table row as a *single* clickable
@@ -5090,7 +5281,8 @@ fn show_data_row(
     cells: &[&str; 4],
     row_height: f32,
     id_source: &Path,
-    selected: bool,
+    multi_selected: bool,
+    focused: bool,
     text_color: Option<egui::Color32>,
 ) -> egui::Response {
     let width = table_width(ui.spacing().item_spacing.x);
@@ -5115,12 +5307,27 @@ fn show_data_row(
     // default palette entries - the same colors any ordinary selected or
     // hovered widget would use.
     let visuals = ui.visuals();
-    if selected {
+    if multi_selected {
         ui.painter()
             .rect_filled(rect, 0.0, visuals.selection.bg_fill);
     } else if response.hovered() {
         ui.painter()
             .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+    // The Ctrl+Up/Down "focus doesn't visibly move" fix: a *border*, not
+    // another fill, so it stays visible whether or not this row is also
+    // `multi_selected` - moving focus with Ctrl held between two rows that
+    // are both already multi-selected must still show something change.
+    // `warn_fg_color` is deliberately a different hue from
+    // `selection.bg_fill`/`.stroke` so the two states never look like the
+    // same highlight at a glance.
+    if focused {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            0.0,
+            egui::Stroke::new(2.0, visuals.warn_fg_color),
+            egui::StrokeKind::Inside,
+        );
     }
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
@@ -5145,15 +5352,17 @@ fn show_data_row(
     response
 }
 
-/// Renders one page of table rows, highlighting a row if it is either the
-/// single "focused" row (`selected_index`) or a member of the multi-select
-/// set (`multi_selected` - exact `ArchiveRow::path` identity, never a row
-/// index). Returns `Some((row_index, ctrl_held))` for the row clicked
-/// this frame, if any - `ctrl_held` is read once, from the same frame's
-/// input state every row in this call shares, so the caller can
-/// distinguish an ordinary click (replace the selection) from a
-/// Ctrl-click (toggle just this row) without this function needing to
-/// know anything about selection semantics itself.
+/// Renders one page of table rows. A row can be `multi_selected` (a member
+/// of the exact `ArchiveRow::path` identity set), the single "focused" row
+/// (`selected_index`), both, or neither - these are rendered as visually
+/// distinct states (see `show_data_row`), not collapsed into one "is
+/// selected" flag, so that Ctrl+Up/Down moving focus among an existing
+/// multi-selection is still visible. Returns `Some((row_index, ctrl_held))`
+/// for the row clicked this frame, if any - `ctrl_held` is read once, from
+/// the same frame's input state every row in this call shares, so the
+/// caller can distinguish an ordinary click (replace the selection) from a
+/// Ctrl-click (toggle just this row) without this function needing to know
+/// anything about selection semantics itself.
 fn show_archive_rows(
     ui: &mut egui::Ui,
     rows: &[ArchiveRow],
@@ -5177,13 +5386,15 @@ fn show_archive_rows(
             row.archive_path.as_str(),
             row.mount_path.as_str(),
         ];
-        let is_selected = selected_index == Some(row_index) || multi_selected.contains(&row.path);
+        let is_multi_selected = multi_selected.contains(&row.path);
+        let is_focused = selected_index == Some(row_index);
         let response = show_data_row(
             ui,
             &cells,
             row_height,
             &row.path,
-            is_selected,
+            is_multi_selected,
+            is_focused,
             row.row_text_color(&visuals),
         );
         if response.clicked() {
@@ -5251,6 +5462,224 @@ fn apply_row_click(
 /// condition is directly testable without an `egui::Ui`.
 fn bulk_action_bar_visible(selected_archives: &HashSet<PathBuf>) -> bool {
     selected_archives.len() > 1
+}
+
+/// A compact, always-visible summary of the multi-selection's size -
+/// milestone requirement 3. Shown unconditionally, unlike
+/// `show_bulk_platform_action_bar` (2+ rows only), so a single selected
+/// row is still visibly confirmed somewhere other than the row's
+/// background colour.
+fn selection_status_text(selected_count: usize) -> String {
+    match selected_count {
+        0 => "No archives selected".to_string(),
+        1 => "1 archive selected".to_string(),
+        n => format!("{n} archives selected"),
+    }
+}
+
+const EMPTY_LIBRARY_MESSAGE: &str =
+    "No archives in the library yet. Scan a source folder to add archives.";
+const ZERO_FILTER_RESULTS_MESSAGE: &str = "No archives match the current search and filters.";
+
+/// Requirement 4: distinguishes "the library itself has no archives at
+/// all" from "the library has archives, but the current search/filters
+/// hide every one of them" - factored out as its own pure predicate
+/// (mirroring `bulk_action_bar_visible`) so the choice of message is
+/// directly testable without an `egui::Ui`, and so the table is never
+/// left rendering as an unexplained blank area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryTableMessage {
+    EmptyLibrary,
+    NoFilterResults,
+}
+
+fn library_table_message(
+    merged_rows_is_empty: bool,
+    visible_count: usize,
+) -> Option<LibraryTableMessage> {
+    if merged_rows_is_empty {
+        Some(LibraryTableMessage::EmptyLibrary)
+    } else if visible_count == 0 {
+        Some(LibraryTableMessage::NoFilterResults)
+    } else {
+        None
+    }
+}
+
+/// The four sortable table columns - milestone requirement 2. Order
+/// matches `COLUMN_HEADERS`/`COLUMN_WIDTHS` exactly (see
+/// `COLUMN_SORT_FIELDS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortField {
+    Platform,
+    State,
+    ArchivePath,
+    MountPath,
+}
+
+const COLUMN_SORT_FIELDS: [SortField; 4] = [
+    SortField::Platform,
+    SortField::State,
+    SortField::ArchivePath,
+    SortField::MountPath,
+];
+
+fn sort_field_key(row: &ArchiveRow, field: SortField) -> &str {
+    match field {
+        SortField::Platform => &row.platform,
+        SortField::State => &row.state,
+        SortField::ArchivePath => &row.archive_path,
+        SortField::MountPath => &row.mount_path,
+    }
+}
+
+/// Sorts `indices` (a filtered view into `merged_rows`, never the rows
+/// themselves - requirement 2: "must not mutate database order or
+/// archive identity") by the chosen column. `Vec::sort_by` is a stable
+/// sort, and the exact `ArchiveRow::path` is always the final
+/// tie-breaker (in fixed ascending order, independent of `ascending`, so
+/// ties resolve identically either direction) - together these make the
+/// result fully deterministic regardless of `merged_rows`'s incoming
+/// order.
+fn sort_visible_indices(
+    merged_rows: &[ArchiveRow],
+    indices: &mut [usize],
+    field: SortField,
+    ascending: bool,
+) {
+    indices.sort_by(|&left, &right| {
+        let left_row = &merged_rows[left];
+        let right_row = &merged_rows[right];
+        let primary = sort_field_key(left_row, field).cmp(sort_field_key(right_row, field));
+        let primary = if ascending {
+            primary
+        } else {
+            primary.reverse()
+        };
+        primary.then_with(|| left_row.path.cmp(&right_row.path))
+    });
+}
+
+/// Applies one header click to the current sort state - requirement 2:
+/// clicking a new column selects it (starting ascending); clicking the
+/// already-active column toggles its direction. Factored out from
+/// `show_loaded_data` so this decision is directly testable without an
+/// `egui::Ui`.
+fn apply_header_click(
+    sort_field: &mut Option<SortField>,
+    sort_ascending: &mut bool,
+    clicked_field: SortField,
+) {
+    if *sort_field == Some(clicked_field) {
+        *sort_ascending = !*sort_ascending;
+    } else {
+        *sort_field = Some(clicked_field);
+        *sort_ascending = true;
+    }
+}
+
+/// Requirement 1: Ctrl+A must select exactly the archives currently
+/// visible after filters are applied - never a hidden/filtered-out row.
+/// Paths are cloned directly out of `merged_rows` at the positions
+/// `visible_indices` names, computed fresh this same frame, so this can
+/// never select against a stale filter/sort state from an earlier frame.
+fn select_all_visible(merged_rows: &[ArchiveRow], visible_indices: &[usize]) -> HashSet<PathBuf> {
+    visible_indices
+        .iter()
+        .map(|&index| merged_rows[index].path.clone())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrowDirection {
+    Up,
+    Down,
+}
+
+/// Requirement 1: computes the next focused archive for Up/Down,
+/// stepping strictly through `visible_indices` - the exact filtered *and
+/// sorted* order currently on screen - by searching for the current
+/// focus's exact path rather than trusting any previously-computed row
+/// index. A raw index saved from an earlier frame can be invalidated by
+/// a filter or sort change between frames; re-deriving the position from
+/// `current_focus`'s `PathBuf` identity every call means there is no
+/// stale index to go stale. Clamps at either end rather than wrapping.
+fn next_focus_in_visible_order(
+    merged_rows: &[ArchiveRow],
+    visible_indices: &[usize],
+    current_focus: Option<&Path>,
+    direction: ArrowDirection,
+) -> Option<PathBuf> {
+    if visible_indices.is_empty() {
+        return None;
+    }
+    let current_pos = current_focus.and_then(|path| {
+        visible_indices
+            .iter()
+            .position(|&index| merged_rows[index].path == path)
+    });
+    let next_pos = match (current_pos, direction) {
+        (Some(pos), ArrowDirection::Down) => (pos + 1).min(visible_indices.len() - 1),
+        (Some(pos), ArrowDirection::Up) => pos.saturating_sub(1),
+        (None, _) => 0,
+    };
+    Some(merged_rows[visible_indices[next_pos]].path.clone())
+}
+
+/// Applies one Up/Down focus change - requirement 1's exact semantics.
+/// Moving focus without Ctrl replaces the whole multi-selection with
+/// just the newly-focused row; with Ctrl held, only the focus itself
+/// moves and the multi-selection is left untouched (Shift-range
+/// selection is explicitly out of scope for this milestone).
+fn apply_arrow_focus_change(
+    selected_archives: &mut HashSet<PathBuf>,
+    selected_archive: &mut Option<PathBuf>,
+    new_focus: PathBuf,
+    ctrl_held: bool,
+) {
+    if !ctrl_held {
+        selected_archives.clear();
+        selected_archives.insert(new_focus.clone());
+    }
+    *selected_archive = Some(new_focus);
+}
+
+/// Auto-scroll fix for Ctrl+Up/Down: computes the vertical `ScrollArea`
+/// offset needed to bring the row at visible position `focus_pos` (rows
+/// `row_stride` pixels apart) into view, given the scroll area's
+/// `current_offset` (its own offset as of the end of the previous frame)
+/// and `viewport_height`. Performs the smallest scroll that satisfies
+/// this: if the row is already fully within
+/// `current_offset..current_offset + viewport_height`, `current_offset` is
+/// returned unchanged (no jump on every keypress); otherwise the offset is
+/// clamped to align the row to whichever edge it just crossed.
+fn compute_scroll_offset_for_focus(
+    focus_pos: usize,
+    row_stride: f32,
+    current_offset: f32,
+    viewport_height: f32,
+) -> f32 {
+    let row_top = focus_pos as f32 * row_stride;
+    let row_bottom = row_top + row_stride;
+    if row_top < current_offset {
+        row_top
+    } else if row_bottom > current_offset + viewport_height {
+        (row_bottom - viewport_height).max(0.0)
+    } else {
+        current_offset
+    }
+}
+
+/// Requirement 1's last bullet: keyboard shortcuts (Escape, Ctrl+A,
+/// arrow navigation) must not fire while a text field or `ComboBox` is
+/// actively receiving keyboard input. `mem.focused()` is `Some` exactly
+/// when a widget (a `TextEdit`'s cursor, for example) currently holds
+/// keyboard focus; `Popup::is_any_open` additionally covers an open
+/// `ComboBox` dropdown, which does not itself hold "focus" in that sense
+/// but should equally suppress these shortcuts while its own keyboard
+/// navigation is active.
+fn keyboard_shortcuts_blocked_by_focus(ctx: &egui::Context) -> bool {
+    ctx.memory(|memory| memory.focused().is_some()) || egui::Popup::is_any_open(ctx)
 }
 
 /// The persisted database row backing the selected archive, if the
@@ -5892,6 +6321,9 @@ mod tests {
             selected_archives: HashSet::new(),
             bulk_platform_action: None,
             bulk_platform_choice: None,
+            sort_field: None,
+            sort_ascending: true,
+            library_scroll_offset: 0.0,
         }
     }
 
@@ -5936,6 +6368,44 @@ mod tests {
                 mounted_archives: 0,
             },
             config_identity: default_config_identity(),
+        }
+    }
+
+    /// A fully-populated `ArchiveRow` with every displayable field set
+    /// explicitly - unlike `row()` above (search-text only, everything
+    /// else blank), this is what the milestone's sort/keyboard-nav tests
+    /// need: distinct `path`/`platform`/`state`/`archive_path`/
+    /// `mount_path` values to actually exercise ordering.
+    fn row_with_fields(
+        path: &str,
+        platform: &str,
+        state: &str,
+        archive_path: &str,
+        mount_path: &str,
+    ) -> ArchiveRow {
+        ArchiveRow {
+            path: PathBuf::from(path),
+            archive_path: archive_path.to_string(),
+            mount_path: mount_path.to_string(),
+            platform: platform.to_string(),
+            state: state.to_string(),
+            search_text: format!("{archive_path}\n{mount_path}\n{platform}\n{state}")
+                .to_lowercase(),
+            origin: RowOrigin::Live,
+            unknown_platform: false,
+        }
+    }
+
+    /// Like `empty_loaded_data`, but with `rows` populated directly -
+    /// `records` stays empty and `cached` stays `None` at every call
+    /// site that uses this, so `build_display_rows` always passes these
+    /// rows straight through unchanged (see its `cached.is_none()`
+    /// short-circuit), making `data.rows` and `merged_rows` identical for
+    /// these tests.
+    fn loaded_data_with_rows(mount_root: &str, rows: Vec<ArchiveRow>) -> LoadedData {
+        LoadedData {
+            rows,
+            ..empty_loaded_data(mount_root)
         }
     }
 
@@ -9155,7 +9625,7 @@ mod tests {
             &ctx,
             egui::pos2(50.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, None),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None),
         );
 
         assert!(
@@ -9175,7 +9645,7 @@ mod tests {
 
         let (response, ctrl_held) =
             simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
-                show_data_row(ui, &test_row_cells(), 24.0, &path, false, None)
+                show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None)
             });
         assert!(response.clicked(), "the click itself must still register");
         assert!(
@@ -9209,7 +9679,7 @@ mod tests {
             &ctx,
             egui::pos2(50.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, None),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, false, None),
         );
         assert!(response.clicked());
         assert!(!ctrl_held);
@@ -9238,7 +9708,7 @@ mod tests {
 
         let (response, ctrl_held) =
             simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
-                show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, None)
+                show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, false, None)
             });
         assert!(response.clicked());
         assert!(ctrl_held);
@@ -9271,7 +9741,7 @@ mod tests {
         // click (or its modifiers) from registering.
         let (response, ctrl_held) =
             simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
-                show_data_row(ui, &test_row_cells(), 24.0, &path_a, true, None)
+                show_data_row(ui, &test_row_cells(), 24.0, &path_a, true, false, None)
             });
         assert!(response.clicked());
         assert!(ctrl_held);
@@ -9306,7 +9776,7 @@ mod tests {
             &ctx,
             egui::pos2(10.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, None),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None),
         );
         assert!(on_text.clicked(), "a click on rendered text must register");
 
@@ -9314,11 +9784,79 @@ mod tests {
             &ctx,
             egui::pos2(121.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, None),
+            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None),
         );
         assert!(
             on_gap.clicked(),
             "a click in the inter-column gap must register exactly the same as on text"
+        );
+    }
+
+    /// The Ctrl+Up/Down "focus doesn't visibly move" bug, reproduced and
+    /// fixed at the paint level: before this fix, `multi_selected` and
+    /// `focused` collapsed into one `is_selected` flag that painted the
+    /// exact same fill either way, so moving focus (via Ctrl+arrow)
+    /// between two rows that were both already multi-selected painted
+    /// nothing different at all. Inspects `FullOutput::shapes` - the real
+    /// painted output, not a re-implementation of the paint logic - to
+    /// prove multi-selection (a fill) and focus (a stroke) are genuinely
+    /// distinct paint calls, independently present or absent.
+    #[test]
+    fn focused_row_paints_a_distinct_stroke_from_the_multi_selected_fill() {
+        let ctx = egui::Context::default();
+        let path = PathBuf::from("/roms/a.zip");
+
+        let capture = |multi_selected: bool, focused: bool| -> egui::FullOutput {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_data_row(
+                        ui,
+                        &test_row_cells(),
+                        24.0,
+                        &path,
+                        multi_selected,
+                        focused,
+                        None,
+                    );
+                });
+            })
+        };
+        let visuals = ctx.style().visuals.clone();
+
+        fn has_stroke(output: &egui::FullOutput, color: egui::Color32) -> bool {
+            output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Rect(rect) if rect.stroke.width > 0.0 && rect.stroke.color == color)
+            })
+        }
+        fn has_fill(output: &egui::FullOutput, color: egui::Color32) -> bool {
+            output.shapes.iter().any(
+                |clipped| matches!(&clipped.shape, egui::Shape::Rect(rect) if rect.fill == color),
+            )
+        }
+
+        let neither = capture(false, false);
+        assert!(!has_fill(&neither, visuals.selection.bg_fill));
+        assert!(!has_stroke(&neither, visuals.warn_fg_color));
+
+        let multi_selected_only = capture(true, false);
+        assert!(has_fill(&multi_selected_only, visuals.selection.bg_fill));
+        assert!(
+            !has_stroke(&multi_selected_only, visuals.warn_fg_color),
+            "a multi-selected but unfocused row must not show the focus ring"
+        );
+
+        let focused_only = capture(false, true);
+        assert!(has_stroke(&focused_only, visuals.warn_fg_color));
+        assert!(
+            !has_fill(&focused_only, visuals.selection.bg_fill),
+            "a focused but not multi-selected row must not show the multi-select fill"
+        );
+
+        let both = capture(true, true);
+        assert!(
+            has_fill(&both, visuals.selection.bg_fill) && has_stroke(&both, visuals.warn_fg_color),
+            "a row that is both focused and multi-selected must show both the fill and the ring - \
+             this is the exact case Ctrl+Up/Down moving focus within a multi-selection hits"
         );
     }
 
@@ -9378,121 +9916,149 @@ mod tests {
     }
 
     /// Renders the *real* `show_loaded_data` - the exact parent GUI
-    /// section `update()` calls in production, not `show_bulk_platform_action_bar`
-    /// in isolation - into a real `egui::Context` frame, using the exact
-    /// same `selected_archives` `HashSet` that drives row highlighting.
-    /// Returns the height of the whole panel's rendered content, a real,
-    /// observable side effect of everything `show_loaded_data` actually
-    /// painted this frame (mount-all/doctor/search/filters/table/bulk
-    /// bar/details panel all included) - not a stand-in for any of it.
-    /// This is what closes the exact gap the previous "bulk bar never
-    /// appears" bug slipped through: a test that only called
-    /// `show_bulk_platform_action_bar` (or its `bulk_action_bar_visible`
-    /// predicate) directly could never have caught a layout-ordering bug
-    /// in `show_loaded_data` itself, since that function was never
-    /// exercised at all.
-    fn render_real_show_loaded_data(
-        ctx: &egui::Context,
-        data: &LoadedData,
-        selected_archives: &mut HashSet<PathBuf>,
-    ) -> f32 {
-        let mut filter = String::new();
-        let mut filtered_rows = None;
-        let mut selected_archive = None;
-        let mut confirm_unmount = None;
-        let mut confirm_lazy_unmount = None;
-        let mut confirm_lazy_unmount_final = None;
-        let mut confirm_mount_all = None;
-        let mut focus_mount_all_cancel = false;
-        let mut confirm_unmount_all = None;
-        let mut focus_unmount_all_cancel = false;
-        let mut focus_lazy_cancel = false;
-        let mut focus_final_lazy_cancel = false;
-        let lazy_unmount_offers = HashSet::new();
-        let remount_offers = HashSet::new();
-        let mut cleanup_after_unmount = false;
-        let mut history = OperationHistory::default();
-        let mut library_filters = LibraryRowFilters::default();
-        let mut platform_choice = None;
-        let mut platform_custom_text = String::new();
-        let mut bulk_platform_choice = None;
+    /// section `update()` calls in production, not any of its inner
+    /// helpers in isolation - into a real `egui::Context` frame, driving
+    /// it through the exact same fields `ArchiveFsApp` itself owns across
+    /// frames. This is what closes the exact gap the original "bulk bar
+    /// never appears" bug slipped through: a test that only called an
+    /// inner helper (or its pure predicate) directly could never have
+    /// caught a layout-ordering bug in `show_loaded_data` itself, since
+    /// that function was never exercised at all. Used the same way for
+    /// the milestone's keyboard-navigation and header-sort-click tests:
+    /// each call can supply its own synthetic `RawInput` (key events,
+    /// clicks, focus changes) while every other field persists across
+    /// calls exactly as it would across real frames.
+    struct RealLoadedDataHarness {
+        filter: String,
+        filtered_rows: Option<Vec<usize>>,
+        selected_archive: Option<PathBuf>,
+        selected_archives: HashSet<PathBuf>,
+        library_filters: LibraryRowFilters,
+        sort_field: Option<SortField>,
+        sort_ascending: bool,
+        library_scroll_offset: f32,
+    }
 
-        // A bounded, realistic `screen_rect` is required here, not just for
-        // fidelity: with `RawInput::default()` (no `screen_rect`), egui
-        // falls back to a very large default canvas. Both `ScrollArea`s
-        // below use `auto_shrink([false, false])`, i.e. "always claim all
-        // remaining space" - against a near-infinite canvas that remaining
-        // space is effectively constant, so the scroll areas silently
-        // absorb whatever height the bulk bar adds above them and the
-        // panel's total `min_rect().height()` comes out identical either
-        // way. Bounding the panel to a realistic window size makes the
-        // inner vertical `ScrollArea`'s `.max(row_height)` floor (see
-        // `show_loaded_data`) bite, so it can no longer fully compensate -
-        // only then does the bulk bar's contribution actually show up in
-        // the total height, which is what makes this a meaningful
-        // "did the real layout render it" check instead of a tautology.
-        let mut panel_height = 0.0;
-        let input = egui::RawInput {
+    impl RealLoadedDataHarness {
+        fn new() -> Self {
+            Self {
+                filter: String::new(),
+                filtered_rows: None,
+                selected_archive: None,
+                selected_archives: HashSet::new(),
+                library_filters: LibraryRowFilters::default(),
+                sort_field: None,
+                sort_ascending: true,
+                library_scroll_offset: 0.0,
+            }
+        }
+
+        /// Renders one frame with `input`, returning the whole panel's
+        /// rendered content height - a real, observable side effect of
+        /// everything `show_loaded_data` actually painted this frame
+        /// (mount-all/doctor/search/filters/table/bulk bar/details panel
+        /// all included), never a pixel-position assertion.
+        fn render(&mut self, ctx: &egui::Context, data: &LoadedData, input: egui::RawInput) -> f32 {
+            let mut confirm_unmount = None;
+            let mut confirm_lazy_unmount = None;
+            let mut confirm_lazy_unmount_final = None;
+            let mut confirm_mount_all = None;
+            let mut focus_mount_all_cancel = false;
+            let mut confirm_unmount_all = None;
+            let mut focus_unmount_all_cancel = false;
+            let mut focus_lazy_cancel = false;
+            let mut focus_final_lazy_cancel = false;
+            let lazy_unmount_offers = HashSet::new();
+            let remount_offers = HashSet::new();
+            let mut cleanup_after_unmount = false;
+            let mut history = OperationHistory::default();
+            let mut platform_choice = None;
+            let mut platform_custom_text = String::new();
+            let mut bulk_platform_choice = None;
+
+            let mut panel_height = 0.0;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_loaded_data(
+                        ui,
+                        data,
+                        LoadedViewState {
+                            filter: &mut self.filter,
+                            filtered_rows: &mut self.filtered_rows,
+                            selected_archive: &mut self.selected_archive,
+                            operation: None,
+                            busy: false,
+                            feedback: None,
+                            confirm_unmount: &mut confirm_unmount,
+                            confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                            confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
+                            confirm_mount_all: &mut confirm_mount_all,
+                            focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                            confirm_unmount_all: &mut confirm_unmount_all,
+                            focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                            focus_lazy_cancel: &mut focus_lazy_cancel,
+                            focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
+                            lazy_unmount_offers: &lazy_unmount_offers,
+                            remount_offers: &remount_offers,
+                            cleanup_after_unmount: &mut cleanup_after_unmount,
+                            mount_all_result: None,
+                            unmount_all_result: None,
+                            history: &mut history,
+                            cached: None,
+                            library_filters: &mut self.library_filters,
+                            platform_choice: &mut platform_choice,
+                            platform_custom_text: &mut platform_custom_text,
+                            platform_busy: false,
+                            selected_archives: &mut self.selected_archives,
+                            bulk_platform_choice: &mut bulk_platform_choice,
+                            bulk_platform_busy: false,
+                            sort_field: &mut self.sort_field,
+                            sort_ascending: &mut self.sort_ascending,
+                            library_scroll_offset: &mut self.library_scroll_offset,
+                        },
+                    );
+                    panel_height = ui.min_rect().height();
+                });
+            });
+            panel_height
+        }
+    }
+
+    // A bounded, realistic `screen_rect` is required here, not just for
+    // fidelity: with `RawInput::default()` (no `screen_rect`), egui falls
+    // back to a very large default canvas. Both `ScrollArea`s in
+    // `show_loaded_data` use `auto_shrink([false, false])`, i.e. "always
+    // claim all remaining space" - against a near-infinite canvas that
+    // remaining space is effectively constant, so the scroll areas
+    // silently absorb whatever height content placed above them adds and
+    // the panel's total `min_rect().height()` comes out identical either
+    // way. Bounding the panel to a realistic window size makes the inner
+    // vertical `ScrollArea`'s `.max(row_height)` floor (see
+    // `show_loaded_data`) bite, so it can no longer fully compensate -
+    // only then does content above it actually show up in the total
+    // height, which is what makes a height comparison a meaningful "did
+    // the real layout render it" check instead of a tautology.
+    fn bounded_test_input() -> egui::RawInput {
+        egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
                 egui::vec2(1000.0, 250.0),
             )),
             ..Default::default()
-        };
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_loaded_data(
-                    ui,
-                    data,
-                    LoadedViewState {
-                        filter: &mut filter,
-                        filtered_rows: &mut filtered_rows,
-                        selected_archive: &mut selected_archive,
-                        operation: None,
-                        busy: false,
-                        feedback: None,
-                        confirm_unmount: &mut confirm_unmount,
-                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
-                        confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
-                        confirm_mount_all: &mut confirm_mount_all,
-                        focus_mount_all_cancel: &mut focus_mount_all_cancel,
-                        confirm_unmount_all: &mut confirm_unmount_all,
-                        focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
-                        focus_lazy_cancel: &mut focus_lazy_cancel,
-                        focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
-                        lazy_unmount_offers: &lazy_unmount_offers,
-                        remount_offers: &remount_offers,
-                        cleanup_after_unmount: &mut cleanup_after_unmount,
-                        mount_all_result: None,
-                        unmount_all_result: None,
-                        history: &mut history,
-                        cached: None,
-                        library_filters: &mut library_filters,
-                        platform_choice: &mut platform_choice,
-                        platform_custom_text: &mut platform_custom_text,
-                        platform_busy: false,
-                        selected_archives,
-                        bulk_platform_choice: &mut bulk_platform_choice,
-                        bulk_platform_busy: false,
-                    },
-                );
-                panel_height = ui.min_rect().height();
-            });
-        });
-        panel_height
+        }
     }
 
     #[test]
     fn real_show_loaded_data_hides_the_bulk_bar_for_one_selected_row() {
         let ctx = egui::Context::default();
         let data = empty_loaded_data("/mount");
-        let mut selected_archives: HashSet<PathBuf> =
-            [PathBuf::from("/roms/a.zip")].into_iter().collect();
 
-        let one_selected_height = render_real_show_loaded_data(&ctx, &data, &mut selected_archives);
+        let mut one_selected = RealLoadedDataHarness::new();
+        one_selected.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        let one_selected_height = one_selected.render(&ctx, &data, bounded_test_input());
 
-        let mut none_selected = HashSet::new();
-        let none_selected_height = render_real_show_loaded_data(&ctx, &data, &mut none_selected);
+        let mut none_selected = RealLoadedDataHarness::new();
+        let none_selected_height = none_selected.render(&ctx, &data, bounded_test_input());
 
         assert_eq!(
             one_selected_height, none_selected_height,
@@ -9511,18 +10077,20 @@ mod tests {
         // regression is actually fixed.
         let ctx = egui::Context::default();
         let data = empty_loaded_data("/mount");
-        let mut one_selected: HashSet<PathBuf> =
-            [PathBuf::from("/roms/a.zip")].into_iter().collect();
-        let one_selected_height = render_real_show_loaded_data(&ctx, &data, &mut one_selected);
 
-        let mut three_selected: HashSet<PathBuf> = [
+        let mut one_selected = RealLoadedDataHarness::new();
+        one_selected.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        let one_selected_height = one_selected.render(&ctx, &data, bounded_test_input());
+
+        let mut three_selected = RealLoadedDataHarness::new();
+        three_selected.selected_archives = [
             PathBuf::from("/roms/a.zip"),
             PathBuf::from("/roms/b.zip"),
             PathBuf::from("/roms/c.zip"),
         ]
         .into_iter()
         .collect();
-        let three_selected_height = render_real_show_loaded_data(&ctx, &data, &mut three_selected);
+        let three_selected_height = three_selected.render(&ctx, &data, bounded_test_input());
 
         assert!(
             three_selected_height > one_selected_height,
@@ -9593,6 +10161,838 @@ mod tests {
 
         selected.insert(PathBuf::from("/roms/b.zip"));
         assert!(bulk_action_bar_visible(&selected));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.3.8-alpha: library-table usability milestone - pure-logic tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn selection_status_text_matches_the_hashset_count() {
+        assert_eq!(selection_status_text(0), "No archives selected");
+        assert_eq!(selection_status_text(1), "1 archive selected");
+        assert_eq!(selection_status_text(2), "2 archives selected");
+        assert_eq!(selection_status_text(11), "11 archives selected");
+    }
+
+    #[test]
+    fn library_table_message_distinguishes_empty_library_from_zero_filter_results() {
+        assert_eq!(
+            library_table_message(true, 0),
+            Some(LibraryTableMessage::EmptyLibrary),
+            "an empty library must report EmptyLibrary regardless of visible_count"
+        );
+        assert_eq!(
+            library_table_message(false, 0),
+            Some(LibraryTableMessage::NoFilterResults),
+            "archives exist but none are visible must report NoFilterResults"
+        );
+        assert_eq!(
+            library_table_message(false, 3),
+            None,
+            "archives exist and some are visible: no message, render the table"
+        );
+    }
+
+    #[test]
+    fn select_all_visible_returns_only_the_visible_paths_not_the_hidden_ones() {
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+            row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+        ];
+        // Only rows 0 and 2 pass the current filter - row 1 is hidden.
+        let visible_indices = vec![0usize, 2usize];
+
+        let selected = select_all_visible(&merged_rows, &visible_indices);
+
+        assert_eq!(
+            selected,
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "Ctrl+A must select exactly the visible rows, never the filtered-out one"
+        );
+    }
+
+    #[test]
+    fn next_focus_in_visible_order_steps_through_visible_sorted_order() {
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "Z", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "Y", "Live", "b.zip", "/mnt/b"),
+            row_with_fields("/roms/c.zip", "X", "Live", "c.zip", "/mnt/c"),
+        ];
+        // Sorted by platform ascending would put c (X), b (Y), a (Z) in
+        // that screen order - verify arrow navigation follows *this*
+        // order, not the merged_rows insertion order.
+        let visible_indices = vec![2usize, 1usize, 0usize];
+
+        let first =
+            next_focus_in_visible_order(&merged_rows, &visible_indices, None, ArrowDirection::Down);
+        assert_eq!(first, Some(PathBuf::from("/roms/c.zip")));
+
+        let second = next_focus_in_visible_order(
+            &merged_rows,
+            &visible_indices,
+            first.as_deref(),
+            ArrowDirection::Down,
+        );
+        assert_eq!(second, Some(PathBuf::from("/roms/b.zip")));
+
+        let third = next_focus_in_visible_order(
+            &merged_rows,
+            &visible_indices,
+            second.as_deref(),
+            ArrowDirection::Down,
+        );
+        assert_eq!(third, Some(PathBuf::from("/roms/a.zip")));
+
+        let back = next_focus_in_visible_order(
+            &merged_rows,
+            &visible_indices,
+            third.as_deref(),
+            ArrowDirection::Up,
+        );
+        assert_eq!(back, Some(PathBuf::from("/roms/b.zip")));
+    }
+
+    #[test]
+    fn next_focus_in_visible_order_clamps_at_both_ends_without_wrapping() {
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+        ];
+        let visible_indices = vec![0usize, 1usize];
+
+        let at_last = next_focus_in_visible_order(
+            &merged_rows,
+            &visible_indices,
+            Some(Path::new("/roms/b.zip")),
+            ArrowDirection::Down,
+        );
+        assert_eq!(
+            at_last,
+            Some(PathBuf::from("/roms/b.zip")),
+            "Down at the last visible row must stay put, not wrap to the first"
+        );
+
+        let at_first = next_focus_in_visible_order(
+            &merged_rows,
+            &visible_indices,
+            Some(Path::new("/roms/a.zip")),
+            ArrowDirection::Up,
+        );
+        assert_eq!(
+            at_first,
+            Some(PathBuf::from("/roms/a.zip")),
+            "Up at the first visible row must stay put, not wrap to the last"
+        );
+    }
+
+    #[test]
+    fn next_focus_in_visible_order_does_not_use_a_stale_index_after_filtering() {
+        // Reproduces the exact stale-index hazard requirement 1 calls
+        // out: focus is on a row that a *new* filter has just hidden.
+        // `next_focus_in_visible_order` must re-derive the focus's
+        // position from its exact path every call, never trust a
+        // previously-computed row index into the old (pre-filter)
+        // `visible_indices`.
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+            row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+        ];
+        // Before filtering: focus sits on b.zip at visible position 1.
+        let focus = Some(PathBuf::from("/roms/b.zip"));
+
+        // A filter change just ran: b.zip no longer matches, only a.zip
+        // and c.zip remain visible (at *new* positions 0 and 1).
+        let visible_indices_after_filter = vec![0usize, 2usize];
+
+        let next = next_focus_in_visible_order(
+            &merged_rows,
+            &visible_indices_after_filter,
+            focus.as_deref(),
+            ArrowDirection::Down,
+        );
+
+        // b.zip can no longer be found in the new visible list, so this
+        // must fall back to the first visible row (a.zip) - never panic,
+        // never silently keep pointing at the now-hidden b.zip, and never
+        // misinterpret a stale numeric index as still meaning position 1
+        // (which would incorrectly land on c.zip).
+        assert_eq!(next, Some(PathBuf::from("/roms/a.zip")));
+    }
+
+    #[test]
+    fn apply_arrow_focus_change_replaces_selection_without_ctrl_and_preserves_it_with_ctrl() {
+        let mut selected_archives: HashSet<PathBuf> =
+            [PathBuf::from("/roms/old.zip")].into_iter().collect();
+        let mut selected_archive = Some(PathBuf::from("/roms/old.zip"));
+
+        apply_arrow_focus_change(
+            &mut selected_archives,
+            &mut selected_archive,
+            PathBuf::from("/roms/new.zip"),
+            false,
+        );
+        assert_eq!(selected_archive, Some(PathBuf::from("/roms/new.zip")));
+        assert_eq!(
+            selected_archives,
+            [PathBuf::from("/roms/new.zip")].into_iter().collect(),
+            "without Ctrl, moving focus must replace the whole selection"
+        );
+
+        apply_arrow_focus_change(
+            &mut selected_archives,
+            &mut selected_archive,
+            PathBuf::from("/roms/newer.zip"),
+            true,
+        );
+        assert_eq!(selected_archive, Some(PathBuf::from("/roms/newer.zip")));
+        assert_eq!(
+            selected_archives,
+            [PathBuf::from("/roms/new.zip")].into_iter().collect(),
+            "with Ctrl held, moving focus must not touch the multi-selection"
+        );
+    }
+
+    #[test]
+    fn compute_scroll_offset_for_focus_does_not_move_when_already_visible() {
+        // Focus at row 2 (rows 24px apart) sits entirely within a viewport
+        // already scrolled to show rows 1-5 (offset 24.0, height 120.0) -
+        // no scroll should be requested at all, so repeatedly pressing
+        // Ctrl+Down within an already-visible range never jitters the view.
+        let offset = compute_scroll_offset_for_focus(2, 24.0, 24.0, 120.0);
+        assert_eq!(offset, 24.0);
+    }
+
+    #[test]
+    fn compute_scroll_offset_for_focus_scrolls_up_when_focus_moves_above_the_viewport() {
+        // Focus lands on row 1, but the viewport currently starts at
+        // offset 48.0 (row 2) - row 1 is above the visible area, so the
+        // offset must move up to align row 1 to the top edge exactly.
+        let offset = compute_scroll_offset_for_focus(1, 24.0, 48.0, 120.0);
+        assert_eq!(
+            offset, 24.0,
+            "focus above the viewport must scroll up to the row's own top edge"
+        );
+    }
+
+    #[test]
+    fn compute_scroll_offset_for_focus_scrolls_down_when_focus_moves_below_the_viewport() {
+        // Viewport shows rows starting at offset 0.0, 120.0 tall (5 rows of
+        // 24px each, rows 0-4). Focus moves to row 5, one past the bottom
+        // edge - the offset must move down just enough to bring row 5's
+        // bottom edge exactly to the viewport's bottom edge.
+        let offset = compute_scroll_offset_for_focus(5, 24.0, 0.0, 120.0);
+        assert_eq!(
+            offset, 24.0,
+            "focus below the viewport must scroll down to the row's own bottom edge"
+        );
+    }
+
+    #[test]
+    fn compute_scroll_offset_for_focus_never_scrolls_above_the_top() {
+        let offset = compute_scroll_offset_for_focus(0, 24.0, 0.0, 500.0);
+        assert_eq!(
+            offset, 0.0,
+            "a viewport taller than the content must clamp to 0"
+        );
+    }
+
+    #[test]
+    fn sort_visible_indices_orders_each_column_ascending_and_descending() {
+        let merged_rows = vec![
+            row_with_fields("/roms/a.zip", "SNES", "Missing", "b_archive.zip", "/mnt/z"),
+            row_with_fields("/roms/b.zip", "GBA", "Live", "a_archive.zip", "/mnt/a"),
+            row_with_fields("/roms/c.zip", "NES", "Pending", "c_archive.zip", "/mnt/m"),
+        ];
+
+        for field in COLUMN_SORT_FIELDS {
+            let mut ascending = vec![0usize, 1usize, 2usize];
+            sort_visible_indices(&merged_rows, &mut ascending, field, true);
+            let ascending_keys: Vec<&str> = ascending
+                .iter()
+                .map(|&index| sort_field_key(&merged_rows[index], field))
+                .collect();
+            let mut expected_ascending = ascending_keys.clone();
+            expected_ascending.sort();
+            assert_eq!(
+                ascending_keys, expected_ascending,
+                "{field:?} ascending must be in ascending key order"
+            );
+
+            let mut descending = vec![0usize, 1usize, 2usize];
+            sort_visible_indices(&merged_rows, &mut descending, field, false);
+            let descending_keys: Vec<&str> = descending
+                .iter()
+                .map(|&index| sort_field_key(&merged_rows[index], field))
+                .collect();
+            let mut expected_descending = descending_keys.clone();
+            expected_descending.sort();
+            expected_descending.reverse();
+            assert_eq!(
+                descending_keys, expected_descending,
+                "{field:?} descending must be in descending key order"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_visible_indices_breaks_ties_deterministically_by_exact_path() {
+        // All three rows share the same platform - only the exact path
+        // can break the tie, and it must do so the same way every time,
+        // regardless of `merged_rows`'s incoming order.
+        let merged_rows = vec![
+            row_with_fields("/roms/charlie.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+            row_with_fields("/roms/alpha.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+            row_with_fields("/roms/bravo.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+        ];
+        let mut indices = vec![0usize, 1usize, 2usize];
+        sort_visible_indices(&merged_rows, &mut indices, SortField::Platform, true);
+
+        let ordered_paths: Vec<&PathBuf> = indices.iter().map(|&i| &merged_rows[i].path).collect();
+        assert_eq!(
+            ordered_paths,
+            vec![
+                &PathBuf::from("/roms/alpha.zip"),
+                &PathBuf::from("/roms/bravo.zip"),
+                &PathBuf::from("/roms/charlie.zip"),
+            ],
+            "rows tied on platform must be ordered by their exact path"
+        );
+
+        // Reversing the incoming order must not change the outcome -
+        // this is what makes the tie-break actually deterministic rather
+        // than merely "stable" (stability alone would just preserve
+        // whatever order happened to be handed in).
+        let mut reversed_indices = vec![2usize, 1usize, 0usize];
+        sort_visible_indices(
+            &merged_rows,
+            &mut reversed_indices,
+            SortField::Platform,
+            true,
+        );
+        let reversed_ordered_paths: Vec<&PathBuf> = reversed_indices
+            .iter()
+            .map(|&i| &merged_rows[i].path)
+            .collect();
+        assert_eq!(ordered_paths, reversed_ordered_paths);
+    }
+
+    #[test]
+    fn sort_visible_indices_never_touches_merged_rows_itself() {
+        // Requirement 2: sorting must not mutate database order or
+        // archive identity - `merged_rows` (and by extension
+        // `data.records`/`data.rows`) must come out byte-for-byte
+        // unchanged; only the separate `indices` list may reorder.
+        let merged_rows = vec![
+            row_with_fields("/roms/z.zip", "Z", "Live", "z.zip", "/mnt/z"),
+            row_with_fields("/roms/a.zip", "A", "Live", "a.zip", "/mnt/a"),
+        ];
+        let original_paths: Vec<PathBuf> = merged_rows.iter().map(|row| row.path.clone()).collect();
+
+        let mut indices = vec![0usize, 1usize];
+        sort_visible_indices(&merged_rows, &mut indices, SortField::Platform, true);
+
+        let paths_after: Vec<PathBuf> = merged_rows.iter().map(|row| row.path.clone()).collect();
+        assert_eq!(
+            original_paths, paths_after,
+            "merged_rows's own order must be untouched by sorting"
+        );
+        assert_eq!(indices, vec![1usize, 0usize]);
+    }
+
+    #[test]
+    fn apply_header_click_selects_new_field_ascending_then_toggles_same_field() {
+        let mut sort_field = None;
+        let mut sort_ascending = true;
+
+        apply_header_click(&mut sort_field, &mut sort_ascending, SortField::Platform);
+        assert_eq!(sort_field, Some(SortField::Platform));
+        assert!(sort_ascending, "a newly selected column starts ascending");
+
+        apply_header_click(&mut sort_field, &mut sort_ascending, SortField::Platform);
+        assert_eq!(sort_field, Some(SortField::Platform));
+        assert!(
+            !sort_ascending,
+            "clicking the already-active column again toggles direction"
+        );
+
+        apply_header_click(&mut sort_field, &mut sort_ascending, SortField::Platform);
+        assert!(sort_ascending, "toggling twice returns to ascending");
+
+        apply_header_click(&mut sort_field, &mut sort_ascending, SortField::State);
+        assert_eq!(sort_field, Some(SortField::State));
+        assert!(
+            sort_ascending,
+            "selecting a different column resets to ascending"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.3.8-alpha: library-table usability milestone - real
+    // `egui::Context::run` input-path tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn real_header_click_reaches_show_header_row_and_reports_the_clicked_column() {
+        let ctx = egui::Context::default();
+        let clicked_field: std::cell::RefCell<Option<SortField>> = std::cell::RefCell::new(None);
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            ui.scope(|ui| {
+                if let Some(field) =
+                    show_header_row(ui, &COLUMN_HEADERS, &COLUMN_SORT_FIELDS, 20.0, None, true)
+                {
+                    *clicked_field.borrow_mut() = Some(field);
+                }
+            })
+            .response
+        };
+
+        let mut header_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                header_rect = Some(render(ui).rect);
+            });
+        });
+        let header_rect = header_rect.unwrap();
+
+        // "Platform" is the first column - click well inside its left
+        // edge, safely clear of any neighbouring column regardless of
+        // exact font metrics.
+        let click_pos = egui::pos2(header_rect.left() + 20.0, header_rect.center().y);
+        simulate_row_click(&ctx, click_pos, egui::Modifiers::default(), render);
+
+        assert_eq!(
+            *clicked_field.borrow(),
+            Some(SortField::Platform),
+            "a real click on the header must be detected as the Platform column"
+        );
+    }
+
+    /// A single key-press event, bundled with the same bounded
+    /// `screen_rect` `bounded_test_input` uses - see its comment for why
+    /// an unbounded default canvas would make a height-based assertion
+    /// meaningless. Keyboard shortcuts do not depend on hit-testing
+    /// (unlike pointer clicks), so - unlike `simulate_row_click` - a
+    /// single frame carrying the event is enough; there is no
+    /// previous-frame-rect requirement to work around.
+    fn key_press_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..bounded_test_input()
+        }
+    }
+
+    #[test]
+    fn real_escape_key_clears_the_selected_archives_set() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archives = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+            .into_iter()
+            .collect();
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::Escape, egui::Modifiers::default()),
+        );
+
+        assert!(
+            harness.selected_archives.is_empty(),
+            "Escape must clear the complete selected_archives set"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_a_selects_only_the_currently_visible_filtered_rows() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "alpha.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "GBA", "Live", "bravo.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "SNES", "Live", "charlie.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        // Simulates the state right after a real filter-changed frame: only
+        // rows 0 and 2 (a.zip, c.zip) currently pass the search filter;
+        // row 1 (b.zip) is hidden.
+        harness.filtered_rows = Some(vec![0usize, 2usize]);
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::A, egui::Modifiers::CTRL),
+        );
+
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+                .into_iter()
+                .collect(),
+            "Ctrl+A must select only the archives visible after the current search/filters, \
+             never the hidden b.zip"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_a_is_ignored_while_the_search_box_has_keyboard_focus() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+
+        // Frame 1: render once so the search TextEdit exists this
+        // `Context`, then give it real keyboard focus - exactly the state
+        // egui is in immediately after a user clicks into the search box.
+        harness.render(&ctx, &data, bounded_test_input());
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID));
+        });
+
+        // Frame 2: Ctrl+A must be left for the focused text field's own
+        // "select all text" behaviour, never hijacked into a table
+        // selection change.
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::A, egui::Modifiers::CTRL),
+        );
+
+        assert!(
+            harness.selected_archives.is_empty(),
+            "Ctrl+A must be ignored for table selection while the search box has keyboard focus"
+        );
+    }
+
+    #[test]
+    fn real_ctrl_a_is_ignored_while_the_bulk_platform_combobox_popup_is_open() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+
+        // Frame 1: render once (registers everything with this Context).
+        harness.render(&ctx, &data, bounded_test_input());
+
+        // Open the exact popup egui's own `ComboBox::from_id_salt(
+        // "bulk_platform_choice_combo")` (see `show_bulk_platform_action_bar`)
+        // opens when clicked - `ComboBox::widget_to_popup_id` is private,
+        // but its formula (the widget id salted with "popup") is exactly
+        // reproducible, so this is a faithful simulation of a user having
+        // opened the dropdown, not a shortcut around it.
+        let popup_id = egui::Id::new("bulk_platform_choice_combo").with("popup");
+        egui::Popup::open_id(&ctx, popup_id);
+
+        // If Ctrl+A were not suppressed here, all 3 visible rows would be
+        // selected - so an unchanged single-row selection is conclusive.
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::A, egui::Modifiers::CTRL),
+        );
+
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/a.zip")].into_iter().collect(),
+            "Ctrl+A must be ignored for table selection while a ComboBox popup is open"
+        );
+    }
+
+    #[test]
+    fn real_arrow_navigation_follows_the_visible_sorted_order() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "Z-Platform", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "Y-Platform", "Live", "b.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "X-Platform", "Live", "c.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        // Ascending by platform puts c (X), b (Y), a (Z) in that screen
+        // order - arrow navigation must follow *this* order, never the
+        // rows' insertion order.
+        harness.sort_field = Some(SortField::Platform);
+        harness.sort_ascending = true;
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
+        );
+        assert_eq!(harness.selected_archive, Some(PathBuf::from("/roms/c.zip")));
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/c.zip")].into_iter().collect()
+        );
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
+        );
+        assert_eq!(harness.selected_archive, Some(PathBuf::from("/roms/b.zip")));
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/b.zip")].into_iter().collect(),
+            "moving focus without Ctrl must replace the selection with the newly focused row"
+        );
+    }
+
+    #[test]
+    fn real_arrow_navigation_does_not_use_a_stale_index_after_filtering() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archive = Some(PathBuf::from("/roms/b.zip"));
+        // A filter has just excluded b.zip - only a.zip and c.zip (at new
+        // positions 0 and 1) remain visible; b.zip's old position no
+        // longer means anything.
+        harness.filtered_rows = Some(vec![0usize, 2usize]);
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
+        );
+
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/a.zip")),
+            "focus must fall back to the first visible row, never use a stale index that \
+             would have pointed at whatever now occupies the old visible position 1"
+        );
+    }
+
+    /// The exact Nobara bug report: multiple rows selected, Ctrl+Up/Down
+    /// pressed - the selected count must stay unchanged (correct, and
+    /// already worked) while the focused archive (`selected_archive`)
+    /// actually moves through the visible order (the part that was
+    /// broken - see `focused_row_paints_a_distinct_stroke_from_the_multi_selected_fill`
+    /// for why it was invisible even though this underlying state change
+    /// itself was already correct before this fix).
+    #[test]
+    fn real_ctrl_arrow_navigation_preserves_the_multi_selection_and_moves_focus() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "SNES", "Live", "b.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "SNES", "Live", "c.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        let full_selection: HashSet<PathBuf> = [
+            PathBuf::from("/roms/a.zip"),
+            PathBuf::from("/roms/b.zip"),
+            PathBuf::from("/roms/c.zip"),
+        ]
+        .into_iter()
+        .collect();
+        harness.selected_archives = full_selection.clone();
+        harness.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::ArrowDown, egui::Modifiers::CTRL),
+        );
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/b.zip")),
+            "Ctrl+Down must move the focused archive to the next visible row"
+        );
+        assert_eq!(
+            harness.selected_archives, full_selection,
+            "Ctrl+Down must leave every multi-selected row exactly as it was"
+        );
+
+        harness.render(
+            &ctx,
+            &data,
+            key_press_input(egui::Key::ArrowUp, egui::Modifiers::CTRL),
+        );
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/a.zip")),
+            "Ctrl+Up must move the focused archive to the previous visible row"
+        );
+        assert_eq!(
+            harness.selected_archives, full_selection,
+            "Ctrl+Up must also leave every multi-selected row exactly as it was"
+        );
+    }
+
+    #[test]
+    fn real_keyboard_navigation_scrolls_the_newly_focused_row_into_view() {
+        let ctx = egui::Context::default();
+        // Comfortably more rows than the bounded 250px test viewport
+        // (see `bounded_test_input`) can show at once, so moving focus to
+        // the last one requires the fix to actually scroll - this cannot
+        // pass by coincidence the way a 2-3 row table could.
+        let rows: Vec<ArchiveRow> = (0..30)
+            .map(|i| {
+                row_with_fields(
+                    &format!("/roms/{i:02}.zip"),
+                    "SNES",
+                    "Live",
+                    &format!("{i:02}.zip"),
+                    &format!("/mnt/{i:02}"),
+                )
+            })
+            .collect();
+        let data = loaded_data_with_rows("/mount", rows);
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archive = Some(PathBuf::from("/roms/00.zip"));
+
+        for _ in 0..29 {
+            harness.render(
+                &ctx,
+                &data,
+                key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
+            );
+        }
+
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/29.zip")),
+            "sanity check: focus must actually have reached the last row"
+        );
+        assert!(
+            harness.library_scroll_offset > 0.0,
+            "moving keyboard focus down through 30 rows in a ~250px viewport must have \
+             scrolled the table - offset is still {}",
+            harness.library_scroll_offset
+        );
+    }
+
+    #[test]
+    fn real_sorting_does_not_change_the_selected_archives_set() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "Z", "Live", "a.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "Y", "Live", "b.zip", "/mnt/b"),
+                row_with_fields("/roms/c.zip", "X", "Live", "c.zip", "/mnt/c"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archives = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+            .into_iter()
+            .collect();
+
+        harness.render(&ctx, &data, bounded_test_input());
+        assert_eq!(harness.selected_archives.len(), 2);
+
+        harness.sort_field = Some(SortField::Platform);
+        harness.sort_ascending = false;
+        harness.render(&ctx, &data, bounded_test_input());
+
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+                .into_iter()
+                .collect(),
+            "sorting must never change which exact archives are selected, only the display order"
+        );
+    }
+
+    #[test]
+    fn real_zero_filter_results_message_renders_instead_of_an_empty_table() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![row_with_fields(
+                "/roms/a.zip",
+                "SNES",
+                "Live",
+                "a.zip",
+                "/mnt/a",
+            )],
+        );
+
+        let mut visible = RealLoadedDataHarness::new();
+        let visible_height = visible.render(&ctx, &data, bounded_test_input());
+
+        let mut hidden = RealLoadedDataHarness::new();
+        hidden.filtered_rows = Some(Vec::new());
+        let hidden_height = hidden.render(&ctx, &data, bounded_test_input());
+
+        assert!(
+            hidden_height < visible_height,
+            "when every row is filtered out, the header/table must not render at all (a short \
+             message instead) - got hidden={hidden_height} vs visible={visible_height}"
+        );
+    }
+
+    #[test]
+    fn real_empty_library_message_renders_instead_of_an_empty_table() {
+        let ctx = egui::Context::default();
+        let populated = loaded_data_with_rows(
+            "/mount",
+            vec![row_with_fields(
+                "/roms/a.zip",
+                "SNES",
+                "Live",
+                "a.zip",
+                "/mnt/a",
+            )],
+        );
+        let empty = empty_loaded_data("/mount");
+
+        let mut populated_harness = RealLoadedDataHarness::new();
+        let populated_height = populated_harness.render(&ctx, &populated, bounded_test_input());
+
+        let mut empty_harness = RealLoadedDataHarness::new();
+        let empty_height = empty_harness.render(&ctx, &empty, bounded_test_input());
+
+        assert!(
+            empty_height < populated_height,
+            "an empty library must never render the (empty) table - got empty={empty_height} \
+             vs populated={populated_height}"
+        );
     }
 
     #[test]
