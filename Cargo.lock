@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-cli"
-version = "0.4.2-alpha"
+version = "0.4.3-alpha"
 dependencies = [
  "archivefs-core",
  "log",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-core"
-version = "0.4.2-alpha"
+version = "0.4.3-alpha"
 dependencies = [
  "log",
  "notify",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-gui"
-version = "0.4.2-alpha"
+version = "0.4.3-alpha"
 dependencies = [
  "arboard",
  "archivefs-core",
