@@ -27,6 +27,13 @@ pub use database::{
     latest_schema_version, persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
+mod inspector;
+pub use inspector::{
+    INSPECTOR_ENTRY_LIMIT, InspectorEntry, InspectorEntryClassification, InspectorEntryKind,
+    InspectorError, InspectorReport, classify_entry, inspect_archive, inspect_archive_with_limit,
+    is_inspectable,
+};
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),
@@ -500,42 +507,87 @@ fn complete_doctor_report(
         }
     }
 
-    match inspect_path(&config.mount_root) {
-        PathInspection::Directory => report.pass(
-            "mount root",
-            format!("{} exists", config.mount_root.display()),
-        ),
-        PathInspection::Other => report.fail(
-            "mount root",
-            format!(
-                "{} exists but is not a directory",
-                config.mount_root.display()
-            ),
-        ),
+    // `mount_root_exists_as_directory` tracks whether the checks below
+    // should also probe writability - deliberately a *second*, separate
+    // check (mirroring `run_setup_diagnostics_with_checks`'s
+    // `mount_root_ready`/`mount_root_writable` split) rather than folding
+    // writability into the "mount root" pass/fail above. This closes a
+    // real gap where a mount root that exists but is not writable by the
+    // current user (owned by another user, wrong permissions - the exact
+    // live-Nobara symptom this was added for) used to report "mount root:
+    // Pass" here even though `SetupDiagnostics.ready_for_actions` (the
+    // actual Mount/Unmount gate) already correctly failed on it, making
+    // the Library page's "Doctor: Ready" summary silently contradict the
+    // real, stricter gate with no visible explanation.
+    let mount_root_exists_as_directory = match inspect_path(&config.mount_root) {
+        PathInspection::Directory => {
+            report.pass(
+                "mount root",
+                format!("{} exists", config.mount_root.display()),
+            );
+            true
+        }
+        PathInspection::Other => {
+            report.fail(
+                "mount root",
+                format!(
+                    "{} exists but is not a directory",
+                    config.mount_root.display()
+                ),
+            );
+            false
+        }
         PathInspection::Missing if create_mount_root => {
             match fs::create_dir_all(&config.mount_root) {
-                Ok(()) => report.pass(
-                    "mount root",
-                    format!("{} was created", config.mount_root.display()),
-                ),
-                Err(error) => report.fail(
-                    "mount root",
-                    format!("{} cannot be created: {error}", config.mount_root.display()),
-                ),
+                Ok(()) => {
+                    report.pass(
+                        "mount root",
+                        format!("{} was created", config.mount_root.display()),
+                    );
+                    true
+                }
+                Err(error) => {
+                    report.fail(
+                        "mount root",
+                        format!("{} cannot be created: {error}", config.mount_root.display()),
+                    );
+                    false
+                }
             }
         }
-        PathInspection::Missing => report.fail(
-            "mount root",
-            format!("{} does not exist", config.mount_root.display()),
-        ),
-        PathInspection::PermissionDenied(error) | PathInspection::MetadataError(error) => report
-            .fail(
+        PathInspection::Missing => {
+            report.fail(
+                "mount root",
+                format!("{} does not exist", config.mount_root.display()),
+            );
+            false
+        }
+        PathInspection::PermissionDenied(error) | PathInspection::MetadataError(error) => {
+            report.fail(
                 "mount root",
                 format!(
                     "{} cannot be inspected: {error}",
                     config.mount_root.display()
                 ),
-            ),
+            );
+            false
+        }
+    };
+    if mount_root_exists_as_directory {
+        if directory_is_writable(&config.mount_root) {
+            report.pass(
+                "mount root writable",
+                format!("{} is writable", config.mount_root.display()),
+            );
+        } else {
+            report.fail(
+                "mount root writable",
+                format!(
+                    "{} exists but is not writable by the current user",
+                    config.mount_root.display()
+                ),
+            );
+        }
     }
 
     if command_available(&config.ratarmount_bin) {
@@ -803,10 +855,27 @@ fn run_setup_diagnostics_with_checks(
     let config_valid = contents
         .as_deref()
         .is_some_and(|contents| parse_config(contents).is_ok());
-    let source_folders = fields
-        .as_ref()
-        .and_then(|fields| fields.source_folders.as_ref())
-        .map(|sources| sources.iter().map(PathBuf::from).collect::<Vec<_>>());
+    // Must agree with the Sources page, Scan All, and CLI source
+    // management - all three ultimately read `parse_source_folder_configs`
+    // (via `load_source_folder_configs_from`), never `ConfigFields.
+    // source_folders` directly. Reading that raw legacy field here used to
+    // mean a config using only the newer `[[source]]` block format
+    // reported zero source folders to diagnostics while the rest of the
+    // app correctly saw every structured, enabled source - "ArchiveFS is
+    // ready for scanning"/"...for mount/unmount actions" could then be
+    // permanently false even with a fully valid, populated config. Enabled
+    // filtering here mirrors `parse_config`'s own `Config.source_folders`
+    // semantics, so a disabled-only config is correctly still "no usable
+    // source folder is configured".
+    let source_folders = contents.as_deref().and_then(|contents| {
+        parse_source_folder_configs(contents).ok().map(|sources| {
+            sources
+                .into_iter()
+                .filter(|source| source.enabled)
+                .map(|source| source.path)
+                .collect::<Vec<_>>()
+        })
+    });
     let source_states = source_folders
         .as_deref()
         .unwrap_or_default()
@@ -867,11 +936,11 @@ fn run_setup_diagnostics_with_checks(
             .as_ref()
             .is_some_and(|sources| !sources.is_empty()),
         source_folders.as_ref().map_or_else(
-            || "No usable source_folders setting is available.".to_string(),
+            || "No usable source folder is configured.".to_string(),
             |sources| format!("{} source folder(s) configured.", sources.len()),
         ),
         "Source folders contain the archives ArchiveFS scans.",
-        "Add at least one existing directory to source_folders.",
+        "Add at least one existing, enabled source folder (Sources page or source_folders).",
     );
     for (source, state) in &source_states {
         setup_check(
@@ -888,7 +957,7 @@ fn run_setup_diagnostics_with_checks(
                 },
             ),
             "Unavailable source folders make library scans incomplete.",
-            "Create the directory or update source_folders to the correct path.",
+            "Create the directory or update this source's path (Sources page or source_folders).",
         );
     }
     setup_check(
@@ -4153,7 +4222,20 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("mame", "Arcade"),
     ("dos", "DOS"),
     ("msdos", "DOS"),
+    ("dosgames", "DOS"),
     ("scummvm", "ScummVM"),
+    // Conservative aliases only - see the doc comment above. Deliberately
+    // NOT included: bare "acorn" (too broad - Acorn made several distinct
+    // machines), and generic path components like "games", "software",
+    // "win", or "desktop" for PC (would false-positive on any unrelated
+    // folder using those common words).
+    ("archimedes", "Acorn Archimedes"),
+    ("acornarchimedes", "Acorn Archimedes"),
+    ("riscos", "Acorn Archimedes"),
+    ("pc", "PC"),
+    ("pcgames", "PC"),
+    ("windows", "PC"),
+    ("windowsgames", "PC"),
 ];
 
 /// Every canonical platform name this build recognises via the
@@ -4161,11 +4243,13 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
 /// sorted. This is the single source of truth for "known platform" used
 /// by manual platform assignment (`Database::set_manual_platform`) and
 /// its CLI/GUI callers - neither the CLI nor the GUI maintains a second,
-/// independently-drifting platform list. Does not include the small set
-/// of platform names only ever produced by the filename/title heuristic
-/// in `detect_platform_from_known_heuristics` (for example `"PC"` and
-/// `"Nintendo3DS"`) - those are ad hoc title matches, not part of the
-/// structured alias table this function draws from.
+/// independently-drifting platform list. Does not include platform names
+/// only ever produced by the filename/title heuristic in
+/// `detect_platform_from_known_heuristics` (for example `"Nintendo3DS"`) -
+/// those are ad hoc title matches, not part of the structured alias table
+/// this function draws from. `"PC"` is also reachable through that
+/// heuristic (see `iamjesuschrist`/`steamrip`), but is additionally a
+/// first-class folder alias below, so it does appear here.
 pub fn canonical_platform_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = FOLDER_PLATFORM_ALIASES
         .iter()
@@ -8478,6 +8562,9 @@ mod tests {
             ("mame", "Arcade"),
             ("dos", "DOS"),
             ("scummvm", "ScummVM"),
+            ("archimedes", "Acorn Archimedes"),
+            ("riscos", "Acorn Archimedes"),
+            ("pc", "PC"),
         ];
 
         let root = "/home/davedap/Archives";
@@ -8508,12 +8595,163 @@ mod tests {
             "canonical_platform_names must not contain duplicates"
         );
 
-        for expected in ["NeoGeo64", "NGage", "GameCube", "MSX2", "Xbox360"] {
+        for expected in [
+            "NeoGeo64",
+            "NGage",
+            "GameCube",
+            "MSX2",
+            "Xbox360",
+            "Acorn Archimedes",
+            "PC",
+        ] {
             assert!(
                 names.contains(&expected),
                 "{expected:?} should be a canonical platform name"
             );
         }
+    }
+
+    #[test]
+    fn acorn_archimedes_conservative_aliases_detect_the_canonical_platform() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/Archimedes/Game.zip"), root),
+            Some("Acorn Archimedes".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Acorn Archimedes/Game.7z"), root),
+            Some("Acorn Archimedes".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/RISC OS/Game.zip"), root),
+            Some("Acorn Archimedes".to_string())
+        );
+        // Explicitly NOT an alias: bare "acorn" is too broad (Acorn made
+        // several distinct machines) and must not match anything.
+        assert_eq!(
+            detect_platform(format!("{root}/Acorn/Game.zip"), root),
+            None
+        );
+    }
+
+    #[test]
+    fn pc_conservative_aliases_detect_the_canonical_platform() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/PC Games/Game Name.zip"), root),
+            Some("PC".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Windows Games/Game Name.7z"), root),
+            Some("PC".to_string())
+        );
+    }
+
+    #[test]
+    fn generic_games_and_desktop_paths_do_not_automatically_become_pc() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/Games/Game Name.zip"), root),
+            None,
+            "a bare \"Games\" folder must not imply PC"
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Desktop/GAMES/Game Name.zip"), root),
+            None,
+            "\"Desktop\"/\"GAMES\" are too generic to imply PC"
+        );
+    }
+
+    #[test]
+    fn dos_remains_distinct_from_pc_including_dos_games() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/DOS/Game Name.zip"), root),
+            Some("DOS".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/DOS Games/Game Name.zip"), root),
+            Some("DOS".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Platform detection must never depend on mount state (requirement:
+    // detection happens during scanning/catalogue reconciliation, before
+    // - and entirely independent of - any mount action).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unmounted_archive_receives_automatic_platform_detection() {
+        // `ArchiveIdentity::from_path` - the sole entry point archive
+        // scanning uses to populate `identity.platform` - takes only a
+        // path, source root, and filesystem metadata. It has no mount
+        // state parameter at all, so an archive the scanner has never
+        // even attempted to mount still gets a confident detection here.
+        let identity = ArchiveIdentity::from_path(
+            Path::new("/home/davedap/Archives/snes/Game.zip"),
+            PathBuf::from("/home/davedap/Archives"),
+            None,
+        );
+        assert_eq!(identity.platform.as_deref(), Some("SNES"));
+    }
+
+    #[test]
+    fn mounting_and_unmounting_do_not_change_the_detected_platform() {
+        // Build one `ArchiveRecord` per `MountState` from the exact same
+        // path/source-root pair, mirroring how the scanner attaches a
+        // separately-computed `MountState` (from `/proc/self/mountinfo`
+        // via `mount_state_for_plan`) onto an already-detected identity -
+        // the two are structurally independent, computed by different
+        // functions with no shared input. Detection must be identical
+        // across all three mount states.
+        let archive_for = |mount_state: MountState| {
+            let path = PathBuf::from("/home/davedap/Archives/snes/Game.zip");
+            let identity =
+                ArchiveIdentity::from_path(&path, PathBuf::from("/home/davedap/Archives"), None);
+            let archive = Archive {
+                kind: archive_kind(&path).unwrap(),
+                identity,
+                path,
+                health: ArchiveHealth::Pending,
+            };
+            ArchiveRecord::new(
+                MountPlan::new(archive, PathBuf::from("/mnt/archivefs/Test")),
+                mount_state,
+                ArchiveMetadata::empty(),
+                ArchiveHealth::Pending,
+            )
+        };
+
+        let pending = archive_for(MountState::Pending);
+        let mounted = archive_for(MountState::Mounted);
+        let mount_path_exists = archive_for(MountState::MountPathExists);
+
+        assert_eq!(pending.identity.platform.as_deref(), Some("SNES"));
+        assert_eq!(
+            pending.identity.platform, mounted.identity.platform,
+            "mounting must not change the detected platform"
+        );
+        assert_eq!(
+            pending.identity.platform, mount_path_exists.identity.platform,
+            "an existing mount-path directory must not change the detected platform"
+        );
+    }
+
+    #[test]
+    fn rescanning_applies_the_current_folder_alias_rules() {
+        // A stand-in for "rescan": detection is a pure function of the
+        // current alias table and the path, so re-running it (as a
+        // rescan would) against a folder alias added in this pass
+        // reflects the current rules with no separate "refresh" step
+        // needed - there is no stale cache to invalidate.
+        assert_eq!(
+            detect_platform(
+                "/home/davedap/Archives/Acorn Archimedes/Game.zip",
+                "/home/davedap/Archives"
+            ),
+            Some("Acorn Archimedes".to_string())
+        );
     }
 
     // -----------------------------------------------------------------
@@ -8912,6 +9150,71 @@ mod tests {
                 && check.status == DoctorStatus::Fail
                 && check.detail.ends_with("does not exist")
         }));
+    }
+
+    /// Reproduces the exact live-Nobara symptom reported: a mount root that
+    /// *exists* (so the old "mount root" check alone reported Pass, and
+    /// `DoctorReport::is_ready()` - what the Library page's "Doctor: Ready"
+    /// summary reads - agreed) but is not writable by the user actually
+    /// running ArchiveFS, while `run_setup_diagnostics_with_checks` (the
+    /// separate check that actually gates Mount/Unmount via
+    /// `SetupDiagnostics.ready_for_actions`) already correctly failed on
+    /// the same directory. Before the new "mount root writable" check
+    /// added alongside this test, Doctor could say "Ready" while Mount
+    /// stayed disabled with no visible explanation for why the two
+    /// disagreed. This pins `is_ready()` to `false` in that exact state,
+    /// closing the gap.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_mount_root_exists_but_unwritable_is_not_reported_ready() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("doctor_unwritable_mount_root");
+        let source_root = root.join("roms");
+        let mount_root = root.join("mounts");
+        let ratarmount = root.join("ratarmount");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::write(&ratarmount, b"").unwrap();
+        fs::set_permissions(&mount_root, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\n",
+                source_root.display(),
+                mount_root.display(),
+                ratarmount.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_doctor_read_only(&config_path);
+
+        // Restore write access so `test_root`'s next-run cleanup (and this
+        // process's own tempdir) is never left behind unremovable.
+        fs::set_permissions(&mount_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "mount root" && check.status == DoctorStatus::Pass),
+            "the mount root does exist, so the existence check must still pass"
+        );
+        assert!(
+            report.checks.iter().any(|check| {
+                check.name == "mount root writable" && check.status == DoctorStatus::Fail
+            }),
+            "an existing but unwritable mount root must be reported as such"
+        );
+        assert!(
+            !report.is_ready(),
+            "Doctor must not report Ready while the mount root is unwritable - this is exactly \
+             what let \"Doctor: Ready\" contradict the real Mount/Unmount gate \
+             (SetupDiagnostics.ready_for_actions) with no visible explanation"
+        );
     }
 
     #[test]
@@ -9938,6 +10241,349 @@ mod tests {
         let tools_missing = run_setup_diagnostics_with_command_check(&config_path, |_| false);
         assert!(tools_missing.ready_for_scanning);
         assert!(!tools_missing.ready_for_actions);
+    }
+
+    /// Reproduces the reported live-Nobara bug: `run_setup_diagnostics_
+    /// with_checks` used to read `ConfigFields.source_folders` (the raw
+    /// legacy key) directly, so a config using only the newer `[[source]]`
+    /// block format reported "no usable source folder" and stayed
+    /// permanently not-ready-for-scanning/-actions, even though the
+    /// Sources page and Scan All (both built on `parse_source_folder_
+    /// configs`) correctly saw every structured source.
+    #[test]
+    fn structured_source_config_with_one_enabled_available_source_is_action_ready() {
+        let root = test_root("setup_structured_one_source");
+        let source = root.join("Archives");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = true\n",
+                mount_root.display(),
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(
+            report.checks.iter().any(|check| check.name
+                == "At least one source folder is configured"
+                && check.status == SetupDiagnosticStatus::Ready),
+            "a single enabled, available [[source]] must count as a configured source folder"
+        );
+        assert!(report.ready_for_scanning);
+        assert!(report.ready_for_actions);
+    }
+
+    #[test]
+    fn three_structured_sources_are_recognised_by_setup_diagnostics() {
+        // Mirrors the exact live-Nobara report: three structured sources,
+        // all enabled and available.
+        let root = test_root("setup_structured_three_sources");
+        let archives = root.join("Archives");
+        let games = root.join("Games");
+        let desktop_games = root.join("Desktop").join("GAMES");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&archives).unwrap();
+        fs::create_dir_all(&games).unwrap();
+        fs::create_dir_all(&desktop_games).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n",
+                mount_root.display(),
+                archives.display(),
+                games.display(),
+                desktop_games.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "At least one source folder is configured"
+                && check.status == SetupDiagnosticStatus::Ready
+                && check.detail == "3 source folder(s) configured."
+        }));
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .filter(|check| check.name == "Configured source folder exists")
+                .count(),
+            3,
+            "every structured source must get its own existence check, not just the legacy list"
+        );
+        assert!(report.ready_for_scanning);
+        assert!(report.ready_for_actions);
+    }
+
+    #[test]
+    fn legacy_source_folders_setup_diagnostics_remain_compatible() {
+        // Requirement 3: the fix must not regress the pre-multi-source
+        // config format - already exercised end to end by
+        // `ready_setup_diagnostics_distinguish_scanning_and_actions`, this
+        // pins the specific "at least one source folder is configured"
+        // check's Ready status for a legacy config too.
+        let root = test_root("setup_legacy_compat");
+        let source = root.join("roms");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                source.display(),
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "At least one source folder is configured"
+                && check.status == SetupDiagnosticStatus::Ready
+        }));
+        assert!(report.ready_for_scanning);
+        assert!(report.ready_for_actions);
+    }
+
+    #[test]
+    fn zero_sources_config_is_valid_but_not_action_ready() {
+        // Requirement 4: an empty/absent source list must remain a valid,
+        // startable config (no config-read/parse error), just not ready
+        // to scan or mount.
+        let root = test_root("setup_zero_sources");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config file exists" && check.status == SetupDiagnosticStatus::Ready
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config parses successfully"
+                && check.status == SetupDiagnosticStatus::Ready
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "At least one source folder is configured"
+                && check.status != SetupDiagnosticStatus::Ready
+        }));
+        assert!(!report.ready_for_scanning);
+        assert!(!report.ready_for_actions);
+    }
+
+    #[test]
+    fn only_disabled_structured_sources_is_not_action_ready() {
+        // Requirement 5: disabled sources alone must not count as usable,
+        // even though they are genuinely present in the config - mirrors
+        // `parse_config`'s own enabled-only filtering for `Config.
+        // source_folders`.
+        let root = test_root("setup_only_disabled_sources");
+        let source = root.join("Archives");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
+                mount_root.display(),
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "At least one source folder is configured"
+                && check.status != SetupDiagnosticStatus::Ready
+        }));
+        assert!(!report.ready_for_scanning);
+        assert!(!report.ready_for_actions);
+    }
+
+    #[test]
+    fn missing_structured_source_keeps_truthful_diagnostics() {
+        // Requirement 6: a source that exists in config but not on disk
+        // must still be reported as missing, never silently treated as
+        // usable just because it is enabled and present in the file.
+        let root = test_root("setup_missing_structured_source");
+        let missing_source = root.join("does-not-exist");
+        let mount_root = root.join("mounts");
+        fs::create_dir(&mount_root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = true\n",
+                mount_root.display(),
+                missing_source.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "At least one source folder is configured"
+                && check.status == SetupDiagnosticStatus::Ready
+        }));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "Configured source folder exists"
+                    && check.status != SetupDiagnosticStatus::Ready),
+            "an enabled but missing source must still fail its own existence check"
+        );
+        assert!(
+            !report.ready_for_scanning,
+            "a missing enabled source must block scanning even though it is configured"
+        );
+        assert!(!report.ready_for_actions);
+    }
+
+    #[test]
+    fn setup_diagnostics_sources_match_scan_all_sources() {
+        // Requirement 1/9: SetupDiagnostics and Scan All must agree on
+        // exactly which sources are "configured and enabled" - both now
+        // read `parse_source_folder_configs`/`load_source_folder_configs_
+        // from`, never a second, independently-drifting list.
+        let root = test_root("setup_matches_scan_all");
+        let archives = root.join("Archives");
+        let games = root.join("Games");
+        let disabled = root.join("Old");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&archives).unwrap();
+        fs::create_dir_all(&games).unwrap();
+        fs::create_dir_all(&disabled).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::write(archives.join("Game.zip"), b"").unwrap();
+        fs::write(games.join("Other.zip"), b"").unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = false\n",
+                mount_root.display(),
+                archives.display(),
+                games.display(),
+                disabled.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+        assert!(report.ready_for_scanning);
+        assert!(report.ready_for_actions);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "At least one source folder is configured"
+                && check.detail == "2 source folder(s) configured."
+        }));
+
+        let database_path = root.join("library.sqlite3");
+        let summary = scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+        assert!(
+            summary.folder_errors.is_empty(),
+            "both enabled sources must scan without error"
+        );
+        assert_eq!(
+            summary.counts.source_folders_scanned, 2,
+            "Scan All must attempt exactly the same 2 enabled sources SetupDiagnostics counted"
+        );
+        assert_eq!(summary.counts.archives_added, 2);
+    }
+
+    #[test]
+    fn exact_nobara_state_makes_a_present_pending_archive_action_ready() {
+        // End-to-end reproduction of the reported live state: three
+        // enabled, available structured sources, a valid writable mount
+        // root, ratarmount/unmount tools present - `ready_for_actions`
+        // must be true, which is exactly what makes
+        // `archive_action_block_reason` return `None` (Mount available)
+        // for a present, live, Pending archive - see
+        // `present_live_selected_archive_enables_mount` in
+        // `archivefs-gui` for the GUI-side half of this same guarantee.
+        let root = test_root("setup_exact_nobara_state");
+        let archives = root.join("Archives");
+        let games = root.join("Games");
+        let desktop_games = root.join("Desktop").join("GAMES");
+        let mount_root = root.join("mounts");
+        fs::create_dir_all(&archives).unwrap();
+        fs::create_dir_all(&games).unwrap();
+        fs::create_dir_all(&desktop_games).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::write(archives.join("Game.zip"), b"").unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n",
+                mount_root.display(),
+                archives.display(),
+                games.display(),
+                desktop_games.display()
+            ),
+        )
+        .unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        for name in [
+            "Config file exists",
+            "Config parses successfully",
+            "At least one source folder is configured",
+            "mount_root is configured",
+            "Mount root exists or can be created safely",
+            "Mount root is writable",
+            "ratarmount is available",
+            "fusermount3 or umount is available",
+            "ArchiveFS is ready for scanning",
+            "ArchiveFS is ready for mount/unmount actions",
+        ] {
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .any(|check| check.name == name && check.status == SetupDiagnosticStatus::Ready),
+                "expected {name:?} to be Ready in the exact reproduced Nobara state"
+            );
+        }
+        assert!(report.ready_for_scanning);
+        assert!(report.ready_for_actions);
     }
 
     #[test]

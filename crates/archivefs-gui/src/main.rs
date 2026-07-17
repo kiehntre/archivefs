@@ -16,8 +16,9 @@ use archivefs_core::{
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
     Config, ConfigIdentity, Database, DatabaseHealth, DoctorReport, DoctorStatus, HealthCategory,
-    HealthIssue, LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult,
-    MountOneOutcome, MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
+    HealthIssue, InspectorEntry, InspectorEntryClassification, InspectorEntryKind, InspectorReport,
+    LazyUnmountCleanupResult, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, MountOneOutcome,
+    MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
     PlatformProvenanceDetails, RecoveryAction, RecoveryOffer, RemoveSourceFolderOutcome,
     ScanPersistSummary, SetSourceFolderEnabledOutcome, SetupDiagnosticStatus, SetupDiagnostics,
     SourceAvailability, SourceFolderConfig, SourceFolderView, UnmountOneOutcome,
@@ -25,8 +26,9 @@ use archivefs_core::{
     catalogue_filename_duplicates, check_database_health, classify_archive_health,
     cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
-    format_unix_timestamp_utc, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
-    load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
+    format_unix_timestamp_utc, inspect_archive, is_inspectable, latest_schema_version,
+    lazy_unmount_one_archive_path_with_progress, load_read_only_snapshot_default,
+    load_source_folder_configs_from, mount_one_archive_path,
     persisted_archive_has_unknown_platform, remount_one_archive_path, remove_source_folder_default,
     run_setup_diagnostics_default, scan_all_enabled_sources_default, scan_and_persist,
     scan_source_folder_default, set_source_folder_enabled_default, source_health_issues,
@@ -40,8 +42,98 @@ use eframe::egui;
 // UTF-8/char-boundary handling.
 use eframe::egui::TextBuffer;
 
+/// The default/initial column widths - `[Platform, State, Archive path,
+/// Mount path]`. Platform and State stay fixed at these widths forever
+/// (milestone requirement: "Platform and State should remain compact");
+/// Archive path and Mount path are only the *starting point* for
+/// `LibraryColumnWidths`, which the header's drag handles mutate at
+/// runtime (see `show_column_resize_handle`). Still used directly
+/// wherever a widths array is needed but resizing is irrelevant (the
+/// loading-preview table before any live session exists, and the large
+/// majority of existing table tests that predate resizing and are not
+/// about it).
 const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
 const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
+/// Below this width a resizable column becomes an unusable sliver (milestone
+/// requirement: "sensible minimum widths so columns cannot collapse").
+/// Chosen so the column header text itself ("Archive path" / "Mount path")
+/// still fits without being clipped at the default readability scale.
+const MIN_RESIZABLE_COLUMN_WIDTH: f32 = 160.0;
+/// An upper bound purely to stop a single wild drag gesture from producing
+/// an absurd column width - not a meaningful design constraint otherwise;
+/// horizontal scrolling (see `show_loaded_data`'s outer
+/// `egui::ScrollArea::horizontal`) is what actually accommodates a wide
+/// column, not this cap.
+const MAX_RESIZABLE_COLUMN_WIDTH: f32 = 2400.0;
+/// How much of a resizable column's own trailing edge is reserved for its
+/// drag handle (see `show_header_row`) - deliberately taken out of the
+/// column's own width rather than added on top, so a header button and its
+/// handle never occupy overlapping screen space (and therefore never
+/// compete for the same click/drag).
+const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
+
+/// Vertical bounds for the Library page's two draggable top panels (see
+/// `show_loaded_data`'s `TopBottomPanel::top` calls). Both use egui's own
+/// built-in resizable-panel support - session-persisted via `ctx.memory`
+/// keyed by the panel id, so a height survives navigating away to Health/
+/// Duplicates/Sources/Tools/Inspector and back with no extra state of our
+/// own to manage, and clamped by `height_range` so neither panel can be
+/// dragged into a zero-height sliver or squeeze the table below it out of
+/// existence. `SUMMARY_PANEL_DEFAULT_HEIGHT` matches the panel's ordinary
+/// single-line content (the milestone's "compact by default" requirement);
+/// `SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT` is tall enough to show the
+/// archive's core fields plus the Mount/Unmount button without scrolling
+/// for a typical record.
+const SUMMARY_PANEL_MIN_HEIGHT: f32 = 32.0;
+const SUMMARY_PANEL_DEFAULT_HEIGHT: f32 = 64.0;
+const SUMMARY_PANEL_MAX_HEIGHT: f32 = 320.0;
+const SELECTED_ARCHIVE_PANEL_MIN_HEIGHT: f32 = 48.0;
+const SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT: f32 = 320.0;
+const SELECTED_ARCHIVE_PANEL_MAX_HEIGHT: f32 = 900.0;
+
+// A build-time guard against a future typo in the constants above -
+// stronger than a unit test, since a violation fails the build itself.
+const _: () = assert!(SUMMARY_PANEL_MIN_HEIGHT > 0.0);
+const _: () = assert!(SUMMARY_PANEL_MIN_HEIGHT <= SUMMARY_PANEL_DEFAULT_HEIGHT);
+const _: () = assert!(SUMMARY_PANEL_DEFAULT_HEIGHT <= SUMMARY_PANEL_MAX_HEIGHT);
+const _: () = assert!(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT > 0.0);
+const _: () = assert!(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT <= SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT);
+const _: () = assert!(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT <= SELECTED_ARCHIVE_PANEL_MAX_HEIGHT);
+
+/// The Library table's two user-resizable column widths - Platform and
+/// State are not part of this (see `COLUMN_WIDTHS`'s doc comment); they
+/// stay fixed. Lives on `ArchiveFsApp` for the app's whole session, so a
+/// resize survives navigating away from and back to the Library page
+/// exactly like every other Library-page display preference already does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LibraryColumnWidths {
+    archive_path: f32,
+    mount_path: f32,
+}
+
+impl Default for LibraryColumnWidths {
+    fn default() -> Self {
+        Self {
+            archive_path: COLUMN_WIDTHS[2],
+            mount_path: COLUMN_WIDTHS[3],
+        }
+    }
+}
+
+impl LibraryColumnWidths {
+    /// The full four-column widths array in the same `[Platform, State,
+    /// Archive path, Mount path]` order every rendering function already
+    /// expects - the one place Platform/State's fixed widths and the two
+    /// resizable ones are combined.
+    fn as_array(&self) -> [f32; 4] {
+        [
+            COLUMN_WIDTHS[0],
+            COLUMN_WIDTHS[1],
+            self.archive_path,
+            self.mount_path,
+        ]
+    }
+}
 /// A fixed, explicit `egui::Id` for the library search box - not for any
 /// production behaviour, but so tests can give it real keyboard focus
 /// via `Memory::request_focus` deterministically, without depending on
@@ -1151,11 +1243,126 @@ fn latest_generation_actions_safe(
     report.ready_for_actions && snapshot_identity == Some(&report.config_identity)
 }
 
+/// A concise, human-readable explanation for why archive actions (Mount,
+/// Unmount, Lazy Unmount, Remount) are currently blocked for a selected
+/// *live* archive. Mirrors `latest_generation_actions_safe`'s checks in the
+/// same order rather than re-deriving its own notion of "safe", so the
+/// label can never disagree with the actual gate: `Some(_)` here if and
+/// only if `busy || !latest_generation_actions_safe(..)` is true for the
+/// same inputs (see `archive_action_block_reason_matches_the_safety_gate`).
+/// Returns `None` when actions are available.
+fn archive_action_block_reason(
+    busy: bool,
+    current: RefreshGeneration,
+    snapshot_generation: Option<RefreshGeneration>,
+    snapshot_stale: bool,
+    snapshot_identity: Option<&ConfigIdentity>,
+    diagnostics: &DiagnosticsState,
+) -> Option<&'static str> {
+    if busy {
+        return Some("Another operation is running.");
+    }
+    if snapshot_generation != Some(current) || snapshot_stale {
+        return Some("Selection is stale. Refresh to continue.");
+    }
+    if diagnostics.generation() != current {
+        return Some("Waiting for diagnostics.");
+    }
+    let DiagnosticsState::Ready { report, .. } = diagnostics else {
+        return Some("Waiting for diagnostics.");
+    };
+    if !report.ready_for_actions {
+        let mount_root_failed = report.checks.iter().any(|check| {
+            (check.name == "Mount root exists or can be created safely"
+                || check.name == "Mount root is writable")
+                && check.status != SetupDiagnosticStatus::Ready
+        });
+        return Some(if mount_root_failed {
+            "Mount root is unavailable."
+        } else {
+            "Setup needs attention."
+        });
+    }
+    if snapshot_identity != Some(&report.config_identity) {
+        return Some("Selection is stale. Refresh to continue.");
+    }
+    None
+}
+
 fn snapshot_identity(state: &LoadState) -> Option<&ConfigIdentity> {
     match state {
         LoadState::Ready(data) => Some(&data.config_identity),
         LoadState::Loading { .. } | LoadState::Error(_) => None,
     }
+}
+
+/// A full, line-by-line breakdown of every boolean
+/// `latest_generation_actions_safe`/`archive_action_block_reason` reads,
+/// plus the raw `SetupDiagnostics.checks` list underneath `ready_for_actions`.
+/// Added specifically because the Library page's "Doctor: Ready" summary
+/// (from the *separate* `ArchiveSnapshot.doctor`/`DoctorReport`, computed by
+/// a different code path than `SetupDiagnostics`) can legitimately disagree
+/// with this gate, and previously gave the user no way to see why. Rendered
+/// in an always-present, collapsed-by-default section next to the Mount/
+/// Unmount button (see `show_selected_archive`); its mere presence in a
+/// running build also confirms the deployed binary actually contains this
+/// code, not just the terse one-line `archive_action_block_reason` text.
+fn action_readiness_debug_lines(
+    is_operation_busy: bool,
+    current: RefreshGeneration,
+    snapshot_generation: Option<RefreshGeneration>,
+    snapshot_stale: bool,
+    snapshot_identity: Option<&ConfigIdentity>,
+    diagnostics: &DiagnosticsState,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "busy (an operation is running): {is_operation_busy}"
+    ));
+    lines.push(format!("current refresh generation: {}", current.0));
+    lines.push(format!(
+        "snapshot generation: {}",
+        snapshot_generation
+            .map_or_else(|| "none".to_string(), |generation| generation.0.to_string())
+    ));
+    lines.push(format!(
+        "snapshot generation matches current: {}",
+        snapshot_generation == Some(current)
+    ));
+    lines.push(format!("snapshot marked stale: {snapshot_stale}"));
+    lines.push(format!(
+        "diagnostics generation: {}",
+        diagnostics.generation().0
+    ));
+    lines.push(format!(
+        "diagnostics generation matches current: {}",
+        diagnostics.generation() == current
+    ));
+    match diagnostics {
+        DiagnosticsState::Loading { .. } => {
+            lines.push("diagnostics state: Loading".to_string());
+        }
+        DiagnosticsState::Error { message, .. } => {
+            lines.push(format!("diagnostics state: Error ({message})"));
+        }
+        DiagnosticsState::Ready { report, .. } => {
+            lines.push("diagnostics state: Ready".to_string());
+            lines.push(format!("ready_for_scanning: {}", report.ready_for_scanning));
+            lines.push(format!("ready_for_actions: {}", report.ready_for_actions));
+            lines.push(format!(
+                "snapshot config identity matches diagnostics config identity: {}",
+                snapshot_identity == Some(&report.config_identity)
+            ));
+            lines.push("setup checks:".to_string());
+            for check in &report.checks {
+                lines.push(format!(
+                    "  [{:?}] {}: {}",
+                    check.status, check.name, check.detail
+                ));
+            }
+        }
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------
@@ -1816,14 +2023,19 @@ enum MainView {
     Sources,
 }
 
-/// A secondary, full-panel destination reached from the "Tools" menu -
-/// distinct from `MainView` because none of these are one of the four
-/// primary destinations the navigation bar always shows, but each still
-/// deserves its own full screen rather than a cramped inline corner of
-/// the Library page (milestone requirement: "Do not show database
-/// administration, aliases, diagnostics ... inline on \[the Library\]
-/// page"). Replaces the old standalone `show_diagnostics: bool` - one
-/// overlay slot, one thing showing at a time, exactly like `MainView`.
+/// A secondary, full-panel destination - distinct from `MainView` because
+/// none of these are one of the four primary destinations the navigation
+/// bar always shows, but each still deserves its own full screen rather
+/// than a cramped inline corner of the Library page (milestone
+/// requirement: "Do not show database administration, aliases,
+/// diagnostics ... inline on \[the Library\] page"). Replaces the old
+/// standalone `show_diagnostics: bool` - one overlay slot, one thing
+/// showing at a time, exactly like `MainView`. Most variants are reached
+/// from the "Tools" menu; `ArchiveInspector` is the one exception,
+/// reached instead from the selected archive's own "Inspect contents"
+/// button (see `show_selected_archive`) - it still belongs here rather
+/// than as a new `MainView`, since it is not one of the four
+/// always-visible primary destinations either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ToolsOverlay {
     #[default]
@@ -1832,7 +2044,91 @@ enum ToolsOverlay {
     PlatformAliases,
     DatabaseStatus,
     DoctorChecks,
+    ArchiveInspector,
 }
+
+/// The Archive Inspector's column/sort choices - path (its exact stored
+/// name), size (uncompressed), or classification (grouped, then by name
+/// within a group). Mirrors the Library table's `SortField` in spirit,
+/// but kept as its own type since the two lists share no fields at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InspectorSortField {
+    #[default]
+    Path,
+    Size,
+    Classification,
+}
+
+impl std::fmt::Display for InspectorSortField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Path => "Path",
+            Self::Size => "Size",
+            Self::Classification => "Classification",
+        })
+    }
+}
+
+type InspectorMessage = (RefreshGeneration, Result<InspectorReport, String>);
+
+/// What the Archive Inspector overlay is currently showing for its one
+/// archive (`ArchiveInspectorState::archive_path`) - mirrors
+/// `LoadState`'s own "Loading holds its own receiver" shape.
+enum ArchiveInspectorStatus {
+    Loading {
+        generation: RefreshGeneration,
+        receiver: Receiver<InspectorMessage>,
+    },
+    Ready(InspectorReport),
+    Error(String),
+}
+
+/// The Archive Inspector overlay's complete state for one archive.
+/// Opening the inspector for a *different* archive (or re-opening it for
+/// the same one) always replaces this wholesale with a fresh value - see
+/// `ArchiveFsApp::start_archive_inspection` - rather than mutating an
+/// existing one in place, so stray filter/sort/selection state from a
+/// previous archive can never leak into the next.
+struct ArchiveInspectorState {
+    archive_path: PathBuf,
+    status: ArchiveInspectorStatus,
+    search: String,
+    classification_filter: Option<InspectorEntryClassification>,
+    sort_field: InspectorSortField,
+    sort_ascending: bool,
+    /// The selected entry's exact stored name (see `InspectorEntry::name`)
+    /// - identity within one report, never a display-only truncated form.
+    selected_entry: Option<String>,
+    /// The Inspector row list's resizable Path column width - milestone
+    /// requirement: reuse the same readable-long-text treatment
+    /// (resizable columns, via `show_column_resize_handle`) the Library
+    /// table already has.
+    path_column_width: f32,
+}
+
+impl ArchiveInspectorState {
+    fn loading(
+        archive_path: PathBuf,
+        generation: RefreshGeneration,
+        receiver: Receiver<InspectorMessage>,
+    ) -> Self {
+        Self {
+            archive_path,
+            status: ArchiveInspectorStatus::Loading {
+                generation,
+                receiver,
+            },
+            search: String::new(),
+            classification_filter: None,
+            sort_field: InspectorSortField::default(),
+            sort_ascending: true,
+            selected_entry: None,
+            path_column_width: DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH,
+        }
+    }
+}
+
+const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
 
 /// Milestone readability requirement: "modestly increase default UI
 /// scale/text sizing" and give controls enough room that adjacent
@@ -2015,6 +2311,25 @@ struct ArchiveFsApp {
     /// path. Lives here, independent of `library_filters`, so it survives
     /// navigation exactly like every other Library filter already does.
     library_source_filter: Option<Option<PathBuf>>,
+    /// The Library table's current Archive path / Mount path column
+    /// widths - see `LibraryColumnWidths`. Platform and State are not
+    /// resizable and have no equivalent field.
+    library_column_widths: LibraryColumnWidths,
+    /// The Archive Inspector overlay's state for whichever archive it was
+    /// last opened for, if any - `None` means it has never been opened
+    /// this session. Independent of `tools_overlay`: closing the overlay
+    /// (setting `tools_overlay` back to `None`) deliberately leaves this
+    /// as-is, so reopening it shows the same archive's already-loaded
+    /// report instead of re-inspecting from scratch.
+    archive_inspector: Option<ArchiveInspectorState>,
+    /// Bumped every time a new inspection starts (a fresh "Inspect
+    /// contents" click, whether for a new archive or the same one again);
+    /// see `start_archive_inspection`/`poll_archive_inspection`. A
+    /// background result whose generation no longer matches this is
+    /// stale and must never be applied. Milestone requirement: "If the
+    /// selected archive changes or disappears before the result returns,
+    /// do not apply stale results."
+    archive_inspector_generation: RefreshGeneration,
 }
 
 impl ArchiveFsApp {
@@ -2104,6 +2419,9 @@ impl ArchiveFsApp {
             sources_add_dialog: None,
             sources_remove_dialog: None,
             library_source_filter: None,
+            library_column_widths: LibraryColumnWidths::default(),
+            archive_inspector: None,
+            archive_inspector_generation: RefreshGeneration::INITIAL,
         }
     }
 
@@ -2126,6 +2444,80 @@ impl ArchiveFsApp {
         };
         self.refresh_diagnostics(context);
         self.state = start_load(context.clone(), generation, previous);
+    }
+
+    /// Starts a fresh read-only inspection of `archive_path` in a
+    /// background thread (milestone requirement: "so large ZIP files do
+    /// not freeze the GUI") and opens the Archive Inspector overlay to
+    /// show it. Always replaces `self.archive_inspector` wholesale - see
+    /// `ArchiveInspectorState`'s own doc comment - and always bumps
+    /// `archive_inspector_generation` first, so any still-in-flight
+    /// result from a *previous* call can never be mistaken for this new
+    /// one once it lands (see `poll_archive_inspection`).
+    fn start_archive_inspection(&mut self, context: egui::Context, archive_path: PathBuf) {
+        self.archive_inspector_generation = self.archive_inspector_generation.next();
+        let generation = self.archive_inspector_generation;
+        let (sender, receiver) = mpsc::channel();
+        let job_path = archive_path.clone();
+        thread::spawn(move || {
+            // `inspect_archive` re-checks the path live (existence,
+            // format, structure) regardless of anything the caller
+            // believed - milestone requirement: "cached catalogue rows
+            // must not authorise inspection of a missing file."
+            let result = inspect_archive(&job_path).map_err(|error| error.to_string());
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+        self.archive_inspector = Some(ArchiveInspectorState::loading(
+            archive_path,
+            generation,
+            receiver,
+        ));
+        self.tools_overlay = ToolsOverlay::ArchiveInspector;
+    }
+
+    /// Mirrors `poll_load`'s exact shape: read the receiver (immutable
+    /// borrow) into an owned `result` first, then apply it as a separate
+    /// step, so the borrow checker never sees a conflict between reading
+    /// `self.archive_inspector` and later writing to it.
+    fn poll_archive_inspection(&mut self) {
+        let result = match self
+            .archive_inspector
+            .as_ref()
+            .map(|inspector| &inspector.status)
+        {
+            Some(ArchiveInspectorStatus::Loading {
+                generation,
+                receiver,
+            }) => match receiver.try_recv() {
+                Ok(message) => Some(message),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((
+                    *generation,
+                    Err("The inspection worker stopped unexpectedly.".to_string()),
+                )),
+            },
+            Some(ArchiveInspectorStatus::Ready(_) | ArchiveInspectorStatus::Error(_)) | None => {
+                None
+            }
+        };
+
+        let Some((generation, result)) = result else {
+            return;
+        };
+        // Stale - a newer inspection (a different archive, or the same
+        // one inspected again) has already superseded this one. Dropping
+        // it silently here, rather than ever applying it, is exactly the
+        // milestone's "do not apply stale results" requirement.
+        if generation != self.archive_inspector_generation {
+            return;
+        }
+        if let Some(inspector) = self.archive_inspector.as_mut() {
+            inspector.status = match result {
+                Ok(report) => ArchiveInspectorStatus::Ready(report),
+                Err(message) => ArchiveInspectorStatus::Error(message),
+            };
+        }
     }
 
     fn poll_load(&mut self, _context: &egui::Context) {
@@ -3879,6 +4271,7 @@ enum AppOperationRequest {
         kind: BulkPlatformActionKind,
     },
     RemoveMissing(Vec<PathBuf>),
+    InspectArchive(PathBuf),
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -3989,6 +4382,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
         self.poll_source_action(context);
+        self.poll_archive_inspection();
         self.poll_missing_removal(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
@@ -4004,6 +4398,22 @@ impl eframe::App for ArchiveFsApp {
             &self.diagnostics,
         );
         let archive_actions_blocked = busy || !actions_safe;
+        let archive_action_block_reason = archive_action_block_reason(
+            busy,
+            self.refresh_generation,
+            self.snapshot_generation,
+            self.snapshot_stale,
+            snapshot_identity(&self.state),
+            &self.diagnostics,
+        );
+        let action_readiness_debug_lines = action_readiness_debug_lines(
+            busy,
+            self.refresh_generation,
+            self.snapshot_generation,
+            self.snapshot_stale,
+            snapshot_identity(&self.state),
+            &self.diagnostics,
+        );
         let missing_removal_available = self.missing_removal_action_available();
         if loading || diagnostics_loading || busy {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -4203,6 +4613,13 @@ impl eframe::App for ArchiveFsApp {
                         };
                         show_doctor_checks_panel(ui, doctor);
                     }
+                    ToolsOverlay::ArchiveInspector => {
+                        if let Some(inspector) = self.archive_inspector.as_mut()
+                            && show_archive_inspector_panel(ui, inspector, &mut self.clipboard)
+                        {
+                            self.tools_overlay = ToolsOverlay::None;
+                        }
+                    }
                     ToolsOverlay::None => unreachable!(),
                 }
                 return;
@@ -4370,15 +4787,19 @@ impl eframe::App for ArchiveFsApp {
                             ui.spacing().interact_size.y,
                         );
                         let horizontal_spacing = ui.spacing().item_spacing.x;
+                        let preview_widths = self.library_column_widths.as_array();
                         egui::ScrollArea::horizontal()
                             .id_salt("cache_preview_horizontal")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.set_min_width(table_width(horizontal_spacing));
+                                ui.set_min_width(table_width(horizontal_spacing, &preview_widths));
                                 // This cache-only loading preview has no sort
                                 // state of its own to wire up (it disappears
                                 // the moment the live snapshot loads) - the
-                                // headers render inertly, unsorted.
+                                // headers render inertly, unsorted. Still
+                                // resizable (shares `self.library_column_widths`
+                                // with the real table) so a resize made here
+                                // is not lost once the live snapshot loads.
                                 let _ = show_header_row(
                                     ui,
                                     &COLUMN_HEADERS,
@@ -4386,6 +4807,7 @@ impl eframe::App for ArchiveFsApp {
                                     row_height,
                                     None,
                                     true,
+                                    &mut self.library_column_widths,
                                 );
                                 ui.separator();
                                 let body_height = ui.available_height().max(row_height);
@@ -4409,6 +4831,7 @@ impl eframe::App for ArchiveFsApp {
                                                 row_height,
                                                 None,
                                                 &HashSet::new(),
+                                                &preview_widths,
                                             );
                                         },
                                     );
@@ -4434,6 +4857,8 @@ impl eframe::App for ArchiveFsApp {
                             selected_archive: &mut self.selected_archive,
                             operation: self.operation.as_ref(),
                             busy: archive_actions_blocked,
+                            block_reason: archive_action_block_reason,
+                            action_readiness_debug_lines: &action_readiness_debug_lines,
                             feedback: self.feedback.as_ref(),
                             confirm_unmount: &mut self.confirm_unmount,
                             confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
@@ -4467,6 +4892,7 @@ impl eframe::App for ArchiveFsApp {
                             clipboard: &mut self.clipboard,
                             select_all_visible_requested: &mut self.select_all_visible_requested,
                             library_source_filter: &mut self.library_source_filter,
+                            library_column_widths: &mut self.library_column_widths,
                         },
                     );
                 }
@@ -4574,6 +5000,9 @@ impl eframe::App for ArchiveFsApp {
                 }
                 AppOperationRequest::RemoveMissing(archive_paths) => {
                     self.start_missing_removal(context.clone(), archive_paths);
+                }
+                AppOperationRequest::InspectArchive(archive_path) => {
+                    self.start_archive_inspection(context.clone(), archive_path);
                 }
             }
         }
@@ -5415,7 +5844,16 @@ fn show_activity_panel(
                 return;
             }
 
-            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+            // Milestone requirement: long activity messages must be
+            // readable, not silently clipped. Wrapping (the default for a
+            // `Label` inside this vertical `ScrollArea`, made explicit
+            // with `.wrap()`) replaces the previous single-line
+            // `.truncate()` + hover-tooltip treatment: every entry is now
+            // fully visible without needing to hover at all, and
+            // `.selectable(true)` lets a long path or error message be
+            // copied directly. This list is never `show_rows`-virtualized
+            // (bounded by `HISTORY_LIMIT` entries), so variable per-entry
+            // heights from wrapping need no special handling here.
             egui::ScrollArea::vertical()
                 .id_salt("activity_history")
                 .max_height(220.0)
@@ -5423,11 +5861,8 @@ fn show_activity_panel(
                 .show(ui, |ui| {
                     for entry in history.entries() {
                         let text = history_entry_text(entry);
-                        ui.add_sized(
-                            [ui.available_width(), row_height],
-                            egui::Label::new(&text).truncate(),
-                        )
-                        .on_hover_text(text);
+                        ui.add(egui::Label::new(text).selectable(true).wrap());
+                        ui.add_space(2.0);
                     }
                 });
         });
@@ -5462,6 +5897,394 @@ fn show_doctor_checks_panel(ui: &mut egui::Ui, doctor: Option<&DoctorReport>) {
                 ui.end_row();
             }
         });
+}
+
+const INSPECTOR_DETAILS_COLUMN_WIDTH: f32 = 300.0;
+
+/// Whether one entry matches the Archive Inspector's current search text
+/// (case-insensitive substring against its exact stored name) and
+/// classification filter - pure, so it is directly testable without
+/// rendering anything, mirroring `health_issue_matches`'s existing
+/// convention in this file.
+fn inspector_entry_matches(
+    entry: &InspectorEntry,
+    search_lower: &str,
+    classification_filter: Option<InspectorEntryClassification>,
+) -> bool {
+    if let Some(filter) = classification_filter
+        && entry.classification != filter
+    {
+        return false;
+    }
+    search_lower.is_empty() || entry.name.to_lowercase().contains(search_lower)
+}
+
+/// Filters and sorts the already-inspected entry list without ever
+/// mutating it - `entries` is only ever read here, exactly like
+/// `visible_health_issue_indices` reads its own `issues` slice.
+fn visible_inspector_entry_indices(
+    entries: &[InspectorEntry],
+    search: &str,
+    classification_filter: Option<InspectorEntryClassification>,
+    sort_field: InspectorSortField,
+    sort_ascending: bool,
+) -> Vec<usize> {
+    let search_lower = search.trim().to_lowercase();
+    let mut indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            inspector_entry_matches(entry, &search_lower, classification_filter).then_some(index)
+        })
+        .collect();
+    indices.sort_by(|&left, &right| {
+        let (left_entry, right_entry) = (&entries[left], &entries[right]);
+        let ordering = match sort_field {
+            InspectorSortField::Path => left_entry.name.cmp(&right_entry.name),
+            InspectorSortField::Size => left_entry
+                .uncompressed_size
+                .cmp(&right_entry.uncompressed_size),
+            InspectorSortField::Classification => {
+                left_entry.classification.cmp(&right_entry.classification)
+            }
+        }
+        .then_with(|| left_entry.name.cmp(&right_entry.name));
+        if sort_ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+    indices
+}
+
+/// The Inspector row list's compact trailing summary column - kind,
+/// classification, and (for files) size/compression, combined into one
+/// readable string rather than several more narrow fixed columns, in
+/// keeping with the milestone's "keep this first slice deliberately
+/// small" instruction. Every individual field is still available in full
+/// in the selected-entry details panel below the list.
+fn inspector_entry_details_text(entry: &InspectorEntry) -> String {
+    match entry.kind {
+        InspectorEntryKind::Directory => "Directory".to_string(),
+        InspectorEntryKind::File => format!(
+            "{} \u{2014} {} \u{2014} compressed {} \u{2014} {}",
+            entry.classification.label(),
+            format_size(Some(entry.uncompressed_size)),
+            format_size(entry.compressed_size),
+            entry.compression_method.as_deref().unwrap_or("Unknown"),
+        ),
+    }
+}
+
+/// Renders one Archive Inspector entry row - the same technique
+/// `show_data_row` uses for the Library table (a single `Sense::click()`
+/// region with `Painter`-painted cell text, never a child widget inside
+/// that region), generalised to two columns via the same now-slice-based
+/// `cell_index_at`/`hovered_cell_full_text` helpers the Library table
+/// itself uses. Selection here is single (`selected: bool`, no
+/// multi-select/Ctrl-click) - "Selecting one entry shows its complete
+/// details" never needed the Library table's fuller multi-select model.
+fn show_inspector_row(
+    ui: &mut egui::Ui,
+    entry: &InspectorEntry,
+    row_height: f32,
+    selected: bool,
+    widths: &[f32],
+) -> egui::Response {
+    let spacing = ui.spacing().item_spacing.x;
+    let width = widths.iter().sum::<f32>() + spacing * (widths.len().saturating_sub(1) as f32);
+    let (_, rect) = ui.allocate_space(egui::vec2(width, row_height));
+    let row_id = egui::Id::new("inspector_row").with(&entry.name);
+    let mut response = ui.interact(rect, row_id, egui::Sense::click());
+
+    let visuals = ui.visuals();
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 0.0, visuals.selection.bg_fill);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+
+    let details_text = inspector_entry_details_text(entry);
+    let cells: [&str; 2] = [entry.name.as_str(), details_text.as_str()];
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    let mut x = rect.left();
+    for (text, column_width) in cells.iter().zip(widths.iter().copied()) {
+        let cell_rect = egui::Rect::from_min_size(
+            egui::pos2(x, rect.top()),
+            egui::vec2(column_width, row_height),
+        );
+        ui.painter().with_clip_rect(cell_rect).text(
+            egui::pos2(x + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            *text,
+            font_id.clone(),
+            color,
+        );
+        x += column_width + spacing;
+    }
+
+    let pointer_x = response.hover_pos().map(|pos| pos.x);
+    if let Some(full_text) =
+        hovered_cell_full_text(pointer_x, rect.left(), &cells, widths, spacing, |text| {
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(text.to_string(), font_id.clone(), color)
+                    .size()
+                    .x
+            })
+        })
+    {
+        response = response.on_hover_text(full_text.to_string());
+    }
+
+    response
+}
+
+/// The Archive Inspector overlay - milestone: a read-only, first-slice
+/// viewer for one ZIP archive's entries. Returns `true` when the user
+/// asked to close it ("Back to Library"), exactly like every other
+/// `ToolsOverlay` panel - see its own dispatch in `update`.
+fn show_archive_inspector_panel(
+    ui: &mut egui::Ui,
+    state: &mut ArchiveInspectorState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> bool {
+    let close = show_tools_overlay_header(ui, "Archive Inspector");
+    ui.horizontal(|ui| {
+        ui.label("Archive:");
+        let path_text = state.archive_path.display().to_string();
+        ui.add(egui::Label::new(&path_text).selectable(true).wrap());
+        if ui.small_button("Copy").clicked() {
+            let _ = clipboard.set_text(path_text.clone());
+        }
+    });
+    ui.add_space(4.0);
+
+    match &state.status {
+        ArchiveInspectorStatus::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting archive - this runs in the background.");
+            });
+            return close;
+        }
+        ArchiveInspectorStatus::Error(message) => {
+            ui.colored_label(ui.visuals().error_fg_color, message);
+            return close;
+        }
+        ArchiveInspectorStatus::Ready(_) => {}
+    }
+    let ArchiveInspectorStatus::Ready(report) = &state.status else {
+        unreachable!("every other status already returned above");
+    };
+
+    if report.truncated {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "Showing the first {} of {} entries - this view is incomplete. Use a more \
+                 specific search to find a particular entry.",
+                report.entries.len(),
+                report.total_entries_in_archive
+            ),
+        );
+        ui.add_space(2.0);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        for classification in InspectorEntryClassification::ALL {
+            let count = report
+                .entries
+                .iter()
+                .filter(|entry| entry.classification == classification)
+                .count();
+            summary_value(ui, classification.label(), count);
+        }
+    });
+    ui.separator();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Search path:");
+        show_text_edit_with_context_menu(ui, &mut state.search, clipboard, |text_edit| {
+            text_edit
+                .id_salt("archivefs_inspector_search")
+                .desired_width(260.0)
+        });
+        ui.label("Classification:");
+        egui::ComboBox::from_id_salt("inspector_classification_filter")
+            .selected_text(
+                state
+                    .classification_filter
+                    .map(InspectorEntryClassification::label)
+                    .unwrap_or("All"),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.classification_filter, None, "All");
+                for classification in InspectorEntryClassification::ALL {
+                    ui.selectable_value(
+                        &mut state.classification_filter,
+                        Some(classification),
+                        classification.label(),
+                    );
+                }
+            });
+        ui.label("Sort by:");
+        egui::ComboBox::from_id_salt("inspector_sort_field")
+            .selected_text(state.sort_field.to_string())
+            .show_ui(ui, |ui| {
+                for field in [
+                    InspectorSortField::Path,
+                    InspectorSortField::Size,
+                    InspectorSortField::Classification,
+                ] {
+                    ui.selectable_value(&mut state.sort_field, field, field.to_string());
+                }
+            });
+        ui.checkbox(&mut state.sort_ascending, "Ascending");
+    });
+
+    let visible = visible_inspector_entry_indices(
+        &report.entries,
+        &state.search,
+        state.classification_filter,
+        state.sort_field,
+        state.sort_ascending,
+    );
+    ui.horizontal_wrapped(|ui| {
+        summary_value(ui, "Entries shown", visible.len());
+        summary_value(ui, "Total entries", report.entries.len());
+    });
+    ui.separator();
+
+    if report.entries.is_empty() {
+        ui.label("This archive has no entries.");
+        return close;
+    }
+    if visible.is_empty() {
+        ui.label("No entries match the current search/filter.");
+        return close;
+    }
+
+    let row_height = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let spacing = ui.spacing().item_spacing.x;
+
+    ui.strong("Entries");
+    egui::ScrollArea::horizontal()
+        .id_salt("inspector_entries_horizontal")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let start_of_frame_width = state.path_column_width;
+            ui.set_min_width(start_of_frame_width + spacing + INSPECTOR_DETAILS_COLUMN_WIDTH);
+
+            let mut path_header_rect = None;
+            ui.horizontal(|ui| {
+                let response = ui.add_sized(
+                    [start_of_frame_width, row_height],
+                    egui::Label::new(egui::RichText::new("Path").strong()),
+                );
+                path_header_rect = Some(response.rect);
+                ui.add_sized(
+                    [INSPECTOR_DETAILS_COLUMN_WIDTH, row_height],
+                    egui::Label::new(egui::RichText::new("Details").strong()),
+                );
+            });
+            if let Some(path_header_rect) = path_header_rect {
+                let handle_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        path_header_rect.right() - COLUMN_RESIZE_HANDLE_WIDTH,
+                        path_header_rect.top(),
+                    ),
+                    egui::vec2(COLUMN_RESIZE_HANDLE_WIDTH, path_header_rect.height()),
+                );
+                show_column_resize_handle(
+                    ui,
+                    egui::Id::new("inspector_path_column_resize"),
+                    handle_rect,
+                    &mut state.path_column_width,
+                );
+            }
+            ui.separator();
+
+            // Re-read after the resize handle, which may have just
+            // changed `state.path_column_width` this very frame - the
+            // rows below must always paint with *this* frame's width,
+            // never a one-frame-stale copy (matches the Library table's
+            // identical fix in `show_loaded_data`).
+            let widths = [state.path_column_width, INSPECTOR_DETAILS_COLUMN_WIDTH];
+
+            let body_height = ui.available_height().max(row_height);
+            egui::ScrollArea::vertical()
+                .id_salt("inspector_entries_vertical")
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, visible.len(), |ui, row_range| {
+                    for visible_index in row_range {
+                        let entry_index = visible[visible_index];
+                        let entry = &report.entries[entry_index];
+                        let selected = state.selected_entry.as_deref() == Some(entry.name.as_str());
+                        let response = show_inspector_row(ui, entry, row_height, selected, &widths);
+                        if response.clicked() {
+                            state.selected_entry = Some(entry.name.clone());
+                        }
+                    }
+                });
+        });
+
+    let Some(selected_name) = state.selected_entry.clone() else {
+        ui.label("Select an entry to view its details.");
+        return close;
+    };
+    let Some(selected_entry) = report
+        .entries
+        .iter()
+        .find(|entry| entry.name == selected_name)
+    else {
+        return close;
+    };
+
+    ui.separator();
+    ui.strong("Selected entry");
+    egui::Grid::new("inspector_selected_entry_details")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            detail_row_with_copy(ui, "Path", &selected_entry.name, clipboard);
+            detail_row(
+                ui,
+                "Type",
+                match selected_entry.kind {
+                    InspectorEntryKind::File => "File",
+                    InspectorEntryKind::Directory => "Directory",
+                },
+            );
+            detail_row(ui, "Classification", selected_entry.classification.label());
+            detail_row(
+                ui,
+                "Uncompressed size",
+                &format_size(Some(selected_entry.uncompressed_size)),
+            );
+            detail_row(
+                ui,
+                "Compressed size",
+                &format_size(selected_entry.compressed_size),
+            );
+            detail_row(
+                ui,
+                "Compression method",
+                selected_entry
+                    .compression_method
+                    .as_deref()
+                    .unwrap_or("Unknown"),
+            );
+        });
+
+    close
 }
 
 /// The shared header every `ToolsOverlay` screen that doesn't already
@@ -5766,12 +6589,13 @@ fn show_sources_page(
     ui.add_space(6.0);
     ui.separator();
     ui.strong("Mount root");
-    ui.label(
+    ui.label(format!(
+        "Current mount root: {}",
         mount_root
             .map(|root| root.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-    );
-    ui.label("Mount-root editing will be added after multi-source scanning is stable.");
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    ui.label("Editing this setting is not yet available.");
 
     if let Some(dialog) = add_dialog.as_mut() {
         let mut open = true;
@@ -6498,14 +7322,18 @@ fn show_duplicate_review_panel(
                 let identity = DuplicateGroupIdentity::from(group);
                 let entry_count = duplicate_visible_entries(group, filters.include_missing).len();
                 let selected = selected_group.as_ref() == Some(&identity);
+                let label_text = format!(
+                    "{} — {} — {} entries",
+                    group.title, group.platform, entry_count
+                );
+                // `.truncate()` bounds the row to the list's own width
+                // (never lets one long title stretch the whole page) and
+                // the hover tooltip always carries the full, untruncated
+                // text - milestone requirement: avoid narrow labels that
+                // silently hide information.
                 if ui
-                    .selectable_label(
-                        selected,
-                        format!(
-                            "{} — {} — {} entries",
-                            group.title, group.platform, entry_count
-                        ),
-                    )
+                    .add(egui::Button::selectable(selected, &label_text).truncate())
+                    .on_hover_text(&label_text)
                     .clicked()
                 {
                     *selected_group = Some(identity);
@@ -6559,9 +7387,10 @@ fn show_duplicate_review_panel(
     for entry in entries {
         let is_selected = selected_archive.as_ref() == Some(&entry.path);
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            let entry_path_text = entry.path.display().to_string();
             if ui
-                .selectable_label(is_selected, entry.path.display().to_string())
-                .on_hover_text(entry.path.display().to_string())
+                .add(egui::Button::selectable(is_selected, &entry_path_text).truncate())
+                .on_hover_text(&entry_path_text)
                 .clicked()
             {
                 *selected_archive = Some(entry.path.clone());
@@ -7167,17 +7996,21 @@ fn show_health_dashboard_panel(
             for &index in &visible {
                 let issue = &issues[index];
                 let selected = selected_issue.as_ref() == Some(&issue.path);
+                let label_text = format!(
+                    "{} — {} — {} — {}",
+                    issue.path.display(),
+                    issue.platform.as_deref().unwrap_or("Unknown"),
+                    issue.category.label(),
+                    issue.reason
+                );
+                // Path + platform + category + reason combined can easily
+                // exceed the list's width - `.truncate()` keeps the row
+                // itself from stretching the page, and the hover tooltip
+                // (this list previously had none at all) always carries
+                // every field in full.
                 if ui
-                    .selectable_label(
-                        selected,
-                        format!(
-                            "{} — {} — {} — {}",
-                            issue.path.display(),
-                            issue.platform.as_deref().unwrap_or("Unknown"),
-                            issue.category.label(),
-                            issue.reason
-                        ),
-                    )
+                    .add(egui::Button::selectable(selected, &label_text).truncate())
+                    .on_hover_text(&label_text)
                     .clicked()
                 {
                     *selected_issue = Some(issue.path.clone());
@@ -7296,6 +8129,15 @@ struct LoadedViewState<'a> {
     selected_archive: &'a mut Option<PathBuf>,
     operation: Option<&'a RunningOperation>,
     busy: bool,
+    /// Why archive actions (Mount/Unmount/Lazy Unmount/Remount) are
+    /// blocked for the selected live archive, if they are - see
+    /// `archive_action_block_reason`, the single source of truth this is
+    /// always derived from. `None` whenever actions are available.
+    block_reason: Option<&'static str>,
+    /// The full boolean-by-boolean breakdown behind `block_reason` - see
+    /// `action_readiness_debug_lines`. Rendered in an always-present,
+    /// collapsed-by-default "Debug: action readiness" section.
+    action_readiness_debug_lines: &'a [String],
     feedback: Option<&'a ActionFeedback>,
     confirm_unmount: &'a mut Option<PathBuf>,
     confirm_lazy_unmount: &'a mut Option<PathBuf>,
@@ -7335,6 +8177,9 @@ struct LoadedViewState<'a> {
     /// `ArchiveFsApp::library_source_filter`'s doc comment for what each
     /// of the three states means.
     library_source_filter: &'a mut Option<Option<PathBuf>>,
+    /// The Library table's resizable Archive path / Mount path column
+    /// widths - see `LibraryColumnWidths`.
+    library_column_widths: &'a mut LibraryColumnWidths,
 }
 
 const REMOVE_MISSING_CANCEL_LABEL: &str = "Cancel";
@@ -7400,6 +8245,8 @@ fn show_loaded_data(
         selected_archive,
         operation,
         busy,
+        block_reason,
+        action_readiness_debug_lines,
         feedback,
         confirm_unmount,
         confirm_lazy_unmount,
@@ -7433,6 +8280,7 @@ fn show_loaded_data(
         clipboard,
         select_all_visible_requested,
         library_source_filter,
+        library_column_widths,
     } = view_state;
     let mut requested_action = None;
     let pending_count = data.stats.pending_count;
@@ -7448,83 +8296,109 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
-    ui.horizontal_wrapped(|ui| {
-        summary_value(ui, "Total archives", data.stats.total_archives);
-        summary_value(ui, "Mounted", data.stats.mounted_count);
-        summary_value(ui, "Pending", data.stats.pending_count);
-        if ui
-            .add_enabled(
-                mount_all_available(pending_count, busy),
-                egui::Button::new("Mount All"),
-            )
-            .clicked()
-        {
-            *confirm_mount_all = Some(MountAllConfirmation);
-            *focus_mount_all_cancel = true;
-            history.record(HistoryEntry::new(
-                ActivityAction::MountAll,
-                None,
-                ActivityOutcome::Offered,
-                format!("Mount All offered for {} pending archives.", pending_count),
-            ));
-        }
-        if ui
-            .add_enabled(mounted_count > 0 && !busy, egui::Button::new("Unmount All"))
-            .clicked()
-        {
-            *confirm_unmount_all = Some(UnmountAllConfirmation);
-            *focus_unmount_all_cancel = true;
-            history.record(HistoryEntry::new(
-                ActivityAction::UnmountAll,
-                None,
-                ActivityOutcome::Offered,
-                format!("Unmount All offered for {mounted_count} mounted archives."),
-            ));
-        }
-        ui.separator();
-        let (readiness, color) = if data.doctor.is_ready() {
-            ("Ready", ui.visuals().selection.bg_fill)
-        } else {
-            ("Needs attention", ui.visuals().error_fg_color)
-        };
-        ui.label("Doctor:");
-        ui.colored_label(color, readiness);
-    });
-
-    if let Some(result) = mount_all_result {
-        show_mount_all_result(ui, result);
-    }
-    if let Some(result) = unmount_all_result {
-        show_unmount_all_result(ui, result);
-    }
-
-    ui.separator();
-    if let Some(feedback) = feedback {
-        let color = if feedback.succeeded {
-            egui::Color32::from_rgb(70, 170, 90)
-        } else {
-            ui.visuals().error_fg_color
-        };
-        ui.colored_label(color, &feedback.message);
-        if let Some(warning) = &feedback.warning {
-            ui.colored_label(egui::Color32::from_rgb(210, 140, 40), warning);
-        }
-        if let Some(more_information) = &feedback.more_information {
-            egui::CollapsingHeader::new("More information")
-                .default_open(false)
+    // A resizable top panel (egui's own built-in support - session
+    // persistence, drag-handle hover cursor, and min/max clamping all come
+    // for free from `ctx.memory`, keyed by this panel id - see
+    // `SUMMARY_PANEL_MIN_HEIGHT`'s doc comment) so the summary stays
+    // compact by default (`SUMMARY_PANEL_DEFAULT_HEIGHT` fits its ordinary
+    // one-line content) while remaining expandable to read a longer
+    // feedback/"More information" message without it being clipped.
+    egui::TopBottomPanel::top("library_summary_panel")
+        .resizable(true)
+        .default_height(SUMMARY_PANEL_DEFAULT_HEIGHT)
+        .height_range(SUMMARY_PANEL_MIN_HEIGHT..=SUMMARY_PANEL_MAX_HEIGHT)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("library_summary_scroll")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.label(more_information);
+                    ui.horizontal_wrapped(|ui| {
+                        summary_value(ui, "Total archives", data.stats.total_archives);
+                        summary_value(ui, "Mounted", data.stats.mounted_count);
+                        summary_value(ui, "Pending", data.stats.pending_count);
+                        if ui
+                            .add_enabled(
+                                mount_all_available(pending_count, busy),
+                                egui::Button::new("Mount All"),
+                            )
+                            .clicked()
+                        {
+                            *confirm_mount_all = Some(MountAllConfirmation);
+                            *focus_mount_all_cancel = true;
+                            history.record(HistoryEntry::new(
+                                ActivityAction::MountAll,
+                                None,
+                                ActivityOutcome::Offered,
+                                format!(
+                                    "Mount All offered for {} pending archives.",
+                                    pending_count
+                                ),
+                            ));
+                        }
+                        if ui
+                            .add_enabled(
+                                mounted_count > 0 && !busy,
+                                egui::Button::new("Unmount All"),
+                            )
+                            .clicked()
+                        {
+                            *confirm_unmount_all = Some(UnmountAllConfirmation);
+                            *focus_unmount_all_cancel = true;
+                            history.record(HistoryEntry::new(
+                                ActivityAction::UnmountAll,
+                                None,
+                                ActivityOutcome::Offered,
+                                format!(
+                                    "Unmount All offered for {mounted_count} mounted archives."
+                                ),
+                            ));
+                        }
+                        ui.separator();
+                        let (readiness, color) = if data.doctor.is_ready() {
+                            ("Ready", ui.visuals().selection.bg_fill)
+                        } else {
+                            ("Needs attention", ui.visuals().error_fg_color)
+                        };
+                        ui.label("Doctor:");
+                        ui.colored_label(color, readiness);
+                    });
+
+                    if let Some(result) = mount_all_result {
+                        show_mount_all_result(ui, result);
+                    }
+                    if let Some(result) = unmount_all_result {
+                        show_unmount_all_result(ui, result);
+                    }
+
+                    ui.separator();
+                    if let Some(feedback) = feedback {
+                        let color = if feedback.succeeded {
+                            egui::Color32::from_rgb(70, 170, 90)
+                        } else {
+                            ui.visuals().error_fg_color
+                        };
+                        ui.colored_label(color, &feedback.message);
+                        if let Some(warning) = &feedback.warning {
+                            ui.colored_label(egui::Color32::from_rgb(210, 140, 40), warning);
+                        }
+                        if let Some(more_information) = &feedback.more_information {
+                            egui::CollapsingHeader::new("More information")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label(more_information);
+                                });
+                        }
+                        if let Some(cleanup) = &feedback.cleanup {
+                            let color = if cleanup.succeeded {
+                                egui::Color32::from_rgb(70, 170, 90)
+                            } else {
+                                ui.visuals().error_fg_color
+                            };
+                            ui.colored_label(color, &cleanup.message);
+                        }
+                    }
                 });
-        }
-        if let Some(cleanup) = &feedback.cleanup {
-            let color = if cleanup.succeeded {
-                egui::Color32::from_rgb(70, 170, 90)
-            } else {
-                ui.visuals().error_fg_color
-            };
-            ui.colored_label(color, &cleanup.message);
-        }
-    }
+        });
     if confirm_mount_all.is_some() {
         let actions_available = !busy;
         egui::Window::new("Mount All pending archives?")
@@ -7630,27 +8504,50 @@ fn show_loaded_data(
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
-    let (operation_request, platform_request) = show_selected_archive(
-        ui,
-        selected_record(&data.records, selected_archive.as_deref()),
-        selected_persisted,
-        selected_platform_details(cached, selected_persisted),
-        selected_source_path,
-        SelectedArchiveViewState {
-            operation,
-            busy,
-            confirm_unmount,
-            confirm_lazy_unmount,
-            focus_lazy_cancel,
-            lazy_unmount_offers,
-            remount_offers,
-            cleanup_after_unmount,
-            platform_choice,
-            platform_custom_text,
-            platform_busy,
-            clipboard,
-        },
-    );
+    // Same resizable-panel treatment as the summary above, sized taller by
+    // default (`SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT`) to fit a typical
+    // record's fields plus the Mount/Unmount button without scrolling. The
+    // inner `ScrollArea` means a shorter user-chosen height degrades to
+    // scrolling the details rather than clipping the Mount button or
+    // platform controls out of reach - see the milestone requirement that
+    // these must "remain reachable" at any panel height.
+    let (operation_request, platform_request, inspect_request) =
+        egui::TopBottomPanel::top("library_selected_archive_panel")
+            .resizable(true)
+            .default_height(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT)
+            .height_range(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT..=SELECTED_ARCHIVE_PANEL_MAX_HEIGHT)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("library_selected_archive_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        show_selected_archive(
+                            ui,
+                            selected_record(&data.records, selected_archive.as_deref()),
+                            selected_persisted,
+                            selected_platform_details(cached, selected_persisted),
+                            selected_source_path,
+                            SelectedArchiveViewState {
+                                operation,
+                                busy,
+                                block_reason,
+                                action_readiness_debug_lines,
+                                confirm_unmount,
+                                confirm_lazy_unmount,
+                                focus_lazy_cancel,
+                                lazy_unmount_offers,
+                                remount_offers,
+                                cleanup_after_unmount,
+                                platform_choice,
+                                platform_custom_text,
+                                platform_busy,
+                                clipboard,
+                            },
+                        )
+                    })
+                    .inner
+            })
+            .inner;
     if let Some(request) = operation_request {
         requested_action = Some(AppOperationRequest::Archive(request));
     }
@@ -7659,6 +8556,9 @@ fn show_loaded_data(
             archive_path,
             action,
         });
+    }
+    if let Some(archive_path) = inspect_request {
+        requested_action = Some(AppOperationRequest::InspectArchive(archive_path));
     }
 
     if let Some(archive_path) = confirm_lazy_unmount.clone() {
@@ -8110,7 +9010,8 @@ fn show_loaded_data(
                 .id_salt("archive_status_horizontal")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_min_width(table_width(horizontal_spacing));
+                    let initial_widths = library_column_widths.as_array();
+                    ui.set_min_width(table_width(horizontal_spacing, &initial_widths));
                     if let Some(clicked_field) = show_header_row(
                         ui,
                         &COLUMN_HEADERS,
@@ -8118,10 +9019,16 @@ fn show_loaded_data(
                         row_height,
                         *sort_field,
                         *sort_ascending,
+                        library_column_widths,
                     ) {
                         apply_header_click(sort_field, sort_ascending, clicked_field);
                     }
                     ui.separator();
+                    // Re-read after `show_header_row`, which may have just
+                    // resized a column via its drag handle this very
+                    // frame - the rows below must always paint with
+                    // *this* frame's widths, never a one-frame-stale copy.
+                    let widths = library_column_widths.as_array();
 
                     let body_height = ui.available_height().max(row_height);
                     let mut vertical_scroll_area = egui::ScrollArea::vertical()
@@ -8152,6 +9059,7 @@ fn show_loaded_data(
                                 row_height,
                                 selected_index,
                                 selected_archives,
+                                &widths,
                             );
                         },
                     );
@@ -8180,9 +9088,47 @@ fn fixed_row_height(text_height: f32, interact_height: f32) -> f32 {
     text_height.max(interact_height)
 }
 
-fn table_width(horizontal_spacing: f32) -> f32 {
-    COLUMN_WIDTHS.iter().sum::<f32>()
-        + horizontal_spacing * (COLUMN_WIDTHS.len().saturating_sub(1) as f32)
+fn table_width(horizontal_spacing: f32, widths: &[f32; 4]) -> f32 {
+    widths.iter().sum::<f32>() + horizontal_spacing * (widths.len().saturating_sub(1) as f32)
+}
+
+/// Draws one draggable divider at a resizable column's own trailing edge
+/// (see `COLUMN_RESIZE_HANDLE_WIDTH`'s doc comment for why it is carved
+/// out of the column's own width rather than added alongside it).
+/// Dragging changes only `*width`, clamped to
+/// `MIN_RESIZABLE_COLUMN_WIDTH..=MAX_RESIZABLE_COLUMN_WIDTH` so a column
+/// can never be dragged into an unusable sliver or an unbounded runaway
+/// size (milestone requirement: "sensible minimum widths"). Never touches
+/// sort state, selection, or any other column's width - growing this one
+/// column simply makes the table wider, which the enclosing horizontal
+/// `egui::ScrollArea` (see `show_loaded_data`) accommodates with a
+/// scrollbar rather than by shrinking anything else.
+fn show_column_resize_handle(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    handle_rect: egui::Rect,
+    width: &mut f32,
+) {
+    let response = ui.interact(handle_rect, id, egui::Sense::drag());
+    if response.dragged() {
+        *width = (*width + response.drag_delta().x)
+            .clamp(MIN_RESIZABLE_COLUMN_WIDTH, MAX_RESIZABLE_COLUMN_WIDTH);
+    }
+    if response.hovered() || response.dragged() {
+        ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::ResizeColumn);
+    }
+    let stroke_color = if response.dragged() {
+        ui.visuals().widgets.active.bg_fill
+    } else if response.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke.color
+    };
+    ui.painter().vline(
+        handle_rect.center().x,
+        handle_rect.y_range(),
+        egui::Stroke::new(2.0, stroke_color),
+    );
 }
 
 /// Renders the column header row - milestone requirement 2: each cell is
@@ -8198,6 +9144,14 @@ fn table_width(horizontal_spacing: f32) -> f32 {
 /// small arrow suffix showing its direction. Returns the column whose
 /// header was clicked this frame, if any - the caller decides whether
 /// that selects a new sort field or toggles the existing one.
+///
+/// Cells are placed at exact, manually computed rects (`ui.put`) rather
+/// than through `ui.horizontal`'s automatic layout, for two reasons: it
+/// guarantees the header's column boundaries land at exactly the same x
+/// positions `show_data_row` paints its cells at (both read the same
+/// `column_widths.as_array()`), and it leaves room to place each
+/// resizable column's drag handle (`show_column_resize_handle`) at an
+/// exact boundary without perturbing any other column's position.
 fn show_header_row(
     ui: &mut egui::Ui,
     cells: &[&str; 4],
@@ -8205,34 +9159,123 @@ fn show_header_row(
     row_height: f32,
     sort_field: Option<SortField>,
     sort_ascending: bool,
+    column_widths: &mut LibraryColumnWidths,
 ) -> Option<SortField> {
     let mut clicked_field = None;
-    ui.horizontal(|ui| {
-        for ((text, width), field) in cells.iter().zip(COLUMN_WIDTHS).zip(fields.iter().copied()) {
-            let label = if sort_field == Some(field) {
-                format!(
-                    "{text} {}",
-                    if sort_ascending {
-                        "\u{25B2}"
-                    } else {
-                        "\u{25BC}"
-                    }
-                )
-            } else {
-                (*text).to_string()
-            };
-            let response = ui
-                .add_sized(
-                    [width, row_height],
-                    egui::Button::new(egui::RichText::new(label).strong()).frame(false),
-                )
-                .on_hover_text(*text);
-            if response.clicked() {
-                clicked_field = Some(field);
-            }
+    let spacing = ui.spacing().item_spacing.x;
+    let widths = column_widths.as_array();
+    let total_width = table_width(spacing, &widths);
+    let (_, header_rect) = ui.allocate_space(egui::vec2(total_width, row_height));
+
+    let mut x = header_rect.left();
+    for (index, ((text, width), field)) in cells
+        .iter()
+        .zip(widths)
+        .zip(fields.iter().copied())
+        .enumerate()
+    {
+        // Resizable columns reserve their own trailing edge for the drag
+        // handle (see `COLUMN_RESIZE_HANDLE_WIDTH`), so the button itself
+        // never overlaps the handle's own interact rect.
+        let is_resizable = index == 2 || index == 3;
+        let button_width = if is_resizable {
+            width - COLUMN_RESIZE_HANDLE_WIDTH
+        } else {
+            width
+        };
+        let cell_rect = egui::Rect::from_min_size(
+            egui::pos2(x, header_rect.top()),
+            egui::vec2(button_width, row_height),
+        );
+        let label = if sort_field == Some(field) {
+            format!(
+                "{text} {}",
+                if sort_ascending {
+                    "\u{25B2}"
+                } else {
+                    "\u{25BC}"
+                }
+            )
+        } else {
+            (*text).to_string()
+        };
+        let response = ui
+            .put(
+                cell_rect,
+                egui::Button::new(egui::RichText::new(label).strong()).frame(false),
+            )
+            .on_hover_text(*text);
+        if response.clicked() {
+            clicked_field = Some(field);
         }
-    });
+
+        if is_resizable {
+            let handle_rect = egui::Rect::from_min_size(
+                egui::pos2(x + width - COLUMN_RESIZE_HANDLE_WIDTH, header_rect.top()),
+                egui::vec2(COLUMN_RESIZE_HANDLE_WIDTH, row_height),
+            );
+            let handle_id = egui::Id::new("library_column_resize_handle").with(index);
+            let target_width = if index == 2 {
+                &mut column_widths.archive_path
+            } else {
+                &mut column_widths.mount_path
+            };
+            show_column_resize_handle(ui, handle_id, handle_rect, target_width);
+        }
+
+        x += width + spacing;
+    }
     clicked_field
+}
+
+/// Finds which cell rect (laid out left-to-right starting at `row_left`,
+/// each `widths[i]` wide with `spacing` between them, matching exactly
+/// how `show_data_row`/`show_inspector_row` paint them) contains
+/// `pointer_x`, if any. Pure and independent of any live `egui::Context`;
+/// see `hovered_cell_full_text`, its only caller, and its own doc
+/// comment for why this is kept testable in isolation from real font
+/// metrics/hover state. Generic over the number of columns (a slice, not
+/// a fixed-size array) so both the four-column Library table and the
+/// two-column Archive Inspector row share this one implementation.
+fn cell_index_at(pointer_x: f32, row_left: f32, widths: &[f32], spacing: f32) -> Option<usize> {
+    let mut x = row_left;
+    for (index, width) in widths.iter().enumerate() {
+        if pointer_x >= x && pointer_x < x + width {
+            return Some(index);
+        }
+        x += width + spacing;
+    }
+    None
+}
+
+/// Decides which cell's *full, untruncated* text (if any) a row-painting
+/// function should attach as a hover tooltip this frame - milestone
+/// requirement: "Show the full value in a hover tooltip when text is
+/// clipped." Returns `None` whenever there is nothing useful to show: no
+/// current hover position, the hovered pixel falls outside every known
+/// cell (the inter-row gap, or past the last column), or the hovered
+/// cell's text already fits without clipping.
+///
+/// `measure_width` abstracts real font-metric measurement
+/// (`ui.fonts(|f| f.layout_no_wrap(...))` in production) behind a closure
+/// specifically so this stays unit-testable with a deterministic stand-in
+/// instead of depending on real font rendering - egui tooltips are
+/// `Area`-based and, like floating `Window`s elsewhere in this file, are
+/// not reliably assertable from a single headless render pass, so the
+/// decision logic is kept here, pure and directly testable, rather than
+/// only provable by eye. Generic over the column count for the same
+/// reason as `cell_index_at`.
+fn hovered_cell_full_text<'a>(
+    pointer_x: Option<f32>,
+    row_left: f32,
+    cells: &[&'a str],
+    widths: &[f32],
+    spacing: f32,
+    mut measure_width: impl FnMut(&str) -> f32,
+) -> Option<&'a str> {
+    let index = cell_index_at(pointer_x?, row_left, widths, spacing)?;
+    let text = cells[index];
+    (measure_width(text) > widths[index]).then_some(text)
 }
 
 /// Renders one selectable archive table row as a *single* clickable
@@ -8261,6 +9304,14 @@ fn show_header_row(
 /// failure mode against the old approach. Direct painting registers no
 /// widgets at all, so there is nothing left inside the row that could
 /// ever compete with its own click/hover sensing.
+///
+/// `widths` (added for resizable columns) pushes this pre-existing,
+/// tightly-scoped rendering primitive one parameter past clippy's default
+/// threshold. Every parameter here is plain, read-only per-row display
+/// data with no natural grouping that would not just be `RowVisualState`-
+/// style busywork for its own sake - see `show_archive_rows`'s identical
+/// justification, its only caller.
+#[allow(clippy::too_many_arguments)]
 fn show_data_row(
     ui: &mut egui::Ui,
     cells: &[&str; 4],
@@ -8269,8 +9320,10 @@ fn show_data_row(
     multi_selected: bool,
     focused: bool,
     text_color: Option<egui::Color32>,
+    widths: &[f32; 4],
 ) -> egui::Response {
-    let width = table_width(ui.spacing().item_spacing.x);
+    let spacing = ui.spacing().item_spacing.x;
+    let width = table_width(spacing, widths);
     // Reserve the row's layout space first (advancing the cursor exactly
     // as any other widget would), then sense clicks/hover for that exact
     // `Rect` under a stable `Id` derived from `id_source` - not egui's
@@ -8282,7 +9335,7 @@ fn show_data_row(
     // archive now happens to occupy that same position.
     let (_, rect) = ui.allocate_space(egui::vec2(width, row_height));
     let row_id = egui::Id::new("archive_table_row").with(id_source);
-    let response = ui.interact(rect, row_id, egui::Sense::click());
+    let mut response = ui.interact(rect, row_id, egui::Sense::click());
 
     // Paint the background *before* the text, so a selected/hovered row
     // gets one clean, contiguous highlight across all four columns
@@ -8317,9 +9370,8 @@ fn show_data_row(
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let color = text_color.unwrap_or_else(|| ui.visuals().text_color());
-    let spacing = ui.spacing().item_spacing.x;
     let mut x = rect.left();
-    for (text, column_width) in cells.iter().zip(COLUMN_WIDTHS) {
+    for (text, column_width) in cells.iter().zip(widths.iter().copied()) {
         let cell_rect = egui::Rect::from_min_size(
             egui::pos2(x, rect.top()),
             egui::vec2(column_width, row_height),
@@ -8332,6 +9384,26 @@ fn show_data_row(
             color,
         );
         x += column_width + spacing;
+    }
+
+    // Milestone requirement: "Show the full value in a hover tooltip when
+    // text is clipped." `response.hover_pos()` is `Some` only while this
+    // exact row is hovered, so this never attaches a tooltip (and
+    // therefore never shows one) for any other row - and never touches
+    // `.clicked()`/selection at all, since `on_hover_text` only adds
+    // hover-only decoration to the same `Response` already returned below.
+    let pointer_x = response.hover_pos().map(|pos| pos.x);
+    if let Some(full_text) =
+        hovered_cell_full_text(pointer_x, rect.left(), cells, widths, spacing, |text| {
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(text.to_string(), font_id.clone(), color)
+                    .size()
+                    .x
+            })
+        })
+    {
+        response = response.on_hover_text(full_text);
     }
 
     response
@@ -8348,6 +9420,11 @@ fn show_data_row(
 /// caller can distinguish an ordinary click (replace the selection) from a
 /// Ctrl-click (toggle just this row) without this function needing to know
 /// anything about selection semantics itself.
+///
+/// `widths` (added for resizable columns) pushes this one parameter past
+/// clippy's default threshold - see `show_data_row`'s identical
+/// justification.
+#[allow(clippy::too_many_arguments)]
 fn show_archive_rows(
     ui: &mut egui::Ui,
     rows: &[ArchiveRow],
@@ -8356,6 +9433,7 @@ fn show_archive_rows(
     row_height: f32,
     selected_index: Option<usize>,
     multi_selected: &HashSet<PathBuf>,
+    widths: &[f32; 4],
 ) -> Option<(usize, bool)> {
     let mut clicked = None;
     let visuals = ui.visuals().clone();
@@ -8381,6 +9459,7 @@ fn show_archive_rows(
             is_multi_selected,
             is_focused,
             row.row_text_color(&visuals),
+            widths,
         );
         if response.clicked() {
             clicked = Some((row_index, ctrl_held));
@@ -8843,6 +9922,8 @@ fn remount_is_offered(record: &ArchiveRecord, offered_archives: &HashSet<PathBuf
 struct SelectedArchiveViewState<'a> {
     operation: Option<&'a RunningOperation>,
     busy: bool,
+    block_reason: Option<&'static str>,
+    action_readiness_debug_lines: &'a [String],
     confirm_unmount: &'a mut Option<PathBuf>,
     confirm_lazy_unmount: &'a mut Option<PathBuf>,
     focus_lazy_cancel: &'a mut bool,
@@ -8862,10 +9943,16 @@ fn show_selected_archive(
     platform_details: Option<&PlatformProvenanceDetails>,
     source_path: Option<&Path>,
     view_state: SelectedArchiveViewState<'_>,
-) -> (Option<OperationRequest>, Option<(PathBuf, PlatformAction)>) {
+) -> (
+    Option<OperationRequest>,
+    Option<(PathBuf, PlatformAction)>,
+    Option<PathBuf>,
+) {
     let SelectedArchiveViewState {
         operation,
         busy,
+        block_reason,
+        action_readiness_debug_lines,
         confirm_unmount,
         confirm_lazy_unmount,
         focus_lazy_cancel,
@@ -8879,6 +9966,7 @@ fn show_selected_archive(
     } = view_state;
     let mut request = None;
     let mut platform_request = None;
+    let mut inspect_request = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong("Selected archive");
         if record.is_none() && persisted.is_none() {
@@ -8888,16 +9976,18 @@ fn show_selected_archive(
 
         let Some(record) = record else {
             if let Some(persisted) = persisted {
-                ui.label(format!(
-                    "Archive path: {}",
-                    persisted.absolute_path.display()
-                ));
-                ui.label(format!(
-                    "Source: {}",
-                    source_path
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "Unassigned / Legacy".to_string())
-                ));
+                let archive_path_text = persisted.absolute_path.display().to_string();
+                ui.label("Archive path:");
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(&archive_path_text).selectable(true).wrap());
+                    if ui.small_button("Copy").clicked() {
+                        let _ = clipboard.set_text(archive_path_text.clone());
+                    }
+                });
+                let source_text = source_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Unassigned / Legacy".to_string());
+                ui.label(format!("Source: {source_text}"));
                 if persisted.last_verified_missing_at.is_some() {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
@@ -8910,6 +10000,18 @@ fn show_selected_archive(
                      Mount/unmount actions are unavailable until it is - platform assignment \
                      below is metadata only and unaffected.",
                 );
+                if ui
+                    .add_enabled(
+                        is_inspectable(&persisted.absolute_path),
+                        egui::Button::new("Inspect contents"),
+                    )
+                    .on_hover_text(
+                        "Read-only: view this archive's internal entries without extracting them.",
+                    )
+                    .clicked()
+                {
+                    inspect_request = Some(persisted.absolute_path.clone());
+                }
             }
             let action = show_platform_section(
                 ui,
@@ -8930,22 +10032,25 @@ fn show_selected_archive(
             .num_columns(2)
             .striped(true)
             .show(ui, |ui| {
-                detail_row(
+                detail_row_with_copy(
                     ui,
                     "Archive path",
                     &record.mount_plan.archive.path.display().to_string(),
+                    clipboard,
                 );
-                detail_row(
+                detail_row_with_copy(
                     ui,
                     "Mount path",
                     &record.mount_plan.mount_path.display().to_string(),
+                    clipboard,
                 );
-                detail_row(
+                detail_row_with_copy(
                     ui,
                     "Source",
                     &source_path
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "Unassigned / Legacy".to_string()),
+                    clipboard,
                 );
                 detail_row(
                     ui,
@@ -8991,6 +10096,18 @@ fn show_selected_archive(
             available_action(record.mount_state)
         };
         ui.strong("Options");
+        if ui
+            .add_enabled(
+                is_inspectable(&record.mount_plan.archive.path),
+                egui::Button::new("Inspect contents"),
+            )
+            .on_hover_text(
+                "Read-only: view this archive's internal entries without extracting them.",
+            )
+            .clicked()
+        {
+            inspect_request = Some(record.mount_plan.archive.path.clone());
+        }
         ui.add_enabled_ui(!busy, |ui| {
             ui.checkbox(
                 cleanup_after_unmount,
@@ -9014,10 +10131,11 @@ fn show_selected_archive(
             }
         };
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(primary_enabled, egui::Button::new(label))
-                .clicked()
-            {
+            let mut button = ui.add_enabled(primary_enabled, egui::Button::new(label));
+            if !primary_enabled && let Some(reason) = block_reason {
+                button = button.on_disabled_hover_text(reason);
+            }
+            if button.clicked() {
                 let archive_path = record.mount_plan.archive.path.clone();
                 match action {
                     ArchiveAction::Mount => {
@@ -9059,6 +10177,21 @@ fn show_selected_archive(
                 });
             }
         });
+        if !primary_enabled && let Some(reason) = block_reason {
+            ui.colored_label(ui.visuals().weak_text_color(), reason);
+        }
+        // Always present (not just when blocked) so its mere presence
+        // proves the running binary actually contains this code - see
+        // `action_readiness_debug_lines`'s doc comment for why this exists
+        // (the "Doctor: Ready" summary above can legitimately disagree
+        // with this gate, and previously gave no way to see why).
+        egui::CollapsingHeader::new("Debug: action readiness")
+            .default_open(false)
+            .show(ui, |ui| {
+                for line in action_readiness_debug_lines {
+                    ui.label(line);
+                }
+            });
 
         let action = show_platform_section(
             ui,
@@ -9073,7 +10206,7 @@ fn show_selected_archive(
             platform_request = Some((record.mount_plan.archive.path.clone(), action));
         }
     });
-    (request, platform_request)
+    (request, platform_request, inspect_request)
 }
 
 /// Renders the "Set platform" / "Clear manual platform" controls tucked
@@ -9696,9 +10829,17 @@ fn show_text_edit_with_context_menu(
     response
 }
 
+/// Milestone requirement: long values (paths, reasons, provenance detail)
+/// must stay fully readable rather than silently stretching or clipping
+/// this row's enclosing `egui::Grid`. `.wrap()` bounds the value to the
+/// Grid's own available width (wrapping onto more lines rather than
+/// growing the column indefinitely); `.selectable(true)` lets any value
+/// here be selected and copied directly, which for a Grid used this way
+/// is a cleaner fit than a dedicated Copy button on every single row (see
+/// `detail_row_with_copy` for the few rows that do get one).
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.strong(label);
-    ui.label(value);
+    ui.add(egui::Label::new(value).selectable(true).wrap());
     ui.end_row();
 }
 
@@ -9706,6 +10847,32 @@ fn optional_detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
     if let Some(value) = value {
         detail_row(ui, label, value);
     }
+}
+
+/// Like `detail_row`, but for the long, exact-path-identity fields
+/// (Archive path / Mount path / Source) that most benefit from a one-click
+/// copy - milestone requirement: "Add click-to-copy only if it can be
+/// implemented cleanly with the existing clipboard helper." Uses the
+/// exact same `ClipboardBackend::set_text` every other Copy button in this
+/// app already goes through (see `show_about_window`'s database/config
+/// path rows) - never a second clipboard mechanism. A failed copy is
+/// silently ignored here exactly as it already is in `show_about_window`:
+/// the value stays fully visible and selectable either way, so a failed
+/// copy never hides information, it only means the click did nothing.
+fn detail_row_with_copy(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    ui.strong(label);
+    ui.vertical(|ui| {
+        ui.add(egui::Label::new(value).selectable(true).wrap());
+        if ui.small_button("Copy").clicked() {
+            let _ = clipboard.set_text(value.to_string());
+        }
+    });
+    ui.end_row();
 }
 
 fn archive_kind_name(kind: ArchiveKind) -> &'static str {
@@ -9764,7 +10931,10 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archivefs_core::{Archive, ArchiveHealth, ArchiveMetadata, MountPlan, SourceScanStatus};
+    use archivefs_core::{
+        Archive, ArchiveHealth, ArchiveMetadata, MountPlan, SetupDiagnostic, SourceScanStatus,
+        classify_entry,
+    };
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
@@ -9957,6 +11127,9 @@ mod tests {
             sources_add_dialog: None,
             sources_remove_dialog: None,
             library_source_filter: None,
+            library_column_widths: LibraryColumnWidths::default(),
+            archive_inspector: None,
+            archive_inspector_generation: RefreshGeneration::INITIAL,
         }
     }
 
@@ -10941,7 +12114,347 @@ mod tests {
         let expected = COLUMN_WIDTHS.iter().sum::<f32>() + spacing * 3.0;
 
         assert_eq!(COLUMN_HEADERS.len(), COLUMN_WIDTHS.len());
-        assert_eq!(table_width(spacing), expected);
+        assert_eq!(table_width(spacing, &COLUMN_WIDTHS), expected);
+    }
+
+    #[test]
+    fn library_column_widths_defaults_match_the_original_fixed_constants() {
+        // A brand new session (no resize ever performed) must render
+        // identically to the pre-resizing table - the milestone's
+        // "preserve existing safety behaviour" / "do not redesign"
+        // requirement applied to the default, unresized case.
+        assert_eq!(LibraryColumnWidths::default().as_array(), COLUMN_WIDTHS);
+    }
+
+    #[test]
+    fn cell_index_at_maps_pointer_positions_to_the_correct_column() {
+        let widths = [120.0, 120.0, 440.0, 520.0];
+        let spacing = 8.0;
+        let row_left = 0.0;
+
+        assert_eq!(cell_index_at(0.0, row_left, &widths, spacing), Some(0));
+        assert_eq!(cell_index_at(119.9, row_left, &widths, spacing), Some(0));
+        // Inside the inter-column spacing gap - not part of any cell.
+        assert_eq!(cell_index_at(122.0, row_left, &widths, spacing), None);
+        assert_eq!(cell_index_at(128.0, row_left, &widths, spacing), Some(1));
+        // Past the last column entirely.
+        assert_eq!(cell_index_at(10_000.0, row_left, &widths, spacing), None);
+    }
+
+    #[test]
+    fn hovered_cell_full_text_only_fires_when_the_cell_actually_clips() {
+        let widths = [120.0, 120.0, 440.0, 520.0];
+        let spacing = 8.0;
+        let cells = [
+            "Xbox",
+            "Pending",
+            "/roms/a-very-long-archive-path.zip",
+            "/mnt/a",
+        ];
+
+        // A deterministic stand-in for real font metrics: any text over 10
+        // bytes is "wider than its column" here, well clear of every cell
+        // width above, so this exercises the clipped branch without
+        // depending on actual glyph rendering.
+        let wide_measure = |text: &str| if text.len() > 10 { 10_000.0 } else { 1.0 };
+
+        // Pointer over column 2 (Archive path), which the fixture
+        // deliberately made long enough to clip.
+        let pointer_over_archive_path = Some(120.0 + spacing + 120.0 + spacing + 50.0);
+        assert_eq!(
+            hovered_cell_full_text(
+                pointer_over_archive_path,
+                0.0,
+                &cells,
+                &widths,
+                spacing,
+                wide_measure,
+            ),
+            Some("/roms/a-very-long-archive-path.zip"),
+            "the full, untruncated cell text must be returned when it clips"
+        );
+
+        // Same position, but every cell reports as fitting - no tooltip.
+        assert_eq!(
+            hovered_cell_full_text(
+                pointer_over_archive_path,
+                0.0,
+                &cells,
+                &widths,
+                spacing,
+                |_| 1.0,
+            ),
+            None,
+            "a cell that fits must never get a tooltip"
+        );
+    }
+
+    #[test]
+    fn hovered_cell_full_text_returns_none_without_a_hover_position_or_outside_every_cell() {
+        let widths = [120.0, 120.0, 440.0, 520.0];
+        let spacing = 8.0;
+        let cells = ["Xbox", "Pending", "/roms/a.zip", "/mnt/a"];
+        let always_clipped = |_: &str| 10_000.0;
+
+        assert_eq!(
+            hovered_cell_full_text(None, 0.0, &cells, &widths, spacing, always_clipped),
+            None,
+            "no current hover position means no tooltip"
+        );
+        // In the gap between Platform and State.
+        assert_eq!(
+            hovered_cell_full_text(Some(122.0), 0.0, &cells, &widths, spacing, always_clipped),
+            None,
+            "the inter-column gap belongs to no cell"
+        );
+    }
+
+    /// Simulates a real drag gesture - press, move while held, release -
+    /// mirroring `simulate_row_click`'s three-frame structure for clicks
+    /// (see its own doc comment for why hit-testing needs the extra
+    /// frames). `render` must paint the *same* interactive widget (same
+    /// `egui::Id`) every call, so egui recognizes the drag as one
+    /// continuous gesture across frames rather than several unrelated
+    /// presses.
+    fn simulate_drag(
+        ctx: &egui::Context,
+        start: egui::Pos2,
+        end: egui::Pos2,
+        render: impl Fn(&mut egui::Ui) -> egui::Response,
+    ) -> egui::Response {
+        run_frame(
+            ctx,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(start)],
+                ..Default::default()
+            },
+            &render,
+        );
+        run_frame(
+            ctx,
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            &render,
+        );
+        let (response, _) = run_frame(
+            ctx,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(end)],
+                ..Default::default()
+            },
+            &render,
+        );
+        run_frame(
+            ctx,
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            &render,
+        );
+        response
+    }
+
+    /// Shared by every header-resize test below: renders the real header,
+    /// returns its rect and the actual `item_spacing.x` this `Context`'s
+    /// default style used - never hard-coded, so these tests keep working
+    /// even if egui's own default spacing ever changes.
+    fn render_header_and_measure(
+        ctx: &egui::Context,
+        column_widths: &std::cell::RefCell<LibraryColumnWidths>,
+        clicked_field: &std::cell::RefCell<Option<SortField>>,
+    ) -> (egui::Rect, f32) {
+        let spacing = std::cell::RefCell::new(0.0_f32);
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            *spacing.borrow_mut() = ui.spacing().item_spacing.x;
+            ui.scope(|ui| {
+                let mut widths = column_widths.borrow_mut();
+                if let Some(field) = show_header_row(
+                    ui,
+                    &COLUMN_HEADERS,
+                    &COLUMN_SORT_FIELDS,
+                    20.0,
+                    None,
+                    true,
+                    &mut widths,
+                ) {
+                    *clicked_field.borrow_mut() = Some(field);
+                }
+            })
+            .response
+        };
+        let mut header_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                header_rect = Some(render(ui).rect);
+            });
+        });
+        (header_rect.unwrap(), *spacing.borrow())
+    }
+
+    /// The Archive path column's own resize-handle x position, given the
+    /// header rect/spacing `render_header_and_measure` returns and the
+    /// widths in effect *before* any drag - matches `show_header_row`'s
+    /// own boundary math exactly (Platform, then State, then Archive
+    /// path's own trailing edge).
+    fn archive_path_handle_x(
+        header_rect: egui::Rect,
+        spacing: f32,
+        widths: &LibraryColumnWidths,
+    ) -> f32 {
+        let array = widths.as_array();
+        header_rect.left() + array[0] + spacing + array[1] + spacing + array[2]
+            - COLUMN_RESIZE_HANDLE_WIDTH / 2.0
+    }
+
+    #[test]
+    fn dragging_the_archive_path_handle_grows_only_that_column_and_never_sorts() {
+        let ctx = egui::Context::default();
+        let column_widths = std::cell::RefCell::new(LibraryColumnWidths::default());
+        let clicked_field: std::cell::RefCell<Option<SortField>> = std::cell::RefCell::new(None);
+
+        let (header_rect, spacing) =
+            render_header_and_measure(&ctx, &column_widths, &clicked_field);
+        let before = *column_widths.borrow();
+        let handle_x = archive_path_handle_x(header_rect, spacing, &before);
+        let handle_y = header_rect.center().y;
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            ui.scope(|ui| {
+                let mut widths = column_widths.borrow_mut();
+                if let Some(field) = show_header_row(
+                    ui,
+                    &COLUMN_HEADERS,
+                    &COLUMN_SORT_FIELDS,
+                    20.0,
+                    None,
+                    true,
+                    &mut widths,
+                ) {
+                    *clicked_field.borrow_mut() = Some(field);
+                }
+            })
+            .response
+        };
+        simulate_drag(
+            &ctx,
+            egui::pos2(handle_x, handle_y),
+            egui::pos2(handle_x + 60.0, handle_y),
+            render,
+        );
+
+        let after = *column_widths.borrow();
+        assert!(
+            after.archive_path > before.archive_path,
+            "dragging right must grow Archive path (before {}, after {})",
+            before.archive_path,
+            after.archive_path
+        );
+        assert_eq!(
+            after.mount_path, before.mount_path,
+            "resizing Archive path must never change Mount path's own width"
+        );
+        assert_eq!(
+            *clicked_field.borrow(),
+            None,
+            "a drag on the resize handle must never register as a column-sort click"
+        );
+    }
+
+    #[test]
+    fn resize_handle_clamps_to_the_minimum_width() {
+        let ctx = egui::Context::default();
+        let column_widths = std::cell::RefCell::new(LibraryColumnWidths::default());
+        let clicked_field: std::cell::RefCell<Option<SortField>> = std::cell::RefCell::new(None);
+
+        let (header_rect, spacing) =
+            render_header_and_measure(&ctx, &column_widths, &clicked_field);
+        let before = *column_widths.borrow();
+        let handle_x = archive_path_handle_x(header_rect, spacing, &before);
+        let handle_y = header_rect.center().y;
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            ui.scope(|ui| {
+                let mut widths = column_widths.borrow_mut();
+                let _ = show_header_row(
+                    ui,
+                    &COLUMN_HEADERS,
+                    &COLUMN_SORT_FIELDS,
+                    20.0,
+                    None,
+                    true,
+                    &mut widths,
+                );
+            })
+            .response
+        };
+        // A single wild drag far to the left - must clamp, never collapse
+        // into a sliver or go negative.
+        simulate_drag(
+            &ctx,
+            egui::pos2(handle_x, handle_y),
+            egui::pos2(handle_x - 10_000.0, handle_y),
+            render,
+        );
+
+        assert_eq!(
+            column_widths.borrow().archive_path,
+            MIN_RESIZABLE_COLUMN_WIDTH,
+            "a column can never collapse below the minimum usable width"
+        );
+    }
+
+    #[test]
+    fn resize_handle_clamps_to_the_maximum_width() {
+        let ctx = egui::Context::default();
+        let column_widths = std::cell::RefCell::new(LibraryColumnWidths::default());
+        let clicked_field: std::cell::RefCell<Option<SortField>> = std::cell::RefCell::new(None);
+
+        let (header_rect, spacing) =
+            render_header_and_measure(&ctx, &column_widths, &clicked_field);
+        let before = *column_widths.borrow();
+        let handle_x = archive_path_handle_x(header_rect, spacing, &before);
+        let handle_y = header_rect.center().y;
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            ui.scope(|ui| {
+                let mut widths = column_widths.borrow_mut();
+                let _ = show_header_row(
+                    ui,
+                    &COLUMN_HEADERS,
+                    &COLUMN_SORT_FIELDS,
+                    20.0,
+                    None,
+                    true,
+                    &mut widths,
+                );
+            })
+            .response
+        };
+        simulate_drag(
+            &ctx,
+            egui::pos2(handle_x, handle_y),
+            egui::pos2(handle_x + 100_000.0, handle_y),
+            render,
+        );
+
+        assert_eq!(
+            column_widths.borrow().archive_path,
+            MAX_RESIZABLE_COLUMN_WIDTH,
+            "a column can never grow into an unbounded runaway size"
+        );
     }
 
     #[test]
@@ -12514,6 +14027,100 @@ mod tests {
     }
 
     #[test]
+    fn refresh_recomputes_action_readiness_as_true_once_diagnostics_complete() {
+        // The other half of `successful_refresh_invalidates_stale_action_
+        // readiness`: readiness must not just correctly go stale mid-
+        // refresh, it must also correctly come back once the new
+        // diagnostics generation actually completes as Ready - this is
+        // "a refresh after startup recomputes action readiness correctly".
+        let mut app = app_for_operation_tests();
+        app.refresh(&egui::Context::default());
+        let current = app.refresh_generation;
+        app.state = LoadState::Ready(Box::new(empty_loaded_data("/new-mount")));
+        app.snapshot_generation = Some(current);
+        assert!(!latest_generation_actions_safe(
+            current,
+            app.snapshot_generation,
+            app.snapshot_stale,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        ));
+
+        app.diagnostics = DiagnosticsState::Ready {
+            generation: current,
+            report: setup_report(true, true),
+        };
+
+        assert!(
+            latest_generation_actions_safe(
+                current,
+                app.snapshot_generation,
+                app.snapshot_stale,
+                snapshot_identity(&app.state),
+                &app.diagnostics,
+            ),
+            "action readiness must recompute to true once the new generation's \
+             diagnostics complete as Ready"
+        );
+        assert_eq!(
+            archive_action_block_reason(
+                app.is_busy(),
+                current,
+                app.snapshot_generation,
+                app.snapshot_stale,
+                snapshot_identity(&app.state),
+                &app.diagnostics,
+            ),
+            None,
+            "block_reason must agree: no reason once readiness is restored"
+        );
+    }
+
+    #[test]
+    fn opening_and_closing_the_archive_inspector_does_not_stale_action_readiness() {
+        // `start_archive_inspection` only ever touches `archive_inspector`/
+        // `archive_inspector_generation`/`tools_overlay` - never
+        // `refresh_generation`, `snapshot_generation`, `snapshot_stale`, or
+        // `diagnostics`, the only fields `latest_generation_actions_safe`
+        // reads. This proves that structural claim end to end rather than
+        // just by inspection.
+        let mut app = app_for_operation_tests();
+        let before = latest_generation_actions_safe(
+            app.refresh_generation,
+            app.snapshot_generation,
+            app.snapshot_stale,
+            snapshot_identity(&app.state),
+            &app.diagnostics,
+        );
+        assert!(before, "the fixture must start in the actions-safe state");
+
+        app.start_archive_inspection(egui::Context::default(), PathBuf::from("/roms/a.zip"));
+        assert_eq!(app.tools_overlay, ToolsOverlay::ArchiveInspector);
+        assert!(
+            latest_generation_actions_safe(
+                app.refresh_generation,
+                app.snapshot_generation,
+                app.snapshot_stale,
+                snapshot_identity(&app.state),
+                &app.diagnostics,
+            ),
+            "opening Inspector must not stale action readiness"
+        );
+
+        app.tools_overlay = ToolsOverlay::None;
+        assert!(
+            latest_generation_actions_safe(
+                app.refresh_generation,
+                app.snapshot_generation,
+                app.snapshot_stale,
+                snapshot_identity(&app.state),
+                &app.diagnostics,
+            ),
+            "closing Inspector must not stale action readiness"
+        );
+    }
+
+    #[test]
     fn newer_unsafe_config_cannot_inherit_old_action_readiness() {
         let current = RefreshGeneration(2);
         let old_ready = DiagnosticsState::Ready {
@@ -14005,7 +15612,18 @@ mod tests {
             &ctx,
             egui::pos2(50.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None),
+            |ui| {
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path,
+                    false,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
+            },
         );
 
         assert!(
@@ -14025,7 +15643,16 @@ mod tests {
 
         let (response, ctrl_held) =
             simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
-                show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None)
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path,
+                    false,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
             });
         assert!(response.clicked(), "the click itself must still register");
         assert!(
@@ -14059,7 +15686,18 @@ mod tests {
             &ctx,
             egui::pos2(50.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, false, None),
+            |ui| {
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path_b,
+                    false,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
+            },
         );
         assert!(response.clicked());
         assert!(!ctrl_held);
@@ -14088,7 +15726,16 @@ mod tests {
 
         let (response, ctrl_held) =
             simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
-                show_data_row(ui, &test_row_cells(), 24.0, &path_b, false, false, None)
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path_b,
+                    false,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
             });
         assert!(response.clicked());
         assert!(ctrl_held);
@@ -14121,7 +15768,16 @@ mod tests {
         // click (or its modifiers) from registering.
         let (response, ctrl_held) =
             simulate_row_click(&ctx, egui::pos2(50.0, 12.0), egui::Modifiers::CTRL, |ui| {
-                show_data_row(ui, &test_row_cells(), 24.0, &path_a, true, false, None)
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path_a,
+                    true,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
             });
         assert!(response.clicked());
         assert!(ctrl_held);
@@ -14156,7 +15812,18 @@ mod tests {
             &ctx,
             egui::pos2(10.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None),
+            |ui| {
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path,
+                    false,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
+            },
         );
         assert!(on_text.clicked(), "a click on rendered text must register");
 
@@ -14164,12 +15831,56 @@ mod tests {
             &ctx,
             egui::pos2(121.0, 12.0),
             egui::Modifiers::default(),
-            |ui| show_data_row(ui, &test_row_cells(), 24.0, &path, false, false, None),
+            |ui| {
+                show_data_row(
+                    ui,
+                    &test_row_cells(),
+                    24.0,
+                    &path,
+                    false,
+                    false,
+                    None,
+                    &COLUMN_WIDTHS,
+                )
+            },
         );
         assert!(
             on_gap.clicked(),
             "a click in the inter-column gap must register exactly the same as on text"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_data_row_handles_a_long_non_utf8_cell_without_panicking() {
+        // Exercises the new hover-tooltip text-measurement path
+        // (`ui.fonts(|f| f.layout_no_wrap(...))` inside `show_data_row`)
+        // against exactly the kind of value most likely to upset it: very
+        // long, and containing bytes that are not valid UTF-8 on a Unix
+        // path. `Path::display()` never panics on such bytes (it
+        // lossily substitutes replacement characters), and this proves
+        // the new measurement code path does not either.
+        let mut path = PathBuf::from("/roms");
+        let mut long_name: Vec<u8> = b"a-very-long-archive-name-segment-".repeat(20);
+        long_name.extend_from_slice(b"\x80\x81\x82.zip");
+        path.push(OsString::from_vec(long_name));
+        let long_display = path.display().to_string();
+        let cells = ["Xbox", "Pending", long_display.as_str(), "/mnt/Xbox/a"];
+
+        let ctx = egui::Context::default();
+        // x=300 lands inside the (default-width) Archive path column
+        // (COLUMN_WIDTHS = [120, 120, 440, 520]), so the pointer is
+        // hovering that exact cell across every frame of the click
+        // simulation, guaranteeing the measurement branch actually runs.
+        let (response, _) = simulate_row_click(
+            &ctx,
+            egui::pos2(300.0, 12.0),
+            egui::Modifiers::default(),
+            |ui| show_data_row(ui, &cells, 24.0, &path, false, false, None, &COLUMN_WIDTHS),
+        );
+        // Reaching this assertion without panicking is the real proof;
+        // the row otherwise behaving like any other is a bonus check.
+        assert!(response.clicked());
     }
 
     /// The Ctrl+Up/Down "focus doesn't visibly move" bug, reproduced and
@@ -14197,6 +15908,7 @@ mod tests {
                         multi_selected,
                         focused,
                         None,
+                        &COLUMN_WIDTHS,
                     );
                 });
             })
@@ -14317,6 +16029,7 @@ mod tests {
         sort_field: Option<SortField>,
         sort_ascending: bool,
         library_scroll_offset: f32,
+        library_column_widths: LibraryColumnWidths,
     }
 
     impl RealLoadedDataHarness {
@@ -14330,6 +16043,7 @@ mod tests {
                 sort_field: None,
                 sort_ascending: true,
                 library_scroll_offset: 0.0,
+                library_column_widths: LibraryColumnWidths::default(),
             }
         }
 
@@ -14372,6 +16086,8 @@ mod tests {
                             selected_archive: &mut self.selected_archive,
                             operation: None,
                             busy: false,
+                            block_reason: None,
+                            action_readiness_debug_lines: &[],
                             feedback: None,
                             confirm_unmount: &mut confirm_unmount,
                             confirm_lazy_unmount: &mut confirm_lazy_unmount,
@@ -14405,6 +16121,7 @@ mod tests {
                             clipboard: &mut clipboard,
                             select_all_visible_requested: &mut select_all_visible_requested,
                             library_source_filter: &mut library_source_filter,
+                            library_column_widths: &mut self.library_column_widths,
                         },
                     );
                     panel_height = ui.min_rect().height();
@@ -15327,12 +17044,21 @@ mod tests {
     fn real_header_click_reaches_show_header_row_and_reports_the_clicked_column() {
         let ctx = egui::Context::default();
         let clicked_field: std::cell::RefCell<Option<SortField>> = std::cell::RefCell::new(None);
+        let column_widths: std::cell::RefCell<LibraryColumnWidths> =
+            std::cell::RefCell::new(LibraryColumnWidths::default());
 
         let render = |ui: &mut egui::Ui| -> egui::Response {
             ui.scope(|ui| {
-                if let Some(field) =
-                    show_header_row(ui, &COLUMN_HEADERS, &COLUMN_SORT_FIELDS, 20.0, None, true)
-                {
+                let mut widths = column_widths.borrow_mut();
+                if let Some(field) = show_header_row(
+                    ui,
+                    &COLUMN_HEADERS,
+                    &COLUMN_SORT_FIELDS,
+                    20.0,
+                    None,
+                    true,
+                    &mut widths,
+                ) {
                     *clicked_field.borrow_mut() = Some(field);
                 }
             })
@@ -15379,6 +17105,138 @@ mod tests {
             }],
             ..bounded_test_input()
         }
+    }
+
+    #[test]
+    fn resizing_a_column_does_not_alter_selection_or_sort_state() {
+        // The resize handle's own drag mechanics (grows only the dragged
+        // column, never triggers a sort click) are already proven in
+        // isolation by `dragging_the_archive_path_handle_grows_only_that_column_and_never_sorts`.
+        // This test proves the other half: rendering the *whole* Library
+        // page after a resize never perturbs row selection or sort state,
+        // which nothing in `show_loaded_data` ever reads
+        // `library_column_widths` to decide.
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "alpha.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "GBA", "Live", "bravo.zip", "/mnt/b"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archive = Some(PathBuf::from("/roms/b.zip"));
+        harness.selected_archives = [PathBuf::from("/roms/b.zip")].into_iter().collect();
+        harness.sort_field = Some(SortField::Platform);
+        harness.sort_ascending = false;
+        harness.library_column_widths.archive_path += 150.0;
+        harness.library_column_widths.mount_path -= 50.0;
+
+        harness.render(&ctx, &data, bounded_test_input());
+
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/b.zip")),
+            "a resized column must never change the focused row"
+        );
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/b.zip")].into_iter().collect(),
+            "a resized column must never change the multi-selection"
+        );
+        assert_eq!(harness.sort_field, Some(SortField::Platform));
+        assert!(!harness.sort_ascending);
+    }
+
+    #[test]
+    fn changing_the_available_window_height_does_not_alter_selection_sort_or_filter_state() {
+        // A real proxy for "the user resizes a panel or the window itself"
+        // (see the milestone requirement that this must never change
+        // selection, sorting, focus, or mount eligibility): render the
+        // same page three times with a shrinking, then growing, screen
+        // height, driving `show_loaded_data`'s two new `TopBottomPanel`s
+        // and every `ScrollArea` through real layout recomputation each
+        // time, and confirm none of it leaks into app state that nothing
+        // in `show_loaded_data` has any business reading window size to
+        // decide.
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "alpha.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "GBA", "Live", "bravo.zip", "/mnt/b"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archive = Some(PathBuf::from("/roms/b.zip"));
+        harness.selected_archives = [PathBuf::from("/roms/b.zip")].into_iter().collect();
+        harness.sort_field = Some(SortField::Platform);
+        harness.sort_ascending = false;
+        harness.library_filters.present = true;
+
+        harness.render(&ctx, &data, bounded_test_input());
+
+        let mut short_input = bounded_test_input();
+        short_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 120.0),
+        ));
+        harness.render(&ctx, &data, short_input);
+
+        let mut tall_input = bounded_test_input();
+        tall_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 900.0),
+        ));
+        harness.render(&ctx, &data, tall_input);
+
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/b.zip")),
+            "a changed window/panel height must never change the focused row"
+        );
+        assert_eq!(
+            harness.selected_archives,
+            [PathBuf::from("/roms/b.zip")].into_iter().collect(),
+            "a changed window/panel height must never change the multi-selection"
+        );
+        assert_eq!(harness.sort_field, Some(SortField::Platform));
+        assert!(!harness.sort_ascending);
+        assert!(harness.library_filters.present);
+    }
+
+    #[test]
+    fn horizontal_scrolling_does_not_change_sorting_or_the_focused_row() {
+        let ctx = egui::Context::default();
+        let data = loaded_data_with_rows(
+            "/mount",
+            vec![
+                row_with_fields("/roms/a.zip", "SNES", "Live", "alpha.zip", "/mnt/a"),
+                row_with_fields("/roms/b.zip", "GBA", "Live", "bravo.zip", "/mnt/b"),
+            ],
+        );
+        let mut harness = RealLoadedDataHarness::new();
+        harness.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        harness.sort_field = Some(SortField::Platform);
+        harness.sort_ascending = true;
+
+        let scroll_input = egui::RawInput {
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-120.0, 0.0),
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..bounded_test_input()
+        };
+        harness.render(&ctx, &data, scroll_input);
+
+        assert_eq!(
+            harness.selected_archive,
+            Some(PathBuf::from("/roms/a.zip")),
+            "a horizontal scroll must never change the focused row"
+        );
+        assert_eq!(harness.sort_field, Some(SortField::Platform));
+        assert!(harness.sort_ascending);
     }
 
     #[test]
@@ -17087,6 +18945,7 @@ mod tests {
         app.tools_overlay = ToolsOverlay::DoctorChecks;
         app.tools_overlay = ToolsOverlay::PlatformAliases;
         app.tools_overlay = ToolsOverlay::DatabaseStatus;
+        app.tools_overlay = ToolsOverlay::ArchiveInspector;
         app.tools_overlay = ToolsOverlay::None;
         app.view = MainView::Library;
 
@@ -17243,6 +19102,7 @@ mod tests {
         let mut library_scroll_offset = 0.0;
         let mut clipboard = InMemoryClipboard::default();
         let mut library_source_filter = None;
+        let mut library_column_widths = LibraryColumnWidths::default();
 
         ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -17255,6 +19115,8 @@ mod tests {
                         selected_archive: &mut selected_archive,
                         operation: None,
                         busy: false,
+                        block_reason: None,
+                        action_readiness_debug_lines: &[],
                         feedback: None,
                         confirm_unmount: &mut confirm_unmount,
                         confirm_lazy_unmount: &mut confirm_lazy_unmount,
@@ -17288,6 +19150,7 @@ mod tests {
                         clipboard: &mut clipboard,
                         select_all_visible_requested,
                         library_source_filter: &mut library_source_filter,
+                        library_column_widths: &mut library_column_widths,
                     },
                 );
             });
@@ -17419,8 +19282,8 @@ mod tests {
             "Scan All Enabled Sources",
             "Refresh Status",
             "Mount root",
-            "/mnt/archivefs",
-            "Mount-root editing will be added after multi-source scanning is stable.",
+            "Current mount root: /mnt/archivefs",
+            "Editing this setting is not yet available.",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
@@ -17429,6 +19292,13 @@ mod tests {
         }
         // Milestone requirement: no fake mount-root edit control exists.
         assert!(!rendered_text_contains(&output, "Change Mount Root"));
+        // The old wording implied mounting itself was unavailable, not just
+        // editing the setting - make sure it is truly gone, not just masked
+        // by the new assertions above.
+        assert!(!rendered_text_contains(
+            &output,
+            "Mount-root editing will be added after multi-source scanning is stable."
+        ));
     }
 
     #[test]
@@ -17767,6 +19637,112 @@ mod tests {
             rendered_text_contains(&shown, "distinctive-activity-marker"),
             "an expanded Activity panel must still show its history entries"
         );
+    }
+
+    #[test]
+    fn activity_panel_wraps_a_very_long_message_and_shows_it_in_full() {
+        // Milestone requirement: long activity messages must be
+        // readable - `.wrap()` replaces the old `.truncate()` +
+        // hover-tooltip treatment, so the complete message must now be
+        // present in the rendered output with no hover needed at all.
+        // `Label::wrap()` still produces one text galley regardless of
+        // how many visual lines it wraps onto, and `Shape::Text::galley
+        // .text()` always returns the complete original source string -
+        // `rendered_text_contains` finding the full 2000-character
+        // message proves nothing was clipped.
+        let ctx = egui::Context::default();
+        let mut history = OperationHistory::default();
+        let long_message = "X".repeat(2000);
+        history.record(HistoryEntry::new(
+            ActivityAction::Refresh,
+            None,
+            ActivityOutcome::Completed,
+            long_message.clone(),
+        ));
+        let mut expanded = true;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            show_activity_panel(ctx, &mut history, &mut expanded);
+        });
+        let shown = ctx.run(egui::RawInput::default(), |ctx| {
+            show_activity_panel(ctx, &mut history, &mut expanded);
+        });
+
+        assert!(
+            rendered_text_contains(&shown, &long_message),
+            "a 2000-character activity message must render in full, not be truncated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_review_panel_renders_a_long_non_utf8_group_without_panicking() {
+        // Bypasses `catalogue_filename_duplicates`'s grouping algorithm
+        // entirely (irrelevant here) by constructing a
+        // `CatalogueDuplicateReport` directly - the milestone's "long
+        // non-UTF8 paths do not panic" requirement applied to Duplicate
+        // Review's group list and per-entry path rows, both of which
+        // switched from a plain `selectable_label` to
+        // `Button::selectable(...).truncate()` in this milestone.
+        let mut path = PathBuf::from("/roms/dup");
+        let mut long_name: Vec<u8> = b"same-title-segment-".repeat(30);
+        long_name.extend_from_slice(b"\x93\x94.zip");
+        path.push(OsString::from_vec(long_name));
+
+        let long_title = "T".repeat(500);
+        let report = CatalogueDuplicateReport {
+            groups: vec![CatalogueDuplicateGroup {
+                normalized_title: "dup".to_string(),
+                title: long_title.clone(),
+                platform: "SNES".to_string(),
+                reason: "same normalized title and platform".to_string(),
+                entries: vec![
+                    CatalogueDuplicateArchive {
+                        archive_id: 1,
+                        path: path.clone(),
+                        present: true,
+                        size_bytes: Some(1024),
+                        modified_time_unix_seconds: Some(0),
+                    },
+                    CatalogueDuplicateArchive {
+                        archive_id: 2,
+                        path: PathBuf::from("/roms/dup/same-title-segment.7z"),
+                        present: true,
+                        size_bytes: Some(2048),
+                        modified_time_unix_seconds: Some(0),
+                    },
+                ],
+                total_known_size_bytes: 3072,
+                entries_with_known_size: 2,
+            }],
+            archives_in_groups: 2,
+        };
+
+        let mut filters = DuplicateReviewFilters::initial();
+        let mut sort_field = DuplicateSortField::Title;
+        let mut sort_ascending = true;
+        let mut selected_group = Some(DuplicateGroupIdentity::from(&report.groups[0]));
+        let mut selected_archive = Some(path);
+        let mut clipboard = InMemoryClipboard::default();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_duplicate_review_panel(
+                    ui,
+                    &report,
+                    DuplicateReviewViewState {
+                        filters: &mut filters,
+                        sort_field: &mut sort_field,
+                        sort_ascending: &mut sort_ascending,
+                        selected_group: &mut selected_group,
+                        selected_archive: &mut selected_archive,
+                        clipboard: &mut clipboard,
+                    },
+                );
+            });
+        });
+        // No panic reaching here is the assertion.
     }
 
     #[test]
@@ -18649,5 +20625,787 @@ mod tests {
             history_len,
             "no context-menu action may ever add an Activity entry"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Archive Inspector milestone - tests.
+    // -----------------------------------------------------------------
+
+    fn inspector_entry(name: &str, kind: InspectorEntryKind, size: u64) -> InspectorEntry {
+        let classification = classify_entry(name, matches!(kind, InspectorEntryKind::Directory));
+        InspectorEntry {
+            name: name.to_string(),
+            kind,
+            uncompressed_size: size,
+            compressed_size: Some(size / 2),
+            compression_method: Some("Deflated".to_string()),
+            classification,
+        }
+    }
+
+    #[test]
+    fn stale_archive_inspection_results_are_ignored() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        let superseded_generation = app.archive_inspector_generation.next();
+        app.archive_inspector = Some(ArchiveInspectorState::loading(
+            PathBuf::from("/roms/a.zip"),
+            superseded_generation,
+            receiver,
+        ));
+        // Mirrors what `start_archive_inspection` does for a second
+        // "Inspect contents" click before the first result arrives: the
+        // generation counter moves on before a new state is installed.
+        app.archive_inspector_generation = superseded_generation.next();
+
+        sender
+            .send((
+                superseded_generation,
+                Ok(InspectorReport {
+                    entries: vec![inspector_entry("a.txt", InspectorEntryKind::File, 10)],
+                    truncated: false,
+                    total_entries_in_archive: 1,
+                }),
+            ))
+            .unwrap();
+
+        app.poll_archive_inspection();
+
+        assert!(
+            matches!(
+                app.archive_inspector.as_ref().unwrap().status,
+                ArchiveInspectorStatus::Loading { .. }
+            ),
+            "a result whose generation no longer matches the current one must never be applied"
+        );
+    }
+
+    #[test]
+    fn disconnected_inspection_worker_reports_a_truthful_error_only_for_the_current_generation() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        let generation = app.archive_inspector_generation.next();
+        app.archive_inspector = Some(ArchiveInspectorState::loading(
+            PathBuf::from("/roms/a.zip"),
+            generation,
+            receiver,
+        ));
+        app.archive_inspector_generation = generation;
+        drop(sender);
+
+        app.poll_archive_inspection();
+
+        match &app.archive_inspector.as_ref().unwrap().status {
+            ArchiveInspectorStatus::Error(message) => {
+                assert!(message.contains("unexpectedly"));
+            }
+            other => panic!("expected Error, got a different status: {other:?}"),
+        }
+    }
+
+    // `ArchiveInspectorStatus` has no `Debug` derive of its own reason to
+    // exist outside this one assertion - a tiny local impl is simpler
+    // than deriving it crate-wide for a type whose real fields
+    // (`InspectorReport`, a `Receiver`) mostly do not benefit from it.
+    impl std::fmt::Debug for ArchiveInspectorStatus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Loading { .. } => write!(f, "Loading"),
+                Self::Ready(_) => write!(f, "Ready"),
+                Self::Error(message) => write!(f, "Error({message})"),
+            }
+        }
+    }
+
+    /// A struct, not a tuple, purely to keep `show_selected_archive`'s
+    /// many small pieces of caller-owned state readable at the two call
+    /// sites below by field name instead of position.
+    struct EmptySelectedArchiveViewStateParts {
+        confirm_unmount: Option<PathBuf>,
+        confirm_lazy_unmount: Option<PathBuf>,
+        focus_lazy_cancel: bool,
+        lazy_unmount_offers: HashSet<PathBuf>,
+        remount_offers: HashSet<PathBuf>,
+        cleanup_after_unmount: bool,
+        platform_choice: Option<String>,
+        platform_custom_text: String,
+        clipboard: InMemoryClipboard,
+    }
+
+    fn empty_selected_archive_view_state_parts() -> EmptySelectedArchiveViewStateParts {
+        EmptySelectedArchiveViewStateParts {
+            confirm_unmount: None,
+            confirm_lazy_unmount: None,
+            focus_lazy_cancel: false,
+            lazy_unmount_offers: HashSet::new(),
+            remount_offers: HashSet::new(),
+            cleanup_after_unmount: false,
+            platform_choice: None,
+            platform_custom_text: String::new(),
+            clipboard: InMemoryClipboard::default(),
+        }
+    }
+
+    #[test]
+    fn inspect_contents_button_is_absent_when_nothing_is_selected() {
+        let ctx = egui::Context::default();
+        let EmptySelectedArchiveViewStateParts {
+            mut confirm_unmount,
+            mut confirm_lazy_unmount,
+            mut focus_lazy_cancel,
+            lazy_unmount_offers,
+            remount_offers,
+            mut cleanup_after_unmount,
+            mut platform_choice,
+            mut platform_custom_text,
+            mut clipboard,
+        } = empty_selected_archive_view_state_parts();
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_archive(
+                    ui,
+                    None,
+                    None,
+                    None,
+                    None,
+                    SelectedArchiveViewState {
+                        operation: None,
+                        busy: false,
+                        block_reason: None,
+                        action_readiness_debug_lines: &[],
+                        confirm_unmount: &mut confirm_unmount,
+                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                        focus_lazy_cancel: &mut focus_lazy_cancel,
+                        lazy_unmount_offers: &lazy_unmount_offers,
+                        remount_offers: &remount_offers,
+                        cleanup_after_unmount: &mut cleanup_after_unmount,
+                        platform_choice: &mut platform_choice,
+                        platform_custom_text: &mut platform_custom_text,
+                        platform_busy: false,
+                        clipboard: &mut clipboard,
+                    },
+                );
+            });
+        });
+
+        assert!(
+            !rendered_text_contains(&output, "Inspect contents"),
+            "no archive is selected, so the entry point must not even be offered"
+        );
+    }
+
+    #[test]
+    fn inspect_contents_button_appears_for_a_selected_zip_archive() {
+        let ctx = egui::Context::default();
+        let EmptySelectedArchiveViewStateParts {
+            mut confirm_unmount,
+            mut confirm_lazy_unmount,
+            mut focus_lazy_cancel,
+            lazy_unmount_offers,
+            remount_offers,
+            mut cleanup_after_unmount,
+            mut platform_choice,
+            mut platform_custom_text,
+            mut clipboard,
+        } = empty_selected_archive_view_state_parts();
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_archive(
+                    ui,
+                    Some(&record),
+                    None,
+                    None,
+                    None,
+                    SelectedArchiveViewState {
+                        operation: None,
+                        busy: false,
+                        block_reason: None,
+                        action_readiness_debug_lines: &[],
+                        confirm_unmount: &mut confirm_unmount,
+                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                        focus_lazy_cancel: &mut focus_lazy_cancel,
+                        lazy_unmount_offers: &lazy_unmount_offers,
+                        remount_offers: &remount_offers,
+                        cleanup_after_unmount: &mut cleanup_after_unmount,
+                        platform_choice: &mut platform_choice,
+                        platform_custom_text: &mut platform_custom_text,
+                        platform_busy: false,
+                        clipboard: &mut clipboard,
+                    },
+                );
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "Inspect contents"));
+    }
+
+    /// Renders `show_selected_archive` for one live `record` with the given
+    /// `busy`/`block_reason`, mirroring exactly what `update()` passes down
+    /// via `LoadedViewState`/`SelectedArchiveViewState` for a live archive.
+    /// Used by the disabled-Mount-reason regression tests below.
+    fn render_selected_archive_with_reason(
+        record: &ArchiveRecord,
+        busy: bool,
+        block_reason: Option<&'static str>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let EmptySelectedArchiveViewStateParts {
+            mut confirm_unmount,
+            mut confirm_lazy_unmount,
+            mut focus_lazy_cancel,
+            lazy_unmount_offers,
+            remount_offers,
+            mut cleanup_after_unmount,
+            mut platform_choice,
+            mut platform_custom_text,
+            mut clipboard,
+        } = empty_selected_archive_view_state_parts();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_archive(
+                    ui,
+                    Some(record),
+                    None,
+                    None,
+                    None,
+                    SelectedArchiveViewState {
+                        operation: None,
+                        busy,
+                        block_reason,
+                        action_readiness_debug_lines: &[],
+                        confirm_unmount: &mut confirm_unmount,
+                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                        focus_lazy_cancel: &mut focus_lazy_cancel,
+                        lazy_unmount_offers: &lazy_unmount_offers,
+                        remount_offers: &remount_offers,
+                        cleanup_after_unmount: &mut cleanup_after_unmount,
+                        platform_choice: &mut platform_choice,
+                        platform_custom_text: &mut platform_custom_text,
+                        platform_busy: false,
+                        clipboard: &mut clipboard,
+                    },
+                );
+            });
+        })
+    }
+
+    #[test]
+    fn present_live_selected_archive_enables_mount() {
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let output = render_selected_archive_with_reason(&record, false, None);
+
+        assert!(rendered_text_contains(&output, "Mount"));
+        assert!(
+            !rendered_text_contains(&output, "Another operation is running."),
+            "no block reason should render when actions are available"
+        );
+    }
+
+    #[test]
+    fn busy_operation_disables_mount_with_the_correct_reason() {
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let reason = archive_action_block_reason(
+            true,
+            RefreshGeneration::INITIAL,
+            Some(RefreshGeneration::INITIAL),
+            false,
+            Some(&default_config_identity()),
+            &DiagnosticsState::Ready {
+                generation: RefreshGeneration::INITIAL,
+                report: setup_report(true, true),
+            },
+        );
+        assert_eq!(reason, Some("Another operation is running."));
+
+        let output = render_selected_archive_with_reason(&record, true, reason);
+        assert!(rendered_text_contains(
+            &output,
+            "Another operation is running."
+        ));
+    }
+
+    #[test]
+    fn waiting_for_diagnostics_disables_mount_with_the_correct_reason() {
+        let (_sender, receiver) = mpsc::channel();
+        let diagnostics = DiagnosticsState::Loading {
+            generation: RefreshGeneration::INITIAL,
+            receiver,
+        };
+        let reason = archive_action_block_reason(
+            false,
+            RefreshGeneration::INITIAL,
+            Some(RefreshGeneration::INITIAL),
+            false,
+            Some(&default_config_identity()),
+            &diagnostics,
+        );
+        assert_eq!(reason, Some("Waiting for diagnostics."));
+
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let output = render_selected_archive_with_reason(&record, true, reason);
+        assert!(rendered_text_contains(&output, "Waiting for diagnostics."));
+    }
+
+    #[test]
+    fn stale_snapshot_disables_mount_with_the_correct_reason() {
+        let reason = archive_action_block_reason(
+            false,
+            RefreshGeneration::INITIAL,
+            Some(RefreshGeneration::INITIAL),
+            true,
+            Some(&default_config_identity()),
+            &DiagnosticsState::Ready {
+                generation: RefreshGeneration::INITIAL,
+                report: setup_report(true, true),
+            },
+        );
+        assert_eq!(reason, Some("Selection is stale. Refresh to continue."));
+
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let output = render_selected_archive_with_reason(&record, true, reason);
+        assert!(rendered_text_contains(
+            &output,
+            "Selection is stale. Refresh to continue."
+        ));
+    }
+
+    #[test]
+    fn stale_selection_generation_disables_mount_with_the_correct_reason() {
+        // A refresh is in flight: the snapshot has not yet caught up to
+        // the bumped refresh_generation.
+        let reason = archive_action_block_reason(
+            false,
+            RefreshGeneration(2),
+            Some(RefreshGeneration(1)),
+            false,
+            Some(&default_config_identity()),
+            &DiagnosticsState::Ready {
+                generation: RefreshGeneration(1),
+                report: setup_report(true, true),
+            },
+        );
+        assert_eq!(reason, Some("Selection is stale. Refresh to continue."));
+    }
+
+    #[test]
+    fn setup_not_ready_disables_mount_with_a_generic_reason_when_no_check_names_mount_root() {
+        let mut report = setup_report(true, false);
+        report.checks = vec![SetupDiagnostic {
+            name: "ratarmount is available".to_string(),
+            status: SetupDiagnosticStatus::Error,
+            detail: "ratarmount was not found.".to_string(),
+            why_it_matters: "ArchiveFS uses ratarmount to expose archives.".to_string(),
+            next_step: "Install ratarmount.".to_string(),
+        }];
+        let reason = archive_action_block_reason(
+            false,
+            RefreshGeneration::INITIAL,
+            Some(RefreshGeneration::INITIAL),
+            false,
+            Some(&default_config_identity()),
+            &DiagnosticsState::Ready {
+                generation: RefreshGeneration::INITIAL,
+                report,
+            },
+        );
+        assert_eq!(reason, Some("Setup needs attention."));
+
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let output = render_selected_archive_with_reason(&record, true, reason);
+        assert!(rendered_text_contains(&output, "Setup needs attention."));
+    }
+
+    #[test]
+    fn mount_root_failure_disables_mount_with_a_specific_reason() {
+        let mut report = setup_report(true, false);
+        report.checks = vec![SetupDiagnostic {
+            name: "Mount root is writable".to_string(),
+            status: SetupDiagnosticStatus::Error,
+            detail: "Writable directory required: /mnt/archivefs".to_string(),
+            why_it_matters: "ArchiveFS must create mount-point directories.".to_string(),
+            next_step: "Grant write access.".to_string(),
+        }];
+        let reason = archive_action_block_reason(
+            false,
+            RefreshGeneration::INITIAL,
+            Some(RefreshGeneration::INITIAL),
+            false,
+            Some(&default_config_identity()),
+            &DiagnosticsState::Ready {
+                generation: RefreshGeneration::INITIAL,
+                report,
+            },
+        );
+        assert_eq!(reason, Some("Mount root is unavailable."));
+
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let output = render_selected_archive_with_reason(&record, true, reason);
+        assert!(rendered_text_contains(
+            &output,
+            "Mount root is unavailable."
+        ));
+    }
+
+    /// One `archive_action_block_reason`/`latest_generation_actions_safe`
+    /// input tuple: `(busy, current, snapshot_generation, snapshot_stale,
+    /// snapshot_identity, diagnostics)` - named purely to keep the table in
+    /// `archive_action_block_reason_matches_the_safety_gate` readable.
+    type ActionSafetyCase<'a> = (
+        bool,
+        RefreshGeneration,
+        Option<RefreshGeneration>,
+        bool,
+        Option<&'a ConfigIdentity>,
+        DiagnosticsState,
+    );
+
+    #[test]
+    fn archive_action_block_reason_matches_the_safety_gate() {
+        // `archive_action_block_reason` must never disagree with
+        // `latest_generation_actions_safe` (plus the `busy` flag it is
+        // OR'd with in `update()`) - this is the single source of truth
+        // both are required to share, exercised here across every branch.
+        let ready_identity = default_config_identity();
+        let mismatched_identity = ConfigIdentity {
+            config_path: Some(PathBuf::from("/config/archivefs.toml")),
+            content_digest: Some([9; 32]),
+        };
+        let (_sender, loading_receiver) = mpsc::channel();
+        let cases: Vec<ActionSafetyCase> = vec![
+            (
+                false,
+                RefreshGeneration::INITIAL,
+                Some(RefreshGeneration::INITIAL),
+                false,
+                Some(&ready_identity),
+                DiagnosticsState::Ready {
+                    generation: RefreshGeneration::INITIAL,
+                    report: setup_report(true, true),
+                },
+            ),
+            (
+                true,
+                RefreshGeneration::INITIAL,
+                Some(RefreshGeneration::INITIAL),
+                false,
+                Some(&ready_identity),
+                DiagnosticsState::Ready {
+                    generation: RefreshGeneration::INITIAL,
+                    report: setup_report(true, true),
+                },
+            ),
+            (
+                false,
+                RefreshGeneration(2),
+                Some(RefreshGeneration(1)),
+                false,
+                Some(&ready_identity),
+                DiagnosticsState::Ready {
+                    generation: RefreshGeneration(1),
+                    report: setup_report(true, true),
+                },
+            ),
+            (
+                false,
+                RefreshGeneration::INITIAL,
+                Some(RefreshGeneration::INITIAL),
+                true,
+                Some(&ready_identity),
+                DiagnosticsState::Ready {
+                    generation: RefreshGeneration::INITIAL,
+                    report: setup_report(true, true),
+                },
+            ),
+            (
+                false,
+                RefreshGeneration::INITIAL,
+                Some(RefreshGeneration::INITIAL),
+                false,
+                Some(&ready_identity),
+                DiagnosticsState::Loading {
+                    generation: RefreshGeneration::INITIAL,
+                    receiver: loading_receiver,
+                },
+            ),
+            (
+                false,
+                RefreshGeneration::INITIAL,
+                Some(RefreshGeneration::INITIAL),
+                false,
+                Some(&ready_identity),
+                DiagnosticsState::Ready {
+                    generation: RefreshGeneration::INITIAL,
+                    report: setup_report(true, false),
+                },
+            ),
+            (
+                false,
+                RefreshGeneration::INITIAL,
+                Some(RefreshGeneration::INITIAL),
+                false,
+                Some(&mismatched_identity),
+                DiagnosticsState::Ready {
+                    generation: RefreshGeneration::INITIAL,
+                    report: setup_report(true, true),
+                },
+            ),
+        ];
+
+        for (busy, current, snapshot_generation, snapshot_stale, identity, diagnostics) in cases {
+            let safe = !busy
+                && latest_generation_actions_safe(
+                    current,
+                    snapshot_generation,
+                    snapshot_stale,
+                    identity,
+                    &diagnostics,
+                );
+            let reason = archive_action_block_reason(
+                busy,
+                current,
+                snapshot_generation,
+                snapshot_stale,
+                identity,
+                &diagnostics,
+            );
+            assert_eq!(
+                reason.is_none(),
+                safe,
+                "block_reason disagreed with the safety gate for busy={busy}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_readiness_debug_lines_surfaces_ready_for_actions_and_every_setup_check() {
+        // Reproduces the reported live-Nobara state: a mount root that
+        // *exists* (so the separate `DoctorReport`/"Doctor: Ready" summary
+        // agreed nothing was wrong) but is not writable, so
+        // `SetupDiagnostics.ready_for_actions` is false even though every
+        // other check passes. The debug breakdown must make this visible:
+        // `ready_for_actions: false` plus the specific failing check line,
+        // not just a generic "something is wrong".
+        let mut report = setup_report(true, false);
+        report.checks = vec![
+            SetupDiagnostic {
+                name: "Mount root exists or can be created safely".to_string(),
+                status: SetupDiagnosticStatus::Ready,
+                detail: "Mount root: /mnt/archivefs".to_string(),
+                why_it_matters: "Mount and unmount actions require a safe dedicated root."
+                    .to_string(),
+                next_step: String::new(),
+            },
+            SetupDiagnostic {
+                name: "Mount root is writable".to_string(),
+                status: SetupDiagnosticStatus::Error,
+                detail: "Writable directory required: /mnt/archivefs".to_string(),
+                why_it_matters: "ArchiveFS must create mount-point directories.".to_string(),
+                next_step: "Grant write access.".to_string(),
+            },
+        ];
+        let diagnostics = DiagnosticsState::Ready {
+            generation: RefreshGeneration::INITIAL,
+            report,
+        };
+
+        let lines = action_readiness_debug_lines(
+            false,
+            RefreshGeneration::INITIAL,
+            Some(RefreshGeneration::INITIAL),
+            false,
+            Some(&default_config_identity()),
+            &diagnostics,
+        );
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("ready_for_actions: false"));
+        assert!(joined.contains("ready_for_scanning: true"));
+        assert!(joined.contains("[Ready] Mount root exists or can be created safely"));
+        assert!(joined.contains("[Error] Mount root is writable"));
+        assert!(joined.contains("busy (an operation is running): false"));
+        assert!(joined.contains("snapshot generation matches current: true"));
+    }
+
+    #[test]
+    fn debug_action_readiness_section_is_always_present_for_a_selected_live_archive() {
+        // Its presence alone (regardless of whether it happens to be
+        // expanded this frame - `CollapsingHeader`'s header button, unlike
+        // a floating popup/tooltip, always renders) is what proves a
+        // running build actually contains this diagnostic code, addressing
+        // "verify the deployed binary contains the new code".
+        let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
+        let output = render_selected_archive_with_reason(&record, false, None);
+        assert!(rendered_text_contains(&output, "Debug: action readiness"));
+    }
+
+    #[test]
+    fn acorn_archimedes_and_pc_appear_in_the_gui_platform_selector() {
+        // `show_platform_section`'s `platform_choice_combo` iterates
+        // `canonical_platform_names()` directly with no filtering in
+        // between (see its call site) - never a second,
+        // independently-drifting GUI list. A ComboBox popup renders as a
+        // floating `Area`, which `rendered_text_contains` cannot see (a
+        // documented limitation - see its doc comment), so the meaningful,
+        // observable assertion is on the exact list the dropdown is built
+        // from, pinning the "reachable from the GUI" claim at the source
+        // the widget actually reads.
+        let names = canonical_platform_names();
+        assert!(names.contains(&"Acorn Archimedes"));
+        assert!(names.contains(&"PC"));
+    }
+
+    #[test]
+    fn is_inspectable_gates_the_entry_point_to_zip_only() {
+        // The GUI button's enabled state is driven directly by this core
+        // predicate (see `show_selected_archive`) - already exhaustively
+        // tested in `archivefs-core`; this pins down that the GUI reads
+        // it correctly for the one case that matters most here (a
+        // non-ZIP archive must never offer a working Inspect action).
+        assert!(is_inspectable(Path::new("/roms/a.zip")));
+        assert!(!is_inspectable(Path::new("/roms/a.rar")));
+        assert!(!is_inspectable(Path::new("/roms/a.7z")));
+    }
+
+    #[test]
+    fn visible_inspector_entry_indices_filters_sorts_and_never_mutates_entries() {
+        let entries = vec![
+            inspector_entry("b/game.nes", InspectorEntryKind::File, 300),
+            inspector_entry("a/cover.png", InspectorEntryKind::File, 100),
+            inspector_entry("c/readme.txt", InspectorEntryKind::File, 10),
+            inspector_entry("b/", InspectorEntryKind::Directory, 0),
+        ];
+        let original = entries.clone();
+
+        let by_path =
+            visible_inspector_entry_indices(&entries, "", None, InspectorSortField::Path, true);
+        assert_eq!(
+            by_path
+                .iter()
+                .map(|&i| entries[i].name.as_str())
+                .collect::<Vec<_>>(),
+            ["a/cover.png", "b/", "b/game.nes", "c/readme.txt"]
+        );
+
+        let by_size_desc =
+            visible_inspector_entry_indices(&entries, "", None, InspectorSortField::Size, false);
+        assert_eq!(entries[by_size_desc[0]].name, "b/game.nes");
+
+        let search_only =
+            visible_inspector_entry_indices(&entries, "GAME", None, InspectorSortField::Path, true);
+        assert_eq!(search_only.len(), 1);
+        assert_eq!(entries[search_only[0]].name, "b/game.nes");
+
+        let classification_only = visible_inspector_entry_indices(
+            &entries,
+            "",
+            Some(InspectorEntryClassification::Artwork),
+            InspectorSortField::Path,
+            true,
+        );
+        assert_eq!(classification_only.len(), 1);
+        assert_eq!(entries[classification_only[0]].name, "a/cover.png");
+
+        // Pure: the underlying entries are completely untouched by any
+        // amount of filtering/sorting.
+        assert_eq!(entries, original);
+    }
+
+    #[test]
+    fn inspector_row_click_selects_the_exact_full_entry_name() {
+        let long_name = format!("roms/{}/game.nes", "very-long-folder-name-".repeat(20));
+        let entry = inspector_entry(&long_name, InspectorEntryKind::File, 4096);
+        let ctx = egui::Context::default();
+        let widths = [520.0_f32, INSPECTOR_DETAILS_COLUMN_WIDTH];
+
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            show_inspector_row(ui, &entry, 24.0, false, &widths)
+        };
+        let (response, _) = simulate_row_click(
+            &ctx,
+            egui::pos2(10.0, 12.0),
+            egui::Modifiers::default(),
+            render,
+        );
+        assert!(response.clicked());
+
+        // Mirrors exactly what `show_archive_inspector_panel` does with a
+        // clicked row's response.
+        let mut selected_entry = None;
+        if response.clicked() {
+            selected_entry = Some(entry.name.clone());
+        }
+
+        assert_eq!(
+            selected_entry.as_deref(),
+            Some(long_name.as_str()),
+            "selection identity must be the complete, untruncated entry name - the same value \
+             the details panel's Copy button would then copy"
+        );
+    }
+
+    #[test]
+    fn archive_inspector_panel_renders_a_very_long_entry_name_without_panicking() {
+        let long_name = format!("{}/deeply/nested/entry.nes", "a".repeat(500));
+        let report = InspectorReport {
+            entries: vec![inspector_entry(
+                &long_name,
+                InspectorEntryKind::File,
+                123_456,
+            )],
+            truncated: true,
+            total_entries_in_archive: 250_000,
+        };
+        let mut state = ArchiveInspectorState {
+            archive_path: PathBuf::from("/roms/huge.zip"),
+            status: ArchiveInspectorStatus::Ready(report),
+            search: String::new(),
+            classification_filter: None,
+            sort_field: InspectorSortField::Path,
+            sort_ascending: true,
+            selected_entry: Some(long_name.clone()),
+            path_column_width: DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH,
+        };
+        let mut clipboard = InMemoryClipboard::default();
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_archive_inspector_panel(ui, &mut state, &mut clipboard);
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "incomplete"));
+    }
+
+    #[test]
+    fn archive_inspector_panel_shows_a_truthful_error_without_panicking() {
+        let mut state = ArchiveInspectorState {
+            archive_path: PathBuf::from("/roms/broken.zip"),
+            status: ArchiveInspectorStatus::Error(
+                "not a readable ZIP archive: invalid Zip archive".to_string(),
+            ),
+            search: String::new(),
+            classification_filter: None,
+            sort_field: InspectorSortField::Path,
+            sort_ascending: true,
+            selected_entry: None,
+            path_column_width: DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH,
+        };
+        let mut clipboard = InMemoryClipboard::default();
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_archive_inspector_panel(ui, &mut state, &mut clipboard);
+            });
+        });
+
+        assert!(rendered_text_contains(
+            &output,
+            "not a readable ZIP archive"
+        ));
     }
 }

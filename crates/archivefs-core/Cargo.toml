@@ -9,3 +9,20 @@ log = "0.4"
 notify = "8"
 sha2 = "0.11.0"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+# Archive Inspector (read-only ZIP listing): a small, focused, well
+# established crate rather than hand-parsed ZIP structure or shelling out
+# to `unzip`/`7z`. Production code only ever lists entry metadata via
+# `ZipArchive::by_index_raw` - it never decompresses anything - so no
+# codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
+# see the `[dev-dependencies]` entry below for why tests need more.
+zip = { version = "8.6", default-features = false }
+
+[dev-dependencies]
+# Same crate, fuller feature set: only test fixtures need to *write* zip
+# files (including a deflated and a password-encrypted one) to exercise
+# the read-only inspector against real archives. Cargo unifies features
+# for one crate across `[dependencies]`/`[dev-dependencies]` only within
+# a build that includes both (`cargo test`) - a plain `cargo build
+# --release` (no test targets) never links any codec this crate does not
+# itself need.
+zip = { version = "8.6", features = ["deflate", "aes-crypto"] }
