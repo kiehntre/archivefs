@@ -6,17 +6,21 @@ use std::sync::OnceLock;
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
-    CatalogueStats, CompletedScanSummary, Config, ConfigCheckReport, ConfigCheckStatus, Database,
-    DatabaseHealth, DoctorReport, DuplicateDetector, DuplicateEntry, DuplicateReport,
-    FilenameDuplicateDetector, MissingArchiveRemovalResult, MountPlan, PersistedArchive,
-    PlatformAlias, PlatformAssignmentChange, ScanPersistSummary, WatchRebuildSummary,
-    build_and_write_archive_index, canonical_platform_names, check_archive_index_freshness,
-    check_database_health, clean_mount_root, cleanup_selected_mount_dir, current_archive_info,
-    current_archive_stats, current_statuses, default_database_path, default_index_path,
-    find_archive_index_entries, latest_schema_version, mount_archives, mount_one_archive,
-    persisted_archive_has_unknown_platform, read_default_archive_index, run_config_check_default,
-    run_doctor_default, scan_and_persist, summarize_archive_index, unmount_archives,
-    unmount_one_archive, watch_archive_index,
+    CatalogueHealthReport, CatalogueStats, CompletedScanSummary, Config, ConfigCheckReport,
+    ConfigCheckStatus, Database, DatabaseHealth, DoctorReport, DuplicateDetector, DuplicateEntry,
+    DuplicateReport, FilenameDuplicateDetector, MissingArchiveRemovalResult, MountPlan,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    SourceAvailability, SourceFolderView, WatchRebuildSummary, add_source_folder_default,
+    build_and_write_archive_index, canonical_platform_names, catalogue_health_report,
+    check_archive_index_freshness, check_database_health, clean_mount_root,
+    cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
+    default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
+    list_source_folder_views_default, load_source_folder_configs_default, mount_archives,
+    mount_one_archive, persisted_archive_has_unknown_platform, read_default_archive_index,
+    remove_source_folder_default, resolve_source_folder_identifier, run_config_check_default,
+    run_doctor_default, scan_all_enabled_sources_default, scan_and_persist,
+    scan_source_folder_default, set_source_folder_enabled_default, summarize_archive_index,
+    unmount_archives, unmount_one_archive, watch_archive_index,
 };
 use serde::Serialize;
 
@@ -246,6 +250,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_status(&view);
             }
         }
+        "health" => {
+            let json = args.any(|arg| arg == "--json");
+            let database_path = default_database_path()?;
+            let database = Database::open_or_create(&database_path)?;
+            let archives = database.load_archives()?;
+            let report = catalogue_health_report(&archives);
+            if json {
+                print_health_report_json(&report)?;
+            } else {
+                print_health_report(&report);
+            }
+        }
         "library-scan" => {
             let json = args.any(|arg| arg == "--json");
             let config = Config::load_default()?;
@@ -444,6 +460,139 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 || println!("Watching configured source folders for archive changes."),
                 print_watch_rebuild,
             )?;
+        }
+        "sources" => {
+            let mut input_args: Vec<String> = args.collect();
+            if input_args.first().is_some_and(|arg| arg == "scan-all") {
+                input_args.remove(0);
+                let json = extract_flag(&mut input_args, "--json");
+                let summary =
+                    scan_all_enabled_sources_default().map_err(|error| error.to_string())?;
+                let report = LibraryScanReport::from(&summary);
+                if json {
+                    print_library_scan_json(&report)?;
+                } else {
+                    print_library_scan(&report);
+                }
+            } else {
+                let json = extract_flag(&mut input_args, "--json");
+                let views =
+                    list_source_folder_views_default().map_err(|error| error.to_string())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&views)?);
+                } else {
+                    print_source_folder_views(&views);
+                }
+            }
+        }
+        "source" => {
+            let Some(sub_command) = args.next() else {
+                return Err(
+                    "source requires a sub-command: add <path> | enable <id-or-path> | \
+                     disable <id-or-path> | scan <id-or-path> | remove <id-or-path> \
+                     (--keep-catalogue | --remove-catalogue)"
+                        .into(),
+                );
+            };
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+
+            match sub_command.as_str() {
+                "add" => {
+                    let Some(path) = input_args.first().cloned() else {
+                        return Err(
+                            "source add requires a path, e.g. archivefs-cli source add /mnt/roms"
+                                .into(),
+                        );
+                    };
+                    let added = add_source_folder_default(Path::new(&path))
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&added)?);
+                    } else {
+                        println!("Added source folder: {}", added.path.display());
+                        println!(
+                            "Run 'archivefs-cli source scan {}' to scan it.",
+                            added.path.display()
+                        );
+                    }
+                }
+                "enable" | "disable" => {
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err(format!("source {sub_command} requires an id or path").into());
+                    };
+                    let target = resolve_source_identifier(&identifier)?;
+                    let enabled = sub_command == "enable";
+                    let outcome = set_source_folder_enabled_default(&target, enabled)
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&outcome.source)?);
+                    } else if enabled {
+                        println!("Enabled source folder: {}", outcome.source.path.display());
+                        if let Some(scan) = &outcome.scan {
+                            print_library_scan(&LibraryScanReport::from(scan));
+                        }
+                    } else {
+                        println!("Disabled source folder: {}", outcome.source.path.display());
+                        println!(
+                            "Its catalogue entries are preserved and excluded from future scans."
+                        );
+                    }
+                }
+                "scan" => {
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err("source scan requires an id or path".into());
+                    };
+                    let target = resolve_source_identifier(&identifier)?;
+                    let summary =
+                        scan_source_folder_default(&target).map_err(|error| error.to_string())?;
+                    let report = LibraryScanReport::from(&summary);
+                    if json {
+                        print_library_scan_json(&report)?;
+                    } else {
+                        print_library_scan(&report);
+                    }
+                }
+                "remove" => {
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err("source remove requires an id or path".into());
+                    };
+                    let keep_catalogue = extract_flag(&mut input_args, "--keep-catalogue");
+                    let remove_catalogue = extract_flag(&mut input_args, "--remove-catalogue");
+                    let keep = resolve_keep_catalogue_flag(keep_catalogue, remove_catalogue)?;
+                    let target = resolve_source_identifier(&identifier)?;
+                    let outcome = remove_source_folder_default(&target, keep)
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&RemoveSourceFolderReport {
+                                removed_path: outcome.removed_source.path.clone(),
+                                catalogue_rows_removed: outcome.catalogue_rows_removed,
+                            })?
+                        );
+                    } else {
+                        println!(
+                            "Removed source folder from configuration: {}",
+                            outcome.removed_source.path.display()
+                        );
+                        println!("ArchiveFS did not delete the folder or any files inside it.");
+                        match outcome.catalogue_rows_removed {
+                            Some(count) => println!(
+                                "Removed {count} catalogue entr{} for this source.",
+                                if count == 1 { "y" } else { "ies" }
+                            ),
+                            None => println!("Catalogue entries for this source were kept."),
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "unknown 'source' sub-command '{other}' (expected add, enable, disable, scan, or remove)"
+                    )
+                    .into());
+                }
+            }
         }
         // `--version`/`-V` are recognised only in the command position -
         // exactly the same scope `--help`/`-h` already have (neither is
@@ -751,6 +900,58 @@ fn format_library_status(view: &LibraryStatusView) -> String {
     output
 }
 
+/// `health` prints [`CatalogueHealthReport`] - a new, stable JSON shape
+/// (never a field on any existing serialized struct), so no existing
+/// field is renamed or removed. Read-only: `catalogue_health_report`
+/// classifies already-loaded catalogue rows only - this command never
+/// scans, mounts, unmounts, or writes to the database. Its report is
+/// necessarily a catalogue-only subset of the GUI Health Dashboard's
+/// report - it can never report `AwaitingValidation`/`CachedOnly`,
+/// retryable/terminal mount failures, or recovery-offer availability,
+/// since all of those require a live GUI session this command
+/// deliberately never has (see `ArchivePresence`'s doc comment in
+/// archivefs-core).
+fn print_health_report(report: &CatalogueHealthReport) {
+    print!("{}", format_health_report(report));
+}
+
+fn print_health_report_json(report: &CatalogueHealthReport) -> Result<(), serde_json::Error> {
+    println!("{}", format_health_report_json(report)?);
+    Ok(())
+}
+
+fn format_health_report_json(report: &CatalogueHealthReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
+}
+
+fn format_health_report(report: &CatalogueHealthReport) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS Health Report\n\n");
+    output.push_str(&format!("Archives checked: {}\n", report.archives_checked));
+    output.push_str(&format!("Missing: {}\n", report.missing_count));
+    output.push_str(&format!(
+        "Unknown platform: {}\n",
+        report.unknown_platform_count
+    ));
+
+    if report.issues.is_empty() {
+        output.push_str("\nNo archive health issues were found.\n");
+        return output;
+    }
+
+    output.push_str("\nIssues:\n");
+    for issue in &report.issues {
+        output.push_str(&format!(
+            "  [{}] {} ({}) - {}\n",
+            issue.category.label(),
+            issue.path.display(),
+            issue.platform.as_deref().unwrap_or("Unknown"),
+            issue.reason
+        ));
+    }
+    output
+}
+
 /// A `library-scan` result, reshaped from [`ScanPersistSummary`] into
 /// names that read clearly on their own (`source_folders_attempted` etc.)
 /// rather than requiring the reader to know this crate's internal
@@ -859,6 +1060,87 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
         }
     }
     output
+}
+
+/// Resolves a `sources`/`source` sub-command's `<id-or-path>` argument
+/// against the current config and database state - shared by every
+/// per-source CLI sub-command so the numeric-id-vs-path resolution
+/// (`resolve_source_folder_identifier`) is called exactly the same way
+/// everywhere.
+fn resolve_source_identifier(identifier: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let sources = load_source_folder_configs_default().map_err(|error| error.to_string())?;
+    let database_path = default_database_path()?;
+    let database = Database::open_or_create(&database_path)?;
+    let records = database.list_source_folders()?;
+    resolve_source_folder_identifier(identifier, &sources, &records)
+        .map_err(|error| error.to_string().into())
+}
+
+fn format_source_availability(availability: SourceAvailability) -> &'static str {
+    match availability {
+        SourceAvailability::Available => "Available",
+        SourceAvailability::Unavailable => "Unavailable",
+        SourceAvailability::PermissionDenied => "Permission denied",
+        SourceAvailability::Disabled => "Disabled",
+        SourceAvailability::ScanFailed => "Scan failed",
+    }
+}
+
+fn print_source_folder_views(views: &[SourceFolderView]) {
+    print!("{}", format_source_folder_views(views));
+}
+
+fn format_source_folder_views(views: &[SourceFolderView]) -> String {
+    let mut output = String::from("ArchiveFS Sources\n\n");
+    if views.is_empty() {
+        output.push_str("No source folders are configured.\n");
+        output.push_str("Add one with: archivefs-cli source add <path>\n");
+        return output;
+    }
+    for view in views {
+        output.push_str(&format!("{}\n", view.path.display()));
+        output.push_str(&format!(
+            "  Id:               {}\n",
+            view.id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        output.push_str(&format!(
+            "  Enabled:          {}\n",
+            if view.enabled { "yes" } else { "no" }
+        ));
+        output.push_str(&format!(
+            "  Availability:     {}\n",
+            format_source_availability(view.availability)
+        ));
+        output.push_str(&format!(
+            "  Last archive count: {}\n",
+            view.last_archive_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "never scanned".to_string())
+        ));
+        output.push_str(&format!(
+            "  Last scan:        {}\n",
+            view.last_scan_at.as_deref().unwrap_or("never")
+        ));
+        if let Some(error) = &view.last_scan_error {
+            output.push_str(&format!("  Last scan error:  {error}\n"));
+        }
+        output.push('\n');
+    }
+    output
+}
+
+/// `source remove`'s `--json` output - a small display-ready reshaping of
+/// [`archivefs_core::RemoveSourceFolderOutcome`], matching the same
+/// "CLI-local report type" convention `LibraryScanReport` already
+/// establishes rather than deriving `Serialize` on the core outcome type
+/// directly.
+#[derive(Debug, Clone, Serialize)]
+struct RemoveSourceFolderReport {
+    #[serde(serialize_with = "serialize_path_display")]
+    removed_path: PathBuf,
+    catalogue_rows_removed: Option<usize>,
 }
 
 /// One archive as shown by `library-list`/`library-find`: a display-ready
@@ -1336,6 +1618,26 @@ fn extract_flag(args: &mut Vec<String>, flag: &str) -> bool {
     let had_flag = args.iter().any(|arg| arg == flag);
     args.retain(|arg| arg != flag);
     had_flag
+}
+
+/// `source remove` deliberately never defaults to a destructive choice -
+/// the caller must always pass exactly one of `--keep-catalogue` or
+/// `--remove-catalogue` explicitly. Returns `true` (keep) or `false`
+/// (remove); errors clearly on neither or both.
+fn resolve_keep_catalogue_flag(
+    keep_catalogue: bool,
+    remove_catalogue: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match (keep_catalogue, remove_catalogue) {
+        (true, false) => Ok(true),
+        (false, true) => Ok(false),
+        (false, false) => Err(
+            "source remove requires exactly one of --keep-catalogue or --remove-catalogue".into(),
+        ),
+        (true, true) => {
+            Err("source remove cannot take both --keep-catalogue and --remove-catalogue".into())
+        }
+    }
 }
 
 /// Removes `--id <value>` from `args` if present, returning the parsed
@@ -1969,6 +2271,9 @@ fn print_help() {
     println!("  index-show     Show a summary of the JSON archive index");
     println!("  index-find     Find entries in the JSON archive index");
     println!("  library-status Show the persistent library database's health and counts");
+    println!(
+        "  health         Show catalogue archive health (missing, unknown platform) - no scan, mount, or unmount"
+    );
     println!("  library-scan   Scan configured source folders into the library database");
     println!("  library-list   List archives from the library database (no rescan)");
     println!("  library-find   Search the library database by path or platform");
@@ -1990,6 +2295,15 @@ fn print_help() {
         "  platform-alias-add     Add a custom folder-name platform alias (applies on next scan)"
     );
     println!("  platform-alias-remove   Remove a custom folder-name platform alias");
+    println!("  sources                List configured source folders and their status");
+    println!("  sources scan-all       Scan every enabled source folder independently");
+    println!("  source add             Add a new source folder (validated, never auto-scanned)");
+    println!("  source enable          Enable a source folder (scans it automatically)");
+    println!("  source disable         Disable a source folder (catalogue preserved, no scan)");
+    println!("  source scan            Scan one source folder by id or path");
+    println!(
+        "  source remove          Remove a source folder from configuration (--keep-catalogue or --remove-catalogue)"
+    );
     println!();
     println!("Examples:");
     println!("  archivefs --version");
@@ -2017,6 +2331,14 @@ fn print_help() {
     println!("  archivefs platform-alias-list");
     println!("  archivefs platform-alias-add gc GameCube");
     println!("  archivefs platform-alias-remove gc");
+    println!("  archivefs sources");
+    println!("  archivefs sources --json");
+    println!("  archivefs sources scan-all");
+    println!("  archivefs source add /mnt/usbdrive/retro");
+    println!("  archivefs source enable /mnt/usbdrive/retro");
+    println!("  archivefs source disable 3");
+    println!("  archivefs source scan 3");
+    println!("  archivefs source remove 3 --keep-catalogue");
     println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
     println!("  archivefs mount-one \"007 Legends\"");
@@ -3161,6 +3483,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // -----------------------------------------------------------------
+    // v0.4.3-alpha: `health` / `health --json` - catalogue-only,
+    // never-scans health report.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn health_report_is_empty_for_a_freshly_scanned_healthy_library() {
+        let root = temp_dir("health-empty");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "Xbox360/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        let report = catalogue_health_report(&archives);
+
+        assert_eq!(report.archives_checked, 1);
+        assert_eq!(report.missing_count, 0);
+        assert_eq!(report.unknown_platform_count, 0);
+        assert!(report.issues.is_empty());
+        assert!(format_health_report(&report).contains("No archive health issues were found."));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn health_report_json_round_trips_missing_and_unknown_platform() {
+        let root = temp_dir("health-json");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let disappearing = write_archive_file(&source, "Xbox360/game.zip", b"contents");
+        write_archive_file(&source, "mystery.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        std::fs::remove_file(&disappearing).unwrap();
+        run_library_scan(&config, &database_path, "test").unwrap();
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        let report = catalogue_health_report(&archives);
+
+        assert_eq!(report.archives_checked, 2);
+        assert_eq!(report.missing_count, 1);
+        assert_eq!(report.unknown_platform_count, 1);
+        assert_eq!(report.issues.len(), 2);
+
+        let output = format_health_report_json(&report).unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+        assert_eq!(json["missing_count"], 1);
+        assert_eq!(json["unknown_platform_count"], 1);
+        assert_eq!(json["issues"].as_array().unwrap().len(), 2);
+        assert!(
+            json["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["category"] == "Missing")
+        );
+        assert!(
+            json["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["category"] == "UnknownPlatform")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn health_report_never_triggers_a_scan_itself() {
+        // Scan once while the archive is present, then delete it from
+        // disk without ever scanning again. `catalogue_health_report`
+        // must read only what the last completed scan already persisted
+        // (`last_verified_missing_at` still unset) - if it instead
+        // performed its own live check, this archive would incorrectly
+        // show up as Missing.
+        let root = temp_dir("health-no-scan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let archive_path = write_archive_file(&source, "Xbox360/game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "test").unwrap();
+        std::fs::remove_file(&archive_path).unwrap();
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        let report = catalogue_health_report(&archives);
+
+        assert_eq!(
+            report.missing_count, 0,
+            "reading the health report must never itself run a scan that would notice the \
+             archive is now gone"
+        );
+        assert!(report.issues.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     #[cfg(unix)]
     fn non_utf8_path_formats_without_panicking() {
@@ -4115,6 +4541,98 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_starter_config(config_path: &Path, mount_root: &Path) {
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_keep_catalogue_flag_requires_exactly_one_flag() {
+        assert!(resolve_keep_catalogue_flag(true, false).unwrap());
+        assert!(!resolve_keep_catalogue_flag(false, true).unwrap());
+        assert!(resolve_keep_catalogue_flag(false, false).is_err());
+        assert!(resolve_keep_catalogue_flag(true, true).is_err());
+    }
+
+    #[test]
+    fn format_source_folder_views_reports_an_empty_configuration_truthfully() {
+        let output = format_source_folder_views(&[]);
+        assert!(output.contains("No source folders are configured."));
+        assert!(output.contains("archivefs-cli source add"));
+    }
+
+    #[test]
+    fn cli_source_lifecycle_uses_the_same_core_functions_as_the_gui() {
+        // Exercises the exact core functions the CLI's "source" and
+        // "sources" match arms call (add/list/scan/enable/disable/remove)
+        // through the same `_at` entry points, proving the CLI never
+        // duplicates core logic - it only formats what these functions
+        // already return.
+        let root = temp_dir("cli-source-lifecycle");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let source_a = root.join("source-a");
+        std::fs::create_dir_all(&source_a).unwrap();
+        std::fs::write(source_a.join("a.zip"), b"a").unwrap();
+
+        let added =
+            archivefs_core::add_source_folder_at(&config_path, &database_path, &source_a).unwrap();
+        assert!(added.enabled);
+
+        let views =
+            archivefs_core::list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1);
+        let formatted = format_source_folder_views(&views);
+        assert!(formatted.contains("source-a"));
+        assert!(formatted.contains("Available"));
+
+        let summary =
+            archivefs_core::scan_source_folder_at(&config_path, &database_path, &source_a, "test")
+                .unwrap();
+        assert_eq!(summary.counts.archives_added, 1);
+
+        let disabled = archivefs_core::set_source_folder_enabled_at(
+            &config_path,
+            &database_path,
+            &source_a,
+            false,
+        )
+        .unwrap();
+        assert!(!disabled.source.enabled);
+        assert!(disabled.scan.is_none());
+
+        let removed =
+            archivefs_core::remove_source_folder_at(&config_path, &database_path, &source_a, true)
+                .unwrap();
+        assert_eq!(removed.catalogue_rows_removed, None);
+        assert!(
+            source_a.exists(),
+            "the CLI path must never touch the filesystem source"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_source_folder_report_serializes_a_display_safe_path() {
+        let report = RemoveSourceFolderReport {
+            removed_path: PathBuf::from("/mnt/usbdrive/retro"),
+            catalogue_rows_removed: Some(3),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("/mnt/usbdrive/retro"));
+        assert!(json.contains("\"catalogue_rows_removed\":3"));
     }
 
     #[test]

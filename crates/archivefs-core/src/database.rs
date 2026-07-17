@@ -79,6 +79,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "add platform_aliases: persistent custom folder-name -> canonical platform mappings",
         sql: include_str!("migrations/0002_platform_aliases.sql"),
     },
+    Migration {
+        version: 3,
+        description: "add source_folders scan-status columns: last_scan_status, last_scan_error, last_scan_at, last_successful_scan_at, last_archive_count",
+        sql: include_str!("migrations/0003_source_folder_scan_status.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -378,6 +383,53 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 pub struct RegisteredSourceFolder {
     pub id: i64,
     pub path: PathBuf,
+}
+
+/// Whether the most recent scan attempt of one source folder succeeded or
+/// failed - see the `source_folders.last_scan_status` column added by
+/// migration 0003. Deliberately just these two variants: distinguishing
+/// *why* a failure happened (missing path vs. permission denied vs. some
+/// other error) is done from `last_scan_error`'s text by
+/// `classify_source_availability`, not encoded redundantly here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum SourceScanStatus {
+    Success,
+    Failed,
+}
+
+impl SourceScanStatus {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "success" => Some(Self::Success),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A full `source_folders` row, including migration 0003's scan-status
+/// columns - the multi-source Sources page's per-source display data.
+/// Does not include `enabled` (a config-owned fact, not a database one);
+/// callers building a full display view join this against
+/// `Vec<SourceFolderConfig>` by path (see `lib.rs`'s source-management
+/// functions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFolderRecord {
+    pub id: i64,
+    pub path: PathBuf,
+    pub first_seen_at: String,
+    pub last_scan_status: Option<SourceScanStatus>,
+    pub last_scan_error: Option<String>,
+    pub last_scan_at: Option<String>,
+    pub last_successful_scan_at: Option<String>,
+    pub last_archive_count: Option<i64>,
 }
 
 /// What happened to one `archives` row during [`Database::upsert_archive`].
@@ -800,6 +852,96 @@ impl Database {
         tx.commit()
             .map_err(|error| db_error("failed to commit register_source_folders", error))?;
         Ok(registered)
+    }
+
+    /// Every source folder not removed from config (`removed_from_config_at
+    /// IS NULL`), with its scan-status columns - the multi-source Sources
+    /// page's data source. Ordered by `first_seen_at` so the display order
+    /// is stable across renders instead of depending on SQLite's
+    /// unspecified row order.
+    pub fn list_source_folders(&self) -> Result<Vec<SourceFolderRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, path, first_seen_at, last_scan_status, last_scan_error, \
+                 last_scan_at, last_successful_scan_at, last_archive_count \
+                 FROM source_folders WHERE removed_from_config_at IS NULL \
+                 ORDER BY first_seen_at ASC, id ASC",
+            )
+            .map_err(|error| db_error("failed to prepare source folder listing", error))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                let path_bytes: Vec<u8> = row.get(1)?;
+                let status: Option<String> = row.get(3)?;
+                Ok(SourceFolderRecord {
+                    id: row.get(0)?,
+                    path: PathBuf::from(OsString::from_vec(path_bytes)),
+                    first_seen_at: row.get(2)?,
+                    last_scan_status: status
+                        .and_then(|status| SourceScanStatus::from_db_str(&status)),
+                    last_scan_error: row.get(4)?,
+                    last_scan_at: row.get(5)?,
+                    last_successful_scan_at: row.get(6)?,
+                    last_archive_count: row.get(7)?,
+                })
+            })
+            .map_err(|error| db_error("failed to list source folders", error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| db_error("failed to read source folders", error))?;
+
+        Ok(rows)
+    }
+
+    /// Records the outcome of one source folder's scan attempt (success or
+    /// failure) into its `source_folders` row - always called exactly
+    /// once per folder per scan pass, whether that folder's
+    /// `ArchiveScanner::scan_archives` call itself failed or the
+    /// filesystem walk succeeded but persistence (`persist_one_folder`)
+    /// then failed. `last_successful_scan_at` and `last_archive_count`
+    /// only advance on `Success` - a failed attempt never overwrites the
+    /// last genuinely known archive count, matching the "preserve
+    /// catalogue on an unavailable source" safety requirement.
+    fn record_source_scan_result(
+        &mut self,
+        source_folder_id: i64,
+        outcome: SourceScanStatus,
+        error: Option<&str>,
+        archive_count: Option<i64>,
+    ) -> Result<()> {
+        let now = now_utc_string();
+        match outcome {
+            SourceScanStatus::Success => {
+                self.connection
+                    .execute(
+                        "UPDATE source_folders SET last_scan_status = ?2, last_scan_error = NULL, \
+                         last_scan_at = ?3, last_successful_scan_at = ?3, last_archive_count = ?4 \
+                         WHERE id = ?1",
+                        params![
+                            source_folder_id,
+                            SourceScanStatus::Success.as_db_str(),
+                            now,
+                            archive_count
+                        ],
+                    )
+                    .map_err(|error| db_error("failed to record source scan success", error))?;
+            }
+            SourceScanStatus::Failed => {
+                self.connection
+                    .execute(
+                        "UPDATE source_folders SET last_scan_status = ?2, last_scan_error = ?3, \
+                         last_scan_at = ?4 WHERE id = ?1",
+                        params![
+                            source_folder_id,
+                            SourceScanStatus::Failed.as_db_str(),
+                            error,
+                            now
+                        ],
+                    )
+                    .map_err(|error| db_error("failed to record source scan failure", error))?;
+            }
+        }
+        Ok(())
     }
 
     /// Starts a new `scan_runs` row with `status = 'running'` and returns
@@ -1491,6 +1633,88 @@ impl Database {
             removed: ids.len(),
             archive_ids: ids,
         })
+    }
+
+    /// The exact number of catalogue rows a
+    /// [`Self::remove_source_folder_catalogue`] call for `source_folder_id`
+    /// would delete - read-only, for a removal confirmation dialog to show
+    /// the precise count *before* the user commits to anything.
+    pub fn count_archives_for_source_folder(&self, source_folder_id: i64) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM archives WHERE source_folder_id = ?1",
+                params![source_folder_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| db_error("failed to count archives for source folder", error))
+    }
+
+    /// Deletes every catalogue entry owned by `source_folder_id` - present
+    /// or missing alike, unlike [`Self::remove_missing_archives`], since
+    /// removing an entire source's catalogue is a deliberate "stop
+    /// tracking this source" action, not a missing-entry cleanup. Same
+    /// explicit child-then-parent delete order as
+    /// `remove_missing_archives` (this schema has no cascading deletes),
+    /// all in one transaction: a failure partway through rolls back
+    /// completely rather than leaving a source half-cleaned. Only rows
+    /// whose `source_folder_id` matches are ever touched - no other
+    /// source's archives, and no filesystem content, are affected. Returns
+    /// the number of archive rows removed.
+    ///
+    /// Does not remove the `source_folders` row itself (that stays,
+    /// marked `removed_from_config_at` by the caller's config save +
+    /// `register_source_folders` cycle) - this only clears its owned
+    /// catalogue rows.
+    pub fn remove_source_folder_catalogue(&mut self, source_folder_id: i64) -> Result<usize> {
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error(
+                "failed to start remove_source_folder_catalogue transaction",
+                error,
+            )
+        })?;
+
+        let archive_ids: Vec<i64> = {
+            let mut statement = tx
+                .prepare("SELECT id FROM archives WHERE source_folder_id = ?1")
+                .map_err(|error| db_error("failed to prepare source folder archive scan", error))?;
+            statement
+                .query_map(params![source_folder_id], |row| row.get(0))
+                .map_err(|error| db_error("failed to list source folder archives", error))?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(|error| db_error("failed to read source folder archives", error))?
+        };
+
+        for archive_id in &archive_ids {
+            tx.execute(
+                "DELETE FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove platform history for source folder archive",
+                    error,
+                )
+            })?;
+            tx.execute(
+                "DELETE FROM archive_scan_observations WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove scan observations for source folder archive",
+                    error,
+                )
+            })?;
+        }
+        tx.execute(
+            "DELETE FROM archives WHERE source_folder_id = ?1",
+            params![source_folder_id],
+        )
+        .map_err(|error| db_error("failed to remove source folder archives", error))?;
+
+        tx.commit()
+            .map_err(|error| db_error("failed to commit remove_source_folder_catalogue", error))?;
+        Ok(archive_ids.len())
     }
 
     /// Sets `platform` as a manual, user-chosen platform assignment for
@@ -2312,25 +2536,56 @@ pub fn scan_and_persist(
     config: &Config,
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
-    database.mark_interrupted_scan_runs()?;
     let registered_folders = database.register_source_folders(&config.source_folders)?;
+    scan_and_persist_folders(database, &registered_folders, triggered_by)
+}
+
+/// The shared scan+persist pipeline both [`scan_and_persist`] (the legacy
+/// whole-config entry point) and the multi-source milestone's
+/// `scan_source_folder`/`scan_all_enabled_sources` (see `lib.rs`) drive -
+/// an explicit, already-registered list of folders, with per-folder
+/// isolation: one folder's scanner or persistence failure is recorded in
+/// [`ScanPersistSummary::folder_errors`] and that folder's own
+/// `source_folders` status columns, without touching any other folder's
+/// archives, status, or the overall run's success. This is the single
+/// place archive discovery is ever walked and persisted - no caller
+/// duplicates this loop.
+///
+/// Registration itself is deliberately the caller's responsibility, not
+/// this function's: `scan_and_persist` only ever knows "enabled" folders
+/// (`Config::source_folders`), while multi-source management must also
+/// register disabled ones (to keep them "configured" rather than
+/// "removed") without asking this function to scan them.
+pub(crate) fn scan_and_persist_folders(
+    database: &mut Database,
+    folders: &[RegisteredSourceFolder],
+    triggered_by: &str,
+) -> Result<ScanPersistSummary> {
+    database.mark_interrupted_scan_runs()?;
     let scan_run_id = database.start_scan_run(triggered_by, None)?;
 
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
 
-    for folder in &registered_folders {
+    for folder in folders {
         let folder_config = Config {
             source_folders: vec![folder.path.clone()],
-            mount_root: config.mount_root.clone(),
-            ratarmount_bin: config.ratarmount_bin.clone(),
+            mount_root: PathBuf::new(),
+            ratarmount_bin: String::new(),
         };
 
         let archives = match ArchiveScanner::new(&folder_config).scan_archives() {
             Ok(archives) => archives,
             Err(error) => {
                 counts.errors_count += 1;
-                folder_errors.push((folder.path.clone(), error.to_string()));
+                let message = error.to_string();
+                database.record_source_scan_result(
+                    folder.id,
+                    SourceScanStatus::Failed,
+                    Some(&message),
+                    None,
+                )?;
+                folder_errors.push((folder.path.clone(), message));
                 continue;
             }
         };
@@ -2345,10 +2600,23 @@ pub fn scan_and_persist(
                 counts.archives_unchanged += folder_counts.archives_unchanged;
                 counts.archives_updated += folder_counts.archives_updated;
                 counts.archives_missing += folder_counts.archives_missing;
+                database.record_source_scan_result(
+                    folder.id,
+                    SourceScanStatus::Success,
+                    None,
+                    Some(archives.len() as i64),
+                )?;
             }
             Err(error) => {
                 counts.errors_count += 1;
-                folder_errors.push((folder.path.clone(), error.to_string()));
+                let message = error.to_string();
+                database.record_source_scan_result(
+                    folder.id,
+                    SourceScanStatus::Failed,
+                    Some(&message),
+                    None,
+                )?;
+                folder_errors.push((folder.path.clone(), message));
             }
         }
     }
@@ -3628,6 +3896,59 @@ mod tests {
                 .last_verified_missing_at
                 .is_none()
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn each_source_folder_records_its_own_independent_scan_status() {
+        let root = temp_dir("independent-scan-status");
+        let source_a = root.join("source-a");
+        let source_b = root.join("source-b");
+        let mount = root.join("mount");
+        write_archive_file(&source_a, "a.zip", b"a");
+        write_archive_file(&source_b, "b.zip", b"b");
+        let config = Config {
+            source_folders: vec![source_a.clone(), source_b.clone()],
+            mount_root: mount,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let folders = database.list_source_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        for folder in &folders {
+            assert_eq!(folder.last_scan_status, Some(SourceScanStatus::Success));
+            assert_eq!(folder.last_archive_count, Some(1));
+            assert!(folder.last_scan_at.is_some());
+            assert!(folder.last_successful_scan_at.is_some());
+            assert!(folder.last_scan_error.is_none());
+        }
+
+        // source_a goes offline; source_b keeps scanning fine.
+        fs::remove_dir_all(&source_a).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let folders = database.list_source_folders().unwrap();
+        let folder_a = folders.iter().find(|f| f.path == source_a).unwrap();
+        let folder_b = folders.iter().find(|f| f.path == source_b).unwrap();
+
+        assert_eq!(folder_a.last_scan_status, Some(SourceScanStatus::Failed));
+        assert!(folder_a.last_scan_error.is_some());
+        assert_eq!(
+            folder_a.last_archive_count,
+            Some(1),
+            "a failed rescan must not overwrite the last genuinely known archive count"
+        );
+
+        assert_eq!(
+            folder_b.last_scan_status,
+            Some(SourceScanStatus::Success),
+            "source_b's status must be completely unaffected by source_a's failure"
+        );
+        assert_eq!(folder_b.last_archive_count, Some(1));
+        assert!(folder_b.last_scan_error.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5768,6 +6089,103 @@ mod tests {
             details[&archives[0].id].source.as_deref(),
             Some(CUSTOM_FOLDER_ALIAS_SOURCE)
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_all_across_three_sources_isolates_two_independent_failures_from_the_success() {
+        let root = temp_dir("three-source-mixed-failures");
+        let source_a = root.join("source-a");
+        let source_b = root.join("source-b");
+        let source_c = root.join("source-c");
+        let mount = root.join("mount");
+        write_archive_file(&source_a, "a.zip", b"a");
+        write_archive_file(&source_b, "b.zip", b"b");
+        write_archive_file(&source_c, "c.zip", b"c");
+        let config = Config {
+            source_folders: vec![source_a.clone(), source_b.clone(), source_c.clone()],
+            mount_root: mount,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let first = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(first.counts.archives_added, 3);
+        assert!(first.folder_errors.is_empty());
+
+        // Two sources fail for genuinely different reasons: source_b is
+        // deleted entirely (missing-path failure), source_c is replaced
+        // by a plain file where a directory used to be (a different
+        // underlying io error). source_a is left untouched and must keep
+        // scanning successfully throughout.
+        fs::remove_dir_all(&source_b).unwrap();
+        fs::remove_dir_all(&source_c).unwrap();
+        fs::write(&source_c, b"not a directory anymore").unwrap();
+
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+
+        assert_eq!(
+            second.folder_errors.len(),
+            2,
+            "both source_b and source_c must fail independently"
+        );
+        let failed_paths: std::collections::HashSet<&PathBuf> =
+            second.folder_errors.iter().map(|(path, _)| path).collect();
+        assert!(failed_paths.contains(&source_b));
+        assert!(failed_paths.contains(&source_c));
+        let error_b = &second
+            .folder_errors
+            .iter()
+            .find(|(path, _)| path == &source_b)
+            .unwrap()
+            .1;
+        let error_c = &second
+            .folder_errors
+            .iter()
+            .find(|(path, _)| path == &source_c)
+            .unwrap()
+            .1;
+        assert_ne!(
+            error_b, error_c,
+            "the two failures have genuinely different root causes and must not report \
+             identical error text"
+        );
+
+        // source_a's success is completely unaffected by the other two
+        // sources both failing in the same run.
+        assert_eq!(second.counts.source_folders_scanned, 1);
+        assert_eq!(second.counts.archives_seen, 1);
+        assert_eq!(second.counts.archives_unchanged, 1);
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            archives.len(),
+            3,
+            "all three archives must still exist - a partial multi-source scan never marks \
+             unrelated archives missing"
+        );
+        for name in ["a.zip", "b.zip", "c.zip"] {
+            assert!(
+                find_archive(&archives, name)
+                    .last_verified_missing_at
+                    .is_none(),
+                "{name} must not be marked missing: either its own source's scan never \
+                 succeeded (b.zip, c.zip) or nothing about it changed (a.zip)"
+            );
+        }
+
+        let folders = database.list_source_folders().unwrap();
+        let folder_a = folders.iter().find(|f| f.path == source_a).unwrap();
+        let folder_b = folders.iter().find(|f| f.path == source_b).unwrap();
+        let folder_c = folders.iter().find(|f| f.path == source_c).unwrap();
+        assert_eq!(folder_a.last_scan_status, Some(SourceScanStatus::Success));
+        assert_eq!(folder_b.last_scan_status, Some(SourceScanStatus::Failed));
+        assert_eq!(folder_c.last_scan_status, Some(SourceScanStatus::Failed));
+        // Each failed source keeps its own last-known-good count from the
+        // first scan - a stale scan result never replaces a newer/older
+        // source's own state, and failure never fabricates a count.
+        assert_eq!(folder_b.last_archive_count, Some(1));
+        assert_eq!(folder_c.last_archive_count, Some(1));
 
         let _ = fs::remove_dir_all(&root);
     }

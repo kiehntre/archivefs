@@ -10,3 +10,32 @@ eframe = {
     default-features = false,
     features = ["default_fonts", "glow", "wayland", "x11"],
 }
+# Direct access to the same native clipboard eframe's own "clipboard"
+# feature already links in transitively (see NativeClipboard's doc
+# comment): egui/eframe expose no way to synchronously read or write the
+# clipboard at the moment a context-menu item is clicked, only an
+# asynchronous `ViewportCommand` round-trip that (per live testing) never
+# reliably lands on the field the user actually clicked. Same version
+# already resolved by eframe's own dependency tree.
+#
+# "wayland-data-control" is required explicitly: arboard's own default
+# features do not include it (confirmed via `cargo tree -e features`),
+# so without this, arboard's Linux backend is *unconditionally* X11 (see
+# arboard's `platform/linux/mod.rs`: the Wayland branch of
+# `Clipboard::new()` only exists in the compiled binary at all when this
+# feature is on). On a native Wayland session, an X11-only client depends
+# entirely on the compositor's XWayland clipboard bridging to see content
+# copied by a native-Wayland application (e.g. Firefox) - unreliable, and
+# confirmed broken on the real Nobara session this shipped to live-tested
+# against. Cargo unifies features across the whole dependency graph for a
+# single binary, so this also fixes egui-winit's own transitive `arboard`
+# fallback (used only if its separate `smithay-clipboard` path fails),
+# not just this crate's direct use.
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+# Native folder picker for "Add Folder" on the Sources page. Default
+# features enable the "xdg-portal" backend, which talks to the
+# xdg-desktop-portal D-Bus FileChooser directly (GNOME/KDE both implement
+# it) rather than shelling out to a desktop-specific binary - portal-aware
+# and in-process, as required. `pick_folder()` is synchronous and returns
+# `None` on cancel/failure, never panics.
+rfd = "0.17.2"

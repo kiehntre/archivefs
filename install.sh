@@ -43,7 +43,14 @@ Without --uninstall, this script:
   3. Creates $config_dir if it does not exist.
   4. Copies config.toml.example to $config_file, but only if that file
      does not already exist. An existing config is never overwritten.
-  5. Checks whether ratarmount is on PATH and prints installation
+  5. If a new config was just written and this script is running
+     interactively, optionally prompts for one archive source folder to
+     add via 'archivefs-cli source add'. Leave blank to skip - source
+     folders are never required at install time, and more can always be
+     added later from the Sources page in the GUI or the CLI. Never
+     offered for an existing config, and never offered for a
+     non-interactive install.
+  6. Checks whether ratarmount is on PATH and prints installation
      guidance if it is not (ArchiveFS uses it to mount archives).
 EOF
 }
@@ -136,16 +143,47 @@ chmod +x -- "$bin_dir/archivefs-gui"
 printf 'Installed archivefs-cli and archivefs-gui to %s (source: %s)\n' "$bin_dir" "$src_mode"
 
 mkdir -p -- "$config_dir"
+wrote_new_config=0
 if [ -e "$config_file" ]; then
     printf 'Existing config found at %s - leaving it untouched.\n' "$config_file"
 else
     src_config_example="$script_dir/config.toml.example"
     if [ -f "$src_config_example" ]; then
         cp -- "$src_config_example" "$config_file"
-        printf 'Wrote a starter config to %s - edit source_folders and mount_root before running doctor.\n' "$config_file"
+        wrote_new_config=1
+        printf 'Wrote a starter config to %s - edit mount_root before running doctor.\n' "$config_file"
+        printf 'No source folders are configured yet; that is fine to run with.\n'
     else
         printf '%s: warning: config.toml.example not found next to this script; no starter config was written.\n' "$program_name" >&2
         printf 'Create %s yourself before running archivefs-cli.\n' "$config_file" >&2
+    fi
+fi
+
+# Optional first source folder - only offered right after writing a brand
+# new config (never for an existing one, which is left untouched above),
+# and only when this script has an interactive terminal to prompt on
+# (never for a piped/non-interactive install, e.g. `curl ... | sh`).
+# Deliberately does not validate the path itself in shell: it is handed
+# straight to the just-installed `archivefs-cli source add`, the exact
+# same validated, atomically-persisting function the GUI's Sources page
+# and every other source-management entry point uses - no second,
+# shell-side implementation of that validation. Skipping (blank input) is
+# always safe; more sources can be added the same way, or from the
+# Sources page in the GUI, at any time after this script exits.
+if [ "$wrote_new_config" -eq 1 ] && [ -t 0 ] && [ -r /dev/tty ]; then
+    printf '\n'
+    printf 'Add your first archive source folder now? Leave blank to skip and add one\n'
+    printf 'later (Sources page in the GUI, or: archivefs-cli source add PATH).\n'
+    printf 'Source folder path: '
+    # shellcheck disable=SC2039 # `read -r` is supported by every /bin/sh this script targets.
+    if IFS= read -r first_source_path < /dev/tty && [ -n "$first_source_path" ]; then
+        if "$bin_dir/archivefs-cli" source add "$first_source_path"; then
+            printf 'Added. Scan it from the Sources page, or: archivefs-cli source scan "%s"\n' "$first_source_path"
+        else
+            printf 'Could not add that source folder; you can retry later from the Sources page or: archivefs-cli source add PATH\n' >&2
+        fi
+    else
+        printf 'Skipped - add one later from the Sources page, or: archivefs-cli source add PATH\n'
     fi
 fi
 
@@ -168,7 +206,9 @@ esac
 
 printf '\n'
 printf 'Next steps:\n'
-printf '  1. Edit %s (source_folders, mount_root).\n' "$config_file"
+printf '  1. Edit %s (mount_root). Source folders can be managed entirely\n' "$config_file"
+printf '     from the app from now on - see the Sources page in the GUI, or\n'
+printf '     archivefs-cli sources / source add / source scan.\n'
 if [ "$path_has_bin_dir" -eq 1 ]; then
     printf '  2. Run: archivefs-cli doctor\n'
     printf '  3. Run: archivefs-cli config-check\n'

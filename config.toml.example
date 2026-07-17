@@ -1,24 +1,28 @@
 # Example ArchiveFS configuration.
 #
-# Copy this file to ~/.config/archivefs/config.toml and edit the values
-# below for your system. Every path below is a placeholder - replace it
-# with paths that actually exist on your machine.
+# Copy this file to ~/.config/archivefs/config.toml and edit mount_root
+# below for your system - source folders do not need to be edited here at
+# all (see below).
 
 # Folders ArchiveFS scans recursively for supported archives (.zip, .7z,
-# .rar). Add one entry per folder you want scanned. Required: this key
-# must be present and contain at least one path.
+# .rar). ArchiveFS supports any number of independent source folders, and
+# a config with zero sources loads and runs fine - this is not a required
+# key.
 #
-# The array can be written on one line (as below) or split across
-# multiple lines within the brackets, e.g.:
-#   source_folders = [
-#     "/data/archives",
-#     "/data/more-archives",
-#   ]
-# ArchiveFS uses a small hand-written parser, not a full TOML
-# implementation - only this key = "value" / key = [...] form is
-# understood, with no support for tables, inline tables, or nested
-# arrays.
-source_folders = ["/data/archives"]
+# You do not need to hand-edit this array: add, enable/disable, scan, and
+# remove source folders from the Sources page in the GUI, or from the
+# command line, e.g.:
+#   archivefs-cli source add /data/archives
+#   archivefs-cli source add /data/more-archives
+#   archivefs-cli sources
+# Both ways write to this same config atomically, and both are safe to
+# use interchangeably at any time - nothing here needs reinstalling.
+#
+# If you do prefer to pre-seed this file by hand, either the legacy plain
+# array below or one `[[source]]` block per folder (path/enabled fields)
+# is understood; ArchiveFS uses a small hand-written parser, not a full
+# TOML implementation.
+source_folders = []
 
 # Directory where ArchiveFS creates mount points for the archives it opens.
 # ArchiveFS creates this directory if it does not already exist, and never

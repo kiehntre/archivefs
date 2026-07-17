@@ -16,14 +16,15 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 mod database;
+use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
     Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult,
     PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
-    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, check_database_health,
-    default_database_path, format_unix_timestamp_utc, latest_schema_version,
-    persisted_archive_has_unknown_platform, scan_and_persist,
+    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, SourceFolderRecord,
+    SourceScanStatus, check_database_health, default_database_path, format_unix_timestamp_utc,
+    latest_schema_version, persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 #[derive(Debug)]
@@ -155,6 +156,25 @@ impl From<io::Error> for ArchiveFsError {
 }
 
 pub type Result<T> = std::result::Result<T, ArchiveFsError>;
+
+/// A single configured archive source folder, as the multi-source
+/// milestone persists it - richer than the plain `PathBuf` entries in
+/// `Config::source_folders`. `Config::source_folders` is deliberately kept
+/// as "every *enabled* source's path" (see `parse_config`), so every
+/// existing consumer of `Config` (the scanner, doctor checks, diagnostics,
+/// mount-root creation, and dozens of existing tests) is automatically and
+/// correctly disabled-source-aware without being touched at all - only the
+/// new Sources-page/CLI source-management code needs this richer type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceFolderConfig {
+    pub path: PathBuf,
+    pub enabled: bool,
+    /// RFC 3339 timestamp string, if known. `None` for sources migrated
+    /// from a legacy `source_folders = [...]` config that never recorded
+    /// one - never fabricated, per the milestone's "created timestamp if
+    /// consistent with existing configuration style" (i.e. best-effort).
+    pub created_at: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -1047,7 +1067,16 @@ pub fn create_starter_config(path: &Path) -> Result<()> {
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     use std::io::Write;
     file.write_all(
-        b"# ArchiveFS starter configuration\n# Replace these example paths with directories on your system.\nsource_folders = [\"/path/to/archives\"]\nmount_root = \"/path/to/archivefs-mounts\"\nratarmount_bin = \"ratarmount\"\n",
+        b"# ArchiveFS starter configuration\n\
+          # No source folders are configured yet - that is fine, a fresh\n\
+          # install with zero sources loads normally. Add your first one\n\
+          # from the Sources page in the GUI, or from the command line:\n\
+          #   archivefs-cli source add /path/to/archives\n\
+          # More can be added the same way at any time; nothing here needs\n\
+          # to be edited by hand unless you prefer to.\n\
+          source_folders = []\n\
+          mount_root = \"/path/to/archivefs-mounts\"\n\
+          ratarmount_bin = \"ratarmount\"\n",
     )
     .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))
 }
@@ -1134,7 +1163,7 @@ fn run_config_check_with_mount_root_creation(
         }
     };
 
-    let fields = match parse_config_fields(&contents) {
+    let mut fields = match parse_config_fields(&contents) {
         Ok(fields) => {
             report.pass("config parses", "configuration syntax parsed successfully");
             fields
@@ -1144,6 +1173,21 @@ fn run_config_check_with_mount_root_creation(
             return report;
         }
     };
+    // The checks below were written against the legacy flat
+    // `source_folders` list; a config using the newer `[[source]]` block
+    // format never populates that field directly, so synthesize an
+    // equivalent view (every configured path, enabled or not - this is a
+    // truthfulness diagnostic about what's on disk, not a scan) rather
+    // than duplicating the whole per-folder existence/readability loop.
+    if fields.source_folders.is_none() && !fields.structured_sources.is_empty() {
+        fields.source_folders = Some(
+            fields
+                .structured_sources
+                .iter()
+                .map(|source| source.path.display().to_string())
+                .collect(),
+        );
+    }
 
     match &fields.source_folders {
         Some(source_folders) if source_folders.is_empty() => {
@@ -1340,26 +1384,81 @@ pub fn default_config_path() -> Result<PathBuf> {
         .join("config.toml"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConfigFields {
     source_folders: Option<Vec<String>>,
     mount_root: Option<PathBuf>,
     ratarmount_bin: Option<String>,
+    /// Populated only when the config uses the newer `[[source]]` block
+    /// format (see `parse_config_fields`) - empty for every legacy
+    /// `source_folders = [...]`/`sources = [...]` config, which is the
+    /// signal `parse_config` and `run_config_check_with_mount_root_creation`
+    /// both use to decide which representation is authoritative.
+    structured_sources: Vec<SourceFolderConfig>,
 }
 
+/// Accumulates one `[[source]]` block's `path`/`enabled`/`created_at`
+/// fields across however many lines it spans, in any order, before being
+/// finalized into a `SourceFolderConfig` once the block ends (the next
+/// `[[source]]`, any other `[section]` header, or end of file).
+#[derive(Debug, Clone, Default)]
+struct PendingSourceEntry {
+    path: Option<PathBuf>,
+    enabled: Option<bool>,
+    created_at: Option<String>,
+}
+
+impl PendingSourceEntry {
+    fn finish(self, block_line: usize) -> Result<SourceFolderConfig> {
+        let path = self.path.ok_or_else(|| {
+            ArchiveFsError::Config(format!(
+                "the [[source]] block starting at line {block_line} has no path"
+            ))
+        })?;
+        Ok(SourceFolderConfig {
+            path,
+            enabled: self.enabled.unwrap_or(true),
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// Parses `config.toml` into a `Config` whose `source_folders` is always
+/// "every currently *enabled* source's path" - disabled sources are
+/// filtered out here, at the single narrowest point, so every existing
+/// consumer of `Config` (scanner, doctor checks, mount-root creation, ...)
+/// is correctly disabled-source-aware without any of that code changing.
+/// Reading the richer per-source list (including disabled entries and
+/// their metadata) is `load_source_folder_configs_default`/`_from`'s job,
+/// not this function's.
+///
+/// A config with zero enabled sources (via an empty/absent legacy
+/// `source_folders`, or zero/all-disabled `[[source]]` blocks) is valid,
+/// not an error - the multi-source milestone's first-run flow explicitly
+/// allows skipping source setup and adding folders later from inside the
+/// app, so `Config::load_default` must be able to succeed with nothing
+/// configured yet.
 pub fn parse_config(contents: &str) -> Result<Config> {
     let fields = parse_config_fields(contents)?;
-    let source_folders = fields
-        .source_folders
-        .ok_or_else(|| ArchiveFsError::Config("missing source_folders".to_string()))?;
-    if source_folders.is_empty() {
-        return Err(ArchiveFsError::Config(
-            "source_folders must contain at least one path".to_string(),
-        ));
-    }
+
+    let source_folders = if !fields.structured_sources.is_empty() {
+        fields
+            .structured_sources
+            .iter()
+            .filter(|source| source.enabled)
+            .map(|source| source.path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        fields
+            .source_folders
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    };
 
     Ok(Config {
-        source_folders: source_folders.into_iter().map(PathBuf::from).collect(),
+        source_folders,
         mount_root: fields
             .mount_root
             .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?,
@@ -1370,11 +1469,9 @@ pub fn parse_config(contents: &str) -> Result<Config> {
 }
 
 fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
-    let mut fields = ConfigFields {
-        source_folders: None,
-        mount_root: None,
-        ratarmount_bin: None,
-    };
+    let mut fields = ConfigFields::default();
+    let mut pending_source: Option<PendingSourceEntry> = None;
+    let mut pending_source_line: usize = 0;
 
     let lines: Vec<&str> = contents.lines().collect();
     let mut i = 0;
@@ -1382,7 +1479,26 @@ fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
         let line_number = i + 1;
         let line = strip_comment(lines[i]).trim();
         i += 1;
-        if line.is_empty() || line.starts_with('[') {
+        if line.is_empty() {
+            continue;
+        }
+
+        if line == "[[source]]" {
+            if let Some(pending) = pending_source.take() {
+                fields
+                    .structured_sources
+                    .push(pending.finish(pending_source_line)?);
+            }
+            pending_source = Some(PendingSourceEntry::default());
+            pending_source_line = line_number;
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(pending) = pending_source.take() {
+                fields
+                    .structured_sources
+                    .push(pending.finish(pending_source_line)?);
+            }
             continue;
         }
 
@@ -1391,8 +1507,21 @@ fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
                 "line {line_number} is not a key/value pair",
             )));
         };
+        let key = key.trim();
 
-        match key.trim() {
+        if let Some(pending) = pending_source.as_mut() {
+            match key {
+                "path" => {
+                    pending.path = Some(PathBuf::from(parse_string(value.trim(), line_number)?))
+                }
+                "enabled" => pending.enabled = Some(parse_bool(value.trim(), line_number)?),
+                "created_at" => pending.created_at = Some(parse_string(value.trim(), line_number)?),
+                _ => {}
+            }
+            continue;
+        }
+
+        match key {
             "source_folders" | "sources" => {
                 // An array value may open with '[' here and only close
                 // with ']' on a later line - collect_array_text joins any
@@ -1416,7 +1545,737 @@ fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
         }
     }
 
+    if let Some(pending) = pending_source.take() {
+        fields
+            .structured_sources
+            .push(pending.finish(pending_source_line)?);
+    }
+
     Ok(fields)
+}
+
+fn parse_bool(value: &str, line_number: usize) -> Result<bool> {
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ArchiveFsError::Config(format!(
+            "line {line_number} expected true or false, found '{other}'"
+        ))),
+    }
+}
+
+/// Reads every configured source folder, including disabled ones and
+/// their `enabled`/`created_at` metadata - the multi-source Sources
+/// page/CLI's data source. `Config::source_folders` deliberately can't
+/// answer this: it's enabled-only by design (see `parse_config`'s doc
+/// comment), so every pre-existing consumer of `Config` stays correct
+/// without change while this is the one new entry point that needs the
+/// full picture.
+pub fn load_source_folder_configs_default() -> Result<Vec<SourceFolderConfig>> {
+    load_source_folder_configs_from(default_config_path()?)
+}
+
+pub fn load_source_folder_configs_from(path: impl AsRef<Path>) -> Result<Vec<SourceFolderConfig>> {
+    let path = path.as_ref();
+    let contents = fs::read_to_string(path)
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    parse_source_folder_configs(&contents)
+}
+
+/// Shares `parse_config_fields` with `parse_config` (never a second,
+/// divergent parser): if the file uses the newer `[[source]]` block
+/// format, those entries are authoritative and returned directly, complete
+/// with disabled entries; otherwise every legacy `source_folders`/
+/// `sources` path is treated as one enabled source with an unknown
+/// (`None`) creation time - the automatic migration this milestone
+/// requires, applied in memory on every read, with no file rewrite unless
+/// the caller explicitly saves (see `save_source_folder_configs_default`).
+pub fn parse_source_folder_configs(contents: &str) -> Result<Vec<SourceFolderConfig>> {
+    let fields = parse_config_fields(contents)?;
+    if !fields.structured_sources.is_empty() {
+        return Ok(fields.structured_sources);
+    }
+    Ok(fields
+        .source_folders
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| SourceFolderConfig {
+            path: PathBuf::from(path),
+            enabled: true,
+            created_at: None,
+        })
+        .collect())
+}
+
+/// Atomically rewrites the config file with `sources`, always in the
+/// newer `[[source]]` block format regardless of which format the file
+/// was previously in - the first source-management mutation (add/enable/
+/// disable/remove) is what actually upgrades a legacy config on disk;
+/// merely loading it never does (see `parse_source_folder_configs`'s doc
+/// comment). `mount_root`/`ratarmount_bin` are preserved exactly as
+/// given, never invented or defaulted.
+pub fn save_source_folder_configs_default(
+    sources: &[SourceFolderConfig],
+    mount_root: &Path,
+    ratarmount_bin: &str,
+) -> Result<()> {
+    save_source_folder_configs_to(default_config_path()?, sources, mount_root, ratarmount_bin)
+}
+
+pub fn save_source_folder_configs_to(
+    path: impl AsRef<Path>,
+    sources: &[SourceFolderConfig],
+    mount_root: &Path,
+    ratarmount_bin: &str,
+) -> Result<()> {
+    let contents = render_source_folder_configs(sources, mount_root, ratarmount_bin);
+    atomic_write_text(path.as_ref(), &contents)
+}
+
+/// Renders the config in the current, `[[source]]`-block format - see
+/// `SourceFolderConfig`'s doc comment. Once this has run once (any
+/// add/enable/disable/remove), the config no longer contains a plain
+/// `source_folders = [...]` line at all.
+///
+/// Downgrade note: a pre-multi-source ArchiveFS build's parser only
+/// understands `key = value` / `key = [...]` lines (see
+/// `config.toml.example`'s own note on this), not `[[source]]` tables. If
+/// you downgrade to such a build after using any source-management
+/// feature (Sources page, or `archivefs-cli source`/`sources` commands)
+/// even once, that older build will see zero configured sources - it has
+/// no `source_folders` key left to fall back on, and it does not
+/// recognize `[[source]]`. Nothing is corrupted or lost: upgrading again
+/// reads the same `[[source]]` blocks back correctly, and the sources
+/// themselves are never deleted by this - only re-add them (or restore a
+/// backup of `config.toml`) if you need them visible on an older build in
+/// the meantime.
+fn render_source_folder_configs(
+    sources: &[SourceFolderConfig],
+    mount_root: &Path,
+    ratarmount_bin: &str,
+) -> String {
+    let mut out = String::from("# ArchiveFS configuration\n\n");
+    out.push_str(&format!(
+        "mount_root = {}\n",
+        quote_config_string(&mount_root.display().to_string())
+    ));
+    out.push_str(&format!(
+        "ratarmount_bin = {}\n",
+        quote_config_string(ratarmount_bin)
+    ));
+    for source in sources {
+        out.push('\n');
+        out.push_str("[[source]]\n");
+        out.push_str(&format!(
+            "path = {}\n",
+            quote_config_string(&source.path.display().to_string())
+        ));
+        out.push_str(&format!("enabled = {}\n", source.enabled));
+        if let Some(created_at) = &source.created_at {
+            out.push_str(&format!(
+                "created_at = {}\n",
+                quote_config_string(created_at)
+            ));
+        }
+    }
+    out
+}
+
+fn quote_config_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Writes `contents` to `path` via a same-directory temp file plus
+/// `fs::rename` - the rename is atomic on any POSIX filesystem, so a
+/// crash or power loss mid-write can never leave `path` half-written or
+/// corrupted; readers always see either the old complete file or the new
+/// complete file, never a partial one.
+fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
+    static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+
+    let temp_path = parent.join(format!(
+        ".archivefs-config-write-{}-{}.tmp",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temp_path, contents)
+        .map_err(|source| ArchiveFsError::io(temp_path.clone(), source))?;
+    fs::rename(&temp_path, path).map_err(|source| {
+        let _ = fs::remove_file(&temp_path);
+        ArchiveFsError::io(path.to_path_buf(), source)
+    })
+}
+
+/// Validates a user-supplied path as a candidate new source folder,
+/// against the currently configured sources - the multi-source
+/// milestone's shared validation, used identically by the GUI's Add
+/// Folder dialog and the CLI's `source add` (never two implementations).
+/// Confirms the path exists, is a directory, and is readable (via
+/// `fs::read_dir`, which only lists directory entries - this never opens
+/// or inspects any archive file inside it), then rejects it as a
+/// duplicate or a parent/child overlap of any `existing` source, using
+/// canonicalized paths for that comparison so a trailing separator or a
+/// symlink cannot slip an equivalent path past the check. Overlaps are
+/// rejected outright rather than accepted-with-confirmation, per the
+/// milestone's stated preference, since nothing in this schema
+/// deduplicates a file discovered under two different source folders.
+///
+/// Returns the path to store: the original input with only its path
+/// components re-collected (which drops a harmless trailing separator),
+/// never canonicalized - so a symlinked source folder is stored exactly
+/// as the user typed it, not silently resolved to wherever it points.
+pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Result<PathBuf> {
+    let normalized: PathBuf = candidate.components().collect();
+
+    match inspect_path(&normalized) {
+        PathInspection::Missing => {
+            return Err(ArchiveFsError::Config(format!(
+                "{} does not exist",
+                normalized.display()
+            )));
+        }
+        PathInspection::Other => {
+            return Err(ArchiveFsError::Config(format!(
+                "{} is not a directory",
+                normalized.display()
+            )));
+        }
+        PathInspection::PermissionDenied(detail) => {
+            return Err(ArchiveFsError::Config(format!(
+                "{} cannot be inspected: permission denied ({detail})",
+                normalized.display()
+            )));
+        }
+        PathInspection::MetadataError(detail) => {
+            return Err(ArchiveFsError::Config(format!(
+                "{} cannot be inspected: {detail}",
+                normalized.display()
+            )));
+        }
+        PathInspection::Directory => {}
+    }
+
+    if let Err(error) = fs::read_dir(&normalized) {
+        return Err(ArchiveFsError::Config(format!(
+            "{} cannot be read: {error}",
+            normalized.display()
+        )));
+    }
+
+    let candidate_canonical = fs::canonicalize(&normalized)
+        .map_err(|source| ArchiveFsError::io(normalized.clone(), source))?;
+
+    for existing_path in existing {
+        let existing_canonical =
+            fs::canonicalize(existing_path).unwrap_or_else(|_| existing_path.clone());
+        if candidate_canonical == existing_canonical {
+            return Err(ArchiveFsError::Config(format!(
+                "{} is already a configured source folder",
+                normalized.display()
+            )));
+        }
+        if candidate_canonical.starts_with(&existing_canonical) {
+            return Err(ArchiveFsError::Config(format!(
+                "{} is inside the already-configured source folder {} - overlapping \
+                 sources are not supported",
+                normalized.display(),
+                existing_path.display()
+            )));
+        }
+        if existing_canonical.starts_with(&candidate_canonical) {
+            return Err(ArchiveFsError::Config(format!(
+                "{} would contain the already-configured source folder {} - overlapping \
+                 sources are not supported",
+                normalized.display(),
+                existing_path.display()
+            )));
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn now_utc_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    format_unix_timestamp_utc(seconds)
+}
+
+// -----------------------------------------------------------------------
+// Multi-source management: shared CLI/GUI operations. Every mutating
+// function here follows the same three-step shape - load the full
+// per-source config list, mutate it in memory, save it back atomically -
+// then, where relevant, brings the database's `source_folders` table in
+// sync via `Database::register_source_folders` (which already knows how
+// to add/refresh/mark-removed a path, see its own doc comment) rather
+// than inventing a second synchronization mechanism.
+// -----------------------------------------------------------------------
+
+/// The five states the multi-source milestone requires the Sources page
+/// to distinguish. `Disabled` always wins regardless of scan history (a
+/// user who disabled a source doesn't need to be told it also failed to
+/// scan). For an enabled source, `None`/`Success` scan history reads as
+/// `Available` (optimistic for a never-yet-scanned source - it was
+/// validated as an existing, readable directory at add time); a failed
+/// scan is further classified from its error text into `PermissionDenied`
+/// / `Unavailable` (path missing) / `ScanFailed` (anything else) by
+/// [`classify_scan_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SourceAvailability {
+    Available,
+    Unavailable,
+    PermissionDenied,
+    Disabled,
+    ScanFailed,
+}
+
+/// Pure and fully deterministic from already-known state (never touches
+/// the filesystem itself) - see [`SourceAvailability`]'s doc comment for
+/// the precedence rules.
+pub fn classify_source_availability(
+    enabled: bool,
+    last_scan_status: Option<SourceScanStatus>,
+    last_scan_error: Option<&str>,
+) -> SourceAvailability {
+    if !enabled {
+        return SourceAvailability::Disabled;
+    }
+    match last_scan_status {
+        None | Some(SourceScanStatus::Success) => SourceAvailability::Available,
+        Some(SourceScanStatus::Failed) => {
+            classify_scan_failure(last_scan_error.unwrap_or_default())
+        }
+    }
+}
+
+/// Classifies a scan failure's error text (always produced by this
+/// process's own `ArchiveFsError`/`io::Error` formatting, never
+/// user-supplied) into the milestone's three failure categories. Matches
+/// the standard Linux `io::Error` `Display` text for the two specific,
+/// stable cases the milestone calls out; anything else is `ScanFailed`
+/// rather than mis-filed as one of the more specific categories.
+fn classify_scan_failure(error: &str) -> SourceAvailability {
+    let lower = error.to_lowercase();
+    if lower.contains("permission denied") {
+        SourceAvailability::PermissionDenied
+    } else if lower.contains("no such file") || lower.contains("not found") {
+        SourceAvailability::Unavailable
+    } else {
+        SourceAvailability::ScanFailed
+    }
+}
+
+/// One source folder's complete display state for the Sources page/CLI -
+/// config-owned facts (`enabled`, `created_at`) merged with
+/// database-owned facts (`id`, scan history) by exact path, via
+/// [`build_source_folder_views`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceFolderView {
+    pub path: PathBuf,
+    pub enabled: bool,
+    pub created_at: Option<String>,
+    /// `None` only if this source has never been registered in the
+    /// database at all - in practice this should not happen once
+    /// `add_source_folder_at` always registers on add, but is kept
+    /// `Option` rather than assumed for robustness against a config
+    /// edited by hand outside the app.
+    pub id: Option<i64>,
+    pub availability: SourceAvailability,
+    pub last_scan_status: Option<SourceScanStatus>,
+    pub last_scan_error: Option<String>,
+    pub last_scan_at: Option<String>,
+    pub last_successful_scan_at: Option<String>,
+    pub last_archive_count: Option<i64>,
+}
+
+/// Joins the config's per-source list against the database's per-source
+/// scan history by exact path - a pure, DB-free function so it is
+/// directly testable with hand-built fixtures (see the tests module).
+pub fn build_source_folder_views(
+    sources: &[SourceFolderConfig],
+    records: &[SourceFolderRecord],
+) -> Vec<SourceFolderView> {
+    sources
+        .iter()
+        .map(|source| {
+            let record = records.iter().find(|record| record.path == source.path);
+            let last_scan_status = record.and_then(|record| record.last_scan_status);
+            let last_scan_error = record.and_then(|record| record.last_scan_error.clone());
+            SourceFolderView {
+                path: source.path.clone(),
+                enabled: source.enabled,
+                created_at: source.created_at.clone(),
+                id: record.map(|record| record.id),
+                availability: classify_source_availability(
+                    source.enabled,
+                    last_scan_status,
+                    last_scan_error.as_deref(),
+                ),
+                last_scan_status,
+                last_scan_error,
+                last_scan_at: record.and_then(|record| record.last_scan_at.clone()),
+                last_successful_scan_at: record
+                    .and_then(|record| record.last_successful_scan_at.clone()),
+                last_archive_count: record.and_then(|record| record.last_archive_count),
+            }
+        })
+        .collect()
+}
+
+pub fn list_source_folder_views_default() -> Result<Vec<SourceFolderView>> {
+    list_source_folder_views_at(&default_config_path()?, &default_database_path()?)
+}
+
+pub fn list_source_folder_views_at(
+    config_path: &Path,
+    database_path: &Path,
+) -> Result<Vec<SourceFolderView>> {
+    let sources = load_source_folder_configs_from(config_path)?;
+    let database = Database::open_or_create(database_path)?;
+    let records = database.list_source_folders()?;
+    Ok(build_source_folder_views(&sources, &records))
+}
+
+/// Adds `candidate` as a new, enabled source folder: validates it against
+/// every currently configured source (see [`validate_new_source_folder`]),
+/// atomically saves the updated config, then immediately registers it in
+/// the database so it has a stable id and shows up on the Sources page
+/// right away - deliberately *never* scans it (the milestone requires an
+/// explicit, separate Scan action; adding a source must never itself walk
+/// the filesystem beyond the one-time validation check).
+pub fn add_source_folder_default(candidate: &Path) -> Result<SourceFolderConfig> {
+    add_source_folder_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        candidate,
+    )
+}
+
+pub fn add_source_folder_at(
+    config_path: &Path,
+    database_path: &Path,
+    candidate: &Path,
+) -> Result<SourceFolderConfig> {
+    let mut sources = load_source_folder_configs_from(config_path)?;
+    let config = Config::load_from(config_path)?;
+
+    let existing_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let validated_path = validate_new_source_folder(candidate, &existing_paths)?;
+
+    let new_source = SourceFolderConfig {
+        path: validated_path,
+        enabled: true,
+        created_at: Some(now_utc_timestamp()),
+    };
+    sources.push(new_source.clone());
+
+    save_source_folder_configs_to(
+        config_path,
+        &sources,
+        &config.mount_root,
+        &config.ratarmount_bin,
+    )?;
+
+    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let mut database = Database::open_or_create(database_path)?;
+    database.register_source_folders(&all_paths)?;
+
+    Ok(new_source)
+}
+
+/// The result of enabling or disabling a source folder. `scan` is only
+/// `Some` when *enabling* - re-enabling a source must not silently trust
+/// old filesystem state, so this always scans that one source as part of
+/// the same operation before returning (never a separate step the caller
+/// could forget); disabling never scans anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetSourceFolderEnabledOutcome {
+    pub source: SourceFolderConfig,
+    pub scan: Option<ScanPersistSummary>,
+}
+
+pub fn set_source_folder_enabled_default(
+    target: &Path,
+    enabled: bool,
+) -> Result<SetSourceFolderEnabledOutcome> {
+    set_source_folder_enabled_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        enabled,
+    )
+}
+
+pub fn set_source_folder_enabled_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    enabled: bool,
+) -> Result<SetSourceFolderEnabledOutcome> {
+    let mut sources = load_source_folder_configs_from(config_path)?;
+    let config = Config::load_from(config_path)?;
+
+    let index = sources
+        .iter()
+        .position(|source| source.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Config(format!(
+                "{} is not a configured source folder",
+                target.display()
+            ))
+        })?;
+    sources[index].enabled = enabled;
+    let updated = sources[index].clone();
+
+    save_source_folder_configs_to(
+        config_path,
+        &sources,
+        &config.mount_root,
+        &config.ratarmount_bin,
+    )?;
+
+    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let mut database = Database::open_or_create(database_path)?;
+    let registered = database.register_source_folders(&all_paths)?;
+
+    let scan = if enabled {
+        let folder = registered
+            .into_iter()
+            .find(|folder| folder.path == target)
+            .ok_or_else(|| {
+                ArchiveFsError::Database(format!(
+                    "source folder {} could not be resolved to a database id",
+                    target.display()
+                ))
+            })?;
+        Some(scan_and_persist_folders(
+            &mut database,
+            std::slice::from_ref(&folder),
+            "source-enable",
+        )?)
+    } else {
+        None
+    };
+
+    Ok(SetSourceFolderEnabledOutcome {
+        source: updated,
+        scan,
+    })
+}
+
+/// The result of removing a source folder from configuration.
+/// `catalogue_rows_removed` is `None` when the default, safe "Keep
+/// catalogue entries" choice was used - the only difference between the
+/// two removal modes is whether this is `None` or `Some(count)`; the
+/// config-file and `source_folders`-table changes are identical either
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveSourceFolderOutcome {
+    pub removed_source: SourceFolderConfig,
+    pub catalogue_rows_removed: Option<usize>,
+}
+
+/// Removes `target` from ArchiveFS configuration only - never the
+/// directory or any file inside it; this function never touches the
+/// filesystem the source folder points to at all. Defaults
+/// (`keep_catalogue = true`) to preserving every archive row the source
+/// ever contributed, marking its `source_folders` row
+/// `removed_from_config_at` but leaving `archives` untouched, so
+/// re-adding the same path later reunites with its history. Only when the
+/// caller explicitly passes `keep_catalogue = false` are that source's
+/// catalogue rows atomically deleted (see
+/// [`Database::remove_source_folder_catalogue`]) - never another
+/// source's.
+pub fn remove_source_folder_default(
+    target: &Path,
+    keep_catalogue: bool,
+) -> Result<RemoveSourceFolderOutcome> {
+    remove_source_folder_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        keep_catalogue,
+    )
+}
+
+pub fn remove_source_folder_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    keep_catalogue: bool,
+) -> Result<RemoveSourceFolderOutcome> {
+    let mut sources = load_source_folder_configs_from(config_path)?;
+    let config = Config::load_from(config_path)?;
+
+    let index = sources
+        .iter()
+        .position(|source| source.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Config(format!(
+                "{} is not a configured source folder",
+                target.display()
+            ))
+        })?;
+    let removed_source = sources.remove(index);
+
+    save_source_folder_configs_to(
+        config_path,
+        &sources,
+        &config.mount_root,
+        &config.ratarmount_bin,
+    )?;
+
+    let mut database = Database::open_or_create(database_path)?;
+
+    // Resolve the removed source's database id *before* re-registering
+    // only the remaining paths (which is what actually marks its row
+    // `removed_from_config_at` - see `register_source_folders`'s doc
+    // comment). Registering the full original list first guarantees an
+    // id exists even for a source that was somehow never registered
+    // before (for example a config edited by hand outside the app).
+    let all_paths_including_removed: Vec<PathBuf> = std::iter::once(removed_source.path.clone())
+        .chain(sources.iter().map(|source| source.path.clone()))
+        .collect();
+    let registered = database.register_source_folders(&all_paths_including_removed)?;
+    let removed_folder = registered
+        .into_iter()
+        .find(|folder| folder.path == removed_source.path)
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "source folder {} could not be resolved to a database id",
+                removed_source.path.display()
+            ))
+        })?;
+
+    let remaining_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    database.register_source_folders(&remaining_paths)?;
+
+    let catalogue_rows_removed = if keep_catalogue {
+        None
+    } else {
+        Some(database.remove_source_folder_catalogue(removed_folder.id)?)
+    };
+
+    Ok(RemoveSourceFolderOutcome {
+        removed_source,
+        catalogue_rows_removed,
+    })
+}
+
+/// Scans exactly one configured source folder, enabled or disabled - an
+/// explicit, targeted action, so unlike [`scan_all_enabled_sources_at`]
+/// this does not check `enabled` at all (a user directly clicking "Scan"
+/// on one row is unambiguous explicit intent). Shares
+/// `scan_and_persist_folders` with every other scan entry point; nothing
+/// here duplicates archive-discovery logic.
+pub fn scan_source_folder_default(target: &Path) -> Result<ScanPersistSummary> {
+    scan_source_folder_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        "cli-source-scan",
+    )
+}
+
+pub fn scan_source_folder_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    triggered_by: &str,
+) -> Result<ScanPersistSummary> {
+    let sources = load_source_folder_configs_from(config_path)?;
+    if !sources.iter().any(|source| source.path == target) {
+        return Err(ArchiveFsError::Config(format!(
+            "{} is not a configured source folder",
+            target.display()
+        )));
+    }
+
+    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let mut database = Database::open_or_create(database_path)?;
+    let registered = database.register_source_folders(&all_paths)?;
+    let folder = registered
+        .into_iter()
+        .find(|folder| folder.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "source folder {} could not be resolved to a database id",
+                target.display()
+            ))
+        })?;
+
+    scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)
+}
+
+/// Scans every *enabled* configured source folder independently - a
+/// disabled source is registered (so it stays "configured", never marked
+/// removed) but never walked, exactly matching "excluded from Scan All"
+/// and "not treated as missing". One folder's failure never affects
+/// another's, via the same per-folder isolation `scan_and_persist_folders`
+/// always provides.
+pub fn scan_all_enabled_sources_default() -> Result<ScanPersistSummary> {
+    scan_all_enabled_sources_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        "cli-scan-all-sources",
+    )
+}
+
+pub fn scan_all_enabled_sources_at(
+    config_path: &Path,
+    database_path: &Path,
+    triggered_by: &str,
+) -> Result<ScanPersistSummary> {
+    let sources = load_source_folder_configs_from(config_path)?;
+    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let mut database = Database::open_or_create(database_path)?;
+    let registered = database.register_source_folders(&all_paths)?;
+
+    let enabled_paths: HashSet<&PathBuf> = sources
+        .iter()
+        .filter(|source| source.enabled)
+        .map(|source| &source.path)
+        .collect();
+    let enabled_folders: Vec<RegisteredSourceFolder> = registered
+        .into_iter()
+        .filter(|folder| enabled_paths.contains(&folder.path))
+        .collect();
+
+    scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)
+}
+
+/// Resolves a CLI-style `<id-or-path>` argument to a configured source
+/// folder's exact path - shared by every CLI source subcommand so the
+/// numeric-id-vs-path parsing logic exists exactly once. A pure numeric
+/// string is looked up against database ids; anything else is compared
+/// directly against configured paths.
+pub fn resolve_source_folder_identifier(
+    identifier: &str,
+    sources: &[SourceFolderConfig],
+    records: &[SourceFolderRecord],
+) -> Result<PathBuf> {
+    if let Ok(id) = identifier.parse::<i64>() {
+        let record = records
+            .iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| ArchiveFsError::Config(format!("no source folder with id {id}")))?;
+        return Ok(record.path.clone());
+    }
+    let candidate = PathBuf::from(identifier);
+    if sources.iter().any(|source| source.path == candidate) {
+        return Ok(candidate);
+    }
+    Err(ArchiveFsError::Config(format!(
+        "no configured source folder matches '{identifier}'"
+    )))
 }
 
 /// If `first` opens an array with '[' but does not itself close it with a
@@ -2061,6 +2920,375 @@ pub fn catalogue_filename_duplicates(archives: &[PersistedArchive]) -> Catalogue
         groups,
         archives_in_groups,
     }
+}
+
+/// A single archive's overall health category - see `classify_archive_health`
+/// for the truthful, non-invented rules deriving this (v0.4.3-alpha, Health
+/// and Recovery Dashboard). Every variant here is backed by state ArchiveFS
+/// can already observe reliably; nothing here is inferred or guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HealthCategory {
+    /// A live mount attempt failed in a way
+    /// [`ArchiveHealth::is_terminal_without_source_change`] says will not
+    /// succeed by retrying alone (corrupt archive, unsupported format,
+    /// permission denied).
+    TerminalFailure,
+    /// A live mount attempt failed in a way [`ArchiveHealth::is_retryable`]
+    /// says may succeed if retried.
+    RetryableFailure,
+    /// A remount or lazy-unmount recovery offer is currently active for
+    /// this exact archive in this session.
+    RecoveryAvailable,
+    /// The persisted catalogue's last successful scan explicitly marked
+    /// this archive missing (`last_verified_missing_at` is set).
+    Missing,
+    /// Known to the persisted catalogue and not marked missing, but not
+    /// yet confirmed present by the current live snapshot.
+    AwaitingValidation,
+    /// Known to the persisted catalogue, not confirmed present by the
+    /// current live snapshot, and not currently reachable on disk either.
+    CachedOnly,
+    /// No current platform assignment - manual, alias, or automatic.
+    UnknownPlatform,
+}
+
+impl HealthCategory {
+    /// The milestone's documented default severity order: lower is more
+    /// severe. Used only to sort the issue list; never to hide a category.
+    pub fn severity_rank(self) -> u8 {
+        match self {
+            Self::TerminalFailure => 1,
+            Self::RetryableFailure => 2,
+            Self::RecoveryAvailable => 3,
+            Self::Missing => 4,
+            Self::AwaitingValidation => 5,
+            Self::CachedOnly => 6,
+            Self::UnknownPlatform => 7,
+        }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::RetryableFailure)
+    }
+
+    /// A short, human-readable classification label - never a raw enum or
+    /// database source string (see the milestone's UI wording rule).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TerminalFailure => "Terminal failure",
+            Self::RetryableFailure => "Retryable failure",
+            Self::RecoveryAvailable => "Recovery available",
+            Self::Missing => "Missing",
+            Self::AwaitingValidation => "Awaiting validation",
+            Self::CachedOnly => "Cached only",
+            Self::UnknownPlatform => "Unknown platform",
+        }
+    }
+}
+
+/// Whether an archive is confirmed by the caller's live session, or only
+/// known some other way - see `classify_archive_health`. A catalogue-only
+/// caller with no live session (e.g. the CLI) can only ever truthfully
+/// assert `Confirmed` (not known to be missing) or `Missing`;
+/// `AwaitingValidation` and `Unreachable` both require a live session to
+/// be a meaningful claim, so `catalogue_health_report` never produces
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchivePresence {
+    /// Live-confirmed this session, or (for a catalogue-only caller)
+    /// simply not known to be missing.
+    Confirmed,
+    /// The persisted catalogue's last successful scan explicitly marked
+    /// this archive missing.
+    Missing,
+    /// Known to the catalogue, not marked missing, not yet confirmed by
+    /// the current live snapshot, but still reachable on disk right now.
+    AwaitingValidation,
+    /// Known to the catalogue, not confirmed by the current live
+    /// snapshot, and not currently reachable on disk either.
+    Unreachable,
+}
+
+/// Which existing recovery offer (if any) is currently active for an
+/// archive - see the GUI's `lazy_unmount_offers`/`remount_offers` session
+/// state, the only place this ever varies. Always `None` outside a GUI
+/// session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RecoveryOffer {
+    Remount,
+    LazyUnmount,
+}
+
+/// Which existing, already-implemented action (if any) can safely resolve
+/// a [`HealthIssue`] - see the milestone's "reuse existing action
+/// availability checks... do not implement a second mount, unmount,
+/// remount, or cleanup path" requirement. Always one of the actions
+/// already wired up elsewhere; never a new action kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RecoveryAction {
+    RetryMount,
+    Remount,
+    LazyUnmount,
+}
+
+/// Every raw signal [`classify_archive_health`] needs for one archive.
+/// Borrowed, not owned - the caller (GUI or CLI) already owns all of this
+/// data; classification never clones anything until it decides an issue
+/// actually exists.
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveHealthInput<'a> {
+    pub path: &'a Path,
+    pub platform: Option<&'a str>,
+    pub presence: ArchivePresence,
+    /// `Some` only for a live, current-session mount attempt.
+    pub mount_state: Option<MountState>,
+    /// `Some` only for a live, current-session mount attempt.
+    pub archive_health: Option<ArchiveHealth>,
+    pub recovery_offer: Option<RecoveryOffer>,
+    pub last_seen_at: Option<&'a str>,
+    pub size_bytes: Option<u64>,
+    pub modified_time_unix_seconds: Option<i64>,
+}
+
+/// One archive that needs attention, plus everything the milestone's
+/// health issue list requires to display it without a raw enum or
+/// database source string - see `classify_archive_health`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HealthIssue {
+    pub path: PathBuf,
+    pub platform: Option<String>,
+    pub present: bool,
+    pub mount_state: Option<MountState>,
+    pub category: HealthCategory,
+    pub reason: String,
+    pub retryable: bool,
+    pub recovery_action: Option<RecoveryAction>,
+    pub last_seen_at: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub modified_time_unix_seconds: Option<i64>,
+}
+
+impl HealthIssue {
+    pub fn recovery_available(&self) -> bool {
+        self.recovery_action.is_some()
+    }
+}
+
+fn health_issue_reason(category: HealthCategory, recovery_offer: Option<RecoveryOffer>) -> String {
+    match category {
+        HealthCategory::TerminalFailure => "Mount failure requires manual review".to_string(),
+        HealthCategory::RetryableFailure => "Mount failed and may be retried".to_string(),
+        HealthCategory::RecoveryAvailable => match recovery_offer {
+            Some(RecoveryOffer::Remount) => "Remount is available".to_string(),
+            Some(RecoveryOffer::LazyUnmount) => "Lazy-unmount recovery is available".to_string(),
+            None => "Recovery is available".to_string(),
+        },
+        HealthCategory::Missing => "Missing from latest successful scan".to_string(),
+        HealthCategory::AwaitingValidation => "Awaiting validation".to_string(),
+        HealthCategory::CachedOnly => "Archive exists only in the cached catalogue".to_string(),
+        HealthCategory::UnknownPlatform => "Platform could not be determined".to_string(),
+    }
+}
+
+/// The single, truthful rule set deciding whether one archive needs
+/// attention, and if so, exactly which category - see the milestone's
+/// documented severity order ([`HealthCategory::severity_rank`]) and "do
+/// not invent health states" requirement. Every branch here is backed by
+/// a signal `input` already carries; nothing is guessed. Returns `None`
+/// for a healthy archive - callers must never synthesize an issue for
+/// one.
+///
+/// Priority (highest first, matching [`HealthCategory::severity_rank`]): a
+/// live mount failure always outranks a merely-offered recovery, which
+/// outranks catalogue presence, which outranks an unknown platform - an
+/// archive gets exactly one category, its single most severe applicable
+/// one, never more than one.
+pub fn classify_archive_health(input: &ArchiveHealthInput<'_>) -> Option<HealthIssue> {
+    let category = input.archive_health.and_then(|health| {
+        if health.is_terminal_without_source_change() {
+            Some(HealthCategory::TerminalFailure)
+        } else if health.is_retryable() {
+            Some(HealthCategory::RetryableFailure)
+        } else {
+            None
+        }
+    });
+
+    let category = category.or_else(|| {
+        input
+            .recovery_offer
+            .map(|_| HealthCategory::RecoveryAvailable)
+    });
+
+    let category = category.or(match input.presence {
+        ArchivePresence::Missing => Some(HealthCategory::Missing),
+        ArchivePresence::AwaitingValidation => Some(HealthCategory::AwaitingValidation),
+        ArchivePresence::Unreachable => Some(HealthCategory::CachedOnly),
+        ArchivePresence::Confirmed => None,
+    });
+
+    let category = category.or_else(|| {
+        input
+            .platform
+            .is_none()
+            .then_some(HealthCategory::UnknownPlatform)
+    });
+
+    let category = category?;
+    let retryable = category.is_retryable();
+    let recovery_action = match category {
+        HealthCategory::RetryableFailure => Some(RecoveryAction::RetryMount),
+        HealthCategory::RecoveryAvailable => match input.recovery_offer {
+            Some(RecoveryOffer::Remount) => Some(RecoveryAction::Remount),
+            Some(RecoveryOffer::LazyUnmount) => Some(RecoveryAction::LazyUnmount),
+            None => None,
+        },
+        _ => None,
+    };
+    let reason = health_issue_reason(category, input.recovery_offer);
+
+    Some(HealthIssue {
+        path: input.path.to_path_buf(),
+        platform: input.platform.map(str::to_string),
+        present: !matches!(input.presence, ArchivePresence::Missing),
+        mount_state: input.mount_state,
+        category,
+        reason,
+        retryable,
+        recovery_action,
+        last_seen_at: input.last_seen_at.map(str::to_string),
+        size_bytes: input.size_bytes,
+        modified_time_unix_seconds: input.modified_time_unix_seconds,
+    })
+}
+
+/// A catalogue-only health report - see `catalogue_health_report`. Built
+/// without any live scan, so a caller with no live session (the CLI) can
+/// still truthfully report `Missing` and `UnknownPlatform` (both facts the
+/// persisted catalogue alone already knows); `AwaitingValidation`/
+/// `CachedOnly` never appear here since asserting either requires a live
+/// session this report deliberately never has (see `ArchivePresence`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueHealthReport {
+    pub archives_checked: usize,
+    pub missing_count: usize,
+    pub unknown_platform_count: usize,
+    pub issues: Vec<HealthIssue>,
+}
+
+/// Builds a [`CatalogueHealthReport`] purely from already-loaded catalogue
+/// rows - no filesystem or live-scan access, mirroring
+/// `catalogue_filename_duplicates`'s existing read-only contract. Safe for
+/// a CLI command that must never trigger a scan, mount, unmount, or
+/// write. Deterministically sorted by severity, then exact path.
+pub fn catalogue_health_report(archives: &[PersistedArchive]) -> CatalogueHealthReport {
+    let mut issues: Vec<HealthIssue> = archives
+        .iter()
+        .filter_map(|archive| {
+            let presence = if archive.last_verified_missing_at.is_some() {
+                ArchivePresence::Missing
+            } else {
+                ArchivePresence::Confirmed
+            };
+            let input = ArchiveHealthInput {
+                path: &archive.absolute_path,
+                platform: archive.platform.as_deref(),
+                presence,
+                mount_state: None,
+                archive_health: None,
+                recovery_offer: None,
+                last_seen_at: Some(&archive.last_seen_at),
+                size_bytes: archive.size_bytes,
+                modified_time_unix_seconds: archive.modified_time_unix_seconds,
+            };
+            classify_archive_health(&input)
+        })
+        .collect();
+    issues.sort_by(|left, right| {
+        left.category
+            .severity_rank()
+            .cmp(&right.category.severity_rank())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let missing_count = issues
+        .iter()
+        .filter(|issue| issue.category == HealthCategory::Missing)
+        .count();
+    let unknown_platform_count = issues
+        .iter()
+        .filter(|issue| issue.category == HealthCategory::UnknownPlatform)
+        .count();
+    CatalogueHealthReport {
+        archives_checked: archives.len(),
+        missing_count,
+        unknown_platform_count,
+        issues,
+    }
+}
+
+/// One source folder's own health problem - kept entirely separate from
+/// per-archive [`HealthIssue`]s so an offline source produces exactly one
+/// entry here, never one `HealthIssue` per archive it owns (the
+/// multi-source milestone's explicit "do not flood Health with one issue
+/// per archive for an offline source" safety requirement).
+/// `classify_source_availability` already applies `Disabled` precedence
+/// over any scan-derived state, and this only ever looks at the other four
+/// variants, so a merely-disabled source (ordinary, user-directed
+/// configuration state, not a problem) never appears here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceHealthIssue {
+    pub path: PathBuf,
+    pub availability: SourceAvailability,
+    pub reason: String,
+    pub last_scan_error: Option<String>,
+    /// The catalogue row count this source last successfully scanned -
+    /// never recomputed here and never affected by the source currently
+    /// being offline (see `scan_and_persist_folders`'s per-folder
+    /// isolation, which never touches another folder's archives). Purely
+    /// informational: "these rows were preserved, not lost."
+    pub archives_preserved: i64,
+}
+
+fn source_health_reason(availability: SourceAvailability) -> &'static str {
+    match availability {
+        SourceAvailability::Unavailable => {
+            "Source unavailable. Existing catalogue entries were preserved."
+        }
+        SourceAvailability::PermissionDenied => {
+            "Permission denied reading this source. Existing catalogue entries were preserved."
+        }
+        SourceAvailability::ScanFailed => {
+            "The last scan of this source failed. Existing catalogue entries were preserved."
+        }
+        SourceAvailability::Available | SourceAvailability::Disabled => "",
+    }
+}
+
+/// Builds one health issue per *enabled* source folder that is not
+/// currently `Available` - never one per archive that source owns. Pure
+/// and database-free, exactly like [`catalogue_health_report`]: takes the
+/// already-built [`SourceFolderView`]s (see [`build_source_folder_views`])
+/// and only reads already-known fields, so the CLI and the GUI both ever
+/// compute this identically.
+pub fn source_health_issues(views: &[SourceFolderView]) -> Vec<SourceHealthIssue> {
+    views
+        .iter()
+        .filter(|view| {
+            matches!(
+                view.availability,
+                SourceAvailability::Unavailable
+                    | SourceAvailability::PermissionDenied
+                    | SourceAvailability::ScanFailed
+            )
+        })
+        .map(|view| SourceHealthIssue {
+            path: view.path.clone(),
+            availability: view.availability,
+            reason: source_health_reason(view.availability).to_string(),
+            last_scan_error: view.last_scan_error.clone(),
+            archives_preserved: view.last_archive_count.unwrap_or(0),
+        })
+        .collect()
 }
 
 fn duplicate_record_platform(record: &ArchiveRecord) -> String {
@@ -5901,6 +7129,393 @@ mod tests {
         assert_eq!(report.groups[0].entries[1].path, second);
     }
 
+    // -----------------------------------------------------------------
+    // v0.4.3-alpha: Health and Recovery Dashboard - classification tests.
+    // -----------------------------------------------------------------
+
+    /// A baseline "nothing wrong" input: `classify_archive_health` must
+    /// return `None` for this exact input (see
+    /// `healthy_archive_produces_no_issue`) - every other test below
+    /// overrides exactly one field away from this baseline to isolate
+    /// what actually triggered the resulting category.
+    fn healthy_health_input(path: &Path) -> ArchiveHealthInput<'_> {
+        ArchiveHealthInput {
+            path,
+            platform: Some("SNES"),
+            presence: ArchivePresence::Confirmed,
+            mount_state: Some(MountState::Mounted),
+            archive_health: Some(ArchiveHealth::Mounted),
+            recovery_offer: None,
+            last_seen_at: Some("2026-01-01T00:00:00Z"),
+            size_bytes: Some(1024),
+            modified_time_unix_seconds: Some(1_700_000_000),
+        }
+    }
+
+    #[test]
+    fn healthy_archive_produces_no_issue() {
+        let path = PathBuf::from("/roms/a/Game.zip");
+        assert!(classify_archive_health(&healthy_health_input(&path)).is_none());
+    }
+
+    #[test]
+    fn pending_live_archive_with_no_failure_produces_no_issue() {
+        // Requirement 12: "mounted and pending states classify correctly"
+        // - a freshly discovered, not-yet-mounted archive with no mount
+        // attempt failure must never be reported as a health issue.
+        let path = PathBuf::from("/roms/a/Game.zip");
+        let input = ArchiveHealthInput {
+            mount_state: Some(MountState::Pending),
+            archive_health: Some(ArchiveHealth::Pending),
+            ..healthy_health_input(&path)
+        };
+        assert!(classify_archive_health(&input).is_none());
+    }
+
+    #[test]
+    fn mounted_archive_produces_no_issue() {
+        let path = PathBuf::from("/roms/a/Game.zip");
+        let input = ArchiveHealthInput {
+            mount_state: Some(MountState::Mounted),
+            archive_health: Some(ArchiveHealth::Mounted),
+            ..healthy_health_input(&path)
+        };
+        assert!(classify_archive_health(&input).is_none());
+    }
+
+    #[test]
+    fn terminal_and_retryable_failures_remain_distinct() {
+        let path = PathBuf::from("/roms/a/Game.zip");
+        for (health, expected) in [
+            (ArchiveHealth::Corrupt, HealthCategory::TerminalFailure),
+            (ArchiveHealth::Unsupported, HealthCategory::TerminalFailure),
+            (
+                ArchiveHealth::PermissionDenied,
+                HealthCategory::TerminalFailure,
+            ),
+            (ArchiveHealth::Failed, HealthCategory::RetryableFailure),
+            (
+                ArchiveHealth::MissingParts,
+                HealthCategory::RetryableFailure,
+            ),
+            (
+                ArchiveHealth::RetryAvailable,
+                HealthCategory::RetryableFailure,
+            ),
+        ] {
+            let input = ArchiveHealthInput {
+                mount_state: Some(MountState::Pending),
+                archive_health: Some(health),
+                ..healthy_health_input(&path)
+            };
+            let issue = classify_archive_health(&input)
+                .unwrap_or_else(|| panic!("{health:?} must be reported as an issue"));
+            assert_eq!(
+                issue.category, expected,
+                "{health:?} must classify as {expected:?}"
+            );
+        }
+
+        let terminal = classify_archive_health(&ArchiveHealthInput {
+            archive_health: Some(ArchiveHealth::Corrupt),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        let retryable = classify_archive_health(&ArchiveHealthInput {
+            archive_health: Some(ArchiveHealth::Failed),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        assert!(
+            !terminal.retryable,
+            "a terminal failure must not be reported retryable"
+        );
+        assert!(
+            retryable.retryable,
+            "a retryable failure must be reported retryable"
+        );
+        assert_eq!(terminal.recovery_action, None);
+        assert_eq!(retryable.recovery_action, Some(RecoveryAction::RetryMount));
+    }
+
+    #[test]
+    fn missing_and_cached_only_states_remain_distinct() {
+        let path = PathBuf::from("/roms/a/Game.zip");
+        let missing = classify_archive_health(&ArchiveHealthInput {
+            presence: ArchivePresence::Missing,
+            mount_state: None,
+            archive_health: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        let cached_only = classify_archive_health(&ArchiveHealthInput {
+            presence: ArchivePresence::Unreachable,
+            mount_state: None,
+            archive_health: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        let awaiting_validation = classify_archive_health(&ArchiveHealthInput {
+            presence: ArchivePresence::AwaitingValidation,
+            mount_state: None,
+            archive_health: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+
+        assert_eq!(missing.category, HealthCategory::Missing);
+        assert_eq!(cached_only.category, HealthCategory::CachedOnly);
+        assert_eq!(
+            awaiting_validation.category,
+            HealthCategory::AwaitingValidation
+        );
+        assert_ne!(missing.category, cached_only.category);
+        assert_ne!(missing.category, awaiting_validation.category);
+        assert_ne!(cached_only.category, awaiting_validation.category);
+        assert!(!missing.present);
+        assert!(
+            cached_only.present,
+            "cached-only is not the same as missing"
+        );
+        assert!(awaiting_validation.present);
+    }
+
+    #[test]
+    fn unknown_platform_is_reported_only_when_nothing_more_severe_applies() {
+        let path = PathBuf::from("/roms/a/Game.zip");
+        let unknown = classify_archive_health(&ArchiveHealthInput {
+            platform: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        assert_eq!(unknown.category, HealthCategory::UnknownPlatform);
+        assert_eq!(unknown.platform, None);
+
+        // A missing archive that also has an unknown platform is reported
+        // as Missing, never double-counted or reclassified as
+        // UnknownPlatform - single most-severe category only.
+        let missing_and_unknown = classify_archive_health(&ArchiveHealthInput {
+            platform: None,
+            presence: ArchivePresence::Missing,
+            mount_state: None,
+            archive_health: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        assert_eq!(missing_and_unknown.category, HealthCategory::Missing);
+    }
+
+    #[test]
+    fn recovery_availability_is_represented_only_when_a_real_offer_exists() {
+        let path = PathBuf::from("/roms/a/Game.zip");
+        // No offer at all: a pending, otherwise-healthy archive is not an
+        // issue just because it is not currently mounted.
+        let no_offer = classify_archive_health(&ArchiveHealthInput {
+            mount_state: Some(MountState::Pending),
+            archive_health: Some(ArchiveHealth::Pending),
+            recovery_offer: None,
+            ..healthy_health_input(&path)
+        });
+        assert!(no_offer.is_none());
+
+        let remount = classify_archive_health(&ArchiveHealthInput {
+            mount_state: Some(MountState::Pending),
+            archive_health: Some(ArchiveHealth::Pending),
+            recovery_offer: Some(RecoveryOffer::Remount),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        assert_eq!(remount.category, HealthCategory::RecoveryAvailable);
+        assert_eq!(remount.reason, "Remount is available");
+        assert_eq!(remount.recovery_action, Some(RecoveryAction::Remount));
+        assert!(remount.recovery_available());
+
+        let lazy_unmount = classify_archive_health(&ArchiveHealthInput {
+            mount_state: Some(MountState::Mounted),
+            archive_health: Some(ArchiveHealth::Mounted),
+            recovery_offer: Some(RecoveryOffer::LazyUnmount),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        assert_eq!(lazy_unmount.category, HealthCategory::RecoveryAvailable);
+        assert_eq!(lazy_unmount.reason, "Lazy-unmount recovery is available");
+        assert_eq!(
+            lazy_unmount.recovery_action,
+            Some(RecoveryAction::LazyUnmount)
+        );
+    }
+
+    #[test]
+    fn a_live_mount_failure_outranks_a_merely_offered_recovery() {
+        // Severity order: a terminal/retryable failure must win even if a
+        // recovery offer also happens to be active for the same path.
+        let path = PathBuf::from("/roms/a/Game.zip");
+        let issue = classify_archive_health(&ArchiveHealthInput {
+            mount_state: Some(MountState::Pending),
+            archive_health: Some(ArchiveHealth::Failed),
+            recovery_offer: Some(RecoveryOffer::Remount),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+        assert_eq!(issue.category, HealthCategory::RetryableFailure);
+    }
+
+    #[test]
+    fn health_category_severity_order_is_deterministic_and_matches_the_documented_default() {
+        let mut categories = [
+            HealthCategory::UnknownPlatform,
+            HealthCategory::CachedOnly,
+            HealthCategory::AwaitingValidation,
+            HealthCategory::Missing,
+            HealthCategory::RecoveryAvailable,
+            HealthCategory::RetryableFailure,
+            HealthCategory::TerminalFailure,
+        ];
+        categories.sort_by_key(|category| category.severity_rank());
+        assert_eq!(
+            categories,
+            [
+                HealthCategory::TerminalFailure,
+                HealthCategory::RetryableFailure,
+                HealthCategory::RecoveryAvailable,
+                HealthCategory::Missing,
+                HealthCategory::AwaitingValidation,
+                HealthCategory::CachedOnly,
+                HealthCategory::UnknownPlatform,
+            ]
+        );
+
+        // Ranks are also stable across repeated calls (no interior
+        // randomness / hashing involved).
+        for category in categories {
+            assert_eq!(category.severity_rank(), category.severity_rank());
+        }
+    }
+
+    #[test]
+    fn exact_paths_remain_distinct_between_two_otherwise_identical_issues() {
+        let first_path = PathBuf::from("/roms/a/Game.zip");
+        let second_path = PathBuf::from("/roms/a/Game (1).zip");
+        let first = classify_archive_health(&ArchiveHealthInput {
+            archive_health: Some(ArchiveHealth::Failed),
+            mount_state: Some(MountState::Pending),
+            ..healthy_health_input(&first_path)
+        })
+        .unwrap();
+        let second = classify_archive_health(&ArchiveHealthInput {
+            archive_health: Some(ArchiveHealth::Failed),
+            mount_state: Some(MountState::Pending),
+            ..healthy_health_input(&second_path)
+        })
+        .unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.path, first_path);
+        assert_eq!(second.path, second_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_archive_health_never_panics_on_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut path = PathBuf::from("/roms/a");
+        path.push(std::ffi::OsString::from_vec(b"Game\x80.zip".to_vec()));
+        let input = ArchiveHealthInput {
+            archive_health: Some(ArchiveHealth::Failed),
+            mount_state: Some(MountState::Pending),
+            ..healthy_health_input(&path)
+        };
+        let issue = classify_archive_health(&input).unwrap();
+        assert_eq!(issue.path, path);
+    }
+
+    #[test]
+    fn catalogue_health_report_counts_exactly_match_the_issues_present() {
+        let archives = vec![
+            persisted_duplicate_archive(1, "/roms/a/Game.zip", Some("SNES"), true, Some(10)),
+            persisted_duplicate_archive(2, "/roms/b/Missing.zip", Some("SNES"), false, Some(20)),
+            persisted_duplicate_archive(3, "/roms/c/Unknown.zip", None, true, Some(30)),
+            persisted_duplicate_archive(4, "/roms/d/Fine.zip", Some("Genesis"), true, Some(40)),
+        ];
+
+        let report = catalogue_health_report(&archives);
+
+        assert_eq!(report.archives_checked, 4);
+        assert_eq!(report.missing_count, 1);
+        assert_eq!(report.unknown_platform_count, 1);
+        assert_eq!(
+            report.issues.len(),
+            report.missing_count + report.unknown_platform_count,
+            "the report's counts must exactly match the entries actually present"
+        );
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.category == HealthCategory::Missing)
+                .count(),
+            report.missing_count
+        );
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.category == HealthCategory::UnknownPlatform)
+                .count(),
+            report.unknown_platform_count
+        );
+        // A catalogue-only report never asserts AwaitingValidation or
+        // CachedOnly - those require a live session it deliberately never
+        // has.
+        assert!(report.issues.iter().all(|issue| !matches!(
+            issue.category,
+            HealthCategory::AwaitingValidation | HealthCategory::CachedOnly
+        )));
+    }
+
+    #[test]
+    fn catalogue_health_report_sorting_is_deterministic_by_severity_then_path() {
+        let archives = vec![
+            persisted_duplicate_archive(1, "/roms/z/Unknown.zip", None, true, None),
+            persisted_duplicate_archive(2, "/roms/a/Missing.zip", Some("SNES"), false, None),
+            persisted_duplicate_archive(3, "/roms/b/Missing.zip", Some("SNES"), false, None),
+        ];
+
+        let first = catalogue_health_report(&archives);
+        let second = catalogue_health_report(&archives.clone());
+
+        assert_eq!(
+            first, second,
+            "sorting must be deterministic across reloads"
+        );
+        assert_eq!(first.issues[0].category, HealthCategory::Missing);
+        assert_eq!(first.issues[1].category, HealthCategory::Missing);
+        assert_eq!(first.issues[2].category, HealthCategory::UnknownPlatform);
+        assert!(
+            first.issues[0].path < first.issues[1].path,
+            "same-severity issues must be ordered by exact path"
+        );
+    }
+
+    #[test]
+    fn catalogue_health_report_does_not_mutate_its_input() {
+        let archives = vec![persisted_duplicate_archive(
+            1,
+            "/roms/a/Game.zip",
+            Some("SNES"),
+            false,
+            Some(10),
+        )];
+        let before = archives.clone();
+
+        let _ = catalogue_health_report(&archives);
+
+        assert_eq!(
+            archives, before,
+            "building the report must not mutate the catalogue slice"
+        );
+    }
+
     #[test]
     fn empty_duplicate_detector_returns_empty_report_for_empty_input() {
         let detector = EmptyDuplicateDetector;
@@ -7396,9 +9011,562 @@ mod tests {
              if you changed the parser or the example, keep both in sync",
         );
 
-        assert_eq!(config.source_folders, vec![PathBuf::from("/data/archives")]);
+        // The shipped example intentionally ships with zero sources
+        // configured (multi-source milestone: the installer/first-run
+        // flow no longer hardcodes one permanent source folder) - a
+        // config with no sources loads and runs fine; see
+        // `a_config_with_zero_sources_is_valid_not_an_error`.
+        assert!(config.source_folders.is_empty());
         assert_eq!(config.mount_root, PathBuf::from("/mnt/archivefs"));
         assert_eq!(config.ratarmount_bin, "ratarmount");
+    }
+
+    #[test]
+    fn legacy_source_folders_config_migrates_to_one_enabled_source_in_memory() {
+        let contents = "source_folders = [\"/data/archives\"]\nmount_root = \"/mnt/archivefs\"\n";
+
+        let config = parse_config(contents).unwrap();
+        let sources = parse_source_folder_configs(contents).unwrap();
+
+        assert_eq!(config.source_folders, vec![PathBuf::from("/data/archives")]);
+        assert_eq!(
+            sources,
+            vec![SourceFolderConfig {
+                path: PathBuf::from("/data/archives"),
+                enabled: true,
+                created_at: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn structured_source_blocks_round_trip_through_parse_and_render() {
+        let root = test_root("structured_source_round_trip");
+        let mount_root = root.join("mounts");
+        let contents = format!(
+            "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n\
+             [[source]]\npath = \"/data/archives\"\nenabled = true\ncreated_at = \"2026-01-01T00:00:00Z\"\n\n\
+             [[source]]\npath = \"/mnt/other\"\nenabled = false\n",
+            mount_root.display()
+        );
+
+        let sources = parse_source_folder_configs(&contents).unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                SourceFolderConfig {
+                    path: PathBuf::from("/data/archives"),
+                    enabled: true,
+                    created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                },
+                SourceFolderConfig {
+                    path: PathBuf::from("/mnt/other"),
+                    enabled: false,
+                    created_at: None,
+                },
+            ]
+        );
+
+        // A disabled source must never appear in the enabled-only Config
+        // view every other part of the codebase relies on.
+        let config = parse_config(&contents).unwrap();
+        assert_eq!(config.source_folders, vec![PathBuf::from("/data/archives")]);
+
+        let rendered = render_source_folder_configs(&sources, &mount_root, "ratarmount");
+        let round_tripped = parse_source_folder_configs(&rendered).unwrap();
+        assert_eq!(
+            round_tripped, sources,
+            "rendering then re-parsing must be lossless"
+        );
+    }
+
+    #[test]
+    fn a_config_with_zero_sources_is_valid_not_an_error() {
+        let contents = "mount_root = \"/mnt/archivefs\"\n";
+
+        let config = parse_config(contents).unwrap();
+
+        assert!(
+            config.source_folders.is_empty(),
+            "a fresh install with no sources configured yet must still load successfully"
+        );
+    }
+
+    #[test]
+    fn save_source_folder_configs_is_atomic_and_leaves_no_temp_file_behind() {
+        let root = test_root("save_source_folder_configs_atomic");
+        let config_path = root.join("config.toml");
+        let mount_root = root.join("mounts");
+        let sources = vec![SourceFolderConfig {
+            path: root.join("archives"),
+            enabled: true,
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+        }];
+
+        save_source_folder_configs_to(&config_path, &sources, &mount_root, "ratarmount").unwrap();
+
+        let loaded = load_source_folder_configs_from(&config_path).unwrap();
+        assert_eq!(loaded, sources);
+        let loaded_config = Config::load_from(&config_path).unwrap();
+        assert_eq!(loaded_config.mount_root, mount_root);
+
+        let leftover_temp_files = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(
+            leftover_temp_files, 0,
+            "atomic write must not leave a temp file behind"
+        );
+    }
+
+    #[test]
+    fn save_source_folder_configs_never_loses_an_existing_enabled_source() {
+        let root = test_root("save_source_folder_configs_preserves");
+        let config_path = root.join("config.toml");
+        let archives_dir = root.join("Archives");
+        fs::create_dir_all(&archives_dir).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "source_folders = [\"{}\"]\nmount_root = \"{}\"\n",
+                archives_dir.display(),
+                root.join("mounts").display()
+            ),
+        )
+        .unwrap();
+
+        // Simulate the app's first source-management mutation: load the
+        // legacy config, then immediately save it back unchanged.
+        let sources = load_source_folder_configs_from(&config_path).unwrap();
+        let config = Config::load_from(&config_path).unwrap();
+        save_source_folder_configs_to(
+            &config_path,
+            &sources,
+            &config.mount_root,
+            &config.ratarmount_bin,
+        )
+        .unwrap();
+
+        let reloaded = Config::load_from(&config_path).unwrap();
+        assert_eq!(reloaded.source_folders, vec![archives_dir]);
+    }
+
+    #[test]
+    fn validate_new_source_folder_rejects_a_missing_directory() {
+        let root = test_root("validate_missing");
+        let missing = root.join("does-not-exist");
+
+        let error = validate_new_source_folder(&missing, &[]).unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn validate_new_source_folder_rejects_a_file_not_a_directory() {
+        let root = test_root("validate_not_a_dir");
+        let file_path = root.join("not-a-dir");
+        fs::write(&file_path, b"x").unwrap();
+
+        let error = validate_new_source_folder(&file_path, &[]).unwrap_err();
+
+        assert!(error.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn validate_new_source_folder_rejects_an_exact_duplicate() {
+        let root = test_root("validate_exact_duplicate");
+        let source = root.join("archives");
+        fs::create_dir_all(&source).unwrap();
+
+        let error = validate_new_source_folder(&source, std::slice::from_ref(&source)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already a configured source folder")
+        );
+    }
+
+    #[test]
+    fn validate_new_source_folder_rejects_a_trailing_separator_duplicate() {
+        let root = test_root("validate_trailing_separator_duplicate");
+        let source = root.join("archives");
+        fs::create_dir_all(&source).unwrap();
+        let with_trailing_slash = PathBuf::from(format!("{}/", source.display()));
+
+        let error = validate_new_source_folder(&with_trailing_slash, std::slice::from_ref(&source))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already a configured source folder")
+        );
+    }
+
+    #[test]
+    fn validate_new_source_folder_rejects_a_child_of_an_existing_source() {
+        let root = test_root("validate_overlap_child");
+        let parent = root.join("archives");
+        let child = parent.join("nested");
+        fs::create_dir_all(&child).unwrap();
+
+        let error = validate_new_source_folder(&child, &[parent]).unwrap_err();
+
+        assert!(error.to_string().contains("overlapping"));
+    }
+
+    #[test]
+    fn validate_new_source_folder_rejects_a_parent_of_an_existing_source() {
+        let root = test_root("validate_overlap_parent");
+        let parent = root.join("archives");
+        let child = parent.join("nested");
+        fs::create_dir_all(&child).unwrap();
+
+        let error = validate_new_source_folder(&parent, &[child]).unwrap_err();
+
+        assert!(error.to_string().contains("overlapping"));
+    }
+
+    #[test]
+    fn validate_new_source_folder_accepts_a_genuinely_new_sibling_directory() {
+        let root = test_root("validate_new_sibling");
+        let existing = root.join("archives-a");
+        let new_source = root.join("archives-b");
+        fs::create_dir_all(&existing).unwrap();
+        fs::create_dir_all(&new_source).unwrap();
+
+        let validated = validate_new_source_folder(&new_source, &[existing]).unwrap();
+
+        assert_eq!(validated, new_source);
+    }
+
+    fn write_starter_config(config_path: &Path, mount_root: &Path) {
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+                mount_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn add_source_folder_persists_immediately_and_is_visible_without_a_scan() {
+        let root = test_root("add_source_folder_immediate");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let archives_dir = root.join("archives");
+        fs::create_dir_all(&archives_dir).unwrap();
+
+        let added = add_source_folder_at(&config_path, &database_path, &archives_dir).unwrap();
+        assert_eq!(added.path, archives_dir);
+        assert!(added.enabled);
+        assert!(added.created_at.is_some());
+
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].path, archives_dir);
+        assert!(
+            views[0].id.is_some(),
+            "adding a source must assign it a stable id immediately, without scanning"
+        );
+        assert_eq!(views[0].last_archive_count, None, "adding must never scan");
+        assert_eq!(views[0].availability, SourceAvailability::Available);
+    }
+
+    #[test]
+    fn add_source_folder_rejects_an_overlap_through_the_orchestration_layer() {
+        let root = test_root("add_source_folder_overlap");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let parent = root.join("archives");
+        let child = parent.join("nested");
+        fs::create_dir_all(&child).unwrap();
+
+        add_source_folder_at(&config_path, &database_path, &parent).unwrap();
+        let error = add_source_folder_at(&config_path, &database_path, &child).unwrap_err();
+
+        assert!(error.to_string().contains("overlapping"));
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1, "a rejected add must not partially persist");
+    }
+
+    #[test]
+    fn disabling_a_source_excludes_it_from_scan_all_but_preserves_its_catalogue() {
+        let root = test_root("disable_source_preserves_catalogue");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let source_a = root.join("source-a");
+        let source_b = root.join("source-b");
+        fs::create_dir_all(&source_a).unwrap();
+        fs::create_dir_all(&source_b).unwrap();
+        fs::write(source_a.join("a.zip"), b"a").unwrap();
+        fs::write(source_b.join("b.zip"), b"b").unwrap();
+        add_source_folder_at(&config_path, &database_path, &source_a).unwrap();
+        add_source_folder_at(&config_path, &database_path, &source_b).unwrap();
+        scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+
+        let outcome =
+            set_source_folder_enabled_at(&config_path, &database_path, &source_a, false).unwrap();
+        assert!(!outcome.source.enabled);
+        assert!(outcome.scan.is_none(), "disabling must never scan");
+
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(
+            config.source_folders,
+            vec![source_b.clone()],
+            "a disabled source must be excluded from the enabled-only Config view"
+        );
+
+        let summary = scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+        assert_eq!(
+            summary.counts.source_folders_scanned, 1,
+            "Scan All must skip the disabled source entirely"
+        );
+
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        let disabled_view = views.iter().find(|view| view.path == source_a).unwrap();
+        assert_eq!(disabled_view.availability, SourceAvailability::Disabled);
+        assert_eq!(
+            disabled_view.last_archive_count,
+            Some(1),
+            "disabling must preserve the last known archive count, not reset it"
+        );
+    }
+
+    #[test]
+    fn enabling_a_source_scans_it_automatically() {
+        let root = test_root("enable_source_scans_automatically");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let source_a = root.join("source-a");
+        fs::create_dir_all(&source_a).unwrap();
+        fs::write(source_a.join("a.zip"), b"a").unwrap();
+        add_source_folder_at(&config_path, &database_path, &source_a).unwrap();
+        set_source_folder_enabled_at(&config_path, &database_path, &source_a, false).unwrap();
+
+        let outcome =
+            set_source_folder_enabled_at(&config_path, &database_path, &source_a, true).unwrap();
+
+        assert!(outcome.source.enabled);
+        let scan = outcome.scan.expect(
+            "re-enabling a source must trigger a scan before live actions become available",
+        );
+        assert_eq!(scan.counts.source_folders_scanned, 1);
+        assert_eq!(scan.counts.archives_added, 1);
+    }
+
+    #[test]
+    fn removing_a_source_with_keep_catalogue_never_touches_its_archive_rows() {
+        let root = test_root("remove_source_keep_catalogue");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let source_a = root.join("source-a");
+        fs::create_dir_all(&source_a).unwrap();
+        fs::write(source_a.join("a.zip"), b"a").unwrap();
+        add_source_folder_at(&config_path, &database_path, &source_a).unwrap();
+        scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+
+        let outcome =
+            remove_source_folder_at(&config_path, &database_path, &source_a, true).unwrap();
+
+        assert_eq!(outcome.catalogue_rows_removed, None);
+        let config = Config::load_from(&config_path).unwrap();
+        assert!(config.source_folders.is_empty());
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(
+            database.load_archives().unwrap().len(),
+            1,
+            "removing configuration must never delete a catalogue row by default"
+        );
+        assert!(
+            source_a.exists(),
+            "removing a source must never touch the filesystem"
+        );
+        assert!(source_a.join("a.zip").exists());
+    }
+
+    #[test]
+    fn removing_a_source_with_explicit_catalogue_removal_is_exact_and_scoped() {
+        let root = test_root("remove_source_delete_catalogue");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("mounts");
+        write_starter_config(&config_path, &mount_root);
+        let source_a = root.join("source-a");
+        let source_b = root.join("source-b");
+        fs::create_dir_all(&source_a).unwrap();
+        fs::create_dir_all(&source_b).unwrap();
+        fs::write(source_a.join("a1.zip"), b"1").unwrap();
+        fs::write(source_a.join("a2.zip"), b"2").unwrap();
+        fs::write(source_b.join("b.zip"), b"b").unwrap();
+        add_source_folder_at(&config_path, &database_path, &source_a).unwrap();
+        add_source_folder_at(&config_path, &database_path, &source_b).unwrap();
+        scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+
+        let outcome =
+            remove_source_folder_at(&config_path, &database_path, &source_a, false).unwrap();
+
+        assert_eq!(outcome.catalogue_rows_removed, Some(2));
+        let database = Database::open_or_create(&database_path).unwrap();
+        let remaining = database.load_archives().unwrap();
+        assert_eq!(remaining.len(), 1, "only source_a's rows must be removed");
+        assert_eq!(remaining[0].relative_path, PathBuf::from("b.zip"));
+        assert!(
+            source_a.exists(),
+            "catalogue removal must never touch the filesystem"
+        );
+        assert!(source_a.join("a1.zip").exists());
+        assert!(source_a.join("a2.zip").exists());
+    }
+
+    #[test]
+    fn classify_source_availability_covers_all_five_states() {
+        assert_eq!(
+            classify_source_availability(false, Some(SourceScanStatus::Success), None),
+            SourceAvailability::Disabled,
+            "disabled always wins regardless of scan history"
+        );
+        assert_eq!(
+            classify_source_availability(true, None, None),
+            SourceAvailability::Available
+        );
+        assert_eq!(
+            classify_source_availability(true, Some(SourceScanStatus::Success), None),
+            SourceAvailability::Available
+        );
+        assert_eq!(
+            classify_source_availability(
+                true,
+                Some(SourceScanStatus::Failed),
+                Some("/mnt/x: Permission denied (os error 13)")
+            ),
+            SourceAvailability::PermissionDenied
+        );
+        assert_eq!(
+            classify_source_availability(
+                true,
+                Some(SourceScanStatus::Failed),
+                Some("/mnt/x: No such file or directory (os error 2)")
+            ),
+            SourceAvailability::Unavailable
+        );
+        assert_eq!(
+            classify_source_availability(
+                true,
+                Some(SourceScanStatus::Failed),
+                Some("/mnt/x: some other unexpected I/O error")
+            ),
+            SourceAvailability::ScanFailed
+        );
+    }
+
+    /// A single view-builder helper for the tests below, so each test only
+    /// states the one or two fields it actually cares about.
+    fn source_view(
+        path: &str,
+        availability: SourceAvailability,
+        archive_count: i64,
+    ) -> SourceFolderView {
+        SourceFolderView {
+            path: PathBuf::from(path),
+            enabled: !matches!(availability, SourceAvailability::Disabled),
+            created_at: None,
+            id: Some(1),
+            availability,
+            last_scan_status: None,
+            last_scan_error: Some("boom".to_string()),
+            last_scan_at: None,
+            last_successful_scan_at: None,
+            last_archive_count: Some(archive_count),
+        }
+    }
+
+    #[test]
+    fn source_health_issues_reports_exactly_one_issue_per_unavailable_source_never_per_archive() {
+        // 1,242 preserved archives under one offline source must still
+        // surface as exactly one `SourceHealthIssue`, not 1,242 - this is
+        // the milestone's core anti-flood guarantee.
+        let views = vec![source_view(
+            "/mnt/usbdrive/retro",
+            SourceAvailability::Unavailable,
+            1242,
+        )];
+        let issues = source_health_issues(&views);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path, PathBuf::from("/mnt/usbdrive/retro"));
+        assert_eq!(issues[0].archives_preserved, 1242);
+        assert!(issues[0].reason.contains("preserved"));
+    }
+
+    #[test]
+    fn source_health_issues_covers_permission_denied_and_scan_failed_with_distinct_wording() {
+        let views = vec![
+            source_view(
+                "/mnt/nvme2/collections",
+                SourceAvailability::PermissionDenied,
+                0,
+            ),
+            source_view("/mnt/broken", SourceAvailability::ScanFailed, 40),
+        ];
+        let issues = source_health_issues(&views);
+        assert_eq!(issues.len(), 2);
+        assert!(issues[0].reason.to_lowercase().contains("permission"));
+        assert!(issues[1].reason.to_lowercase().contains("scan"));
+    }
+
+    #[test]
+    fn source_health_issues_never_reports_available_or_disabled_sources() {
+        let views = vec![
+            source_view("/home/davedap/Archives", SourceAvailability::Available, 500),
+            source_view("/mnt/games/roms", SourceAvailability::Disabled, 10),
+        ];
+        assert!(source_health_issues(&views).is_empty());
+    }
+
+    #[test]
+    fn resolve_source_folder_identifier_accepts_both_id_and_path() {
+        let sources = vec![SourceFolderConfig {
+            path: PathBuf::from("/data/archives"),
+            enabled: true,
+            created_at: None,
+        }];
+        let records = vec![SourceFolderRecord {
+            id: 7,
+            path: PathBuf::from("/data/archives"),
+            first_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            last_scan_status: None,
+            last_scan_error: None,
+            last_scan_at: None,
+            last_successful_scan_at: None,
+            last_archive_count: None,
+        }];
+
+        assert_eq!(
+            resolve_source_folder_identifier("7", &sources, &records).unwrap(),
+            PathBuf::from("/data/archives")
+        );
+        assert_eq!(
+            resolve_source_folder_identifier("/data/archives", &sources, &records).unwrap(),
+            PathBuf::from("/data/archives")
+        );
+        assert!(resolve_source_folder_identifier("99", &sources, &records).is_err());
+        assert!(resolve_source_folder_identifier("/no/such/path", &sources, &records).is_err());
     }
 
     #[test]
