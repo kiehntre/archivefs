@@ -4490,6 +4490,86 @@ mod tests {
     }
 
     #[test]
+    fn manual_assignment_survives_rescan_for_every_new_retro_platform() {
+        // Requirement: manual assignments for every one of the milestone's
+        // 20 new canonical platforms survive a rescan, exactly like the
+        // pre-existing platforms already proven by
+        // `rescan_with_no_detected_platform_still_preserves_manual_platform`.
+        // Each archive first auto-detects via its new folder alias (a
+        // sanity check that the alias itself works end to end through a
+        // real scan, not just `detect_platform` in isolation), then gets
+        // manually overridden to a different value that must win over the
+        // folder alias on every subsequent rescan.
+        let cases: &[(&str, &str)] = &[
+            ("Game Boy", "Game Boy"),
+            ("GBC", "Game Boy Color"),
+            ("GBA", "Game Boy Advance"),
+            ("Nintendo DS", "Nintendo DS"),
+            ("C64", "Commodore 64"),
+            ("ZX Spectrum", "ZX Spectrum"),
+            ("Sega 32X", "Sega 32X"),
+            ("Mega CD", "Sega CD"),
+            ("PC Engine", "PC Engine"),
+            ("TurboGrafx-16", "TurboGrafx-16"),
+            ("Atari Lynx", "Atari Lynx"),
+            ("Atari Jaguar", "Atari Jaguar"),
+            ("NGP", "Neo Geo Pocket"),
+            ("NGPC", "Neo Geo Pocket Color"),
+            ("WonderSwan", "WonderSwan"),
+            ("WSC", "WonderSwan Color"),
+            ("3DO", "3DO"),
+            ("PS Vita", "PlayStation Vita"),
+            ("ColecoVision", "ColecoVision"),
+            ("Vectrex", "Vectrex"),
+        ];
+
+        let root = temp_dir("manual-survives-rescan-new-platforms");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        for (folder, _) in cases {
+            write_archive_file(&source, format!("{folder}/Game.zip"), b"contents");
+        }
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial-scan").unwrap();
+
+        for (folder, expected_auto) in cases {
+            let relative = format!("{folder}/Game.zip");
+            let loaded = database.load_archives().unwrap();
+            let archive = find_archive(&loaded, &relative);
+            assert_eq!(
+                archive.platform.as_deref(),
+                Some(*expected_auto),
+                "sanity check: {folder:?} should auto-detect as {expected_auto:?}"
+            );
+            let archive_id = archive.id;
+            database
+                .set_manual_platform(archive_id, "Manual Override")
+                .unwrap();
+        }
+
+        scan_and_persist(&mut database, &config, "rescan-1").unwrap();
+        scan_and_persist(&mut database, &config, "rescan-2").unwrap();
+
+        let archives = database.load_archives().unwrap();
+        for (folder, _) in cases {
+            let relative = format!("{folder}/Game.zip");
+            let archive = find_archive(&archives, &relative);
+            assert_eq!(
+                archive.platform.as_deref(),
+                Some("Manual Override"),
+                "manual assignment for {folder:?} must survive rescans"
+            );
+            assert_eq!(
+                archive.platform_source.as_deref(),
+                Some(MANUAL_PLATFORM_SOURCE)
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn find_archive_id_by_absolute_path_matches_exact_bytes_and_rejects_no_match() {
         let root = temp_dir("find-archive-id-by-path");
         let source = root.join("source");
@@ -6186,6 +6266,70 @@ mod tests {
         // source's own state, and failure never fabricates a count.
         assert_eq!(folder_b.last_archive_count, Some(1));
         assert_eq!(folder_c.last_archive_count, Some(1));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_all_applies_new_retro_platform_aliases_consistently_across_sources() {
+        // The real `Scan All` entry point (`scan_all_enabled_sources_at`,
+        // reading a config file's `[[source]]` blocks - not the lower-level
+        // `scan_and_persist` the other tests above call directly) applied
+        // to three separate enabled sources, each containing one archive
+        // that should auto-detect via a different new canonical platform's
+        // folder alias. Every source must get the correct platform, not
+        // just the first one scanned.
+        let root = temp_dir("scan_all-new-retro-platforms");
+        let source_a = root.join("source-a");
+        let source_b = root.join("source-b");
+        let source_c = root.join("source-c");
+        let mount = root.join("mount");
+        write_archive_file(&source_a, "Game Boy Advance/Game.zip", b"a");
+        write_archive_file(&source_b, "ColecoVision/Game.zip", b"b");
+        write_archive_file(&source_c, "WSC/Game.zip", b"c");
+        fs::create_dir_all(&mount).unwrap();
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n\n\
+                 [[source]]\npath = \"{}\"\nenabled = true\n",
+                mount.display(),
+                source_a.display(),
+                source_b.display(),
+                source_c.display()
+            ),
+        )
+        .unwrap();
+
+        let database_path = root.join("library.sqlite3");
+        let summary =
+            crate::scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+        assert!(summary.folder_errors.is_empty());
+        assert_eq!(summary.counts.source_folders_scanned, 3);
+        assert_eq!(summary.counts.archives_added, 3);
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            find_archive(&archives, "Game Boy Advance/Game.zip")
+                .platform
+                .as_deref(),
+            Some("Game Boy Advance")
+        );
+        assert_eq!(
+            find_archive(&archives, "ColecoVision/Game.zip")
+                .platform
+                .as_deref(),
+            Some("ColecoVision")
+        );
+        assert_eq!(
+            find_archive(&archives, "WSC/Game.zip").platform.as_deref(),
+            Some("WonderSwan Color")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

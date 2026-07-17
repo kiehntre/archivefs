@@ -21258,6 +21258,46 @@ mod tests {
     }
 
     #[test]
+    fn every_new_retro_platform_appears_exactly_once_in_the_gui_platform_selector() {
+        // Same rationale as `acorn_archimedes_and_pc_appear_in_the_gui_
+        // platform_selector`: the dropdown is `canonical_platform_names()`
+        // with no filtering, so the meaningful, observable check is that
+        // the list this build's GUI reads from contains each of this
+        // milestone's 20 new canonical platforms exactly once - not zero
+        // (unreachable from the GUI) and not more than once (a duplicate
+        // dropdown entry).
+        let names = canonical_platform_names();
+        for expected in [
+            "Game Boy",
+            "Game Boy Color",
+            "Game Boy Advance",
+            "Nintendo DS",
+            "Commodore 64",
+            "ZX Spectrum",
+            "Sega 32X",
+            "Sega CD",
+            "PC Engine",
+            "TurboGrafx-16",
+            "Atari Lynx",
+            "Atari Jaguar",
+            "Neo Geo Pocket",
+            "Neo Geo Pocket Color",
+            "WonderSwan",
+            "WonderSwan Color",
+            "3DO",
+            "PlayStation Vita",
+            "ColecoVision",
+            "Vectrex",
+        ] {
+            assert_eq!(
+                names.iter().filter(|name| **name == expected).count(),
+                1,
+                "{expected:?} must appear exactly once in the GUI platform selector"
+            );
+        }
+    }
+
+    #[test]
     fn is_inspectable_gates_the_entry_point_to_zip_only() {
         // The GUI button's enabled state is driven directly by this core
         // predicate (see `show_selected_archive`) - already exhaustively

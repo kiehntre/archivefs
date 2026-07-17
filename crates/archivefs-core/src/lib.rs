@@ -4236,6 +4236,57 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("pcgames", "PC"),
     ("windows", "PC"),
     ("windowsgames", "PC"),
+    // Conservative retro-platform expansion. Deliberately NOT included:
+    // bare "handheld", "nintendo", "sega", "atari", "sony", "console",
+    // "games", or "roms" - each is broad enough to appear as an unrelated
+    // folder name and would false-positive across the whole library. Short
+    // aliases here ("gb", "ds", "lynx", "jaguar", "vita", "pce", "wsc",
+    // "32x", "c64", "tg16", "ngp", "ngpc") are safe specifically because
+    // `folder_platform_alias` only ever matches one whole, normalized path
+    // *component* (a directory name) - never a substring of a longer
+    // segment and never the archive's own filename (see
+    // `detect_platform_from_folder_alias_with_match`, which pops the
+    // filename before matching) - so a file merely named e.g. "Vita
+    // Game.zip" or a folder like "Digital" can never match "vita"/"ds".
+    ("gameboy", "Game Boy"),
+    ("gb", "Game Boy"),
+    ("gameboycolor", "Game Boy Color"),
+    ("gbc", "Game Boy Color"),
+    ("gameboyadvance", "Game Boy Advance"),
+    ("gba", "Game Boy Advance"),
+    ("nintendods", "Nintendo DS"),
+    ("nds", "Nintendo DS"),
+    ("ds", "Nintendo DS"),
+    ("commodore64", "Commodore 64"),
+    ("c64", "Commodore 64"),
+    ("zxspectrum", "ZX Spectrum"),
+    ("spectrum", "ZX Spectrum"),
+    ("sega32x", "Sega 32X"),
+    ("32x", "Sega 32X"),
+    ("segacd", "Sega CD"),
+    ("megacd", "Sega CD"),
+    ("pcengine", "PC Engine"),
+    ("pce", "PC Engine"),
+    ("turbografx16", "TurboGrafx-16"),
+    ("tg16", "TurboGrafx-16"),
+    ("atarilynx", "Atari Lynx"),
+    ("lynx", "Atari Lynx"),
+    ("atarijaguar", "Atari Jaguar"),
+    ("jaguar", "Atari Jaguar"),
+    ("neogeopocket", "Neo Geo Pocket"),
+    ("ngp", "Neo Geo Pocket"),
+    ("neogeopocketcolor", "Neo Geo Pocket Color"),
+    ("ngpc", "Neo Geo Pocket Color"),
+    ("wonderswan", "WonderSwan"),
+    ("wonderswancolor", "WonderSwan Color"),
+    ("wsc", "WonderSwan Color"),
+    ("3do", "3DO"),
+    ("panasonic3do", "3DO"),
+    ("playstationvita", "PlayStation Vita"),
+    ("psvita", "PlayStation Vita"),
+    ("vita", "PlayStation Vita"),
+    ("colecovision", "ColecoVision"),
+    ("vectrex", "Vectrex"),
 ];
 
 /// Every canonical platform name this build recognises via the
@@ -8603,10 +8654,68 @@ mod tests {
             "Xbox360",
             "Acorn Archimedes",
             "PC",
+            "Game Boy",
+            "Game Boy Color",
+            "Game Boy Advance",
+            "Nintendo DS",
+            "Commodore 64",
+            "ZX Spectrum",
+            "Sega 32X",
+            "Sega CD",
+            "PC Engine",
+            "TurboGrafx-16",
+            "Atari Lynx",
+            "Atari Jaguar",
+            "Neo Geo Pocket",
+            "Neo Geo Pocket Color",
+            "WonderSwan",
+            "WonderSwan Color",
+            "3DO",
+            "PlayStation Vita",
+            "ColecoVision",
+            "Vectrex",
         ] {
             assert!(
                 names.contains(&expected),
                 "{expected:?} should be a canonical platform name"
+            );
+        }
+    }
+
+    #[test]
+    fn every_new_retro_platform_appears_exactly_once_in_canonical_names() {
+        // Several new platforms have multiple aliases mapping to the same
+        // canonical string (e.g. "gameboy"/"gb" both -> "Game Boy") -
+        // `canonical_platform_names`'s dedup must collapse these to one
+        // entry each, which is what the GUI's platform selector iterates
+        // directly (see `show_platform_section`).
+        let names = canonical_platform_names();
+        for expected in [
+            "Game Boy",
+            "Game Boy Color",
+            "Game Boy Advance",
+            "Nintendo DS",
+            "Commodore 64",
+            "ZX Spectrum",
+            "Sega 32X",
+            "Sega CD",
+            "PC Engine",
+            "TurboGrafx-16",
+            "Atari Lynx",
+            "Atari Jaguar",
+            "Neo Geo Pocket",
+            "Neo Geo Pocket Color",
+            "WonderSwan",
+            "WonderSwan Color",
+            "3DO",
+            "PlayStation Vita",
+            "ColecoVision",
+            "Vectrex",
+        ] {
+            assert_eq!(
+                names.iter().filter(|name| **name == expected).count(),
+                1,
+                "{expected:?} must appear exactly once in canonical_platform_names"
             );
         }
     }
@@ -8676,6 +8785,182 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Retro-platform expansion: 20 new canonical platforms (Nintendo
+    // handhelds + retro computers/consoles), conservative folder aliases.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn retro_platform_expansion_folder_aliases_detect_the_canonical_platform() {
+        let root = "/home/davedap/Archives";
+        let cases: &[(&str, &str)] = &[
+            ("Game Boy", "Game Boy"),
+            ("GBC", "Game Boy Color"),
+            ("Game Boy Color", "Game Boy Color"),
+            ("GBA", "Game Boy Advance"),
+            ("Game Boy Advance", "Game Boy Advance"),
+            ("Nintendo DS", "Nintendo DS"),
+            ("DS", "Nintendo DS"),
+            ("NDS", "Nintendo DS"),
+            ("C64", "Commodore 64"),
+            ("Commodore 64", "Commodore 64"),
+            ("ZX Spectrum", "ZX Spectrum"),
+            ("Sega 32X", "Sega 32X"),
+            ("32X", "Sega 32X"),
+            ("Mega CD", "Sega CD"),
+            ("Sega CD", "Sega CD"),
+            ("PC Engine", "PC Engine"),
+            ("PCE", "PC Engine"),
+            ("TurboGrafx-16", "TurboGrafx-16"),
+            ("TG16", "TurboGrafx-16"),
+            ("Atari Lynx", "Atari Lynx"),
+            ("Atari Jaguar", "Atari Jaguar"),
+            ("NGP", "Neo Geo Pocket"),
+            ("Neo Geo Pocket", "Neo Geo Pocket"),
+            ("NGPC", "Neo Geo Pocket Color"),
+            ("Neo Geo Pocket Color", "Neo Geo Pocket Color"),
+            ("WonderSwan", "WonderSwan"),
+            ("WSC", "WonderSwan Color"),
+            ("WonderSwan Color", "WonderSwan Color"),
+            ("3DO", "3DO"),
+            ("Panasonic 3DO", "3DO"),
+            ("PS Vita", "PlayStation Vita"),
+            ("PSVita", "PlayStation Vita"),
+            ("PlayStation Vita", "PlayStation Vita"),
+            ("ColecoVision", "ColecoVision"),
+            ("Vectrex", "Vectrex"),
+        ];
+
+        for (folder, expected) in cases {
+            assert_eq!(
+                detect_platform(format!("{root}/{folder}/Game.zip"), root),
+                Some((*expected).to_string()),
+                "folder {folder:?} should detect {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nintendo_ds_and_nintendo_3ds_remain_distinct() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/Nintendo DS/Game.zip"), root),
+            Some("Nintendo DS".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/DS/Game.zip"), root),
+            Some("Nintendo DS".to_string())
+        );
+        // "Nintendo 3DS" must never collide with the new bare "ds"/"nds"
+        // aliases - `normalize_path_segment` keeps the "3", so
+        // "Nintendo 3DS" normalizes to "nintendo3ds", never "ds"/"nds"/
+        // "nintendods". Nintendo3DS itself is not a folder alias at all
+        // (only reachable via the existing filename/title heuristic), so
+        // this must stay Unknown from folder detection alone.
+        assert_eq!(
+            detect_platform(format!("{root}/Nintendo 3DS/Game.zip"), root),
+            None,
+            "\"Nintendo 3DS\" must not become Nintendo DS"
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/3DS/Game.zip"), root),
+            None,
+            "a bare \"3DS\" folder must not become Nintendo DS either"
+        );
+    }
+
+    #[test]
+    fn pc_engine_and_turbografx_16_remain_separate_canonical_platforms() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/PC Engine/Game.zip"), root),
+            Some("PC Engine".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/TurboGrafx-16/Game.zip"), root),
+            Some("TurboGrafx-16".to_string())
+        );
+    }
+
+    #[test]
+    fn neo_geo_pocket_and_neo_geo_pocket_color_remain_separate() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/NGP/Game.zip"), root),
+            Some("Neo Geo Pocket".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NGPC/Game.zip"), root),
+            Some("Neo Geo Pocket Color".to_string())
+        );
+    }
+
+    #[test]
+    fn wonderswan_and_wonderswan_color_remain_separate() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/WonderSwan/Game.zip"), root),
+            Some("WonderSwan".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/WSC/Game.zip"), root),
+            Some("WonderSwan Color".to_string())
+        );
+    }
+
+    #[test]
+    fn broad_brand_only_and_generic_folders_remain_unknown() {
+        let root = "/home/davedap/Archives";
+        for folder in ["Games", "Nintendo", "Sega", "Atari", "Sony"] {
+            assert_eq!(
+                detect_platform(format!("{root}/{folder}/Game.zip"), root),
+                None,
+                "a bare {folder:?} folder must not imply any platform"
+            );
+        }
+    }
+
+    #[test]
+    fn short_alias_substrings_never_trigger_folder_alias_detection() {
+        // The new short aliases ("ds", "gb", "lynx", "jaguar", "vita",
+        // "pce", "wsc", "spectrum", ...) match one whole, normalized path
+        // *component* only - never a substring of a longer folder name,
+        // and never the archive's own filename (see
+        // `detect_platform_from_folder_alias_with_match`, which excludes
+        // the filename entirely before matching).
+        let root = "/home/davedap/Archives";
+        let filenames = [
+            "MyVitaGame.zip",
+            "dsgame.zip",
+            "gbcollection.zip",
+            "lynxmania.zip",
+            "jaguarland.zip",
+            "spectrumanalysis.zip",
+            "pcexpress.zip",
+            "wscfile.zip",
+        ];
+        for filename in filenames {
+            assert_eq!(
+                detect_platform(format!("{root}/Unsorted/{filename}"), root),
+                None,
+                "filename {filename:?} must never trigger folder-alias detection"
+            );
+        }
+        // A folder whose normalized name merely *starts with* or contains
+        // a short alias must not match either - only an exact, whole-
+        // component match counts.
+        for folder in [
+            "Digital Stuff", // normalizes to "digitalstuff", not "ds"
+            "Galaxy Battle", // normalizes to "galaxybattle", not "gb"
+        ] {
+            assert_eq!(
+                detect_platform(format!("{root}/{folder}/Game.zip"), root),
+                None,
+                "folder {folder:?} must not partially match a short alias"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Platform detection must never depend on mount state (requirement:
     // detection happens during scanning/catalogue reconciliation, before
     // - and entirely independent of - any mount action).
@@ -8736,6 +9021,52 @@ mod tests {
             pending.identity.platform, mount_path_exists.identity.platform,
             "an existing mount-path directory must not change the detected platform"
         );
+    }
+
+    #[test]
+    fn mounting_and_unmounting_do_not_change_new_retro_platform_detection() {
+        // Same guarantee as `mounting_and_unmounting_do_not_change_the_
+        // detected_platform`, exercised for two of this milestone's new
+        // canonical platforms - one Nintendo handheld, one non-Nintendo
+        // console - since `ArchiveIdentity::from_path`/`mount_state_for_
+        // plan` are the same structurally-independent functions regardless
+        // of which platform's alias matched.
+        let archive_for = |path: &str, mount_state: MountState| {
+            let path = PathBuf::from(path);
+            let identity =
+                ArchiveIdentity::from_path(&path, PathBuf::from("/home/davedap/Archives"), None);
+            let archive = Archive {
+                kind: archive_kind(&path).unwrap(),
+                identity,
+                path,
+                health: ArchiveHealth::Pending,
+            };
+            ArchiveRecord::new(
+                MountPlan::new(archive, PathBuf::from("/mnt/archivefs/Test")),
+                mount_state,
+                ArchiveMetadata::empty(),
+                ArchiveHealth::Pending,
+            )
+        };
+
+        for (path, expected) in [
+            (
+                "/home/davedap/Archives/Game Boy Advance/Game.zip",
+                "Game Boy Advance",
+            ),
+            (
+                "/home/davedap/Archives/PS Vita/Game.zip",
+                "PlayStation Vita",
+            ),
+        ] {
+            let pending = archive_for(path, MountState::Pending);
+            let mounted = archive_for(path, MountState::Mounted);
+            assert_eq!(pending.identity.platform.as_deref(), Some(expected));
+            assert_eq!(
+                pending.identity.platform, mounted.identity.platform,
+                "mounting must not change the detected platform for {expected:?}"
+            );
+        }
     }
 
     #[test]
