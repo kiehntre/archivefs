@@ -279,3 +279,7 @@ Developer and design docs live in [`docs/`](docs/):
 - [Security](docs/security.md)
 - [Database notes](docs/database.md)
 - [Provider pipeline](docs/provider-pipeline.md)
+
+## Dedication
+
+ArchiveFS is dedicated to [my dad](DEDICATION.md).
