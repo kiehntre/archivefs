@@ -22,7 +22,7 @@ Library
 - `Archive`: the source archive file for a release.
 - `Mount`: the mounted folder view of an archive.
 
-v0.1 implements `Archive` and mount planning directly. `Library`, `Platform`, `Title`, and `Release` are domain concepts reserved for richer indexing and duplicate handling.
+`Archive` and mount planning are fully implemented today. `Library`, `Platform`, `Title`, and `Release` are represented concretely in the persistent catalogue (see [`docs/database.md`](database.md) and [`docs/DATABASE_DESIGN.md`](DATABASE_DESIGN.md)) at the `platform` and `archive` levels; the full `titles`/`releases` hierarchy sketched there remains reserved for richer indexing and duplicate handling.
 
 ## Archive
 
@@ -54,7 +54,7 @@ ArchiveKind {
 }
 ```
 
-v0.1 detects these from `.zip`, `.7z`, and `.rar` file extensions. Split RAR continuation parts are skipped except the main `.rar` or `.part1.rar` archive.
+These are detected from `.zip`, `.7z`, and `.rar` file extensions. Split RAR continuation parts are skipped except the main `.rar` or `.part1.rar` archive.
 
 ## ArchiveIdentity
 
@@ -165,6 +165,6 @@ Mount logic depends on this trait instead of calling a concrete mount tool direc
 
 ## RatarmountBackend
 
-`RatarmountBackend` is the v0.1 mount backend. It invokes `ratarmount` to mount archives and uses the platform unmount tools for unmounting.
+`RatarmountBackend` is the current mount backend. It invokes `ratarmount` to mount archives and uses the platform unmount tools for unmounting.
 
-Native FUSE, daemon behavior, GUI behavior, and Docker packaging are outside the v0.1 domain model.
+Native FUSE and Docker packaging remain outside the current domain model. A desktop GUI exists and is built on this same domain model rather than a separate one; there is no separate daemon process.

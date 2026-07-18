@@ -2,30 +2,75 @@
 
 # ArchiveFS
 
-ArchiveFS is a Linux-first command-line tool for mounting archive files as read-only folders. It scans configured source folders, plans safe mount paths, can mount archives through `ratarmount`, and provides status, stats, info, index, and watcher commands over the same core scanner.
+ArchiveFS is a Linux-first, local-first tool for browsing, mounting,
+inspecting, validating, and organizing archived collections you already
+have - games, software, media, documents, or other preservation material -
+without extracting everything permanently. It is alpha-stage software under
+active development.
 
-ArchiveFS is designed to inspect and mount archives without modifying the original archive files.
+**ArchiveFS is not:** a game or ROM download service, a storefront, a
+source of BIOS/firmware/copyrighted content, a cloud account service, a DRM
+platform, an emulator replacement, or a universal launcher/frontend
+replacement. See [Current limitations](#current-limitations) and
+[`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
+explicit list of what it deliberately does not do.
 
-## Key Features
+## Principles
 
-- Scans configured folders for supported archives: `.zip`, `.7z`, and `.rar`.
-- Skips obvious split RAR continuation parts such as `.r00` and non-primary `.partN.rar` files.
-- Mounts archives read-only through `ratarmount`.
-- Tracks archive path, mount path, mount state, health, size, modified time, and platform hints.
-- Provides `status`, `stats`, and `info` commands for inspecting a library.
-- Builds a JSON index for summary and search commands.
-- Watches source folders and refreshes the JSON index without auto-mounting or auto-unmounting.
-- Includes config validation and doctor diagnostics.
+- **Local-first.** No telemetry, no required cloud account, and it keeps
+  working offline.
+- **Read-only by default.** Archives are mounted read-only; ArchiveFS never
+  modifies your source archive files.
+- **Explicit over automatic.** Mounting, unmounting, cleanup, patch preview,
+  and library-view changes are all explicit user actions - nothing silently
+  mounts, unmounts, downloads, or rewrites emulator configuration on your
+  behalf.
+- **Transparent.** No secret scanning, no remote kill switches, no hidden
+  writes, and no service deciding on your behalf which files are
+  "acceptable." You remain responsible for your own files.
+
+See [`docs/security.md`](docs/security.md) and [`SECURITY.md`](SECURITY.md)
+for the detailed safety model behind these principles.
+
+## What ArchiveFS does today
+
+- Scans configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping obvious split-archive continuation parts).
+- Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
+- Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions.
+- Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
+- Detects platform from filenames and folder-name aliases, with manual overrides (`library-set-platform`) and persistent custom aliases (`platform-alias-*`) that outrank automatic detection.
+- Reports filename-based duplicate candidates (`duplicates`) - a read-only report, never an automatic cleanup.
+- Builds **managed Library Views**: named, symlink-based organized views of your catalogue (for example, grouped by platform) in a separate directory tree, without moving, copying, or extracting your archives. See [`docs/library-views.md`](docs/library-views.md).
+- Provides a **read-only PCSX2 patch-preview** (`pcsx2-patch-preview`): fetches official PCSX2 patch metadata and shows native/Flatpak installation *candidates* as a non-executable advisory plan. It does not download, verify, install, or enable any patch. PCSX2 is currently the only implemented adapter on an emulator-neutral adapter boundary designed to support additional emulators later - see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
+- Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
+- Includes config validation and doctor-style diagnostics.
+- Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
+- Provides stable, documented JSON output for several commands - see [`docs/json-api.md`](docs/json-api.md).
+
+## Current limitations
+
+- No automatic patch installation, cheat enabling, or artifact downloading -
+  `pcsx2-patch-preview` is metadata-only preview.
+- No broad multi-emulator support yet - PCSX2 is the first and only
+  concrete emulator adapter today.
+- Not every archive format, Linux distribution, emulator, or frontend is
+  supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
+- No automatic modification of emulator configuration files.
+- No official distribution of games, ROMs, BIOS, firmware, or patches -
+  ArchiveFS organizes and previews collections you already have.
+- This is alpha software: workflows may be incomplete, and defects should
+  be expected. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually
+  shipped.
 
 ## Install from a Release
 
-Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.2.0-alpha`. This is the quickest way to get running without building from source.
+Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.4.3-alpha`. This is the quickest way to get running without building from source.
 
 1. Download the release tarball and its `SHA256SUMS` file, for example:
 
    ```sh
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.2.0-alpha/archivefs-v0.2.0-alpha-x86_64-linux.tar.gz
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.2.0-alpha/SHA256SUMS
+   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.4.3-alpha/archivefs-v0.4.3-alpha-x86_64-linux.tar.gz
+   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.4.3-alpha/SHA256SUMS
    ```
 
 2. Verify the tarball against the checksum file before extracting it:
@@ -37,8 +82,8 @@ Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehn
 3. Extract it:
 
    ```sh
-   tar -xzf archivefs-v0.2.0-alpha-x86_64-linux.tar.gz
-   cd archivefs-v0.2.0-alpha-x86_64-linux
+   tar -xzf archivefs-v0.4.3-alpha-x86_64-linux.tar.gz
+   cd archivefs-v0.4.3-alpha-x86_64-linux
    ```
 
 ### Quick install
@@ -109,9 +154,30 @@ Archive mounts created by ArchiveFS are always read-only; it never modifies file
 
 There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pacman, Homebrew, or similar package) - the release tarball above and building from source below are the two supported ways to install it.
 
+## Supported/tested environments and formats
+
+- **Platform:** Linux only. Mount and watcher behavior rely on Linux
+  facilities (`/proc/self/mountinfo`, FUSE-style mount tools, `inotify` via
+  the `notify` crate). macOS and Windows are not supported.
+- **Archive formats:** `.zip`, `.7z`, and `.rar` (with split-RAR
+  continuation-part skipping). No other archive formats are currently
+  detected or mounted.
+- **Mount backend:** `ratarmount` only, invoked as an external tool - not
+  bundled, must be installed and on `PATH` separately.
+- **Desktop GUI:** requires a running X11 or Wayland session; there is no
+  headless mode.
+- This list reflects what the code and tests currently exercise, not an
+  exhaustive compatibility guarantee across every Linux distribution.
+
 ## Build from Source (Developers)
 
-ArchiveFS is a Rust workspace. Build the CLI from source:
+ArchiveFS is a Rust workspace. It pins an exact Rust toolchain via
+[`rust-toolchain.toml`](rust-toolchain.toml) - if you have `rustup`
+installed, it will install and use that exact version automatically inside
+this repository. See [`CONTRIBUTING.md`](CONTRIBUTING.md#rust-toolchain-policy)
+for the full toolchain policy.
+
+Build the CLI from source:
 
 ```sh
 cargo build --workspace
@@ -129,9 +195,20 @@ For regular local use, install it with Cargo:
 cargo install --path crates/archivefs-cli
 ```
 
+Run the full validation suite before submitting changes:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo build --workspace --release --locked
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for more on making changes.
+
 ## Desktop GUI
 
-ArchiveFS also includes a small read-only desktop frontend. It scans in the background and shows archive totals, mount states, doctor checks, paths, platforms, and searchable status rows.
+ArchiveFS also includes a desktop frontend built with `egui`/`eframe`. It scans in the background and shows archive totals, mount states, doctor checks, paths, platforms, sources, catalogue duplicates and health, and searchable status rows, with the same read-only-by-default safety model as the CLI.
 
 Build and run it from the workspace root:
 
@@ -140,7 +217,7 @@ cargo build -p archivefs-gui
 cargo run -p archivefs-gui
 ```
 
-The GUI uses the same `~/.config/archivefs/config.toml` configuration and core scanning logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.
+The GUI uses the same `~/.config/archivefs/config.toml` configuration and core scanning/catalogue logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.
 
 Archive mounting uses `ratarmount`, so install it separately and make sure it is available on `PATH`, or set `ratarmount_bin` in the config.
 
@@ -175,7 +252,13 @@ source_folders = [
 
 is also accepted, but only this `key = "value"` / `key = [...]` form is understood - there is no support for TOML tables, inline tables, or nested arrays.
 
+Managed Library Views and persistent multi-source configuration use their
+own JSON files under `~/.config/archivefs/` (`library_views.json`,
+`sources.json`) - see [`docs/library-views.md`](docs/library-views.md).
+
 ## Common Commands
+
+Scanning, status, and mounting:
 
 ```sh
 archivefs-cli doctor
@@ -186,10 +269,40 @@ archivefs-cli stats
 archivefs-cli info "007 Legends"
 archivefs-cli mount-one "007 Legends"
 archivefs-cli unmount-one "007 Legends"
+archivefs-cli duplicates
 archivefs-cli index-build
 archivefs-cli index-show
 archivefs-cli index-find "xbox360"
 archivefs-cli watch
+```
+
+Persistent catalogue and multi-source management:
+
+```sh
+archivefs-cli library-status
+archivefs-cli library-scan
+archivefs-cli library-list
+archivefs-cli library-find "007 Legends"
+archivefs-cli library-set-platform "Luigi's Mansion" GameCube
+archivefs-cli platform-alias-add gc GameCube
+archivefs-cli sources
+archivefs-cli source add /data/more-archives
+archivefs-cli source scan-all
+```
+
+Managed library views:
+
+```sh
+archivefs-cli view list
+archivefs-cli view preview "By Platform"
+archivefs-cli view apply "By Platform"
+```
+
+Patch preview:
+
+```sh
+archivefs-cli pcsx2-patch-preview
+archivefs-cli pcsx2-patch-preview --json
 ```
 
 Use verbose or debug logging when you need more detail:
@@ -199,16 +312,19 @@ archivefs-cli --verbose stats
 archivefs-cli --debug watch
 ```
 
+Run `archivefs-cli --help` for the complete, current command list with
+descriptions.
+
 ## Typical Workflow
 
 1. Create `~/.config/archivefs/config.toml`.
 2. Run `archivefs-cli config-check` to validate the config.
 3. Run `archivefs-cli doctor` to check source folders, mount root, tools, and current archive state.
-4. Run `archivefs-cli stats` or `archivefs-cli scan` to inspect what ArchiveFS sees.
+4. Run `archivefs-cli library-scan` to build the persistent catalogue, then `archivefs-cli stats` or `archivefs-cli library-list` to inspect what ArchiveFS sees.
 5. Run `archivefs-cli info "name"` to inspect one archive.
 6. Run `archivefs-cli mount-one "name"` to mount a single archive.
 7. Run `archivefs-cli unmount-one "name"` when finished.
-8. Run `archivefs-cli index-build` and `archivefs-cli index-find "query"` for indexed search.
+8. Optionally set up a Library View (`archivefs-cli view preview`/`apply`) for an organized, browsable directory tree.
 9. Run `archivefs-cli watch` if you want ArchiveFS to refresh the JSON index when source folders change.
 
 ## Example Output
@@ -270,15 +386,23 @@ Platforms:
 
 ## Documentation
 
-Developer and design docs live in [`docs/`](docs/):
-
-- [Architecture](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
+- [Architecture overview](ARCHITECTURE.md) / [full architecture reference](docs/architecture.md)
+- [Roadmap](ROADMAP.md)
+- [Changelog](CHANGELOG.md)
 - [Domain model](docs/domain-model.md)
+- [Persistent database](docs/database.md) / [database design](docs/DATABASE_DESIGN.md) / [ADR 0001](docs/adr/0001-persistent-library-database.md)
+- [Managed library views](docs/library-views.md)
+- [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
 - [Watcher](docs/watcher.md)
-- [Security](docs/security.md)
-- [Database notes](docs/database.md)
 - [Provider pipeline](docs/provider-pipeline.md)
+- [Duplicate detector](docs/duplicate-detector.md)
+- [Security model](docs/security.md)
+- [JSON API](docs/json-api.md)
+- [Release checklist](docs/release-checklist.md)
+- [Paper cuts / small usability notes](docs/paper-cuts.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy / reporting](SECURITY.md)
+- [Vision](VISION.md)
 
 ## Dedication
 

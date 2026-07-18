@@ -10818,7 +10818,7 @@ fn show_column_resize_handle(
     ui.painter().vline(
         handle_rect.center().x,
         handle_rect.y_range(),
-        egui::Stroke::new(2.0, stroke_color),
+        egui::Stroke::new(2.0_f32, stroke_color),
     );
 }
 

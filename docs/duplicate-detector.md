@@ -1,6 +1,16 @@
 # Duplicate Detector Plugin Architecture
 
-This document describes the intended architecture for duplicate detection in ArchiveFS. It is a design document only. Duplicate detection is not implemented yet.
+This document describes the intended architecture for richer, hash- and metadata-assisted duplicate detection in ArchiveFS. Most of it remains a design document, not yet implemented.
+
+**Current status:** a first, narrower tier already exists today:
+`FilenameDuplicateDetector` groups catalogue entries by normalized filename
+plus effective platform - roughly the "Same Title + Platform" tier described
+below - and is exposed through the `duplicates` CLI command and a GUI
+duplicate-review workflow with bulk selection. It is read-only: it reports
+candidates and never deletes, moves, renames, mounts, or unmounts anything.
+The remaining tiers (exact archive/CRC/ROM-hash duplicates, metadata-assisted
+matching, and a full plugin architecture) are still future work, described
+below as originally designed.
 
 ## Goals
 

@@ -83,8 +83,17 @@ jobs:
           # v0.2.0-alpha -> 379eeea) even if main has since moved on.
           ref: refs/tags/${{ steps.vars.outputs.tag }}
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned to the exact version .github/workflows/ci.yml and
+      # rust-toolchain.toml use, so a release build is built with the same
+      # reproducible toolchain that was actually validated - never
+      # whatever "stable" happens to resolve to on the day a tag is
+      # pushed. rustfmt/clippy are not installed here: this job only runs
+      # `cargo build`, and CI has already run fmt/clippy against the exact
+      # commit being tagged.
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
 
       # No apt packages are installed for archivefs-gui on Linux.
       #

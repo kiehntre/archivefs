@@ -1,14 +1,15 @@
 # Overview
 
-ArchiveFS is a Linux-first tool for exposing archive files as read-only directory trees. The current implementation focuses on conservative filesystem behavior, reusable core types, and small CLI commands built on shared library code.
+ArchiveFS is a Linux-first tool for exposing archive files as read-only directory trees, and for browsing, organizing, and previewing archived collections without extracting them permanently. The implementation focuses on conservative filesystem behavior, reusable core types, and CLI/GUI commands built on shared library code in `archivefs-core`.
 
 Core project principles:
 
 - Linux-first: current mount and watcher behavior assumes Linux facilities such as `/proc/self/mountinfo`, FUSE-style mount tools, and `notify` with Linux-friendly event handling.
 - Read-only archive mounting: archives are mounted as folder views through `ratarmount`; ArchiveFS does not provide writable archive editing.
-- Never modify user archives: scanner, status, stats, info, watcher, and index operations read archive metadata and filesystem state but do not rewrite source archive files.
-- Build reusable components before features: commands are thin wrappers over `archivefs-core` types such as `ArchiveScanner`, `ArchiveRecord`, mount planning, index building, and selection helpers.
-- Provider and plugin architecture: provider traits exist for metadata and health. Plugin-style integrations are future extension points; the current built-in providers are filename metadata and filesystem health.
+- Never modify user archives: scanner, status, stats, info, watcher, catalogue, library-view, and patch-preview operations read archive metadata and filesystem state but do not rewrite source archive files.
+- Build reusable components before features: commands are thin wrappers over `archivefs-core` types such as `ArchiveScanner`, `ArchiveRecord`, `Database`, `LibraryViewConfig`, and the patch-manager types.
+- Extension points before hardcoding: metadata/health provider traits and, more recently, the `EmulatorAdapter` trait, exist so new sources of information and new emulators can be added without redesigning shared orchestration. The current built-in providers are filename metadata and filesystem health; the current built-in adapter is PCSX2's read-only patch preview.
+- The database is additive, never load-bearing for safety: the persistent catalogue (below) caches what the filesystem scanner would discover anyway. Mount, unmount, lazy-unmount, and cleanup code paths read live filesystem and mount state directly and do not depend on the catalogue - see [ADR 0001](adr/0001-persistent-library-database.md).
 
 # High-Level Architecture
 
@@ -80,6 +81,12 @@ Core project principles:
 
 # Commands
 
+This section groups commands by area. Run `archivefs --help` for the exact,
+current, authoritative list and usage examples - this document explains what
+each group does, not every flag.
+
+## Scanning and mounting
+
 `scan` loads config, uses `ArchiveScanner`, and prints supported archive paths.
 
 `doctor` runs readiness diagnostics: config loading, source folders, mount root, tool availability, archive scan, and mount status summary.
@@ -109,6 +116,28 @@ Core project principles:
 `index-show` reads the JSON index, checks for missing or stale archive paths, and prints an index summary.
 
 `index-find <query>` reads the JSON index, checks freshness, and searches archive path, display name, platform, and mount path fields.
+
+`duplicates` reports filename-based duplicate candidates (`FilenameDuplicateDetector`) without changing anything on disk.
+
+## Persistent catalogue and multi-source management
+
+`library-status` shows the persistent library database's health and counts. `health` shows catalogue archive health (missing entries, unknown platform) without scanning, mounting, or unmounting. `library-scan` scans configured source folders into the database. `library-list` and `library-find` read from the database without rescanning.
+
+`library-set-platform` / `library-clear-platform` (and their `-bulk` variants) record manual platform overrides that outrank automatic detection. `library-remove-missing` removes catalogue rows whose source file is gone by exact id/path - it never deletes files.
+
+`platform-alias-list` / `platform-alias-add` / `platform-alias-remove` manage persistent, user-defined folder-name-to-platform aliases, applied on the next scan.
+
+`sources` lists configured source folders and status; `sources scan-all` scans every enabled one. `source add` / `source enable` / `source disable` / `source scan` / `source remove` manage one source folder at a time, including whether removing a source keeps or removes its catalogue entries.
+
+See [`docs/database.md`](database.md) and [`docs/DATABASE_DESIGN.md`](DATABASE_DESIGN.md) for the schema and design rationale, and [ADR 0001](adr/0001-persistent-library-database.md) for why the catalogue is additive rather than authoritative.
+
+## Managed library views
+
+`view list` / `view preview` / `view apply` / `view repair` / `view remove` manage named, symlink-based organized views of the catalogue - for example, a view that groups archives by platform into a separate directory tree a frontend can browse, without moving or copying the underlying archives. `preview` shows the plan without changing anything; `apply`/`repair` create or fix the managed symlinks; `remove` removes them (optionally keeping the view's own configuration). See [`docs/library-views.md`](library-views.md).
+
+## Patch preview
+
+`pcsx2-patch-preview` fetches official PCSX2 patch metadata and prints a read-only, non-executable advisory plan describing native/Flatpak installation candidates. It does not download, verify, install, or enable anything. See [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md) for the full design and current implementation boundary.
 
 # Watcher
 
@@ -164,11 +193,19 @@ The testing philosophy is to keep dangerous behavior behind abstractions and use
 
 # Future Architecture
 
-Future extension points only:
+See [`/ROADMAP.md`](../ROADMAP.md) for the full, current roadmap. At the
+architecture level, the main open extension points are:
 
-- Metadata plugins
-- Health plugins
-- Duplicate detector plugin
-- ScreenScraper provider
-- MobyGames provider
-- AI provider
+- Additional `EmulatorAdapter` implementations beyond PCSX2 (RetroArch is the
+  planned next one) built on the boundary in
+  [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
+- Richer, hash-based duplicate detection beyond today's filename-based
+  `FilenameDuplicateDetector`, described in
+  [`docs/duplicate-detector.md`](duplicate-detector.md).
+- Additional metadata providers (for example ScreenScraper) beyond today's
+  `FilenameMetadataProvider`, following the provider-pipeline design in
+  [`docs/provider-pipeline.md`](provider-pipeline.md).
+- Growing the persistent catalogue schema toward the longer-horizon
+  `platforms -> titles -> releases -> archives -> mounts/health_events`
+  hierarchy sketched in [`docs/database.md`](database.md), as metadata and
+  health-history become real work.

@@ -15,10 +15,12 @@ ArchiveFS mounts untrusted archive files as folders. Archives may be incomplete,
 
 ## Non-Goals
 
-- No native FUSE implementation in v0.1.
-- No daemon security model in v0.1.
-- No GUI permission model in v0.1.
-- No Docker or container sandbox design in v0.1.
+- No native FUSE implementation - `ratarmount` remains the mount backend.
+- There is no separate daemon process, so there is no daemon-specific
+  security model to design.
+- No formal GUI permission model beyond the same config-identity and
+  mount/unmount safety checks the CLI uses.
+- No Docker or container sandbox design.
 - No malware scanning.
 
 ## Trust Boundaries
@@ -65,7 +67,7 @@ Security rules:
 
 ### Mount Backend
 
-v0.1 uses `ratarmount` through `RatarmountBackend`.
+ArchiveFS currently uses `ratarmount` through `RatarmountBackend`.
 
 Security rules:
 
@@ -114,12 +116,18 @@ Future versions should consider:
 - Daemon-specific least-privilege rules.
 - GUI warnings for corrupt, unsupported, or permission-denied archives.
 
-## v0.1 Summary
+## Summary
 
-The v0.1 security posture is conservative:
+The current security posture is conservative:
 
 - Archives are mounted read-only through ratarmount.
 - Source archives are not modified.
 - Mount directories are generated under `mount_root`.
 - Unmounting is restricted to paths under `mount_root`.
-- Native FUSE, daemon behavior, GUI behavior, and Docker packaging are intentionally out of scope.
+- The persistent catalogue, managed library views, and the read-only
+  PCSX2 patch-preview feature all follow the same rule: they read or
+  organize existing state, and none of them is a dependency of mount or
+  unmount safety (see [ADR 0001](adr/0001-persistent-library-database.md)).
+- Native FUSE and Docker packaging remain out of scope. A desktop GUI now
+  exists and reuses the same core safety checks as the CLI rather than its
+  own permission model.
