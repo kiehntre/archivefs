@@ -34,6 +34,22 @@ pub use inspector::{
     is_inspectable,
 };
 
+mod library_views;
+pub use library_views::{
+    LibraryViewApplyEntryResult, LibraryViewApplyOutcome, LibraryViewApplyReport,
+    LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewManifest, LibraryViewManifestEntry,
+    LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts, LibraryViewPlanEntry,
+    add_library_view_default, apply_library_view, apply_library_view_default,
+    default_library_views_config_path, default_library_views_data_dir, edit_library_view_default,
+    generate_library_view_id, generate_relative_link_path, library_view_manifest_path,
+    load_library_view_configs_default, load_library_view_configs_from,
+    load_library_view_manifest_at, load_library_view_manifest_default, plan_library_view,
+    preview_library_view_default, remove_library_view_default, remove_library_view_symlinks,
+    repair_library_view, repair_library_view_default, resolve_library_view_identifier,
+    save_library_view_configs_default, save_library_view_configs_to,
+    set_library_view_enabled_default, validate_library_view_destination,
+};
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),
@@ -67,7 +83,7 @@ pub enum SelectionError {
 }
 
 impl ArchiveFsError {
-    fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
+    pub(crate) fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             path: Some(path.into()),
             source,
@@ -1759,7 +1775,7 @@ fn quote_config_string(value: &str) -> String {
 /// crash or power loss mid-write can never leave `path` half-written or
 /// corrupted; readers always see either the old complete file or the new
 /// complete file, never a partial one.
-fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     let parent = path.parent().ok_or_else(|| {

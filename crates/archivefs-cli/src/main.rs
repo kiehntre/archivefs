@@ -8,16 +8,20 @@ use archivefs_core::{
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
     CatalogueHealthReport, CatalogueStats, CompletedScanSummary, Config, ConfigCheckReport,
     ConfigCheckStatus, Database, DatabaseHealth, DoctorReport, DuplicateDetector, DuplicateEntry,
-    DuplicateReport, FilenameDuplicateDetector, MissingArchiveRemovalResult, MountPlan,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
-    SourceAvailability, SourceFolderView, WatchRebuildSummary, add_source_folder_default,
+    DuplicateReport, FilenameDuplicateDetector, LibraryViewApplyOutcome, LibraryViewApplyReport,
+    LibraryViewConfig, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry,
+    MissingArchiveRemovalResult, MountPlan, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, ScanPersistSummary, SourceAvailability, SourceFolderView,
+    WatchRebuildSummary, add_source_folder_default, apply_library_view_default,
     build_and_write_archive_index, canonical_platform_names, catalogue_health_report,
     check_archive_index_freshness, check_database_health, clean_mount_root,
     cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
     default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
-    list_source_folder_views_default, load_source_folder_configs_default, mount_archives,
-    mount_one_archive, persisted_archive_has_unknown_platform, read_default_archive_index,
-    remove_source_folder_default, resolve_source_folder_identifier, run_config_check_default,
+    list_source_folder_views_default, load_library_view_configs_default,
+    load_source_folder_configs_default, mount_archives, mount_one_archive,
+    persisted_archive_has_unknown_platform, preview_library_view_default,
+    read_default_archive_index, remove_library_view_default, remove_source_folder_default,
+    repair_library_view_default, resolve_source_folder_identifier, run_config_check_default,
     run_doctor_default, scan_all_enabled_sources_default, scan_and_persist,
     scan_source_folder_default, set_source_folder_enabled_default, summarize_archive_index,
     unmount_archives, unmount_one_archive, watch_archive_index,
@@ -594,6 +598,112 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "view" => {
+            let Some(sub_command) = args.next() else {
+                return Err(
+                    "view requires a sub-command: list | preview <name> | apply <name> | \
+                     repair <name> | remove <name> [--keep-definition]"
+                        .into(),
+                );
+            };
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+
+            match sub_command.as_str() {
+                "list" => {
+                    let views =
+                        load_library_view_configs_default().map_err(|error| error.to_string())?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&views)?);
+                    } else {
+                        print_library_views(&views);
+                    }
+                }
+                "preview" => {
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err("view preview requires a view id or name".into());
+                    };
+                    let (view, plan) = preview_library_view_default(&identifier)
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&LibraryViewPreviewJson {
+                                view: &view,
+                                plan: &plan
+                            })?
+                        );
+                    } else {
+                        print_library_view_plan(&view, &plan);
+                    }
+                }
+                "apply" => {
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err("view apply requires a view id or name".into());
+                    };
+                    let (view, report) = apply_library_view_default(&identifier)
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&LibraryViewApplyJson {
+                                view: &view,
+                                report: &report
+                            })?
+                        );
+                    } else {
+                        print_library_view_apply_report(&view, &report, "Apply");
+                    }
+                }
+                "repair" => {
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err("view repair requires a view id or name".into());
+                    };
+                    let (view, report) = repair_library_view_default(&identifier)
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&LibraryViewApplyJson {
+                                view: &view,
+                                report: &report
+                            })?
+                        );
+                    } else {
+                        print_library_view_apply_report(&view, &report, "Repair");
+                    }
+                }
+                "remove" => {
+                    // Extracted before reading the identifier positionally,
+                    // unlike `source remove`'s flags - so `--keep-definition`
+                    // is recognised no matter where it appears on the
+                    // command line, not only after the identifier.
+                    let keep_definition = extract_flag(&mut input_args, "--keep-definition");
+                    let Some(identifier) = input_args.first().cloned() else {
+                        return Err("view remove requires a view id or name".into());
+                    };
+                    let (view, report) = remove_library_view_default(&identifier, keep_definition)
+                        .map_err(|error| error.to_string())?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&LibraryViewApplyJson {
+                                view: &view,
+                                report: &report
+                            })?
+                        );
+                    } else {
+                        print_library_view_remove_report(&view, &report, keep_definition);
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "unknown 'view' sub-command '{other}' (expected list, preview, apply, repair, or remove)"
+                    )
+                    .into());
+                }
+            }
+        }
         // `--version`/`-V` are recognised only in the command position -
         // exactly the same scope `--help`/`-h` already have (neither is
         // special-cased inside any individual subcommand's own argument
@@ -1129,6 +1239,158 @@ fn format_source_folder_views(views: &[SourceFolderView]) -> String {
         output.push('\n');
     }
     output
+}
+
+/// `view preview --json` output: the view alongside its plan, both already
+/// `Serialize` on the core types themselves (including their non-UTF-8-safe
+/// path encoding) - no CLI-local reshaping needed, unlike
+/// `RemoveSourceFolderReport` below.
+#[derive(Debug, Serialize)]
+struct LibraryViewPreviewJson<'a> {
+    view: &'a LibraryViewConfig,
+    plan: &'a LibraryViewPlan,
+}
+
+/// `view apply`/`view repair`/`view remove --json` output: the view
+/// alongside the resulting report.
+#[derive(Debug, Serialize)]
+struct LibraryViewApplyJson<'a> {
+    view: &'a LibraryViewConfig,
+    report: &'a LibraryViewApplyReport,
+}
+
+fn print_library_views(views: &[LibraryViewConfig]) {
+    println!("ArchiveFS Library Views");
+    println!();
+    if views.is_empty() {
+        println!("No library views are configured.");
+        return;
+    }
+    for view in views {
+        println!("{} ({})", view.name, view.id);
+        println!(
+            "  Enabled:        {}",
+            if view.enabled { "yes" } else { "no" }
+        );
+        println!("  Destination:    {}", view.destination_root.display());
+        println!(
+            "  Source folders: {}",
+            if view.source_folders.is_empty() {
+                "all configured sources".to_string()
+            } else {
+                view.source_folders
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        println!(
+            "  Platforms:      {}",
+            if view.platforms.is_empty() {
+                "all known platforms".to_string()
+            } else {
+                view.platforms.join(", ")
+            }
+        );
+        println!("  Layout:         {}", view.layout_template.label());
+        println!();
+    }
+}
+
+fn print_library_view_plan(view: &LibraryViewConfig, plan: &LibraryViewPlan) {
+    println!("Library View: {} ({})", view.name, view.id);
+    println!("Destination:  {}", plan.destination_root.display());
+    if let Some(error) = &plan.unsafe_root_error {
+        println!();
+        println!("UNSAFE - Apply is refused: {error}");
+        return;
+    }
+    println!();
+    println!("Create:    {}", plan.counts.create);
+    println!("Correct:   {}", plan.counts.correct);
+    println!("Repair:    {}", plan.counts.repair);
+    println!("Remove:    {}", plan.counts.remove);
+    println!("Collision: {}", plan.counts.collision);
+    println!("Skip:      {}", plan.counts.skip);
+
+    let interesting: Vec<&LibraryViewPlanEntry> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.action != LibraryViewPlanAction::AlreadyCorrect)
+        .collect();
+    if interesting.is_empty() {
+        return;
+    }
+    println!();
+    println!("Details:");
+    for entry in interesting {
+        let path = entry
+            .destination_path
+            .as_ref()
+            .or(entry.archive_path.as_ref())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "?".to_string());
+        print!("  [{:?}] {path}", entry.action);
+        if let Some(reason) = &entry.reason {
+            print!(" - {reason}");
+        }
+        println!();
+    }
+}
+
+fn print_library_view_apply_report(
+    view: &LibraryViewConfig,
+    report: &LibraryViewApplyReport,
+    verb: &str,
+) {
+    println!("Library View: {} ({})", view.name, view.id);
+    println!("{verb} complete:");
+    println!("  Created:   {}", report.created);
+    println!("  Repaired:  {}", report.repaired);
+    println!("  Removed:   {}", report.removed);
+    println!("  Unchanged: {}", report.unchanged);
+    println!("  Failed:    {}", report.failed);
+    if report.failed > 0 {
+        println!();
+        println!("Failures:");
+        for result in &report.results {
+            if result.outcome == LibraryViewApplyOutcome::Failed {
+                println!(
+                    "  {} - {}",
+                    result.relative_link_path.display(),
+                    result.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
+    }
+}
+
+fn print_library_view_remove_report(
+    view: &LibraryViewConfig,
+    report: &LibraryViewApplyReport,
+    kept_definition: bool,
+) {
+    println!("Library View: {} ({})", view.name, view.id);
+    println!("Removed {} managed symlink(s).", report.removed);
+    println!("ArchiveFS did not delete any original archive files.");
+    if kept_definition {
+        println!("The view definition was kept - Preview/Apply will recreate its symlinks.");
+    } else {
+        println!("The view definition was also removed from configuration.");
+    }
+    let left_untouched: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == LibraryViewApplyOutcome::LeftUnchanged)
+        .collect();
+    if !left_untouched.is_empty() {
+        println!();
+        println!("Left untouched (changed since the last apply):");
+        for result in left_untouched {
+            println!("  {}", result.relative_link_path.display());
+        }
+    }
 }
 
 /// `source remove`'s `--json` output - a small display-ready reshaping of
@@ -2304,6 +2566,13 @@ fn print_help() {
     println!(
         "  source remove          Remove a source folder from configuration (--keep-catalogue or --remove-catalogue)"
     );
+    println!("  view list              List configured Library Views");
+    println!("  view preview           Show a Library View's plan without changing anything");
+    println!("  view apply             Create/repair a Library View's managed symlinks");
+    println!("  view repair            Same as apply - fixes drift and creates anything missing");
+    println!(
+        "  view remove            Remove a Library View's managed symlinks (--keep-definition to keep its config)"
+    );
     println!();
     println!("Examples:");
     println!("  archivefs --version");
@@ -2339,6 +2608,11 @@ fn print_help() {
     println!("  archivefs source disable 3");
     println!("  archivefs source scan 3");
     println!("  archivefs source remove 3 --keep-catalogue");
+    println!("  archivefs view list");
+    println!("  archivefs view preview retrodeck");
+    println!("  archivefs view apply retrodeck");
+    println!("  archivefs view repair retrodeck --json");
+    println!("  archivefs view remove retrodeck --keep-definition");
     println!("  archivefs stats --json");
     println!("  archivefs info \"007 Legends\"");
     println!("  archivefs mount-one \"007 Legends\"");
