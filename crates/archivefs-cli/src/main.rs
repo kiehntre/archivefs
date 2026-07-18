@@ -861,7 +861,7 @@ fn format_advisory_patch_plan(plan: &AdvisoryPatchPlan) -> String {
     for installation in &plan.installation_candidates {
         writeln!(
             &mut output,
-            "  {:?}: {} ({}, confidence: {:?}, version: {}, mutation readiness: {})",
+            "  {}: {} ({}, confidence: {:?}, version: {}, mutation readiness: {})",
             installation.kind,
             installation.data_root.display(),
             installation.provenance,
@@ -922,7 +922,7 @@ fn format_advisory_patch_plan(plan: &AdvisoryPatchPlan) -> String {
             for destination in &entry.hypothetical_destinations {
                 writeln!(
                     &mut output,
-                    "  hypothetical PNACH destination ({:?}, not created): {}",
+                    "  hypothetical PNACH destination ({}, not created): {}",
                     destination.candidate_kind, destination.display_path
                 )
                 .unwrap();
@@ -2785,9 +2785,9 @@ mod tests {
     use super::*;
     use archivefs_core::MANUAL_PLATFORM_SOURCE;
     use archivefs_core::patch_manager::{
-        AdvisoryDisposition, AdvisoryPlanEntry, AdvisoryPlanSummary, GameMatch,
-        HypotheticalPnachDestination, MatchConfidence, PatchMetadataRecord, Pcsx2CandidateKind,
-        Pcsx2DiscoveryConfidence, Pcsx2InstallationCandidate, SourceSnapshot, VerificationLevel,
+        AdvisoryDisposition, AdvisoryPlanEntry, AdvisoryPlanSummary, DiscoveryConfidence,
+        GameMatch, HypotheticalDestination, InstallationCandidate, MatchConfidence,
+        PatchMetadataRecord, SourceSnapshot, VerificationLevel,
     };
 
     fn example_statuses() -> Vec<ArchiveStatus> {
@@ -2860,11 +2860,12 @@ mod tests {
                 verification_explanation: VerificationLevel::TransportOnly.explanation(),
                 freshness_explanation: "No authenticated timestamp or monotonic version; first-seen replay cannot be detected",
             },
-            installation_candidates: vec![Pcsx2InstallationCandidate {
-                kind: Pcsx2CandidateKind::Native,
+            installation_candidates: vec![InstallationCandidate {
+                adapter_id: "pcsx2",
+                kind: "Native".to_string(),
                 data_root: PathBuf::from("/readonly/PCSX2"),
                 provenance: "fixture root",
-                discovery_confidence: Pcsx2DiscoveryConfidence::StandardPathCandidate,
+                discovery_confidence: DiscoveryConfidence::StandardPathCandidate,
                 detected_version: None,
                 mutation_readiness: "NotEvaluated",
             }],
@@ -2886,8 +2887,8 @@ mod tests {
                     catalogue_archive_ids: Vec::new(),
                     reasons: vec!["no compatible catalogue identity evidence".to_string()],
                 },
-                hypothetical_destinations: vec![HypotheticalPnachDestination {
-                    candidate_kind: Pcsx2CandidateKind::Native,
+                hypothetical_destinations: vec![HypotheticalDestination {
+                    candidate_kind: "Native".to_string(),
                     relative_path: "patches/12345678.pnach".to_string(),
                     display_path: "/readonly/PCSX2/patches/12345678.pnach".to_string(),
                     hypothetical: true,
@@ -2918,6 +2919,175 @@ mod tests {
         assert_eq!(
             json["entries"][0]["hypothetical_destinations"][0]["hypothetical"],
             true
+        );
+    }
+
+    fn golden_two_candidate_plan() -> AdvisoryPatchPlan {
+        AdvisoryPatchPlan {
+            format_version: 1,
+            plan_id: "golden-plan-id".to_string(),
+            executable: false,
+            source: SourceSnapshot {
+                id: "golden-source",
+                display_name: "Golden PCSX2 metadata",
+                endpoint: "https://golden.invalid/endpoint",
+                provenance: "golden provenance",
+                license_notice: "golden license notice",
+                metadata_schema: "golden-schema-v1",
+                source_version: "golden-revision".to_string(),
+                metadata_sha256: "golden-metadata-hash".to_string(),
+                verification: VerificationLevel::TransportOnly,
+                verification_explanation: VerificationLevel::TransportOnly.explanation(),
+                freshness_explanation:
+                    "No authenticated timestamp or monotonic version; first-seen replay cannot be detected",
+            },
+            installation_candidates: vec![
+                InstallationCandidate {
+                    adapter_id: "pcsx2",
+                    kind: "Native".to_string(),
+                    data_root: PathBuf::from("/golden/home/.config/PCSX2"),
+                    provenance: "golden native provenance",
+                    discovery_confidence: DiscoveryConfidence::StandardPathCandidate,
+                    detected_version: None,
+                    mutation_readiness: "NotEvaluated",
+                },
+                InstallationCandidate {
+                    adapter_id: "pcsx2",
+                    kind: "Flatpak".to_string(),
+                    data_root: PathBuf::from("/golden/home/.var/app/net.pcsx2.PCSX2/config/PCSX2"),
+                    provenance: "golden flatpak provenance",
+                    discovery_confidence: DiscoveryConfidence::StandardPathCandidate,
+                    detected_version: None,
+                    mutation_readiness: "NotEvaluated",
+                },
+            ],
+            entries: vec![AdvisoryPlanEntry {
+                record: PatchMetadataRecord {
+                    record_id: "patches/GOLD-00001_DEADBEEF.pnach".to_string(),
+                    repository_path: "patches/GOLD-00001_DEADBEEF.pnach".to_string(),
+                    patch_blob_id: "golden-blob-id".to_string(),
+                    title: None,
+                    platform: "PS2".to_string(),
+                    region: None,
+                    serial: Some("GOLD-00001".to_string()),
+                    executable_crc: Some("DEADBEEF".to_string()),
+                    metadata_kind: "golden fixture".to_string(),
+                },
+                disposition: AdvisoryDisposition::AmbiguousInstallationCandidates,
+                game_match: GameMatch {
+                    confidence: MatchConfidence::NoMatch,
+                    catalogue_archive_ids: Vec::new(),
+                    reasons: vec!["no compatible catalogue identity evidence".to_string()],
+                },
+                hypothetical_destinations: vec![
+                    HypotheticalDestination {
+                        candidate_kind: "Native".to_string(),
+                        relative_path: "patches/GOLD-00001_DEADBEEF.pnach".to_string(),
+                        display_path: "/golden/home/.config/PCSX2/patches/GOLD-00001_DEADBEEF.pnach"
+                            .to_string(),
+                        hypothetical: true,
+                    },
+                    HypotheticalDestination {
+                        candidate_kind: "Flatpak".to_string(),
+                        relative_path: "patches/GOLD-00001_DEADBEEF.pnach".to_string(),
+                        display_path:
+                            "/golden/home/.var/app/net.pcsx2.PCSX2/config/PCSX2/patches/GOLD-00001_DEADBEEF.pnach"
+                                .to_string(),
+                        hypothetical: true,
+                    },
+                ],
+                reasons: vec![
+                    "no compatible catalogue identity evidence".to_string(),
+                    "metadata preview only; no PNACH content was downloaded".to_string(),
+                    "multiple standard-path PCSX2 candidates were found; none was selected"
+                        .to_string(),
+                ],
+            }],
+            summary: AdvisoryPlanSummary {
+                metadata_records: 1,
+                exact_matches: 0,
+                probable_matches: 0,
+                uncertain_matches: 0,
+                ambiguous_matches: 0,
+                missing_games: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn advisory_patch_preview_exact_human_output_for_a_fixed_native_and_flatpak_plan() {
+        let output = format_advisory_patch_plan(&golden_two_candidate_plan());
+        assert_eq!(
+            output,
+            concat!(
+                "ArchiveFS PCSX2 Patch Metadata Preview\n",
+                "Advisory only: yes (executable: false)\n",
+                "Plan format: 1\n",
+                "Plan ID: golden-plan-id\n",
+                "Source: Golden PCSX2 metadata\n",
+                "Endpoint: https://golden.invalid/endpoint\n",
+                "Provenance: golden provenance\n",
+                "License: golden license notice\n",
+                "Metadata schema: golden-schema-v1\n",
+                "Source version: golden-revision\n",
+                "Metadata SHA-256: golden-metadata-hash\n",
+                "Verification: TransportOnly\n",
+                "Verification detail: HTTPS transport verified; downloaded metadata is not signed content\n",
+                "Freshness: No authenticated timestamp or monotonic version; first-seen replay cannot be detected\n",
+                "\n",
+                "PCSX2 candidates: 2\n",
+                "  Native: /golden/home/.config/PCSX2 (golden native provenance, confidence: StandardPathCandidate, version: not inspected, mutation readiness: NotEvaluated)\n",
+                "  Flatpak: /golden/home/.var/app/net.pcsx2.PCSX2/config/PCSX2 (golden flatpak provenance, confidence: StandardPathCandidate, version: not inspected, mutation readiness: NotEvaluated)\n",
+                "\n",
+                "Records: 1 | exact: 0 | probable: 0 | uncertain: 0 | ambiguous: 0 | no match: 1\n",
+                "\n",
+                "patches/GOLD-00001_DEADBEEF.pnach\n",
+                "  disposition: AmbiguousInstallationCandidates\n",
+                "  match confidence: NoMatch\n",
+                "  catalogue archive IDs: []\n",
+                "  identity: serial=GOLD-00001 executable_crc=DEADBEEF\n",
+                "  reason: no compatible catalogue identity evidence\n",
+                "  reason: metadata preview only; no PNACH content was downloaded\n",
+                "  reason: multiple standard-path PCSX2 candidates were found; none was selected\n",
+                "  hypothetical PNACH destination (Native, not created): /golden/home/.config/PCSX2/patches/GOLD-00001_DEADBEEF.pnach\n",
+                "  hypothetical PNACH destination (Flatpak, not created): /golden/home/.var/app/net.pcsx2.PCSX2/config/PCSX2/patches/GOLD-00001_DEADBEEF.pnach\n",
+            )
+        );
+
+        // Native listed (and its hypothetical destination rendered) before
+        // Flatpak, matching the candidate order this fixed plan was given.
+        let native_index = output.find("Native: /golden").unwrap();
+        let flatpak_index = output.find("Flatpak: /golden").unwrap();
+        assert!(native_index < flatpak_index);
+    }
+
+    #[test]
+    fn advisory_patch_preview_json_candidate_object_has_the_complete_v1_shape() {
+        let plan = golden_two_candidate_plan();
+        let json = serde_json::to_value(&plan).unwrap();
+
+        assert_eq!(
+            json["installation_candidates"],
+            serde_json::json!([
+                {
+                    "kind": "Native",
+                    "data_root": "/golden/home/.config/PCSX2",
+                    "provenance": "golden native provenance",
+                    "discovery_confidence": "StandardPathCandidate",
+                    "detected_version": null,
+                    "mutation_readiness": "NotEvaluated",
+                },
+                {
+                    "kind": "Flatpak",
+                    "data_root": "/golden/home/.var/app/net.pcsx2.PCSX2/config/PCSX2",
+                    "provenance": "golden flatpak provenance",
+                    "discovery_confidence": "StandardPathCandidate",
+                    "detected_version": null,
+                    "mutation_readiness": "NotEvaluated",
+                },
+            ]),
+            "the complete format_version=1 installation_candidates shape - field \
+             names, field count, string values, and order - must match exactly"
         );
     }
 

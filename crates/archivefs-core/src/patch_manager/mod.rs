@@ -3,7 +3,16 @@
 //! This module deliberately contains no artifact retrieval, PNACH parsing,
 //! destination inspection, write-capable plan, cache, manifest, or rollback
 //! API. Its only output is [`AdvisoryPatchPlan`].
+//!
+//! PCSX2-only logic (serial/CRC normalization, PNACH filename parsing,
+//! candidate conversion, hypothetical destination calculation) lives
+//! behind [`adapter::EmulatorAdapter`] in `pcsx2.rs`; this module owns the
+//! orchestration (fetch, catalogue read, candidate/game matching,
+//! plan/plan-ID assembly) that is still PCSX2-specific for this first
+//! adapter slice - see `docs/PATCH_CHEAT_MANAGER_DESIGN.md`.
 
+mod adapter;
+mod matching;
 mod pcsx2;
 mod retrieval;
 
@@ -16,6 +25,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{Database, PersistedArchive};
 
+pub use adapter::{
+    AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
+    HypotheticalDestination, InstallationCandidate,
+};
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
@@ -192,16 +205,8 @@ pub struct AdvisoryPlanEntry {
     pub record: PatchMetadataRecord,
     pub disposition: AdvisoryDisposition,
     pub game_match: GameMatch,
-    pub hypothetical_destinations: Vec<HypotheticalPnachDestination>,
+    pub hypothetical_destinations: Vec<HypotheticalDestination>,
     pub reasons: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct HypotheticalPnachDestination {
-    pub candidate_kind: Pcsx2CandidateKind,
-    pub relative_path: String,
-    pub display_path: String,
-    pub hypothetical: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -220,7 +225,7 @@ pub struct AdvisoryPatchPlan {
     pub plan_id: String,
     pub executable: bool,
     pub source: SourceSnapshot,
-    pub installation_candidates: Vec<Pcsx2InstallationCandidate>,
+    pub installation_candidates: Vec<InstallationCandidate>,
     pub entries: Vec<AdvisoryPlanEntry>,
     pub summary: AdvisoryPlanSummary,
 }
@@ -354,7 +359,7 @@ fn git_tree_entry_to_record(entry: GitTreeEntry) -> Result<Option<PatchMetadataR
     let stem = file_name.strip_suffix(".pnach").ok_or_else(|| {
         PatchManagerError::MalformedMetadata("patch path lacks .pnach suffix".to_string())
     })?;
-    let (serial, executable_crc) = parse_patch_identity(stem);
+    let (serial, executable_crc) = pcsx2::parse_patch_identity(stem);
     Ok(Some(PatchMetadataRecord {
         record_id: entry.path.clone(),
         repository_path: entry.path,
@@ -368,41 +373,6 @@ fn git_tree_entry_to_record(entry: GitTreeEntry) -> Result<Option<PatchMetadataR
     }))
 }
 
-fn parse_patch_identity(stem: &str) -> (Option<String>, Option<String>) {
-    let mut parts = stem.rsplitn(2, '_');
-    let possible_crc = parts.next().unwrap_or_default();
-    let possible_serial = parts.next();
-    let crc = normalize_crc(possible_crc);
-    let serial = possible_serial.and_then(normalize_serial);
-    match (serial, crc) {
-        (Some(serial), Some(crc)) => (Some(serial), Some(crc)),
-        (None, Some(crc)) if possible_serial.is_none() => (None, Some(crc)),
-        _ => (None, None),
-    }
-}
-
-fn normalize_serial(value: &str) -> Option<String> {
-    let value = value.trim().to_ascii_uppercase();
-    let (prefix, digits) = value.split_once('-')?;
-    if prefix.len() == 4
-        && prefix
-            .chars()
-            .all(|character| character.is_ascii_alphabetic())
-        && digits.len() == 5
-        && digits.chars().all(|character| character.is_ascii_digit())
-    {
-        Some(format!("{prefix}-{digits}"))
-    } else {
-        None
-    }
-}
-
-fn normalize_crc(value: &str) -> Option<String> {
-    let value = value.trim();
-    (value.len() == 8 && value.chars().all(|character| character.is_ascii_hexdigit()))
-        .then(|| value.to_ascii_uppercase())
-}
-
 fn normalize_title(value: &str) -> String {
     value
         .chars()
@@ -411,65 +381,30 @@ fn normalize_title(value: &str) -> String {
         .collect()
 }
 
-fn match_record(
+fn match_record<A: EmulatorAdapter>(
+    adapter: &A,
     record: &PatchMetadataRecord,
     catalogue: &[CatalogueGameEvidence],
 ) -> (GameMatch, bool) {
     let mut candidates = Vec::<(MatchConfidence, i64, Vec<String>)>::new();
     let mut contradictions = Vec::new();
+    let record_evidence = adapter.identity_evidence_from_record(record);
     for game in catalogue {
         if !game.is_present || game.platform.as_deref() != Some("PS2") {
             continue;
         }
 
-        let serial_matches = record.serial.as_ref().is_some_and(|serial| {
-            game.serial.as_deref().and_then(normalize_serial).as_ref() == Some(serial)
-        });
-        let crc_matches = record.executable_crc.as_ref().is_some_and(|crc| {
-            game.executable_crc
-                .as_deref()
-                .and_then(normalize_crc)
-                .as_ref()
-                == Some(crc)
-        });
-        let requires_serial = record.serial.is_some();
-        let requires_crc = record.executable_crc.is_some();
-        let serial_conflicts = record.serial.as_ref().is_some_and(|record_serial| {
-            game.serial
-                .as_deref()
-                .and_then(normalize_serial)
-                .is_some_and(|game_serial| &game_serial != record_serial)
-        });
-        let crc_conflicts = record.executable_crc.as_ref().is_some_and(|record_crc| {
-            game.executable_crc
-                .as_deref()
-                .and_then(normalize_crc)
-                .is_some_and(|game_crc| &game_crc != record_crc)
-        });
-        if serial_conflicts || crc_conflicts {
-            let mut reasons = Vec::new();
-            if serial_conflicts {
-                reasons.push("catalogue disc serial conflicts with patch metadata".to_string());
+        let catalogue_evidence = adapter.identity_evidence_from_catalogue(game);
+        match matching::exact_tier_outcome(&record_evidence, &catalogue_evidence) {
+            matching::ExactTierOutcome::Conflict(reasons) => {
+                contradictions.extend(reasons);
+                continue;
             }
-            if crc_conflicts {
-                reasons.push("catalogue executable CRC conflicts with patch metadata".to_string());
+            matching::ExactTierOutcome::Exact(reasons) => {
+                candidates.push((MatchConfidence::Exact, game.archive_id, reasons));
+                continue;
             }
-            contradictions.extend(reasons);
-            continue;
-        }
-        if (requires_serial || requires_crc)
-            && (!requires_serial || serial_matches)
-            && (!requires_crc || crc_matches)
-        {
-            let mut reasons = Vec::new();
-            if serial_matches {
-                reasons.push("namespaced PCSX2 disc serial matches".to_string());
-            }
-            if crc_matches {
-                reasons.push("namespaced PCSX2 executable CRC matches".to_string());
-            }
-            candidates.push((MatchConfidence::Exact, game.archive_id, reasons));
-            continue;
+            matching::ExactTierOutcome::NotApplicable => {}
         }
 
         if let Some(title) = &record.title {
@@ -550,9 +485,10 @@ fn match_record(
     )
 }
 
-pub fn build_advisory_plan(
+pub fn build_advisory_plan<A: EmulatorAdapter>(
+    adapter: &A,
     snapshot: MetadataSnapshot,
-    installation_candidates: Vec<Pcsx2InstallationCandidate>,
+    installation_candidates: Vec<InstallationCandidate>,
     catalogue: &[CatalogueGameEvidence],
 ) -> AdvisoryPatchPlan {
     let installation_ambiguity = installation_candidates.len() > 1;
@@ -562,7 +498,7 @@ pub fn build_advisory_plan(
         .iter()
         .cloned()
         .map(|record| {
-            let (game_match, ambiguous_game) = match_record(&record, catalogue);
+            let (game_match, ambiguous_game) = match_record(adapter, &record, catalogue);
             let disposition = if missing_emulator_candidate {
                 AdvisoryDisposition::NoInstallationCandidate
             } else if installation_ambiguity {
@@ -574,25 +510,22 @@ pub fn build_advisory_plan(
             } else {
                 AdvisoryDisposition::Preview
             };
-            let file_name = record
-                .repository_path
-                .strip_prefix("patches/")
-                .unwrap_or(&record.repository_path)
-                .to_string();
-            let relative_path = format!("patches/{file_name}");
-            let hypothetical_destinations = installation_candidates
-                .iter()
-                .map(|installation| HypotheticalPnachDestination {
-                    candidate_kind: installation.kind,
-                    relative_path: relative_path.clone(),
-                    display_path: installation
-                        .data_root
-                        .join(&relative_path)
-                        .to_string_lossy()
-                        .into_owned(),
-                    hypothetical: true,
-                })
-                .collect();
+            let hypothetical_destinations = match adapter.hypothetical_relative_path(&record) {
+                Some(relative_path) => installation_candidates
+                    .iter()
+                    .map(|installation| HypotheticalDestination {
+                        candidate_kind: installation.kind.clone(),
+                        relative_path: relative_path.clone(),
+                        display_path: installation
+                            .data_root
+                            .join(&relative_path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        hypothetical: true,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
             let mut reasons = game_match.reasons.clone();
             reasons.push("metadata preview only; no PNACH content was downloaded".to_string());
             if installation_ambiguity {
@@ -655,7 +588,7 @@ pub fn build_advisory_plan(
 
 fn compute_plan_id(
     source: &SourceSnapshot,
-    candidates: &[Pcsx2InstallationCandidate],
+    candidates: &[InstallationCandidate],
     entries: &[AdvisoryPlanEntry],
 ) -> String {
     let mut hasher = Sha256::new();
@@ -671,7 +604,7 @@ fn compute_plan_id(
     }
     hash_field(&mut hasher, verification_tag(source.verification));
     for candidate in candidates {
-        hash_field(&mut hasher, candidate_kind_tag(candidate.kind));
+        hash_candidate_kind(&mut hasher, &candidate.kind);
         hash_field(
             &mut hasher,
             candidate.data_root.as_os_str().as_encoded_bytes(),
@@ -703,7 +636,7 @@ fn compute_plan_id(
             hash_field(&mut hasher, &archive_id.to_le_bytes());
         }
         for destination in &entry.hypothetical_destinations {
-            hash_field(&mut hasher, candidate_kind_tag(destination.candidate_kind));
+            hash_candidate_kind(&mut hasher, &destination.candidate_kind);
             hash_field(&mut hasher, destination.relative_path.as_bytes());
         }
     }
@@ -725,11 +658,13 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn candidate_kind_tag(kind: Pcsx2CandidateKind) -> &'static [u8] {
-    match kind {
-        Pcsx2CandidateKind::Native => b"native",
-        Pcsx2CandidateKind::Flatpak => b"flatpak",
-    }
+/// Hashes a neutral candidate `kind` string ("Native"/"Flatpak") the same
+/// way the pre-extraction `candidate_kind_tag` hashed the old
+/// `Pcsx2CandidateKind` enum - lowercased, so `plan_id` is byte-identical
+/// before and after this extraction for every kind PCSX2 produces today.
+/// Adapter-neutral: it makes no assumption about which kind strings exist.
+fn hash_candidate_kind(hasher: &mut Sha256, kind: &str) {
+    hash_field(hasher, kind.to_ascii_lowercase().as_bytes());
 }
 
 fn disposition_tag(disposition: AdvisoryDisposition) -> &'static [u8] {
@@ -803,9 +738,10 @@ pub fn preview_pcsx2_metadata<F: ReadOnlyFilesystem>(
     catalogue_path: &Path,
 ) -> Result<AdvisoryPatchPlan> {
     let snapshot = fetch_built_in_metadata(fetcher)?;
-    let installation_candidates = adapter.discover()?;
+    let installation_candidates = adapter.discover_installations()?;
     let catalogue = load_catalogue_evidence_read_only(catalogue_path)?;
     Ok(build_advisory_plan(
+        adapter,
         snapshot,
         installation_candidates,
         &catalogue,
@@ -982,20 +918,39 @@ mod tests {
         }
     }
 
-    fn installation() -> Pcsx2InstallationCandidate {
-        Pcsx2InstallationCandidate {
-            kind: Pcsx2CandidateKind::Native,
+    fn installation() -> InstallationCandidate {
+        InstallationCandidate {
+            adapter_id: "pcsx2",
+            kind: "Native".to_string(),
             data_root: PathBuf::from("/home/test/.config/PCSX2"),
             provenance: "test",
-            discovery_confidence: Pcsx2DiscoveryConfidence::StandardPathCandidate,
+            discovery_confidence: DiscoveryConfidence::StandardPathCandidate,
             detected_version: None,
             mutation_readiness: "NotEvaluated",
         }
     }
 
+    /// An adapter instance for tests that exercise shared matching/planning
+    /// logic directly (never calling `.discover()`/`.discover_installations()`,
+    /// so these placeholder roots are never actually read).
+    fn test_adapter() -> ReadOnlyPcsx2Adapter<HostReadOnlyFilesystem> {
+        ReadOnlyPcsx2Adapter::new(
+            HostReadOnlyFilesystem,
+            Pcsx2DiscoveryRoots {
+                home: PathBuf::from("/unused-in-tests"),
+                xdg_config_home: PathBuf::from("/unused-in-tests/.config"),
+            },
+        )
+    }
+
     #[test]
     fn matcher_exact_identity_requires_all_declared_exact_identifiers() {
-        let plan = build_advisory_plan(snapshot_with(record()), vec![installation()], &[game(7)]);
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![installation()],
+            &[game(7)],
+        );
 
         assert_eq!(
             plan.entries[0].game_match.confidence,
@@ -1007,6 +962,7 @@ mod tests {
         let mut crc_missing = game(8);
         crc_missing.executable_crc = None;
         let plan = build_advisory_plan(
+            &test_adapter(),
             snapshot_with(record()),
             vec![installation()],
             &[crc_missing],
@@ -1020,6 +976,7 @@ mod tests {
     #[test]
     fn duplicate_exact_identity_is_ambiguous_not_actionable() {
         let plan = build_advisory_plan(
+            &test_adapter(),
             snapshot_with(record()),
             vec![installation()],
             &[game(7), game(8)],
@@ -1036,9 +993,14 @@ mod tests {
     fn multiple_installation_candidates_remain_blocked_and_distinct() {
         let native = installation();
         let mut flatpak = installation();
-        flatpak.kind = Pcsx2CandidateKind::Flatpak;
+        flatpak.kind = "Flatpak".to_string();
         flatpak.data_root = PathBuf::from("/home/test/.var/app/net.pcsx2.PCSX2/config/PCSX2");
-        let plan = build_advisory_plan(snapshot_with(record()), vec![native, flatpak], &[game(7)]);
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![native, flatpak],
+            &[game(7)],
+        );
 
         assert_eq!(
             plan.entries[0].disposition,
@@ -1053,6 +1015,7 @@ mod tests {
         let mut conflicting = game(7);
         conflicting.executable_crc = Some("FFFFFFFF".to_string());
         let plan = build_advisory_plan(
+            &test_adapter(),
             snapshot_with(record()),
             vec![installation()],
             &[conflicting],
@@ -1076,6 +1039,7 @@ mod tests {
         let mut incompatible = game(7);
         incompatible.platform = Some("PS3".to_string());
         let plan = build_advisory_plan(
+            &test_adapter(),
             snapshot_with(record()),
             vec![installation()],
             &[incompatible],
@@ -1097,6 +1061,7 @@ mod tests {
         probable_game.serial = None;
         probable_game.executable_crc = None;
         let probable = build_advisory_plan(
+            &test_adapter(),
             snapshot_with(record()),
             vec![installation()],
             &[probable_game],
@@ -1113,6 +1078,7 @@ mod tests {
         uncertain_game.serial = None;
         uncertain_game.executable_crc = None;
         let uncertain = build_advisory_plan(
+            &test_adapter(),
             snapshot_with(record()),
             vec![installation()],
             &[uncertain_game],
@@ -1242,7 +1208,12 @@ mod tests {
         let evidence = CatalogueGameEvidence::from(&archive);
         assert_eq!(evidence.serial, None);
         assert_eq!(evidence.executable_crc, None);
-        let plan = build_advisory_plan(snapshot_with(record()), vec![installation()], &[evidence]);
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![installation()],
+            &[evidence],
+        );
         assert_eq!(
             plan.entries[0].game_match.confidence,
             MatchConfidence::Uncertain
@@ -1293,7 +1264,12 @@ mod tests {
     fn missing_catalogue_rows_do_not_match_patch_metadata() {
         let mut missing = game(7);
         missing.is_present = false;
-        let plan = build_advisory_plan(snapshot_with(record()), vec![installation()], &[missing]);
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![installation()],
+            &[missing],
+        );
 
         assert_eq!(
             plan.entries[0].game_match.confidence,
@@ -1318,7 +1294,7 @@ mod tests {
         let snapshot = snapshot_with(record());
         let source = snapshot.source.clone();
         let candidates = vec![installation()];
-        let plan = build_advisory_plan(snapshot, candidates.clone(), &[game(7)]);
+        let plan = build_advisory_plan(&test_adapter(), snapshot, candidates.clone(), &[game(7)]);
         let mut presentation_changed = plan.entries.clone();
         presentation_changed[0]
             .reasons
@@ -1329,6 +1305,287 @@ mod tests {
         assert_eq!(
             plan.plan_id,
             compute_plan_id(&source, &candidates, &presentation_changed)
+        );
+    }
+
+    #[test]
+    fn advisory_patch_plan_json_preserves_the_pre_extraction_kind_string_shape() {
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![installation()],
+            &[game(7)],
+        );
+
+        let json = serde_json::to_value(&plan).unwrap();
+        // Pre-extraction, `installation_candidates[].kind` serialized as a
+        // plain JSON string via the derived enum tag (`"Native"`); the
+        // post-extraction neutral `String` field must produce the exact
+        // same JSON shape and value, not a nested object or a different
+        // case.
+        assert_eq!(json["installation_candidates"][0]["kind"], "Native");
+        assert!(json["installation_candidates"][0]["kind"].is_string());
+        assert_eq!(
+            json["entries"][0]["hypothetical_destinations"][0]["candidate_kind"],
+            "Native"
+        );
+    }
+
+    #[test]
+    fn plan_id_is_deterministic_across_repeated_calls_with_identical_inputs() {
+        let first = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![installation()],
+            &[game(7)],
+        );
+        let second = build_advisory_plan(
+            &test_adapter(),
+            snapshot_with(record()),
+            vec![installation()],
+            &[game(7)],
+        );
+
+        assert_eq!(first.plan_id, second.plan_id);
+        assert!(!first.plan_id.is_empty());
+    }
+
+    #[test]
+    fn preview_never_migrates_or_changes_the_catalogue_schema_version() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-patch-preview-no-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let native_root = home.join(".config/PCSX2");
+        fs::create_dir_all(&native_root).unwrap();
+        let catalogue_path = root.join("library.sqlite3");
+        Database::open_or_create(&catalogue_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let schema_before = Database::open_read_only(&catalogue_path)
+            .unwrap()
+            .schema_version()
+            .unwrap();
+        assert_eq!(schema_before, crate::latest_schema_version());
+
+        let adapter = ReadOnlyPcsx2Adapter::new(
+            HostReadOnlyFilesystem,
+            Pcsx2DiscoveryRoots {
+                home,
+                xdg_config_home: native_root.parent().unwrap().to_path_buf(),
+            },
+        );
+        let body = br#"{
+            "sha":"0123456789abcdef0123456789abcdef01234567",
+            "truncated":false,
+            "tree":[]
+        }"#;
+        let _ = preview_pcsx2_metadata(&fetcher(body), &adapter, &catalogue_path).unwrap();
+
+        let schema_after = Database::open_read_only(&catalogue_path)
+            .unwrap()
+            .schema_version()
+            .unwrap();
+        assert_eq!(schema_after, schema_before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- Fixed pre-extraction plan-ID regression fixture ----
+    //
+    // These exact values, and the three `GOLDEN_*_PLAN_ID` hashes below,
+    // were produced by literally re-running the pre-extraction
+    // `compute_plan_id`/`build_advisory_plan`/`candidate_kind_tag`
+    // implementation from commit 52d6ef5 (copied verbatim into a
+    // standalone throwaway harness, never committed) against this exact
+    // fixed scenario. They are not merely "the same value the current
+    // code produces twice" - they anchor the current code's plan IDs to
+    // what history actually produced, so a change to field order, hashed
+    // bytes, or candidate-kind casing would be caught even if it happened
+    // to be internally self-consistent.
+
+    fn golden_source() -> SourceSnapshot {
+        SourceSnapshot {
+            id: "golden-source-id",
+            display_name: "Golden Source",
+            endpoint: "https://golden.invalid/endpoint",
+            provenance: "golden provenance",
+            license_notice: "golden license",
+            metadata_schema: "golden-schema-v1",
+            source_version: "golden-version".to_string(),
+            metadata_sha256: "golden-metadata-hash".to_string(),
+            verification: VerificationLevel::TransportOnly,
+            verification_explanation: "golden verification explanation",
+            freshness_explanation: "golden freshness explanation",
+        }
+    }
+
+    fn golden_record() -> PatchMetadataRecord {
+        PatchMetadataRecord {
+            record_id: "patches/GOLD-00001_DEADBEEF.pnach".to_string(),
+            repository_path: "patches/GOLD-00001_DEADBEEF.pnach".to_string(),
+            patch_blob_id: "golden-blob-id".to_string(),
+            title: None,
+            platform: "PS2".to_string(),
+            region: None,
+            serial: Some("GOLD-00001".to_string()),
+            executable_crc: Some("DEADBEEF".to_string()),
+            metadata_kind: "golden fixture".to_string(),
+        }
+    }
+
+    fn golden_native() -> InstallationCandidate {
+        InstallationCandidate {
+            adapter_id: "pcsx2",
+            kind: "Native".to_string(),
+            data_root: PathBuf::from("/golden/home/.config/PCSX2"),
+            provenance: "golden native provenance",
+            discovery_confidence: DiscoveryConfidence::StandardPathCandidate,
+            detected_version: None,
+            mutation_readiness: "NotEvaluated",
+        }
+    }
+
+    fn golden_flatpak() -> InstallationCandidate {
+        InstallationCandidate {
+            adapter_id: "pcsx2",
+            kind: "Flatpak".to_string(),
+            data_root: PathBuf::from("/golden/home/.var/app/net.pcsx2.PCSX2/config/PCSX2"),
+            provenance: "golden flatpak provenance",
+            discovery_confidence: DiscoveryConfidence::StandardPathCandidate,
+            detected_version: None,
+            mutation_readiness: "NotEvaluated",
+        }
+    }
+
+    fn golden_snapshot() -> MetadataSnapshot {
+        MetadataSnapshot {
+            source: golden_source(),
+            records: vec![golden_record()],
+        }
+    }
+
+    const GOLDEN_NATIVE_ONLY_PLAN_ID: &str =
+        "1cf5adde6763fe1a7f1573d9b02c7de184728a43a4103ce11c8aa41ac4dadbf0";
+    const GOLDEN_FLATPAK_ONLY_PLAN_ID: &str =
+        "1fa5bfc287c3e870aa162ee3d5bdf762e694ad54f8f14a28e6ff233159750bb4";
+    const GOLDEN_NATIVE_PLUS_FLATPAK_PLAN_ID: &str =
+        "09ef31b00d2b1e65ff86dd17e8a39d8498cf5796f16dccd6e1a2938b44f99af1";
+
+    #[test]
+    fn plan_id_matches_the_pre_extraction_hash_for_a_native_candidate() {
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            golden_snapshot(),
+            vec![golden_native()],
+            &[],
+        );
+        assert_eq!(plan.plan_id, GOLDEN_NATIVE_ONLY_PLAN_ID);
+    }
+
+    #[test]
+    fn plan_id_matches_the_pre_extraction_hash_for_a_flatpak_candidate() {
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            golden_snapshot(),
+            vec![golden_flatpak()],
+            &[],
+        );
+        assert_eq!(plan.plan_id, GOLDEN_FLATPAK_ONLY_PLAN_ID);
+    }
+
+    #[test]
+    fn plan_id_matches_the_pre_extraction_hash_for_native_plus_flatpak_candidates() {
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            golden_snapshot(),
+            vec![golden_native(), golden_flatpak()],
+            &[],
+        );
+        assert_eq!(plan.plan_id, GOLDEN_NATIVE_PLUS_FLATPAK_PLAN_ID);
+    }
+
+    #[test]
+    fn installation_candidate_json_has_exactly_the_pre_extraction_key_set() {
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            golden_snapshot(),
+            vec![golden_native()],
+            &[],
+        );
+        let json = serde_json::to_value(&plan).unwrap();
+
+        let mut candidate_keys: Vec<String> = json["installation_candidates"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        candidate_keys.sort();
+        assert_eq!(
+            candidate_keys,
+            vec![
+                "data_root",
+                "detected_version",
+                "discovery_confidence",
+                "kind",
+                "mutation_readiness",
+                "provenance",
+            ],
+            "installation_candidates[] must serialize exactly the pre-extraction \
+             Pcsx2InstallationCandidate field set - no adapter_id or other new key"
+        );
+
+        let mut destination_keys: Vec<String> = json["entries"][0]["hypothetical_destinations"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        destination_keys.sort();
+        assert_eq!(
+            destination_keys,
+            vec![
+                "candidate_kind",
+                "display_path",
+                "hypothetical",
+                "relative_path"
+            ],
+            "hypothetical_destinations[] must serialize exactly the pre-extraction \
+             HypotheticalPnachDestination field set"
+        );
+    }
+
+    #[test]
+    fn build_advisory_plan_preserves_whatever_candidate_order_it_is_given() {
+        // `build_advisory_plan` itself never sorts its
+        // `installation_candidates` argument - ordering is entirely the
+        // caller's responsibility. In production that caller is
+        // `ReadOnlyPcsx2Adapter::discover_installations`, proven to yield
+        // Native before Flatpak by
+        // `discover_installations_yields_native_before_flatpak_when_both_exist`
+        // in `pcsx2.rs`. This test only proves the plan is a faithful,
+        // order-preserving projection of whatever it was given - passing
+        // Flatpak first here deliberately, to prove this function is not
+        // silently re-sorting behind the scenes.
+        let plan = build_advisory_plan(
+            &test_adapter(),
+            golden_snapshot(),
+            vec![golden_flatpak(), golden_native()],
+            &[],
+        );
+
+        assert_eq!(plan.installation_candidates[0].kind, "Flatpak");
+        assert_eq!(plan.installation_candidates[1].kind, "Native");
+        assert_eq!(
+            plan.entries[0].hypothetical_destinations[0].candidate_kind,
+            "Flatpak"
+        );
+        assert_eq!(
+            plan.entries[0].hypothetical_destinations[1].candidate_kind,
+            "Native"
         );
     }
 
