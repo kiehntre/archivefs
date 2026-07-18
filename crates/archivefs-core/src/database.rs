@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
@@ -129,6 +129,54 @@ impl Database {
     /// its parent directory) if needed.
     pub fn open_or_create_default() -> Result<Self> {
         Self::open_or_create(default_database_path()?)
+    }
+
+    /// Opens an existing, current-schema catalogue with SQLite's read-only
+    /// flag and `PRAGMA query_only`. This path never creates parent
+    /// directories, creates a database, applies migrations, repairs state, or
+    /// obtains a write-capable connection. It is intended for advisory
+    /// features whose safety contract requires the catalogue to remain
+    /// byte-for-byte unchanged.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(ArchiveFsError::Database(format!(
+                "library database does not exist at {}",
+                path.display()
+            )));
+        }
+
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            ArchiveFsError::Database(format!(
+                "failed to open {} read-only: {error}",
+                path.display()
+            ))
+        })?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "failed to enforce read-only query mode for {}: {error}",
+                    path.display()
+                ))
+            })?;
+
+        let current_version = schema_version(&connection)?;
+        let expected_version = latest_known_version(MIGRATIONS);
+        if current_version != expected_version {
+            return Err(ArchiveFsError::Database(format!(
+                "library database schema version {current_version} is not the required current version {expected_version}; refusing to migrate or repair it during a read-only operation"
+            )));
+        }
+
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
     }
 
     /// The path this database was opened from.
@@ -3030,6 +3078,73 @@ mod tests {
         assert!(db_path.exists());
         assert_eq!(database.path(), db_path.as_path());
         database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_open_never_creates_a_missing_database_or_parent() {
+        let root = temp_dir("read-only-open-missing");
+        let database_path = root.join("missing").join("library.sqlite3");
+
+        let error = Database::open_read_only(&database_path).unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!database_path.exists());
+        assert!(!database_path.parent().unwrap().exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_open_does_not_migrate_write_or_create_sidecars() {
+        let root = temp_dir("read-only-open-no-writes");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let before_bytes = fs::read(&database_path).unwrap();
+        let mut before_entries = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before_entries.sort();
+
+        let database = Database::open_read_only(&database_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        assert!(database.load_archives().unwrap().is_empty());
+        let write_error = database
+            .connection
+            .execute("DELETE FROM archives", [])
+            .unwrap_err();
+        assert!(write_error.to_string().contains("readonly"));
+        database.close().unwrap();
+
+        let mut after_entries = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        after_entries.sort();
+        assert_eq!(after_entries, before_entries);
+        assert_eq!(fs::read(&database_path).unwrap(), before_bytes);
+        assert!(!root.join("library.sqlite3-wal").exists());
+        assert!(!root.join("library.sqlite3-shm").exists());
+        assert!(!root.join("library.sqlite3-journal").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_open_rejects_an_outdated_schema_without_migrating_it() {
+        let root = temp_dir("read-only-open-outdated");
+        let database_path = root.join("library.sqlite3");
+        let connection = Connection::open(&database_path).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection.close().unwrap();
+        let before_bytes = fs::read(&database_path).unwrap();
+
+        let error = Database::open_read_only(&database_path).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to migrate or repair"));
+        assert_eq!(fs::read(&database_path).unwrap(), before_bytes);
         let _ = fs::remove_dir_all(&root);
     }
 

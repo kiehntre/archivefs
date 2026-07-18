@@ -50,6 +50,8 @@ pub use library_views::{
     set_library_view_enabled_default, validate_library_view_destination,
 };
 
+pub mod patch_manager;
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),

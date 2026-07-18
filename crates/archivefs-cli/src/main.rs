@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::patch_manager::{
+    AdvisoryPatchPlan, HttpsMetadataFetcher, ReadOnlyPcsx2Adapter,
+};
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
@@ -214,6 +217,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
+        }
+        "pcsx2-patch-preview" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            if !input_args.is_empty() {
+                return Err("pcsx2-patch-preview accepts only --json".into());
+            }
+            let fetcher = HttpsMetadataFetcher::new();
+            let adapter = ReadOnlyPcsx2Adapter::from_environment()?;
+            let plan = archivefs_core::patch_manager::preview_pcsx2_metadata(
+                &fetcher,
+                &adapter,
+                &default_database_path()?,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print!("{}", format_advisory_patch_plan(&plan));
+            }
         }
         "index-build" => {
             let config = Config::load_default()?;
@@ -779,6 +801,135 @@ fn print_config_check_report(report: &ConfigCheckReport) {
             "Needs attention"
         }
     );
+}
+
+fn format_advisory_patch_plan(plan: &AdvisoryPatchPlan) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS PCSX2 Patch Metadata Preview").unwrap();
+    writeln!(
+        &mut output,
+        "Advisory only: yes (executable: {})",
+        plan.executable
+    )
+    .unwrap();
+    writeln!(&mut output, "Plan format: {}", plan.format_version).unwrap();
+    writeln!(&mut output, "Plan ID: {}", plan.plan_id).unwrap();
+    writeln!(&mut output, "Source: {}", plan.source.display_name).unwrap();
+    writeln!(&mut output, "Endpoint: {}", plan.source.endpoint).unwrap();
+    writeln!(&mut output, "Provenance: {}", plan.source.provenance).unwrap();
+    writeln!(&mut output, "License: {}", plan.source.license_notice).unwrap();
+    writeln!(
+        &mut output,
+        "Metadata schema: {}",
+        plan.source.metadata_schema
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Source version: {}",
+        plan.source.source_version
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Metadata SHA-256: {}",
+        plan.source.metadata_sha256
+    )
+    .unwrap();
+    writeln!(&mut output, "Verification: {:?}", plan.source.verification).unwrap();
+    writeln!(
+        &mut output,
+        "Verification detail: {}",
+        plan.source.verification_explanation
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Freshness: {}",
+        plan.source.freshness_explanation
+    )
+    .unwrap();
+    writeln!(&mut output).unwrap();
+    writeln!(
+        &mut output,
+        "PCSX2 candidates: {}",
+        plan.installation_candidates.len()
+    )
+    .unwrap();
+    for installation in &plan.installation_candidates {
+        writeln!(
+            &mut output,
+            "  {:?}: {} ({}, confidence: {:?}, version: {}, mutation readiness: {})",
+            installation.kind,
+            installation.data_root.display(),
+            installation.provenance,
+            installation.discovery_confidence,
+            installation
+                .detected_version
+                .as_deref()
+                .unwrap_or("not inspected"),
+            installation.mutation_readiness
+        )
+        .unwrap();
+    }
+    writeln!(&mut output).unwrap();
+    writeln!(
+        &mut output,
+        "Records: {} | exact: {} | probable: {} | uncertain: {} | ambiguous: {} | no match: {}",
+        plan.summary.metadata_records,
+        plan.summary.exact_matches,
+        plan.summary.probable_matches,
+        plan.summary.uncertain_matches,
+        plan.summary.ambiguous_matches,
+        plan.summary.missing_games
+    )
+    .unwrap();
+    for entry in &plan.entries {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "{}", entry.record.record_id).unwrap();
+        writeln!(&mut output, "  disposition: {:?}", entry.disposition).unwrap();
+        writeln!(
+            &mut output,
+            "  match confidence: {:?}",
+            entry.game_match.confidence
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  catalogue archive IDs: {:?}",
+            entry.game_match.catalogue_archive_ids
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  identity: serial={} executable_crc={}",
+            entry.record.serial.as_deref().unwrap_or("none"),
+            entry.record.executable_crc.as_deref().unwrap_or("none")
+        )
+        .unwrap();
+        for reason in &entry.reasons {
+            writeln!(&mut output, "  reason: {reason}").unwrap();
+        }
+        if entry.hypothetical_destinations.is_empty() {
+            writeln!(
+                &mut output,
+                "  hypothetical PNACH destination: unavailable (no PCSX2 candidate)"
+            )
+            .unwrap();
+        } else {
+            for destination in &entry.hypothetical_destinations {
+                writeln!(
+                    &mut output,
+                    "  hypothetical PNACH destination ({:?}, not created): {}",
+                    destination.candidate_kind, destination.display_path
+                )
+                .unwrap();
+            }
+        }
+    }
+    output
 }
 
 fn print_watch_rebuild(index: &ArchiveIndex, summary: &WatchRebuildSummary) {
@@ -2519,6 +2670,7 @@ fn print_help() {
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether ArchiveFS is ready to run");
     println!("  config-check   Validate ArchiveFS configuration");
+    println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
     println!("  duplicates     Show filename-based duplicate candidates");
@@ -2578,6 +2730,8 @@ fn print_help() {
     println!("  archivefs --version");
     println!("  archivefs doctor");
     println!("  archivefs config-check");
+    println!("  archivefs pcsx2-patch-preview");
+    println!("  archivefs pcsx2-patch-preview --json");
     println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs library-status");
@@ -2630,6 +2784,11 @@ fn print_help() {
 mod tests {
     use super::*;
     use archivefs_core::MANUAL_PLATFORM_SOURCE;
+    use archivefs_core::patch_manager::{
+        AdvisoryDisposition, AdvisoryPlanEntry, AdvisoryPlanSummary, GameMatch,
+        HypotheticalPnachDestination, MatchConfidence, PatchMetadataRecord, Pcsx2CandidateKind,
+        Pcsx2DiscoveryConfidence, Pcsx2InstallationCandidate, SourceSnapshot, VerificationLevel,
+    };
 
     fn example_statuses() -> Vec<ArchiveStatus> {
         vec![
@@ -2680,6 +2839,86 @@ mod tests {
 
         assert!(!output.contains("Archive                                           Mount"));
         assert!(!output.contains("State\n"));
+    }
+
+    #[test]
+    fn advisory_patch_preview_format_is_explicitly_non_executable_and_hypothetical() {
+        let plan = AdvisoryPatchPlan {
+            format_version: 1,
+            plan_id: "plan-hash".to_string(),
+            executable: false,
+            source: SourceSnapshot {
+                id: "source",
+                display_name: "PCSX2 metadata",
+                endpoint: "https://example.invalid/compiled-in",
+                provenance: "fixture provenance",
+                license_notice: "fixture license notice",
+                metadata_schema: "fixture-schema-v1",
+                source_version: "revision".to_string(),
+                metadata_sha256: "metadata-hash".to_string(),
+                verification: VerificationLevel::TransportOnly,
+                verification_explanation: VerificationLevel::TransportOnly.explanation(),
+                freshness_explanation: "No authenticated timestamp or monotonic version; first-seen replay cannot be detected",
+            },
+            installation_candidates: vec![Pcsx2InstallationCandidate {
+                kind: Pcsx2CandidateKind::Native,
+                data_root: PathBuf::from("/readonly/PCSX2"),
+                provenance: "fixture root",
+                discovery_confidence: Pcsx2DiscoveryConfidence::StandardPathCandidate,
+                detected_version: None,
+                mutation_readiness: "NotEvaluated",
+            }],
+            entries: vec![AdvisoryPlanEntry {
+                record: PatchMetadataRecord {
+                    record_id: "patches/12345678.pnach".to_string(),
+                    repository_path: "patches/12345678.pnach".to_string(),
+                    patch_blob_id: "blob".to_string(),
+                    title: None,
+                    platform: "PS2".to_string(),
+                    region: None,
+                    serial: None,
+                    executable_crc: Some("12345678".to_string()),
+                    metadata_kind: "metadata".to_string(),
+                },
+                disposition: AdvisoryDisposition::MissingGame,
+                game_match: GameMatch {
+                    confidence: MatchConfidence::NoMatch,
+                    catalogue_archive_ids: Vec::new(),
+                    reasons: vec!["no compatible catalogue identity evidence".to_string()],
+                },
+                hypothetical_destinations: vec![HypotheticalPnachDestination {
+                    candidate_kind: Pcsx2CandidateKind::Native,
+                    relative_path: "patches/12345678.pnach".to_string(),
+                    display_path: "/readonly/PCSX2/patches/12345678.pnach".to_string(),
+                    hypothetical: true,
+                }],
+                reasons: vec!["metadata preview only; no PNACH content was downloaded".to_string()],
+            }],
+            summary: AdvisoryPlanSummary {
+                metadata_records: 1,
+                exact_matches: 0,
+                probable_matches: 0,
+                uncertain_matches: 0,
+                ambiguous_matches: 0,
+                missing_games: 1,
+            },
+        };
+
+        let output = format_advisory_patch_plan(&plan);
+        assert!(output.contains("Advisory only: yes (executable: false)"));
+        assert!(output.contains("TransportOnly"));
+        assert!(output.contains("not signed content"));
+        assert!(output.contains("first-seen replay cannot be detected"));
+        assert!(output.contains("match confidence: NoMatch"));
+        assert!(output.contains("hypothetical PNACH destination (Native, not created)"));
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["executable"], false);
+        assert_eq!(
+            json["entries"][0]["hypothetical_destinations"][0]["hypothetical"],
+            true
+        );
     }
 
     #[test]

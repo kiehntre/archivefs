@@ -1,0 +1,1354 @@
+//! Read-only Phase 1 PCSX2 patch metadata preview.
+//!
+//! This module deliberately contains no artifact retrieval, PNACH parsing,
+//! destination inspection, write-capable plan, cache, manifest, or rollback
+//! API. Its only output is [`AdvisoryPatchPlan`].
+
+mod pcsx2;
+mod retrieval;
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{Database, PersistedArchive};
+
+pub use pcsx2::{
+    HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
+    Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
+};
+pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
+
+pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
+pub const BUILT_IN_SOURCE_NAME: &str = "PCSX2 official patch repository metadata";
+pub const BUILT_IN_SOURCE_URL: &str =
+    "https://api.github.com/repos/PCSX2/pcsx2_patches/git/trees/main?recursive=1";
+pub const BUILT_IN_SOURCE_PROVENANCE: &str = "PCSX2/pcsx2_patches official Git repository";
+pub const BUILT_IN_SOURCE_LICENSE: &str =
+    "Repository metadata only; upstream does not declare one repository-wide patch license";
+pub const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_METADATA_RECORDS: usize = 50_000;
+pub const MAX_JSON_DEPTH: usize = 32;
+pub const MAX_METADATA_STRING_BYTES: usize = 4 * 1024;
+pub const METADATA_SCHEMA: &str = "github-git-tree-v1";
+
+pub type Result<T> = std::result::Result<T, PatchManagerError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchManagerError {
+    Network(String),
+    RedirectRejected { status: u16 },
+    ResponseTooLarge { limit: usize },
+    MalformedMetadata(String),
+    UnsupportedMetadata(String),
+    Catalogue(String),
+    Discovery(String),
+}
+
+impl fmt::Display for PatchManagerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Network(message) => write!(formatter, "metadata network error: {message}"),
+            Self::RedirectRejected { status } => write!(
+                formatter,
+                "metadata redirect rejected (HTTP {status}); Phase 1 does not follow redirects"
+            ),
+            Self::ResponseTooLarge { limit } => write!(
+                formatter,
+                "metadata response exceeds the {limit}-byte Phase 1 limit"
+            ),
+            Self::MalformedMetadata(message) => {
+                write!(formatter, "malformed PCSX2 metadata: {message}")
+            }
+            Self::UnsupportedMetadata(message) => {
+                write!(formatter, "unsupported PCSX2 metadata: {message}")
+            }
+            Self::Catalogue(message) => write!(formatter, "read-only catalogue error: {message}"),
+            Self::Discovery(message) => write!(formatter, "PCSX2 discovery error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for PatchManagerError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataFetch {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub verification: VerificationLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum VerificationLevel {
+    TransportOnly,
+}
+
+impl VerificationLevel {
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::TransportOnly => {
+                "HTTPS transport verified; downloaded metadata is not signed content"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceSnapshot {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub endpoint: &'static str,
+    pub provenance: &'static str,
+    pub license_notice: &'static str,
+    pub metadata_schema: &'static str,
+    pub source_version: String,
+    pub metadata_sha256: String,
+    pub verification: VerificationLevel,
+    pub verification_explanation: &'static str,
+    pub freshness_explanation: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataSnapshot {
+    pub source: SourceSnapshot,
+    pub records: Vec<PatchMetadataRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PatchMetadataRecord {
+    pub record_id: String,
+    pub repository_path: String,
+    pub patch_blob_id: String,
+    pub title: Option<String>,
+    pub platform: String,
+    pub region: Option<String>,
+    pub serial: Option<String>,
+    pub executable_crc: Option<String>,
+    pub metadata_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueGameEvidence {
+    pub archive_id: i64,
+    pub is_present: bool,
+    pub display_name: String,
+    pub normalized_name: String,
+    pub platform: Option<String>,
+    pub region: Option<String>,
+    /// Present only when supplied by an approved catalogue identity field.
+    /// Phase 1 never derives this from a filename.
+    pub serial: Option<String>,
+    /// Present only when supplied by an approved catalogue identity field.
+    /// Phase 1 never computes this from game content.
+    pub executable_crc: Option<String>,
+}
+
+impl From<&PersistedArchive> for CatalogueGameEvidence {
+    fn from(archive: &PersistedArchive) -> Self {
+        Self {
+            archive_id: archive.id,
+            is_present: archive.last_verified_missing_at.is_none(),
+            display_name: archive.display_name.clone(),
+            normalized_name: archive.normalized_name.clone(),
+            platform: archive.platform.clone(),
+            region: None,
+            serial: None,
+            executable_crc: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum MatchConfidence {
+    NoMatch,
+    Uncertain,
+    Probable,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AdvisoryDisposition {
+    Preview,
+    MissingGame,
+    NoInstallationCandidate,
+    AmbiguousGame,
+    AmbiguousInstallationCandidates,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GameMatch {
+    pub confidence: MatchConfidence,
+    pub catalogue_archive_ids: Vec<i64>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdvisoryPlanEntry {
+    pub record: PatchMetadataRecord,
+    pub disposition: AdvisoryDisposition,
+    pub game_match: GameMatch,
+    pub hypothetical_destinations: Vec<HypotheticalPnachDestination>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HypotheticalPnachDestination {
+    pub candidate_kind: Pcsx2CandidateKind,
+    pub relative_path: String,
+    pub display_path: String,
+    pub hypothetical: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdvisoryPlanSummary {
+    pub metadata_records: usize,
+    pub exact_matches: usize,
+    pub probable_matches: usize,
+    pub uncertain_matches: usize,
+    pub ambiguous_matches: usize,
+    pub missing_games: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdvisoryPatchPlan {
+    pub format_version: u32,
+    pub plan_id: String,
+    pub executable: bool,
+    pub source: SourceSnapshot,
+    pub installation_candidates: Vec<Pcsx2InstallationCandidate>,
+    pub entries: Vec<AdvisoryPlanEntry>,
+    pub summary: AdvisoryPlanSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitTreeDocument {
+    sha: String,
+    #[serde(default)]
+    truncated: bool,
+    tree: Vec<GitTreeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitTreeEntry {
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    sha: String,
+    size: Option<u64>,
+}
+
+pub fn fetch_built_in_metadata(fetcher: &dyn MetadataFetcher) -> Result<MetadataSnapshot> {
+    let response = fetcher.fetch(BUILT_IN_SOURCE_URL)?;
+    if (300..400).contains(&response.status) {
+        return Err(PatchManagerError::RedirectRejected {
+            status: response.status,
+        });
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(PatchManagerError::Network(format!(
+            "metadata server returned HTTP {}",
+            response.status
+        )));
+    }
+    if response.body.len() > MAX_METADATA_BYTES {
+        return Err(PatchManagerError::ResponseTooLarge {
+            limit: MAX_METADATA_BYTES,
+        });
+    }
+    if !response.content_type.is_empty()
+        && !response.content_type.contains("json")
+        && !response.content_type.contains("github")
+    {
+        return Err(PatchManagerError::UnsupportedMetadata(format!(
+            "unexpected content type {}",
+            response.content_type
+        )));
+    }
+    validate_json_depth(&response.body, MAX_JSON_DEPTH)?;
+
+    let document: GitTreeDocument = serde_json::from_slice(&response.body)
+        .map_err(|error| PatchManagerError::MalformedMetadata(error.to_string()))?;
+    if document.truncated {
+        return Err(PatchManagerError::UnsupportedMetadata(
+            "the upstream Git tree response is truncated".to_string(),
+        ));
+    }
+    validate_git_object_id("source version", &document.sha)?;
+    if document.tree.len() > MAX_METADATA_RECORDS {
+        return Err(PatchManagerError::UnsupportedMetadata(format!(
+            "metadata contains {} entries; limit is {MAX_METADATA_RECORDS}",
+            document.tree.len()
+        )));
+    }
+
+    let metadata_hash = hex_sha256(&response.body);
+    let mut records = Vec::new();
+    let mut record_ids = BTreeSet::new();
+    for entry in document.tree {
+        if let Some(record) = git_tree_entry_to_record(entry)? {
+            if !record_ids.insert(record.record_id.clone()) {
+                return Err(PatchManagerError::MalformedMetadata(format!(
+                    "duplicate patch record {}",
+                    record.record_id
+                )));
+            }
+            records.push(record);
+        }
+    }
+    records.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+    let verification = response.verification;
+
+    Ok(MetadataSnapshot {
+        source: SourceSnapshot {
+            id: BUILT_IN_SOURCE_ID,
+            display_name: BUILT_IN_SOURCE_NAME,
+            endpoint: BUILT_IN_SOURCE_URL,
+            provenance: BUILT_IN_SOURCE_PROVENANCE,
+            license_notice: BUILT_IN_SOURCE_LICENSE,
+            metadata_schema: METADATA_SCHEMA,
+            source_version: document.sha,
+            metadata_sha256: metadata_hash,
+            verification,
+            verification_explanation: verification.explanation(),
+            freshness_explanation: "No authenticated timestamp or monotonic version; first-seen replay cannot be detected",
+        },
+        records,
+    })
+}
+
+fn git_tree_entry_to_record(entry: GitTreeEntry) -> Result<Option<PatchMetadataRecord>> {
+    validate_metadata_string("repository path", &entry.path)?;
+    validate_repository_path(&entry.path)?;
+    validate_metadata_string("tree entry type", &entry.entry_type)?;
+    validate_git_object_id("tree entry SHA", &entry.sha)?;
+    if entry.entry_type != "blob"
+        || !entry.path.starts_with("patches/")
+        || !entry.path.ends_with(".pnach")
+    {
+        return Ok(None);
+    }
+    if entry
+        .size
+        .is_some_and(|size| size > MAX_METADATA_BYTES as u64)
+    {
+        return Err(PatchManagerError::UnsupportedMetadata(format!(
+            "metadata advertises an oversized patch entry at {}",
+            entry.path
+        )));
+    }
+    let file_name = entry
+        .path
+        .strip_prefix("patches/")
+        .filter(|name| !name.contains('/') && !name.contains('\\'))
+        .ok_or_else(|| {
+            PatchManagerError::UnsupportedMetadata(format!(
+                "unsafe or nested patch metadata path {}",
+                entry.path
+            ))
+        })?;
+    let stem = file_name.strip_suffix(".pnach").ok_or_else(|| {
+        PatchManagerError::MalformedMetadata("patch path lacks .pnach suffix".to_string())
+    })?;
+    let (serial, executable_crc) = parse_patch_identity(stem);
+    Ok(Some(PatchMetadataRecord {
+        record_id: entry.path.clone(),
+        repository_path: entry.path,
+        patch_blob_id: entry.sha,
+        title: None,
+        platform: "PS2".to_string(),
+        region: None,
+        serial,
+        executable_crc,
+        metadata_kind: "PCSX2 repository patch record".to_string(),
+    }))
+}
+
+fn parse_patch_identity(stem: &str) -> (Option<String>, Option<String>) {
+    let mut parts = stem.rsplitn(2, '_');
+    let possible_crc = parts.next().unwrap_or_default();
+    let possible_serial = parts.next();
+    let crc = normalize_crc(possible_crc);
+    let serial = possible_serial.and_then(normalize_serial);
+    match (serial, crc) {
+        (Some(serial), Some(crc)) => (Some(serial), Some(crc)),
+        (None, Some(crc)) if possible_serial.is_none() => (None, Some(crc)),
+        _ => (None, None),
+    }
+}
+
+fn normalize_serial(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_uppercase();
+    let (prefix, digits) = value.split_once('-')?;
+    if prefix.len() == 4
+        && prefix
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        && digits.len() == 5
+        && digits.chars().all(|character| character.is_ascii_digit())
+    {
+        Some(format!("{prefix}-{digits}"))
+    } else {
+        None
+    }
+}
+
+fn normalize_crc(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 8 && value.chars().all(|character| character.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_uppercase())
+}
+
+fn normalize_title(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn match_record(
+    record: &PatchMetadataRecord,
+    catalogue: &[CatalogueGameEvidence],
+) -> (GameMatch, bool) {
+    let mut candidates = Vec::<(MatchConfidence, i64, Vec<String>)>::new();
+    let mut contradictions = Vec::new();
+    for game in catalogue {
+        if !game.is_present || game.platform.as_deref() != Some("PS2") {
+            continue;
+        }
+
+        let serial_matches = record.serial.as_ref().is_some_and(|serial| {
+            game.serial.as_deref().and_then(normalize_serial).as_ref() == Some(serial)
+        });
+        let crc_matches = record.executable_crc.as_ref().is_some_and(|crc| {
+            game.executable_crc
+                .as_deref()
+                .and_then(normalize_crc)
+                .as_ref()
+                == Some(crc)
+        });
+        let requires_serial = record.serial.is_some();
+        let requires_crc = record.executable_crc.is_some();
+        let serial_conflicts = record.serial.as_ref().is_some_and(|record_serial| {
+            game.serial
+                .as_deref()
+                .and_then(normalize_serial)
+                .is_some_and(|game_serial| &game_serial != record_serial)
+        });
+        let crc_conflicts = record.executable_crc.as_ref().is_some_and(|record_crc| {
+            game.executable_crc
+                .as_deref()
+                .and_then(normalize_crc)
+                .is_some_and(|game_crc| &game_crc != record_crc)
+        });
+        if serial_conflicts || crc_conflicts {
+            let mut reasons = Vec::new();
+            if serial_conflicts {
+                reasons.push("catalogue disc serial conflicts with patch metadata".to_string());
+            }
+            if crc_conflicts {
+                reasons.push("catalogue executable CRC conflicts with patch metadata".to_string());
+            }
+            contradictions.extend(reasons);
+            continue;
+        }
+        if (requires_serial || requires_crc)
+            && (!requires_serial || serial_matches)
+            && (!requires_crc || crc_matches)
+        {
+            let mut reasons = Vec::new();
+            if serial_matches {
+                reasons.push("namespaced PCSX2 disc serial matches".to_string());
+            }
+            if crc_matches {
+                reasons.push("namespaced PCSX2 executable CRC matches".to_string());
+            }
+            candidates.push((MatchConfidence::Exact, game.archive_id, reasons));
+            continue;
+        }
+
+        if let Some(title) = &record.title {
+            let title_matches = normalize_title(title) == normalize_title(&game.normalized_name);
+            let region_compatible = match (&record.region, &game.region) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                (Some(_), None) => false,
+                _ => true,
+            };
+            if title_matches && region_compatible {
+                candidates.push((
+                    MatchConfidence::Probable,
+                    game.archive_id,
+                    vec!["normalized title and PS2 platform match".to_string()],
+                ));
+                continue;
+            }
+        }
+
+        let display = game.display_name.to_ascii_uppercase();
+        let filename_similarity = record
+            .serial
+            .as_ref()
+            .is_some_and(|serial| display.contains(serial))
+            || record
+                .executable_crc
+                .as_ref()
+                .is_some_and(|crc| display.contains(crc));
+        if filename_similarity {
+            candidates.push((
+                MatchConfidence::Uncertain,
+                game.archive_id,
+                vec![
+                    "filename text contains a patch identifier; explicit review required"
+                        .to_string(),
+                ],
+            ));
+        }
+    }
+
+    let best = candidates
+        .iter()
+        .map(|candidate| candidate.0)
+        .max()
+        .unwrap_or(MatchConfidence::NoMatch);
+    let best_candidates = candidates
+        .into_iter()
+        .filter(|candidate| candidate.0 == best)
+        .collect::<Vec<_>>();
+    let ambiguous = best != MatchConfidence::NoMatch && best_candidates.len() > 1;
+    let mut ids = best_candidates
+        .iter()
+        .map(|candidate| candidate.1)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    let mut reasons = best_candidates
+        .iter()
+        .flat_map(|candidate| candidate.2.iter().cloned())
+        .collect::<Vec<_>>();
+    if best == MatchConfidence::NoMatch {
+        reasons.extend(contradictions);
+    }
+    reasons.sort();
+    reasons.dedup();
+    if best == MatchConfidence::NoMatch {
+        reasons.push("no compatible catalogue identity evidence".to_string());
+    }
+    if ambiguous {
+        reasons.push("multiple catalogue archives share the strongest evidence".to_string());
+    }
+    (
+        GameMatch {
+            confidence: best,
+            catalogue_archive_ids: ids,
+            reasons,
+        },
+        ambiguous,
+    )
+}
+
+pub fn build_advisory_plan(
+    snapshot: MetadataSnapshot,
+    installation_candidates: Vec<Pcsx2InstallationCandidate>,
+    catalogue: &[CatalogueGameEvidence],
+) -> AdvisoryPatchPlan {
+    let installation_ambiguity = installation_candidates.len() > 1;
+    let missing_emulator_candidate = installation_candidates.is_empty();
+    let entries = snapshot
+        .records
+        .iter()
+        .cloned()
+        .map(|record| {
+            let (game_match, ambiguous_game) = match_record(&record, catalogue);
+            let disposition = if missing_emulator_candidate {
+                AdvisoryDisposition::NoInstallationCandidate
+            } else if installation_ambiguity {
+                AdvisoryDisposition::AmbiguousInstallationCandidates
+            } else if ambiguous_game {
+                AdvisoryDisposition::AmbiguousGame
+            } else if game_match.confidence == MatchConfidence::NoMatch {
+                AdvisoryDisposition::MissingGame
+            } else {
+                AdvisoryDisposition::Preview
+            };
+            let file_name = record
+                .repository_path
+                .strip_prefix("patches/")
+                .unwrap_or(&record.repository_path)
+                .to_string();
+            let relative_path = format!("patches/{file_name}");
+            let hypothetical_destinations = installation_candidates
+                .iter()
+                .map(|installation| HypotheticalPnachDestination {
+                    candidate_kind: installation.kind,
+                    relative_path: relative_path.clone(),
+                    display_path: installation
+                        .data_root
+                        .join(&relative_path)
+                        .to_string_lossy()
+                        .into_owned(),
+                    hypothetical: true,
+                })
+                .collect();
+            let mut reasons = game_match.reasons.clone();
+            reasons.push("metadata preview only; no PNACH content was downloaded".to_string());
+            if installation_ambiguity {
+                reasons.push(
+                    "multiple standard-path PCSX2 candidates were found; none was selected"
+                        .to_string(),
+                );
+            }
+            if missing_emulator_candidate {
+                reasons.push(
+                    "no supported standard-path PCSX2 candidate was found; this does not prove PCSX2 is absent"
+                        .to_string(),
+                );
+            }
+            AdvisoryPlanEntry {
+                record,
+                disposition,
+                game_match,
+                hypothetical_destinations,
+                reasons,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let summary = AdvisoryPlanSummary {
+        metadata_records: entries.len(),
+        exact_matches: entries
+            .iter()
+            .filter(|entry| entry.game_match.confidence == MatchConfidence::Exact)
+            .count(),
+        probable_matches: entries
+            .iter()
+            .filter(|entry| entry.game_match.confidence == MatchConfidence::Probable)
+            .count(),
+        uncertain_matches: entries
+            .iter()
+            .filter(|entry| entry.game_match.confidence == MatchConfidence::Uncertain)
+            .count(),
+        ambiguous_matches: entries
+            .iter()
+            .filter(|entry| entry.disposition == AdvisoryDisposition::AmbiguousGame)
+            .count(),
+        missing_games: entries
+            .iter()
+            .filter(|entry| entry.game_match.confidence == MatchConfidence::NoMatch)
+            .count(),
+    };
+    let plan_id = compute_plan_id(&snapshot.source, &installation_candidates, &entries);
+
+    AdvisoryPatchPlan {
+        format_version: 1,
+        plan_id,
+        executable: false,
+        source: snapshot.source,
+        installation_candidates,
+        entries,
+        summary,
+    }
+}
+
+fn compute_plan_id(
+    source: &SourceSnapshot,
+    candidates: &[Pcsx2InstallationCandidate],
+    entries: &[AdvisoryPlanEntry],
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"archivefs-advisory-plan-v1");
+    for value in [
+        source.id,
+        source.endpoint,
+        source.metadata_schema,
+        &source.source_version,
+        &source.metadata_sha256,
+    ] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hash_field(&mut hasher, verification_tag(source.verification));
+    for candidate in candidates {
+        hash_field(&mut hasher, candidate_kind_tag(candidate.kind));
+        hash_field(
+            &mut hasher,
+            candidate.data_root.as_os_str().as_encoded_bytes(),
+        );
+        hash_field(&mut hasher, candidate.provenance.as_bytes());
+        hash_optional_string(&mut hasher, candidate.detected_version.as_deref());
+    }
+    for entry in entries {
+        for value in [
+            &entry.record.record_id,
+            &entry.record.repository_path,
+            &entry.record.patch_blob_id,
+            &entry.record.platform,
+            &entry.record.metadata_kind,
+        ] {
+            hash_field(&mut hasher, value.as_bytes());
+        }
+        for value in [
+            entry.record.title.as_deref(),
+            entry.record.region.as_deref(),
+            entry.record.serial.as_deref(),
+            entry.record.executable_crc.as_deref(),
+        ] {
+            hash_optional_string(&mut hasher, value);
+        }
+        hash_field(&mut hasher, disposition_tag(entry.disposition));
+        hash_field(&mut hasher, confidence_tag(entry.game_match.confidence));
+        for archive_id in &entry.game_match.catalogue_archive_ids {
+            hash_field(&mut hasher, &archive_id.to_le_bytes());
+        }
+        for destination in &entry.hypothetical_destinations {
+            hash_field(&mut hasher, candidate_kind_tag(destination.candidate_kind));
+            hash_field(&mut hasher, destination.relative_path.as_bytes());
+        }
+    }
+    encode_hex(&hasher.finalize())
+}
+
+fn hash_optional_string(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_field(hasher, b"some");
+            hash_field(hasher, value.as_bytes());
+        }
+        None => hash_field(hasher, b"none"),
+    }
+}
+
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn candidate_kind_tag(kind: Pcsx2CandidateKind) -> &'static [u8] {
+    match kind {
+        Pcsx2CandidateKind::Native => b"native",
+        Pcsx2CandidateKind::Flatpak => b"flatpak",
+    }
+}
+
+fn disposition_tag(disposition: AdvisoryDisposition) -> &'static [u8] {
+    match disposition {
+        AdvisoryDisposition::Preview => b"preview",
+        AdvisoryDisposition::MissingGame => b"missing-game",
+        AdvisoryDisposition::NoInstallationCandidate => b"no-installation-candidate",
+        AdvisoryDisposition::AmbiguousGame => b"ambiguous-game",
+        AdvisoryDisposition::AmbiguousInstallationCandidates => {
+            b"ambiguous-installation-candidates"
+        }
+        AdvisoryDisposition::Unsupported => b"unsupported",
+    }
+}
+
+fn confidence_tag(confidence: MatchConfidence) -> &'static [u8] {
+    match confidence {
+        MatchConfidence::NoMatch => b"no-match",
+        MatchConfidence::Uncertain => b"uncertain",
+        MatchConfidence::Probable => b"probable",
+        MatchConfidence::Exact => b"exact",
+    }
+}
+
+fn verification_tag(verification: VerificationLevel) -> &'static [u8] {
+    match verification {
+        VerificationLevel::TransportOnly => b"transport-only",
+    }
+}
+
+pub fn load_catalogue_evidence_read_only(path: &Path) -> Result<Vec<CatalogueGameEvidence>> {
+    let database = Database::open_read_only(path)
+        .map_err(|error| PatchManagerError::Catalogue(error.to_string()))?;
+    let archives = database
+        .load_archives()
+        .map_err(|error| PatchManagerError::Catalogue(error.to_string()))?;
+    database
+        .close()
+        .map_err(|error| PatchManagerError::Catalogue(error.to_string()))?;
+    let evidence = archives
+        .iter()
+        .map(CatalogueGameEvidence::from)
+        .collect::<Vec<_>>();
+    for game in &evidence {
+        validate_catalogue_evidence(game)?;
+    }
+    Ok(evidence)
+}
+
+fn validate_catalogue_evidence(game: &CatalogueGameEvidence) -> Result<()> {
+    validate_metadata_string("catalogue display name", &game.display_name)?;
+    validate_metadata_string("catalogue normalized name", &game.normalized_name)?;
+    if let Some(platform) = &game.platform {
+        validate_metadata_string("catalogue platform", platform)?;
+    }
+    if let Some(region) = &game.region {
+        validate_metadata_string("catalogue region", region)?;
+    }
+    if let Some(serial) = &game.serial {
+        validate_metadata_string("catalogue serial", serial)?;
+    }
+    if let Some(crc) = &game.executable_crc {
+        validate_metadata_string("catalogue executable CRC", crc)?;
+    }
+    Ok(())
+}
+
+pub fn preview_pcsx2_metadata<F: ReadOnlyFilesystem>(
+    fetcher: &dyn MetadataFetcher,
+    adapter: &ReadOnlyPcsx2Adapter<F>,
+    catalogue_path: &Path,
+) -> Result<AdvisoryPatchPlan> {
+    let snapshot = fetch_built_in_metadata(fetcher)?;
+    let installation_candidates = adapter.discover()?;
+    let catalogue = load_catalogue_evidence_read_only(catalogue_path)?;
+    Ok(build_advisory_plan(
+        snapshot,
+        installation_candidates,
+        &catalogue,
+    ))
+}
+
+fn validate_metadata_string(field: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_METADATA_STRING_BYTES {
+        return Err(PatchManagerError::UnsupportedMetadata(format!(
+            "{field} exceeds the {MAX_METADATA_STRING_BYTES}-byte string limit"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(PatchManagerError::MalformedMetadata(format!(
+            "{field} contains a NUL byte"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_git_object_id(field: &str, value: &str) -> Result<()> {
+    validate_metadata_string(field, value)?;
+    if value.len() != 40 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(PatchManagerError::MalformedMetadata(format!(
+            "{field} is not a supported Git object ID"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_repository_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(PatchManagerError::UnsupportedMetadata(format!(
+            "unsafe repository path {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_json_depth(bytes: &[u8], max_depth: usize) -> Result<()> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max_depth {
+                    return Err(PatchManagerError::UnsupportedMetadata(format!(
+                        "JSON nesting exceeds the depth limit of {max_depth}"
+                    )));
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    PatchManagerError::MalformedMetadata(
+                        "JSON contains an unmatched closing delimiter".to_string(),
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+    if in_string || depth != 0 {
+        return Err(PatchManagerError::MalformedMetadata(
+            "JSON document is incomplete".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    encode_hex(&Sha256::digest(bytes))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct StaticFetcher {
+        response: MetadataFetch,
+    }
+
+    impl MetadataFetcher for StaticFetcher {
+        fn fetch(&self, _url: &str) -> Result<MetadataFetch> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn fetcher(body: &[u8]) -> StaticFetcher {
+        StaticFetcher {
+            response: MetadataFetch {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: body.to_vec(),
+                verification: VerificationLevel::TransportOnly,
+            },
+        }
+    }
+
+    fn snapshot_with(record: PatchMetadataRecord) -> MetadataSnapshot {
+        MetadataSnapshot {
+            source: SourceSnapshot {
+                id: BUILT_IN_SOURCE_ID,
+                display_name: BUILT_IN_SOURCE_NAME,
+                endpoint: BUILT_IN_SOURCE_URL,
+                provenance: BUILT_IN_SOURCE_PROVENANCE,
+                license_notice: BUILT_IN_SOURCE_LICENSE,
+                metadata_schema: METADATA_SCHEMA,
+                source_version: "version".to_string(),
+                metadata_sha256: "hash".to_string(),
+                verification: VerificationLevel::TransportOnly,
+                verification_explanation: VerificationLevel::TransportOnly.explanation(),
+                freshness_explanation: "No authenticated timestamp or monotonic version; first-seen replay cannot be detected",
+            },
+            records: vec![record],
+        }
+    }
+
+    fn record() -> PatchMetadataRecord {
+        PatchMetadataRecord {
+            record_id: "patches/SLUS-20312_A1B2C3D4.pnach".to_string(),
+            repository_path: "patches/SLUS-20312_A1B2C3D4.pnach".to_string(),
+            patch_blob_id: "blob".to_string(),
+            title: Some("Example Game".to_string()),
+            platform: "PS2".to_string(),
+            region: Some("NTSC-U".to_string()),
+            serial: Some("SLUS-20312".to_string()),
+            executable_crc: Some("A1B2C3D4".to_string()),
+            metadata_kind: "synthetic matcher fixture".to_string(),
+        }
+    }
+
+    fn game(id: i64) -> CatalogueGameEvidence {
+        CatalogueGameEvidence {
+            archive_id: id,
+            is_present: true,
+            display_name: "Example Game".to_string(),
+            normalized_name: "examplegame".to_string(),
+            platform: Some("PS2".to_string()),
+            region: Some("NTSC-U".to_string()),
+            serial: Some("SLUS-20312".to_string()),
+            executable_crc: Some("A1B2C3D4".to_string()),
+        }
+    }
+
+    fn installation() -> Pcsx2InstallationCandidate {
+        Pcsx2InstallationCandidate {
+            kind: Pcsx2CandidateKind::Native,
+            data_root: PathBuf::from("/home/test/.config/PCSX2"),
+            provenance: "test",
+            discovery_confidence: Pcsx2DiscoveryConfidence::StandardPathCandidate,
+            detected_version: None,
+            mutation_readiness: "NotEvaluated",
+        }
+    }
+
+    #[test]
+    fn matcher_exact_identity_requires_all_declared_exact_identifiers() {
+        let plan = build_advisory_plan(snapshot_with(record()), vec![installation()], &[game(7)]);
+
+        assert_eq!(
+            plan.entries[0].game_match.confidence,
+            MatchConfidence::Exact
+        );
+        assert_eq!(plan.entries[0].game_match.catalogue_archive_ids, vec![7]);
+        assert!(!plan.executable);
+
+        let mut crc_missing = game(8);
+        crc_missing.executable_crc = None;
+        let plan = build_advisory_plan(
+            snapshot_with(record()),
+            vec![installation()],
+            &[crc_missing],
+        );
+        assert_ne!(
+            plan.entries[0].game_match.confidence,
+            MatchConfidence::Exact
+        );
+    }
+
+    #[test]
+    fn duplicate_exact_identity_is_ambiguous_not_actionable() {
+        let plan = build_advisory_plan(
+            snapshot_with(record()),
+            vec![installation()],
+            &[game(7), game(8)],
+        );
+
+        assert_eq!(
+            plan.entries[0].disposition,
+            AdvisoryDisposition::AmbiguousGame
+        );
+        assert_eq!(plan.entries[0].game_match.catalogue_archive_ids, vec![7, 8]);
+    }
+
+    #[test]
+    fn multiple_installation_candidates_remain_blocked_and_distinct() {
+        let native = installation();
+        let mut flatpak = installation();
+        flatpak.kind = Pcsx2CandidateKind::Flatpak;
+        flatpak.data_root = PathBuf::from("/home/test/.var/app/net.pcsx2.PCSX2/config/PCSX2");
+        let plan = build_advisory_plan(snapshot_with(record()), vec![native, flatpak], &[game(7)]);
+
+        assert_eq!(
+            plan.entries[0].disposition,
+            AdvisoryDisposition::AmbiguousInstallationCandidates
+        );
+        assert_eq!(plan.installation_candidates.len(), 2);
+        assert_eq!(plan.entries[0].hypothetical_destinations.len(), 2);
+    }
+
+    #[test]
+    fn conflicting_exact_identity_cannot_fall_back_to_title_matching() {
+        let mut conflicting = game(7);
+        conflicting.executable_crc = Some("FFFFFFFF".to_string());
+        let plan = build_advisory_plan(
+            snapshot_with(record()),
+            vec![installation()],
+            &[conflicting],
+        );
+
+        assert_eq!(
+            plan.entries[0].game_match.confidence,
+            MatchConfidence::NoMatch
+        );
+        assert!(
+            plan.entries[0]
+                .game_match
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("conflicts"))
+        );
+    }
+
+    #[test]
+    fn incompatible_catalogue_has_no_match() {
+        let mut incompatible = game(7);
+        incompatible.platform = Some("PS3".to_string());
+        let plan = build_advisory_plan(
+            snapshot_with(record()),
+            vec![installation()],
+            &[incompatible],
+        );
+
+        assert_eq!(
+            plan.entries[0].game_match.confidence,
+            MatchConfidence::NoMatch
+        );
+        assert_eq!(
+            plan.entries[0].disposition,
+            AdvisoryDisposition::MissingGame
+        );
+    }
+
+    #[test]
+    fn domain_matcher_classifies_synthetic_title_and_filename_evidence_conservatively() {
+        let mut probable_game = game(7);
+        probable_game.serial = None;
+        probable_game.executable_crc = None;
+        let probable = build_advisory_plan(
+            snapshot_with(record()),
+            vec![installation()],
+            &[probable_game],
+        );
+        assert_eq!(
+            probable.entries[0].game_match.confidence,
+            MatchConfidence::Probable
+        );
+
+        let mut uncertain_game = game(8);
+        uncertain_game.display_name = "Unknown SLUS-20312 dump".to_string();
+        uncertain_game.normalized_name = "unknown".to_string();
+        uncertain_game.region = None;
+        uncertain_game.serial = None;
+        uncertain_game.executable_crc = None;
+        let uncertain = build_advisory_plan(
+            snapshot_with(record()),
+            vec![installation()],
+            &[uncertain_game],
+        );
+        assert_eq!(
+            uncertain.entries[0].game_match.confidence,
+            MatchConfidence::Uncertain
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_is_rejected() {
+        let error = fetch_built_in_metadata(&fetcher(br#"{"sha":"x","tree":[}"#)).unwrap_err();
+        assert!(matches!(error, PatchManagerError::MalformedMetadata(_)));
+    }
+
+    #[test]
+    fn oversized_response_is_rejected_before_parsing() {
+        let body = vec![b' '; MAX_METADATA_BYTES + 1];
+        let error = fetch_built_in_metadata(&fetcher(&body)).unwrap_err();
+        assert!(matches!(error, PatchManagerError::ResponseTooLarge { .. }));
+    }
+
+    #[test]
+    fn redirects_are_rejected() {
+        let fetcher = StaticFetcher {
+            response: MetadataFetch {
+                status: 302,
+                content_type: "text/html".to_string(),
+                body: Vec::new(),
+                verification: VerificationLevel::TransportOnly,
+            },
+        };
+        let error = fetch_built_in_metadata(&fetcher).unwrap_err();
+        assert_eq!(error, PatchManagerError::RedirectRejected { status: 302 });
+    }
+
+    #[test]
+    fn duplicate_identity_fields_are_rejected() {
+        let body = br#"{
+            "sha":"first",
+            "sha":"second",
+            "truncated":false,
+            "tree":[]
+        }"#;
+        let error = fetch_built_in_metadata(&fetcher(body)).unwrap_err();
+        assert!(matches!(error, PatchManagerError::MalformedMetadata(_)));
+    }
+
+    #[test]
+    fn unsafe_repository_paths_are_rejected_not_rendered() {
+        let body = br#"{
+            "sha":"0123456789abcdef0123456789abcdef01234567",
+            "truncated":false,
+            "tree":[{"path":"patches/../escape.pnach","type":"blob","sha":"2222222222222222222222222222222222222222","size":42}]
+        }"#;
+        let error = fetch_built_in_metadata(&fetcher(body)).unwrap_err();
+        assert!(matches!(error, PatchManagerError::UnsupportedMetadata(_)));
+    }
+
+    #[test]
+    fn duplicate_patch_records_are_rejected() {
+        let body = br#"{
+            "sha":"0123456789abcdef0123456789abcdef01234567",
+            "truncated":false,
+            "tree":[
+                {"path":"patches/12345678.pnach","type":"blob","sha":"2222222222222222222222222222222222222222","size":42},
+                {"path":"patches/12345678.pnach","type":"blob","sha":"2222222222222222222222222222222222222222","size":42}
+            ]
+        }"#;
+        let error = fetch_built_in_metadata(&fetcher(body)).unwrap_err();
+        assert!(matches!(error, PatchManagerError::MalformedMetadata(_)));
+    }
+
+    #[test]
+    fn official_tree_shape_yields_metadata_without_fetching_patch_content() {
+        let body = br#"{
+            "sha":"0123456789abcdef0123456789abcdef01234567",
+            "truncated":false,
+            "tree":[
+                {"path":"README.md","type":"blob","sha":"1111111111111111111111111111111111111111","size":10,"url":"https://ignored.invalid/readme"},
+                {"path":"patches/SLUS-20312_A1B2C3D4.pnach","type":"blob","sha":"2222222222222222222222222222222222222222","size":42,"url":"https://ignored.invalid/artifact"}
+            ]
+        }"#;
+        let snapshot = fetch_built_in_metadata(&fetcher(body)).unwrap();
+
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.records[0].serial.as_deref(), Some("SLUS-20312"));
+        assert_eq!(
+            snapshot.records[0].executable_crc.as_deref(),
+            Some("A1B2C3D4")
+        );
+        assert_eq!(
+            snapshot.source.verification,
+            VerificationLevel::TransportOnly
+        );
+    }
+
+    #[test]
+    fn excessive_json_depth_is_rejected() {
+        let mut body = String::from("{\"sha\":\"x\",\"tree\":");
+        body.push_str(&"[".repeat(MAX_JSON_DEPTH));
+        body.push_str(&"]".repeat(MAX_JSON_DEPTH));
+        body.push('}');
+        let error = fetch_built_in_metadata(&fetcher(body.as_bytes())).unwrap_err();
+        assert!(matches!(error, PatchManagerError::UnsupportedMetadata(_)));
+    }
+
+    #[test]
+    fn catalogue_rows_do_not_gain_exact_identity_from_filenames() {
+        let archive = PersistedArchive {
+            id: 3,
+            source_folder_id: 1,
+            relative_path: PathBuf::from("SLUS-20312_A1B2C3D4.iso"),
+            absolute_path: PathBuf::from("/games/SLUS-20312_A1B2C3D4.iso"),
+            archive_kind: "iso".to_string(),
+            display_name: "SLUS-20312_A1B2C3D4".to_string(),
+            normalized_name: "slus20312a1b2c3d4".to_string(),
+            size_bytes: None,
+            modified_time_unix_seconds: None,
+            platform: Some("PS2".to_string()),
+            platform_source: Some("automatic".to_string()),
+            last_known_health: "present".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            last_verified_missing_at: None,
+        };
+        let evidence = CatalogueGameEvidence::from(&archive);
+        assert_eq!(evidence.serial, None);
+        assert_eq!(evidence.executable_crc, None);
+        let plan = build_advisory_plan(snapshot_with(record()), vec![installation()], &[evidence]);
+        assert_eq!(
+            plan.entries[0].game_match.confidence,
+            MatchConfidence::Uncertain
+        );
+    }
+
+    #[test]
+    fn preview_does_not_change_fixture_paths_or_catalogue_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-patch-preview-no-write-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let native_root = home.join(".config/PCSX2");
+        fs::create_dir_all(&native_root).unwrap();
+        let catalogue_path = root.join("library.sqlite3");
+        Database::open_or_create(&catalogue_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let before_database = fs::read(&catalogue_path).unwrap();
+        let before_entries = tree_entries(&root);
+        let adapter = ReadOnlyPcsx2Adapter::new(
+            HostReadOnlyFilesystem,
+            Pcsx2DiscoveryRoots {
+                home,
+                xdg_config_home: native_root.parent().unwrap().to_path_buf(),
+            },
+        );
+        let body = br#"{
+            "sha":"0123456789abcdef0123456789abcdef01234567",
+            "truncated":false,
+            "tree":[{"path":"patches/1234ABCD.pnach","type":"blob","sha":"2222222222222222222222222222222222222222","size":42}]
+        }"#;
+
+        let plan = preview_pcsx2_metadata(&fetcher(body), &adapter, &catalogue_path).unwrap();
+
+        assert!(!plan.executable);
+        assert_eq!(tree_entries(&root), before_entries);
+        assert_eq!(fs::read(&catalogue_path).unwrap(), before_database);
+        assert!(!native_root.join("patches").exists());
+        assert!(!native_root.join("cheats").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_catalogue_rows_do_not_match_patch_metadata() {
+        let mut missing = game(7);
+        missing.is_present = false;
+        let plan = build_advisory_plan(snapshot_with(record()), vec![installation()], &[missing]);
+
+        assert_eq!(
+            plan.entries[0].game_match.confidence,
+            MatchConfidence::NoMatch
+        );
+        assert!(plan.entries[0].game_match.catalogue_archive_ids.is_empty());
+    }
+
+    #[test]
+    fn oversized_catalogue_identity_text_is_rejected() {
+        let mut evidence = game(7);
+        evidence.display_name = "x".repeat(MAX_METADATA_STRING_BYTES + 1);
+
+        assert!(matches!(
+            validate_catalogue_evidence(&evidence),
+            Err(PatchManagerError::UnsupportedMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn plan_id_ignores_presentation_only_reason_and_display_path_text() {
+        let snapshot = snapshot_with(record());
+        let source = snapshot.source.clone();
+        let candidates = vec![installation()];
+        let plan = build_advisory_plan(snapshot, candidates.clone(), &[game(7)]);
+        let mut presentation_changed = plan.entries.clone();
+        presentation_changed[0]
+            .reasons
+            .push("different presentation".to_string());
+        presentation_changed[0].hypothetical_destinations[0].display_path =
+            "different display text".to_string();
+
+        assert_eq!(
+            plan.plan_id,
+            compute_plan_id(&source, &candidates, &presentation_changed)
+        );
+    }
+
+    fn tree_entries(root: &Path) -> Vec<PathBuf> {
+        fn visit(root: &Path, current: &Path, entries: &mut Vec<PathBuf>) {
+            let mut children = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                entries.push(child.strip_prefix(root).unwrap().to_path_buf());
+                if child.is_dir() {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+}
