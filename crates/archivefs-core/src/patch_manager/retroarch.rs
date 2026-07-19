@@ -70,6 +70,7 @@ use crate::emulator_environment::retroarch::{
 use crate::emulator_environment::{EncodedPath, FsProbe, ReadOnlyHostFilesystem};
 use crate::{Database, PersistedArchive};
 
+use super::retroarch_inventory::{RetroArchArtifactInventory, build_retroarch_artifact_inventory};
 use super::{PatchManagerError, Result};
 
 pub const RETROARCH_ADVISORY_FORMAT_VERSION: u32 = 1;
@@ -348,6 +349,10 @@ pub struct RetroArchAdvisoryPlan {
     /// `CatalogueGameEvidence::is_present`/PCSX2's own treatment of
     /// already-missing rows), sorted by `archive_id` for determinism.
     pub entries: Vec<RetroArchAdvisoryEntry>,
+    /// Bounded inventory of existing local `.cht`, `.ips`, `.bps`, `.ups`,
+    /// and `.xdelta` artifacts. Additive to the destination-preview v1
+    /// contract and independently format-versioned.
+    pub artifact_inventory: RetroArchArtifactInventory,
     pub summary: RetroArchAdvisorySummary,
 }
 
@@ -449,6 +454,7 @@ pub fn build_retroarch_advisory_plan(
     };
 
     let plan_id = compute_plan_id(&environment, &entries);
+    let artifact_inventory = build_retroarch_artifact_inventory(filesystem, &environment, &entries);
 
     RetroArchAdvisoryPlan {
         format_version: RETROARCH_ADVISORY_FORMAT_VERSION,
@@ -456,6 +462,7 @@ pub fn build_retroarch_advisory_plan(
         executable: false,
         environment,
         entries,
+        artifact_inventory,
         summary,
     }
 }
@@ -3035,6 +3042,261 @@ mod tests {
 
         let after = tree_entries(&root);
         assert_eq!(before, after);
+    }
+
+    // ---- Existing cheat/patch artifact inventory ----
+
+    #[test]
+    fn inventory_reports_exact_cheat_and_patch_with_bounded_cheat_metadata() {
+        use super::super::retroarch_inventory::{ArtifactConflictState, ArtifactKind};
+
+        let root = temp_root("artifact-exact");
+        let cheats_dir = root.join("cheats");
+        let core_dir = cheats_dir.join("snes9x");
+        fs::create_dir_all(&core_dir).unwrap();
+        let archive_path = root.join("game.zip");
+        fs::write(&archive_path, b"archive").unwrap();
+        fs::write(root.join("game.ips"), b"PATCH").unwrap();
+        let cheat_path = core_dir.join("game.cht");
+        fs::write(
+            &cheat_path,
+            b"cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = true\n",
+        )
+        .unwrap();
+        let before_cheat = fs::read(&cheat_path).unwrap();
+        let before_modified = fs::metadata(&cheat_path).unwrap().modified().unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let report = one_profile_report(
+            resolved_cheats_finding(&cheats_dir, true),
+            vec![found_core("snes9x", &["zip"])],
+        );
+
+        let plan = build_retroarch_advisory_plan(
+            &filesystem,
+            report,
+            vec![archive(1, "game.zip", &archive_path, Some("SNES"))],
+        );
+
+        let inventory = &plan.artifact_inventory;
+        assert_eq!(inventory.summary.artifacts_found, 2);
+        assert_eq!(inventory.summary.cheat_files, 1);
+        assert_eq!(inventory.summary.soft_patch_files, 1);
+        assert_eq!(inventory.summary.occupied_destinations, 2);
+        let cheat = inventory
+            .findings
+            .iter()
+            .find(|finding| finding.artifact_kind == ArtifactKind::Cheat)
+            .unwrap();
+        assert_eq!(cheat.conflict_state, ArtifactConflictState::Matched);
+        assert!(cheat.occupies_expected_destination);
+        assert_eq!(cheat.association.catalogue_games[0].archive_id, 1);
+        assert_eq!(cheat.association.core_stems, ["snes9x"]);
+        let summary = cheat.cheat_summary.as_ref().unwrap();
+        assert_eq!(summary.description.as_deref(), Some("Infinite Lives"));
+        assert_eq!(summary.parsed_cheat_entries, 1);
+        assert!(summary.any_cheats_enabled);
+        assert!(summary.complete);
+        assert_eq!(fs::read(&cheat_path).unwrap(), before_cheat);
+        assert_eq!(
+            fs::metadata(&cheat_path).unwrap().modified().unwrap(),
+            before_modified
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inventory_keeps_orphans_and_marks_multiple_artifacts_for_one_game_duplicate() {
+        use super::super::retroarch_inventory::{ArtifactConflictState, ArtifactKind};
+
+        let root = temp_root("artifact-orphan-duplicate");
+        let cheats_dir = root.join("cheats");
+        fs::create_dir_all(cheats_dir.join("snes9x")).unwrap();
+        fs::create_dir_all(cheats_dir.join("legacy")).unwrap();
+        fs::write(cheats_dir.join("snes9x/game.cht"), b"cheats = 0\n").unwrap();
+        fs::write(cheats_dir.join("legacy/game.cht"), b"cheats = 0\n").unwrap();
+        fs::write(cheats_dir.join("unknown.cht"), b"cheats = 0\n").unwrap();
+        let archive_path = root.join("game.zip");
+        fs::write(&archive_path, b"archive").unwrap();
+        fs::write(root.join("unknown.bps"), b"patch").unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let report = one_profile_report(
+            resolved_cheats_finding(&cheats_dir, true),
+            vec![found_core("snes9x", &["zip"])],
+        );
+
+        let plan = build_retroarch_advisory_plan(
+            &filesystem,
+            report,
+            vec![archive(1, "game.zip", &archive_path, Some("SNES"))],
+        );
+        let inventory = &plan.artifact_inventory;
+
+        assert_eq!(inventory.summary.duplicate_artifacts, 2);
+        assert_eq!(inventory.summary.orphaned_artifacts, 2);
+        assert!(inventory.findings.iter().any(|finding| {
+            finding.artifact_kind == ArtifactKind::SoftPatchBps
+                && finding.conflict_state == ArtifactConflictState::Orphaned
+        }));
+        assert!(inventory.findings.iter().any(|finding| {
+            finding.filename.display == "unknown.cht"
+                && finding.conflict_state == ArtifactConflictState::Orphaned
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_expected_cheat_destination_is_reported_ambiguous_without_picking_a_game() {
+        use super::super::retroarch_inventory::ArtifactConflictState;
+
+        let root = temp_root("artifact-ambiguous");
+        let cheats_dir = root.join("cheats");
+        let core_dir = cheats_dir.join("snes9x");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("game.cht"), b"cheats = 0\n").unwrap();
+        let first_path = root.join("source-a/game.zip");
+        let second_path = root.join("source-b/game.zip");
+        fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        fs::write(&first_path, b"first").unwrap();
+        fs::write(&second_path, b"second").unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let report = one_profile_report(
+            resolved_cheats_finding(&cheats_dir, true),
+            vec![found_core("snes9x", &["zip"])],
+        );
+
+        let plan = build_retroarch_advisory_plan(
+            &filesystem,
+            report,
+            vec![
+                archive(1, "game.zip", &first_path, Some("SNES")),
+                archive(2, "game.zip", &second_path, Some("SNES")),
+            ],
+        );
+
+        let finding = plan
+            .artifact_inventory
+            .findings
+            .iter()
+            .find(|finding| finding.filename.display == "game.cht")
+            .unwrap();
+        assert_eq!(finding.conflict_state, ArtifactConflictState::Ambiguous);
+        assert_eq!(
+            finding
+                .association
+                .catalogue_games
+                .iter()
+                .map(|game| game.archive_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            plan.artifact_inventory
+                .destinations
+                .iter()
+                .any(|destination| destination.state == ArtifactConflictState::Ambiguous)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_reports_but_never_follows_cheat_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        use super::super::retroarch_inventory::ArtifactConflictState;
+
+        let root = temp_root("artifact-symlink");
+        let cheats_dir = root.join("cheats");
+        let core_dir = cheats_dir.join("snes9x");
+        fs::create_dir_all(&core_dir).unwrap();
+        let target = root.join("outside.cht");
+        fs::write(&target, b"cheats = 1\ncheat0_enable = true\n").unwrap();
+        symlink(&target, core_dir.join("game.cht")).unwrap();
+        let archive_path = root.join("game.zip");
+        fs::write(&archive_path, b"archive").unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let report = one_profile_report(
+            resolved_cheats_finding(&cheats_dir, true),
+            vec![found_core("snes9x", &["zip"])],
+        );
+
+        let plan = build_retroarch_advisory_plan(
+            &filesystem,
+            report,
+            vec![archive(1, "game.zip", &archive_path, Some("SNES"))],
+        );
+        let finding = plan.artifact_inventory.findings.first().unwrap();
+        assert!(finding.symlink);
+        assert_eq!(finding.probe, FsProbe::Symlink);
+        assert_eq!(finding.conflict_state, ArtifactConflictState::Conflicting);
+        assert!(finding.cheat_summary.is_none());
+        assert!(
+            finding
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "artifact_symlink_not_followed")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_cheat_is_reported_without_partial_parsing() {
+        use super::super::retroarch_inventory::MAX_CHEAT_FILE_BYTES;
+
+        let root = temp_root("artifact-oversized");
+        let cheats_dir = root.join("cheats");
+        let core_dir = cheats_dir.join("snes9x");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(
+            core_dir.join("game.cht"),
+            vec![b'x'; MAX_CHEAT_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let archive_path = root.join("game.zip");
+        fs::write(&archive_path, b"archive").unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let report = one_profile_report(
+            resolved_cheats_finding(&cheats_dir, true),
+            vec![found_core("snes9x", &["zip"])],
+        );
+
+        let plan = build_retroarch_advisory_plan(
+            &filesystem,
+            report,
+            vec![archive(1, "game.zip", &archive_path, Some("SNES"))],
+        );
+        let finding = plan.artifact_inventory.findings.first().unwrap();
+        assert!(finding.cheat_summary.is_none());
+        assert!(
+            finding
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cheat_file_too_large")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_serializes_non_utf8_artifact_paths_without_using_lossy_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("artifact-non-utf8");
+        let cheats_dir = root.join("cheats");
+        fs::create_dir_all(&cheats_dir).unwrap();
+        let filename = std::ffi::OsString::from_vec(b"orphan-\x80.cht".to_vec());
+        fs::write(cheats_dir.join(filename), b"cheats = 0\n").unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let report = one_profile_report(resolved_cheats_finding(&cheats_dir, true), Vec::new());
+
+        let plan = build_retroarch_advisory_plan(&filesystem, report, Vec::new());
+        let finding = plan.artifact_inventory.findings.first().unwrap();
+        assert!(finding.path.lossy);
+        assert!(finding.filename.lossy);
+        assert_eq!(finding.association.catalogue_games.len(), 0);
+        assert!(serde_json::to_string(&plan).is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn tree_entries(root: &Path) -> Vec<PathBuf> {

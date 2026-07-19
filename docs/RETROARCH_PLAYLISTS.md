@@ -1,5 +1,10 @@
 # RetroArch Playlist Identity and Content Matching
 
+The read-only artifact inventory reuses the conservative playlist/game/core
+evidence described here when explaining existing `.cht` associations; it does
+not add a new playlist matching tier. See
+[`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md).
+
 This milestone adds read-only discovery and parsing of RetroArch's own
 `.lpl` playlist files, and uses them as additional, stronger identity
 evidence for `archivefs retroarch-patch-preview`. It changes nothing

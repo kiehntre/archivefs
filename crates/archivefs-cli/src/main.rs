@@ -1138,7 +1138,108 @@ fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
             }
         }
     }
+    format_retroarch_artifact_inventory(&mut output, &plan.artifact_inventory);
     output
+}
+
+fn format_retroarch_artifact_inventory(
+    output: &mut String,
+    inventory: &archivefs_core::patch_manager::RetroArchArtifactInventory,
+) {
+    use std::fmt::Write;
+
+    writeln!(output).unwrap();
+    writeln!(
+        output,
+        "Existing artifact inventory (format {}, complete: {}):",
+        inventory.format_version, inventory.complete
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  found: {} | cheats: {} | soft patches: {} | expected: {} | empty: {} | occupied: {}",
+        inventory.summary.artifacts_found,
+        inventory.summary.cheat_files,
+        inventory.summary.soft_patch_files,
+        inventory.summary.expected_destinations,
+        inventory.summary.empty_destinations,
+        inventory.summary.occupied_destinations
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  duplicate: {} | conflicting: {} | orphaned: {} | ambiguous: {} | unsupported: {}",
+        inventory.summary.duplicate_artifacts,
+        inventory.summary.conflicting_artifacts,
+        inventory.summary.orphaned_artifacts,
+        inventory.summary.ambiguous_artifacts,
+        inventory.summary.unsupported_artifacts
+    )
+    .unwrap();
+    for finding in &inventory.findings {
+        writeln!(
+            output,
+            "  {:?}: {} ({} bytes, {:?}, confidence {:?})",
+            finding.artifact_kind,
+            finding.path.display,
+            finding
+                .size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            finding.conflict_state,
+            finding.association.confidence
+        )
+        .unwrap();
+        if !finding.association.catalogue_games.is_empty() {
+            let games = finding
+                .association
+                .catalogue_games
+                .iter()
+                .map(|game| format!("{} ({})", game.display_name, game.archive_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(output, "    catalogue games: {games}").unwrap();
+        }
+        if !finding.association.core_stems.is_empty() {
+            writeln!(
+                output,
+                "    core evidence: {}",
+                finding.association.core_stems.join(", ")
+            )
+            .unwrap();
+        }
+        if let Some(summary) = &finding.cheat_summary {
+            writeln!(
+                output,
+                "    cheat metadata: entries {}{} | enabled {} | complete {} | description {}",
+                summary.parsed_cheat_entries,
+                summary
+                    .declared_cheat_count
+                    .map(|count| format!(" (declared {count})"))
+                    .unwrap_or_default(),
+                summary.enabled_cheat_entries,
+                summary.complete,
+                summary.description.as_deref().unwrap_or("unknown")
+            )
+            .unwrap();
+        }
+        for diagnostic in &finding.diagnostics {
+            writeln!(
+                output,
+                "    diagnostic: {} ({:?})",
+                diagnostic.code, diagnostic.severity
+            )
+            .unwrap();
+        }
+    }
+    for diagnostic in &inventory.diagnostics {
+        writeln!(
+            output,
+            "  inventory diagnostic: {} ({:?})",
+            diagnostic.code, diagnostic.severity
+        )
+        .unwrap();
+    }
 }
 
 fn format_retroarch_environment_report(report: &RetroArchEnvironmentReport) -> String {
@@ -3207,7 +3308,7 @@ fn print_help() {
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
-        "  retroarch-patch-preview  Preview RetroArch cheat/patch destinations for catalogue games (read-only)"
+        "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
     );
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
@@ -3784,6 +3885,27 @@ mod tests {
                     ],
                 }],
             }],
+            artifact_inventory: archivefs_core::patch_manager::RetroArchArtifactInventory {
+                format_version: 1,
+                read_only: true,
+                complete: true,
+                findings: Vec::new(),
+                destinations: Vec::new(),
+                diagnostics: Vec::new(),
+                summary: archivefs_core::patch_manager::RetroArchArtifactSummary {
+                    artifacts_found: 0,
+                    cheat_files: 0,
+                    soft_patch_files: 0,
+                    expected_destinations: 0,
+                    empty_destinations: 0,
+                    occupied_destinations: 0,
+                    duplicate_artifacts: 0,
+                    conflicting_artifacts: 0,
+                    orphaned_artifacts: 0,
+                    ambiguous_artifacts: 0,
+                    unsupported_artifacts: 0,
+                },
+            },
             summary: RetroArchAdvisorySummary {
                 catalogue_archives: 1,
                 exact_core_profile_outcomes: 1,
@@ -3815,6 +3937,11 @@ mod tests {
             "per-game cheat file (core_supported_extensions_single_match, not created): /home/golden/.config/retroarch/cheats/snes9x/Chrono Trigger (USA).sfc.cht"
         ));
         assert!(output.contains("candidate (content_basename_soft_patch_sibling, not created)"));
+        assert!(output.ends_with(concat!(
+            "\nExisting artifact inventory (format 1, complete: true):\n",
+            "  found: 0 | cheats: 0 | soft patches: 0 | expected: 0 | empty: 0 | occupied: 0\n",
+            "  duplicate: 0 | conflicting: 0 | orphaned: 0 | ambiguous: 0 | unsupported: 0\n",
+        )));
     }
 
     #[test]
@@ -3836,6 +3963,27 @@ mod tests {
             json["entries"][0]["soft_patch_candidates"][0]["kind"],
             "soft_patch_sibling"
         );
+        let mut inventory_keys = json["artifact_inventory"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        inventory_keys.sort();
+        assert_eq!(
+            inventory_keys,
+            [
+                "complete",
+                "destinations",
+                "diagnostics",
+                "findings",
+                "format_version",
+                "read_only",
+                "summary",
+            ]
+        );
+        assert_eq!(json["artifact_inventory"]["format_version"], 1);
+        assert_eq!(json["artifact_inventory"]["read_only"], true);
     }
 
     #[test]

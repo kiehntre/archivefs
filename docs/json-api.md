@@ -19,6 +19,12 @@ The RetroArch playlist identity/matching milestone added only additive fields to
 
 A later RetroArch AppImage-detection milestone bumped `retroarch-environment --json`'s `format_version` from `1` to `2`: unlike a purely additive field, `profiles[]` can now have a 4th (AppImage) entry inserted *between* native and Flatpak/user, which shifts what a positional index like `profiles[2]` means for any consumer that indexed into the array rather than reading each profile's own `profile_kind`. This is the "deliberate JSON API change" case the Stability Guarantees below call out, not the "new fields may be added" case. `retroarch-patch-preview --json`'s own top-level `format_version` stayed `1` - only its *embedded* `environment` field's format_version changed. See [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md) for the full record.
 
+The existing-artifact milestone likewise adds one top-level
+`artifact_inventory` field to `retroarch-patch-preview --json` without changing
+the enclosing format version. The nested inventory has its own
+`format_version: 1`, exact key set, lower-snake-case enums, and byte-safe paths;
+see [`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md).
+
 ## `archivefs database-check --json`
 
 `database-check` is a read-only database diagnostic. Its top-level key set is

@@ -117,6 +117,11 @@ pub enum ExecutableProbe {
 pub struct DirEntryInfo {
     pub file_name: OsString,
     pub probe: FsProbe,
+    /// Final-component no-follow size from `symlink_metadata`. Present
+    /// for regular files and symlinks; `None` when metadata could not be
+    /// read. Callers must still use `probe` to decide whether content may
+    /// be opened.
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +167,12 @@ pub enum BoundedListResult {
 /// command in this codebase already has.
 pub trait ReadOnlyHostFilesystem {
     fn probe(&self, path: &Path) -> FsProbe;
+    /// Final-component no-follow size for an existing filesystem object.
+    /// Returns `None` when metadata is unavailable. Callers must pair this
+    /// with [`Self::probe`] before treating the object as a regular file.
+    fn size_no_follow(&self, _path: &Path) -> Option<u64> {
+        None
+    }
     /// Follows symlinks (`metadata`, not `symlink_metadata`) - used only
     /// for native executable discovery via `PATH`. See
     /// [`ExecutableProbe`].
@@ -219,6 +230,12 @@ fn io_error_to_probe(error: &io::Error) -> FsProbe {
 impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
     fn probe(&self, path: &Path) -> FsProbe {
         Self::probe_metadata(fs::symlink_metadata(path))
+    }
+
+    fn size_no_follow(&self, path: &Path) -> Option<u64> {
+        fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| metadata.len())
     }
 
     fn probe_executable(&self, path: &Path) -> ExecutableProbe {
@@ -292,14 +309,17 @@ impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
             if entries.len() >= max_entries {
                 return BoundedListResult::TooLarge;
             }
-            let entry_probe = Self::probe_metadata(
-                entry
-                    .metadata()
-                    .or_else(|_| fs::symlink_metadata(entry.path())),
-            );
+            // `DirEntry::metadata` follows a final-component symlink.
+            // The abstraction's documented contract is no-follow, so use
+            // `symlink_metadata` directly and derive both fields from the
+            // same observation.
+            let metadata = fs::symlink_metadata(entry.path());
+            let size_bytes = metadata.as_ref().ok().map(fs::Metadata::len);
+            let entry_probe = Self::probe_metadata(metadata);
             entries.push(DirEntryInfo {
                 file_name: entry.file_name(),
                 probe: entry_probe,
+                size_bytes,
             });
         }
         BoundedListResult::Ok(entries)
@@ -378,6 +398,40 @@ mod tests {
         assert_eq!(fs_probe.probe(&root.join("file.txt")), FsProbe::PresentFile);
         assert_eq!(fs_probe.probe(&root.join("missing")), FsProbe::Missing);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_directory_listing_does_not_follow_final_component_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-emulator-env-list-symlink-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("real-directory")).unwrap();
+        fs::write(root.join("real-file"), b"payload").unwrap();
+        symlink(root.join("real-directory"), root.join("directory-link")).unwrap();
+        symlink(root.join("real-file"), root.join("file-link")).unwrap();
+
+        let entries = match HostReadOnlyFilesystem.list_dir_bounded(&root, 16) {
+            BoundedListResult::Ok(entries) => entries,
+            other => panic!("unexpected listing result: {other:?}"),
+        };
+        let probes = entries
+            .into_iter()
+            .map(|entry| (entry.file_name, entry.probe))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            probes.get(std::ffi::OsStr::new("directory-link")),
+            Some(&FsProbe::Symlink)
+        );
+        assert_eq!(
+            probes.get(std::ffi::OsStr::new("file-link")),
+            Some(&FsProbe::Symlink)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -73,6 +73,13 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
   a separate, narrowly-scoped `RetroArchAdvisoryPlan` instead. No PCSX2
   type, plan ID, JSON shape, or CLI output was changed. See
   [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
+- A bounded, read-only inventory of existing RetroArch `.cht`, `.ips`,
+  `.bps`, `.ups`, and `.xdelta` artifacts, included in
+  `retroarch-patch-preview` human and JSON output. It reports empty and
+  occupied expected destinations plus duplicate, conflicting, ambiguous,
+  and orphaned files; parses only bounded non-executable `.cht` metadata;
+  and never follows artifact symlinks or modifies a file. See
+  [`docs/RETROARCH_ARTIFACT_INVENTORY.md`](docs/RETROARCH_ARTIFACT_INVENTORY.md).
 - Read-only RetroArch playlist identity and content matching: discovers
   and parses modern JSON `.lpl` playlist files from the already-discovered
   Playlists directory (bounded at 4 MiB per file, 1024 files and 65536
@@ -118,6 +125,10 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
   `CONTRIBUTING.md` for why.
 
 ### Fixed
+
+- Bounded emulator-environment directory listings now use
+  `symlink_metadata` directly, preserving their documented
+  final-component no-follow contract even when a symlink target exists.
 
 - An ambiguous float literal (`egui::Stroke::new(2.0, stroke_color)`) that a
   newer Rust compiler's stricter lint started rejecting was made explicit

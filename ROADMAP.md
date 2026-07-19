@@ -105,6 +105,14 @@ These are implemented, tested, and in current use today:
   distinct-configuration AppImage inserts a 4th profile into a previously
   fixed-length, positionally-relied-upon array; see
   [`docs/RETROARCH_APPIMAGE.md`](docs/RETROARCH_APPIMAGE.md).
+- Read-only RetroArch cheat/patch artifact inventory: the existing
+  `retroarch-patch-preview` now enumerates bounded `.cht` files beneath
+  configured cheat roots and `.ips`/`.bps`/`.ups`/`.xdelta` files in
+  catalogue-relevant content directories, then reports exact, strong,
+  weak, ambiguous, duplicate, conflicting, and orphaned associations. It
+  parses only bounded `.cht` metadata and never mutates or follows an
+  artifact symlink; see
+  [`docs/RETROARCH_ARTIFACT_INVENTORY.md`](docs/RETROARCH_ARTIFACT_INVENTORY.md).
 
 ## Current development
 

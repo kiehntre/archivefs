@@ -1,5 +1,11 @@
 # RetroArch Environment Discovery
 
+The same final-component no-follow, bounded-read, bounded-listing filesystem
+abstraction is reused by the existing cheat/patch artifact inventory; see
+[`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md). Environment
+discovery itself remains concerned only with profiles, configured paths, cores,
+playlists, and AppImage evidence.
+
 `archivefs retroarch-environment` is a strictly read-only command that
 discovers and reports the local RetroArch environment: which installation
 profiles exist, where their configuration lives, which of a fixed set of

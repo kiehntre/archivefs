@@ -1,5 +1,10 @@
 # RetroArch AppImage Detection
 
+Any distinct AppImage profile discovered here participates in the same bounded,
+read-only existing-artifact inventory as native and Flatpak profiles; no
+AppImage is executed, mounted, or extracted for inventory. See
+[`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md).
+
 `archivefs retroarch-environment` also detects RetroArch installed as an
 AppImage - the primary way many users, including the one this feature was
 built for, actually run RetroArch and other emulators on Linux. Detection

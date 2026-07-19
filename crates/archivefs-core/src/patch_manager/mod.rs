@@ -24,6 +24,7 @@ mod matching;
 mod pcsx2;
 mod retrieval;
 mod retroarch;
+mod retroarch_inventory;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -48,6 +49,12 @@ pub use retroarch::{
     PlaylistMatchConfidence, ProposedDestination, RetroArchAdvisoryEntry, RetroArchAdvisoryPlan,
     RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
+};
+pub use retroarch_inventory::{
+    ArtifactAssociation, ArtifactAssociationConfidence, ArtifactCatalogueGame,
+    ArtifactConflictState, ArtifactDiagnostic, ArtifactDiagnosticSeverity, ArtifactKind,
+    ArtifactPlaylistEvidence, CheatFileSummary, RetroArchArtifactDestination,
+    RetroArchArtifactFinding, RetroArchArtifactInventory, RetroArchArtifactSummary,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";

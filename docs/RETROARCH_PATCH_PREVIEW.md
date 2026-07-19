@@ -6,6 +6,13 @@ go for each catalogued game, for each discovered RetroArch installation
 profile. It makes no filesystem changes, launches no process, loads no
 core, and makes no network call of any kind.
 
+The command now also inventories supported `.cht`, `.ips`, `.bps`, `.ups`,
+and `.xdelta` files that already exist and classifies empty, occupied,
+duplicate, conflicting, ambiguous, and orphaned states. That additive,
+independently versioned report is documented in
+[`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md). It does
+not make the preview executable and does not parse patch payloads.
+
 This is the second concrete preview built on top of `patch_manager`,
 after PCSX2's `pcsx2-patch-preview`. It builds directly on the read-only
 RetroArch environment discovery shipped earlier (see
