@@ -10,9 +10,10 @@ use archivefs_core::emulator_environment::retroarch::{
     discover_retroarch_environment,
 };
 use archivefs_core::patch_manager::{
-    AdvisoryPatchPlan, CoreSelectionSource, DestinationKind, HttpsMetadataFetcher,
-    ProposedDestination, ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan,
-    preview_retroarch_patch_and_cheat_destinations,
+    AdvisoryPatchPlan, CheatAvailabilityReport, CoreSelectionSource, DestinationKind,
+    HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan,
+    build_cheat_availability_report, load_catalogue_evidence_read_only,
+    load_cheat_catalogue_snapshot, preview_retroarch_patch_and_cheat_destinations,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -277,6 +278,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print!("{}", format_retroarch_advisory_plan(&plan));
+            }
+        }
+        "retroarch-cheat-catalogue" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            if input_args.is_empty() {
+                return Err("retroarch-cheat-catalogue requires a local catalogue path".into());
+            }
+            if input_args.len() > 1 {
+                return Err(
+                    "retroarch-cheat-catalogue accepts one local catalogue path and only --json"
+                        .into(),
+                );
+            }
+            let catalogue_root = PathBuf::from(&input_args[0]);
+            let filesystem = HostReadOnlyFilesystem;
+            let environment = DiscoveryEnvironment::from_process_environment();
+            let database_path = default_database_path()?;
+            let plan = preview_retroarch_patch_and_cheat_destinations(
+                &filesystem,
+                &environment,
+                &database_path,
+            )?;
+            let catalogue_games = load_catalogue_evidence_read_only(&database_path)?;
+            let snapshot =
+                load_cheat_catalogue_snapshot(&filesystem, "local-catalogue", &catalogue_root);
+            let report = build_cheat_availability_report(
+                &filesystem,
+                &snapshot,
+                &catalogue_games,
+                Some(&plan),
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_cheat_availability_report(&report));
             }
         }
         "index-build" => {
@@ -1240,6 +1277,120 @@ fn format_retroarch_artifact_inventory(
         )
         .unwrap();
     }
+}
+
+fn format_cheat_availability_report(report: &CheatAvailabilityReport) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS RetroArch Cheat Catalogue Preview").unwrap();
+    writeln!(&mut output, "Report format: {}", report.format_version).unwrap();
+    writeln!(
+        &mut output,
+        "Read-only: yes (no cheat was downloaded, installed, enabled, or copied; no core was loaded; no network call was made)"
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Source: {} ({})",
+        report.source_name, report.source_root.display
+    )
+    .unwrap();
+    writeln!(&mut output, "Complete: {}", report.complete).unwrap();
+    writeln!(
+        &mut output,
+        "Games in catalogue: {} | exact: {} | strong: {} | weak: {} | ambiguous: {} | unsupported: {}",
+        report.summary.games_in_catalogue,
+        report.summary.exact_matches,
+        report.summary.strong_matches,
+        report.summary.weak_matches,
+        report.summary.ambiguous_matches,
+        report.summary.unsupported_matches
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Not installed: {} | already installed: {} | conflicts: {} | staging candidates: {}",
+        report.summary.not_installed,
+        report.summary.already_installed,
+        report.summary.conflicts,
+        report.summary.staging_candidates
+    )
+    .unwrap();
+
+    for entry in &report.entries {
+        writeln!(&mut output).unwrap();
+        writeln!(
+            &mut output,
+            "{} ({:?}, {} cheats, {} enabled by default)",
+            entry.game.source_game_name,
+            entry.game.format,
+            entry.game.cheat_count,
+            entry.game.enabled_by_default_count
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  source file: {}",
+            entry.game.source_file_path.display
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  match: {:?} | installed state: {:?} | staging candidate: {}",
+            entry.game_match.confidence, entry.installed_state, entry.staging_candidate
+        )
+        .unwrap();
+        for evidence in &entry.game_match.evidence {
+            writeln!(
+                &mut output,
+                "    evidence: {} - {}",
+                evidence.tier, evidence.detail
+            )
+            .unwrap();
+        }
+        if !entry.game_match.candidates.is_empty() {
+            let candidates = entry
+                .game_match
+                .candidates
+                .iter()
+                .map(|candidate| format!("{} ({})", candidate.display_name, candidate.archive_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(&mut output, "    candidates: {candidates}").unwrap();
+        }
+        for detail in &entry.installed_state_detail {
+            writeln!(&mut output, "    installed state: {detail}").unwrap();
+        }
+        if !entry.game.parsing_complete {
+            writeln!(
+                &mut output,
+                "    parsing diagnostics present (bounded metadata incomplete)"
+            )
+            .unwrap();
+        }
+    }
+
+    if !report.diagnostics.is_empty() {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "Catalogue diagnostics:").unwrap();
+        for diagnostic in &report.diagnostics {
+            writeln!(
+                &mut output,
+                "  {} ({:?}){}",
+                diagnostic.code,
+                diagnostic.severity,
+                diagnostic
+                    .path
+                    .as_ref()
+                    .map(|path| format!(" - {}", path.display))
+                    .unwrap_or_default()
+            )
+            .unwrap();
+        }
+    }
+
+    output
 }
 
 fn format_retroarch_environment_report(report: &RetroArchEnvironmentReport) -> String {
@@ -3310,6 +3461,9 @@ fn print_help() {
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
     );
+    println!(
+        "  retroarch-cheat-catalogue <local-path>  Discover and match an external cheat catalogue against your library (read-only)"
+    );
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
     println!("  duplicates     Show filename-based duplicate candidates");
@@ -3376,6 +3530,8 @@ fn print_help() {
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");
     println!("  archivefs retroarch-patch-preview --json");
+    println!("  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue");
+    println!("  archivefs retroarch-cheat-catalogue /path/to/manifest.json --json");
     println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs library-status");

@@ -607,6 +607,23 @@ Acceptance criteria:
 
 Tests: adapter contract suite; emulator layout/version fixtures; per-format parser fuzzing; global/per-game mapping; restart/rescan reporting; ambiguity handling; custom-root containment; cross-adapter manifest isolation.
 
+### External cheat catalogue discovery and matching (shipped, read-only)
+
+A third, independent read-only preview (`retroarch-cheat-catalogue`; see
+[`docs/RETROARCH_CHEAT_CATALOGUE.md`](RETROARCH_CHEAT_CATALOGUE.md)) answers
+which cheats an external local catalogue source offers for which catalogued
+game, without downloading, installing, enabling, or applying anything. Like
+`retroarch-patch-preview`, it does not implement `EmulatorAdapter` - a cheat
+catalogue's identity evidence (serial, content hash, playlist identity,
+title/platform/region, filename) does not fit that PCSX2-shaped trait either.
+It reuses `retroarch-patch-preview`'s already-built advisory plan (catalogue
+game entries, playlist evidence, and artifact inventory) for matching and
+installed-state comparison rather than re-discovering anything, and supports
+only local sources (a `.cht` directory tree or a bounded JSON manifest) -
+network-fetched catalogues remain a distinct, separately reviewed future
+capability gated by this document's Retrieval and Verification, Source
+Configuration, and threat-model sections above.
+
 ## Auditing and Observability
 
 Persistent audit storage begins only in a later approved phase; Phase 1 emits bounded in-memory diagnostics and CLI output. Later audit events record source ID/version, metadata snapshot hash, optional artifact hash, verification result, adapter/installation ID, match evidence, plan ID, user or unattended-policy decision, operation ID, changed manifest IDs, result, and sanitized error category. They do not record secrets or unnecessary game paths in exported diagnostics. CLI and GUI can derive a chronological report and answer: what source supplied this file, why it matched this game, what bytes were installed, what was replaced, and whether rollback is available.

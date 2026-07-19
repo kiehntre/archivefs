@@ -20,6 +20,7 @@
 //! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
+mod cheat_catalogue;
 mod matching;
 mod pcsx2;
 mod retrieval;
@@ -38,6 +39,14 @@ use crate::{Database, PersistedArchive};
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
     HypotheticalDestination, InstallationCandidate,
+};
+pub use cheat_catalogue::{
+    CHEAT_CATALOGUE_FORMAT_VERSION, CatalogueDiagnostic, CheatAvailabilityEntry,
+    CheatAvailabilityReport, CheatAvailabilitySummary, CheatCatalogueFormat,
+    CheatCatalogueSnapshot, CheatCatalogueSource, CheatDefinition, CheatGameMatch, CheatGameRecord,
+    CheatInstalledState, CheatMatchCandidate, CheatMatchConfidence, CheatMatchEvidence,
+    JsonManifestSource, RetroarchChtDirectorySource, build_cheat_availability_report,
+    load_cheat_catalogue_snapshot, match_cheat_game_record,
 };
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,

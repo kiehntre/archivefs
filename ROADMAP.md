@@ -113,6 +113,14 @@ These are implemented, tested, and in current use today:
   parses only bounded `.cht` metadata and never mutates or follows an
   artifact symlink; see
   [`docs/RETROARCH_ARTIFACT_INVENTORY.md`](docs/RETROARCH_ARTIFACT_INVENTORY.md).
+- Read-only external cheat catalogue discovery and matching
+  (`retroarch-cheat-catalogue <local-path>`): matches a local `.cht`
+  directory tree or bounded JSON manifest against catalogued games using
+  conservative serial/content-hash/playlist-identity/title-platform-region
+  evidence tiers, cross-references `retroarch-patch-preview`'s existing
+  artifact inventory for installed-state, and never downloads, installs,
+  enables, or applies a cheat. No network access; local sources only. See
+  [`docs/RETROARCH_CHEAT_CATALOGUE.md`](docs/RETROARCH_CHEAT_CATALOGUE.md).
 
 ## Current development
 

@@ -149,3 +149,13 @@ This inventory does not:
 
 Any future mutation workflow remains separately gated by
 [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
+
+## Related: external cheat catalogue matching
+
+`archivefs retroarch-cheat-catalogue` is a separate, independent read-only
+command that matches an *external* local cheat catalogue source (not this
+inventory's own already-installed artifacts) against your catalogued games,
+reusing this inventory's destinations to answer whether a matched catalogue
+cheat is already installed. It adds its own additional bounded read (a
+SHA-256 hash comparison) that this inventory deliberately does not perform -
+see [`RETROARCH_CHEAT_CATALOGUE.md`](RETROARCH_CHEAT_CATALOGUE.md).
