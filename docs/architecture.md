@@ -139,6 +139,10 @@ See [`docs/database.md`](database.md) and [`docs/DATABASE_DESIGN.md`](DATABASE_D
 
 `pcsx2-patch-preview` fetches official PCSX2 patch metadata and prints a read-only, non-executable advisory plan describing native/Flatpak installation candidates. It does not download, verify, install, or enable anything. See [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md) for the full design and current implementation boundary.
 
+## Emulator environment discovery
+
+`retroarch-environment` discovers the local RetroArch environment: native and Flatpak (user- and system-scope) installation profiles, `retroarch.cfg` location and parse outcome, a fixed set of configured paths, and installed cores with their `.info` metadata. It lives in `archivefs-core::emulator_environment`, a **sibling** to `patch_manager`, not part of it - there is no "game" or "patch" concept here, only "what already exists on disk for this emulator." No `EmulatorAdapter` trait is used or extended; `emulator_environment::retroarch` is a concrete implementation, following the same "no premature generalization" principle that kept `patch_manager::pcsx2` concrete until a second adapter justified extracting `EmulatorAdapter`. It is strictly read-only: no file is created, modified, or deleted, no process is spawned, and no network call is made. See [`docs/RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md) for the full design record, including the primary RetroArch/Flatpak source citations it is based on.
+
 # Watcher
 
 The watcher uses the Rust `notify` crate to observe configured source folders recursively. Events are treated as hints that the archive library may have changed.
@@ -196,8 +200,9 @@ The testing philosophy is to keep dangerous behavior behind abstractions and use
 See [`/ROADMAP.md`](../ROADMAP.md) for the full, current roadmap. At the
 architecture level, the main open extension points are:
 
-- Additional `EmulatorAdapter` implementations beyond PCSX2 (RetroArch is the
-  planned next one) built on the boundary in
+- Additional `EmulatorAdapter` *patch-preview* implementations beyond PCSX2
+  (RetroArch is the planned next one, building on the environment
+  discovery already shipped) on the boundary in
   [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
 - Richer, hash-based duplicate detection beyond today's filename-based
   `FilenameDuplicateDetector`, described in

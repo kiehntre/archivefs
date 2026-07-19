@@ -42,6 +42,16 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
   tests for automated project checkpointing. This is a development/tooling
   addition, not a user-facing ArchiveFS capability.
 - `DEDICATION.md`, linked from the bottom of `README.md`.
+- Read-only RetroArch environment discovery (`retroarch-environment`):
+  detects a native and a Flatpak (user- and system-scope) RetroArch profile,
+  locates and parses `retroarch.cfg` for twelve configured path purposes
+  (System, Cores, CoreInfo, Saves, SaveStates, Playlists, Shaders, Overlays,
+  Thumbnails, JoypadAutoconfig, Database, Cheats), and inventories installed
+  Linux cores (`*_libretro.so`) plus their optional `.info` metadata. This is
+  a sibling to the patch-preview adapter boundary, not part of it - see
+  [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md). Strictly
+  read-only: no file is created, modified, or deleted; no process is
+  spawned; no network call is made; no core is loaded.
 
 ### Changed
 

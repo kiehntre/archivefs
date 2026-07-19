@@ -3,6 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
+use archivefs_core::emulator_environment::retroarch::{
+    ConfigReadOutcome, CoreInfoFinding, DiscoveryEnvironment, ProfileKind, ProfileScope,
+    ResolutionState, RetroArchEnvironmentReport, RetroArchProfile, discover_retroarch_environment,
+};
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, HttpsMetadataFetcher, ReadOnlyPcsx2Adapter,
 };
@@ -235,6 +240,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print!("{}", format_advisory_patch_plan(&plan));
+            }
+        }
+        "retroarch-environment" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            if !input_args.is_empty() {
+                return Err("retroarch-environment accepts only --json".into());
+            }
+            let filesystem = HostReadOnlyFilesystem;
+            let environment = DiscoveryEnvironment::from_process_environment();
+            let report = discover_retroarch_environment(&filesystem, &environment)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_retroarch_environment_report(&report));
             }
         }
         "index-build" => {
@@ -930,6 +950,197 @@ fn format_advisory_patch_plan(plan: &AdvisoryPatchPlan) -> String {
         }
     }
     output
+}
+
+fn format_retroarch_environment_report(report: &RetroArchEnvironmentReport) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS RetroArch Environment Report").unwrap();
+    writeln!(
+        &mut output,
+        "Read-only: yes (no files were created, modified, or deleted)"
+    )
+    .unwrap();
+    writeln!(&mut output, "Format: {}", report.format_version).unwrap();
+
+    for profile in &report.profiles {
+        writeln!(&mut output).unwrap();
+        writeln!(
+            &mut output,
+            "{} / {}",
+            profile_kind_label(profile.profile_kind),
+            profile_scope_label(profile.scope)
+        )
+        .unwrap();
+        write_profile_body(&mut output, profile);
+    }
+
+    if !report.diagnostics.is_empty() {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "Report diagnostics:").unwrap();
+        for diagnostic in &report.diagnostics {
+            writeln!(
+                &mut output,
+                "  [{}] {}",
+                diagnostic.code,
+                diagnostic
+                    .path
+                    .as_ref()
+                    .map(|path| path.display.as_str())
+                    .unwrap_or("")
+            )
+            .unwrap();
+        }
+    }
+
+    output
+}
+
+fn write_profile_body(output: &mut String, profile: &RetroArchProfile) {
+    use std::fmt::Write;
+
+    let executables = if profile.evidence.executables.is_empty() {
+        "none found".to_string()
+    } else {
+        profile
+            .evidence
+            .executables
+            .iter()
+            .map(|path| path.display.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    writeln!(output, "  Executable(s): {executables}").unwrap();
+    if profile.profile_kind == ProfileKind::Flatpak {
+        writeln!(
+            output,
+            "  Flatpak app installed: {}",
+            profile.evidence.flatpak_metadata_found
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "  Config directory: {} ({:?})",
+        profile.config_directory.path.display, profile.config_directory.probe
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Config file: {} ({})",
+        profile.config_file.path.display,
+        config_read_outcome_label(&profile.config_file.read)
+    )
+    .unwrap();
+
+    writeln!(output, "  Configured paths:").unwrap();
+    for finding in &profile.paths {
+        writeln!(
+            output,
+            "    {:<17} {}",
+            format!("{:?}", finding.purpose).to_lowercase(),
+            path_finding_summary(finding)
+        )
+        .unwrap();
+    }
+
+    writeln!(output, "  Cores found: {}", profile.cores.len()).unwrap();
+    for core in &profile.cores {
+        let info_summary = match &core.info {
+            CoreInfoFinding::Found {
+                display_name,
+                display_version,
+                ..
+            } => format!(
+                " -> {}{}",
+                display_name.as_deref().unwrap_or("(no display name)"),
+                display_version
+                    .as_deref()
+                    .map(|version| format!(" v{version}"))
+                    .unwrap_or_default()
+            ),
+            _ => String::new(),
+        };
+        writeln!(output, "    {}{}", core.file_name.display, info_summary).unwrap();
+    }
+
+    if profile.diagnostics.is_empty() {
+        writeln!(output, "  Diagnostics: none").unwrap();
+    } else {
+        writeln!(output, "  Diagnostics:").unwrap();
+        for diagnostic in &profile.diagnostics {
+            let path_suffix = diagnostic
+                .path
+                .as_ref()
+                .map(|path| format!(" ({})", path.display))
+                .unwrap_or_default();
+            writeln!(output, "    [{}]{path_suffix}", diagnostic.code).unwrap();
+        }
+    }
+}
+
+fn profile_kind_label(kind: ProfileKind) -> &'static str {
+    match kind {
+        ProfileKind::Native => "Native",
+        ProfileKind::Flatpak => "Flatpak",
+    }
+}
+
+fn profile_scope_label(scope: ProfileScope) -> &'static str {
+    match scope {
+        ProfileScope::User => "user",
+        ProfileScope::System => "system",
+    }
+}
+
+fn config_read_outcome_label(outcome: &ConfigReadOutcome) -> String {
+    match outcome {
+        ConfigReadOutcome::NotAttempted => "not read".to_string(),
+        ConfigReadOutcome::Parsed {
+            malformed_lines,
+            include_detected,
+            complete,
+        } => format!(
+            "parsed, {} malformed line(s), {}{}",
+            malformed_lines.len(),
+            if *complete { "complete" } else { "partial" },
+            if *include_detected {
+                " (contains an unfollowed #include)"
+            } else {
+                ""
+            }
+        ),
+        ConfigReadOutcome::TooLarge { limit_bytes } => {
+            format!("too large (over {limit_bytes} bytes)")
+        }
+        ConfigReadOutcome::InvalidUtf8 => "invalid UTF-8".to_string(),
+    }
+}
+
+fn path_finding_summary(
+    finding: &archivefs_core::emulator_environment::retroarch::PathFinding,
+) -> String {
+    match finding.resolution {
+        ResolutionState::ConfiguredResolved => {
+            let path = finding
+                .resolved_path
+                .as_ref()
+                .map(|path| path.display.as_str())
+                .unwrap_or("?");
+            let probe = finding
+                .probe
+                .map(|probe| format!("{probe:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("configured -> {path} ({probe})")
+        }
+        ResolutionState::ConfiguredUnresolved => format!(
+            "configured but unresolved: {}",
+            finding.configured_value.as_deref().unwrap_or("")
+        ),
+        ResolutionState::RuntimeDefaultUnknown => "runtime default unknown".to_string(),
+        ResolutionState::NoReadableConfig => "no readable config".to_string(),
+    }
 }
 
 fn print_watch_rebuild(index: &ArchiveIndex, summary: &WatchRebuildSummary) {
@@ -2671,6 +2882,7 @@ fn print_help() {
     println!("  doctor         Check whether ArchiveFS is ready to run");
     println!("  config-check   Validate ArchiveFS configuration");
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
+    println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
     println!("  duplicates     Show filename-based duplicate candidates");
@@ -2732,6 +2944,8 @@ fn print_help() {
     println!("  archivefs config-check");
     println!("  archivefs pcsx2-patch-preview");
     println!("  archivefs pcsx2-patch-preview --json");
+    println!("  archivefs retroarch-environment");
+    println!("  archivefs retroarch-environment --json");
     println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs library-status");

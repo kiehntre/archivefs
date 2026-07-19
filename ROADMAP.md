@@ -62,6 +62,14 @@ These are implemented, tested, and in current use today:
 - A reproducible Rust toolchain: `rust-toolchain.toml` pins an exact Rust
   version, and CI and release workflows install that exact version instead
   of a floating `stable` channel.
+- Read-only RetroArch environment discovery (`retroarch-environment`):
+  detects a native and a Flatpak (user- and system-scope) RetroArch
+  profile, locates and parses `retroarch.cfg` for a fixed set of
+  configured paths, and inventories installed cores and their `.info`
+  metadata. This is a sibling to the patch-preview adapter boundary above,
+  not an implementation of `EmulatorAdapter` - RetroArch is not yet a
+  patch-preview adapter; see
+  [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md).
 
 ## Current development
 
@@ -84,12 +92,11 @@ foundations above:
 
 Realistic, concrete next steps, not yet started:
 
-- RetroArch as the second `EmulatorAdapter` implementation: installation
-  discovery (native and Flatpak), config file discovery, and core
-  inventory, following the same read-only-preview-first approach used for
-  PCSX2.
-- A read-only environment preview and capability report for an adapter (what
-  was found, at what confidence, without assuming write access exists).
+- RetroArch as the second `EmulatorAdapter` *patch-preview* implementation:
+  matching patch/cheat metadata to installed RetroArch content and cores,
+  building on the read-only environment discovery already shipped above,
+  the same way `ReadOnlyPcsx2Adapter` builds on PCSX2 installation
+  discovery. Not started.
 - Release process discipline: a documented, repeatable release checklist
   tied to the pinned toolchain (see [`docs/release-checklist.md`](docs/release-checklist.md)).
 

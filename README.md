@@ -42,6 +42,7 @@ for the detailed safety model behind these principles.
 - Reports filename-based duplicate candidates (`duplicates`) - a read-only report, never an automatic cleanup.
 - Builds **managed Library Views**: named, symlink-based organized views of your catalogue (for example, grouped by platform) in a separate directory tree, without moving, copying, or extracting your archives. See [`docs/library-views.md`](docs/library-views.md).
 - Provides a **read-only PCSX2 patch-preview** (`pcsx2-patch-preview`): fetches official PCSX2 patch metadata and shows native/Flatpak installation *candidates* as a non-executable advisory plan. It does not download, verify, install, or enable any patch. PCSX2 is currently the only implemented adapter on an emulator-neutral adapter boundary designed to support additional emulators later - see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
+- Provides **read-only RetroArch environment discovery** (`retroarch-environment`): detects native and Flatpak RetroArch profiles, parses `retroarch.cfg` for a fixed set of configured paths, and inventories installed cores - a sibling to the patch-preview adapter, not part of it. It makes no filesystem changes, spawns no process, and makes no network call - see [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
@@ -52,7 +53,8 @@ for the detailed safety model behind these principles.
 - No automatic patch installation, cheat enabling, or artifact downloading -
   `pcsx2-patch-preview` is metadata-only preview.
 - No broad multi-emulator support yet - PCSX2 is the first and only
-  concrete emulator adapter today.
+  concrete patch adapter today; RetroArch environment discovery is
+  read-only and does not launch, configure, or manage RetroArch.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
@@ -305,6 +307,13 @@ archivefs-cli pcsx2-patch-preview
 archivefs-cli pcsx2-patch-preview --json
 ```
 
+RetroArch environment discovery:
+
+```sh
+archivefs-cli retroarch-environment
+archivefs-cli retroarch-environment --json
+```
+
 Use verbose or debug logging when you need more detail:
 
 ```sh
@@ -393,6 +402,7 @@ Platforms:
 - [Persistent database](docs/database.md) / [database design](docs/DATABASE_DESIGN.md) / [ADR 0001](docs/adr/0001-persistent-library-database.md)
 - [Managed library views](docs/library-views.md)
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
+- [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [Watcher](docs/watcher.md)
 - [Provider pipeline](docs/provider-pipeline.md)
 - [Duplicate detector](docs/duplicate-detector.md)

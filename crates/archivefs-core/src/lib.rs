@@ -52,6 +52,8 @@ pub use library_views::{
 
 pub mod patch_manager;
 
+pub mod emulator_environment;
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),
