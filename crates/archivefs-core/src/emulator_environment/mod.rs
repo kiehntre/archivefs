@@ -1,16 +1,21 @@
 //! Read-only emulator environment discovery.
 //!
-//! This is a sibling to [`crate::patch_manager`], not part of it.
-//! `patch_manager` matches patch metadata to catalogue games and derives
-//! hypothetical patch destinations; there is no "game" or "patch" concept
-//! here. This module only discovers and reports what already exists on
-//! disk for a given emulator - installation profiles, configured paths,
-//! and installed cores - never matching, planning, or mutating anything.
-//! See `docs/RETROARCH_ENVIRONMENT.md` for the full design record.
+//! This module only discovers and reports what already exists on disk for
+//! a given emulator - installation profiles, configured paths, and
+//! installed cores - never matching, planning, or mutating anything. See
+//! `docs/RETROARCH_ENVIRONMENT.md` for the full design record.
 //!
-//! Nothing here is imported by, or imports from, `patch_manager`. The
-//! read-only filesystem abstraction below intentionally duplicates the
-//! *pattern* already proven by `patch_manager::pcsx2`'s
+//! Originally nothing here was imported by, or imported from,
+//! `patch_manager` - each was a self-contained sibling. That changed with
+//! `patch_manager::retroarch` (see `docs/RETROARCH_PATCH_PREVIEW.md`),
+//! which deliberately reuses [`retroarch::discover_retroarch_environment`]
+//! and this module's read-only filesystem trait rather than rediscovering
+//! the same paths a second time. The reverse import still does not exist:
+//! nothing in this module imports from `patch_manager`, and no type,
+//! plan ID, JSON shape, or CLI output of the original PCSX2-only
+//! `patch_manager` code, nor of `retroarch-environment` itself, changed to
+//! allow this. The read-only filesystem abstraction below intentionally
+//! duplicates the *pattern* already proven by `patch_manager::pcsx2`'s
 //! `ReadOnlyFilesystem` (probe without following the final path
 //! component) rather than sharing code with it - only a second
 //! environment-discovery target would justify extracting a shared trait.

@@ -12,7 +12,7 @@ archivefs info <archive> --json
 
 JSON mode always writes the JSON document to stdout. Human headings, summaries, and explanatory text are omitted. Operational logs, when enabled with `--verbose` or `--debug`, are written to stderr by the normal logger and must not be mixed into stdout.
 
-Two other commands support `--json` but document their own schema in a dedicated design document rather than here, since their output is defined alongside a larger feature design: `archivefs pcsx2-patch-preview --json` (see [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)) and `archivefs retroarch-environment --json` (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)). The stability guarantees below apply to all documented JSON output, not only the three commands listed immediately above.
+Three other commands support `--json` but document their own schema in a dedicated design document rather than here, since their output is defined alongside a larger feature design: `archivefs pcsx2-patch-preview --json` (see [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)), `archivefs retroarch-environment --json` (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)), and `archivefs retroarch-patch-preview --json` (see [`RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md)). The stability guarantees below apply to all documented JSON output, not only the three commands listed immediately above.
 
 ## `archivefs status --json`
 

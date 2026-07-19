@@ -67,22 +67,38 @@ These are implemented, tested, and in current use today:
   profile, locates and parses `retroarch.cfg` for a fixed set of
   configured paths, and inventories installed cores and their `.info`
   metadata. This is a sibling to the patch-preview adapter boundary above,
-  not an implementation of `EmulatorAdapter` - RetroArch is not yet a
-  patch-preview adapter; see
+  not an implementation of `EmulatorAdapter`; see
   [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md).
+- A read-only RetroArch cheat/patch destination preview
+  (`retroarch-patch-preview`): the second concrete preview built on
+  `patch_manager`, after PCSX2. For every present catalogue archive, it
+  previews per-game `.cht` cheat destinations (when exactly one installed
+  core supports the archive's own file extension) and IPS/BPS/UPS/Xdelta
+  soft-patch sibling destinations, across every discovered RetroArch
+  profile - reusing the environment discovery above rather than
+  rediscovering any path, and making no network call at all. It
+  deliberately does *not* implement `EmulatorAdapter` or produce an
+  `AdvisoryPatchPlan` - RetroArch's multi-root, core-selection-ambiguous
+  shape does not fit PCSX2's trait/type, so it is a separate, narrowly-
+  scoped `RetroArchAdvisoryPlan` instead; see
+  [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
 
 ## Current development
 
 Work in progress or the immediate next slice of work on top of the
 foundations above:
 
-- Continuing to isolate PCSX2-specific assumptions that still live outside
-  `patch_manager::pcsx2` (the shared `patch_manager` orchestration layer -
-  platform filtering, ambiguity heuristics, plan assembly - is intentionally
-  not yet fully adapter-parameterized; see
-  [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md)).
-- Refining the `EmulatorAdapter` contract itself as real second-adapter work
-  begins, rather than finalizing it speculatively against one adapter.
+- The shared `patch_manager` orchestration layer (platform filtering,
+  ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
+  PCSX2-specific and adapter-parameterized only through `EmulatorAdapter`'s
+  narrow read-only surface. RetroArch's own preview
+  (`retroarch-patch-preview`) deliberately did not generalize this layer
+  or extend `EmulatorAdapter` - its multi-root, core-selection-ambiguous
+  shape did not fit that trait, so it shipped as an independent module
+  instead; see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
+  and [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
+  Whether a future third adapter should generalize either layer remains
+  open, not scheduled.
 - Ongoing library inspection and catalogue-health improvements building on
   the archive inspector and `CatalogueHealthReport`.
 - Documentation maintenance to keep this roadmap, the architecture docs, and
@@ -92,11 +108,6 @@ foundations above:
 
 Realistic, concrete next steps, not yet started:
 
-- RetroArch as the second `EmulatorAdapter` *patch-preview* implementation:
-  matching patch/cheat metadata to installed RetroArch content and cores,
-  building on the read-only environment discovery already shipped above,
-  the same way `ReadOnlyPcsx2Adapter` builds on PCSX2 installation
-  discovery. Not started.
 - Release process discipline: a documented, repeatable release checklist
   tied to the pinned toolchain (see [`docs/release-checklist.md`](docs/release-checklist.md)).
 

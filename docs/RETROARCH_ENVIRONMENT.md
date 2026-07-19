@@ -7,12 +7,24 @@ configured directories resolve and exist, and which cores (and core
 metadata) are installed. It makes no filesystem changes, launches no
 process, makes no network call, and loads no core.
 
-This is a **sibling** to the PCSX2 patch-preview adapter boundary
-(`archivefs-core::patch_manager`), not part of it - see
+This was originally built as a **sibling** to the PCSX2 patch-preview
+adapter boundary (`archivefs-core::patch_manager`), not part of it - see
 [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md#emulator-adapter-architecture)
-for why environment discovery and patch preview are kept as independent
-systems. No `patch_manager` code, type, JSON output, or historical plan ID
-was changed to add this feature.
+for why environment discovery and patch preview were originally kept as
+independent systems. No `patch_manager` code, type, JSON output, or
+historical plan ID was changed to add this feature, and none of that
+remains true today either: this module's own public API, behavior, and
+output are completely unchanged.
+
+What has changed since: `patch_manager::retroarch` (the
+`retroarch-patch-preview` command; see
+[`RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md)) now reuses
+`discover_retroarch_environment` and this module's `ReadOnlyHostFilesystem`
+trait directly, rather than rediscovering the same paths a second time.
+That is a one-directional dependency: `patch_manager` now depends on
+`emulator_environment`, but nothing in this module imports from
+`patch_manager`, and this module's own report shape, JSON contract, and
+CLI output are exactly what they were before that dependency existed.
 
 ## What is discovered
 

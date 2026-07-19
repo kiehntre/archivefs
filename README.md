@@ -41,8 +41,9 @@ for the detailed safety model behind these principles.
 - Detects platform from filenames and folder-name aliases, with manual overrides (`library-set-platform`) and persistent custom aliases (`platform-alias-*`) that outrank automatic detection.
 - Reports filename-based duplicate candidates (`duplicates`) - a read-only report, never an automatic cleanup.
 - Builds **managed Library Views**: named, symlink-based organized views of your catalogue (for example, grouped by platform) in a separate directory tree, without moving, copying, or extracting your archives. See [`docs/library-views.md`](docs/library-views.md).
-- Provides a **read-only PCSX2 patch-preview** (`pcsx2-patch-preview`): fetches official PCSX2 patch metadata and shows native/Flatpak installation *candidates* as a non-executable advisory plan. It does not download, verify, install, or enable any patch. PCSX2 is currently the only implemented adapter on an emulator-neutral adapter boundary designed to support additional emulators later - see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
-- Provides **read-only RetroArch environment discovery** (`retroarch-environment`): detects native and Flatpak RetroArch profiles, parses `retroarch.cfg` for a fixed set of configured paths, and inventories installed cores - a sibling to the patch-preview adapter, not part of it. It makes no filesystem changes, spawns no process, and makes no network call - see [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md).
+- Provides a **read-only PCSX2 patch-preview** (`pcsx2-patch-preview`): fetches official PCSX2 patch metadata and shows native/Flatpak installation *candidates* as a non-executable advisory plan. It does not download, verify, install, or enable any patch. PCSX2 is the only implemented `EmulatorAdapter` trait implementation - see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
+- Provides **read-only RetroArch environment discovery** (`retroarch-environment`): detects native and Flatpak RetroArch profiles, parses `retroarch.cfg` for a fixed set of configured paths, and inventories installed cores. It makes no filesystem changes, spawns no process, and makes no network call - see [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md).
+- Provides a **read-only RetroArch cheat/patch destination preview** (`retroarch-patch-preview`): for every catalogued game, previews where a per-game `.cht` cheat file or IPS/BPS/UPS/Xdelta soft-patch sibling file would go, across every discovered RetroArch profile. Builds on the environment discovery above; makes no network call at all and does not implement `EmulatorAdapter` (RetroArch's shape doesn't fit that PCSX2-specific trait) - see [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
@@ -51,10 +52,10 @@ for the detailed safety model behind these principles.
 ## Current limitations
 
 - No automatic patch installation, cheat enabling, or artifact downloading -
-  `pcsx2-patch-preview` is metadata-only preview.
-- No broad multi-emulator support yet - PCSX2 is the first and only
-  concrete patch adapter today; RetroArch environment discovery is
-  read-only and does not launch, configure, or manage RetroArch.
+  `pcsx2-patch-preview` and `retroarch-patch-preview` are preview only.
+- No broad multi-emulator support yet - PCSX2 and RetroArch are the only
+  two emulators with any patch/cheat preview today, and neither launches,
+  configures, or manages the emulator itself.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
@@ -314,6 +315,13 @@ archivefs-cli retroarch-environment
 archivefs-cli retroarch-environment --json
 ```
 
+RetroArch cheat/patch destination preview:
+
+```sh
+archivefs-cli retroarch-patch-preview
+archivefs-cli retroarch-patch-preview --json
+```
+
 Use verbose or debug logging when you need more detail:
 
 ```sh
@@ -403,6 +411,7 @@ Platforms:
 - [Managed library views](docs/library-views.md)
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
+- [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [Watcher](docs/watcher.md)
 - [Provider pipeline](docs/provider-pipeline.md)
 - [Duplicate detector](docs/duplicate-detector.md)

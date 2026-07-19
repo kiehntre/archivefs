@@ -10,11 +10,20 @@
 //! orchestration (fetch, catalogue read, candidate/game matching,
 //! plan/plan-ID assembly) that is still PCSX2-specific for this first
 //! adapter slice - see `docs/PATCH_CHEAT_MANAGER_DESIGN.md`.
+//!
+//! `retroarch` (added after PCSX2) is a second, independent preview: it
+//! does not implement `EmulatorAdapter` and does not produce an
+//! [`AdvisoryPatchPlan`] - see that module's own doc comment for why, and
+//! `docs/RETROARCH_PATCH_PREVIEW.md` for the full design record. Nothing
+//! in this top-level module or in `adapter.rs`/`matching.rs`/`pcsx2.rs`/
+//! `retrieval.rs` was changed to add it; every PCSX2 type, plan ID, JSON
+//! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
 mod matching;
 mod pcsx2;
 mod retrieval;
+mod retroarch;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -34,6 +43,11 @@ pub use pcsx2::{
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
 };
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
+pub use retroarch::{
+    CoreMatchDisposition, DestinationKind, ProposedDestination, RetroArchAdvisoryEntry,
+    RetroArchAdvisoryPlan, RetroArchAdvisorySummary, RetroArchProfileOutcome,
+    preview_retroarch_patch_and_cheat_destinations,
+};
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
 pub const BUILT_IN_SOURCE_NAME: &str = "PCSX2 official patch repository metadata";

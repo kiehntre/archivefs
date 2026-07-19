@@ -52,6 +52,20 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
   [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md). Strictly
   read-only: no file is created, modified, or deleted; no process is
   spawned; no network call is made; no core is loaded.
+- A read-only RetroArch cheat/patch destination preview
+  (`retroarch-patch-preview`): for every present catalogue archive,
+  previews per-game `.cht` cheat destinations (gated on exactly one
+  installed core supporting the archive's own file extension) and IPS/
+  BPS/UPS/Xdelta soft-patch sibling destinations, across every discovered
+  RetroArch profile. Builds directly on the RetroArch environment
+  discovery above rather than rediscovering any path, and makes no
+  network call - unlike PCSX2, no RetroArch metadata source has been
+  reviewed for this milestone. Does not implement `EmulatorAdapter` or
+  produce an `AdvisoryPatchPlan`: RetroArch's multi-root, core-selection-
+  ambiguous shape does not fit that PCSX2-specific trait/type, so this is
+  a separate, narrowly-scoped `RetroArchAdvisoryPlan` instead. No PCSX2
+  type, plan ID, JSON shape, or CLI output was changed. See
+  [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
 
 ### Changed
 

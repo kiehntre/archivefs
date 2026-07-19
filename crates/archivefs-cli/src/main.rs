@@ -9,7 +9,8 @@ use archivefs_core::emulator_environment::retroarch::{
     ResolutionState, RetroArchEnvironmentReport, RetroArchProfile, discover_retroarch_environment,
 };
 use archivefs_core::patch_manager::{
-    AdvisoryPatchPlan, HttpsMetadataFetcher, ReadOnlyPcsx2Adapter,
+    AdvisoryPatchPlan, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
+    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, preview_retroarch_patch_and_cheat_destinations,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -255,6 +256,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_retroarch_environment_report(&report));
+            }
+        }
+        "retroarch-patch-preview" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            if !input_args.is_empty() {
+                return Err("retroarch-patch-preview accepts only --json".into());
+            }
+            let filesystem = HostReadOnlyFilesystem;
+            let environment = DiscoveryEnvironment::from_process_environment();
+            let plan = preview_retroarch_patch_and_cheat_destinations(
+                &filesystem,
+                &environment,
+                &default_database_path()?,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print!("{}", format_retroarch_advisory_plan(&plan));
             }
         }
         "index-build" => {
@@ -946,6 +966,134 @@ fn format_advisory_patch_plan(plan: &AdvisoryPatchPlan) -> String {
                     destination.candidate_kind, destination.display_path
                 )
                 .unwrap();
+            }
+        }
+    }
+    output
+}
+
+fn format_destination(output: &mut String, label: &str, destination: &ProposedDestination) {
+    use std::fmt::Write;
+
+    match destination.kind {
+        DestinationKind::Unsupported => {
+            writeln!(
+                output,
+                "    {label}: unsupported ({})",
+                destination
+                    .unsupported_reason
+                    .unwrap_or("no reason recorded")
+            )
+            .unwrap();
+        }
+        _ => {
+            writeln!(
+                output,
+                "    {label} ({}, not created): {}",
+                destination.derivation,
+                destination
+                    .path
+                    .as_ref()
+                    .map(|path| path.display.as_str())
+                    .unwrap_or("unknown")
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "      parent exists: {} | destination exists: {} | conflict: {}",
+                destination
+                    .parent_exists
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                destination
+                    .destination_exists
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                destination.conflict
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS RetroArch Patch/Cheat Preview").unwrap();
+    writeln!(
+        &mut output,
+        "Advisory only: yes (executable: {})",
+        plan.executable
+    )
+    .unwrap();
+    writeln!(&mut output, "Plan format: {}", plan.format_version).unwrap();
+    writeln!(&mut output, "Plan ID: {}", plan.plan_id).unwrap();
+    writeln!(
+        &mut output,
+        "Read-only: yes (no files were created, modified, or deleted; no core was loaded; no network call was made)"
+    )
+    .unwrap();
+    writeln!(&mut output).unwrap();
+    writeln!(
+        &mut output,
+        "Catalogue archives previewed: {} | exact-core outcomes: {} | ambiguous-core outcomes: {} | unsupported outcomes: {}",
+        plan.summary.catalogue_archives,
+        plan.summary.exact_core_profile_outcomes,
+        plan.summary.ambiguous_core_profile_outcomes,
+        plan.summary.unsupported_profile_outcomes
+    )
+    .unwrap();
+
+    for entry in &plan.entries {
+        writeln!(&mut output).unwrap();
+        writeln!(
+            &mut output,
+            "{} (archive id {})",
+            entry.display_name, entry.archive_id
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  platform: {} | content extension: {}",
+            entry.platform.as_deref().unwrap_or("unknown"),
+            entry.content_extension.as_deref().unwrap_or("unknown")
+        )
+        .unwrap();
+        writeln!(&mut output, "  soft-patch sibling candidates:").unwrap();
+        for destination in &entry.soft_patch_candidates {
+            format_destination(&mut output, "candidate", destination);
+        }
+        for outcome in &entry.profile_outcomes {
+            writeln!(
+                &mut output,
+                "  profile {:?}/{:?}: disposition {:?}",
+                outcome.profile.profile_kind, outcome.profile.scope, outcome.disposition
+            )
+            .unwrap();
+            if let Some(core_stem) = &outcome.matched_core_stem {
+                writeln!(&mut output, "    matched core: {core_stem}").unwrap();
+            }
+            if !outcome.candidate_core_stems.is_empty() {
+                writeln!(
+                    &mut output,
+                    "    candidate cores: {}",
+                    outcome.candidate_core_stems.join(", ")
+                )
+                .unwrap();
+            }
+            format_destination(
+                &mut output,
+                "cheat database root",
+                &outcome.cheat_database_root,
+            );
+            format_destination(
+                &mut output,
+                "per-game cheat file",
+                &outcome.per_game_cheat_file,
+            );
+            for reason in &outcome.reasons {
+                writeln!(&mut output, "    reason: {reason}").unwrap();
             }
         }
     }
@@ -2883,6 +3031,9 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
+    println!(
+        "  retroarch-patch-preview  Preview RetroArch cheat/patch destinations for catalogue games (read-only)"
+    );
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
     println!("  duplicates     Show filename-based duplicate candidates");
@@ -2946,6 +3097,8 @@ fn print_help() {
     println!("  archivefs pcsx2-patch-preview --json");
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
+    println!("  archivefs retroarch-patch-preview");
+    println!("  archivefs retroarch-patch-preview --json");
     println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs library-status");
@@ -3302,6 +3455,222 @@ mod tests {
             ]),
             "the complete format_version=1 installation_candidates shape - field \
              names, field count, string values, and order - must match exactly"
+        );
+    }
+
+    fn retroarch_advisory_fixture() -> RetroArchAdvisoryPlan {
+        use archivefs_core::emulator_environment::EncodedPath;
+        use archivefs_core::emulator_environment::retroarch::{
+            ConfigFileFinding, ConfigReadOutcome, CoreInfoFinding, DirectoryProbeFinding, Evidence,
+            PathFinding, PathPurpose, ProfileRef, ResolutionState,
+        };
+        use archivefs_core::patch_manager::{
+            CoreMatchDisposition, DestinationKind, ProposedDestination, RetroArchAdvisoryEntry,
+            RetroArchAdvisorySummary, RetroArchProfileOutcome,
+        };
+
+        let profile = RetroArchProfile {
+            profile_kind: ProfileKind::Native,
+            scope: ProfileScope::User,
+            evidence: Evidence {
+                executables: vec![EncodedPath::from_path(std::path::Path::new(
+                    "/usr/bin/retroarch",
+                ))],
+                flatpak_metadata_found: false,
+                config_directory_found: true,
+                config_file_found: true,
+            },
+            config_directory: DirectoryProbeFinding {
+                path: EncodedPath::from_path(std::path::Path::new(
+                    "/home/golden/.config/retroarch",
+                )),
+                probe: archivefs_core::emulator_environment::FsProbe::PresentDirectory,
+            },
+            config_file: ConfigFileFinding {
+                path: EncodedPath::from_path(std::path::Path::new(
+                    "/home/golden/.config/retroarch/retroarch.cfg",
+                )),
+                probe: archivefs_core::emulator_environment::FsProbe::PresentFile,
+                read: ConfigReadOutcome::Parsed {
+                    malformed_lines: Vec::new(),
+                    include_detected: false,
+                    complete: true,
+                },
+            },
+            paths: vec![PathFinding {
+                purpose: PathPurpose::Cheats,
+                config_key: "cheat_database_path",
+                configured_value: Some("/home/golden/.config/retroarch/cheats".to_string()),
+                resolution: ResolutionState::ConfiguredResolved,
+                resolved_path: Some(EncodedPath::from_path(std::path::Path::new(
+                    "/home/golden/.config/retroarch/cheats",
+                ))),
+                probe: Some(archivefs_core::emulator_environment::FsProbe::PresentDirectory),
+            }],
+            cores: vec![
+                archivefs_core::emulator_environment::retroarch::CoreFinding {
+                    file_name: EncodedPath::from_path(std::path::Path::new("snes9x_libretro.so")),
+                    full_path: EncodedPath::from_path(std::path::Path::new(
+                        "/cores/snes9x_libretro.so",
+                    )),
+                    core_stem: "snes9x".to_string(),
+                    info: CoreInfoFinding::Found {
+                        display_name: Some("Snes9x".to_string()),
+                        display_version: None,
+                        system_name: Some("Super Nintendo Entertainment System".to_string()),
+                        supported_extensions: vec!["zip".to_string(), "sfc".to_string()],
+                    },
+                },
+            ],
+            diagnostics: Vec::new(),
+        };
+
+        RetroArchAdvisoryPlan {
+            format_version: 1,
+            plan_id: "golden-retroarch-plan-id".to_string(),
+            executable: false,
+            environment: RetroArchEnvironmentReport {
+                format_version: 1,
+                profiles: vec![profile],
+                diagnostics: Vec::new(),
+            },
+            entries: vec![RetroArchAdvisoryEntry {
+                archive_id: 7,
+                display_name: "Chrono Trigger (USA).sfc.zip".to_string(),
+                normalized_name: "chronotriggerusasfczip".to_string(),
+                platform: Some("SNES".to_string()),
+                content_extension: Some("zip".to_string()),
+                soft_patch_candidates: vec![ProposedDestination {
+                    kind: DestinationKind::SoftPatchSibling,
+                    path: Some(EncodedPath::from_path(std::path::Path::new(
+                        "/roms/SNES/Chrono Trigger (USA).sfc.ips",
+                    ))),
+                    file_name: Some(EncodedPath::from_path(std::path::Path::new(
+                        "Chrono Trigger (USA).sfc.ips",
+                    ))),
+                    derivation: "content_basename_soft_patch_sibling",
+                    parent_exists: Some(true),
+                    destination_exists: Some(false),
+                    conflict: false,
+                    unsupported_reason: None,
+                }],
+                profile_outcomes: vec![RetroArchProfileOutcome {
+                    profile: ProfileRef {
+                        profile_kind: ProfileKind::Native,
+                        scope: ProfileScope::User,
+                    },
+                    disposition: CoreMatchDisposition::ExactCore,
+                    matched_core_stem: Some("snes9x".to_string()),
+                    candidate_core_stems: vec!["snes9x".to_string()],
+                    cheat_database_root: ProposedDestination {
+                        kind: DestinationKind::CheatDatabaseRoot,
+                        path: Some(EncodedPath::from_path(std::path::Path::new(
+                            "/home/golden/.config/retroarch/cheats",
+                        ))),
+                        file_name: None,
+                        derivation: "cheat_database_path_config_key",
+                        parent_exists: None,
+                        destination_exists: Some(true),
+                        conflict: false,
+                        unsupported_reason: None,
+                    },
+                    per_game_cheat_file: ProposedDestination {
+                        kind: DestinationKind::PerGameCheatFile,
+                        path: Some(EncodedPath::from_path(std::path::Path::new(
+                            "/home/golden/.config/retroarch/cheats/snes9x/Chrono Trigger (USA).sfc.cht",
+                        ))),
+                        file_name: Some(EncodedPath::from_path(std::path::Path::new(
+                            "Chrono Trigger (USA).sfc.cht",
+                        ))),
+                        derivation: "core_supported_extensions_single_match",
+                        parent_exists: Some(false),
+                        destination_exists: Some(false),
+                        conflict: false,
+                        unsupported_reason: None,
+                    },
+                    reasons: vec![
+                        "exactly one installed core (snes9x) declares this file extension as supported"
+                            .to_string(),
+                    ],
+                }],
+            }],
+            summary: RetroArchAdvisorySummary {
+                catalogue_archives: 1,
+                exact_core_profile_outcomes: 1,
+                ambiguous_core_profile_outcomes: 0,
+                unsupported_profile_outcomes: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn retroarch_advisory_preview_human_output_is_explicitly_read_only_and_advisory() {
+        let plan = retroarch_advisory_fixture();
+        let output = format_retroarch_advisory_plan(&plan);
+
+        assert!(output.contains("ArchiveFS RetroArch Patch/Cheat Preview"));
+        assert!(output.contains("Advisory only: yes (executable: false)"));
+        assert!(output.contains("Plan ID: golden-retroarch-plan-id"));
+        assert!(output.contains(
+            "Read-only: yes (no files were created, modified, or deleted; no core was loaded; no network call was made)"
+        ));
+        assert!(output.contains("Chrono Trigger (USA).sfc.zip (archive id 7)"));
+        assert!(output.contains("platform: SNES | content extension: zip"));
+        assert!(output.contains("disposition ExactCore"));
+        assert!(output.contains("matched core: snes9x"));
+        assert!(
+            output.contains("cheat database root (cheat_database_path_config_key, not created)")
+        );
+        assert!(output.contains(
+            "per-game cheat file (core_supported_extensions_single_match, not created): /home/golden/.config/retroarch/cheats/snes9x/Chrono Trigger (USA).sfc.cht"
+        ));
+        assert!(output.contains("candidate (content_basename_soft_patch_sibling, not created)"));
+    }
+
+    #[test]
+    fn retroarch_advisory_preview_json_uses_stable_shape_and_no_network_or_write_claims() {
+        let plan = retroarch_advisory_fixture();
+        let json = serde_json::to_value(&plan).unwrap();
+
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["executable"], false);
+        assert_eq!(
+            json["entries"][0]["profile_outcomes"][0]["disposition"],
+            "exact_core"
+        );
+        assert_eq!(
+            json["entries"][0]["profile_outcomes"][0]["per_game_cheat_file"]["kind"],
+            "per_game_cheat_file"
+        );
+        assert_eq!(
+            json["entries"][0]["soft_patch_candidates"][0]["kind"],
+            "soft_patch_sibling"
+        );
+    }
+
+    #[test]
+    fn retroarch_advisory_preview_unsupported_destination_is_rendered_without_a_fabricated_path() {
+        use archivefs_core::patch_manager::{DestinationKind, ProposedDestination};
+
+        let mut output = String::new();
+        format_destination(
+            &mut output,
+            "per-game cheat file",
+            &ProposedDestination {
+                kind: DestinationKind::Unsupported,
+                path: None,
+                file_name: None,
+                derivation: "unsupported",
+                parent_exists: None,
+                destination_exists: None,
+                conflict: false,
+                unsupported_reason: Some("multiple_installed_cores_support_extension"),
+            },
+        );
+
+        assert_eq!(
+            output,
+            "    per-game cheat file: unsupported (multiple_installed_cores_support_extension)\n"
         );
     }
 

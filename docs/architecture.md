@@ -8,7 +8,7 @@ Core project principles:
 - Read-only archive mounting: archives are mounted as folder views through `ratarmount`; ArchiveFS does not provide writable archive editing.
 - Never modify user archives: scanner, status, stats, info, watcher, catalogue, library-view, and patch-preview operations read archive metadata and filesystem state but do not rewrite source archive files.
 - Build reusable components before features: commands are thin wrappers over `archivefs-core` types such as `ArchiveScanner`, `ArchiveRecord`, `Database`, `LibraryViewConfig`, and the patch-manager types.
-- Extension points before hardcoding: metadata/health provider traits and, more recently, the `EmulatorAdapter` trait, exist so new sources of information and new emulators can be added without redesigning shared orchestration. The current built-in providers are filename metadata and filesystem health; the current built-in adapter is PCSX2's read-only patch preview.
+- Extension points before hardcoding, but never forced: metadata/health provider traits and the `EmulatorAdapter` trait exist so new sources of information and new emulators can be added without redesigning shared orchestration - but only when a trait genuinely fits. The current built-in providers are filename metadata and filesystem health; PCSX2's read-only patch preview is the current (and only) `EmulatorAdapter` implementation. RetroArch's read-only patch/cheat preview is a second, independent preview built the same way PCSX2's was reviewed - by checking the existing trait against real requirements first - and shipped as its own narrowly-scoped type once that trait genuinely did not fit, rather than weakening the trait to force a fit.
 - The database is additive, never load-bearing for safety: the persistent catalogue (below) caches what the filesystem scanner would discover anyway. Mount, unmount, lazy-unmount, and cleanup code paths read live filesystem and mount state directly and do not depend on the catalogue - see [ADR 0001](adr/0001-persistent-library-database.md).
 
 # High-Level Architecture
@@ -141,7 +141,9 @@ See [`docs/database.md`](database.md) and [`docs/DATABASE_DESIGN.md`](DATABASE_D
 
 ## Emulator environment discovery
 
-`retroarch-environment` discovers the local RetroArch environment: native and Flatpak (user- and system-scope) installation profiles, `retroarch.cfg` location and parse outcome, a fixed set of configured paths, and installed cores with their `.info` metadata. It lives in `archivefs-core::emulator_environment`, a **sibling** to `patch_manager`, not part of it - there is no "game" or "patch" concept here, only "what already exists on disk for this emulator." No `EmulatorAdapter` trait is used or extended; `emulator_environment::retroarch` is a concrete implementation, following the same "no premature generalization" principle that kept `patch_manager::pcsx2` concrete until a second adapter justified extracting `EmulatorAdapter`. It is strictly read-only: no file is created, modified, or deleted, no process is spawned, and no network call is made. See [`docs/RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md) for the full design record, including the primary RetroArch/Flatpak source citations it is based on.
+`retroarch-environment` discovers the local RetroArch environment: native and Flatpak (user- and system-scope) installation profiles, `retroarch.cfg` location and parse outcome, a fixed set of configured paths, and installed cores with their `.info` metadata. It lives in `archivefs-core::emulator_environment`, originally a fully independent sibling to `patch_manager` - there is no "game" or "patch" concept here, only "what already exists on disk for this emulator." It is strictly read-only: no file is created, modified, or deleted, no process is spawned, and no network call is made. See [`docs/RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md) for the full design record, including the primary RetroArch/Flatpak source citations it is based on.
+
+`retroarch-patch-preview` is the second concrete preview built on `patch_manager`, after PCSX2's. It reuses `emulator_environment::retroarch`'s discovery directly (the one intentional crossing of the "sibling, not part of" boundary above) rather than rediscovering any path, and for every present catalogue archive previews per-game `.cht` cheat and IPS/BPS/UPS/Xdelta soft-patch sibling destinations across every discovered RetroArch profile. It deliberately does **not** implement `EmulatorAdapter` or produce an `AdvisoryPatchPlan`: RetroArch's several purpose-tagged directories per installation and its core-selection ambiguity (which installed core would load a given file) do not fit PCSX2's single-`data_root`, single-hypothetical-path shape, so it ships as an independent `patch_manager::retroarch` module with its own `RetroArchAdvisoryPlan` type instead - no PCSX2 type, plan ID, JSON shape, or CLI output changed. It also makes no network call at all: unlike PCSX2, no RetroArch metadata source has been reviewed. See [`docs/RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md) for the full design record, including the primary RetroArch source citations the cheat/patch destination conventions are based on.
 
 # Watcher
 
@@ -200,9 +202,10 @@ The testing philosophy is to keep dangerous behavior behind abstractions and use
 See [`/ROADMAP.md`](../ROADMAP.md) for the full, current roadmap. At the
 architecture level, the main open extension points are:
 
-- Additional `EmulatorAdapter` *patch-preview* implementations beyond PCSX2
-  (RetroArch is the planned next one, building on the environment
-  discovery already shipped) on the boundary in
+- Additional emulator patch/cheat previews beyond PCSX2 and RetroArch,
+  each independently reviewed for whether `EmulatorAdapter` genuinely
+  fits or whether (as with RetroArch) a separate, narrowly-scoped
+  advisory type is more honest - see
   [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
 - Richer, hash-based duplicate detection beyond today's filename-based
   `FilenameDuplicateDetector`, described in
