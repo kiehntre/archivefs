@@ -5,8 +5,9 @@ use std::sync::OnceLock;
 
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
-    ConfigReadOutcome, CoreInfoFinding, DiscoveryEnvironment, ProfileKind, ProfileScope,
-    ResolutionState, RetroArchEnvironmentReport, RetroArchProfile, discover_retroarch_environment,
+    ConfigAssociation, ConfigReadOutcome, CoreInfoFinding, DiscoveryEnvironment, ProfileKind,
+    ProfileScope, ResolutionState, RetroArchEnvironmentReport, RetroArchProfile,
+    discover_retroarch_environment,
 };
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CoreSelectionSource, DestinationKind, HttpsMetadataFetcher,
@@ -1259,6 +1260,34 @@ fn write_profile_body(output: &mut String, profile: &RetroArchProfile) {
     )
     .unwrap();
 
+    if !profile.app_images.is_empty() {
+        writeln!(output, "  AppImage candidates:").unwrap();
+        for candidate in &profile.app_images {
+            writeln!(
+                output,
+                "    {} (confidence: {:?}, executable: {}, config: {})",
+                candidate.path.display,
+                candidate.confidence,
+                candidate
+                    .executable
+                    .map(|state| format!("{state:?}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                config_association_summary(&candidate.config_association)
+            )
+            .unwrap();
+            for desktop_match in &candidate.desktop_evidence {
+                writeln!(
+                    output,
+                    "      desktop entry: {} (name evidence: {}, exec: {:?})",
+                    desktop_match.desktop_file.display,
+                    desktop_match.name_evidence,
+                    desktop_match.exec_resolution
+                )
+                .unwrap();
+            }
+        }
+    }
+
     if profile.diagnostics.is_empty() {
         writeln!(output, "  Diagnostics: none").unwrap();
     } else {
@@ -1277,6 +1306,7 @@ fn write_profile_body(output: &mut String, profile: &RetroArchProfile) {
 fn profile_kind_label(kind: ProfileKind) -> &'static str {
     match kind {
         ProfileKind::Native => "Native",
+        ProfileKind::AppImage => "AppImage",
         ProfileKind::Flatpak => "Flatpak",
     }
 }
@@ -1285,6 +1315,20 @@ fn profile_scope_label(scope: ProfileScope) -> &'static str {
     match scope {
         ProfileScope::User => "user",
         ProfileScope::System => "system",
+    }
+}
+
+fn config_association_summary(association: &ConfigAssociation) -> String {
+    match association {
+        ConfigAssociation::SharesNativeProfile => "shared logical profile".to_string(),
+        ConfigAssociation::PortableConfigDetected { config_directory } => {
+            format!("portable config at {}", config_directory.display)
+        }
+        ConfigAssociation::ExplicitConfig { config_directory } => {
+            format!("explicit config at {}", config_directory.display)
+        }
+        ConfigAssociation::Unknown => "unknown".to_string(),
+        ConfigAssociation::Ambiguous => "ambiguous".to_string(),
     }
 }
 
@@ -3575,6 +3619,7 @@ mod tests {
                     diagnostics: Vec::new(),
                     complete: true,
                 },
+            app_images: Vec::new(),
             diagnostics: Vec::new(),
         };
 
@@ -3583,7 +3628,7 @@ mod tests {
             plan_id: "golden-retroarch-plan-id".to_string(),
             executable: false,
             environment: RetroArchEnvironmentReport {
-                format_version: 1,
+                format_version: 2,
                 profiles: vec![profile],
                 diagnostics: Vec::new(),
             },

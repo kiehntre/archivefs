@@ -80,6 +80,26 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
   (`format_version` stays `1` on each, per this project's documented JSON
   policy of allowing new fields without a version bump). See
   [`docs/RETROARCH_PLAYLISTS.md`](docs/RETROARCH_PLAYLISTS.md).
+- Read-only RetroArch AppImage detection: scans a fixed set of default
+  locations (`~/Applications`, `~/.local/bin`,
+  `~/.local/share/applications`, `~/AppImages`, `~/bin`) and your XDG
+  desktop-entry directories for `.desktop` files, entirely read-only and
+  non-recursive, and feeds any detected AppImage into the existing
+  environment/playlist/patch-preview pipeline. An AppImage sharing the
+  native profile's own configuration (the common case) is attached to the
+  existing native profile's new `app_images` field with no new profile
+  created; an AppImage with verified evidence of a genuinely distinct
+  configuration (the official AppImage-runtime portable-mode
+  `.home`/`.config` sibling-directory convention, or an explicit
+  `-c`/`--config` in its desktop launcher) gets its own profile instead,
+  never a duplicate. Never executes, mounts, extracts, or FUSE-mounts an
+  AppImage; never invokes an external tool; never writes or modifies an
+  AppImage or `.desktop` file. Because a distinct-configuration AppImage
+  inserts a 4th `profiles[]` entry between native and Flatpak/user,
+  `retroarch-environment --json`'s `format_version` moves from `1` to `2`;
+  `retroarch-patch-preview` needed no matching/orchestration changes at
+  all, since it already iterates `environment.profiles` generically. See
+  [`docs/RETROARCH_APPIMAGE.md`](docs/RETROARCH_APPIMAGE.md).
 
 ### Changed
 

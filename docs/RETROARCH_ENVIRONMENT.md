@@ -26,11 +26,20 @@ That is a one-directional dependency: `patch_manager` now depends on
 `patch_manager`, and this module's own report shape, JSON contract, and
 CLI output are exactly what they were before that dependency existed.
 
+A later milestone added read-only detection of RetroArch installed as an
+AppImage - see [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md) for the
+full design record. In the common case (an AppImage shares the native
+profile's own configuration) this is purely additive: a new `app_images`
+field on the existing native profile. Only when an AppImage has verified
+evidence of a genuinely distinct configuration directory does a fourth
+profile appear - see "What is discovered" and the JSON contract below.
+
 ## What is discovered
 
-For each of three fixed profiles - native, Flatpak (user scope), and
-Flatpak (system scope) - always reported in that order, even when nothing
-is found for a given profile:
+For native, Flatpak (user scope), and Flatpak (system scope) - always
+reported in that relative order, even when nothing is found for a given
+profile - plus, when a distinct-configuration AppImage was found, one
+additional AppImage profile inserted between native and Flatpak (user):
 
 - **Evidence**: native executables found on `PATH` (deterministic order,
   deduplicated), whether the Flatpak app directory exists for that scope,
@@ -52,6 +61,12 @@ is found for a given profile:
   bounds - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the
   full field/bounds/diagnostics record. Added by a later milestone; the
   rest of this document's own scope is otherwise unchanged.
+- **AppImage candidates** (native and, when it exists, the distinct
+  AppImage profile only - always empty for both Flatpak profiles): every
+  detected AppImage with real evidence of being RetroArch, its
+  identification confidence, executable state, and configuration
+  association - see [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md) for
+  the full record.
 - **Diagnostics**: structured, machine-readable findings (a relative path
   that couldn't be resolved, a configured directory that's missing, an
   `#include` that wasn't followed, an oversized file, ...), sorted
@@ -76,7 +91,9 @@ Also out of scope, deliberately:
   missing - see [Path resolution](#path-resolution) below.
 - More than one native or Flatpak profile (e.g. a portable install) - a
   future `--config <path>` override is a natural, separately-scoped
-  addition.
+  addition. (AppImage installations are the one exception: at most one
+  additional, distinct AppImage profile is now supported - see
+  [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md).)
 - Reading, following, or merging `#include`d config fragments.
 
 ## Native and Flatpak behaviour
@@ -194,11 +211,23 @@ Top level:
 
 ```json
 {
-  "format_version": 1,
-  "profiles": [ /* exactly 3, ordered native/user, flatpak/user, flatpak/system */ ],
+  "format_version": 2,
+  "profiles": [ /* 3 or 4 - see "Profile ordering" below */ ],
   "diagnostics": [ /* report-level only, e.g. a relative XDG_CONFIG_HOME */ ]
 }
 ```
+
+### Profile ordering
+
+`profiles[]` is 3 entries (native, Flatpak/user, Flatpak/system, in that
+order) unless a distinct-configuration AppImage was found, in which case
+it is 4 entries with the new AppImage profile inserted **between** native
+and Flatpak/user: native, AppImage, Flatpak/user, Flatpak/system. This is
+`ProfileKind`'s own derived `Ord` (`Native < AppImage < Flatpak`), which
+profile sorting already relies on. See
+[`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md) for exactly when the
+4th profile appears versus when an AppImage is instead folded into the
+native profile's own `app_images` field.
 
 - All enums serialize as stable `lower_snake_case` strings.
 - Enums that carry data (`ConfigReadOutcome`, `CoreInfoFinding`) use an
@@ -224,13 +253,19 @@ Top level:
   purpose, then path, then entry index. None of this ordering depends on
   filesystem enumeration order.
 - Exact key sets for the report, each profile, each path finding, each
-  core, and the new `playlists`/playlist/entry/content-path shapes are
+  core, and the `playlists`/playlist/entry/content-path shapes are
   locked by regression tests (`json_report_key_sets_are_stable`) - see
   [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the full
-  playlist field documentation.
-- `format_version` stays `1`: the playlist inventory is a purely additive
-  field on each profile, per this project's documented JSON policy
-  (`docs/json-api.md`).
+  playlist field documentation, and [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md)
+  for the `app_images[]` field shape added to each profile.
+- `format_version` is `2` (bumped from `1`): unlike the playlist
+  milestone's purely additive fields, `profiles[]` can now have a 4th
+  element inserted *between* native and Flatpak/user, shifting what index
+  2 (Flatpak/system) means for any consumer that indexed into this array
+  positionally rather than by `profile_kind`. Per this project's
+  documented JSON policy (`docs/json-api.md`), purely additive object
+  fields never require a version bump, but a positional array-shape
+  change like this one does.
 
 There is no `report_id` or snapshot fingerprint in this milestone.
 

@@ -249,7 +249,7 @@ unset).
       "platform": "SNES",
       "content_extension": "zip",
       "soft_patch_candidates": [ /* 4 ProposedDestination, ips/bps/ups/xdelta order */ ],
-      "profile_outcomes": [ /* exactly 3, native/flatpak-user/flatpak-system order */ ]
+      "profile_outcomes": [ /* one per environment.profiles[] entry - 3, or 4 when a distinct AppImage profile exists */ ]
     }
   ],
   "summary": {
@@ -270,8 +270,9 @@ unset).
 - `derivation` and `unsupported_reason` are drawn from a small, fixed set
   of stable identifier-like strings, never free-text prose.
 - `entries[]` is sorted by `archive_id`; `profile_outcomes[]` follows the
-  same fixed native/Flatpak-user/Flatpak-system order as
-  `environment.profiles[]`; `soft_patch_candidates[]` is always in
+  same order (3 or 4 entries, native/[AppImage]/Flatpak-user/Flatpak-system)
+  as `environment.profiles[]` - see [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md)
+  for when the AppImage entry appears; `soft_patch_candidates[]` is always in
   RetroArch's own ips/bps/ups/xdelta try-order. None of this ordering
   depends on filesystem enumeration order, confirmed by
   `plan_entries_are_sorted_by_archive_id_regardless_of_input_order` and
@@ -284,9 +285,22 @@ unset).
   `playlist_evidence` (an array, possibly empty, of matched playlist
   entries naming this archive) and `selected_core_source`
   (`"extension_match"` or `"playlist_evidence"`, `null` when no core was
-  selected). `format_version` stays `1` - see
+  selected). This plan's own top-level `format_version` stays `1` - see
   [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the full
   `playlist_evidence` field shape and the format-version decision.
+- The *embedded* `environment` field's own `format_version` is now `2`
+  (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)), reflecting
+  that `environment.profiles[]` can now be 4 entries when a distinct
+  AppImage profile exists - see
+  [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md). This plan's own
+  `plan_id` hash includes `environment.format_version`, so an
+  AppImage-bearing environment naturally produces a different `plan_id`
+  than one without, with no separate change needed to this plan's own
+  format version. No `patch_manager::retroarch` orchestration code
+  (matching, destination calculation, plan assembly) required any change
+  beyond one `profile_kind_tag` match arm - it already iterates
+  `environment.profiles` generically rather than assuming a fixed count
+  or fixed kinds.
 
 ## Current limitations
 

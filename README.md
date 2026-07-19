@@ -45,6 +45,7 @@ for the detailed safety model behind these principles.
 - Provides **read-only RetroArch environment discovery** (`retroarch-environment`): detects native and Flatpak RetroArch profiles, parses `retroarch.cfg` for a fixed set of configured paths, and inventories installed cores. It makes no filesystem changes, spawns no process, and makes no network call - see [`docs/RETROARCH_ENVIRONMENT.md`](docs/RETROARCH_ENVIRONMENT.md).
 - Provides a **read-only RetroArch cheat/patch destination preview** (`retroarch-patch-preview`): for every catalogued game, previews where a per-game `.cht` cheat file or IPS/BPS/UPS/Xdelta soft-patch sibling file would go, across every discovered RetroArch profile. Builds on the environment discovery above; makes no network call at all and does not implement `EmulatorAdapter` (RetroArch's shape doesn't fit that PCSX2-specific trait) - see [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
 - Strengthens that preview with **read-only RetroArch playlist matching**: parses your existing `.lpl` playlists (never writing or modifying them) to link content and cores with real evidence instead of file-extension guessing alone, resolving ambiguous core matches when the evidence is unambiguous - see [`docs/RETROARCH_PLAYLISTS.md`](docs/RETROARCH_PLAYLISTS.md).
+- Detects **RetroArch installed as an AppImage** (`retroarch-environment`): scans a fixed set of default locations and your XDG desktop-entry directories, read-only and non-recursive, and feeds any found AppImage into the same environment/playlist/patch-preview pipeline as a native install - without ever executing, mounting, or extracting the AppImage, and without creating a duplicate profile when it shares your existing RetroArch configuration. See [`docs/RETROARCH_APPIMAGE.md`](docs/RETROARCH_APPIMAGE.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
@@ -414,6 +415,7 @@ Platforms:
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch playlist identity and content matching](docs/RETROARCH_PLAYLISTS.md)
+- [RetroArch AppImage detection](docs/RETROARCH_APPIMAGE.md)
 - [Watcher](docs/watcher.md)
 - [Provider pipeline](docs/provider-pipeline.md)
 - [Duplicate detector](docs/duplicate-detector.md)

@@ -1389,6 +1389,7 @@ fn profile_kind_tag(kind: crate::emulator_environment::retroarch::ProfileKind) -
     use crate::emulator_environment::retroarch::ProfileKind;
     match kind {
         ProfileKind::Native => b"native",
+        ProfileKind::AppImage => b"app_image",
         ProfileKind::Flatpak => b"flatpak",
     }
 }
@@ -1583,13 +1584,14 @@ mod tests {
                 diagnostics: Vec::new(),
                 complete: true,
             },
+            app_images: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
 
     fn report_with_profiles(profiles: Vec<RetroArchProfile>) -> RetroArchEnvironmentReport {
         RetroArchEnvironmentReport {
-            format_version: 1,
+            format_version: 2,
             profiles,
             diagnostics: Vec::new(),
         }
@@ -2086,6 +2088,8 @@ mod tests {
             path: None,
             user_flatpak_root: home.join(".local/share/flatpak"),
             system_flatpak_root: root.join("var-lib-flatpak-does-not-exist"),
+            app_image_search_roots: Vec::new(),
+            desktop_file_roots: Vec::new(),
         };
 
         let plan = preview_retroarch_patch_and_cheat_destinations(

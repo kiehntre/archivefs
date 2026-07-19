@@ -14,7 +14,9 @@ JSON mode always writes the JSON document to stdout. Human headings, summaries, 
 
 Three other commands support `--json` but document their own schema in a dedicated design document rather than here, since their output is defined alongside a larger feature design: `archivefs pcsx2-patch-preview --json` (see [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)), `archivefs retroarch-environment --json` (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)), and `archivefs retroarch-patch-preview --json` (see [`RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md)). The stability guarantees below apply to all documented JSON output, not only the three commands listed immediately above.
 
-The RetroArch playlist identity/matching milestone added only additive fields to the two RetroArch schemas above (both `format_version`s stay `1`, per the "new fields may be added" guarantee below) - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the playlist-specific field documentation.
+The RetroArch playlist identity/matching milestone added only additive fields to the two RetroArch schemas above (both `format_version`s stayed `1`, per the "new fields may be added" guarantee below) - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the playlist-specific field documentation.
+
+A later RetroArch AppImage-detection milestone bumped `retroarch-environment --json`'s `format_version` from `1` to `2`: unlike a purely additive field, `profiles[]` can now have a 4th (AppImage) entry inserted *between* native and Flatpak/user, which shifts what a positional index like `profiles[2]` means for any consumer that indexed into the array rather than reading each profile's own `profile_kind`. This is the "deliberate JSON API change" case the Stability Guarantees below call out, not the "new fields may be added" case. `retroarch-patch-preview --json`'s own top-level `format_version` stayed `1` - only its *embedded* `environment` field's format_version changed. See [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md) for the full record.
 
 ## `archivefs status --json`
 

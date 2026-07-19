@@ -174,6 +174,15 @@ pub trait ReadOnlyHostFilesystem {
     /// `BoundedListResult::TooLarge` if the directory has more entries;
     /// no partial listing is returned in that case.
     fn list_dir_bounded(&self, path: &Path, max_entries: usize) -> BoundedListResult;
+    /// Whether the executable permission bit is set on a *regular file*,
+    /// checked with `symlink_metadata` (final-component no-follow) -
+    /// distinct from [`Self::probe_executable`], which follows symlinks
+    /// and is used only for `PATH`-based native executable lookup.
+    /// Returns `None` when the final path component is not a regular
+    /// file at all (missing, a symlink, a directory, or inaccessible);
+    /// callers should already have `Self::probe`d the path to
+    /// `FsProbe::PresentFile` before this result is meaningful.
+    fn probe_regular_file_executable_bit(&self, path: &Path) -> Option<bool>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -294,6 +303,15 @@ impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
             });
         }
         BoundedListResult::Ok(entries)
+    }
+
+    fn probe_regular_file_executable_bit(&self, path: &Path) -> Option<bool> {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        Some(metadata.permissions().mode() & 0o111 != 0)
     }
 }
 

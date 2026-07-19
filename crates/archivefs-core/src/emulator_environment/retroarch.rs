@@ -40,6 +40,22 @@ pub const MAX_PLAYLISTS_PER_PROFILE: usize = 1024;
 pub const MAX_ENTRIES_PER_PLAYLIST: usize = 16384;
 pub const MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE: usize = 65536;
 const PLAYLIST_SUFFIX: &str = ".lpl";
+pub const MAX_APPIMAGE_SEARCH_ROOT_ENTRIES: usize = 4096;
+pub const MAX_DESKTOP_FILE_BYTES: usize = 256 * 1024;
+pub const MAX_DESKTOP_FILES_PER_DIRECTORY: usize = 4096;
+const APPIMAGE_SUFFIX: &str = ".appimage";
+const DESKTOP_SUFFIX: &str = ".desktop";
+/// Fixed, documented default AppImage search roots (non-recursive) - see
+/// `docs/RETROARCH_APPIMAGE.md`'s "Detection sources". Deliberately not
+/// `$HOME` itself or any other broad directory; scanning the entire home
+/// directory is explicitly out of scope for this milestone.
+const DEFAULT_APPIMAGE_SEARCH_ROOT_RELATIVE_PATHS: [&str; 5] = [
+    "Applications",
+    ".local/bin",
+    ".local/share/applications",
+    "AppImages",
+    "bin",
+];
 
 /// The only RetroArch path purposes this milestone reports. Declared
 /// order is the fixed emission order for `RetroArchProfile::paths` - it
@@ -99,10 +115,16 @@ const INFO_KEYS: [&str; 4] = [
     "supported_extensions",
 ];
 
+/// Declaration order is deliberately `Native`, `AppImage`, `Flatpak`: this
+/// is also the derived `Ord` used to sort `profiles[]`, and matches the
+/// fixed logical order this milestone documents (native/shared user
+/// profile, then any distinct-config AppImage profiles, then Flatpak
+/// user, then Flatpak system) - see `docs/RETROARCH_APPIMAGE.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileKind {
     Native,
+    AppImage,
     Flatpak,
 }
 
@@ -142,6 +164,9 @@ pub enum DiagnosticCategory {
     /// Playlist directory listing, per-file parsing, and per-entry
     /// findings - see [`RetroArchPlaylistInventory`].
     PlaylistInventory,
+    /// AppImage candidate discovery, desktop-file parsing, and config
+    /// association findings - see [`AppImageCandidate`].
+    AppImageInventory,
 }
 
 /// A structured, machine-readable finding. `code` is the stable
@@ -469,6 +494,134 @@ pub struct RetroArchPlaylistInventory {
     pub complete: bool,
 }
 
+/// Confidence that one AppImage candidate is actually a RetroArch
+/// AppImage - deliberately its own vocabulary (not PCSX2's
+/// `MatchConfidence` or the playlist milestone's `PlaylistMatchConfidence`):
+/// the evidence categories here (filename text, desktop-entry text, exec
+/// resolution) are genuinely different from either. See
+/// `docs/RETROARCH_APPIMAGE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppImageIdentificationConfidence {
+    /// A desktop entry's own `Exec` resolves to exactly this candidate
+    /// *and* the same entry's `Name`/`GenericName`/`StartupWMClass`/`Icon`
+    /// identifies RetroArch.
+    Exact,
+    /// A desktop entry's `Name`/`GenericName`/`StartupWMClass`/`Icon`
+    /// identifies RetroArch, but its `Exec` does not fully resolve to
+    /// this exact candidate (unresolved, a shell wrapper, or a missing
+    /// target) - one strong signal (the name), not two agreeing ones.
+    /// An `Exec` match alone, with no independent name/icon evidence, is
+    /// deliberately *not* enough for this tier - see
+    /// `docs/RETROARCH_APPIMAGE.md` for why (virtually any AppImage with
+    /// an ordinary, unrelated desktop file would otherwise qualify,
+    /// since a desktop entry's `Exec` almost always points at itself).
+    Strong,
+    /// Only the filename itself contains `retroarch` (case-insensitive) -
+    /// never promoted to `Exact`/`Strong` by itself.
+    Weak,
+    /// Multiple, mutually inconsistent pieces of evidence (e.g. two
+    /// different desktop entries both claim this exact file but disagree
+    /// on identity) - never silently resolved to one confidence level.
+    Ambiguous,
+    /// No usable evidence at all (present only structurally; a candidate
+    /// with zero evidence is not reported as a finding in the first
+    /// place, so this value is not expected to appear in practice).
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutableState {
+    Executable,
+    NotExecutable,
+}
+
+/// Result of resolving one desktop entry's own `Exec` value against one
+/// AppImage candidate's path - see [`parse_exec_executable_token`] for the
+/// verified freedesktop.org Desktop Entry Specification grammar this is
+/// based on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExecResolution {
+    /// The `Exec` key's own executable token resolves to exactly this
+    /// candidate's path (matched either by the full path or, when `Exec`
+    /// names a bare filename, by basename).
+    MatchesCandidate,
+    /// `Exec` resolved to a real, well-formed executable token, but it
+    /// names a *different* path than this candidate.
+    MismatchedTarget { target: EncodedPath },
+    /// The executable token names a known shell/wrapper command (`sh`,
+    /// `bash`, `env`, ...) whose real target cannot be determined without
+    /// executing a shell, which this milestone never does.
+    ShellWrapperUnresolved,
+    /// The token resolved to a plausible path, but no such file exists.
+    TargetMissing,
+    /// `Exec` was empty, absent, or could not be tokenized at all.
+    Unresolved,
+}
+
+/// One desktop entry's evidence about one AppImage candidate.
+#[derive(Debug, Clone, Serialize)]
+pub struct DesktopEntryMatch {
+    pub desktop_file: EncodedPath,
+    /// Whether `Name`, `GenericName`, `Icon`, or `StartupWMClass`
+    /// mentions RetroArch (case-insensitive substring match on
+    /// `"retroarch"`).
+    pub name_evidence: bool,
+    pub exec_resolution: ExecResolution,
+}
+
+/// How this AppImage's RetroArch configuration relates to the native
+/// profile's own resolved configuration - see
+/// `docs/RETROARCH_APPIMAGE.md`'s "Configuration association" for the
+/// verified basis of each variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConfigAssociation {
+    /// No evidence of a distinct configuration root was found - this
+    /// AppImage would resolve `HOME`/`XDG_CONFIG_HOME` exactly like the
+    /// native profile (verified: RetroArch's own Linux config resolution
+    /// has no AppImage-specific logic at all).
+    SharesNativeProfile,
+    /// A writable directory named `<AppImage-path>.home` and/or
+    /// `<AppImage-path>.config` exists next to the AppImage - the
+    /// official AppImage `type2-runtime`'s own portable-mode convention,
+    /// which overrides `$HOME`/`$XDG_CONFIG_HOME` before RetroArch ever
+    /// starts, yielding a genuinely distinct resolved config directory.
+    PortableConfigDetected { config_directory: EncodedPath },
+    /// A desktop entry's `Exec` includes `-c`/`--config <path>` (a real,
+    /// verified RetroArch CLI option) naming an explicit config file
+    /// whose parent directory differs from the native profile's own.
+    ExplicitConfig { config_directory: EncodedPath },
+    /// Evidence exists but does not resolve to a specific directory
+    /// (e.g. `--config` present but its value could not be determined).
+    Unknown,
+    /// Two or more pieces of evidence disagree on the resolved
+    /// configuration directory - never silently resolved to one.
+    Ambiguous,
+}
+
+/// One discovered AppImage candidate. A candidate is only ever reported
+/// when at least one piece of evidence (filename or desktop entry)
+/// suggests it might be RetroArch - see [`AppImageIdentificationConfidence`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AppImageCandidate {
+    pub path: EncodedPath,
+    pub probe: FsProbe,
+    /// `None` only when `probe != FsProbe::PresentFile` (a symlink,
+    /// missing, wrong type, or inaccessible candidate has no meaningful
+    /// executable-bit state).
+    pub executable: Option<ExecutableState>,
+    /// Whether the candidate's own filename contains `retroarch`
+    /// case-insensitively.
+    pub filename_evidence: bool,
+    /// Sorted by encoded desktop-file path bytes.
+    pub desktop_evidence: Vec<DesktopEntryMatch>,
+    pub confidence: AppImageIdentificationConfidence,
+    pub config_association: ConfigAssociation,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RetroArchProfile {
     pub profile_kind: ProfileKind,
@@ -479,6 +632,13 @@ pub struct RetroArchProfile {
     pub paths: Vec<PathFinding>,
     pub cores: Vec<CoreFinding>,
     pub playlists: RetroArchPlaylistInventory,
+    /// Every AppImage candidate attributed to this logical profile -
+    /// candidates sharing this profile's own configuration (`Native`) or
+    /// promoted here because they evidence a distinct configuration
+    /// (`AppImage`). Always empty for `Flatpak` profiles: AppImage
+    /// evidence never merges with a Flatpak sandbox's own path roots.
+    /// Sorted by encoded AppImage path bytes.
+    pub app_images: Vec<AppImageCandidate>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -500,23 +660,94 @@ pub struct DiscoveryEnvironment {
     pub path: Option<std::ffi::OsString>,
     pub user_flatpak_root: PathBuf,
     pub system_flatpak_root: PathBuf,
+    /// Bounded, non-recursive AppImage search roots - see
+    /// `docs/RETROARCH_APPIMAGE.md`'s "Detection sources". Production
+    /// code populates this with a small, fixed, documented set of
+    /// directories under `$HOME`; tests inject their own so discovery
+    /// never depends on the real machine's home directory contents.
+    pub app_image_search_roots: Vec<PathBuf>,
+    /// Bounded desktop-file search roots (each is scanned non-recursively
+    /// for `*.desktop` files) - `$XDG_DATA_HOME/applications` plus each
+    /// `$XDG_DATA_DIRS` entry's own `applications` subdirectory.
+    pub desktop_file_roots: Vec<PathBuf>,
 }
 
 impl DiscoveryEnvironment {
     pub fn from_process_environment() -> Self {
         let home = std::env::var_os("HOME");
-        let user_flatpak_root = home
+        let home_path = home.as_ref().map(PathBuf::from);
+        let user_flatpak_root = home_path
             .as_ref()
-            .map(|home| PathBuf::from(home).join(".local/share/flatpak"))
+            .map(|home| home.join(".local/share/flatpak"))
             .unwrap_or_else(|| PathBuf::from(".local/share/flatpak"));
+        let app_image_search_roots = home_path
+            .as_ref()
+            .map(|home| {
+                DEFAULT_APPIMAGE_SEARCH_ROOT_RELATIVE_PATHS
+                    .iter()
+                    .map(|relative| home.join(relative))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let desktop_file_roots = resolve_desktop_file_roots(
+            home_path.as_deref(),
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            std::env::var_os("XDG_DATA_DIRS").as_deref(),
+        );
         Self {
             home,
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             path: std::env::var_os("PATH"),
             user_flatpak_root,
             system_flatpak_root: PathBuf::from("/var/lib/flatpak"),
+            app_image_search_roots,
+            desktop_file_roots,
         }
     }
+}
+
+/// `$XDG_DATA_HOME/applications` plus each `$XDG_DATA_DIRS` entry's own
+/// `applications` subdirectory, per the XDG Base Directory Specification's
+/// documented defaults (`$HOME/.local/share` and
+/// `/usr/local/share:/usr/share` respectively) - applied the same way
+/// this module already applies `XDG_CONFIG_HOME`'s own defaulting rule:
+/// unset, empty, or (for `XDG_DATA_HOME`) relative values fall back to
+/// the default rather than being resolved against an invented base.
+fn resolve_desktop_file_roots(
+    home_dir: Option<&Path>,
+    xdg_data_home: Option<&OsStr>,
+    xdg_data_dirs: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let data_home = match xdg_data_home {
+        Some(value) if !value.is_empty() => {
+            let candidate = PathBuf::from(value);
+            if candidate.is_absolute() {
+                Some(candidate)
+            } else {
+                home_dir.map(|home| home.join(".local/share"))
+            }
+        }
+        _ => home_dir.map(|home| home.join(".local/share")),
+    };
+    if let Some(data_home) = data_home {
+        roots.push(data_home.join("applications"));
+    }
+
+    let data_dirs_value = match xdg_data_dirs {
+        Some(value) if !value.is_empty() => value.as_bytes().to_vec(),
+        _ => b"/usr/local/share:/usr/share".to_vec(),
+    };
+    for directory_bytes in data_dirs_value.split(|&byte| byte == b':') {
+        if directory_bytes.is_empty() {
+            continue;
+        }
+        let directory = PathBuf::from(OsStr::from_bytes(directory_bytes));
+        if directory.is_absolute() {
+            roots.push(directory.join("applications"));
+        }
+    }
+    roots
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,41 +795,97 @@ pub fn discover_retroarch_environment(
     let flatpak_sandbox_home = home_dir.join(".var/app").join(FLATPAK_APP_ID);
     let flatpak_config_dir = flatpak_sandbox_home.join("config").join("retroarch");
 
-    let mut profiles = vec![
-        discover_profile(
+    let (native_profile, native_sort_path, native_diagnostics) = discover_profile(
+        filesystem,
+        ProfileKind::Native,
+        ProfileScope::User,
+        &native_config_dir,
+        &home_dir,
+        environment.path.as_deref(),
+        None,
+    );
+
+    // AppImage/desktop-file discovery is profile-independent scanning
+    // (the same search roots and desktop entries exist regardless of
+    // which RetroArch profile ends up owning the resulting evidence), so
+    // its own diagnostics are report-level, not attributed to one
+    // profile.
+    let desktop_entries = discover_desktop_entries(
+        filesystem,
+        &environment.desktop_file_roots,
+        &mut report_diagnostics,
+    );
+    let appimage_paths = discover_app_image_files(
+        filesystem,
+        &environment.app_image_search_roots,
+        &mut report_diagnostics,
+    );
+    let mut appimage_candidates: Vec<AppImageCandidate> = appimage_paths
+        .iter()
+        .filter_map(|path| {
+            build_app_image_candidate(filesystem, path, &desktop_entries, &native_config_dir)
+        })
+        .collect();
+    appimage_candidates.sort_by(|left, right| left.path.display.cmp(&right.path.display));
+    appimage_candidates.dedup_by(|left, right| left.path.display == right.path.display);
+
+    let partition = partition_by_config_association(appimage_candidates);
+    let mut native_profile = native_profile;
+    native_profile.app_images = partition.shared;
+    if partition.ambiguous_merge_diagnostic {
+        report_diagnostics.push(RawDiagnostic::new(
+            "duplicate_logical_profile_prevented",
+            DiagnosticSeverity::Warning,
+            DiagnosticCategory::AppImageInventory,
+            Some(ProfileRef {
+                profile_kind: ProfileKind::Native,
+                scope: ProfileScope::User,
+            }),
+            None,
+            None,
+        ));
+    }
+
+    let mut profiles = vec![(native_profile, native_sort_path, native_diagnostics)];
+
+    if let Some((distinct_config_dir, distinct_candidates)) = partition.distinct {
+        let (mut distinct_profile, distinct_sort_path, distinct_diagnostics) = discover_profile(
             filesystem,
-            ProfileKind::Native,
+            ProfileKind::AppImage,
             ProfileScope::User,
-            &native_config_dir,
+            &distinct_config_dir,
             &home_dir,
-            environment.path.as_deref(),
             None,
-        ),
-        discover_profile(
+            None,
+        );
+        distinct_profile.app_images = distinct_candidates;
+        profiles.push((distinct_profile, distinct_sort_path, distinct_diagnostics));
+    }
+
+    profiles.push(discover_profile(
+        filesystem,
+        ProfileKind::Flatpak,
+        ProfileScope::User,
+        &flatpak_config_dir,
+        &flatpak_sandbox_home,
+        None,
+        Some(flatpak_metadata_found(
             filesystem,
-            ProfileKind::Flatpak,
-            ProfileScope::User,
-            &flatpak_config_dir,
-            &flatpak_sandbox_home,
-            None,
-            Some(flatpak_metadata_found(
-                filesystem,
-                &environment.user_flatpak_root,
-            )),
-        ),
-        discover_profile(
+            &environment.user_flatpak_root,
+        )),
+    ));
+    profiles.push(discover_profile(
+        filesystem,
+        ProfileKind::Flatpak,
+        ProfileScope::System,
+        &flatpak_config_dir,
+        &flatpak_sandbox_home,
+        None,
+        Some(flatpak_metadata_found(
             filesystem,
-            ProfileKind::Flatpak,
-            ProfileScope::System,
-            &flatpak_config_dir,
-            &flatpak_sandbox_home,
-            None,
-            Some(flatpak_metadata_found(
-                filesystem,
-                &environment.system_flatpak_root,
-            )),
-        ),
-    ];
+            &environment.system_flatpak_root,
+        )),
+    ));
 
     profiles.sort_by(|left, right| {
         (left.0.profile_kind, left.0.scope, &left.1).cmp(&(
@@ -617,7 +904,15 @@ pub fn discover_retroarch_environment(
         .collect();
 
     Ok(RetroArchEnvironmentReport {
-        format_version: 1,
+        // Bumped from 1: `profiles[]` can now contain a 4th element (a
+        // distinct AppImage profile) positioned *between* the native and
+        // Flatpak profiles, which shifts the array index of the
+        // Flatpak/user and Flatpak/system profiles whenever it is
+        // present - a genuine positional-contract change for any
+        // consumer that indexed `profiles[]` by position rather than by
+        // `profile_kind`/`scope`. See `docs/RETROARCH_APPIMAGE.md`'s
+        // "JSON compatibility decision".
+        format_version: 2,
         profiles,
         diagnostics: finalize_diagnostics(report_diagnostics),
     })
@@ -747,6 +1042,7 @@ fn discover_profile(
         paths: path_results.findings,
         cores,
         playlists,
+        app_images: Vec::new(), // filled in by discover_retroarch_environment, native/AppImage profiles only
         diagnostics: Vec::new(), // filled in by the caller after global sort
     };
 
@@ -1732,6 +2028,774 @@ fn discover_playlists(
     }
 }
 
+// ---- AppImage / desktop-file detection ----
+
+struct RawDesktopEntry {
+    entry_type: Option<String>,
+    name: Option<String>,
+    generic_name: Option<String>,
+    exec: Option<String>,
+    try_exec: Option<String>,
+    icon: Option<String>,
+    startup_wm_class: Option<String>,
+    hidden: bool,
+    no_display: bool,
+}
+
+/// Parses only the `[Desktop Entry]` section of a `.desktop` file -
+/// verified against the freedesktop.org Desktop Entry Specification.
+/// Other sections (e.g. `[Desktop Action ...]`) are ignored entirely;
+/// unrecognized keys within `[Desktop Entry]` are also ignored, never
+/// rejected. A non-`Key=Value`, non-comment, non-blank, non-section-header
+/// line inside `[Desktop Entry]` is recorded by one-based line number and
+/// skipped; parsing continues past it. Matches this module's own
+/// first-occurrence-wins duplicate-key convention (already used for
+/// `retroarch.cfg` and `.info` parsing).
+fn parse_desktop_entry(text: &str) -> (RawDesktopEntry, Vec<u32>) {
+    let mut entry = RawDesktopEntry {
+        entry_type: None,
+        name: None,
+        generic_name: None,
+        exec: None,
+        try_exec: None,
+        icon: None,
+        startup_wm_class: None,
+        hidden: false,
+        no_display: false,
+    };
+    let mut malformed_lines = Vec::new();
+    let mut in_desktop_entry_section = false;
+
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line_number = (index + 1) as u32;
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_desktop_entry_section = trimmed == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry_section {
+            continue;
+        }
+        match trimmed.split_once('=') {
+            Some((key, value)) => {
+                let key = key.trim();
+                let value = value.trim();
+                match key {
+                    "Type" => {
+                        entry.entry_type.get_or_insert_with(|| value.to_string());
+                    }
+                    "Name" => {
+                        entry.name.get_or_insert_with(|| value.to_string());
+                    }
+                    "GenericName" => {
+                        entry.generic_name.get_or_insert_with(|| value.to_string());
+                    }
+                    "Exec" => {
+                        entry.exec.get_or_insert_with(|| value.to_string());
+                    }
+                    "TryExec" => {
+                        entry.try_exec.get_or_insert_with(|| value.to_string());
+                    }
+                    "Icon" => {
+                        entry.icon.get_or_insert_with(|| value.to_string());
+                    }
+                    "StartupWMClass" => {
+                        entry
+                            .startup_wm_class
+                            .get_or_insert_with(|| value.to_string());
+                    }
+                    "Hidden" => entry.hidden = entry.hidden || value == "true",
+                    "NoDisplay" => entry.no_display = entry.no_display || value == "true",
+                    _ => {}
+                }
+            }
+            None => malformed_lines.push(line_number),
+        }
+    }
+    (entry, malformed_lines)
+}
+
+/// `Type` absent or exactly `"Application"`, and `Hidden` not `true` - the
+/// only state this milestone treats as a real, evidence-bearing desktop
+/// entry. `NoDisplay=true` does *not* affect this: per spec it only means
+/// "not shown in menus", not "inactive" - it may still be valid evidence.
+fn desktop_entry_is_active(entry: &RawDesktopEntry) -> bool {
+    !entry.hidden
+        && entry
+            .entry_type
+            .as_deref()
+            .is_none_or(|value| value == "Application")
+}
+
+/// Case-insensitive substring check for `"retroarch"` - the one filename/
+/// text evidence signal this milestone uses everywhere identity text is
+/// inspected (AppImage filename, desktop `Name`/`GenericName`/`Icon`/
+/// `StartupWMClass`).
+fn mentions_retroarch(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("retroarch")
+}
+
+fn desktop_entry_name_evidence(entry: &RawDesktopEntry) -> bool {
+    [
+        entry.name.as_deref(),
+        entry.generic_name.as_deref(),
+        entry.icon.as_deref(),
+        entry.startup_wm_class.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(mentions_retroarch)
+}
+
+/// Tokenizes an `Exec` value per the freedesktop.org Desktop Entry
+/// Specification's quoting rules: unquoted tokens are whitespace-
+/// separated; a double-quoted token may contain escaped `"`, `` ` ``,
+/// `$`, and `\` (each unescaped to the literal character); any other
+/// backslash sequence inside quotes is left as-is (matching the spec's
+/// own note that a literal `\\` must appear as `\\\\` to survive both the
+/// general string-escaping rule and this quoting rule - this milestone
+/// does not attempt that second unescaping layer, which only matters for
+/// literal backslashes, never for identifying the executable token).
+/// Returns `None` for an unterminated quote.
+fn tokenize_exec(value: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut chars = value.chars().peekable();
+    loop {
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut token = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next() {
+                    None => return None,
+                    Some('"') => break,
+                    Some('\\') => match chars.next() {
+                        Some(character @ ('"' | '`' | '$' | '\\')) => token.push(character),
+                        Some(other) => {
+                            token.push('\\');
+                            token.push(other);
+                        }
+                        None => return None,
+                    },
+                    Some(character) => token.push(character),
+                }
+            }
+        } else {
+            while let Some(&character) = chars.peek() {
+                if character.is_whitespace() {
+                    break;
+                }
+                token.push(character);
+                chars.next();
+            }
+        }
+        tokens.push(token);
+    }
+    Some(tokens)
+}
+
+/// Known shell/wrapper commands whose real target this milestone never
+/// attempts to resolve - doing so correctly would require a real shell,
+/// which this milestone never invokes.
+const SHELL_WRAPPER_COMMANDS: [&str; 5] = ["sh", "bash", "dash", "zsh", "flatpak-spawn"];
+
+enum ExecTarget {
+    Token(String),
+    ShellWrapper,
+    Empty,
+}
+
+/// Resolves an `Exec` token list down to the single executable text this
+/// milestone will compare against AppImage candidates - conservatively
+/// unwrapping a leading `env NAME=value ...` prefix (a well-defined,
+/// purely textual transformation, never executed), and refusing to look
+/// further into any other recognized shell wrapper.
+fn resolve_exec_target(tokens: &[String]) -> ExecTarget {
+    let mut index = 0;
+    if tokens.first().map(String::as_str) == Some("env") {
+        index = 1;
+        while tokens
+            .get(index)
+            .is_some_and(|token| looks_like_env_assignment(token))
+        {
+            index += 1;
+        }
+    }
+    match tokens.get(index) {
+        None => ExecTarget::Empty,
+        Some(token) => {
+            let basename = Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(token.as_str());
+            if SHELL_WRAPPER_COMMANDS.contains(&basename) {
+                ExecTarget::ShellWrapper
+            } else {
+                ExecTarget::Token(token.clone())
+            }
+        }
+    }
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }
+        None => false,
+    }
+}
+
+/// Compares one already-tokenized `Exec` value's resolved executable
+/// target against one AppImage candidate's real path. A bare (non-
+/// absolute, no path separator) token is compared only by basename - this
+/// milestone does not perform a full `$PATH` lookup for desktop `Exec`
+/// resolution.
+fn exec_resolution_for_candidate(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    target: &ExecTarget,
+    candidate_path: &Path,
+) -> ExecResolution {
+    match target {
+        ExecTarget::Empty => ExecResolution::Unresolved,
+        ExecTarget::ShellWrapper => ExecResolution::ShellWrapperUnresolved,
+        ExecTarget::Token(text) => {
+            if text.starts_with('%') {
+                return ExecResolution::Unresolved;
+            }
+            let token_path = Path::new(text);
+            let is_bare_name = !text.contains('/');
+            let matches = if is_bare_name {
+                token_path.file_name() == candidate_path.file_name()
+            } else {
+                token_path == candidate_path
+            };
+            if matches {
+                return ExecResolution::MatchesCandidate;
+            }
+            if !is_bare_name && filesystem.probe(token_path) == FsProbe::Missing {
+                return ExecResolution::TargetMissing;
+            }
+            ExecResolution::MismatchedTarget {
+                target: EncodedPath::from_path(token_path),
+            }
+        }
+    }
+}
+
+/// Scans an already-tokenized `Exec` value for `-c`/`--config` and
+/// returns the explicit config file path it names, if any - verified
+/// against `retroarch.c`'s own argument parser (`-c`/`--config=FILE` sets
+/// `path_config_file`). `Some(None)` means the flag is present but its
+/// value could not be resolved to a real path (e.g. a field code);
+/// `None` means the flag is simply absent.
+fn exec_explicit_config_value(tokens: &[String]) -> Option<Option<String>> {
+    let mut found: Option<Option<String>> = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let value = if let Some(rest) = token.strip_prefix("--config=") {
+            Some(rest.to_string())
+        } else if token == "--config" || token == "-c" {
+            tokens.get(index + 1).cloned()
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            found = Some(if value.is_empty() || value.starts_with('%') {
+                None
+            } else {
+                Some(value)
+            });
+        }
+        index += 1;
+    }
+    found
+}
+
+fn read_desktop_file(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    path: &Path,
+) -> (Option<RawDesktopEntry>, Vec<RawDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    let entry = match filesystem.read_bounded(path, MAX_DESKTOP_FILE_BYTES) {
+        BoundedReadResult::Ok(bytes) => {
+            let bytes = strip_utf8_bom(&bytes);
+            match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    let (entry, malformed_lines) = parse_desktop_entry(text);
+                    for line in malformed_lines {
+                        let mut diagnostic = RawDiagnostic::new(
+                            "desktop_file_malformed_line",
+                            DiagnosticSeverity::Info,
+                            DiagnosticCategory::AppImageInventory,
+                            None,
+                            None,
+                            Some(path.to_path_buf()),
+                        );
+                        diagnostic.entry_index = Some(line);
+                        diagnostics.push(diagnostic);
+                    }
+                    if !desktop_entry_is_active(&entry) {
+                        diagnostics.push(RawDiagnostic::new(
+                            "desktop_entry_inactive",
+                            DiagnosticSeverity::Info,
+                            DiagnosticCategory::AppImageInventory,
+                            None,
+                            None,
+                            Some(path.to_path_buf()),
+                        ));
+                    }
+                    Some(entry)
+                }
+                Err(_) => {
+                    diagnostics.push(RawDiagnostic::new(
+                        "desktop_file_invalid_utf8",
+                        DiagnosticSeverity::Warning,
+                        DiagnosticCategory::AppImageInventory,
+                        None,
+                        None,
+                        Some(path.to_path_buf()),
+                    ));
+                    None
+                }
+            }
+        }
+        BoundedReadResult::TooLarge => {
+            diagnostics.push(RawDiagnostic::new(
+                "desktop_file_too_large",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::AppImageInventory,
+                None,
+                None,
+                Some(path.to_path_buf()),
+            ));
+            None
+        }
+        _ => None,
+    };
+    (entry, diagnostics)
+}
+
+/// One successfully-parsed, active desktop entry, kept internally with
+/// its own real `PathBuf` (for deterministic sorting and exec-target
+/// comparison) alongside the already-tokenized `Exec` resolution.
+struct DiscoveredDesktopEntry {
+    path: PathBuf,
+    name_evidence: bool,
+    exec_target: Option<ExecTarget>,
+    explicit_config: Option<Option<String>>,
+}
+
+fn discover_desktop_entries(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    roots: &[PathBuf],
+    diagnostics: &mut Vec<RawDiagnostic>,
+) -> Vec<DiscoveredDesktopEntry> {
+    let mut discovered = Vec::new();
+    for root in roots {
+        let entries = match filesystem.list_dir_bounded(root, MAX_DESKTOP_FILES_PER_DIRECTORY) {
+            BoundedListResult::Ok(entries) => entries,
+            BoundedListResult::TooLarge => {
+                diagnostics.push(RawDiagnostic::new(
+                    "appimage_directory_listing_too_large",
+                    DiagnosticSeverity::Warning,
+                    DiagnosticCategory::AppImageInventory,
+                    None,
+                    None,
+                    Some(root.clone()),
+                ));
+                continue;
+            }
+            _ => continue,
+        };
+        for entry in entries {
+            let name_string = entry.file_name.to_string_lossy();
+            if !name_string.to_ascii_lowercase().ends_with(DESKTOP_SUFFIX) {
+                continue;
+            }
+            if entry.probe != FsProbe::PresentFile {
+                continue;
+            }
+            let full_path = root.join(&entry.file_name);
+            let (parsed, mut file_diagnostics) = read_desktop_file(filesystem, &full_path);
+            diagnostics.append(&mut file_diagnostics);
+            let Some(parsed) = parsed else {
+                continue;
+            };
+            if !desktop_entry_is_active(&parsed) {
+                continue;
+            }
+            let name_evidence = desktop_entry_name_evidence(&parsed);
+            let exec_source = parsed.exec.as_deref().or(parsed.try_exec.as_deref());
+            let (exec_target, explicit_config) = match exec_source.map(tokenize_exec) {
+                Some(Some(tokens)) => (
+                    Some(resolve_exec_target(&tokens)),
+                    exec_explicit_config_value(&tokens),
+                ),
+                _ => (None, None),
+            };
+            discovered.push(DiscoveredDesktopEntry {
+                path: full_path,
+                name_evidence,
+                exec_target,
+                explicit_config,
+            });
+        }
+    }
+    discovered.sort_by(|left, right| {
+        os_str_bytes(left.path.as_os_str()).cmp(os_str_bytes(right.path.as_os_str()))
+    });
+    discovered
+}
+
+fn discover_app_image_files(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    roots: &[PathBuf],
+    diagnostics: &mut Vec<RawDiagnostic>,
+) -> Vec<PathBuf> {
+    let mut candidate_paths = Vec::new();
+    for root in roots {
+        let entries = match filesystem.list_dir_bounded(root, MAX_APPIMAGE_SEARCH_ROOT_ENTRIES) {
+            BoundedListResult::Ok(entries) => entries,
+            BoundedListResult::TooLarge => {
+                diagnostics.push(RawDiagnostic::new(
+                    "appimage_directory_listing_too_large",
+                    DiagnosticSeverity::Warning,
+                    DiagnosticCategory::AppImageInventory,
+                    None,
+                    None,
+                    Some(root.clone()),
+                ));
+                continue;
+            }
+            BoundedListResult::NotFound => {
+                // Info, not Warning: most of the fixed default search
+                // roots do not exist for a given user (e.g. `~/AppImages`
+                // is uncommon), so this is expected, routine information,
+                // not something to alarm about - but it is still recorded
+                // so a consumer can see exactly which roots were actually
+                // scanned.
+                diagnostics.push(RawDiagnostic::new(
+                    "appimage_search_root_missing",
+                    DiagnosticSeverity::Info,
+                    DiagnosticCategory::AppImageInventory,
+                    None,
+                    None,
+                    Some(root.clone()),
+                ));
+                continue;
+            }
+            BoundedListResult::Inaccessible => {
+                diagnostics.push(RawDiagnostic::new(
+                    "appimage_search_root_inaccessible",
+                    DiagnosticSeverity::Warning,
+                    DiagnosticCategory::AppImageInventory,
+                    None,
+                    None,
+                    Some(root.clone()),
+                ));
+                continue;
+            }
+            _ => continue,
+        };
+        for entry in entries {
+            let name_string = entry.file_name.to_string_lossy();
+            if !name_string.to_ascii_lowercase().ends_with(APPIMAGE_SUFFIX) {
+                continue;
+            }
+            let full_path = root.join(&entry.file_name);
+            if entry.probe == FsProbe::Symlink {
+                diagnostics.push(RawDiagnostic::new(
+                    "appimage_candidate_symlink",
+                    DiagnosticSeverity::Warning,
+                    DiagnosticCategory::AppImageInventory,
+                    None,
+                    None,
+                    Some(full_path),
+                ));
+                continue;
+            }
+            candidate_paths.push(full_path);
+        }
+    }
+    candidate_paths
+        .sort_by(|left, right| os_str_bytes(left.as_os_str()).cmp(os_str_bytes(right.as_os_str())));
+    candidate_paths.dedup();
+    candidate_paths
+}
+
+/// `<appimage-path>.home`/`<appimage-path>.config` - the official
+/// AppImage `type2-runtime`'s own portable-mode convention (verified:
+/// `set_portable_home_and_config` in `AppImage/type2-runtime`'s
+/// `runtime.c`), which overrides `$HOME`/`$XDG_CONFIG_HOME` for the
+/// launched process before RetroArch itself ever starts. Returns the
+/// resulting effective RetroArch config directory when either sibling
+/// directory is found, using the exact same XDG resolution the native
+/// profile already uses.
+fn portable_config_directory(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    appimage_path: &Path,
+) -> Option<PathBuf> {
+    let mut portable_home = appimage_path.as_os_str().to_os_string();
+    portable_home.push(".home");
+    let portable_home_path = PathBuf::from(portable_home);
+    let portable_home_found = filesystem.probe(&portable_home_path) == FsProbe::PresentDirectory;
+
+    let mut portable_config = appimage_path.as_os_str().to_os_string();
+    portable_config.push(".config");
+    let portable_config_path = PathBuf::from(portable_config);
+    let portable_config_found =
+        filesystem.probe(&portable_config_path) == FsProbe::PresentDirectory;
+
+    if !portable_home_found && !portable_config_found {
+        return None;
+    }
+    let effective_config_home = if portable_config_found {
+        portable_config_path
+    } else {
+        portable_home_path.join(".config")
+    };
+    Some(effective_config_home.join("retroarch"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_app_image_candidate(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    path: &Path,
+    desktop_entries: &[DiscoveredDesktopEntry],
+    native_config_dir: &Path,
+) -> Option<AppImageCandidate> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let filename_evidence = mentions_retroarch(&file_name);
+
+    let mut desktop_evidence = Vec::new();
+    let mut explicit_config_values: Vec<Option<String>> = Vec::new();
+    for desktop_entry in desktop_entries {
+        if !desktop_entry.name_evidence {
+            // A desktop entry that never mentions RetroArch in its own
+            // Name/GenericName/Icon/StartupWMClass is not evidence that
+            // *this* AppImage is RetroArch, even when its `Exec` happens
+            // to resolve to this exact file - every properly-installed
+            // AppImage typically has its own desktop entry whose `Exec`
+            // points at itself, so an exec-match-only rule here would
+            // flag virtually any AppImage that has any desktop file at
+            // all (verified against real installed AppImages during the
+            // real-world smoke test: ES-DE, Heroic, LosslessCut, Vita3K,
+            // and Eden were all falsely flagged before this guard was
+            // added).
+            continue;
+        }
+        let resolution = match &desktop_entry.exec_target {
+            Some(target) => exec_resolution_for_candidate(filesystem, target, path),
+            None => ExecResolution::Unresolved,
+        };
+        if matches!(
+            resolution,
+            ExecResolution::MismatchedTarget { .. } | ExecResolution::TargetMissing
+        ) {
+            // This entry's `Exec` names a specific, different (or
+            // nonexistent) path, so it is not evidence for *this*
+            // existing candidate specifically - it may still be
+            // independently evidence for whichever candidate it does
+            // resolve to.
+            continue;
+        }
+        if resolution == ExecResolution::MatchesCandidate
+            && let Some(explicit_config) = &desktop_entry.explicit_config
+        {
+            explicit_config_values.push(explicit_config.clone());
+        }
+        desktop_evidence.push(DesktopEntryMatch {
+            desktop_file: EncodedPath::from_path(&desktop_entry.path),
+            name_evidence: desktop_entry.name_evidence,
+            exec_resolution: resolution,
+        });
+    }
+
+    if !filename_evidence && desktop_evidence.is_empty() {
+        return None;
+    }
+
+    let confidence = if desktop_evidence.is_empty() {
+        AppImageIdentificationConfidence::Weak
+    } else if desktop_evidence
+        .iter()
+        .any(|entry| entry.exec_resolution == ExecResolution::MatchesCandidate)
+    {
+        AppImageIdentificationConfidence::Exact
+    } else {
+        AppImageIdentificationConfidence::Strong
+    };
+
+    let probe = filesystem.probe(path);
+    let executable = if probe == FsProbe::PresentFile {
+        filesystem
+            .probe_regular_file_executable_bit(path)
+            .map(|bit| {
+                if bit {
+                    ExecutableState::Executable
+                } else {
+                    ExecutableState::NotExecutable
+                }
+            })
+    } else {
+        None
+    };
+
+    let config_association =
+        resolve_config_association(filesystem, path, native_config_dir, &explicit_config_values);
+
+    Some(AppImageCandidate {
+        path: EncodedPath::from_path(path),
+        probe,
+        executable,
+        filename_evidence,
+        desktop_evidence,
+        confidence,
+        config_association,
+    })
+}
+
+fn resolve_config_association(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    appimage_path: &Path,
+    native_config_dir: &Path,
+    explicit_config_values: &[Option<String>],
+) -> ConfigAssociation {
+    // Explicit `--config`/`-c` evidence, when present, is verified
+    // RetroArch-level behavior and takes precedence over the AppImage
+    // runtime's own portable-mode convention (which would be overridden
+    // by RetroArch's own `-c` handling in practice).
+    let mut resolved_explicit: Vec<PathBuf> = Vec::new();
+    let mut unresolved_explicit = false;
+    for value in explicit_config_values {
+        match value {
+            Some(path_text) => {
+                let config_file = PathBuf::from(path_text);
+                if let Some(parent) = config_file.parent() {
+                    resolved_explicit.push(parent.to_path_buf());
+                } else {
+                    unresolved_explicit = true;
+                }
+            }
+            None => unresolved_explicit = true,
+        }
+    }
+    if !resolved_explicit.is_empty() {
+        resolved_explicit.sort();
+        resolved_explicit.dedup();
+        return match resolved_explicit.len() {
+            1 => {
+                let directory = resolved_explicit.into_iter().next().unwrap();
+                if directory == native_config_dir {
+                    ConfigAssociation::SharesNativeProfile
+                } else {
+                    ConfigAssociation::ExplicitConfig {
+                        config_directory: EncodedPath::from_path(&directory),
+                    }
+                }
+            }
+            _ => ConfigAssociation::Ambiguous,
+        };
+    }
+    if unresolved_explicit {
+        return ConfigAssociation::Unknown;
+    }
+
+    match portable_config_directory(filesystem, appimage_path) {
+        Some(directory) if directory == native_config_dir => ConfigAssociation::SharesNativeProfile,
+        Some(directory) => ConfigAssociation::PortableConfigDetected {
+            config_directory: EncodedPath::from_path(&directory),
+        },
+        None => ConfigAssociation::SharesNativeProfile,
+    }
+}
+
+/// Distinct-config candidates found, grouped by resolved directory. When
+/// exactly one distinct directory is agreed upon, that becomes the one
+/// distinct AppImage profile this milestone supports; when candidates
+/// disagree on 2+ distinct directories, no profile is promoted at all
+/// (every such candidate is instead attached to the native profile with
+/// its association downgraded to `Ambiguous`, and a diagnostic recorded) -
+/// a conservative, explicit "do not guess" outcome rather than an
+/// unbounded multi-profile model.
+struct DistinctConfigPartition {
+    shared: Vec<AppImageCandidate>,
+    distinct: Option<(PathBuf, Vec<AppImageCandidate>)>,
+    ambiguous_merge_diagnostic: bool,
+}
+
+fn partition_by_config_association(candidates: Vec<AppImageCandidate>) -> DistinctConfigPartition {
+    let mut shared = Vec::new();
+    let mut distinct_by_directory: BTreeMap<PathBuf, Vec<AppImageCandidate>> = BTreeMap::new();
+    for candidate in candidates {
+        match &candidate.config_association {
+            ConfigAssociation::PortableConfigDetected { config_directory }
+            | ConfigAssociation::ExplicitConfig { config_directory } => {
+                let directory = PathBuf::from(&config_directory.display);
+                distinct_by_directory
+                    .entry(directory)
+                    .or_default()
+                    .push(candidate);
+            }
+            _ => shared.push(candidate),
+        }
+    }
+
+    match distinct_by_directory.len() {
+        0 => DistinctConfigPartition {
+            shared,
+            distinct: None,
+            ambiguous_merge_diagnostic: false,
+        },
+        1 => {
+            let (directory, distinct_candidates) =
+                distinct_by_directory.into_iter().next().unwrap();
+            DistinctConfigPartition {
+                shared,
+                distinct: Some((directory, distinct_candidates)),
+                ambiguous_merge_diagnostic: false,
+            }
+        }
+        _ => {
+            for (_, mut candidates) in distinct_by_directory {
+                for candidate in &mut candidates {
+                    candidate.config_association = ConfigAssociation::Ambiguous;
+                }
+                shared.append(&mut candidates);
+            }
+            DistinctConfigPartition {
+                shared,
+                distinct: None,
+                ambiguous_merge_diagnostic: true,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1774,6 +2838,8 @@ mod tests {
                 path: None,
                 user_flatpak_root: self.path("user-flatpak"),
                 system_flatpak_root: self.path("system-flatpak"),
+                app_image_search_roots: Vec::new(),
+                desktop_file_roots: Vec::new(),
             }
         }
 
@@ -1806,6 +2872,8 @@ mod tests {
             path: None,
             user_flatpak_root: PathBuf::from("/nonexistent"),
             system_flatpak_root: PathBuf::from("/nonexistent"),
+            app_image_search_roots: Vec::new(),
+            desktop_file_roots: Vec::new(),
         };
         assert_eq!(
             discover_retroarch_environment(&filesystem, &env).unwrap_err(),
@@ -1819,13 +2887,14 @@ mod tests {
         let filesystem = HostReadOnlyFilesystem;
         let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
 
-        assert_eq!(report.format_version, 1);
+        assert_eq!(report.format_version, 2);
         assert_eq!(report.profiles.len(), 3);
         for profile in &report.profiles {
             assert!(profile.evidence.executables.is_empty());
             assert!(!profile.evidence.config_directory_found);
             assert!(!profile.evidence.config_file_found);
             assert!(profile.cores.is_empty());
+            assert!(profile.app_images.is_empty());
         }
         assert_eq!(report.profiles[0].profile_kind, ProfileKind::Native);
         assert_eq!(report.profiles[1].profile_kind, ProfileKind::Flatpak);
@@ -2515,9 +3584,13 @@ mod tests {
                 ]
             }"#,
         );
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
 
         let filesystem = HostReadOnlyFilesystem;
-        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
         let json = serde_json::to_value(&report).unwrap();
 
         let mut top_keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
@@ -2530,6 +3603,7 @@ mod tests {
         assert_eq!(
             profile_keys,
             vec![
+                "app_images",
                 "config_directory",
                 "config_file",
                 "cores",
@@ -2622,7 +3696,28 @@ mod tests {
             vec!["archive_member_path", "archive_path", "kind", "raw"]
         );
 
-        assert_eq!(json["format_version"], 1);
+        let app_image = &profile["app_images"][0];
+        let mut app_image_keys: Vec<_> = app_image.as_object().unwrap().keys().cloned().collect();
+        app_image_keys.sort();
+        assert_eq!(
+            app_image_keys,
+            vec![
+                "confidence",
+                "config_association",
+                "desktop_evidence",
+                "executable",
+                "filename_evidence",
+                "path",
+                "probe",
+            ]
+        );
+        assert_eq!(app_image["confidence"], "weak");
+        assert_eq!(
+            app_image["config_association"]["type"],
+            "shares_native_profile"
+        );
+
+        assert_eq!(json["format_version"], 2);
         assert_eq!(profile["profile_kind"], "native");
         assert_eq!(profile["scope"], "user");
         assert_eq!(playlist_entry["content_path"]["kind"], "filesystem");
@@ -3564,6 +4659,808 @@ mod tests {
 
         let before = tree_entries(&fixture.root);
         let _ = fixture.discover_playlists_only();
+        let after = tree_entries(&fixture.root);
+        assert_eq!(before, after);
+    }
+
+    // ---- AppImage discovery ----
+
+    impl Fixture {
+        fn discover_native_app_images(
+            &self,
+            env_mutator: impl FnOnce(&mut DiscoveryEnvironment),
+        ) -> Vec<AppImageCandidate> {
+            let filesystem = HostReadOnlyFilesystem;
+            let mut env = self.env();
+            env_mutator(&mut env);
+            let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+            report.profiles[0].app_images.clone()
+        }
+    }
+
+    #[test]
+    fn appimage_in_applications_directory_is_discovered() {
+        let fixture = Fixture::new("appimage-applications-dir");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].path.display.ends_with("RetroArch.AppImage"));
+    }
+
+    #[test]
+    fn lowercase_appimage_suffix_is_recognized() {
+        let fixture = Fixture::new("appimage-lowercase-suffix");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/retroarch.appimage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn unrelated_appimage_is_ignored() {
+        let fixture = Fixture::new("appimage-unrelated");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/Blender.AppImage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn filename_only_retroarch_candidate_is_weak() {
+        let fixture = Fixture::new("appimage-filename-weak");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch-Linux-x86_64.AppImage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].confidence,
+            AppImageIdentificationConfidence::Weak
+        );
+        assert!(candidates[0].filename_evidence);
+        assert!(candidates[0].desktop_evidence.is_empty());
+    }
+
+    #[test]
+    fn executable_appimage_candidate_reports_executable_state() {
+        let fixture = Fixture::new("appimage-executable");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        make_executable(&fixture.path("Applications/RetroArch.AppImage"));
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(candidates[0].executable, Some(ExecutableState::Executable));
+    }
+
+    #[test]
+    fn non_executable_appimage_candidate_reports_not_executable() {
+        let fixture = Fixture::new("appimage-non-executable");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(
+            candidates[0].executable,
+            Some(ExecutableState::NotExecutable)
+        );
+    }
+
+    #[test]
+    fn symlink_appimage_candidate_is_rejected_and_reported() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("appimage-symlink");
+        fixture.mkdir("Applications");
+        fixture.write("real-retroarch.AppImage", "stub");
+        symlink(
+            fixture.path("real-retroarch.AppImage"),
+            fixture.path("Applications/RetroArch.AppImage"),
+        )
+        .unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(report.profiles[0].app_images.is_empty());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "appimage_candidate_symlink")
+        );
+    }
+
+    #[test]
+    fn non_utf8_appimage_filename_is_discovered_and_serializes_lossily() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = Fixture::new("appimage-non-utf8-name");
+        fixture.mkdir("Applications");
+        let raw_name = std::ffi::OsString::from_vec(b"retroarch-\xFF-bad.AppImage".to_vec());
+        fs::write(fixture.path("Applications").join(&raw_name), "stub").unwrap();
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].path.lossy);
+        let json = serde_json::to_string(&candidates[0]).unwrap();
+        assert!(json.contains("\"lossy\":true"));
+    }
+
+    #[test]
+    fn appimage_candidates_are_sorted_deterministically() {
+        let fixture = Fixture::new("appimage-sorted");
+        fixture.mkdir("Applications");
+        for name in [
+            "zeta-retroarch.AppImage",
+            "mid-retroarch.AppImage",
+            "alpha-retroarch.AppImage",
+        ] {
+            fixture.write(&format!("Applications/{name}"), "stub");
+        }
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        let names: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.path.display.clone())
+            .collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(names, sorted_names);
+        assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn appimage_directory_listing_limit_is_enforced() {
+        let fixture = Fixture::new("appimage-listing-limit");
+        fixture.mkdir("Applications");
+        for index in 0..(MAX_APPIMAGE_SEARCH_ROOT_ENTRIES + 5) {
+            fixture.write(&format!("Applications/file{index}.txt"), "x");
+        }
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(report.profiles[0].app_images.is_empty());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "appimage_directory_listing_too_large")
+        );
+    }
+
+    #[test]
+    fn missing_appimage_search_root_is_diagnosed_but_not_an_error() {
+        let fixture = Fixture::new("appimage-missing-root");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("does-not-exist")];
+        });
+        assert!(candidates.is_empty());
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("does-not-exist")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "appimage_search_root_missing")
+        );
+    }
+
+    #[test]
+    fn no_recursive_scanning_of_appimage_search_roots() {
+        let fixture = Fixture::new("appimage-no-recursion");
+        fixture.mkdir("Applications/nested");
+        fixture.write("Applications/nested/RetroArch.AppImage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert!(candidates.is_empty());
+    }
+
+    // ---- Desktop file parsing ----
+
+    #[test]
+    fn valid_retroarch_desktop_entry_is_matched_with_exact_confidence() {
+        let fixture = Fixture::new("desktop-valid");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/RetroArch.AppImage");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={} %f\nIcon=retroarch\n",
+                appimage_path.display()
+            ),
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].confidence,
+            AppImageIdentificationConfidence::Exact
+        );
+        assert_eq!(candidates[0].desktop_evidence.len(), 1);
+        assert!(candidates[0].desktop_evidence[0].name_evidence);
+        assert_eq!(
+            candidates[0].desktop_evidence[0].exec_resolution,
+            ExecResolution::MatchesCandidate
+        );
+    }
+
+    #[test]
+    fn quoted_exec_path_is_tokenized_correctly() {
+        let fixture = Fixture::new("desktop-quoted-exec");
+        fixture.mkdir("Applications with spaces");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications with spaces/RetroArch.AppImage");
+        fixture.write("Applications with spaces/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec=\"{}\" %f\n",
+                appimage_path.display()
+            ),
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications with spaces")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].desktop_evidence[0].exec_resolution,
+            ExecResolution::MatchesCandidate
+        );
+    }
+
+    #[test]
+    fn exec_with_field_codes_still_resolves_to_the_executable_token() {
+        let fixture = Fixture::new("desktop-field-codes");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/RetroArch.AppImage");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={} %U\n",
+                appimage_path.display()
+            ),
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(
+            candidates[0].desktop_evidence[0].exec_resolution,
+            ExecResolution::MatchesCandidate
+        );
+    }
+
+    #[test]
+    fn hidden_desktop_entry_is_inactive_and_not_used_as_evidence() {
+        let fixture = Fixture::new("desktop-hidden");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/game.AppImage");
+        fixture.write("Applications/game.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nHidden=true\nExec={}\n",
+                appimage_path.display()
+            ),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        env.desktop_file_roots = vec![fixture.path("desktop")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(report.profiles[0].app_images.is_empty());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "desktop_entry_inactive")
+        );
+    }
+
+    #[test]
+    fn malformed_desktop_file_line_is_reported_and_parsing_continues() {
+        let fixture = Fixture::new("desktop-malformed");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/RetroArch.AppImage");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nnot a valid line\nName=RetroArch\nExec={}\n",
+                appimage_path.display()
+            ),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        env.desktop_file_roots = vec![fixture.path("desktop")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert_eq!(report.profiles[0].app_images.len(), 1);
+        assert_eq!(
+            report.profiles[0].app_images[0].confidence,
+            AppImageIdentificationConfidence::Exact
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "desktop_file_malformed_line")
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_desktop_file_is_reported_and_skipped() {
+        let fixture = Fixture::new("desktop-invalid-utf8");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fs::write(
+            fixture.path("desktop/retroarch.desktop"),
+            [b'[', 0xFF, 0xFE, b']'],
+        )
+        .unwrap();
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        env.desktop_file_roots = vec![fixture.path("desktop")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "desktop_file_invalid_utf8")
+        );
+    }
+
+    #[test]
+    fn oversized_desktop_file_is_reported() {
+        let fixture = Fixture::new("desktop-oversized");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        let padding = "#".repeat(MAX_DESKTOP_FILE_BYTES + 1);
+        fixture.write("desktop/retroarch.desktop", &padding);
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        env.desktop_file_roots = vec![fixture.path("desktop")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "desktop_file_too_large")
+        );
+    }
+
+    #[test]
+    fn shell_wrapper_exec_is_unresolved_not_guessed() {
+        let fixture = Fixture::new("desktop-shell-wrapper");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec=sh -c \"/some/script.sh\"\n",
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        // The desktop entry's own Name identifies RetroArch, so it is
+        // still evidence (Strong) even though its shell-wrapped Exec
+        // cannot be resolved to confirm this exact candidate.
+        assert_eq!(
+            candidates[0].confidence,
+            AppImageIdentificationConfidence::Strong
+        );
+        assert_eq!(candidates[0].desktop_evidence.len(), 1);
+        assert_eq!(
+            candidates[0].desktop_evidence[0].exec_resolution,
+            ExecResolution::ShellWrapperUnresolved
+        );
+    }
+
+    #[test]
+    fn env_wrapper_exec_is_handled_conservatively() {
+        let fixture = Fixture::new("desktop-env-wrapper");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/RetroArch.AppImage");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec=env SDL_VIDEODRIVER=wayland {}\n",
+                appimage_path.display()
+            ),
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(
+            candidates[0].desktop_evidence[0].exec_resolution,
+            ExecResolution::MatchesCandidate
+        );
+    }
+
+    #[test]
+    fn desktop_exec_target_missing_is_reported() {
+        let fixture = Fixture::new("desktop-exec-missing");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={}\n",
+                fixture.path("Applications/DoesNotExist.AppImage").display()
+            ),
+        );
+        // No candidate at all is produced for the (missing) exec target,
+        // since it never resolves to the one real candidate that does
+        // exist; the real candidate is still Weak from its own filename.
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].desktop_evidence.is_empty());
+        assert_eq!(
+            candidates[0].confidence,
+            AppImageIdentificationConfidence::Weak
+        );
+    }
+
+    #[test]
+    fn desktop_exec_mismatch_does_not_attach_to_the_wrong_candidate() {
+        let fixture = Fixture::new("desktop-exec-mismatch");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write("Applications/OtherRetroArchTool.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={}\n",
+                fixture.path("Applications/RetroArch.AppImage").display()
+            ),
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(candidates.len(), 2);
+        let exact = candidates
+            .iter()
+            .find(|candidate| candidate.path.display.ends_with("RetroArch.AppImage"))
+            .unwrap();
+        let weak = candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .path
+                    .display
+                    .ends_with("OtherRetroArchTool.AppImage")
+            })
+            .unwrap();
+        assert_eq!(exact.confidence, AppImageIdentificationConfidence::Exact);
+        assert_eq!(weak.confidence, AppImageIdentificationConfidence::Weak);
+        assert!(weak.desktop_evidence.is_empty());
+    }
+
+    #[test]
+    fn unrelated_appimages_own_self_pointing_desktop_entry_is_never_evidence() {
+        // Regression test for a real-world false positive found during the
+        // Phase 18 smoke test: an ordinary, unrelated AppImage (e.g. a
+        // video editor) ships its own desktop entry whose Exec naturally
+        // points at itself. That coincidental Exec match must never, by
+        // itself, be treated as evidence that the AppImage is RetroArch -
+        // only a desktop entry that itself mentions RetroArch counts.
+        let fixture = Fixture::new("desktop-unrelated-self-pointing");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/LosslessCut.AppImage");
+        fixture.write("Applications/LosslessCut.AppImage", "stub");
+        fixture.write(
+            "desktop/losslesscut.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=LosslessCut\nComment=Lossless video/audio editor\nExec={} --no-sandbox %f\n",
+                appimage_path.display()
+            ),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        env.desktop_file_roots = vec![fixture.path("desktop")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert!(
+            report.profiles[0].app_images.is_empty(),
+            "an unrelated AppImage with only its own non-RetroArch desktop entry must not be reported as a candidate at all"
+        );
+    }
+
+    // ---- Configuration association ----
+
+    #[test]
+    fn appimage_with_no_evidence_of_a_distinct_config_shares_the_native_profile() {
+        let fixture = Fixture::new("config-shares-native");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+        });
+        assert_eq!(
+            candidates[0].config_association,
+            ConfigAssociation::SharesNativeProfile
+        );
+    }
+
+    #[test]
+    fn portable_config_sibling_directory_is_detected_as_a_distinct_profile() {
+        let fixture = Fixture::new("config-portable");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.mkdir("Applications/RetroArch.AppImage.config");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+
+        // A genuinely distinct config directory was found, so this
+        // becomes its own logical profile rather than staying attached to
+        // native.
+        assert_eq!(report.profiles.len(), 4);
+        let appimage_profile = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_kind == ProfileKind::AppImage)
+            .unwrap();
+        assert_eq!(appimage_profile.app_images.len(), 1);
+        assert!(matches!(
+            appimage_profile.app_images[0].config_association,
+            ConfigAssociation::PortableConfigDetected { .. }
+        ));
+        assert!(report.profiles[0].app_images.is_empty());
+    }
+
+    #[test]
+    fn portable_home_sibling_directory_alone_also_yields_a_distinct_config() {
+        let fixture = Fixture::new("config-portable-home-only");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.mkdir("Applications/RetroArch.AppImage.home");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert_eq!(report.profiles.len(), 4);
+        let appimage_profile = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_kind == ProfileKind::AppImage)
+            .unwrap();
+        assert!(matches!(
+            appimage_profile.app_images[0].config_association,
+            ConfigAssociation::PortableConfigDetected { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_config_flag_creates_a_distinct_appimage_profile() {
+        let fixture = Fixture::new("config-explicit");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.mkdir("custom-config-dir");
+        let appimage_path = fixture.path("Applications/RetroArch.AppImage");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={} --config {}\n",
+                appimage_path.display(),
+                fixture.path("custom-config-dir/retroarch.cfg").display(),
+            ),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        env.desktop_file_roots = vec![fixture.path("desktop")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+
+        assert_eq!(report.profiles.len(), 4);
+        let appimage_profile = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_kind == ProfileKind::AppImage)
+            .unwrap();
+        assert_eq!(
+            appimage_profile.config_directory.path.display,
+            fixture.path("custom-config-dir").display().to_string()
+        );
+        assert!(matches!(
+            appimage_profile.app_images[0].config_association,
+            ConfigAssociation::ExplicitConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn unresolvable_explicit_config_value_is_unknown_not_a_guess() {
+        let fixture = Fixture::new("config-unresolvable");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        let appimage_path = fixture.path("Applications/RetroArch.AppImage");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={} --config %f\n",
+                appimage_path.display()
+            ),
+        );
+        let candidates = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
+        assert_eq!(candidates[0].config_association, ConfigAssociation::Unknown);
+    }
+
+    #[test]
+    fn two_appimages_sharing_native_config_produce_one_logical_profile() {
+        let fixture = Fixture::new("config-two-share-native");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write("Applications/RetroArch2.AppImage", "stub");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert_eq!(report.profiles.len(), 3);
+        assert_eq!(report.profiles[0].app_images.len(), 2);
+    }
+
+    #[test]
+    fn two_appimages_with_the_same_distinct_config_produce_one_appimage_profile() {
+        let fixture = Fixture::new("config-two-same-distinct");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write("Applications/RetroArch2.AppImage", "stub");
+        fixture.mkdir("Applications/RetroArch.AppImage.config");
+        fixture.mkdir("Applications/RetroArch2.AppImage.config");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        // Both resolve to *different* portable config directories (each
+        // AppImage's own `.config` sibling), so this is the ambiguous
+        // multi-distinct-directory case, not a single shared profile.
+        assert_eq!(report.profiles.len(), 3);
+        assert_eq!(report.profiles[0].app_images.len(), 2);
+        assert!(
+            report.profiles[0]
+                .app_images
+                .iter()
+                .all(|candidate| candidate.config_association == ConfigAssociation::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn ambiguous_distinct_configs_prevent_a_duplicate_profile_and_are_reported() {
+        let fixture = Fixture::new("config-ambiguous-merge");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write("Applications/RetroArch2.AppImage", "stub");
+        fixture.mkdir("Applications/RetroArch.AppImage.config");
+        fixture.mkdir("Applications/RetroArch2.AppImage.config");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert_eq!(
+            report.profiles.len(),
+            3,
+            "no duplicate AppImage profile should be created when evidence disagrees"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "duplicate_logical_profile_prevented")
+        );
+    }
+
+    #[test]
+    fn flatpak_profiles_never_receive_appimage_evidence() {
+        let fixture = Fixture::new("config-flatpak-never-merges");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots = vec![fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        for profile in &report.profiles {
+            if profile.profile_kind == ProfileKind::Flatpak {
+                assert!(profile.app_images.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn deduplication_uses_byte_safe_paths_not_display_strings() {
+        // Two candidates resolved from overlapping search roots (the same
+        // real path reachable via two configured roots) must be
+        // deduplicated to one entry, using the real path bytes - not
+        // string equality on a lossy display form.
+        let fixture = Fixture::new("dedup-byte-safe");
+        fixture.mkdir("Applications");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        let filesystem = HostReadOnlyFilesystem;
+        let mut env = fixture.env();
+        env.app_image_search_roots =
+            vec![fixture.path("Applications"), fixture.path("Applications")];
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert_eq!(report.profiles[0].app_images.len(), 1);
+    }
+
+    #[test]
+    fn no_appimage_or_desktop_file_is_ever_modified() {
+        let fixture = Fixture::new("appimage-no-writes");
+        fixture.mkdir("Applications");
+        fixture.mkdir("desktop");
+        fixture.write("Applications/RetroArch.AppImage", "stub");
+        fixture.write(
+            "desktop/retroarch.desktop",
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec=/nonexistent\n",
+        );
+
+        fn tree_entries(root: &Path) -> Vec<PathBuf> {
+            fn visit(root: &Path, current: &Path, entries: &mut Vec<PathBuf>) {
+                let mut children: Vec<_> = fs::read_dir(current)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                children.sort();
+                for child in children {
+                    entries.push(child.strip_prefix(root).unwrap().to_path_buf());
+                    if child.is_dir() {
+                        visit(root, &child, entries);
+                    }
+                }
+            }
+            let mut entries = Vec::new();
+            visit(root, root, &mut entries);
+            entries
+        }
+
+        let before = tree_entries(&fixture.root);
+        let _ = fixture.discover_native_app_images(|env| {
+            env.app_image_search_roots = vec![fixture.path("Applications")];
+            env.desktop_file_roots = vec![fixture.path("desktop")];
+        });
         let after = tree_entries(&fixture.root);
         assert_eq!(before, after);
     }

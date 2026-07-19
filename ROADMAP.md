@@ -91,6 +91,17 @@ These are implemented, tested, and in current use today:
   written or modified. Purely additive to both `retroarch-environment
   --json` and `retroarch-patch-preview --json`; see
   [`docs/RETROARCH_PLAYLISTS.md`](docs/RETROARCH_PLAYLISTS.md).
+- Read-only RetroArch AppImage detection: scans a fixed set of default
+  locations and XDG desktop-entry directories for RetroArch AppImages -
+  many users' primary way of running RetroArch on Linux - and feeds any
+  found AppImage into the existing environment/playlist/patch-preview
+  pipeline without ever executing, mounting, or extracting it, and
+  without creating a duplicate profile when it shares the existing
+  RetroArch configuration. `retroarch-environment --json`'s
+  `format_version` moved from `1` to `2` for this, since a
+  distinct-configuration AppImage inserts a 4th profile into a previously
+  fixed-length, positionally-relied-upon array; see
+  [`docs/RETROARCH_APPIMAGE.md`](docs/RETROARCH_APPIMAGE.md).
 
 ## Current development
 
