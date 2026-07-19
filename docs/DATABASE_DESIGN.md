@@ -1,8 +1,11 @@
 # ArchiveFS Persistent Library Database: Design
 
-Status: design only. No database code exists yet. This document proposes a small,
-additive SQLite-backed catalogue that sits alongside the existing filesystem-scanning
-core, not underneath it.
+Status: implemented foundation. This document records the small, additive
+SQLite-backed catalogue that sits alongside the existing filesystem-scanning
+core, not underneath it. The live filename is `library.sqlite3` (not the early
+`library.db` proposal retained in historical passages below), and migrations 1
+through 3 are implemented. Read-only health diagnosis and copy-first recovery
+guidance are in [`DATABASE_RECOVERY.md`](DATABASE_RECOVERY.md).
 
 This is a narrower, more immediately actionable document than the existing
 [`docs/database.md`](database.md), which sketches a longer-horizon

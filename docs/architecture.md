@@ -121,7 +121,7 @@ each group does, not every flag.
 
 ## Persistent catalogue and multi-source management
 
-`library-status` shows the persistent library database's health and counts. `health` shows catalogue archive health (missing entries, unknown platform) without scanning, mounting, or unmounting. `library-scan` scans configured source folders into the database. `library-list` and `library-find` read from the database without rescanning.
+`library-status` shows the persistent library database's health and counts. `database-check` is the separate safety-oriented diagnostic: it uses explicit SQLite read-only flags, never creates the database or its parent, never migrates, and reports sidecars and stable error categories. `health` shows catalogue archive health (missing entries, unknown platform) without scanning, mounting, or unmounting. `library-scan` scans configured source folders into the database. `library-list` and `library-find` read from the database without rescanning. Recovery remains a documented, copy-first manual workflow; see [`DATABASE_RECOVERY.md`](DATABASE_RECOVERY.md).
 
 `library-set-platform` / `library-clear-platform` (and their `-bulk` variants) record manual platform overrides that outrank automatic detection. `library-remove-missing` removes catalogue rows whose source file is gone by exact id/path - it never deletes files.
 

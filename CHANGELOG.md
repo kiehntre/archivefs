@@ -17,6 +17,13 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
 
 ### Added
 
+- `database-check` and `database-check --json`: bounded, structured,
+  explicitly read-only SQLite health diagnostics with main-file metadata,
+  rollback-journal/WAL/SHM evidence, journal mode, schema version,
+  `quick_check`, and stable error classifications. The command never creates,
+  migrates, repairs, checkpoints, or deletes database files. See
+  [`docs/DATABASE_RECOVERY.md`](docs/DATABASE_RECOVERY.md).
+
 - Managed library views: named, symlink-based organized views of the
   catalogue (`view list`, `view preview`, `view apply`, `view repair`,
   `view remove`), backed by `~/.config/archivefs/library_views.json` and a

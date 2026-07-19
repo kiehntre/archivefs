@@ -20,11 +20,14 @@ use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
-    Database, DatabaseHealth, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
-    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, SourceFolderRecord,
-    SourceScanStatus, check_database_health, default_database_path, format_unix_timestamp_utc,
-    latest_schema_version, persisted_archive_has_unknown_platform, scan_and_persist,
+    Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
+    DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
+    DatabaseHealthReport, DatabaseOpenOutcome, DatabaseSidecarFinding, DatabaseSidecarKind,
+    MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, PlatformProvenanceDetails, RegisteredSourceFolder,
+    ScanPersistSummary, ScanRunCounts, SourceFolderRecord, SourceScanStatus, check_database_health,
+    default_database_path, diagnose_database, format_unix_timestamp_utc, latest_schema_version,
+    persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 mod inspector;

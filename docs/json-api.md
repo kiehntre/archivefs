@@ -5,6 +5,7 @@ This document describes ArchiveFS command output that is intended for programmat
 Commands that currently support JSON output:
 
 ```sh
+archivefs database-check --json
 archivefs status --json
 archivefs stats --json
 archivefs info <archive> --json
@@ -17,6 +18,45 @@ Three other commands support `--json` but document their own schema in a dedicat
 The RetroArch playlist identity/matching milestone added only additive fields to the two RetroArch schemas above (both `format_version`s stayed `1`, per the "new fields may be added" guarantee below) - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the playlist-specific field documentation.
 
 A later RetroArch AppImage-detection milestone bumped `retroarch-environment --json`'s `format_version` from `1` to `2`: unlike a purely additive field, `profiles[]` can now have a 4th (AppImage) entry inserted *between* native and Flatpak/user, which shifts what a positional index like `profiles[2]` means for any consumer that indexed into the array rather than reading each profile's own `profile_kind`. This is the "deliberate JSON API change" case the Stability Guarantees below call out, not the "new fields may be added" case. `retroarch-patch-preview --json`'s own top-level `format_version` stayed `1` - only its *embedded* `environment` field's format_version changed. See [`RETROARCH_APPIMAGE.md`](RETROARCH_APPIMAGE.md) for the full record.
+
+## `archivefs database-check --json`
+
+`database-check` is a read-only database diagnostic. Its top-level key set is
+stable and exact:
+
+```text
+format_version
+database_path
+database_present
+main_file
+sidecars
+open_outcome
+journal_mode
+quick_check
+integrity_check
+schema_version
+diagnostics
+```
+
+`format_version` is currently `1`. `database_path` and every sidecar path use
+the byte-safe `{ "display": string, "lossy": boolean }` representation.
+`open_outcome` is one of `opened_read_only`, `missing_database`, or `failed`.
+Check statuses are `ok`, `failed`, `error`, or `not_run`. The bounded default
+runs `quick_check`; `integrity_check` is present as `not_run` rather than
+silently doing an unbounded full check.
+
+Every diagnostic has `code`, `severity`, `message`,
+`sqlite_extended_code`, and `raw_sqlite_message`. Codes are stable
+lower-snake-case values including `missing_database`, `permission_denied`,
+`database_locked`, `database_busy`, `rollback_journal_present`, `wal_present`,
+`shm_present`, `corrupt_database`, `malformed_database`,
+`integrity_check_failed`, `schema_version_unsupported`, `migration_failed`,
+`io_error`, and `sqlite_error`. `raw_sqlite_message` is explicitly unstable
+presentation detail and must not be parsed. Sidecar presence is reported as
+evidence and never treated as proof of corruption.
+
+The command never creates a missing file or parent directory, runs a migration,
+changes journal mode, checkpoints WAL, deletes a sidecar, or repairs data.
 
 ## `archivefs status --json`
 

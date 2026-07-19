@@ -18,19 +18,19 @@ use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
     CatalogueHealthReport, CatalogueStats, CompletedScanSummary, Config, ConfigCheckReport,
-    ConfigCheckStatus, Database, DatabaseHealth, DoctorReport, DuplicateDetector, DuplicateEntry,
-    DuplicateReport, FilenameDuplicateDetector, LibraryViewApplyOutcome, LibraryViewApplyReport,
-    LibraryViewConfig, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry,
-    MissingArchiveRemovalResult, MountPlan, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, ScanPersistSummary, SourceAvailability, SourceFolderView,
-    WatchRebuildSummary, add_source_folder_default, apply_library_view_default,
-    build_and_write_archive_index, canonical_platform_names, catalogue_health_report,
-    check_archive_index_freshness, check_database_health, clean_mount_root,
-    cleanup_selected_mount_dir, current_archive_info, current_archive_stats, current_statuses,
-    default_database_path, default_index_path, find_archive_index_entries, latest_schema_version,
-    list_source_folder_views_default, load_library_view_configs_default,
-    load_source_folder_configs_default, mount_archives, mount_one_archive,
-    persisted_archive_has_unknown_platform, preview_library_view_default,
+    ConfigCheckStatus, Database, DatabaseHealth, DatabaseHealthReport, DoctorReport,
+    DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
+    LibraryViewApplyOutcome, LibraryViewApplyReport, LibraryViewConfig, LibraryViewPlan,
+    LibraryViewPlanAction, LibraryViewPlanEntry, MissingArchiveRemovalResult, MountPlan,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    SourceAvailability, SourceFolderView, WatchRebuildSummary, add_source_folder_default,
+    apply_library_view_default, build_and_write_archive_index, canonical_platform_names,
+    catalogue_health_report, check_archive_index_freshness, check_database_health,
+    clean_mount_root, cleanup_selected_mount_dir, current_archive_info, current_archive_stats,
+    current_statuses, default_database_path, default_index_path, diagnose_database,
+    find_archive_index_entries, latest_schema_version, list_source_folder_views_default,
+    load_library_view_configs_default, load_source_folder_configs_default, mount_archives,
+    mount_one_archive, persisted_archive_has_unknown_platform, preview_library_view_default,
     read_default_archive_index, remove_library_view_default, remove_source_folder_default,
     repair_library_view_default, resolve_source_folder_identifier, run_config_check_default,
     run_doctor_default, scan_all_enabled_sources_default, scan_and_persist,
@@ -316,6 +316,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_status_json(&view)?;
             } else {
                 print_library_status(&view);
+            }
+        }
+        "database-check" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            if !input_args.is_empty() {
+                return Err("database-check accepts only --json".into());
+            }
+            let report = diagnose_database(default_database_path()?);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_database_health_report(&report));
             }
         }
         "health" => {
@@ -1489,6 +1502,78 @@ fn print_library_status(view: &LibraryStatusView) {
 fn print_library_status_json(view: &LibraryStatusView) -> Result<(), serde_json::Error> {
     println!("{}", format_library_status_json(view)?);
     Ok(())
+}
+
+fn format_database_health_report(report: &DatabaseHealthReport) -> String {
+    let mut output = String::new();
+    output.push_str("ArchiveFS Database Check\n\n");
+    output.push_str(&format!(
+        "Database: {}{}\n",
+        report.database_path.display,
+        if report.database_path.lossy {
+            " (lossy display)"
+        } else {
+            ""
+        }
+    ));
+    output.push_str(&format!("Present: {}\n", yes_no(report.database_present)));
+    output.push_str(&format!("Open outcome: {:?}\n", report.open_outcome));
+    if let Some(file) = &report.main_file {
+        output.push_str(&format!("Size: {} bytes\n", file.size_bytes));
+        if let Some(mode) = file.permissions_mode {
+            output.push_str(&format!("Permissions: {mode:04o}\n"));
+        }
+        if let (Some(uid), Some(gid)) = (file.owner_uid, file.group_gid) {
+            output.push_str(&format!("Owner UID/GID: {uid}/{gid}\n"));
+        }
+        if let Some(inode) = file.inode {
+            output.push_str(&format!("Inode: {inode}\n"));
+        }
+        if let Some(modified) = file.modified_unix_seconds {
+            output.push_str(&format!("Modified: {modified} Unix seconds\n"));
+        }
+    }
+    output.push_str(&format!(
+        "Journal mode: {}\n",
+        report.journal_mode.as_deref().unwrap_or("not readable")
+    ));
+    output.push_str(&format!(
+        "Schema version: {}\n",
+        report
+            .schema_version
+            .map_or_else(|| "not readable".to_string(), |value| value.to_string())
+    ));
+    output.push_str(&format!("Quick check: {:?}\n", report.quick_check.status));
+    output.push_str(&format!(
+        "Integrity check: {:?} (not run by the bounded default diagnostic)\n",
+        report.integrity_check.status
+    ));
+    output.push_str("Sidecars:\n");
+    for sidecar in &report.sidecars {
+        let size = sidecar
+            .size_bytes
+            .map_or_else(|| "-".to_string(), |value| format!("{value} bytes"));
+        output.push_str(&format!(
+            "  {:?}: {} ({size})\n",
+            sidecar.kind,
+            if sidecar.present { "present" } else { "absent" }
+        ));
+    }
+    output.push_str("Diagnostics:\n");
+    if report.diagnostics.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for diagnostic in &report.diagnostics {
+            output.push_str(&format!(
+                "  {:?}: {}\n",
+                diagnostic.code, diagnostic.message
+            ));
+            if let Some(raw) = &diagnostic.raw_sqlite_message {
+                output.push_str(&format!("    SQLite detail (unstable): {raw}\n"));
+            }
+        }
+    }
+    output
 }
 
 fn format_library_status_json(view: &LibraryStatusView) -> Result<String, serde_json::Error> {
@@ -3138,6 +3223,7 @@ fn print_help() {
     println!("  index-show     Show a summary of the JSON archive index");
     println!("  index-find     Find entries in the JSON archive index");
     println!("  library-status Show the persistent library database's health and counts");
+    println!("  database-check Safely inspect database health (read-only; optional --json)");
     println!(
         "  health         Show catalogue archive health (missing, unknown platform) - no scan, mount, or unmount"
     );
@@ -3192,6 +3278,8 @@ fn print_help() {
     println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs library-status");
+    println!("  archivefs database-check");
+    println!("  archivefs database-check --json");
     println!("  archivefs library-scan");
     println!("  archivefs library-list");
     println!("  archivefs library-list --unknown-only");
@@ -4377,6 +4465,31 @@ mod tests {
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
         }
+    }
+
+    #[test]
+    fn database_check_human_and_json_output_are_deterministic() {
+        let root = temp_dir("database-check-output");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let report = diagnose_database(&database_path);
+
+        let human = format_database_health_report(&report);
+        assert_eq!(human, format_database_health_report(&report));
+        assert!(human.starts_with("ArchiveFS Database Check\n\n"));
+        assert!(human.contains("Quick check: Ok"));
+        assert!(human.contains("RollbackJournal: absent"));
+
+        let first_json = serde_json::to_string_pretty(&report).unwrap();
+        let second_json = serde_json::to_string_pretty(&report).unwrap();
+        assert_eq!(first_json, second_json);
+        let value: serde_json::Value = serde_json::from_str(&first_json).unwrap();
+        assert_eq!(value["format_version"], 1);
+        assert_eq!(value["open_outcome"], "opened_read_only");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

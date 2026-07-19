@@ -33,6 +33,9 @@ These are implemented, tested, and in current use today:
 - A persistent SQLite-backed library catalogue (`archivefs-core::database`),
   additive to and never a dependency of mount/unmount safety - see
   [`docs/adr/0001-persistent-library-database.md`](docs/adr/0001-persistent-library-database.md).
+- Read-only database diagnosis (`database-check`, including stable JSON), with
+  sidecar evidence, bounded consistency checking, and recovery guidance that
+  never performs automatic repair.
 - Multi-source folder management (`sources`, `source add/enable/disable/scan/remove`)
   with independent per-source scan status.
 - Manual platform assignment and persistent folder-name platform aliases

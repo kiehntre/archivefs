@@ -26,10 +26,12 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+
+use crate::emulator_environment::EncodedPath;
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
@@ -132,7 +134,7 @@ impl Database {
     }
 
     /// Opens an existing, current-schema catalogue with SQLite's read-only
-    /// flag and `PRAGMA query_only`. This path never creates parent
+    /// flag. This path never creates parent
     /// directories, creates a database, applies migrations, repairs state, or
     /// obtains a write-capable connection. It is intended for advisory
     /// features whose safety contract requires the catalogue to remain
@@ -156,15 +158,6 @@ impl Database {
                 path.display()
             ))
         })?;
-        connection
-            .pragma_update(None, "query_only", true)
-            .map_err(|error| {
-                ArchiveFsError::Database(format!(
-                    "failed to enforce read-only query mode for {}: {error}",
-                    path.display()
-                ))
-            })?;
-
         let current_version = schema_version(&connection)?;
         let expected_version = latest_known_version(MIGRATIONS);
         if current_version != expected_version {
@@ -208,6 +201,398 @@ impl Database {
         self.connection
             .close()
             .map_err(|(_, error)| ArchiveFsError::Database(error.to_string()))
+    }
+}
+
+/// Stable diagnostic categories. Sidecar presence is evidence only: it is
+/// deliberately never classified as corruption or as proof of a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseDiagnosticCode {
+    MissingDatabase,
+    PermissionDenied,
+    DatabaseLocked,
+    DatabaseBusy,
+    RollbackJournalPresent,
+    WalPresent,
+    ShmPresent,
+    CorruptDatabase,
+    MalformedDatabase,
+    IntegrityCheckFailed,
+    SchemaVersionUnsupported,
+    MigrationFailed,
+    IoError,
+    SqliteError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DatabaseDiagnostic {
+    pub code: DatabaseDiagnosticCode,
+    pub severity: DatabaseDiagnosticSeverity,
+    pub message: String,
+    /// SQLite's numeric extended result code, when the evidence came from SQLite.
+    pub sqlite_extended_code: Option<i32>,
+    /// Unstable presentation detail from SQLite. Consumers must use `code`.
+    pub raw_sqlite_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DatabaseFileFinding {
+    pub path: EncodedPath,
+    pub size_bytes: u64,
+    pub permissions_mode: Option<u32>,
+    pub owner_uid: Option<u32>,
+    pub group_gid: Option<u32>,
+    pub inode: Option<u64>,
+    pub modified_unix_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DatabaseSidecarFinding {
+    pub kind: DatabaseSidecarKind,
+    pub path: EncodedPath,
+    pub present: bool,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseSidecarKind {
+    RollbackJournal,
+    Wal,
+    Shm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseOpenOutcome {
+    OpenedReadOnly,
+    MissingDatabase,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseCheckStatus {
+    Ok,
+    Failed,
+    Error,
+    NotRun,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DatabaseCheckOutcome {
+    pub status: DatabaseCheckStatus,
+    pub messages: Vec<String>,
+}
+
+impl DatabaseCheckOutcome {
+    fn not_run() -> Self {
+        Self {
+            status: DatabaseCheckStatus::NotRun,
+            messages: Vec::new(),
+        }
+    }
+}
+
+/// Complete, read-only database diagnosis. The JSON field names and enum
+/// spellings are an API contract; raw SQLite prose is explicitly secondary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DatabaseHealthReport {
+    pub format_version: u32,
+    pub database_path: EncodedPath,
+    pub database_present: bool,
+    pub main_file: Option<DatabaseFileFinding>,
+    pub sidecars: Vec<DatabaseSidecarFinding>,
+    pub open_outcome: DatabaseOpenOutcome,
+    pub journal_mode: Option<String>,
+    pub quick_check: DatabaseCheckOutcome,
+    pub integrity_check: DatabaseCheckOutcome,
+    pub schema_version: Option<i64>,
+    pub diagnostics: Vec<DatabaseDiagnostic>,
+}
+
+/// Inspects an existing catalogue without creating files/directories, running
+/// migrations, changing pragmas, checkpointing WAL, or attempting recovery.
+pub fn diagnose_database(path: impl AsRef<Path>) -> DatabaseHealthReport {
+    let path = path.as_ref();
+    let mut diagnostics = Vec::new();
+    let (database_present, main_file) = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => (true, Some(file_finding(path, &metadata))),
+        Ok(_) => {
+            diagnostics.push(diagnostic(
+                DatabaseDiagnosticCode::IoError,
+                DatabaseDiagnosticSeverity::Error,
+                "configured database path is not a regular file",
+                None,
+            ));
+            (true, None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(error) => {
+            diagnostics.push(io_diagnostic("failed to inspect database file", &error));
+            // The path may exist but be unstatable. Do not mislabel that as a
+            // missing database; the existing I/O diagnostic is the evidence.
+            (true, None)
+        }
+    };
+    let sidecars = [
+        (
+            DatabaseSidecarKind::RollbackJournal,
+            sidecar_path(path, "-journal"),
+        ),
+        (DatabaseSidecarKind::Wal, sidecar_path(path, "-wal")),
+        (DatabaseSidecarKind::Shm, sidecar_path(path, "-shm")),
+    ]
+    .into_iter()
+    .map(|(kind, sidecar_path)| {
+        let metadata = match fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                diagnostics.push(io_diagnostic("failed to inspect database sidecar", &error));
+                None
+            }
+        };
+        let present = metadata.as_ref().is_some_and(|value| value.is_file());
+        if present {
+            let code = match kind {
+                DatabaseSidecarKind::RollbackJournal => {
+                    DatabaseDiagnosticCode::RollbackJournalPresent
+                }
+                DatabaseSidecarKind::Wal => DatabaseDiagnosticCode::WalPresent,
+                DatabaseSidecarKind::Shm => DatabaseDiagnosticCode::ShmPresent,
+            };
+            diagnostics.push(diagnostic(
+                code,
+                DatabaseDiagnosticSeverity::Warning,
+                "sidecar file is present; presence alone does not imply corruption",
+                None,
+            ));
+        }
+        DatabaseSidecarFinding {
+            kind,
+            path: EncodedPath::from_path(&sidecar_path),
+            present,
+            size_bytes: metadata
+                .filter(|value| value.is_file())
+                .map(|value| value.len()),
+        }
+    })
+    .collect();
+
+    let mut report = DatabaseHealthReport {
+        format_version: 1,
+        database_path: EncodedPath::from_path(path),
+        database_present,
+        main_file,
+        sidecars,
+        open_outcome: DatabaseOpenOutcome::MissingDatabase,
+        journal_mode: None,
+        quick_check: DatabaseCheckOutcome::not_run(),
+        integrity_check: DatabaseCheckOutcome::not_run(),
+        schema_version: None,
+        diagnostics,
+    };
+    if !database_present {
+        report.diagnostics.push(diagnostic(
+            DatabaseDiagnosticCode::MissingDatabase,
+            DatabaseDiagnosticSeverity::Error,
+            "configured database does not exist",
+            None,
+        ));
+        return report;
+    }
+
+    let connection = match Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(error) => {
+            report.open_outcome = DatabaseOpenOutcome::Failed;
+            report.diagnostics.push(sqlite_diagnostic(&error));
+            return report;
+        }
+    };
+    // rusqlite defaults to five seconds. A diagnostic should return promptly;
+    // this changes only the connection's busy handler, never database bytes.
+    if let Err(error) = connection.busy_timeout(Duration::from_millis(250)) {
+        push_unique_diagnostic(&mut report.diagnostics, sqlite_diagnostic(&error));
+    }
+    report.open_outcome = DatabaseOpenOutcome::OpenedReadOnly;
+
+    match connection.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0)) {
+        Ok(mode) => report.journal_mode = Some(mode.to_ascii_lowercase()),
+        Err(error) => push_unique_diagnostic(&mut report.diagnostics, sqlite_diagnostic(&error)),
+    }
+    match connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)) {
+        Ok(version) => {
+            report.schema_version = Some(version);
+            if version > latest_known_version(MIGRATIONS) {
+                report.diagnostics.push(diagnostic(
+                    DatabaseDiagnosticCode::SchemaVersionUnsupported,
+                    DatabaseDiagnosticSeverity::Error,
+                    "database schema is newer than this ArchiveFS build supports",
+                    None,
+                ));
+            }
+        }
+        Err(error) => push_unique_diagnostic(&mut report.diagnostics, sqlite_diagnostic(&error)),
+    }
+    report.quick_check = run_check(&connection, "PRAGMA quick_check", &mut report.diagnostics);
+    let _ = connection.close();
+    report
+}
+
+fn run_check(
+    connection: &Connection,
+    sql: &str,
+    diagnostics: &mut Vec<DatabaseDiagnostic>,
+) -> DatabaseCheckOutcome {
+    let result = (|| -> rusqlite::Result<Vec<String>> {
+        let mut statement = connection.prepare(sql)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    })();
+    match result {
+        Ok(messages) if messages.len() == 1 && messages[0].eq_ignore_ascii_case("ok") => {
+            DatabaseCheckOutcome {
+                status: DatabaseCheckStatus::Ok,
+                messages,
+            }
+        }
+        Ok(messages) => {
+            diagnostics.push(diagnostic(
+                DatabaseDiagnosticCode::IntegrityCheckFailed,
+                DatabaseDiagnosticSeverity::Error,
+                "SQLite quick_check reported a consistency failure",
+                None,
+            ));
+            DatabaseCheckOutcome {
+                status: DatabaseCheckStatus::Failed,
+                messages,
+            }
+        }
+        Err(error) => {
+            push_unique_diagnostic(diagnostics, sqlite_diagnostic(&error));
+            DatabaseCheckOutcome {
+                status: DatabaseCheckStatus::Error,
+                messages: Vec::new(),
+            }
+        }
+    }
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn file_finding(path: &Path, metadata: &fs::Metadata) -> DatabaseFileFinding {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    DatabaseFileFinding {
+        path: EncodedPath::from_path(path),
+        size_bytes: metadata.len(),
+        #[cfg(unix)]
+        permissions_mode: Some(metadata.permissions().mode() & 0o7777),
+        #[cfg(not(unix))]
+        permissions_mode: None,
+        #[cfg(unix)]
+        owner_uid: Some(metadata.uid()),
+        #[cfg(not(unix))]
+        owner_uid: None,
+        #[cfg(unix)]
+        group_gid: Some(metadata.gid()),
+        #[cfg(not(unix))]
+        group_gid: None,
+        #[cfg(unix)]
+        inode: Some(metadata.ino()),
+        #[cfg(not(unix))]
+        inode: None,
+        modified_unix_seconds: metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64),
+    }
+}
+
+fn diagnostic(
+    code: DatabaseDiagnosticCode,
+    severity: DatabaseDiagnosticSeverity,
+    message: impl Into<String>,
+    raw: Option<String>,
+) -> DatabaseDiagnostic {
+    DatabaseDiagnostic {
+        code,
+        severity,
+        message: message.into(),
+        sqlite_extended_code: None,
+        raw_sqlite_message: raw,
+    }
+}
+
+fn push_unique_diagnostic(
+    diagnostics: &mut Vec<DatabaseDiagnostic>,
+    diagnostic: DatabaseDiagnostic,
+) {
+    if !diagnostics.iter().any(|existing| existing == &diagnostic) {
+        diagnostics.push(diagnostic);
+    }
+}
+
+fn io_diagnostic(context: &str, error: &std::io::Error) -> DatabaseDiagnostic {
+    let code = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        DatabaseDiagnosticCode::PermissionDenied
+    } else {
+        DatabaseDiagnosticCode::IoError
+    };
+    diagnostic(
+        code,
+        DatabaseDiagnosticSeverity::Error,
+        context,
+        Some(error.to_string()),
+    )
+}
+
+fn sqlite_diagnostic(error: &rusqlite::Error) -> DatabaseDiagnostic {
+    let raw = error.to_string();
+    let (code, extended_code) = match error.sqlite_error() {
+        Some(sqlite) => {
+            let code = match sqlite.code {
+                ErrorCode::PermissionDenied => DatabaseDiagnosticCode::PermissionDenied,
+                ErrorCode::CannotOpen if raw.to_ascii_lowercase().contains("permission denied") => {
+                    DatabaseDiagnosticCode::PermissionDenied
+                }
+                ErrorCode::DatabaseLocked => DatabaseDiagnosticCode::DatabaseLocked,
+                ErrorCode::DatabaseBusy => DatabaseDiagnosticCode::DatabaseBusy,
+                ErrorCode::DatabaseCorrupt => DatabaseDiagnosticCode::CorruptDatabase,
+                ErrorCode::NotADatabase => DatabaseDiagnosticCode::MalformedDatabase,
+                ErrorCode::SystemIoFailure => DatabaseDiagnosticCode::IoError,
+                _ => DatabaseDiagnosticCode::SqliteError,
+            };
+            (code, Some(sqlite.extended_code))
+        }
+        None => (DatabaseDiagnosticCode::SqliteError, None),
+    };
+    DatabaseDiagnostic {
+        code,
+        severity: DatabaseDiagnosticSeverity::Error,
+        message: "SQLite operation failed".to_string(),
+        sqlite_extended_code: extended_code,
+        raw_sqlite_message: Some(raw),
     }
 }
 
@@ -3400,6 +3785,315 @@ mod tests {
         assert!(health.foreign_keys_enabled);
         assert!(health.error.is_none());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_reports_healthy_database_without_writing() {
+        let root = temp_dir("database-diagnostic-healthy");
+        let path = root.join("library.sqlite3");
+        Database::open_or_create(&path).unwrap().close().unwrap();
+        let before = fs::read(&path).unwrap();
+        let before_metadata = fs::metadata(&path).unwrap();
+
+        let report = diagnose_database(&path);
+
+        assert_eq!(report.format_version, 1);
+        assert!(report.database_present);
+        assert_eq!(report.open_outcome, DatabaseOpenOutcome::OpenedReadOnly);
+        assert_eq!(report.schema_version, Some(latest_schema_version()));
+        assert_eq!(report.quick_check.status, DatabaseCheckStatus::Ok);
+        assert_eq!(report.integrity_check.status, DatabaseCheckStatus::NotRun);
+        assert!(report.sidecars.iter().all(|sidecar| !sidecar.present));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().len(), before_metadata.len());
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before_metadata.modified().unwrap()
+        );
+        assert!(!sidecar_path(&path, "-journal").exists());
+        assert!(!sidecar_path(&path, "-wal").exists());
+        assert!(!sidecar_path(&path, "-shm").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_missing_database_creates_nothing() {
+        let root = temp_dir("database-diagnostic-missing");
+        let path = root.join("missing-parent").join("library.sqlite3");
+
+        let report = diagnose_database(&path);
+
+        assert!(!report.database_present);
+        assert_eq!(report.open_outcome, DatabaseOpenOutcome::MissingDatabase);
+        assert_eq!(report.quick_check.status, DatabaseCheckStatus::NotRun);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::MissingDatabase })
+        );
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_reports_sidecars_without_modifying_them() {
+        let root = temp_dir("database-diagnostic-sidecars");
+        let path = root.join("library.sqlite3");
+        Database::open_or_create(&path).unwrap().close().unwrap();
+        let fixtures = [
+            ("-journal", b"journal fixture".as_slice()),
+            ("-wal", b"wal fixture".as_slice()),
+            ("-shm", b"shm fixture".as_slice()),
+        ];
+        for (suffix, bytes) in fixtures {
+            fs::write(sidecar_path(&path, suffix), bytes).unwrap();
+        }
+        let before = fixtures
+            .iter()
+            .map(|(suffix, _)| {
+                let sidecar = sidecar_path(&path, suffix);
+                (
+                    fs::read(&sidecar).unwrap(),
+                    fs::metadata(&sidecar).unwrap().modified().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let report = diagnose_database(&path);
+
+        assert!(report.sidecars.iter().all(|sidecar| sidecar.present));
+        assert_eq!(
+            report
+                .sidecars
+                .iter()
+                .map(|sidecar| sidecar.size_bytes)
+                .collect::<Vec<_>>(),
+            vec![Some(15), Some(11), Some(11)]
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::RollbackJournalPresent })
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DatabaseDiagnosticCode::WalPresent)
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DatabaseDiagnosticCode::ShmPresent)
+        );
+        for (index, (suffix, _)) in fixtures.iter().enumerate() {
+            let sidecar = sidecar_path(&path, suffix);
+            assert_eq!(fs::read(&sidecar).unwrap(), before[index].0);
+            assert_eq!(
+                fs::metadata(&sidecar).unwrap().modified().unwrap(),
+                before[index].1
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_classifies_malformed_database() {
+        let root = temp_dir("database-diagnostic-malformed");
+        let path = root.join("library.sqlite3");
+        fs::write(&path, b"this is not sqlite").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let report = diagnose_database(&path);
+
+        assert!(report.diagnostics.iter().any(|item| {
+            item.code == DatabaseDiagnosticCode::MalformedDatabase
+                || item.code == DatabaseDiagnosticCode::CorruptDatabase
+        }));
+        assert_eq!(report.quick_check.status, DatabaseCheckStatus::Error);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_reports_future_schema_without_migrating() {
+        let root = temp_dir("database-diagnostic-future-schema");
+        let path = root.join("library.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 999).unwrap();
+        connection.close().unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let report = diagnose_database(&path);
+
+        assert_eq!(report.schema_version, Some(999));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::SchemaVersionUnsupported })
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_error_code_classification_is_stable() {
+        let cases = [
+            (
+                rusqlite::ffi::SQLITE_BUSY,
+                DatabaseDiagnosticCode::DatabaseBusy,
+            ),
+            (
+                rusqlite::ffi::SQLITE_LOCKED,
+                DatabaseDiagnosticCode::DatabaseLocked,
+            ),
+            (
+                rusqlite::ffi::SQLITE_PERM,
+                DatabaseDiagnosticCode::PermissionDenied,
+            ),
+            (
+                rusqlite::ffi::SQLITE_CORRUPT,
+                DatabaseDiagnosticCode::CorruptDatabase,
+            ),
+            (
+                rusqlite::ffi::SQLITE_NOTADB,
+                DatabaseDiagnosticCode::MalformedDatabase,
+            ),
+            (rusqlite::ffi::SQLITE_IOERR, DatabaseDiagnosticCode::IoError),
+        ];
+        for (sqlite_code, expected) in cases {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(sqlite_code),
+                Some("fixture".to_string()),
+            );
+            assert_eq!(sqlite_diagnostic(&error).code, expected);
+        }
+    }
+
+    #[test]
+    fn database_diagnostic_code_json_names_are_stable_lower_snake_case() {
+        let cases = [
+            (DatabaseDiagnosticCode::MissingDatabase, "missing_database"),
+            (
+                DatabaseDiagnosticCode::PermissionDenied,
+                "permission_denied",
+            ),
+            (DatabaseDiagnosticCode::DatabaseLocked, "database_locked"),
+            (DatabaseDiagnosticCode::DatabaseBusy, "database_busy"),
+            (
+                DatabaseDiagnosticCode::RollbackJournalPresent,
+                "rollback_journal_present",
+            ),
+            (DatabaseDiagnosticCode::WalPresent, "wal_present"),
+            (DatabaseDiagnosticCode::ShmPresent, "shm_present"),
+            (DatabaseDiagnosticCode::CorruptDatabase, "corrupt_database"),
+            (
+                DatabaseDiagnosticCode::MalformedDatabase,
+                "malformed_database",
+            ),
+            (
+                DatabaseDiagnosticCode::IntegrityCheckFailed,
+                "integrity_check_failed",
+            ),
+            (
+                DatabaseDiagnosticCode::SchemaVersionUnsupported,
+                "schema_version_unsupported",
+            ),
+            (DatabaseDiagnosticCode::MigrationFailed, "migration_failed"),
+            (DatabaseDiagnosticCode::IoError, "io_error"),
+            (DatabaseDiagnosticCode::SqliteError, "sqlite_error"),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&code).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn database_diagnostic_returns_promptly_and_classifies_exclusive_lock() {
+        let root = temp_dir("database-diagnostic-busy");
+        let path = root.join("library.sqlite3");
+        Database::open_or_create(&path).unwrap().close().unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker
+            .execute_batch(
+                "BEGIN EXCLUSIVE; UPDATE schema_migrations SET description = description;",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+
+        let report = diagnose_database(&path);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(report.diagnostics.iter().any(|item| {
+            matches!(
+                item.code,
+                DatabaseDiagnosticCode::DatabaseBusy | DatabaseDiagnosticCode::DatabaseLocked
+            )
+        }));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        blocker.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_json_has_exact_top_level_contract() {
+        let root = temp_dir("database-diagnostic-json-contract");
+        let path = root.join("library.sqlite3");
+        Database::open_or_create(&path).unwrap().close().unwrap();
+        let value = serde_json::to_value(diagnose_database(&path)).unwrap();
+        let mut keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "database_path",
+                "database_present",
+                "diagnostics",
+                "format_version",
+                "integrity_check",
+                "journal_mode",
+                "main_file",
+                "open_outcome",
+                "quick_check",
+                "schema_version",
+                "sidecars",
+            ]
+        );
+        assert_eq!(value["open_outcome"], "opened_read_only");
+        assert_eq!(value["quick_check"]["status"], "ok");
+        assert_eq!(value["integrity_check"]["status"], "not_run");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn database_diagnostic_json_handles_non_utf8_path() {
+        let root = temp_dir("database-diagnostic-non-utf8");
+        let mut bytes = b"library-".to_vec();
+        bytes.push(0x80);
+        bytes.extend_from_slice(b".sqlite3");
+        let path = root.join(OsString::from_vec(bytes));
+        Database::open_or_create(&path).unwrap().close().unwrap();
+
+        let report = diagnose_database(&path);
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(report.database_path.lossy);
+        assert!(json.contains("\\u{fffd}") || json.contains('�'));
         let _ = fs::remove_dir_all(&root);
     }
 

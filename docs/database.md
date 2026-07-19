@@ -1,8 +1,14 @@
 # ArchiveFS Database Schema
 
-This document describes the future SQLite schema for ArchiveFS.
+This document describes the longer-term SQLite schema direction for ArchiveFS.
 
-SQLite is not implemented in v0.1. This is a design reference for later versions that need persistent indexing, health history, retry state, and richer duplicate detection.
+The narrower persistent catalogue is implemented today at
+`~/.local/share/archivefs/library.sqlite3`; its authoritative current schema
+and migrations are described in [`DATABASE_DESIGN.md`](DATABASE_DESIGN.md).
+This file remains a design reference for later versions that need richer
+indexing, health history, retry state, and duplicate detection. Safe diagnosis
+and recovery procedures are documented in
+[`DATABASE_RECOVERY.md`](DATABASE_RECOVERY.md).
 
 ## Goals
 

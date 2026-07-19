@@ -36,7 +36,7 @@ for the detailed safety model behind these principles.
 
 - Scans configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping obvious split-archive continuation parts).
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
-- Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions.
+- Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. `database-check` diagnoses that catalogue read-only without creating, migrating, repairing, or checkpointing it.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
 - Detects platform from filenames and folder-name aliases, with manual overrides (`library-set-platform`) and persistent custom aliases (`platform-alias-*`) that outrank automatic detection.
 - Reports filename-based duplicate candidates (`duplicates`) - a read-only report, never an automatic cleanup.
@@ -285,6 +285,8 @@ Persistent catalogue and multi-source management:
 
 ```sh
 archivefs-cli library-status
+archivefs-cli database-check
+archivefs-cli database-check --json
 archivefs-cli library-scan
 archivefs-cli library-list
 archivefs-cli library-find "007 Legends"
