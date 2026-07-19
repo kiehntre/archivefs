@@ -44,8 +44,9 @@ pub use pcsx2::{
 };
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
 pub use retroarch::{
-    CoreMatchDisposition, DestinationKind, ProposedDestination, RetroArchAdvisoryEntry,
-    RetroArchAdvisoryPlan, RetroArchAdvisorySummary, RetroArchProfileOutcome,
+    CoreAssociation, CoreMatchDisposition, CoreSelectionSource, DestinationKind, PlaylistEvidence,
+    PlaylistMatchConfidence, ProposedDestination, RetroArchAdvisoryEntry, RetroArchAdvisoryPlan,
+    RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
 };
 

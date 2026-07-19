@@ -9,8 +9,9 @@ use archivefs_core::emulator_environment::retroarch::{
     ResolutionState, RetroArchEnvironmentReport, RetroArchProfile, discover_retroarch_environment,
 };
 use archivefs_core::patch_manager::{
-    AdvisoryPatchPlan, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
-    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, preview_retroarch_patch_and_cheat_destinations,
+    AdvisoryPatchPlan, CoreSelectionSource, DestinationKind, HttpsMetadataFetcher,
+    ProposedDestination, ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan,
+    preview_retroarch_patch_and_cheat_destinations,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -1072,7 +1073,12 @@ fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
             )
             .unwrap();
             if let Some(core_stem) = &outcome.matched_core_stem {
-                writeln!(&mut output, "    matched core: {core_stem}").unwrap();
+                let source = match outcome.selected_core_source {
+                    Some(CoreSelectionSource::PlaylistEvidence) => " (from playlist evidence)",
+                    Some(CoreSelectionSource::ExtensionMatch) => " (from core file extension)",
+                    None => "",
+                };
+                writeln!(&mut output, "    matched core: {core_stem}{source}").unwrap();
             }
             if !outcome.candidate_core_stems.is_empty() {
                 writeln!(
@@ -1081,6 +1087,27 @@ fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
                     outcome.candidate_core_stems.join(", ")
                 )
                 .unwrap();
+            }
+            if !outcome.playlist_evidence.is_empty() {
+                writeln!(
+                    &mut output,
+                    "    playlist evidence ({}):",
+                    outcome.playlist_evidence.len()
+                )
+                .unwrap();
+                for evidence in &outcome.playlist_evidence {
+                    writeln!(
+                        &mut output,
+                        "      {} entry {} ({}): confidence {:?}, database: {}, core: {:?}",
+                        evidence.playlist_name,
+                        evidence.entry_index,
+                        evidence.entry_label.as_deref().unwrap_or("(no label)"),
+                        evidence.confidence,
+                        evidence.database_name.as_deref().unwrap_or("unknown"),
+                        evidence.core_association
+                    )
+                    .unwrap();
+                }
             }
             format_destination(
                 &mut output,
@@ -1212,6 +1239,25 @@ fn write_profile_body(output: &mut String, profile: &RetroArchProfile) {
         };
         writeln!(output, "    {}{}", core.file_name.display, info_summary).unwrap();
     }
+
+    let total_playlist_entries: usize = profile
+        .playlists
+        .playlists
+        .iter()
+        .map(|playlist| playlist.entries.len())
+        .sum();
+    writeln!(
+        output,
+        "  Playlists found: {} ({} total entries){}",
+        profile.playlists.playlists.len(),
+        total_playlist_entries,
+        if profile.playlists.complete {
+            ""
+        } else {
+            " [truncated: a bound was reached]"
+        }
+    )
+    .unwrap();
 
     if profile.diagnostics.is_empty() {
         writeln!(output, "  Diagnostics: none").unwrap();
@@ -3522,6 +3568,13 @@ mod tests {
                     },
                 },
             ],
+            playlists:
+                archivefs_core::emulator_environment::retroarch::RetroArchPlaylistInventory {
+                    directory: None,
+                    playlists: Vec::new(),
+                    diagnostics: Vec::new(),
+                    complete: true,
+                },
             diagnostics: Vec::new(),
         };
 
@@ -3562,6 +3615,10 @@ mod tests {
                     disposition: CoreMatchDisposition::ExactCore,
                     matched_core_stem: Some("snes9x".to_string()),
                     candidate_core_stems: vec!["snes9x".to_string()],
+                    selected_core_source: Some(
+                        archivefs_core::patch_manager::CoreSelectionSource::ExtensionMatch,
+                    ),
+                    playlist_evidence: Vec::new(),
                     cheat_database_root: ProposedDestination {
                         kind: DestinationKind::CheatDatabaseRoot,
                         path: Some(EncodedPath::from_path(std::path::Path::new(

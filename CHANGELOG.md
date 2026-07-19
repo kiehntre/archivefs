@@ -66,6 +66,20 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
   a separate, narrowly-scoped `RetroArchAdvisoryPlan` instead. No PCSX2
   type, plan ID, JSON shape, or CLI output was changed. See
   [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
+- Read-only RetroArch playlist identity and content matching: discovers
+  and parses modern JSON `.lpl` playlist files from the already-discovered
+  Playlists directory (bounded at 4 MiB per file, 1024 files and 65536
+  total entries per profile) and uses them as additional evidence in
+  `retroarch-patch-preview` - a playlist entry's own resolved content path,
+  core association, and database name can now upgrade an `AmbiguousCore`/
+  `UnsupportedNoCore` result to a precise `ExactCore` one when the evidence
+  is unambiguous, without ever downgrading an already-correct extension-
+  based match. No playlist is ever written, repaired, or created, and the
+  binary `.rdb` database is never parsed. Purely additive to both
+  `retroarch-environment --json` and `retroarch-patch-preview --json`
+  (`format_version` stays `1` on each, per this project's documented JSON
+  policy of allowing new fields without a version bump). See
+  [`docs/RETROARCH_PLAYLISTS.md`](docs/RETROARCH_PLAYLISTS.md).
 
 ### Changed
 

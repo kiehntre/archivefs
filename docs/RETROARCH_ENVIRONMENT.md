@@ -45,6 +45,13 @@ is found for a given profile:
   directory, sorted by raw filename bytes, each with its optional `.info`
   metadata (`display_name`, `display_version`, `systemname`,
   `supported_extensions`) when present and readable.
+- **Playlist inventory**: every `*.lpl` file in the resolved Playlists
+  directory (sorted by encoded playlist path bytes, non-recursive), each
+  parsed into its declared entries (content path, label, core
+  association, CRC, database name, subsystem fields) subject to fixed
+  bounds - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the
+  full field/bounds/diagnostics record. Added by a later milestone; the
+  rest of this document's own scope is otherwise unchanged.
 - **Diagnostics**: structured, machine-readable findings (a relative path
   that couldn't be resolved, a configured directory that's missing, an
   `#include` that wasn't followed, an oversized file, ...), sorted
@@ -202,17 +209,28 @@ Top level:
   a lossy display string plus an honest flag rather than a
   `serde_json` error.
 - Diagnostics are structured (`code`, `severity`, `detail_kind`,
-  `profile`, `purpose`, `path`) - no free-text `message` field belongs in
-  the stable contract; human wording lives only in the CLI formatter.
+  `profile`, `purpose`, `path`, `entry_index`) - no free-text `message`
+  field belongs in the stable contract; human wording lives only in the
+  CLI formatter. `entry_index` is additive (added for playlist entry-level
+  findings) and is `null` for every pre-existing, non-entry-specific
+  diagnostic.
 - `paths[]` is in a fixed declared order (System, Cores, CoreInfo, Saves,
   SaveStates, Playlists, Shaders, Overlays, Thumbnails, JoypadAutoconfig,
   Database, Cheats); `cores[]` is sorted by raw filename bytes;
+  `playlists.playlists[]` is sorted by encoded playlist path bytes, and
+  each playlist's own `entries[]` preserves the source JSON array's own
+  order (`entry_index` is the zero-based index into that same array);
   `diagnostics[]` is sorted by severity, then code, then profile, then
-  purpose, then path. None of this ordering depends on filesystem
-  enumeration order.
-- Exact key sets for the report, each profile, each path finding, and
-  each core are locked by regression tests
-  (`json_report_key_sets_are_stable`).
+  purpose, then path, then entry index. None of this ordering depends on
+  filesystem enumeration order.
+- Exact key sets for the report, each profile, each path finding, each
+  core, and the new `playlists`/playlist/entry/content-path shapes are
+  locked by regression tests (`json_report_key_sets_are_stable`) - see
+  [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the full
+  playlist field documentation.
+- `format_version` stays `1`: the playlist inventory is a purely additive
+  field on each profile, per this project's documented JSON policy
+  (`docs/json-api.md`).
 
 There is no `report_id` or snapshot fingerprint in this milestone.
 

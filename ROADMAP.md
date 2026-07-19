@@ -82,6 +82,15 @@ These are implemented, tested, and in current use today:
   shape does not fit PCSX2's trait/type, so it is a separate, narrowly-
   scoped `RetroArchAdvisoryPlan` instead; see
   [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
+- Read-only RetroArch playlist identity and content matching: discovers
+  and parses modern JSON `.lpl` playlist files from the already-discovered
+  Playlists directory and uses them as additional catalogue-matching and
+  core-association evidence in `retroarch-patch-preview` - strengthening
+  or resolving what extension-only matching alone leaves ambiguous,
+  without ever downgrading an already-correct result. No playlist is ever
+  written or modified. Purely additive to both `retroarch-environment
+  --json` and `retroarch-patch-preview --json`; see
+  [`docs/RETROARCH_PLAYLISTS.md`](docs/RETROARCH_PLAYLISTS.md).
 
 ## Current development
 

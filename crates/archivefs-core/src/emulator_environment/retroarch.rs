@@ -18,7 +18,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     BoundedListResult, BoundedReadResult, EncodedPath, ExecutableProbe, FsProbe,
@@ -35,6 +35,11 @@ const CORE_SUFFIX: &str = "_libretro.so";
 pub const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INFO_BYTES: usize = 128 * 1024;
 pub const MAX_CORE_DIR_ENTRIES: usize = 4096;
+pub const MAX_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PLAYLISTS_PER_PROFILE: usize = 1024;
+pub const MAX_ENTRIES_PER_PLAYLIST: usize = 16384;
+pub const MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE: usize = 65536;
+const PLAYLIST_SUFFIX: &str = ".lpl";
 
 /// The only RetroArch path purposes this milestone reports. Declared
 /// order is the fixed emission order for `RetroArchProfile::paths` - it
@@ -134,6 +139,9 @@ pub enum DiagnosticCategory {
     PathResolution,
     CoreInventory,
     Filesystem,
+    /// Playlist directory listing, per-file parsing, and per-entry
+    /// findings - see [`RetroArchPlaylistInventory`].
+    PlaylistInventory,
 }
 
 /// A structured, machine-readable finding. `code` is the stable
@@ -149,6 +157,11 @@ pub struct Diagnostic {
     pub profile: Option<ProfileRef>,
     pub purpose: Option<PathPurpose>,
     pub path: Option<EncodedPath>,
+    /// The zero-based playlist entry index this finding is about, if any -
+    /// `None` for every diagnostic that is not entry-specific (directory-
+    /// or playlist-file-level findings). Added for playlist diagnostics;
+    /// no pre-existing diagnostic ever sets it.
+    pub entry_index: Option<u32>,
 }
 
 /// Internal, pre-sort representation carrying a real `PathBuf` (for
@@ -162,6 +175,30 @@ struct RawDiagnostic {
     profile: Option<ProfileRef>,
     purpose: Option<PathPurpose>,
     path: Option<PathBuf>,
+    entry_index: Option<u32>,
+}
+
+impl RawDiagnostic {
+    /// Convenience constructor for the pre-existing (non-playlist)
+    /// diagnostic call sites, which never set `entry_index`.
+    fn new(
+        code: &'static str,
+        severity: DiagnosticSeverity,
+        detail_kind: DiagnosticCategory,
+        profile: Option<ProfileRef>,
+        purpose: Option<PathPurpose>,
+        path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            code,
+            severity,
+            detail_kind,
+            profile,
+            purpose,
+            path,
+            entry_index: None,
+        }
+    }
 }
 
 fn finalize_diagnostics(mut raw: Vec<RawDiagnostic>) -> Vec<Diagnostic> {
@@ -172,6 +209,7 @@ fn finalize_diagnostics(mut raw: Vec<RawDiagnostic>) -> Vec<Diagnostic> {
             .then_with(|| a.profile.cmp(&b.profile))
             .then_with(|| a.purpose.cmp(&b.purpose))
             .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.entry_index.cmp(&b.entry_index))
     });
     raw.into_iter()
         .map(|diagnostic| Diagnostic {
@@ -181,6 +219,7 @@ fn finalize_diagnostics(mut raw: Vec<RawDiagnostic>) -> Vec<Diagnostic> {
             profile: diagnostic.profile,
             purpose: diagnostic.purpose,
             path: diagnostic.path.as_deref().map(EncodedPath::from_path),
+            entry_index: diagnostic.entry_index,
         })
         .collect()
 }
@@ -296,6 +335,140 @@ pub enum CoreInfoFinding {
     IoError,
 }
 
+/// How one playlist entry's `path` value was classified. Verified against
+/// `libretro/RetroArch`'s `playlist.c` (`playlist_path_id_init`) and
+/// `libretro-common/file/file_path.c` (`path_get_archive_delim`,
+/// `path_is_compressed_file`) - see `docs/RETROARCH_PLAYLISTS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentPathKind {
+    /// An absolute filesystem path with no recognized archive-member
+    /// delimiter.
+    Filesystem,
+    /// Contains a `#` immediately after a `.7z`, `.zip`, `.zst`, or `.apk`
+    /// extension (case-insensitive) - verified as the *only* condition
+    /// under which RetroArch itself treats `#` as an archive-member
+    /// delimiter (`path_get_archive_delim`). A `#` anywhere else in the
+    /// path (including after `.rar`, which RetroArch's own
+    /// `path_is_compressed_file` does not recognize as compressed at all)
+    /// is just a literal character, not a delimiter.
+    ArchiveMember,
+    /// A non-empty value that is not an absolute path (does not start
+    /// with `/`). This milestone does not invent a resolution base for
+    /// it, mirroring the same policy already applied to `retroarch.cfg`
+    /// path values.
+    Relative,
+    /// The `path` key was present with an empty string value.
+    Empty,
+    /// The `path` key was absent from this entry entirely.
+    Missing,
+}
+
+/// A playlist entry's content path, preserved exactly as written plus its
+/// classification. `raw` is always a real, already-UTF-8-validated
+/// `String` (it came from parsed JSON text, never from a probed
+/// filesystem path), so no lossy encoding is needed here - contrast with
+/// [`RetroArchPlaylist::file_path`], which is a real filesystem path and
+/// does use [`EncodedPath`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistContentPath {
+    /// `None` only when [`ContentPathKind::Missing`].
+    pub raw: Option<String>,
+    pub kind: ContentPathKind,
+    /// The portion before the archive-member delimiter. `Some` only when
+    /// `kind == ArchiveMember`.
+    pub archive_path: Option<String>,
+    /// The portion after the archive-member delimiter (the inner member's
+    /// own path, never opened or resolved by this milestone). `Some` only
+    /// when `kind == ArchiveMember`.
+    pub archive_member_path: Option<String>,
+}
+
+/// A playlist entry's `crc32` field. Verified format (`tasks/task_database.c`,
+/// `manual_content_scan.c`): an 8-hex-digit, uppercase CRC32 followed by a
+/// literal `|crc` suffix (e.g. `"A1B2C3D4|crc"`); the literal placeholder
+/// `"00000000|crc"` is RetroArch's own "not computed" sentinel, written
+/// whenever a manual scan does not hash content. Never silently
+/// normalized into a different shape - a value that does not match this
+/// exact grammar is `Malformed`, not coerced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlaylistCrc {
+    /// Exactly 8 hex digits (canonicalized uppercase) followed by `|crc`,
+    /// and not the all-zero placeholder.
+    Verified { value: String },
+    /// The field was absent or an empty string.
+    Missing,
+    /// The literal `"00000000|crc"` placeholder.
+    Placeholder,
+    /// Present, non-empty, but does not match the verified grammar.
+    Malformed { raw: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetroArchPlaylistEntry {
+    /// Zero-based index into this playlist's own JSON `items` array - the
+    /// natural, least-surprising convention, and the one used throughout
+    /// this module's own diagnostics.
+    pub entry_index: u32,
+    pub content_path: PlaylistContentPath,
+    pub label: Option<String>,
+    pub core_path: Option<String>,
+    pub core_name: Option<String>,
+    pub crc: PlaylistCrc,
+    /// Exactly the JSON `db_name` value when present and non-empty;
+    /// `None` otherwise. This milestone does **not** reproduce RetroArch's
+    /// own runtime fallback (playlist basename, then the loaded core's
+    /// declared databases - see `playlist_get_db_name`) - identity
+    /// evidence here is only ever what the file itself actually states.
+    pub database_name: Option<String>,
+    pub subsystem_ident: Option<String>,
+    pub subsystem_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetroArchPlaylist {
+    pub file_path: EncodedPath,
+    /// The playlist filename with its `.lpl` extension removed - a
+    /// convenience identity label. Deliberately not a reproduction of
+    /// `playlist_get_db_name`'s own fallback (which keeps the `.lpl`
+    /// suffix and special-cases `content_history.lpl`/
+    /// `content_favorites.lpl`); see `docs/RETROARCH_PLAYLISTS.md`.
+    pub playlist_name: String,
+    /// The raw JSON `version` field, if present. Never used to accept or
+    /// reject a file - confirmed from `playlist.c`'s own JSON object
+    /// member handler, which has no case for `"version"` at all on read;
+    /// it is write-only metadata upstream itself never validates.
+    pub version: Option<String>,
+    pub default_core_path: Option<String>,
+    pub default_core_name: Option<String>,
+    pub entries: Vec<RetroArchPlaylistEntry>,
+    pub diagnostics: Vec<Diagnostic>,
+    /// `false` if [`MAX_ENTRIES_PER_PLAYLIST`] was reached - `entries`
+    /// then holds only the first-parsed entries up to that limit, never a
+    /// silently-truncated-without-notice list.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetroArchPlaylistInventory {
+    /// The resolved `Playlists` directory, or `None` if it was never
+    /// resolved (unconfigured, empty, a colon alias, a relative value, or
+    /// runtime-default-unknown - see [`ResolutionState`]). This milestone
+    /// never guesses a fallback directory.
+    pub directory: Option<EncodedPath>,
+    /// Sorted by encoded playlist path bytes - never filesystem
+    /// enumeration order.
+    pub playlists: Vec<RetroArchPlaylist>,
+    pub diagnostics: Vec<Diagnostic>,
+    /// `false` if the directory listing exceeded
+    /// [`MAX_PLAYLISTS_PER_PROFILE`] or the running entry total across
+    /// playlists reached [`MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE`] -
+    /// `playlists` then holds only what was actually processed before
+    /// stopping, never a silently-truncated-without-notice list.
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RetroArchProfile {
     pub profile_kind: ProfileKind,
@@ -305,6 +478,7 @@ pub struct RetroArchProfile {
     pub config_file: ConfigFileFinding,
     pub paths: Vec<PathFinding>,
     pub cores: Vec<CoreFinding>,
+    pub playlists: RetroArchPlaylistInventory,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -474,6 +648,7 @@ fn resolve_xdg_config_home(
                     profile: None,
                     purpose: None,
                     path: Some(candidate),
+                    entry_index: None,
                 });
                 home_dir.join(".config")
             }
@@ -541,6 +716,14 @@ fn discover_profile(
         &mut diagnostics,
     );
 
+    // Playlist diagnostics are deliberately *not* threaded into this
+    // profile's own shared `diagnostics` accumulator (unlike every other
+    // finding above): they already live fully nested under
+    // `playlists`/`playlists.playlists[]`, and duplicating them into the
+    // flat `profile.diagnostics` list too would mean every playlist
+    // finding appears twice in JSON for no benefit.
+    let playlists = discover_playlists(filesystem, &path_results.resolved_dirs, profile_ref);
+
     let evidence = Evidence {
         executables: executables.clone(),
         flatpak_metadata_found: flatpak_metadata_found.unwrap_or(false),
@@ -563,6 +746,7 @@ fn discover_profile(
         },
         paths: path_results.findings,
         cores,
+        playlists,
         diagnostics: Vec::new(), // filled in by the caller after global sort
     };
 
@@ -585,6 +769,7 @@ fn record_config_diagnostics(
                 profile: Some(profile),
                 purpose: None,
                 path: Some(config_file_path.to_path_buf()),
+                entry_index: None,
             });
         };
     match (probe, outcome) {
@@ -886,6 +1071,7 @@ fn build_path_findings(
                             profile: Some(profile),
                             purpose: Some(purpose),
                             path: None,
+                            entry_index: None,
                         });
                         (
                             Some(raw.clone()),
@@ -917,6 +1103,7 @@ fn build_path_findings(
                     profile: Some(profile),
                     purpose: Some(purpose),
                     path: Some(path.clone()),
+                    entry_index: None,
                 });
             }
         }
@@ -956,6 +1143,7 @@ fn discover_cores(
                 profile: Some(profile),
                 purpose: Some(PathPurpose::Cores),
                 path: Some(cores_dir.clone()),
+                entry_index: None,
             });
             return Vec::new();
         }
@@ -980,6 +1168,7 @@ fn discover_cores(
                     profile: Some(profile),
                     purpose: Some(PathPurpose::Cores),
                     path: Some(cores_dir.join(&entry.file_name)),
+                    entry_index: None,
                 });
                 continue;
             }
@@ -1051,6 +1240,496 @@ fn split_supported_extensions(raw: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| part.to_string())
         .collect()
+}
+
+/// Archive-container extensions RetroArch itself recognizes for the
+/// purpose of splitting a playlist `path` at a `#` archive-member
+/// delimiter - verified exactly (case-insensitively) against
+/// `libretro-common/file/file_path.c`'s `path_get_archive_delim`/
+/// `path_is_compressed_file`. Deliberately does **not** include `.rar`:
+/// RetroArch's own `path_is_compressed_file` does not recognize it as a
+/// compressed extension at all, so `path_get_archive_delim` never treats
+/// a `#` after `.rar` as a delimiter either.
+const ARCHIVE_CONTAINER_EXTENSIONS: [&str; 4] = ["7z", "zip", "zst", "apk"];
+
+#[derive(Debug, Deserialize)]
+struct RawPlaylistFile {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    default_core_path: Option<String>,
+    #[serde(default)]
+    default_core_name: Option<String>,
+    #[serde(default)]
+    items: Vec<RawPlaylistItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPlaylistItem {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    core_path: Option<String>,
+    #[serde(default)]
+    core_name: Option<String>,
+    #[serde(default)]
+    crc32: Option<String>,
+    #[serde(default)]
+    db_name: Option<String>,
+    #[serde(default)]
+    subsystem_ident: Option<String>,
+    #[serde(default)]
+    subsystem_name: Option<String>,
+}
+
+/// Splits `path` into `(archive_path, archive_member_path)` if and only if
+/// it contains a `#` immediately after one of [`ARCHIVE_CONTAINER_EXTENSIONS`]
+/// (case-insensitive) - mirroring `path_get_archive_delim` exactly,
+/// including its "only the first qualifying `#`" rule and its requirement
+/// that the extension be immediately before the `#` (a `#` elsewhere in
+/// the filename, or after an unrecognized extension such as `.rar`, is
+/// left as a literal character, never split).
+fn split_archive_member_path(path: &str) -> Option<(&str, &str)> {
+    let bytes = path.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(relative_index) = path[search_from..].find('#') {
+        let hash_index = search_from + relative_index;
+        if hash_index >= 4 {
+            let before = &path[..hash_index];
+            if ARCHIVE_CONTAINER_EXTENSIONS.iter().any(|extension| {
+                before.len() > extension.len()
+                    && before.as_bytes()[before.len() - extension.len() - 1] == b'.'
+                    && before[before.len() - extension.len()..].eq_ignore_ascii_case(extension)
+            }) {
+                return Some((before, &path[hash_index + 1..]));
+            }
+        }
+        search_from = hash_index + 1;
+        if search_from >= bytes.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn classify_content_path(raw: Option<String>) -> PlaylistContentPath {
+    match raw {
+        None => PlaylistContentPath {
+            raw: None,
+            kind: ContentPathKind::Missing,
+            archive_path: None,
+            archive_member_path: None,
+        },
+        Some(value) if value.is_empty() => PlaylistContentPath {
+            raw: Some(value),
+            kind: ContentPathKind::Empty,
+            archive_path: None,
+            archive_member_path: None,
+        },
+        Some(value) => {
+            if let Some((archive_path, member_path)) = split_archive_member_path(&value) {
+                let archive_path = archive_path.to_string();
+                let member_path = member_path.to_string();
+                PlaylistContentPath {
+                    raw: Some(value),
+                    kind: ContentPathKind::ArchiveMember,
+                    archive_path: Some(archive_path),
+                    archive_member_path: Some(member_path),
+                }
+            } else if value.starts_with('/') {
+                PlaylistContentPath {
+                    raw: Some(value),
+                    kind: ContentPathKind::Filesystem,
+                    archive_path: None,
+                    archive_member_path: None,
+                }
+            } else {
+                PlaylistContentPath {
+                    raw: Some(value),
+                    kind: ContentPathKind::Relative,
+                    archive_path: None,
+                    archive_member_path: None,
+                }
+            }
+        }
+    }
+}
+
+/// Classifies a playlist entry's `crc32` field - see [`PlaylistCrc`] for
+/// the verified grammar this checks against. Never mutates a malformed
+/// value into a well-formed one; only a value that is *already* well
+/// formed has its hex digits canonicalized to uppercase (matching
+/// upstream's own `%08lX` output), the same lossless canonicalization
+/// `patch_manager::pcsx2`'s `normalize_crc` already applies to PCSX2
+/// executable CRCs.
+fn classify_crc(raw: Option<&str>) -> PlaylistCrc {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return PlaylistCrc::Missing;
+    };
+    if raw == "00000000|crc" {
+        return PlaylistCrc::Placeholder;
+    }
+    let Some(hex_part) = raw.strip_suffix("|crc") else {
+        return PlaylistCrc::Malformed {
+            raw: raw.to_string(),
+        };
+    };
+    if hex_part.len() == 8
+        && hex_part
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        let canonical = hex_part.to_ascii_uppercase();
+        if canonical == "00000000" {
+            PlaylistCrc::Placeholder
+        } else {
+            PlaylistCrc::Verified { value: canonical }
+        }
+    } else {
+        PlaylistCrc::Malformed {
+            raw: raw.to_string(),
+        }
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// Reads and parses one `.lpl` file. Bounded at every step: the read
+/// itself is capped at [`MAX_PLAYLIST_BYTES`], and parsed entries beyond
+/// [`MAX_ENTRIES_PER_PLAYLIST`] are dropped (with a diagnostic and
+/// `complete: false`) rather than exposed. The already-bounded input size
+/// is what actually keeps this safe from unbounded work/memory - see the
+/// module-level note in `docs/RETROARCH_PLAYLISTS.md` on why a
+/// straightforward bounded-then-parse approach does not need a streaming
+/// JSON reader here: JSON has no separate declared-length field to
+/// (mis)trust ahead of the bytes themselves, so bounding the byte count
+/// before parsing already bounds the worst case.
+fn read_playlist_file(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    file_path: &Path,
+    profile: ProfileRef,
+) -> RetroArchPlaylist {
+    let mut diagnostics: Vec<RawDiagnostic> = Vec::new();
+    let playlist_name = file_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let empty = |complete: bool, diagnostics: Vec<RawDiagnostic>| RetroArchPlaylist {
+        file_path: EncodedPath::from_path(file_path),
+        playlist_name: playlist_name.clone(),
+        version: None,
+        default_core_path: None,
+        default_core_name: None,
+        entries: Vec::new(),
+        diagnostics: finalize_diagnostics(diagnostics),
+        complete,
+    };
+
+    let bytes = match filesystem.read_bounded(file_path, MAX_PLAYLIST_BYTES) {
+        BoundedReadResult::Ok(bytes) => bytes,
+        BoundedReadResult::TooLarge => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_too_large",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(file_path.to_path_buf()),
+            ));
+            return empty(false, diagnostics);
+        }
+        _ => return empty(true, diagnostics),
+    };
+    let bytes = strip_utf8_bom(&bytes);
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_invalid_utf8",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(file_path.to_path_buf()),
+            ));
+            return empty(true, diagnostics);
+        }
+    };
+
+    let raw_file: RawPlaylistFile = match serde_json::from_str(text) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_malformed_json",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(file_path.to_path_buf()),
+            ));
+            return empty(true, diagnostics);
+        }
+    };
+
+    if let Some(version) = &raw_file.version
+        && version != "1.0"
+        && version != "1.5"
+    {
+        diagnostics.push(RawDiagnostic::new(
+            "playlist_unsupported_version",
+            DiagnosticSeverity::Info,
+            DiagnosticCategory::PlaylistInventory,
+            Some(profile),
+            Some(PathPurpose::Playlists),
+            Some(file_path.to_path_buf()),
+        ));
+    }
+
+    let mut complete = true;
+    let mut entries = Vec::new();
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, item) in raw_file.items.into_iter().enumerate() {
+        if entries.len() >= MAX_ENTRIES_PER_PLAYLIST {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_entry_count_limit_reached",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(file_path.to_path_buf()),
+            ));
+            complete = false;
+            break;
+        }
+        let entry_index = index as u32;
+        let content_path = classify_content_path(item.path);
+        if let Some(raw_path) = &content_path.raw
+            && !seen_paths.insert(raw_path.clone())
+        {
+            let mut diagnostic = RawDiagnostic::new(
+                "duplicate_playlist_entry",
+                DiagnosticSeverity::Info,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(file_path.to_path_buf()),
+            );
+            diagnostic.entry_index = Some(entry_index);
+            diagnostics.push(diagnostic);
+        }
+        let crc = classify_crc(item.crc32.as_deref());
+        if matches!(crc, PlaylistCrc::Malformed { .. }) {
+            let mut diagnostic = RawDiagnostic::new(
+                "playlist_malformed_crc",
+                DiagnosticSeverity::Info,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(file_path.to_path_buf()),
+            );
+            diagnostic.entry_index = Some(entry_index);
+            diagnostics.push(diagnostic);
+        }
+        entries.push(RetroArchPlaylistEntry {
+            entry_index,
+            content_path,
+            label: non_empty(item.label),
+            core_path: non_empty(item.core_path),
+            core_name: non_empty(item.core_name),
+            crc,
+            database_name: non_empty(item.db_name),
+            subsystem_ident: non_empty(item.subsystem_ident),
+            subsystem_name: non_empty(item.subsystem_name),
+        });
+    }
+
+    RetroArchPlaylist {
+        file_path: EncodedPath::from_path(file_path),
+        playlist_name,
+        version: raw_file.version,
+        default_core_path: non_empty(raw_file.default_core_path),
+        default_core_name: non_empty(raw_file.default_core_name),
+        entries,
+        diagnostics: finalize_diagnostics(diagnostics),
+        complete,
+    }
+}
+
+fn discover_playlists(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    resolved_dirs: &BTreeMap<PathPurpose, PathBuf>,
+    profile: ProfileRef,
+) -> RetroArchPlaylistInventory {
+    let Some(playlists_dir) = resolved_dirs.get(&PathPurpose::Playlists) else {
+        return RetroArchPlaylistInventory {
+            directory: None,
+            playlists: Vec::new(),
+            diagnostics: Vec::new(),
+            complete: true,
+        };
+    };
+
+    let mut diagnostics: Vec<RawDiagnostic> = Vec::new();
+    let entries = match filesystem.list_dir_bounded(playlists_dir, MAX_PLAYLISTS_PER_PROFILE) {
+        BoundedListResult::Ok(entries) => entries,
+        BoundedListResult::TooLarge => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_directory_listing_too_large",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            return RetroArchPlaylistInventory {
+                directory: Some(EncodedPath::from_path(playlists_dir)),
+                playlists: Vec::new(),
+                diagnostics: finalize_diagnostics(diagnostics),
+                complete: false,
+            };
+        }
+        BoundedListResult::NotFound => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_directory_missing",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            return RetroArchPlaylistInventory {
+                directory: Some(EncodedPath::from_path(playlists_dir)),
+                playlists: Vec::new(),
+                diagnostics: finalize_diagnostics(diagnostics),
+                complete: true,
+            };
+        }
+        BoundedListResult::Symlink => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_directory_symlink",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            return RetroArchPlaylistInventory {
+                directory: Some(EncodedPath::from_path(playlists_dir)),
+                playlists: Vec::new(),
+                diagnostics: finalize_diagnostics(diagnostics),
+                complete: true,
+            };
+        }
+        BoundedListResult::WrongType => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_directory_wrong_type",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            return RetroArchPlaylistInventory {
+                directory: Some(EncodedPath::from_path(playlists_dir)),
+                playlists: Vec::new(),
+                diagnostics: finalize_diagnostics(diagnostics),
+                complete: true,
+            };
+        }
+        BoundedListResult::Inaccessible => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_directory_inaccessible",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            return RetroArchPlaylistInventory {
+                directory: Some(EncodedPath::from_path(playlists_dir)),
+                playlists: Vec::new(),
+                diagnostics: finalize_diagnostics(diagnostics),
+                complete: true,
+            };
+        }
+        BoundedListResult::IoError => {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_directory_io_error",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            return RetroArchPlaylistInventory {
+                directory: Some(EncodedPath::from_path(playlists_dir)),
+                playlists: Vec::new(),
+                diagnostics: finalize_diagnostics(diagnostics),
+                complete: true,
+            };
+        }
+    };
+
+    let mut candidate_files: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+    for entry in entries {
+        let name_string = entry.file_name.to_string_lossy();
+        if !name_string.to_ascii_lowercase().ends_with(PLAYLIST_SUFFIX) {
+            continue;
+        }
+        match entry.probe {
+            FsProbe::PresentFile => {}
+            FsProbe::Symlink => {
+                diagnostics.push(RawDiagnostic::new(
+                    "playlist_file_symlink_skipped",
+                    DiagnosticSeverity::Warning,
+                    DiagnosticCategory::PlaylistInventory,
+                    Some(profile),
+                    Some(PathPurpose::Playlists),
+                    Some(playlists_dir.join(&entry.file_name)),
+                ));
+                continue;
+            }
+            _ => continue,
+        }
+        let full_path = playlists_dir.join(&entry.file_name);
+        candidate_files.push((os_str_bytes(full_path.as_os_str()).to_vec(), full_path));
+    }
+    candidate_files.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut playlists = Vec::new();
+    let mut total_entries = 0usize;
+    let mut complete = true;
+    for (_, full_path) in candidate_files {
+        if total_entries >= MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE {
+            diagnostics.push(RawDiagnostic::new(
+                "playlist_total_entry_limit_reached",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::PlaylistInventory,
+                Some(profile),
+                Some(PathPurpose::Playlists),
+                Some(playlists_dir.clone()),
+            ));
+            complete = false;
+            break;
+        }
+        let playlist = read_playlist_file(filesystem, &full_path, profile);
+        total_entries += playlist.entries.len();
+        if !playlist.complete {
+            complete = false;
+        }
+        playlists.push(playlist);
+    }
+
+    RetroArchPlaylistInventory {
+        directory: Some(EncodedPath::from_path(playlists_dir)),
+        playlists,
+        diagnostics: finalize_diagnostics(diagnostics),
+        complete,
+    }
 }
 
 #[cfg(test)]
@@ -1809,10 +2488,33 @@ mod tests {
         let fixture = Fixture::new("json-keys");
         fixture.write(
             ".config/retroarch/retroarch.cfg",
-            &fixture.native_config_body(),
+            &format!(
+                "{}playlist_directory = \"{}\"\n",
+                fixture.native_config_body(),
+                fixture.path("opt/retroarch/playlists").display(),
+            ),
         );
         fixture.mkdir("opt/retroarch/cores");
         fixture.write("opt/retroarch/cores/test_libretro.so", "stub");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Nintendo - Super Nintendo Entertainment System.lpl",
+            r#"{
+                "version": "1.5",
+                "default_core_path": "",
+                "default_core_name": "",
+                "items": [
+                    {
+                        "path": "/roms/snes/game.sfc",
+                        "label": "Game",
+                        "core_path": "DETECT",
+                        "core_name": "DETECT",
+                        "crc32": "00000000|crc",
+                        "db_name": "Nintendo - Super Nintendo Entertainment System.lpl"
+                    }
+                ]
+            }"#,
+        );
 
         let filesystem = HostReadOnlyFilesystem;
         let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
@@ -1834,6 +2536,7 @@ mod tests {
                 "diagnostics",
                 "evidence",
                 "paths",
+                "playlists",
                 "profile_kind",
                 "scope",
             ]
@@ -1862,9 +2565,69 @@ mod tests {
             vec!["core_stem", "file_name", "full_path", "info"]
         );
 
+        let inventory = &profile["playlists"];
+        let mut inventory_keys: Vec<_> = inventory.as_object().unwrap().keys().cloned().collect();
+        inventory_keys.sort();
+        assert_eq!(
+            inventory_keys,
+            vec!["complete", "diagnostics", "directory", "playlists"]
+        );
+
+        let playlist = &inventory["playlists"][0];
+        let mut playlist_keys: Vec<_> = playlist.as_object().unwrap().keys().cloned().collect();
+        playlist_keys.sort();
+        assert_eq!(
+            playlist_keys,
+            vec![
+                "complete",
+                "default_core_name",
+                "default_core_path",
+                "diagnostics",
+                "entries",
+                "file_path",
+                "playlist_name",
+                "version",
+            ]
+        );
+
+        let playlist_entry = &playlist["entries"][0];
+        let mut entry_keys: Vec<_> = playlist_entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        entry_keys.sort();
+        assert_eq!(
+            entry_keys,
+            vec![
+                "content_path",
+                "core_name",
+                "core_path",
+                "crc",
+                "database_name",
+                "entry_index",
+                "label",
+                "subsystem_ident",
+                "subsystem_name",
+            ]
+        );
+
+        let content_path = &playlist_entry["content_path"];
+        let mut content_path_keys: Vec<_> =
+            content_path.as_object().unwrap().keys().cloned().collect();
+        content_path_keys.sort();
+        assert_eq!(
+            content_path_keys,
+            vec!["archive_member_path", "archive_path", "kind", "raw"]
+        );
+
         assert_eq!(json["format_version"], 1);
         assert_eq!(profile["profile_kind"], "native");
         assert_eq!(profile["scope"], "user");
+        assert_eq!(playlist_entry["content_path"]["kind"], "filesystem");
+        assert_eq!(playlist_entry["crc"]["type"], "placeholder");
+        assert_eq!(playlist_entry["core_path"], "DETECT");
     }
 
     #[test]
@@ -1995,5 +2758,813 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    // ---- Playlist discovery and parsing ----
+
+    impl Fixture {
+        fn playlists_config_body(&self) -> String {
+            format!(
+                "playlist_directory = \"{}\"\n",
+                self.path("opt/retroarch/playlists").display()
+            )
+        }
+
+        fn discover_playlists_only(&self) -> RetroArchPlaylistInventory {
+            self.mkdir("opt/retroarch/playlists");
+            let filesystem = HostReadOnlyFilesystem;
+            let report = discover_retroarch_environment(&filesystem, &self.env()).unwrap();
+            report.profiles[0].playlists.clone()
+        }
+    }
+
+    #[test]
+    fn playlist_directory_unconfigured_yields_no_directory_and_no_playlists() {
+        let fixture = Fixture::new("playlists-unconfigured");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.native_config_body(),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let inventory = &report.profiles[0].playlists;
+        assert!(inventory.directory.is_none());
+        assert!(inventory.playlists.is_empty());
+        assert!(inventory.complete);
+    }
+
+    /// A missing configured `Playlists` directory never even reaches
+    /// `discover_playlists`: `build_path_findings` only ever inserts a
+    /// purpose into `resolved_dirs` when its own probe already found
+    /// `FsProbe::PresentDirectory`, and it already emits
+    /// `configured_directory_missing` for exactly this case (the same
+    /// pre-existing mechanism `Cores`/`CoreInfo`/every other purpose
+    /// already relies on - this is not new behavior, just the same
+    /// invariant applied to `Playlists`). `discover_playlists` therefore
+    /// correctly reports `directory: None` here, matching
+    /// `discover_cores`'s own precedent, and does *not* duplicate a
+    /// second, playlist-specific "missing" diagnostic for the same fact.
+    #[test]
+    fn playlist_directory_missing_is_diagnosed_upstream_not_duplicated() {
+        let fixture = Fixture::new("playlists-missing-dir");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "playlist_directory = \"{}\"\n",
+                fixture.path("does-not-exist").display()
+            ),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let profile = &report.profiles[0];
+        assert!(profile.playlists.directory.is_none());
+        assert!(profile.playlists.playlists.is_empty());
+        assert!(profile.playlists.complete);
+        assert!(
+            profile
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "configured_directory_missing"
+                    && d.purpose == Some(PathPurpose::Playlists))
+        );
+    }
+
+    /// Same reasoning as the missing-directory case above: a symlinked
+    /// `Playlists` directory never enters `resolved_dirs` either
+    /// (`FsProbe::Symlink != PresentDirectory`), so it is already reported
+    /// upstream by `build_path_findings` as `configured_directory_symlink`.
+    #[test]
+    fn playlist_directory_final_component_symlink_is_diagnosed_upstream_not_followed() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("playlists-dir-symlink");
+        fixture.mkdir("real-playlists");
+        fixture.mkdir("opt/retroarch");
+        symlink(
+            fixture.path("real-playlists"),
+            fixture.path("opt/retroarch/playlists"),
+        )
+        .unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let profile = &report.profiles[0];
+        assert!(profile.playlists.directory.is_none());
+        assert!(profile.playlists.playlists.is_empty());
+        assert!(profile.playlists.complete);
+        assert!(
+            profile
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "configured_directory_symlink"
+                    && d.purpose == Some(PathPurpose::Playlists))
+        );
+    }
+
+    #[test]
+    fn playlist_file_final_component_symlink_is_skipped_and_reported() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("playlist-file-symlink");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write("real.lpl", r#"{"version":"1.5","items":[]}"#);
+        symlink(
+            fixture.path("real.lpl"),
+            fixture.path("opt/retroarch/playlists/link.lpl"),
+        )
+        .unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let inventory = &report.profiles[0].playlists;
+        assert!(inventory.playlists.is_empty());
+        assert!(
+            inventory
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_file_symlink_skipped")
+        );
+    }
+
+    #[test]
+    fn valid_modern_playlist_parses_every_recognized_field() {
+        let fixture = Fixture::new("playlist-valid");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Test.lpl",
+            r#"{
+                "version": "1.5",
+                "default_core_path": "/cores/snes9x_libretro.so",
+                "default_core_name": "Snes9x",
+                "items": [
+                    {
+                        "path": "/roms/Chrono Trigger (USA).sfc",
+                        "label": "Chrono Trigger (USA)",
+                        "core_path": "/cores/snes9x_libretro.so",
+                        "core_name": "Snes9x",
+                        "crc32": "A1B2C3D4|crc",
+                        "db_name": "Nintendo - Super Nintendo Entertainment System.lpl",
+                        "subsystem_ident": "ident",
+                        "subsystem_name": "name"
+                    }
+                ]
+            }"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let inventory = &report.profiles[0].playlists;
+        assert_eq!(inventory.playlists.len(), 1);
+        let playlist = &inventory.playlists[0];
+        assert_eq!(playlist.playlist_name, "Test");
+        assert_eq!(playlist.version.as_deref(), Some("1.5"));
+        assert_eq!(
+            playlist.default_core_path.as_deref(),
+            Some("/cores/snes9x_libretro.so")
+        );
+        assert_eq!(playlist.default_core_name.as_deref(), Some("Snes9x"));
+        assert!(playlist.complete);
+        assert_eq!(playlist.entries.len(), 1);
+        let entry = &playlist.entries[0];
+        assert_eq!(entry.entry_index, 0);
+        assert_eq!(
+            entry.content_path.raw.as_deref(),
+            Some("/roms/Chrono Trigger (USA).sfc")
+        );
+        assert_eq!(entry.content_path.kind, ContentPathKind::Filesystem);
+        assert_eq!(entry.label.as_deref(), Some("Chrono Trigger (USA)"));
+        assert_eq!(
+            entry.core_path.as_deref(),
+            Some("/cores/snes9x_libretro.so")
+        );
+        assert_eq!(entry.core_name.as_deref(), Some("Snes9x"));
+        assert_eq!(
+            entry.crc,
+            PlaylistCrc::Verified {
+                value: "A1B2C3D4".to_string()
+            }
+        );
+        assert_eq!(
+            entry.database_name.as_deref(),
+            Some("Nintendo - Super Nintendo Entertainment System.lpl")
+        );
+        assert_eq!(entry.subsystem_ident.as_deref(), Some("ident"));
+        assert_eq!(entry.subsystem_name.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn empty_playlist_parses_to_zero_entries() {
+        let fixture = Fixture::new("playlist-empty");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Empty.lpl",
+            r#"{"version":"1.5","items":[]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(inventory.playlists.len(), 1);
+        assert!(inventory.playlists[0].entries.is_empty());
+        assert!(inventory.playlists[0].complete);
+    }
+
+    #[test]
+    fn detect_core_is_preserved_verbatim_not_treated_as_missing() {
+        let fixture = Fixture::new("playlist-detect");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Detect.lpl",
+            r#"{"version":"1.5","items":[{"path":"/roms/game.zip","core_path":"DETECT","core_name":"DETECT"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let entry = &inventory.playlists[0].entries[0];
+        assert_eq!(entry.core_path.as_deref(), Some("DETECT"));
+        assert_eq!(entry.core_name.as_deref(), Some("DETECT"));
+    }
+
+    #[test]
+    fn path_with_spaces_is_preserved_exactly() {
+        let fixture = Fixture::new("playlist-spaces");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Spaces.lpl",
+            r#"{"version":"1.5","items":[{"path":"/roms/My Cool Game (USA) [!].zip"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(
+            inventory.playlists[0].entries[0]
+                .content_path
+                .raw
+                .as_deref(),
+            Some("/roms/My Cool Game (USA) [!].zip")
+        );
+    }
+
+    #[test]
+    fn archive_member_path_is_split_only_after_a_recognized_container_extension() {
+        let fixture = Fixture::new("playlist-archive-member");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Archive.lpl",
+            r#"{"version":"1.5","items":[
+                {"path":"/roms/game.zip#game.sfc"},
+                {"path":"/roms/game.rar#game.sfc"},
+                {"path":"/roms/weird#name.zip"}
+            ]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let entries = &inventory.playlists[0].entries;
+
+        assert_eq!(entries[0].content_path.kind, ContentPathKind::ArchiveMember);
+        assert_eq!(
+            entries[0].content_path.archive_path.as_deref(),
+            Some("/roms/game.zip")
+        );
+        assert_eq!(
+            entries[0].content_path.archive_member_path.as_deref(),
+            Some("game.sfc")
+        );
+
+        // `.rar` is not a recognized RetroArch archive container extension
+        // (verified: `path_is_compressed_file` does not recognize it), so
+        // the `#` here is just a literal character.
+        assert_eq!(entries[1].content_path.kind, ContentPathKind::Filesystem);
+        assert_eq!(
+            entries[1].content_path.raw.as_deref(),
+            Some("/roms/game.rar#game.sfc")
+        );
+
+        // A `#` not immediately after a recognized extension is also just
+        // a literal character.
+        assert_eq!(entries[2].content_path.kind, ContentPathKind::Filesystem);
+    }
+
+    #[test]
+    fn relative_content_path_is_classified_and_never_resolved() {
+        let fixture = Fixture::new("playlist-relative");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Relative.lpl",
+            r#"{"version":"1.5","items":[{"path":"roms/game.zip"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(
+            inventory.playlists[0].entries[0].content_path.kind,
+            ContentPathKind::Relative
+        );
+    }
+
+    #[test]
+    fn missing_optional_fields_are_none_not_defaulted_to_empty_string() {
+        let fixture = Fixture::new("playlist-missing-fields");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Minimal.lpl",
+            r#"{"version":"1.5","items":[{}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let entry = &inventory.playlists[0].entries[0];
+        assert_eq!(entry.content_path.kind, ContentPathKind::Missing);
+        assert!(entry.content_path.raw.is_none());
+        assert!(entry.label.is_none());
+        assert!(entry.core_path.is_none());
+        assert!(entry.core_name.is_none());
+        assert!(entry.database_name.is_none());
+        assert_eq!(entry.crc, PlaylistCrc::Missing);
+    }
+
+    #[test]
+    fn unknown_extra_fields_are_ignored_not_rejected() {
+        let fixture = Fixture::new("playlist-unknown-fields");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Extra.lpl",
+            r#"{
+                "version": "1.5",
+                "some_future_field": {"nested": true},
+                "items": [{"path": "/roms/game.zip", "entry_slot": 3, "future_entry_field": [1,2,3]}]
+            }"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(inventory.playlists.len(), 1);
+        assert!(inventory.playlists[0].complete);
+        assert_eq!(inventory.playlists[0].entries.len(), 1);
+    }
+
+    #[test]
+    fn malformed_json_is_reported_and_yields_an_incomplete_empty_playlist() {
+        let fixture = Fixture::new("playlist-malformed-json");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write("opt/retroarch/playlists/Bad.lpl", "{ not json ][");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(inventory.playlists.len(), 1);
+        let playlist = &inventory.playlists[0];
+        assert!(playlist.entries.is_empty());
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_malformed_json")
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_playlist_is_reported() {
+        let fixture = Fixture::new("playlist-invalid-utf8");
+        fixture.mkdir("opt/retroarch/playlists");
+        fs::write(
+            fixture.path("opt/retroarch/playlists/Bad.lpl"),
+            [b'{', 0xFF, 0xFE, b'}'],
+        )
+        .unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let playlist = &inventory.playlists[0];
+        assert!(playlist.entries.is_empty());
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_invalid_utf8")
+        );
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped_before_parsing() {
+        let fixture = Fixture::new("playlist-bom");
+        fixture.mkdir("opt/retroarch/playlists");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(br#"{"version":"1.5","items":[{"path":"/roms/game.zip"}]}"#);
+        fs::write(fixture.path("opt/retroarch/playlists/Bom.lpl"), bytes).unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(inventory.playlists[0].entries.len(), 1);
+        assert!(inventory.playlists[0].complete);
+    }
+
+    #[test]
+    fn oversized_playlist_is_reported_as_too_large() {
+        let fixture = Fixture::new("playlist-oversized");
+        fixture.mkdir("opt/retroarch/playlists");
+        let padding = "x".repeat(MAX_PLAYLIST_BYTES + 1);
+        fs::write(
+            fixture.path("opt/retroarch/playlists/Big.lpl"),
+            format!(r#"{{"version":"1.5","padding":"{padding}","items":[]}}"#),
+        )
+        .unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let playlist = &inventory.playlists[0];
+        assert!(!playlist.complete);
+        assert!(playlist.entries.is_empty());
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_too_large")
+        );
+    }
+
+    #[test]
+    fn entry_count_limit_truncates_and_marks_incomplete() {
+        let fixture = Fixture::new("playlist-entry-limit");
+        fixture.mkdir("opt/retroarch/playlists");
+        let items = (0..(MAX_ENTRIES_PER_PLAYLIST + 5))
+            .map(|index| format!(r#"{{"path":"/roms/game{index}.zip"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            fixture.path("opt/retroarch/playlists/Many.lpl"),
+            format!(r#"{{"version":"1.5","items":[{items}]}}"#),
+        )
+        .unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let playlist = &inventory.playlists[0];
+        assert_eq!(playlist.entries.len(), MAX_ENTRIES_PER_PLAYLIST);
+        assert!(!playlist.complete);
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_entry_count_limit_reached")
+        );
+    }
+
+    /// Each playlist stays well under [`MAX_ENTRIES_PER_PLAYLIST`] on its
+    /// own (so no per-playlist truncation happens), but there are enough
+    /// playlists that the running total across the profile exceeds
+    /// [`MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE`] partway through -
+    /// proving the two limits are independent and that the total limit
+    /// stops processing *further playlists*, not just further entries
+    /// within one.
+    #[test]
+    fn total_entry_limit_stops_processing_further_playlists() {
+        let fixture = Fixture::new("playlist-total-limit");
+        fixture.mkdir("opt/retroarch/playlists");
+        const ENTRIES_PER_PLAYLIST: usize = 1000;
+        let items = (0..ENTRIES_PER_PLAYLIST)
+            .map(|index| format!(r#"{{"path":"/roms/a{index}.zip"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(r#"{{"version":"1.5","items":[{items}]}}"#);
+        // ceil(MAX_TOTAL / ENTRIES_PER_PLAYLIST) + a few extra playlists,
+        // so the total is guaranteed to be exceeded partway through.
+        let playlist_count =
+            MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE.div_ceil(ENTRIES_PER_PLAYLIST) + 5;
+        for index in 0..playlist_count {
+            fixture.write(&format!("opt/retroarch/playlists/p{index:04}.lpl"), &body);
+        }
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+
+        let inventory = fixture.discover_playlists_only();
+
+        assert!(!inventory.complete);
+        assert!(
+            inventory
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_total_entry_limit_reached")
+        );
+        // The limit is checked *before* starting each new playlist, not by
+        // truncating the one that crosses it - so the running total may
+        // exceed the cap by up to one playlist's worth of entries, but
+        // never reaches a second playlist beyond that, and never fails to
+        // stop at all.
+        assert!(inventory.playlists.len() < playlist_count);
+        let total_entries: usize = inventory
+            .playlists
+            .iter()
+            .map(|playlist| playlist.entries.len())
+            .sum();
+        assert!(total_entries < MAX_TOTAL_PLAYLIST_ENTRIES_PER_PROFILE + ENTRIES_PER_PLAYLIST);
+        assert!(
+            inventory
+                .playlists
+                .iter()
+                .all(|playlist| playlist.entries.len() == ENTRIES_PER_PLAYLIST && playlist.complete)
+        );
+    }
+
+    #[test]
+    fn duplicate_entries_are_reported_but_both_are_kept() {
+        let fixture = Fixture::new("playlist-duplicates");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Dupes.lpl",
+            r#"{"version":"1.5","items":[
+                {"path":"/roms/game.zip"},
+                {"path":"/roms/game.zip"}
+            ]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let playlist = &inventory.playlists[0];
+        assert_eq!(playlist.entries.len(), 2);
+        let duplicate_diagnostics: Vec<_> = playlist
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "duplicate_playlist_entry")
+            .collect();
+        assert_eq!(duplicate_diagnostics.len(), 1);
+        assert_eq!(duplicate_diagnostics[0].entry_index, Some(1));
+    }
+
+    #[test]
+    fn malformed_crc_is_reported_and_not_normalized() {
+        let fixture = Fixture::new("playlist-malformed-crc");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Crc.lpl",
+            r#"{"version":"1.5","items":[{"path":"/roms/game.zip","crc32":"not-a-crc"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let playlist = &inventory.playlists[0];
+        assert_eq!(
+            playlist.entries[0].crc,
+            PlaylistCrc::Malformed {
+                raw: "not-a-crc".to_string()
+            }
+        );
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_malformed_crc" && d.entry_index == Some(0))
+        );
+    }
+
+    #[test]
+    fn valid_crc_is_canonicalized_to_uppercase() {
+        let fixture = Fixture::new("playlist-valid-crc");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Crc.lpl",
+            r#"{"version":"1.5","items":[{"path":"/roms/game.zip","crc32":"a1b2c3d4|crc"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(
+            inventory.playlists[0].entries[0].crc,
+            PlaylistCrc::Verified {
+                value: "A1B2C3D4".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn placeholder_crc_is_distinguished_from_missing_and_verified() {
+        let fixture = Fixture::new("playlist-placeholder-crc");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Crc.lpl",
+            r#"{"version":"1.5","items":[
+                {"path":"/roms/a.zip","crc32":"00000000|crc"},
+                {"path":"/roms/b.zip"}
+            ]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let entries = &inventory.playlists[0].entries;
+        assert_eq!(entries[0].crc, PlaylistCrc::Placeholder);
+        assert_eq!(entries[1].crc, PlaylistCrc::Missing);
+    }
+
+    #[test]
+    fn missing_database_name_is_none_not_empty_string() {
+        let fixture = Fixture::new("playlist-missing-db-name");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/NoDb.lpl",
+            r#"{"version":"1.5","items":[{"path":"/roms/game.zip","db_name":""}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert!(inventory.playlists[0].entries[0].database_name.is_none());
+    }
+
+    #[test]
+    fn unsupported_playlist_version_is_an_informational_diagnostic_not_a_rejection() {
+        let fixture = Fixture::new("playlist-unsupported-version");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Future.lpl",
+            r#"{"version":"9.9","items":[{"path":"/roms/game.zip"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let playlist = &inventory.playlists[0];
+        assert_eq!(playlist.entries.len(), 1);
+        assert!(playlist.complete);
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_unsupported_version"
+                    && d.severity == DiagnosticSeverity::Info)
+        );
+    }
+
+    #[test]
+    fn top_level_default_core_is_parsed() {
+        let fixture = Fixture::new("playlist-default-core");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Default.lpl",
+            r#"{"version":"1.5","default_core_path":"/cores/x_libretro.so","default_core_name":"X","items":[]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(
+            inventory.playlists[0].default_core_path.as_deref(),
+            Some("/cores/x_libretro.so")
+        );
+        assert_eq!(
+            inventory.playlists[0].default_core_name.as_deref(),
+            Some("X")
+        );
+    }
+
+    #[test]
+    fn too_many_playlist_files_are_reported_as_too_large_a_listing() {
+        let fixture = Fixture::new("playlists-too-many-files");
+        fixture.mkdir("opt/retroarch/playlists");
+        for index in 0..(MAX_PLAYLISTS_PER_PROFILE + 5) {
+            fixture.write(
+                &format!("opt/retroarch/playlists/p{index}.lpl"),
+                r#"{"version":"1.5","items":[]}"#,
+            );
+        }
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert!(inventory.playlists.is_empty());
+        assert!(!inventory.complete);
+        assert!(
+            inventory
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "playlist_directory_listing_too_large")
+        );
+    }
+
+    #[test]
+    fn playlists_are_sorted_deterministically_regardless_of_creation_order() {
+        let fixture = Fixture::new("playlists-sorted");
+        fixture.mkdir("opt/retroarch/playlists");
+        for name in ["zeta.lpl", "mid.lpl", "alpha.lpl"] {
+            fixture.write(
+                &format!("opt/retroarch/playlists/{name}"),
+                r#"{"version":"1.5","items":[]}"#,
+            );
+        }
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        let names: Vec<_> = inventory
+            .playlists
+            .iter()
+            .map(|playlist| playlist.playlist_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn non_utf8_playlist_filename_is_still_discovered_and_serializes_lossily() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = Fixture::new("playlist-non-utf8-name");
+        fixture.mkdir("opt/retroarch/playlists");
+        let raw_name = std::ffi::OsString::from_vec(b"bad-\xFF-name.lpl".to_vec());
+        fs::write(
+            fixture.path("opt/retroarch/playlists").join(&raw_name),
+            r#"{"version":"1.5","items":[]}"#,
+        )
+        .unwrap();
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+        let inventory = fixture.discover_playlists_only();
+        assert_eq!(inventory.playlists.len(), 1);
+        assert!(inventory.playlists[0].file_path.lossy);
+        let json = serde_json::to_string(&inventory).unwrap();
+        assert!(json.contains("\"lossy\":true"));
+    }
+
+    #[test]
+    fn playlist_discovery_makes_no_filesystem_writes() {
+        let fixture = Fixture::new("playlist-no-writes");
+        fixture.mkdir("opt/retroarch/playlists");
+        fixture.write(
+            "opt/retroarch/playlists/Test.lpl",
+            r#"{"version":"1.5","items":[{"path":"/roms/game.zip"}]}"#,
+        );
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &fixture.playlists_config_body(),
+        );
+
+        fn tree_entries(root: &Path) -> Vec<PathBuf> {
+            fn visit(root: &Path, current: &Path, entries: &mut Vec<PathBuf>) {
+                let mut children: Vec<_> = fs::read_dir(current)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                children.sort();
+                for child in children {
+                    entries.push(child.strip_prefix(root).unwrap().to_path_buf());
+                    if child.is_dir() {
+                        visit(root, &child, entries);
+                    }
+                }
+            }
+            let mut entries = Vec::new();
+            visit(root, root, &mut entries);
+            entries
+        }
+
+        let before = tree_entries(&fixture.root);
+        let _ = fixture.discover_playlists_only();
+        let after = tree_entries(&fixture.root);
+        assert_eq!(before, after);
     }
 }

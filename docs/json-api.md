@@ -14,6 +14,8 @@ JSON mode always writes the JSON document to stdout. Human headings, summaries, 
 
 Three other commands support `--json` but document their own schema in a dedicated design document rather than here, since their output is defined alongside a larger feature design: `archivefs pcsx2-patch-preview --json` (see [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)), `archivefs retroarch-environment --json` (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)), and `archivefs retroarch-patch-preview --json` (see [`RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md)). The stability guarantees below apply to all documented JSON output, not only the three commands listed immediately above.
 
+The RetroArch playlist identity/matching milestone added only additive fields to the two RetroArch schemas above (both `format_version`s stay `1`, per the "new fields may be added" guarantee below) - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the playlist-specific field documentation.
+
 ## `archivefs status --json`
 
 Command syntax:

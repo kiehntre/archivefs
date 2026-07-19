@@ -70,12 +70,17 @@ against every installed core's declared `supported_extensions`,
 case-insensitively:
 
 - **Exactly one** installed core supports the extension -> `ExactCore`,
-  and a per-game cheat file destination is proposed.
+  and a per-game cheat file destination is proposed
+  (`selected_core_source: extension_match`).
 - **Two or more** installed cores support the extension -> `AmbiguousCore`,
   and no single destination is proposed - every tied core stem is listed
   as a candidate, but nothing is elevated to an executable-looking
-  action.
-- **Zero** installed cores support the extension -> `UnsupportedNoCore`.
+  action - *unless* a later milestone's playlist evidence unambiguously
+  links exactly one of those installed cores, in which case this is
+  upgraded to `ExactCore` with `selected_core_source: playlist_evidence`.
+  See [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md).
+- **Zero** installed cores support the extension -> `UnsupportedNoCore`,
+  similarly upgradable by unambiguous playlist evidence.
 - The archive has no usable (or non-UTF-8) file extension ->
   `UnsupportedNoContentExtension`.
 - This profile's `cheat_database_path` is not configured, is left
@@ -94,6 +99,16 @@ second record here to compare a catalogue row's identity fields against
 in this milestone - a same-row "exact match" would be vacuous. This is a
 deliberate scope decision, not an oversight; the
 `no_identity_tier_is_used_for_retroarch_matching` test locks it in.
+
+A later milestone added a genuinely different second source of evidence:
+RetroArch's own `.lpl` playlists, which *do* record a resolved content
+path, core association, and (for scanned collections) a database name
+for content the user has already loaded. That evidence is read-only,
+never invents anything ArchiveFS doesn't already know, and is documented
+separately in [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) rather
+than here, since it introduces its own confidence vocabulary
+(`exact`/`strong`/`weak`/`ambiguous`/`unsupported`) distinct from the
+extension-based `CoreMatchDisposition` above.
 
 Region, revision, and disc-number evidence have **no bearing** on
 RetroArch's own core/cheat-destination selection - verified from the
@@ -265,6 +280,13 @@ unset).
   `json_destination_key_set_is_stable`.
 - No PCSX2 field name is reused where its meaning differs - this
   contract shares no type with `AdvisoryPatchPlan`.
+- Each `profile_outcomes[]` entry gained two additive fields:
+  `playlist_evidence` (an array, possibly empty, of matched playlist
+  entries naming this archive) and `selected_core_source`
+  (`"extension_match"` or `"playlist_evidence"`, `null` when no core was
+  selected). `format_version` stays `1` - see
+  [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the full
+  `playlist_evidence` field shape and the format-version decision.
 
 ## Current limitations
 
@@ -277,16 +299,21 @@ unset).
   uncompressed extension (e.g. `sfc`, not `zip`) will never match an
   ArchiveFS-managed `.zip` archive directly through this preview, even if
   RetroArch could load the ROM after ArchiveFS mounts it.
-- Exact identity evidence (serial, database identity, checksum) is never
-  used - see "Why this is not an `EmulatorAdapter`" and the honesty note
-  above.
-- Playlists and the RDB content database are not parsed.
+- Exact identity evidence (a per-archive checksum ArchiveFS itself holds)
+  is never used - see "Why this is not an `EmulatorAdapter`" and the
+  honesty note above. RetroArch's own playlists are now read as a
+  *different* kind of evidence (see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md)),
+  but a playlist's CRC is never compared against anything ArchiveFS has,
+  since it may describe an inner archive member ArchiveFS does not track.
+- The binary `.rdb` content database is still not parsed.
 
 ## Core-specific caveats
 
 - Which core a real user would actually pick when several are installed
-  and extension-compatible cannot be determined without parsing
-  playlists (out of scope) or launching RetroArch (never done here) -
+  and extension-compatible is now resolved when the user's own RetroArch
+  playlists unambiguously say so (see
+  [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md)); without that
+  evidence, or when it is itself ambiguous or missing, it is still
   reported as `AmbiguousCore`, never guessed.
 - Arcade content (MAME, FBNeo, ...) participates in the same
   extension-matching path as any other core; no arcade-specific
@@ -296,8 +323,11 @@ unset).
 
 Everything a mutation-capable manager would eventually need is out of
 scope here: writing, enabling, or installing any cheat or patch file;
-downloading a cheat database or patch content from any source; parsing
-`.lpl` playlists or the binary `.rdb` content database; modeling indexed
-(chained) patch destinations beyond the first; launching RetroArch or
-any core; and any network call. This command only previews destinations
-for content ArchiveFS already knows about, using data already on disk.
+downloading a cheat database or patch content from any source; writing,
+repairing, or creating any `.lpl` playlist, or parsing the binary `.rdb`
+content database (`.lpl` playlists are now *read*, as evidence - see
+[`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) - but never written);
+modeling indexed (chained) patch destinations beyond the first; launching
+RetroArch or any core; and any network call. This command only previews
+destinations for content ArchiveFS already knows about, using data
+already on disk.
