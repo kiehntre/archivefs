@@ -1,5 +1,10 @@
 # RetroArch Cheat Rollback
 
+Before performing a rollback, the read-only
+[`retroarch-cheat-history` and `retroarch-cheat-inspect`](RETROARCH_CHEAT_HISTORY.md)
+commands can show whether the destination and backup still satisfy its safety
+preconditions and whether a matching rollback journal already exists.
+
 Rollback reverts one successful `retroarch-cheat-install` run identified by
 its journal. It never guesses a "latest" run and never overwrites files that
 changed after installation.

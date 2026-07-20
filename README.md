@@ -46,6 +46,11 @@ for the detailed safety model behind these principles.
 - Provides a **read-only RetroArch cheat/patch destination preview and existing-artifact inventory** (`retroarch-patch-preview`): for every catalogued game, previews where a per-game `.cht` cheat file or IPS/BPS/UPS/Xdelta soft-patch sibling file would go, then safely inventories supported files already present, including occupied, duplicate, conflicting, ambiguous, and orphaned states. Builds on the environment discovery above; makes no network call at all and does not implement `EmulatorAdapter` (RetroArch's shape doesn't fit that PCSX2-specific trait) - see [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md) and [`docs/RETROARCH_ARTIFACT_INVENTORY.md`](docs/RETROARCH_ARTIFACT_INVENTORY.md).
 - Strengthens that preview with **read-only RetroArch playlist matching**: parses your existing `.lpl` playlists (never writing or modifying them) to link content and cores with real evidence instead of file-extension guessing alone, resolving ambiguous core matches when the evidence is unambiguous - see [`docs/RETROARCH_PLAYLISTS.md`](docs/RETROARCH_PLAYLISTS.md).
 - Detects **RetroArch installed as an AppImage** (`retroarch-environment`): scans a fixed set of default locations and your XDG desktop-entry directories, read-only and non-recursive, and feeds any found AppImage into the same environment/playlist/patch-preview pipeline as a native install - without ever executing, mounting, or extracting the AppImage, and without creating a duplicate profile when it shares your existing RetroArch configuration. See [`docs/RETROARCH_APPIMAGE.md`](docs/RETROARCH_APPIMAGE.md).
+- Provides safe RetroArch cheat installation and journal-driven rollback, plus
+  read-only installation history and single-journal assessment through
+  `retroarch-cheat-history` and `retroarch-cheat-inspect`. Inspection validates
+  current destination and backup hashes without changing files; see
+  [`docs/RETROARCH_CHEAT_HISTORY.md`](docs/RETROARCH_CHEAT_HISTORY.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
@@ -326,6 +331,14 @@ archivefs-cli retroarch-patch-preview
 archivefs-cli retroarch-patch-preview --json
 ```
 
+RetroArch cheat installation history:
+
+```sh
+archivefs-cli retroarch-cheat-history
+archivefs-cli retroarch-cheat-history --json
+archivefs-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
+```
+
 Use verbose or debug logging when you need more detail:
 
 ```sh
@@ -419,6 +432,7 @@ Platforms:
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)
 - [RetroArch playlist identity and content matching](docs/RETROARCH_PLAYLISTS.md)
 - [RetroArch AppImage detection](docs/RETROARCH_APPIMAGE.md)
+- [RetroArch cheat installation history and journal inspection](docs/RETROARCH_CHEAT_HISTORY.md)
 - [Watcher](docs/watcher.md)
 - [Provider pipeline](docs/provider-pipeline.md)
 - [Duplicate detector](docs/duplicate-detector.md)

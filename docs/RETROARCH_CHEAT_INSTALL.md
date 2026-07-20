@@ -3,6 +3,8 @@
 An install journal can be safely reverted with
 [`retroarch-cheat-rollback`](RETROARCH_CHEAT_ROLLBACK.md); rollback requires
 the explicit journal path and destination root.
+Installation journals can be listed and assessed without changing anything
+with [`retroarch-cheat-history` and `retroarch-cheat-inspect`](RETROARCH_CHEAT_HISTORY.md).
 
 `archivefs retroarch-cheat-install <local-path>` is the first
 write-capable command in the RetroArch cheat pipeline: it can actually
