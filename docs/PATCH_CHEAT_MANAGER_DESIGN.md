@@ -624,6 +624,21 @@ network-fetched catalogues remain a distinct, separately reviewed future
 capability gated by this document's Retrieval and Verification, Source
 Configuration, and threat-model sections above.
 
+### Cheat installation result and journal data model (shipped, pure data only)
+
+`patch_manager::cheat_install_result` (see
+[`docs/RETROARCH_CHEAT_INSTALL_RESULT.md`](RETROARCH_CHEAT_INSTALL_RESULT.md))
+defines stable, serializable per-entry and run-level result types - and a
+pure, no-I/O bridge from the staging preview above into them - as a narrow
+data-model slice of this document's full Phase 3 journal design. It
+contains no installer: no file is copied, no destination is created, no
+backup is written, no journal is persisted. `CheatInstallRunStatus`/
+`CheatInstallSummary` are entirely derived from entry results, never
+maintained by hand. This exists so a later, separately reviewed execution
+phase (built on top of the destination-path/symlink-safety primitives
+under parallel development) has a stable shape to populate rather than
+inventing one alongside its first real write.
+
 ## Auditing and Observability
 
 Persistent audit storage begins only in a later approved phase; Phase 1 emits bounded in-memory diagnostics and CLI output. Later audit events record source ID/version, metadata snapshot hash, optional artifact hash, verification result, adapter/installation ID, match evidence, plan ID, user or unattended-policy decision, operation ID, changed manifest IDs, result, and sanitized error category. They do not record secrets or unnecessary game paths in exported diagnostics. CLI and GUI can derive a chronological report and answer: what source supplied this file, why it matched this game, what bytes were installed, what was replaced, and whether rollback is available.

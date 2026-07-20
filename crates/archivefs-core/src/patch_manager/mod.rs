@@ -21,6 +21,7 @@
 
 mod adapter;
 mod cheat_catalogue;
+mod cheat_install_result;
 mod matching;
 mod pcsx2;
 mod retrieval;
@@ -47,6 +48,12 @@ pub use cheat_catalogue::{
     CheatInstalledState, CheatMatchCandidate, CheatMatchConfidence, CheatMatchEvidence,
     JsonManifestSource, RetroarchChtDirectorySource, build_cheat_availability_report,
     load_cheat_catalogue_snapshot, match_cheat_game_record,
+};
+pub use cheat_install_result::{
+    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
+    CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError, CheatInstallRunStatus,
+    CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
+    plan_cheat_install_entries, plan_cheat_install_entry, plan_cheat_install_run,
 };
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
