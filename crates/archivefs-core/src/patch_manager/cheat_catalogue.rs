@@ -69,6 +69,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::emulator_environment::retroarch::{PathPurpose, RetroArchEnvironmentReport};
 use crate::emulator_environment::{
     BoundedListResult, BoundedReadResult, EncodedPath, FsProbe, ReadOnlyHostFilesystem,
     os_str_bytes,
@@ -1290,16 +1291,23 @@ pub enum CheatInstalledState {
     Unknown,
 }
 
-fn resolve_installed_state(
-    filesystem: &dyn ReadOnlyHostFilesystem,
-    record: &CheatGameRecord,
-    matched_archive_id: Option<i64>,
-    advisory_plan: Option<&RetroArchAdvisoryPlan>,
-) -> (CheatInstalledState, Vec<String>) {
-    let (Some(archive_id), Some(plan)) = (matched_archive_id, advisory_plan) else {
-        return (CheatInstalledState::Unknown, Vec::new());
-    };
+/// What the artifact-inventory lookup found for one matched archive's
+/// expected cheat destination(s). Shared between [`resolve_installed_state`]
+/// and the staging-plan resolver below so both consult the exact same
+/// already-built inventory the same way.
+enum ArtifactDestinationLookup<'a> {
+    /// No expected-destination entry exists in the artifact inventory for
+    /// this archive - not a conflict, just nothing to report from that
+    /// source. Callers fall back to [`resolve_canonical_cheat_destination`].
+    None,
+    One(&'a RetroArchArtifactDestination),
+    Many(Vec<&'a RetroArchArtifactDestination>),
+}
 
+fn lookup_artifact_destination(
+    plan: &RetroArchAdvisoryPlan,
+    archive_id: i64,
+) -> ArtifactDestinationLookup<'_> {
     let destinations: Vec<&RetroArchArtifactDestination> = plan
         .artifact_inventory
         .destinations
@@ -1312,20 +1320,73 @@ fn resolve_installed_state(
                     .any(|game| game.archive_id == archive_id)
         })
         .collect();
+    match destinations.len() {
+        0 => ArtifactDestinationLookup::None,
+        1 => ArtifactDestinationLookup::One(destinations[0]),
+        _ => ArtifactDestinationLookup::Many(destinations),
+    }
+}
 
-    if destinations.is_empty() {
+fn resolve_installed_state(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    record: &CheatGameRecord,
+    matched_archive_id: Option<i64>,
+    advisory_plan: Option<&RetroArchAdvisoryPlan>,
+    destination_root_override: Option<&Path>,
+) -> (CheatInstalledState, Vec<String>) {
+    let Some(archive_id) = matched_archive_id else {
         return (CheatInstalledState::Unknown, Vec::new());
+    };
+
+    if let Some(plan) = advisory_plan {
+        match lookup_artifact_destination(plan, archive_id) {
+            ArtifactDestinationLookup::Many(destinations) => {
+                return (
+                    CheatInstalledState::MultipleInstalledCandidates,
+                    destinations
+                        .iter()
+                        .map(|destination| destination.path.display.clone())
+                        .collect(),
+                );
+            }
+            ArtifactDestinationLookup::One(destination) => {
+                return resolve_installed_state_for_known_destination(
+                    filesystem,
+                    record,
+                    plan,
+                    destination,
+                );
+            }
+            ArtifactDestinationLookup::None => {
+                // Nothing in the existing artifact inventory names this
+                // archive's expected cheat destination (e.g. no resolvable
+                // core, or this game came from a source with no matching
+                // installed-artifact entry at all). Previously this always
+                // fell straight through to `Unknown`; now the canonical
+                // platform-directory resolver below is tried first, so
+                // `Unknown` is reserved for when that also cannot
+                // determine anything safely.
+            }
+        }
     }
-    if destinations.len() > 1 {
-        return (
-            CheatInstalledState::MultipleInstalledCandidates,
-            destinations
-                .iter()
-                .map(|destination| destination.path.display.clone())
-                .collect(),
-        );
+
+    match resolve_canonical_cheat_destination(record, advisory_plan, destination_root_override) {
+        Ok(path) => {
+            let probe = filesystem.probe(&path);
+            let encoded = EncodedPath::from_path(&path);
+            let outcome = probe_and_compare_destination(filesystem, record, &encoded, probe, false);
+            (outcome.installed_state, outcome.detail)
+        }
+        Err(_) => (CheatInstalledState::Unknown, Vec::new()),
     }
-    let destination = destinations[0];
+}
+
+fn resolve_installed_state_for_known_destination(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    record: &CheatGameRecord,
+    plan: &RetroArchAdvisoryPlan,
+    destination: &RetroArchArtifactDestination,
+) -> (CheatInstalledState, Vec<String>) {
     let mut detail = vec![format!(
         "expected destination: {}",
         destination.path.display
@@ -1393,6 +1454,367 @@ fn resolve_installed_state(
 }
 
 // ---------------------------------------------------------------------
+// Staging preview (destination planning)
+// ---------------------------------------------------------------------
+
+/// One RetroArch cheat destination-directory root, discovered the same
+/// no-follow, non-recursive way `retroarch_inventory::scan_cheat_directories`
+/// already reads a profile's configured cheat root - the first profile (in
+/// the environment's own fixed native/Flatpak-user/Flatpak-system order)
+/// with a usable (non-lossy) resolved `PathPurpose::Cheats` path wins. This
+/// module never invents a default location itself; if discovery found
+/// none, staging has no root to plan against.
+fn discovered_cheat_root(environment: &RetroArchEnvironmentReport) -> Option<PathBuf> {
+    environment.profiles.iter().find_map(|profile| {
+        let finding = profile
+            .paths
+            .iter()
+            .find(|finding| finding.purpose == PathPurpose::Cheats)?;
+        let resolved = finding.resolved_path.as_ref()?;
+        (!resolved.lossy).then(|| PathBuf::from(&resolved.display))
+    })
+}
+
+/// Rejects anything unsafe as a single path component: empty, `.`/`..`,
+/// any path separator, or a NUL byte. Used for both the platform-directory
+/// and game-filename components of a computed staging destination, so
+/// neither can escape the destination root or address an unintended path.
+fn sanitize_path_component(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    if trimmed.contains(['/', '\\']) || trimmed.contains('\0') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Computes `<root>/<canonical-platform>/<game-name>.cht` under either the
+/// caller-supplied override root (isolated testing only) or the discovered
+/// RetroArch environment's own cheat root - "the canonical RetroArch
+/// platform-directory convention already used by the discovered
+/// installation" from `docs/RETROARCH_CHEAT_CATALOGUE.md`. The platform
+/// component is *only* ArchiveFS's own canonical platform name (the same
+/// alias table used for matching, e.g. `"Atari - 2600"` -> `"Atari2600"`) -
+/// an unknown, ambiguous, or unsafe hint is never used as-is, sanitized or
+/// not: an unrecognized platform is `source_platform_unresolved`, exactly
+/// as if no platform hint had been declared at all. A hint that *can* be
+/// resolved but happens to be spelled unusually (different case, extra
+/// punctuation) still resolves normally, since resolution goes through the
+/// same normalized alias lookup matching already uses. Returns a stable
+/// `&'static str` reason code (matching this module's evidence-code
+/// convention) rather than `None`, so a not-eligible outcome always
+/// explains itself.
+fn resolve_canonical_cheat_destination(
+    record: &CheatGameRecord,
+    advisory_plan: Option<&RetroArchAdvisoryPlan>,
+    destination_root_override: Option<&Path>,
+) -> Result<PathBuf, &'static str> {
+    let root = match destination_root_override {
+        Some(root) => root.to_path_buf(),
+        None => {
+            let plan = advisory_plan.ok_or("destination_environment_unavailable")?;
+            discovered_cheat_root(&plan.environment).ok_or("destination_environment_unavailable")?
+        }
+    };
+
+    let platform_hint = record
+        .source_platform
+        .as_deref()
+        .ok_or("source_platform_unresolved")?;
+    // Canonicalization is mandatory here, not best-effort: an unknown,
+    // ambiguous, or unsafe (traversal-style, absolute, separator-containing)
+    // platform hint must never become a destination directory just because
+    // its raw text happens to pass `sanitize_path_component`. Sanitizing is
+    // a safety check on a string that is *already trusted*; it is not a
+    // substitute for that trust, and must never be used to launder an
+    // unrecognized hint into one. Only a hint this project's own
+    // `FOLDER_PLATFORM_ALIASES` table recognizes may become a destination
+    // directory - anything else is `source_platform_unresolved`, the same
+    // as no platform hint at all.
+    let platform_component =
+        canonical_platform_for_alias(platform_hint).ok_or("source_platform_unresolved")?;
+    // `canonical_platform_for_alias` only ever returns one of this
+    // project's own fixed, code-defined canonical names, which are already
+    // safe path components by construction (no separator, traversal token,
+    // or NUL byte in any table entry). It is still run through the same
+    // sanitizer as `game_component` below as defense in depth, rather than
+    // trusting that invariant implicitly.
+    let platform_component =
+        sanitize_path_component(platform_component).ok_or("destination_traversal_rejected")?;
+    let game_component = sanitize_path_component(&record.source_game_name)
+        .ok_or("destination_traversal_rejected")?;
+
+    Ok(root
+        .join(platform_component)
+        .join(format!("{game_component}.cht")))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheatStagingAction {
+    /// Destination does not exist; source is an exact/strong match.
+    InstallNew,
+    /// Destination exists and its content hash matches the source exactly.
+    AlreadyInstalled,
+    /// Destination exists with different content. Preview only - nothing
+    /// is overwritten. If a future apply operation ever acts on this, it
+    /// is a destructive, content-replacing action (see
+    /// [`CheatAvailabilityEntry::destructive_if_applied`]).
+    ReplaceDifferent,
+    /// Two or more source entries resolved to the same destination, or the
+    /// destination itself could not be resolved safely (a symlink, an
+    /// inaccessible path, a wrong file type, or more than one existing
+    /// artifact-inventory candidate).
+    Conflict,
+    /// Confidence below `strong`, parsing incomplete, source platform
+    /// unresolved, or the destination environment/root could not be
+    /// determined at all.
+    NotEligible,
+}
+
+/// One catalogue cheat's staging preview - never anything more than a
+/// calculation. Building this performs at most one additional bounded read
+/// (to hash an existing destination file) through the same no-write,
+/// no-follow filesystem trait used everywhere else in this module; nothing
+/// is created, renamed, deleted, or executed.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheatStagingPlan {
+    pub source_cheat_path: EncodedPath,
+    /// `None` only when [`Self::planned_action`] is `not_eligible` and no
+    /// destination could be computed at all (e.g. the platform is
+    /// unresolved, so there is nothing to join a filename onto).
+    pub proposed_destination_path: Option<EncodedPath>,
+    pub source_file_hash: Option<String>,
+    /// `Some` only when the destination already exists as a readable
+    /// regular file.
+    pub existing_destination_hash: Option<String>,
+    pub planned_action: CheatStagingAction,
+    /// A stable, fixed identifier for why `planned_action` was chosen -
+    /// never free-text prose, matching this module's existing evidence/
+    /// diagnostic-code convention.
+    pub reason: &'static str,
+}
+
+fn not_eligible_plan(record: &CheatGameRecord, reason: &'static str) -> CheatStagingPlan {
+    CheatStagingPlan {
+        source_cheat_path: record.source_file_path.clone(),
+        proposed_destination_path: None,
+        source_file_hash: record.source_file_hash.clone(),
+        existing_destination_hash: None,
+        planned_action: CheatStagingAction::NotEligible,
+        reason,
+    }
+}
+
+/// The combined result of probing (and, when applicable, hashing) one
+/// computed destination path - the single shared decision point both
+/// [`resolve_installed_state`] (via its canonical-destination fallback)
+/// and the staging-plan resolver use, so the two never disagree about what
+/// one probed path means. `action` and `installed_state` are computed
+/// together from the exact same probe/hash outcome, never derived from one
+/// another after the fact.
+struct DestinationProbeOutcome {
+    action: CheatStagingAction,
+    installed_state: CheatInstalledState,
+    detail: Vec<String>,
+    existing_hash: Option<String>,
+}
+
+fn destination_outcome(
+    action: CheatStagingAction,
+    installed_state: CheatInstalledState,
+    mut detail: Vec<String>,
+    note: &str,
+    existing_hash: Option<String>,
+) -> DestinationProbeOutcome {
+    if !note.is_empty() {
+        detail.push(note.to_string());
+    }
+    DestinationProbeOutcome {
+        action,
+        installed_state,
+        detail,
+        existing_hash,
+    }
+}
+
+/// Probes and, when the destination is a present regular file, hashes it.
+fn probe_and_compare_destination(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    record: &CheatGameRecord,
+    destination_path: &EncodedPath,
+    probe: FsProbe,
+    ambiguous: bool,
+) -> DestinationProbeOutcome {
+    let detail = vec![format!(
+        "proposed destination: {}",
+        destination_path.display
+    )];
+    if ambiguous {
+        return destination_outcome(
+            CheatStagingAction::Conflict,
+            CheatInstalledState::MultipleInstalledCandidates,
+            detail,
+            "",
+            None,
+        );
+    }
+    match probe {
+        FsProbe::Missing => destination_outcome(
+            CheatStagingAction::InstallNew,
+            CheatInstalledState::NotInstalled,
+            detail,
+            "",
+            None,
+        ),
+        FsProbe::Symlink => destination_outcome(
+            CheatStagingAction::Conflict,
+            CheatInstalledState::DestinationSymlink,
+            detail,
+            "destination is a symlink and was not followed",
+            None,
+        ),
+        FsProbe::Inaccessible | FsProbe::IoError => destination_outcome(
+            CheatStagingAction::Conflict,
+            CheatInstalledState::InaccessibleDestination,
+            detail,
+            "destination could not be read",
+            None,
+        ),
+        FsProbe::PresentDirectory | FsProbe::WrongType => destination_outcome(
+            CheatStagingAction::Conflict,
+            CheatInstalledState::DestinationOccupiedDifferentContent,
+            detail,
+            "destination exists but is not a regular file",
+            None,
+        ),
+        FsProbe::PresentFile => {
+            let real_path = Path::new(&destination_path.display);
+            match filesystem.read_bounded(real_path, MAX_CATALOGUE_FILE_BYTES) {
+                BoundedReadResult::Ok(bytes) => {
+                    let existing_hash = hex_sha256(&bytes);
+                    if record.source_file_hash.as_deref() == Some(existing_hash.as_str()) {
+                        destination_outcome(
+                            CheatStagingAction::AlreadyInstalled,
+                            CheatInstalledState::ExactFilePresent,
+                            detail,
+                            "existing destination content hash matches source",
+                            Some(existing_hash),
+                        )
+                    } else {
+                        destination_outcome(
+                            CheatStagingAction::ReplaceDifferent,
+                            CheatInstalledState::DestinationOccupiedDifferentContent,
+                            detail,
+                            "existing destination content hash differs from source",
+                            Some(existing_hash),
+                        )
+                    }
+                }
+                _ => destination_outcome(
+                    CheatStagingAction::Conflict,
+                    CheatInstalledState::DestinationOccupiedDifferentContent,
+                    detail,
+                    "destination could not be re-read for hash comparison",
+                    None,
+                ),
+            }
+        }
+    }
+}
+
+/// Resolves one catalogue game's staging preview: eligibility first (only
+/// `exact`/`strong` matches with complete parsing may proceed), then the
+/// destination itself - preferring the already-computed, core-based
+/// artifact-inventory destination when the existing `retroarch-patch-preview`
+/// advisory plan has one, and falling back to
+/// [`resolve_canonical_cheat_destination`] otherwise. Cross-entry duplicate
+/// destinations are not detected here - see
+/// `build_cheat_availability_report`'s post-pass.
+fn resolve_cheat_staging_plan(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    record: &CheatGameRecord,
+    game_match: &CheatGameMatch,
+    matched_archive_id: Option<i64>,
+    advisory_plan: Option<&RetroArchAdvisoryPlan>,
+    destination_root_override: Option<&Path>,
+) -> CheatStagingPlan {
+    if !record.parsing_complete {
+        return not_eligible_plan(record, "parsing_incomplete");
+    }
+    match game_match.confidence {
+        CheatMatchConfidence::Exact | CheatMatchConfidence::Strong => {}
+        CheatMatchConfidence::Weak => return not_eligible_plan(record, "weak_match_not_eligible"),
+        CheatMatchConfidence::Ambiguous => {
+            return not_eligible_plan(record, "ambiguous_match_not_eligible");
+        }
+        CheatMatchConfidence::Unsupported => {
+            return not_eligible_plan(record, "unsupported_match_not_eligible");
+        }
+    }
+    let Some(archive_id) = matched_archive_id else {
+        return not_eligible_plan(record, "unsupported_match_not_eligible");
+    };
+
+    if let Some(plan) = advisory_plan {
+        match lookup_artifact_destination(plan, archive_id) {
+            ArtifactDestinationLookup::Many(_) => {
+                let mut staging_plan = not_eligible_plan(record, "multiple_installed_candidates");
+                staging_plan.planned_action = CheatStagingAction::Conflict;
+                return staging_plan;
+            }
+            ArtifactDestinationLookup::One(destination) => {
+                let outcome = probe_and_compare_destination(
+                    filesystem,
+                    record,
+                    &destination.path,
+                    destination.probe,
+                    destination.state == ArtifactConflictState::Ambiguous,
+                );
+                return CheatStagingPlan {
+                    source_cheat_path: record.source_file_path.clone(),
+                    proposed_destination_path: Some(destination.path.clone()),
+                    source_file_hash: record.source_file_hash.clone(),
+                    existing_destination_hash: outcome.existing_hash,
+                    planned_action: outcome.action,
+                    reason: staging_reason(outcome.action),
+                };
+            }
+            ArtifactDestinationLookup::None => {}
+        }
+    }
+
+    match resolve_canonical_cheat_destination(record, advisory_plan, destination_root_override) {
+        Ok(path) => {
+            let encoded = EncodedPath::from_path(&path);
+            let probe = filesystem.probe(&path);
+            let outcome = probe_and_compare_destination(filesystem, record, &encoded, probe, false);
+            CheatStagingPlan {
+                source_cheat_path: record.source_file_path.clone(),
+                proposed_destination_path: Some(encoded),
+                source_file_hash: record.source_file_hash.clone(),
+                existing_destination_hash: outcome.existing_hash,
+                planned_action: outcome.action,
+                reason: staging_reason(outcome.action),
+            }
+        }
+        Err(reason) => not_eligible_plan(record, reason),
+    }
+}
+
+fn staging_reason(action: CheatStagingAction) -> &'static str {
+    match action {
+        CheatStagingAction::InstallNew => "destination_missing",
+        CheatStagingAction::AlreadyInstalled => "hash_match",
+        CheatStagingAction::ReplaceDifferent => "hash_mismatch",
+        CheatStagingAction::Conflict => "destination_unsafe_or_ambiguous",
+        CheatStagingAction::NotEligible => "not_eligible",
+    }
+}
+
+// ---------------------------------------------------------------------
 // Availability report
 // ---------------------------------------------------------------------
 
@@ -1402,14 +1824,20 @@ pub struct CheatAvailabilityEntry {
     pub game_match: CheatGameMatch,
     pub installed_state: CheatInstalledState,
     pub installed_state_detail: Vec<String>,
-    /// `true` only when the match is `exact` or `strong`, the record
-    /// parsed with no diagnostics, and the installed state is one where
-    /// staging would not silently overwrite unrelated content
-    /// (`not_installed`, `exact_file_present`, or
-    /// `same_set_different_filename`). This field never causes any
+    /// `true` when [`Self::staging_plan`]'s `planned_action` is
+    /// `install_new`, `already_installed`, or `replace_different` - never
+    /// for `conflict` or `not_eligible`. This field never causes any
     /// install/copy/write - it is advisory metadata only, consistent with
-    /// this milestone's read-only scope.
+    /// this milestone's read-only scope. Kept alongside `staging_plan` for
+    /// backward-compatible JSON consumers that only need the yes/no
+    /// question answered.
     pub staging_candidate: bool,
+    /// `true` exactly when `staging_plan.planned_action == replace_different`,
+    /// as a loud, separate flag so a future apply operation (not implemented
+    /// by this milestone) cannot mistake a content-replacing action for a
+    /// harmless new install merely because `staging_candidate` was `true`.
+    pub destructive_if_applied: bool,
+    pub staging_plan: CheatStagingPlan,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1441,14 +1869,28 @@ pub struct CheatAvailabilityReport {
 /// Builds the full availability report: matches every game in `snapshot`
 /// against `catalogue_games` (and, optionally, `advisory_plan` for
 /// playlist-identity evidence and installed-state), then resolves
-/// installed-state for whichever single archive each record matched.
-/// Ambiguous/unsupported matches always get `Unknown` installed-state -
-/// this function never guesses which of several tied candidates a cheat
-/// file "belongs to" in order to report on it.
+/// installed-state and a [`CheatStagingPlan`] for whichever single archive
+/// each record matched. Ambiguous/unsupported matches always get `unknown`
+/// installed-state and a `not_eligible` staging plan - this function never
+/// guesses which of several tied candidates a cheat file "belongs to" in
+/// order to report on it.
+///
+/// `destination_root_override`, when given, replaces the discovered
+/// RetroArch environment's own cheat root for staging-destination
+/// resolution only (see [`resolve_canonical_cheat_destination`]) - isolated
+/// testing/preview use, never required for normal operation. It does not
+/// change matching, installed-state resolution against an already-known
+/// artifact-inventory destination, or anything about `advisory_plan`
+/// itself.
+///
+/// After every entry's staging plan is computed, entries whose resolved
+/// `proposed_destination_path` is not unique are all demoted to `conflict`,
+/// since two different catalogue source entries proposing the same
+/// destination is never silently resolved by picking one.
 ///
 /// The only I/O this function performs is the same bounded, no-follow
-/// `read_bounded` the rest of this module already uses, to hash an
-/// already-`Occupied`/`Matched` destination for the exact-file-present
+/// `read_bounded`/`probe` the rest of this module already uses, to hash an
+/// existing destination for the exact-file-present/replace-different
 /// comparison. Nothing is written, created, renamed, deleted, executed, or
 /// requested over the network.
 pub fn build_cheat_availability_report(
@@ -1456,6 +1898,7 @@ pub fn build_cheat_availability_report(
     snapshot: &CheatCatalogueSnapshot,
     catalogue_games: &[CatalogueGameEvidence],
     advisory_plan: Option<&RetroArchAdvisoryPlan>,
+    destination_root_override: Option<&Path>,
 ) -> CheatAvailabilityReport {
     let mut entries = Vec::with_capacity(snapshot.games.len());
     let mut summary = CheatAvailabilitySummary {
@@ -1482,45 +1925,54 @@ pub fn build_cheat_availability_report(
             ))
         .then(|| game_match.candidates[0].archive_id);
 
-        let (installed_state, installed_state_detail) =
-            resolve_installed_state(filesystem, game, single_candidate, advisory_plan);
+        let (installed_state, installed_state_detail) = resolve_installed_state(
+            filesystem,
+            game,
+            single_candidate,
+            advisory_plan,
+            destination_root_override,
+        );
 
-        match installed_state {
-            CheatInstalledState::NotInstalled => summary.not_installed += 1,
-            CheatInstalledState::ExactFilePresent
-            | CheatInstalledState::SameSetDifferentFilename => {
-                summary.already_installed += 1;
-            }
-            CheatInstalledState::DestinationOccupiedDifferentContent
-            | CheatInstalledState::MultipleInstalledCandidates
-            | CheatInstalledState::InstalledFileMalformed
-            | CheatInstalledState::DestinationSymlink
-            | CheatInstalledState::InaccessibleDestination => summary.conflicts += 1,
-            CheatInstalledState::Unknown => {}
-        }
-
-        let staging_candidate = game.parsing_complete
-            && matches!(
-                game_match.confidence,
-                CheatMatchConfidence::Exact | CheatMatchConfidence::Strong
-            )
-            && matches!(
-                installed_state,
-                CheatInstalledState::NotInstalled
-                    | CheatInstalledState::ExactFilePresent
-                    | CheatInstalledState::SameSetDifferentFilename
-            );
-        if staging_candidate {
-            summary.staging_candidates += 1;
-        }
+        let staging_plan = resolve_cheat_staging_plan(
+            filesystem,
+            game,
+            &game_match,
+            single_candidate,
+            advisory_plan,
+            destination_root_override,
+        );
 
         entries.push(CheatAvailabilityEntry {
             game: game.clone(),
             game_match,
             installed_state,
             installed_state_detail,
-            staging_candidate,
+            staging_candidate: false, // finalized below, after duplicate detection
+            destructive_if_applied: false,
+            staging_plan,
         });
+    }
+
+    demote_duplicate_staging_destinations(&mut entries);
+
+    for entry in &mut entries {
+        entry.staging_candidate = matches!(
+            entry.staging_plan.planned_action,
+            CheatStagingAction::InstallNew
+                | CheatStagingAction::AlreadyInstalled
+                | CheatStagingAction::ReplaceDifferent
+        );
+        entry.destructive_if_applied =
+            entry.staging_plan.planned_action == CheatStagingAction::ReplaceDifferent;
+        match entry.staging_plan.planned_action {
+            CheatStagingAction::InstallNew => summary.not_installed += 1,
+            CheatStagingAction::AlreadyInstalled => summary.already_installed += 1,
+            CheatStagingAction::Conflict => summary.conflicts += 1,
+            CheatStagingAction::ReplaceDifferent | CheatStagingAction::NotEligible => {}
+        }
+        if entry.staging_candidate {
+            summary.staging_candidates += 1;
+        }
     }
 
     entries.sort_by(|left, right| {
@@ -1539,6 +1991,42 @@ pub fn build_cheat_availability_report(
         entries,
         summary,
         diagnostics: snapshot.diagnostics.clone(),
+    }
+}
+
+/// Groups every entry whose staging plan proposes an actionable
+/// (`install_new`/`already_installed`/`replace_different`) destination by
+/// that destination's path. Any destination named by two or more entries
+/// has every one of those entries demoted to `conflict` -
+/// `duplicate_destination` - before staging candidates are counted, so a
+/// duplicate is never reported as a safe single-target install.
+fn demote_duplicate_staging_destinations(entries: &mut [CheatAvailabilityEntry]) {
+    use std::collections::BTreeMap;
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries.iter() {
+        if matches!(
+            entry.staging_plan.planned_action,
+            CheatStagingAction::InstallNew
+                | CheatStagingAction::AlreadyInstalled
+                | CheatStagingAction::ReplaceDifferent
+        ) && let Some(path) = &entry.staging_plan.proposed_destination_path
+        {
+            *counts.entry(path.display.clone()).or_default() += 1;
+        }
+    }
+    for entry in entries.iter_mut() {
+        if matches!(
+            entry.staging_plan.planned_action,
+            CheatStagingAction::InstallNew
+                | CheatStagingAction::AlreadyInstalled
+                | CheatStagingAction::ReplaceDifferent
+        ) && let Some(path) = &entry.staging_plan.proposed_destination_path
+            && counts.get(&path.display).copied().unwrap_or(0) > 1
+        {
+            entry.staging_plan.planned_action = CheatStagingAction::Conflict;
+            entry.staging_plan.reason = "duplicate_destination";
+        }
     }
 }
 

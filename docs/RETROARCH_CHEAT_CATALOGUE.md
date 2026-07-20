@@ -2,18 +2,31 @@
 
 `archivefs retroarch-cheat-catalogue <local-path>` discovers which cheats a
 **local** external catalogue source offers for your catalogued games, how
-confidently each offer matches a game you own, and whether it is already
-installed - without downloading, installing, enabling, applying, or changing
-any cheat, and without any network access.
+confidently each offer matches a game you own, whether it is already
+installed, and - as of this milestone - exactly where it would go and what
+would happen if it were staged. **No file is installed, copied, renamed, or
+overwritten by this command, now or in any earlier milestone.** Every
+`planned_action` in this document is a calculation only.
 
 ```console
 archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue
 archivefs retroarch-cheat-catalogue /path/to/manifest.json --json
+archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root
 ```
 
 The local catalogue path is always required and always exact. ArchiveFS
 never searches your home directory, a default catalogue location, or any
 remote source for one.
+
+`--cheat-destination-root <path>` replaces the discovered RetroArch
+environment's own cheat root for **staging-destination preview resolution
+only** - isolated testing/preview use (e.g. previewing against a scratch
+directory before RetroArch has even been installed, or reproducing a report
+deterministically outside your real environment). It changes nothing else:
+matching, installed-state resolution against an already-known
+`retroarch-patch-preview` artifact-inventory destination, and catalogue
+parsing are all unaffected. The path is never created, and omitting the flag
+leaves every existing behavior exactly as it was before this flag existed.
 
 ## What this answers
 
@@ -27,8 +40,11 @@ For each game the local catalogue describes:
 - Is a matching cheat file already installed, and does its content agree?
 - Would installing it conflict with something already at the expected
   destination?
-- Is it a safe candidate for future staging (advisory only - nothing is
-  staged by this milestone)?
+- Exactly what path would a staging operation use, and what would it do
+  there - install a new file, recognize it as already present, replace
+  different content, or refuse as a conflict?
+- Is it a safe candidate for future staging (advisory only - see
+  "Staging preview" below; nothing is staged by this milestone)?
 
 ## Scope
 
@@ -145,11 +161,117 @@ as a catalogue `.cht` file) of the expected destination through the same
 no-write, no-follow filesystem trait used everywhere else in this command -
 never a write, never an execute, never a second copy left on disk.
 
-`staging_candidate` is advisory metadata only - `true` exactly when the
-match is `exact`/`strong`, the catalogue record itself parsed without
-diagnostics, and the installed state is `not_installed`,
-`exact_file_present`, or `same_set_different_filename`. Nothing in this
-command stages, copies, or installs a file because of this flag.
+As of this milestone, `unknown` is no longer the automatic result whenever
+`retroarch-patch-preview`'s own artifact inventory has no expected
+destination for the matched archive (e.g. no resolvable core). That case now
+falls back to the same canonical-platform destination resolution the
+staging preview below uses, so `installed_state` reflects a real probe/hash
+result whenever a destination root (discovered or overridden) and a
+resolvable platform are both available. `unknown` is still the honest result
+whenever the environment/root genuinely cannot be determined, or the match
+itself is `ambiguous`/`unsupported`.
+
+## Staging preview
+
+For every entry, `staging_plan` calculates the exact destination path and
+what would happen there - still only a calculation; see the guarantee at
+the top of this document. Fields:
+
+- `source_cheat_path`: the catalogue source file this record came from.
+- `proposed_destination_path`: `<destination root>/<canonical platform>/<game
+  name>.cht`, or absent (`null`) when `planned_action` is `not_eligible` and
+  no destination could even be computed.
+- `source_file_hash` / `existing_destination_hash`: SHA-256 of the source
+  file and, when the destination already exists as a readable regular file,
+  of that file too.
+- `planned_action`: one of the five stable lower-snake-case values below.
+- `reason`: a stable, fixed identifier for why that action was chosen -
+  never free-text prose.
+
+### Destination resolution
+
+The destination directory component is **only** ArchiveFS's own canonical
+platform name for the catalogue record's platform hint (the same alias
+table "Identity evidence and confidence" above uses for matching - e.g.
+`"Atari - 2600"` resolves the same way to `"Atari2600"`). An unknown,
+ambiguous, or unsafe platform hint is never used as a directory name, raw
+or sanitized: if the hint does not resolve to a recognized canonical
+platform, the result is `source_platform_unresolved`, exactly as if no
+platform had been declared at all. Sanitizing a string only proves it is
+*safe to use as a path component*; it never proves the string names a real,
+trusted platform, so this command never treats "passed the sanitizer" as
+license to use an unrecognized hint. This matters even when the match
+itself came from serial/hash evidence that never looked at the platform
+string at all - an exact match on serial does not make an attacker-supplied
+`platform` field trustworthy.
+
+The filename is the catalogue record's own game name plus `.cht`. Unlike
+the platform component, the game name is not checked against any table (a
+catalogue may legitimately name any game), so it is validated by
+sanitization alone: rejected outright (`destination_traversal_rejected`) if
+it is empty, `.`, `..`, or contains a path separator or NUL byte. The
+already-canonical platform component is also run through the same
+sanitizer as defense in depth, even though every table entry is already
+safe by construction.
+
+The destination *root* is, in order: `--cheat-destination-root` when given,
+otherwise the first profile (in the environment's fixed native/Flatpak-user/
+Flatpak-system order) with a usable, non-lossy discovered `cheats` path from
+`retroarch-patch-preview`'s own environment discovery - not a new default
+location this command invents. When `retroarch-patch-preview`'s existing
+artifact inventory already has an expected destination for the matched
+archive (a resolvable RetroArch core), that already-computed, core-based
+path is used instead and takes precedence over the canonical-platform
+resolver - it reflects the real, already-verified RetroArch runtime
+convention exactly, and the canonical-platform resolver exists to cover
+every case that path does not.
+
+The destination root itself is never required to exist, and this command
+never creates it, any subdirectory under it, or the destination file - a
+missing root only ever changes whether `probe` reports `missing` (leading to
+`install_new` when otherwise eligible), never whether the root gets created.
+
+### Planned actions
+
+Stable lower-snake-case JSON values:
+
+- `install_new`: destination does not exist; match is `exact`/`strong`.
+- `already_installed`: destination exists and its SHA-256 matches the
+  source exactly.
+- `replace_different`: destination exists with different content. **Preview
+  only - nothing is overwritten.** Counts as a staging candidate, but is
+  separately flagged `destructive_if_applied: true` on the entry so a
+  future apply operation (not implemented by this or any milestone yet)
+  cannot mistake it for a harmless new install.
+- `conflict`: two or more source entries in this same report resolved to
+  the identical destination path (`duplicate_destination`), or the
+  destination itself could not be resolved safely - a symlink
+  (`destination_symlink_not_followed`, never followed or read), an
+  inaccessible or wrong-type path, more than one existing artifact-inventory
+  candidate (`multiple_installed_candidates`), or a destination that could
+  not be re-read for hashing.
+- `not_eligible`: confidence below `strong` (`weak_match_not_eligible`,
+  `ambiguous_match_not_eligible`, `unsupported_match_not_eligible`),
+  incomplete catalogue parsing (`parsing_incomplete`), an absent, unknown,
+  ambiguous, or otherwise unsafe (traversal-style, absolute, separator-
+  containing) platform hint - anything that does not resolve to a
+  recognized canonical platform (`source_platform_unresolved`), an unsafe
+  game-name path component (`destination_traversal_rejected`), or no
+  destination root/environment available at all
+  (`destination_environment_unavailable`).
+
+Duplicate-destination detection runs after every entry's own plan is
+computed: any destination path named by more than one entry demotes *every*
+entry naming it to `conflict`, even ones that would otherwise have been
+`install_new` - a duplicate is never resolved by silently picking one
+source over another.
+
+`staging_candidate` is `true` exactly when `planned_action` is
+`install_new`, `already_installed`, or `replace_different` - never for
+`conflict` or `not_eligible`. Only `exact`/`strong` matches with complete
+catalogue parsing can ever reach one of those three actions; a `weak` match
+can never become a staging candidate, by construction, regardless of what
+its destination would otherwise resolve to.
 
 ## Safety limits
 
@@ -191,6 +313,18 @@ summary
 diagnostics
 ```
 
+Each `entries[]` object additionally carries `staging_candidate` (bool),
+`destructive_if_applied` (bool), and `staging_plan` (the object documented
+under "Staging preview" above) alongside the pre-existing `game`,
+`game_match`, `installed_state`, and `installed_state_detail` fields -
+purely additive; no field present before this milestone was removed or
+renamed. `summary` gained no new keys; `not_installed`, `already_installed`,
+`conflicts`, and `staging_candidates` are now counted from every entry's
+`staging_plan.planned_action` instead of `installed_state` alone, so a
+`replace_different` entry now counts toward `staging_candidates` rather than
+`conflicts` - the one intentional, documented behavior change to these
+counts.
+
 Enums use explicit lower-snake-case Serde names. Filesystem paths use the
 existing `EncodedPath { display, lossy }` representation. Diagnostics use
 stable `code`/`severity` fields, matching every other bounded discovery
@@ -213,8 +347,15 @@ This command does not:
   metadata;
 - populate `same_set_different_filename` yet (planned: cross-referencing
   every installed cheat finding's hash against the matched game, not only
-  the single expected destination); or
-- add an apply/install/stage operation of any kind.
+  the single expected destination);
+- create the destination root, any platform subdirectory under it, or the
+  destination file itself - `staging_plan` is a calculation, never acted on,
+  regardless of `--cheat-destination-root`;
+- follow a destination symlink, whether or not it escapes the destination
+  root - a symlinked destination is always `conflict`, never read; or
+- add an apply/install/stage operation of any kind. `staging_plan` answers
+  "what would happen", never "make it happen" - no flag, override, or
+  confidence level in this command performs an install, copy, or overwrite.
 
-Any future download or staging workflow remains separately gated by
-[`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
+Any future download or staging *execution* workflow remains separately
+gated by [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).

@@ -277,7 +277,8 @@ fn retroarch_cht_folder_platform_alias_matches_canonical_catalogue_platform() {
         None,
         None,
     )];
-    let report = build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None);
+    let report =
+        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None, None);
 
     assert_eq!(report.entries.len(), 1);
     assert_eq!(
@@ -435,10 +436,20 @@ fn stable_json_serialization() {
     )];
     let first_snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &path);
     let second_snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &path);
-    let first_report =
-        build_cheat_availability_report(&HostReadOnlyFilesystem, &first_snapshot, &games, None);
-    let second_report =
-        build_cheat_availability_report(&HostReadOnlyFilesystem, &second_snapshot, &games, None);
+    let first_report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &first_snapshot,
+        &games,
+        None,
+        None,
+    );
+    let second_report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &second_snapshot,
+        &games,
+        None,
+        None,
+    );
     assert_eq!(
         serde_json::to_string(&first_report).unwrap(),
         serde_json::to_string(&second_report).unwrap()
@@ -741,7 +752,11 @@ cheat1_enable = true
     // source are both real `.cht` byte streams.
     let cht_root = temp_root("already-installed-exact-cht");
     let cht_text = "cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = false\n";
-    fs::write(cht_root.join("Chrono Quest.cht"), cht_text).unwrap();
+    // Nested under a platform subdirectory so the record carries a
+    // platform hint - required for `strong` (title+platform) confidence,
+    // and in turn for staging eligibility.
+    fs::create_dir_all(cht_root.join("SNES")).unwrap();
+    fs::write(cht_root.join("SNES").join("Chrono Quest.cht"), cht_text).unwrap();
     fs::write(&destination_path, cht_text).unwrap();
     let cht_snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &cht_root);
     let cht_record = &cht_snapshot.games[0];
@@ -772,6 +787,7 @@ cheat1_enable = true
         },
         &games,
         Some(&plan),
+        None,
     );
     assert_eq!(report.entries.len(), 1);
     assert_eq!(
@@ -785,8 +801,9 @@ cheat1_enable = true
 #[test]
 fn installed_conflict_different_content() {
     let cht_root = temp_root("installed-conflict-cht");
+    fs::create_dir_all(cht_root.join("SNES")).unwrap();
     fs::write(
-        cht_root.join("Chrono Quest.cht"),
+        cht_root.join("SNES").join("Chrono Quest.cht"),
         "cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = false\n",
     )
     .unwrap();
@@ -810,13 +827,29 @@ fn installed_conflict_different_content() {
     );
     let plan = plan_with(vec![entry], inventory_with(vec![destination], Vec::new()));
 
-    let report =
-        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, Some(&plan));
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        Some(&plan),
+        None,
+    );
     assert_eq!(
         report.entries[0].installed_state,
         CheatInstalledState::DestinationOccupiedDifferentContent
     );
-    assert_eq!(report.summary.conflicts, 1);
+    // Different content at an existing destination is a preview-only
+    // `replace_different` staging action, not a `conflict` - it is a
+    // staging candidate (destructive if ever applied), never silently
+    // treated as unsafe.
+    assert_eq!(
+        report.entries[0].staging_plan.planned_action,
+        CheatStagingAction::ReplaceDifferent
+    );
+    assert!(report.entries[0].staging_candidate);
+    assert!(report.entries[0].destructive_if_applied);
+    assert_eq!(report.summary.conflicts, 0);
+    assert_eq!(report.summary.staging_candidates, 1);
 }
 
 #[test]
@@ -873,8 +906,13 @@ fn installed_file_malformed() {
         inventory_with(vec![destination], vec![malformed_finding]),
     );
 
-    let report =
-        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, Some(&plan));
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        Some(&plan),
+        None,
+    );
     assert_eq!(
         report.entries[0].installed_state,
         CheatInstalledState::InstalledFileMalformed
@@ -908,8 +946,13 @@ fn multiple_installed_candidates_never_silently_picked() {
         inventory_with(vec![destination_a, destination_b], Vec::new()),
     );
 
-    let report =
-        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, Some(&plan));
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        Some(&plan),
+        None,
+    );
     assert_eq!(
         report.entries[0].installed_state,
         CheatInstalledState::MultipleInstalledCandidates
@@ -919,7 +962,12 @@ fn multiple_installed_candidates_never_silently_picked() {
 #[test]
 fn not_installed_when_destination_empty() {
     let cht_root = temp_root("not-installed-cht");
-    fs::write(cht_root.join("Chrono Quest.cht"), "cheats = 0\n").unwrap();
+    fs::create_dir_all(cht_root.join("SNES")).unwrap();
+    fs::write(
+        cht_root.join("SNES").join("Chrono Quest.cht"),
+        "cheats = 0\n",
+    )
+    .unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &cht_root);
 
     let games = vec![evidence(24, "Chrono Quest", Some("SNES"), None, None, None)];
@@ -933,14 +981,24 @@ fn not_installed_when_destination_empty() {
     );
     let plan = plan_with(vec![entry], inventory_with(vec![destination], Vec::new()));
 
-    let report =
-        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, Some(&plan));
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        Some(&plan),
+        None,
+    );
     assert_eq!(
         report.entries[0].installed_state,
         CheatInstalledState::NotInstalled
     );
     assert_eq!(report.summary.not_installed, 1);
-    assert!(report.entries[0].staging_candidate || true); // staged only if confidence is exact/strong; title-only here is weak.
+    assert_eq!(
+        report.entries[0].staging_plan.planned_action,
+        CheatStagingAction::InstallNew
+    );
+    assert!(report.entries[0].staging_candidate);
+    assert!(!report.entries[0].destructive_if_applied);
 }
 
 #[test]
@@ -950,7 +1008,8 @@ fn installed_state_unknown_without_advisory_plan() {
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &cht_root);
     let games = vec![evidence(25, "Chrono Quest", Some("SNES"), None, None, None)];
 
-    let report = build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None);
+    let report =
+        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None, None);
     assert_eq!(
         report.entries[0].installed_state,
         CheatInstalledState::Unknown
@@ -972,7 +1031,8 @@ fn no_filesystem_writes_or_directory_changes() {
 
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
     let games = vec![evidence(30, "Game", None, None, None, None)];
-    let _report = build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None);
+    let _report =
+        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None, None);
 
     let after = fs::read_dir(&root)
         .unwrap()
@@ -1047,7 +1107,553 @@ fn build_availability_report_matches_snapshot_complete_flag() {
     fs::write(root.join("Huge.cht"), oversized).unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
     assert!(!snapshot.complete);
-    let report = build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &[], None);
+    let report =
+        build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &[], None, None);
     assert!(!report.complete);
     assert!(!report.diagnostics.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// Staging preview (destination planning)
+//
+// Every test below uses `temp_root`, which is rooted at
+// `std::env::temp_dir()` and never at a real `$HOME` - see
+// `module_source_never_reads_home_or_xdg_env_directly` below for the
+// structural guarantee that this module cannot read the real `$HOME`
+// even if a future edit tried to. `Frogger`/`"Atari - 2600"` is used
+// throughout to also exercise the canonical-platform-alias resolution
+// (`"Atari - 2600"` -> `"Atari2600"`) end to end into a real destination
+// path, not just in `match_cheat_game_record`'s own unit tests above.
+// ---------------------------------------------------------------------
+
+fn frogger_cht_snapshot(root: &Path) -> CheatCatalogueSnapshot {
+    fs::create_dir_all(root.join("Atari - 2600")).unwrap();
+    fs::write(
+        root.join("Atari - 2600").join("Frogger.cht"),
+        "cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = false\n",
+    )
+    .unwrap();
+    load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", root)
+}
+
+fn frogger_games() -> Vec<CatalogueGameEvidence> {
+    vec![evidence(50, "Frogger", Some("Atari2600"), None, None, None)]
+}
+
+#[test]
+fn staging_strong_frogger_match_installs_new_with_no_destination_file() {
+    let catalogue_root = temp_root("staging-install-new-catalogue");
+    let snapshot = frogger_cht_snapshot(&catalogue_root);
+    let games = frogger_games();
+    let destination_root = temp_root("staging-install-new-dest");
+
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    assert_eq!(report.entries.len(), 1);
+    let entry = &report.entries[0];
+    assert_eq!(entry.game_match.confidence, CheatMatchConfidence::Strong);
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::InstallNew
+    );
+    assert!(entry.staging_candidate);
+    assert!(!entry.destructive_if_applied);
+    let destination = entry
+        .staging_plan
+        .proposed_destination_path
+        .as_ref()
+        .expect("destination resolved");
+    assert!(destination.display.contains("Atari2600"));
+    assert!(destination.display.ends_with("Frogger.cht"));
+    // Preview only - the proposed destination was never actually created.
+    assert!(!Path::new(&destination.display).exists());
+    assert_eq!(report.summary.not_installed, 1);
+    assert_eq!(report.summary.staging_candidates, 1);
+}
+
+#[test]
+fn staging_strong_frogger_match_with_identical_existing_file_is_already_installed() {
+    let catalogue_root = temp_root("staging-already-installed-catalogue");
+    let snapshot = frogger_cht_snapshot(&catalogue_root);
+    let games = frogger_games();
+    let source_hash = snapshot.games[0].source_file_hash.clone();
+
+    let destination_root = temp_root("staging-already-installed-dest");
+    let destination_dir = destination_root.join("Atari2600");
+    fs::create_dir_all(&destination_dir).unwrap();
+    fs::write(
+        destination_dir.join("Frogger.cht"),
+        "cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = false\n",
+    )
+    .unwrap();
+
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::AlreadyInstalled
+    );
+    assert_eq!(entry.staging_plan.existing_destination_hash, source_hash);
+    assert!(entry.staging_candidate);
+    assert!(!entry.destructive_if_applied);
+    assert_eq!(report.summary.already_installed, 1);
+}
+
+#[test]
+fn staging_strong_frogger_match_with_different_existing_file_is_replace_different() {
+    let catalogue_root = temp_root("staging-replace-different-catalogue");
+    let snapshot = frogger_cht_snapshot(&catalogue_root);
+    let games = frogger_games();
+
+    let destination_root = temp_root("staging-replace-different-dest");
+    let destination_dir = destination_root.join("Atari2600");
+    fs::create_dir_all(&destination_dir).unwrap();
+    let original_bytes = "cheats = 1\ncheat0_desc = \"Different\"\n";
+    fs::write(destination_dir.join("Frogger.cht"), original_bytes).unwrap();
+
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::ReplaceDifferent
+    );
+    assert!(entry.staging_candidate);
+    assert!(entry.destructive_if_applied);
+    assert_eq!(report.summary.staging_candidates, 1);
+    assert_eq!(report.summary.conflicts, 0);
+    // Preview only - the existing destination content is byte-for-byte
+    // untouched, never overwritten.
+    assert_eq!(
+        fs::read_to_string(destination_dir.join("Frogger.cht")).unwrap(),
+        original_bytes
+    );
+}
+
+#[test]
+fn staging_weak_title_only_match_is_not_eligible() {
+    let catalogue_root = temp_root("staging-weak-catalogue");
+    // Flat file directly under the root - no platform subdirectory means
+    // no platform hint, so only the filename-only (weak) tier can match.
+    fs::write(catalogue_root.join("Frogger.cht"), "cheats = 0\n").unwrap();
+    let snapshot =
+        load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &catalogue_root);
+    let games = vec![evidence(51, "Frogger", Some("Atari2600"), None, None, None)];
+
+    let destination_root = temp_root("staging-weak-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(entry.game_match.confidence, CheatMatchConfidence::Weak);
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(entry.staging_plan.reason, "weak_match_not_eligible");
+    assert!(!entry.staging_candidate);
+    assert!(entry.staging_plan.proposed_destination_path.is_none());
+    assert_eq!(report.summary.staging_candidates, 0);
+}
+
+#[test]
+fn staging_two_source_entries_resolving_to_same_destination_conflict() {
+    let catalogue_root = temp_root("staging-duplicate-dest-catalogue");
+    // Two different real source files, spelling the same platform two
+    // different ways ("Atari - 2600" vs "Atari2600") - both canonicalize
+    // to the identical `Atari2600` directory, so both propose the exact
+    // same destination path for the same game name.
+    fs::create_dir_all(catalogue_root.join("Atari - 2600")).unwrap();
+    fs::create_dir_all(catalogue_root.join("Atari2600")).unwrap();
+    fs::write(
+        catalogue_root.join("Atari - 2600").join("Frogger.cht"),
+        "cheats = 0\n",
+    )
+    .unwrap();
+    fs::write(
+        catalogue_root.join("Atari2600").join("Frogger.cht"),
+        "cheats = 1\ncheat0_desc = \"Alternate\"\n",
+    )
+    .unwrap();
+    let snapshot =
+        load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &catalogue_root);
+    assert_eq!(snapshot.games.len(), 2);
+    let games = vec![evidence(52, "Frogger", Some("Atari2600"), None, None, None)];
+
+    let destination_root = temp_root("staging-duplicate-dest-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    assert_eq!(report.entries.len(), 2);
+    assert!(
+        report
+            .entries
+            .iter()
+            .all(|entry| entry.staging_plan.planned_action == CheatStagingAction::Conflict)
+    );
+    assert!(
+        report
+            .entries
+            .iter()
+            .all(|entry| entry.staging_plan.reason == "duplicate_destination")
+    );
+    assert!(report.entries.iter().all(|entry| !entry.staging_candidate));
+    assert_eq!(report.summary.conflicts, 2);
+    assert_eq!(report.summary.staging_candidates, 0);
+}
+
+/// Builds a single-game manifest snapshot with an explicit, independently
+/// controlled `game_name`/`platform`/`serial`, for the platform-safety
+/// tests below - all matched via the exact-serial tier (1), which needs no
+/// platform or title evidence at all, so an attacker-controlled
+/// `game_name`/`platform` string can still reach destination resolution
+/// even though it would never win a title/platform-based tier on its own.
+fn serial_matched_snapshot(
+    root: &Path,
+    game_name: &str,
+    platform: &str,
+    serial: &str,
+) -> CheatCatalogueSnapshot {
+    let manifest_path = write_manifest(
+        root,
+        &format!(
+            r#"{{
+                "source_name": "Fixture",
+                "games": [
+                    {{
+                        "game_name": {game_name},
+                        "platform": {platform},
+                        "serial": "{serial}",
+                        "cheats": []
+                    }}
+                ]
+            }}"#,
+            game_name = serde_json::to_string(game_name).unwrap(),
+            platform = serde_json::to_string(platform).unwrap(),
+        ),
+    );
+    load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &manifest_path)
+}
+
+#[test]
+fn staging_traversal_style_game_name_is_rejected_with_valid_platform() {
+    // Platform is a genuine canonical alias (so destination resolution
+    // gets past the platform check) - only the game name is hostile, and
+    // must still be rejected as an unsafe path component rather than ever
+    // being joined onto the destination root.
+    let catalogue_root = temp_root("staging-game-name-traversal-catalogue");
+    let snapshot = serial_matched_snapshot(
+        &catalogue_root,
+        "../../../etc/passwd",
+        "Atari - 2600",
+        "CX2618-TRAVERSAL",
+    );
+    let games = vec![evidence(
+        53,
+        "Something Unrelated",
+        None,
+        None,
+        Some("CX2618-TRAVERSAL"),
+        None,
+    )];
+
+    let destination_root = temp_root("staging-game-name-traversal-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(entry.game_match.confidence, CheatMatchConfidence::Exact);
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(entry.staging_plan.reason, "destination_traversal_rejected");
+    assert!(entry.staging_plan.proposed_destination_path.is_none());
+    assert!(!entry.staging_candidate);
+    // Nothing was created anywhere, including inside the destination root
+    // itself.
+    assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+}
+
+#[test]
+fn staging_unknown_platform_hint_is_not_eligible() {
+    // A platform string that is perfectly safe as a path component but is
+    // simply not a platform ArchiveFS's own alias table recognizes must
+    // never be laundered into a trusted destination directory just
+    // because it contains no unsafe characters. Confidence is `exact`
+    // (matched via serial) precisely to prove the platform gate fires
+    // independently of match confidence.
+    let catalogue_root = temp_root("staging-unknown-platform-catalogue");
+    let snapshot = serial_matched_snapshot(
+        &catalogue_root,
+        "Frogger",
+        "TotallyMadeUpPlatformXYZ",
+        "CX2618-UNKNOWN",
+    );
+    let games = vec![evidence(
+        54,
+        "Something Unrelated",
+        None,
+        None,
+        Some("CX2618-UNKNOWN"),
+        None,
+    )];
+
+    let destination_root = temp_root("staging-unknown-platform-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(entry.game_match.confidence, CheatMatchConfidence::Exact);
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(entry.staging_plan.reason, "source_platform_unresolved");
+    assert!(entry.staging_plan.proposed_destination_path.is_none());
+    assert!(!entry.staging_candidate);
+    assert_eq!(report.summary.staging_candidates, 0);
+    assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+}
+
+#[test]
+fn staging_traversal_style_platform_hint_is_not_eligible() {
+    // A `../`-laden platform hint must be rejected at the canonicalization
+    // gate - `source_platform_unresolved` - never reaching (and therefore
+    // never needing to be caught by) the path-component sanitizer at all.
+    let catalogue_root = temp_root("staging-traversal-platform-catalogue");
+    let snapshot = serial_matched_snapshot(
+        &catalogue_root,
+        "Frogger",
+        "../../escape",
+        "CX2618-PLATTRAV",
+    );
+    let games = vec![evidence(
+        55,
+        "Something Unrelated",
+        None,
+        None,
+        Some("CX2618-PLATTRAV"),
+        None,
+    )];
+
+    let destination_root = temp_root("staging-traversal-platform-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(entry.staging_plan.reason, "source_platform_unresolved");
+    assert!(entry.staging_plan.proposed_destination_path.is_none());
+    assert!(!entry.staging_candidate);
+    assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+}
+
+#[test]
+fn staging_separator_containing_platform_hint_is_not_eligible() {
+    // An absolute-looking / separator-containing platform hint must also
+    // be rejected at the canonicalization gate, not merely at the
+    // sanitizer - it is not a recognized alias either.
+    let catalogue_root = temp_root("staging-separator-platform-catalogue");
+    let snapshot = serial_matched_snapshot(
+        &catalogue_root,
+        "Frogger",
+        "/etc/passwd",
+        "CX2618-SEPARATOR",
+    );
+    let games = vec![evidence(
+        56,
+        "Something Unrelated",
+        None,
+        None,
+        Some("CX2618-SEPARATOR"),
+        None,
+    )];
+
+    let destination_root = temp_root("staging-separator-platform-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(entry.staging_plan.reason, "source_platform_unresolved");
+    assert!(entry.staging_plan.proposed_destination_path.is_none());
+    assert!(!entry.staging_candidate);
+    assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+}
+
+#[test]
+fn staging_canonical_atari_alias_remains_eligible() {
+    // The positive case, confirmed end to end: a genuine canonical alias
+    // ("Atari - 2600" -> "Atari2600") must still resolve to a real,
+    // eligible destination - the platform gate above must reject only
+    // unknown/unsafe hints, never a real one.
+    let catalogue_root = temp_root("staging-canonical-alias-catalogue");
+    let snapshot = frogger_cht_snapshot(&catalogue_root);
+    let games = frogger_games();
+    let destination_root = temp_root("staging-canonical-alias-dest");
+
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(entry.game_match.confidence, CheatMatchConfidence::Strong);
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::InstallNew
+    );
+    assert!(entry.staging_candidate);
+    let destination = entry
+        .staging_plan
+        .proposed_destination_path
+        .as_ref()
+        .expect("destination resolved");
+    assert!(destination.display.contains("Atari2600"));
+    assert!(!destination.display.contains("Atari - 2600"));
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_destination_symlink_escaping_root_is_rejected_without_reading_target() {
+    let catalogue_root = temp_root("staging-symlink-catalogue");
+    let snapshot = frogger_cht_snapshot(&catalogue_root);
+    let games = frogger_games();
+
+    let destination_root = temp_root("staging-symlink-dest");
+    let outside = temp_root("staging-symlink-outside-target");
+    // Deliberately identical content to the real source: if the symlink
+    // were ever followed and hashed, this would wrongly report
+    // `already_installed` instead of refusing to read it at all.
+    fs::write(
+        outside.join("secret.cht"),
+        "cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = false\n",
+    )
+    .unwrap();
+    let destination_dir = destination_root.join("Atari2600");
+    fs::create_dir_all(&destination_dir).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join("secret.cht"),
+        destination_dir.join("Frogger.cht"),
+    )
+    .unwrap();
+
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::Conflict
+    );
+    assert!(entry.staging_plan.existing_destination_hash.is_none());
+    assert!(!entry.staging_candidate);
+    // The external target file itself was never modified.
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.cht")).unwrap(),
+        "cheats = 1\ncheat0_desc = \"Infinite Lives\"\ncheat0_enable = false\n"
+    );
+}
+
+#[test]
+fn staging_absent_destination_root_reports_install_new_without_creating_it() {
+    let catalogue_root = temp_root("staging-absent-root-catalogue");
+    let snapshot = frogger_cht_snapshot(&catalogue_root);
+    let games = frogger_games();
+
+    let destination_root = temp_root("staging-absent-root-dest");
+    fs::remove_dir_all(&destination_root).unwrap();
+    assert!(!destination_root.exists());
+
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::InstallNew
+    );
+    assert!(report.read_only);
+    // Read-only preview never creates the missing root, its platform
+    // subdirectory, or the file itself.
+    assert!(!destination_root.exists());
+}
+
+#[test]
+fn module_source_never_reads_home_or_xdg_env_directly() {
+    // Structural guarantee: destination-root resolution must come only
+    // from an explicitly-supplied `RetroArchAdvisoryPlan.environment` or
+    // `destination_root_override` parameter, never by reading the
+    // process's real `$HOME`/`$XDG_*` environment directly - see
+    // `docs/RETROARCH_CHEAT_CATALOGUE.md` and
+    // `emulator_environment::retroarch::DiscoveryEnvironment`'s own doc
+    // comment on why tests must never depend on the real environment.
+    let source = include_str!("../cheat_catalogue.rs");
+    for forbidden in [
+        "env::var(\"HOME\")",
+        "env::var(\"XDG_",
+        "std::env::home_dir",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "cheat_catalogue.rs must never read {forbidden} directly"
+        );
+    }
 }

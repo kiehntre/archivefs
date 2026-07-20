@@ -283,12 +283,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "retroarch-cheat-catalogue" => {
             let mut input_args = args.collect::<Vec<_>>();
             let json = extract_flag(&mut input_args, "--json");
+            let destination_root_override = extract_cheat_destination_root_flag(&mut input_args)?;
             if input_args.is_empty() {
                 return Err("retroarch-cheat-catalogue requires a local catalogue path".into());
             }
             if input_args.len() > 1 {
                 return Err(
-                    "retroarch-cheat-catalogue accepts one local catalogue path and only --json"
+                    "retroarch-cheat-catalogue accepts one local catalogue path, --json, and \
+                     --cheat-destination-root <path>"
                         .into(),
                 );
             }
@@ -309,6 +311,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &snapshot,
                 &catalogue_games,
                 Some(&plan),
+                destination_root_override.as_deref(),
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1341,6 +1344,29 @@ fn format_cheat_availability_report(report: &CheatAvailabilityReport) -> String 
             entry.game_match.confidence, entry.installed_state, entry.staging_candidate
         )
         .unwrap();
+        writeln!(
+            &mut output,
+            "  staging: {:?} ({}){}",
+            entry.staging_plan.planned_action,
+            entry.staging_plan.reason,
+            if entry.destructive_if_applied {
+                " [destructive if ever applied]"
+            } else {
+                ""
+            }
+        )
+        .unwrap();
+        if let Some(destination) = &entry.staging_plan.proposed_destination_path {
+            writeln!(
+                &mut output,
+                "    proposed destination: {}",
+                destination.display
+            )
+            .unwrap();
+        }
+        if let Some(hash) = &entry.staging_plan.existing_destination_hash {
+            writeln!(&mut output, "    existing destination hash: {hash}").unwrap();
+        }
         for evidence in &entry.game_match.evidence {
             writeln!(
                 &mut output,
@@ -2879,6 +2905,31 @@ fn extract_path_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+/// Removes `--cheat-destination-root <path>` from `args` if present,
+/// returning the parsed override path unchanged (exact bytes, no
+/// normalization or lossy conversion). `retroarch-cheat-catalogue` uses
+/// this only to replace the discovered RetroArch environment's own cheat
+/// root for staging-destination *preview* resolution - isolated testing
+/// only. It never creates, modifies, or requires the path to already
+/// exist; without it, the command behaves exactly as before this flag
+/// existed.
+fn extract_cheat_destination_root_flag(
+    args: &mut Vec<String>,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let Some(position) = args
+        .iter()
+        .position(|arg| arg == "--cheat-destination-root")
+    else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err("--cheat-destination-root requires a value".into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(PathBuf::from(value)))
+}
+
 /// Removes every `--id <value>` occurrence from `args`, returning the
 /// parsed ids in the order given - the bulk counterpart to
 /// [`extract_id_flag`], which only ever handles (and requires) a single
@@ -3465,7 +3516,7 @@ fn print_help() {
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
     );
     println!(
-        "  retroarch-cheat-catalogue <local-path>  Discover and match an external cheat catalogue against your library (read-only)"
+        "  retroarch-cheat-catalogue <local-path>  Discover, match, and preview staging destinations for an external cheat catalogue (read-only; --cheat-destination-root <path> overrides the destination root for isolated preview only)"
     );
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
@@ -3535,6 +3586,9 @@ fn print_help() {
     println!("  archivefs retroarch-patch-preview --json");
     println!("  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue");
     println!("  archivefs retroarch-cheat-catalogue /path/to/manifest.json --json");
+    println!(
+        "  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root"
+    );
     println!("  archivefs status --json");
     println!("  archivefs stats");
     println!("  archivefs library-status");
