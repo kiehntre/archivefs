@@ -23,6 +23,8 @@ mod adapter;
 mod cheat_catalogue;
 mod cheat_install_result;
 mod cheat_installer;
+mod cheat_rollback;
+mod cheat_rollback_result;
 mod destination_safety;
 mod matching;
 mod pcsx2;
@@ -60,6 +62,15 @@ pub use cheat_install_result::{
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
     CheatInstallRunOutcome, execute_cheat_install_run,
+};
+pub use cheat_rollback::{
+    CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatRollbackOptions, CheatRollbackRunOutcome,
+    execute_cheat_rollback_run,
+};
+pub use cheat_rollback_result::{
+    CHEAT_ROLLBACK_RUN_SCHEMA_VERSION, CheatRollbackEntryResult, CheatRollbackOutcome,
+    CheatRollbackRun, CheatRollbackRunSchemaError, CheatRollbackRunStatus, CheatRollbackSummary,
+    parse_cheat_rollback_run,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,
