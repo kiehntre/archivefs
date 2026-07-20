@@ -4334,15 +4334,37 @@ pub fn canonical_platform_names() -> Vec<&'static str> {
     names
 }
 
+/// Resolves one external platform hint through the same normalized,
+/// built-in folder-alias table used by archive platform detection. The
+/// original hint is never changed; callers use the returned canonical name
+/// only for comparison. If a future table edit makes one normalized alias
+/// point at more than one canonical platform, the hint is deliberately
+/// treated as ambiguous and returns `None` rather than selecting the first
+/// row and risking a false-positive match.
+pub fn canonical_platform_for_alias(platform_hint: &str) -> Option<&'static str> {
+    canonical_platform_for_alias_in(platform_hint, FOLDER_PLATFORM_ALIASES)
+}
+
+fn canonical_platform_for_alias_in<'a>(
+    platform_hint: &str,
+    aliases: &'a [(&str, &'a str)],
+) -> Option<&'a str> {
+    let normalized = normalize_path_segment(platform_hint);
+    let mut matches = aliases
+        .iter()
+        .filter(|(alias, _)| *alias == normalized)
+        .map(|(_, canonical)| *canonical);
+    let canonical = matches.next()?;
+    matches
+        .all(|candidate| candidate == canonical)
+        .then_some(canonical)
+}
+
 /// Canonical platform name for one already-lossy-stringified path
 /// component, if it exactly matches a known folder alias after
 /// normalization, or `None` if it does not.
 fn folder_platform_alias(segment: &str) -> Option<&'static str> {
-    let normalized = normalize_path_segment(segment);
-    FOLDER_PLATFORM_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == normalized)
-        .map(|(_, canonical)| *canonical)
+    canonical_platform_for_alias(segment)
 }
 
 /// Infers a platform from `path`'s folder structure alone, walking
@@ -8762,6 +8784,24 @@ mod tests {
         // several distinct machines) and must not match anything.
         assert_eq!(
             detect_platform(format!("{root}/Acorn/Game.zip"), root),
+            None
+        );
+    }
+
+    #[test]
+    fn external_platform_hint_uses_the_shared_folder_alias_table() {
+        assert_eq!(
+            canonical_platform_for_alias("Atari - 2600"),
+            Some("Atari2600")
+        );
+        assert_eq!(canonical_platform_for_alias("unknown console"), None);
+    }
+
+    #[test]
+    fn conflicting_normalized_platform_aliases_are_rejected_as_ambiguous() {
+        let aliases = &[("atari2600", "Atari2600"), ("atari2600", "Atari5200")];
+        assert_eq!(
+            canonical_platform_for_alias_in("Atari - 2600", aliases),
             None
         );
     }

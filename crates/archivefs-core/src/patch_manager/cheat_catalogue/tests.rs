@@ -262,6 +262,40 @@ fn one_matching_game_json_manifest() {
 }
 
 #[test]
+fn retroarch_cht_folder_platform_alias_matches_canonical_catalogue_platform() {
+    let root = temp_root("atari-2600-folder-alias");
+    let platform_root = root.join("Atari - 2600");
+    fs::create_dir_all(&platform_root).unwrap();
+    fs::write(platform_root.join("Frogger (USA).cht"), "cheats = 0\n").unwrap();
+
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    let games = vec![evidence(
+        2600,
+        "Frogger (USA)",
+        Some("Atari2600"),
+        None,
+        None,
+        None,
+    )];
+    let report = build_cheat_availability_report(&HostReadOnlyFilesystem, &snapshot, &games, None);
+
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(
+        report.entries[0].game.source_platform.as_deref(),
+        Some("Atari - 2600")
+    );
+    assert_eq!(report.entries[0].game.source_game_name, "Frogger (USA)");
+    assert_eq!(
+        report.entries[0].game_match.confidence,
+        CheatMatchConfidence::Strong
+    );
+    assert_eq!(
+        report.entries[0].game_match.evidence[0].detail,
+        "normalized title and canonical platform match (Atari - 2600 -> Atari2600)"
+    );
+}
+
+#[test]
 fn malformed_cht_marks_parsing_incomplete_but_keeps_record() {
     let root = temp_root("malformed-cht");
     fs::write(
@@ -510,12 +544,62 @@ fn title_platform_region_match_is_strong() {
 }
 
 #[test]
-fn title_platform_match_without_region_is_weak() {
+fn title_platform_match_without_region_is_strong() {
     let record = record_with("Chrono Quest", Some("SNES"), None, None, None);
     let games = vec![evidence(5, "Chrono Quest", Some("SNES"), None, None, None)];
     let outcome = match_cheat_game_record(&record, &games, None);
-    assert_eq!(outcome.confidence, CheatMatchConfidence::Weak);
+    assert_eq!(outcome.confidence, CheatMatchConfidence::Strong);
     assert_eq!(outcome.evidence[0].tier, "exact_title_platform");
+}
+
+#[test]
+fn retroarch_platform_folder_alias_promotes_matching_title_to_strong() {
+    let record = record_with("Frogger (USA)", Some("Atari - 2600"), None, None, None);
+    let games = vec![evidence(
+        26,
+        "Frogger (USA)",
+        Some("Atari2600"),
+        None,
+        None,
+        None,
+    )];
+
+    let outcome = match_cheat_game_record(&record, &games, None);
+
+    assert_eq!(record.source_platform.as_deref(), Some("Atari - 2600"));
+    assert_eq!(outcome.confidence, CheatMatchConfidence::Strong);
+    assert_eq!(outcome.candidates.len(), 1);
+    assert_eq!(outcome.candidates[0].archive_id, 26);
+    assert_eq!(outcome.evidence[0].tier, "exact_title_platform");
+    assert_eq!(
+        outcome.evidence[0].detail,
+        "normalized title and canonical platform match (Atari - 2600 -> Atari2600)"
+    );
+}
+
+#[test]
+fn unknown_source_platform_does_not_promote_a_title_match() {
+    let record = record_with(
+        "Frogger (USA)",
+        Some("Unrelated Mystery System"),
+        None,
+        None,
+        None,
+    );
+    let games = vec![evidence(
+        27,
+        "Frogger (USA)",
+        Some("Atari2600"),
+        None,
+        None,
+        None,
+    )];
+
+    let outcome = match_cheat_game_record(&record, &games, None);
+
+    assert_eq!(outcome.confidence, CheatMatchConfidence::Weak);
+    assert_eq!(outcome.evidence[0].tier, "filename_only");
+    assert_eq!(outcome.evidence[0].detail, "normalized title match only");
 }
 
 #[test]
@@ -572,7 +656,7 @@ fn region_mismatch_remains_visible() {
     // Region differs, so tier 4 cannot fire; tier 5 (title+platform) still
     // matches, but the mismatch is recorded as extra evidence rather than
     // silently ignored.
-    assert_eq!(outcome.confidence, CheatMatchConfidence::Weak);
+    assert_eq!(outcome.confidence, CheatMatchConfidence::Strong);
     assert!(
         outcome
             .evidence
@@ -594,7 +678,7 @@ fn revision_mismatch_remains_visible() {
         None,
     )];
     let outcome = match_cheat_game_record(&record, &games, None);
-    assert_eq!(outcome.confidence, CheatMatchConfidence::Weak);
+    assert_eq!(outcome.confidence, CheatMatchConfidence::Strong);
     assert!(
         outcome
             .evidence

@@ -81,20 +81,23 @@ treated as a match or a conflict - it simply cannot decide that tier.
 1. **Exact serial/product code** (JSON manifest only).
 2. **Exact known content hash** (JSON manifest only) - reuses the same
    generic identity field PCSX2 matching already calls `executable_crc`.
-3. **Exact playlist identity** - the catalogue title/platform matches a
-   game whose installed-artifact playlist evidence is itself `exact`
+3. **Exact playlist identity** - the catalogue title/canonical-platform
+   matches a game whose installed-artifact playlist evidence is itself `exact`
    (RetroArch's own playlist content path matched byte-for-byte).
-4. **Exact normalized title + platform + region.**
-5. **Exact normalized title + platform** (region ignored for the match
-   itself, but see below).
+4. **Exact normalized title + canonical platform + region.**
+5. **Exact normalized title + canonical platform** (region ignored for the
+   match itself, but see below). External platform hints are resolved through
+   ArchiveFS's existing normalized folder-platform alias table; the original
+   source string remains visible as provenance. Unknown or ambiguous hints do
+   not participate in platform-gated tiers.
 6. **Filename-only evidence** - normalized title alone, no platform
    corroboration.
 
 Confidence levels, stable lower-snake-case JSON values:
 
 - `exact`: tiers 1-3, exactly one candidate.
-- `strong`: tier 4, exactly one candidate.
-- `weak`: tier 5 or 6, exactly one candidate.
+- `strong`: tier 4 or 5, exactly one candidate.
+- `weak`: tier 6, exactly one candidate.
 - `ambiguous`: two or more catalogue games tie at the best available tier -
   every tied candidate is listed; ArchiveFS never silently picks one.
 - `unsupported`: no tier produced a candidate.
@@ -103,8 +106,8 @@ Region and revision differences remain visible rather than being silently
 ignored: if tier 5 matches on title+platform alone but both sides also
 declare a region (or a `(Rev N)`-style revision token), and they differ, an
 extra `region_mismatch`/`revision_mismatch` evidence entry is attached to
-the same match - it does not upgrade to `strong`, and it does not suppress
-the match. A revision token embedded in a title (e.g. `"Chrono Quest (Rev
+the same match; it does not suppress the canonical title/platform match. A
+revision token embedded in a title (e.g. `"Chrono Quest (Rev
 2)"`) is stripped before the title itself is compared, so a revision-only
 difference does not by itself prevent tiers 5-6 from finding the title
 match; the stripped token is still compared separately for the mismatch

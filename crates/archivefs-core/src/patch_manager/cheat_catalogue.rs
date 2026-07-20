@@ -79,6 +79,7 @@ use super::{
     ArtifactConflictState, ArtifactDiagnosticSeverity, ArtifactKind, CatalogueGameEvidence,
     RetroArchArtifactDestination,
 };
+use crate::canonical_platform_for_alias;
 
 pub const CHEAT_CATALOGUE_FORMAT_VERSION: u32 = 1;
 /// Mirrors `retroarch_inventory::MAX_CHEAT_FILE_BYTES` - one catalogue
@@ -1035,6 +1036,9 @@ pub fn match_cheat_game_record(
 ) -> CheatGameMatch {
     let candidates = candidate_games(catalogue_games, advisory_plan);
     let record_title = title_for_matching(&record.source_game_name);
+    let canonical_source_platform = record.source_platform.as_deref().and_then(|source| {
+        canonical_platform_for_alias(source).map(|canonical| (source, canonical))
+    });
     let record_revision = record
         .source_revision
         .as_deref()
@@ -1074,8 +1078,7 @@ pub fn match_cheat_game_record(
     // Tier 3: exact playlist identity - title+platform must also agree, so
     // a playlist-exact archive for an unrelated game can never be pulled
     // in purely because *some* playlist entry elsewhere was exact.
-    if let Some(platform) = record.source_platform.as_deref() {
-        let normalized_platform = normalize_for_matching(platform);
+    if let Some((_, platform)) = canonical_source_platform {
         let hits = candidates
             .iter()
             .filter(|candidate| candidate.exact_playlist_identity)
@@ -1083,8 +1086,8 @@ pub fn match_cheat_game_record(
             .filter(|candidate| {
                 candidate
                     .platform
-                    .map(normalize_for_matching)
-                    .is_some_and(|value| value == normalized_platform)
+                    .and_then(canonical_platform_for_alias)
+                    .is_some_and(|value| value == platform)
             })
             .collect::<Vec<_>>();
         if let Some(outcome) = exact_or_ambiguous(
@@ -1097,11 +1100,9 @@ pub fn match_cheat_game_record(
     }
 
     // Tier 4: exact normalized title + platform + region.
-    if let (Some(platform), Some(region)) = (
-        record.source_platform.as_deref(),
-        record.source_region.as_deref(),
-    ) {
-        let normalized_platform = normalize_for_matching(platform);
+    if let (Some((source_platform, platform)), Some(region)) =
+        (canonical_source_platform, record.source_region.as_deref())
+    {
         let normalized_region = normalize_for_matching(region);
         let hits = candidates
             .iter()
@@ -1109,8 +1110,8 @@ pub fn match_cheat_game_record(
             .filter(|candidate| {
                 candidate
                     .platform
-                    .map(normalize_for_matching)
-                    .is_some_and(|value| value == normalized_platform)
+                    .and_then(canonical_platform_for_alias)
+                    .is_some_and(|value| value == platform)
             })
             .filter(|candidate| {
                 candidate
@@ -1122,7 +1123,9 @@ pub fn match_cheat_game_record(
         if let Some(mut outcome) = exact_or_ambiguous(
             &hits,
             "exact_title_platform_region",
-            format!("title/platform/region match ({platform}, {region})"),
+            format!(
+                "normalized title, canonical platform, and region match ({source_platform} -> {platform}, {region})"
+            ),
         ) {
             if outcome.confidence == CheatMatchConfidence::Exact {
                 outcome.confidence = CheatMatchConfidence::Strong;
@@ -1134,25 +1137,26 @@ pub fn match_cheat_game_record(
     // Tier 5: exact normalized title + platform (region ignored, but a
     // declared-and-differing region on both sides stays visible as an
     // extra evidence entry rather than being silently dropped).
-    if let Some(platform) = record.source_platform.as_deref() {
-        let normalized_platform = normalize_for_matching(platform);
+    if let Some((source_platform, platform)) = canonical_source_platform {
         let hits = candidates
             .iter()
             .filter(|candidate| candidate.normalized_title == record_title)
             .filter(|candidate| {
                 candidate
                     .platform
-                    .map(normalize_for_matching)
-                    .is_some_and(|value| value == normalized_platform)
+                    .and_then(canonical_platform_for_alias)
+                    .is_some_and(|value| value == platform)
             })
             .collect::<Vec<_>>();
         if let Some(mut outcome) = exact_or_ambiguous(
             &hits,
             "exact_title_platform",
-            format!("title/platform match ({platform})"),
+            format!(
+                "normalized title and canonical platform match ({source_platform} -> {platform})"
+            ),
         ) {
             if outcome.confidence == CheatMatchConfidence::Exact {
-                outcome.confidence = CheatMatchConfidence::Weak;
+                outcome.confidence = CheatMatchConfidence::Strong;
             }
             if hits.len() == 1 {
                 if let Some(region) = record.source_region.as_deref()
