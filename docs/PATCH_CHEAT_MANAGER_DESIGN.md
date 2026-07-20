@@ -634,10 +634,28 @@ data-model slice of this document's full Phase 3 journal design. It
 contains no installer: no file is copied, no destination is created, no
 backup is written, no journal is persisted. `CheatInstallRunStatus`/
 `CheatInstallSummary` are entirely derived from entry results, never
-maintained by hand. This exists so a later, separately reviewed execution
-phase (built on top of the destination-path/symlink-safety primitives
-under parallel development) has a stable shape to populate rather than
-inventing one alongside its first real write.
+maintained by hand.
+
+### RetroArch cheat installer (shipped, write-capable, first real execution)
+
+`archivefs retroarch-cheat-install` (`patch_manager::cheat_installer`; see
+[`docs/RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md)) is the
+first command in this codebase that actually creates a cheat file,
+replaces one with a verified backup, or writes a journal. It is a narrow,
+RetroArch-cheat-specific slice of this document's full Phase 3 design, not
+that design in full: there is still no content-addressed backup store, no
+immutable manifest generation chain, and no crash-recovery state machine
+beyond "revalidate everything immediately before every write, verify
+before every rename, and never touch the original until a replacement is
+already durably backed up and verified." It reuses, and does not
+duplicate, three already-reviewed pieces: the staging preview above for
+eligibility, `destination_safety` for every path/symlink safety check
+(performed again, fresh, immediately before each write - never trusting
+the preview's own path as still current), and `cheat_install_result`'s
+data model for every result and journal entry it produces. Only entries
+the staging preview already marked `exact`/`strong` and actionable can
+ever be written; a `weak`/`ambiguous`/`unsupported` match is never
+installed, under any command-line flag.
 
 ## Auditing and Observability
 

@@ -22,6 +22,7 @@
 mod adapter;
 mod cheat_catalogue;
 mod cheat_install_result;
+mod cheat_installer;
 mod destination_safety;
 mod matching;
 mod pcsx2;
@@ -55,6 +56,10 @@ pub use cheat_install_result::{
     CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError, CheatInstallRunStatus,
     CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
     plan_cheat_install_entries, plan_cheat_install_entry, plan_cheat_install_run,
+};
+pub use cheat_installer::{
+    CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
+    CheatInstallRunOutcome, execute_cheat_install_run,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,

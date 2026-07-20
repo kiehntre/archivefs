@@ -10,10 +10,12 @@ use archivefs_core::emulator_environment::retroarch::{
     discover_retroarch_environment,
 };
 use archivefs_core::patch_manager::{
-    AdvisoryPatchPlan, CheatAvailabilityReport, CoreSelectionSource, DestinationKind,
-    HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan,
-    build_cheat_availability_report, load_catalogue_evidence_read_only,
-    load_cheat_catalogue_snapshot, preview_retroarch_patch_and_cheat_destinations,
+    AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
+    CheatAvailabilityReport, CheatInstallOptions, CheatInstallRunOutcome, CheatInstallRunStatus,
+    CoreSelectionSource, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
+    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
+    execute_cheat_install_run, load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot,
+    preview_retroarch_patch_and_cheat_destinations,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -317,6 +319,92 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_cheat_availability_report(&report));
+            }
+        }
+        "retroarch-cheat-install" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let dry_run = extract_flag(&mut input_args, "--dry-run");
+            let confirmed = extract_flag(&mut input_args, "--yes");
+            let allow_replace_different = extract_flag(&mut input_args, "--replace-different");
+            let destination_root = extract_cheat_destination_root_flag(&mut input_args)?
+                .ok_or("retroarch-cheat-install requires --cheat-destination-root <path>")?;
+            if input_args.is_empty() {
+                return Err("retroarch-cheat-install requires a local catalogue path".into());
+            }
+            if input_args.len() > 1 {
+                return Err("retroarch-cheat-install accepts one local catalogue path, \
+                     --cheat-destination-root <path>, --dry-run, --yes, --replace-different, \
+                     and --json"
+                    .into());
+            }
+            let catalogue_root = PathBuf::from(&input_args[0]);
+
+            if !dry_run && !confirmed {
+                log::warn!(
+                    "retroarch-cheat-install: refusing to write without --yes; showing the \
+                     planned result only (equivalent to --dry-run)"
+                );
+            }
+
+            let filesystem = HostReadOnlyFilesystem;
+            let environment = DiscoveryEnvironment::from_process_environment();
+            let database_path = default_database_path()?;
+            let plan = preview_retroarch_patch_and_cheat_destinations(
+                &filesystem,
+                &environment,
+                &database_path,
+            )?;
+            let catalogue_games = load_catalogue_evidence_read_only(&database_path)?;
+            let snapshot =
+                load_cheat_catalogue_snapshot(&filesystem, "local-catalogue", &catalogue_root);
+            let report = build_cheat_availability_report(
+                &filesystem,
+                &snapshot,
+                &catalogue_games,
+                Some(&plan),
+                Some(&destination_root),
+            );
+
+            let data_directory = default_database_path()?
+                .parent()
+                .ok_or("could not determine the ArchiveFS data directory")?
+                .to_path_buf();
+            let options = CheatInstallOptions {
+                destination_root,
+                allow_replace_different,
+                dry_run,
+                confirmed,
+                journal_directory: data_directory.join(CHEAT_INSTALL_RUNS_DIRECTORY_NAME),
+                backup_directory: data_directory.join(CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME),
+                run_id: generate_cheat_install_run_id(),
+                started_at_unix_seconds: unix_seconds_now(),
+                catalogue_source: snapshot.source_name.clone(),
+            };
+
+            let outcome: CheatInstallRunOutcome =
+                execute_cheat_install_run(&report.entries, &options);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome.run)?);
+            } else {
+                print!("{}", format_cheat_install_run(&outcome));
+            }
+            if let Some(path) = &outcome.journal_path {
+                log::info!("retroarch-cheat-install: wrote journal {}", path.display());
+            }
+            if let Some(error) = &outcome.journal_error {
+                log::error!("retroarch-cheat-install: journal write failed: {error}");
+            }
+
+            let real_run_failed = !outcome.run.dry_run
+                && matches!(
+                    outcome.run.status,
+                    CheatInstallRunStatus::Failed | CheatInstallRunStatus::PartialFailure
+                );
+            if real_run_failed || (outcome.journal_error.is_some() && !outcome.run.dry_run) {
+                return Err("retroarch-cheat-install: one or more eligible entries did not complete successfully"
+                    .into());
             }
         }
         "index-build" => {
@@ -1414,6 +1502,93 @@ fn format_cheat_availability_report(report: &CheatAvailabilityReport) -> String 
             )
             .unwrap();
         }
+    }
+
+    output
+}
+
+fn format_cheat_install_run(outcome: &CheatInstallRunOutcome) -> String {
+    use std::fmt::Write;
+
+    let run = &outcome.run;
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS RetroArch Cheat Installer").unwrap();
+    writeln!(&mut output, "Run format: {}", run.schema_version).unwrap();
+    writeln!(&mut output, "Run ID: {}", run.run_id).unwrap();
+    writeln!(
+        &mut output,
+        "Mode: {}",
+        if run.dry_run {
+            "dry-run (no writes performed)"
+        } else {
+            "apply"
+        }
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Replace different content: {}",
+        run.allow_replace_different
+    )
+    .unwrap();
+    if let Some(root) = &run.destination_root {
+        writeln!(&mut output, "Destination root: {}", root.display).unwrap();
+    }
+    writeln!(&mut output, "Catalogue: {}", run.catalogue_source).unwrap();
+    writeln!(&mut output, "Status: {:?}", run.status).unwrap();
+    writeln!(
+        &mut output,
+        "Requested: {} | eligible: {} | installed_new: {} | already_installed: {} | replaced: {} | skipped: {} | failed: {}",
+        run.summary.requested,
+        run.summary.eligible,
+        run.summary.installed_new,
+        run.summary.already_installed,
+        run.summary.replaced,
+        run.summary.skipped,
+        run.summary.failed
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Backups created: {} | writes required: {} | writes attempted: {} | writes succeeded: {} | dry-run actions: {}",
+        run.summary.backups_created,
+        run.summary.writes_required,
+        run.summary.writes_attempted,
+        run.summary.writes_succeeded,
+        run.summary.dry_run_actions
+    )
+    .unwrap();
+
+    for entry in &run.entries {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "{}", entry.source_path.display).unwrap();
+        writeln!(
+            &mut output,
+            "  outcome: {:?} ({}) | applied: {}",
+            entry.outcome, entry.reason_code, entry.applied
+        )
+        .unwrap();
+        if let Some(destination) = &entry.destination_path {
+            writeln!(&mut output, "  destination: {}", destination.display).unwrap();
+        }
+        if let Some(backup) = &entry.backup_path {
+            writeln!(&mut output, "  backup: {}", backup.display).unwrap();
+        }
+        if let Some(hash) = &entry.resulting_destination_hash {
+            writeln!(&mut output, "  resulting hash: {hash}").unwrap();
+        }
+        for detail in &entry.detail {
+            writeln!(&mut output, "  detail: {detail}").unwrap();
+        }
+    }
+
+    if let Some(path) = &outcome.journal_path {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "Journal: {}", path.display()).unwrap();
+    }
+    if let Some(error) = &outcome.journal_error {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "Journal write failed: {error}").unwrap();
     }
 
     output
@@ -2930,6 +3105,25 @@ fn extract_cheat_destination_root_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+/// A unique-enough run identifier for one `retroarch-cheat-install`
+/// invocation - used as the journal filename stem and as part of every
+/// backup filename in that run. Never read back or parsed; only ever
+/// compared for equality/uniqueness.
+fn generate_cheat_install_run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("cheat-install-{nanos:x}-{}", std::process::id())
+}
+
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 /// Removes every `--id <value>` occurrence from `args`, returning the
 /// parsed ids in the order given - the bulk counterpart to
 /// [`extract_id_flag`], which only ever handles (and requires) a single
@@ -3518,6 +3712,9 @@ fn print_help() {
     println!(
         "  retroarch-cheat-catalogue <local-path>  Discover, match, and preview staging destinations for an external cheat catalogue (read-only; --cheat-destination-root <path> overrides the destination root for isolated preview only)"
     );
+    println!(
+        "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
+    );
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
     println!("  duplicates     Show filename-based duplicate candidates");
@@ -3588,6 +3785,15 @@ fn print_help() {
     println!("  archivefs retroarch-cheat-catalogue /path/to/manifest.json --json");
     println!(
         "  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root"
+    );
+    println!(
+        "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --dry-run"
+    );
+    println!(
+        "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes"
+    );
+    println!(
+        "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json"
     );
     println!("  archivefs status --json");
     println!("  archivefs stats");

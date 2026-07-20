@@ -360,7 +360,10 @@ This command does not:
 Any future download or staging *execution* workflow remains separately
 gated by [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
 
-A separate, additive data model exists for describing what such an
-execution *would* (and, later, did) do - stable result and run types with
-no installer behind them yet. See
-[`RETROARCH_CHEAT_INSTALL_RESULT.md`](RETROARCH_CHEAT_INSTALL_RESULT.md).
+A separate, additive data model describes what such an execution would (or
+did) do - see [`RETROARCH_CHEAT_INSTALL_RESULT.md`](RETROARCH_CHEAT_INSTALL_RESULT.md).
+A real, write-capable executor now consumes that data model:
+`archivefs retroarch-cheat-install` - see
+[`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md). This command
+(`retroarch-cheat-catalogue`) remains unchanged and strictly read-only;
+nothing about the installer's implementation modified it.

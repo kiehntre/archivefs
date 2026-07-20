@@ -2,36 +2,38 @@
 
 This document covers `patch_manager::cheat_install_result` - stable,
 serializable Rust types and pure conversion logic describing what would
-happen (and, in a future phase, what did happen) when a cheat from the
-[external cheat catalogue](RETROARCH_CHEAT_CATALOGUE.md) is staged for
-installation.
+happen, and now (via `archivefs retroarch-cheat-install`; see
+[`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md)) what actually
+did happen, when a cheat from the
+[external cheat catalogue](RETROARCH_CHEAT_CATALOGUE.md) is installed.
 
-**This module contains no installer.** Nothing in it reads a cheat file's
-bytes, opens or creates a destination path, writes a file, creates a
-backup, or writes a journal to disk. It defines a data model only - the
-*shape* of a result and a journal entry - not the execution engine that
-will someday populate the fields this milestone cannot populate itself.
-See [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)'s
-Phase 3 for the full transactional install/journal/rollback design this is
-a narrow, forward-compatible slice of - no atomic rename, content-addressed
-backup, manifest generation, or crash-recovery state machine is
-implemented or implied by anything here.
+**This module itself still contains no installer.** Nothing in
+`cheat_install_result` reads a cheat file's bytes, opens or creates a
+destination path, writes a file, creates a backup, or writes a journal to
+disk - it defines the data model only, the *shape* of a result and a
+journal entry. The separate `cheat_installer` module (documented in
+[`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md)) is the real
+execution engine that populates these types for a genuine run, without
+redefining any of them. See
+[`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)'s Phase 3
+for the full transactional install/journal/rollback design this remains a
+narrower slice of - content-addressed backup storage, manifest
+generations, and a full crash-recovery state machine are still not
+implemented.
 
-No CLI command exposes this data model yet. It exists purely as a library
-building block for a later, separately reviewed milestone.
+## Relationship to the destination-path/symlink-safety module
 
-## Relationship to Codex's destination-path/symlink-safety work
-
-A parallel effort is building the reusable destination-path resolution and
-symlink-safety primitives the actual future installer will use to decide
-*where* a cheat goes and whether a destination is safe to touch. This
-module does not duplicate, reimplement, or depend on the internals of that
-work: it only *describes results* in terms of values a resolver (today,
-the existing [staging preview](RETROARCH_CHEAT_CATALOGUE.md); in the
-future, a real executor) already computed and handed it. Nothing here
-resolves a path, follows or rejects a symlink, or decides whether a hint is
-safe - seeing a `destination_path` field here is a description of a
-decision made elsewhere, never a decision made by this module.
+The `destination_safety` module provides the reusable destination-path
+resolution and symlink-safety primitives both the staging preview and the
+real installer use to decide *where* a cheat goes and whether a
+destination is safe to touch. This module does not duplicate, reimplement,
+or depend on the internals of that work: it only *describes results* in
+terms of values a resolver (the staging preview, or the real installer's
+own fresh revalidation immediately before writing) already computed and
+handed it. Nothing here resolves a path, follows or rejects a symlink, or
+decides whether a hint is safe - seeing a `destination_path` field here is
+a description of a decision made elsewhere, never a decision made by this
+module.
 
 ## Purpose
 
@@ -191,25 +193,30 @@ ignored on read (no `deny_unknown_fields`), so a future minor addition to
 this schema does not by itself break reading an older or newer document
 back with the same major schema version.
 
-## Non-goals
+## Non-goals (of this data-model module itself)
 
-This milestone does not:
+This module - `cheat_install_result` - still does not, and never will:
 
-- copy, install, replace, or delete any cheat file;
+- copy, install, replace, or delete any cheat file itself;
 - create a destination directory or the destination file itself;
 - create a backup;
 - write a journal (or anything else) to disk;
-- add a confirmation prompt or any write-capable CLI command;
-- perform new destination probing, path resolution, or symlink-safety
-  validation - all of that remains inside the existing staging preview
-  (today) and Codex's destination-path/symlink-safety primitives
-  (future);
-- access the live ArchiveFS database or a real RetroArch cheat directory;
-  or
+- perform destination probing, path resolution, or symlink-safety
+  validation - that remains entirely inside
+  [`destination_safety`](RETROARCH_CHEAT_CATALOGUE.md); or
 - read the system clock, an environment variable, or any other live
-  process state.
+  process state (the executor that now consumes this module, described
+  below, does read the clock for its own real timestamps - this module's
+  own pure types and functions still never do).
 
-Any future execution engine that actually writes files, creates backups,
-or persists a journal remains separately gated by
-[`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md) and would
-consume this data model, not replace it.
+**A real, write-capable executor now exists and consumes this exact data
+model without redefining it**: see
+[`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md) for
+`archivefs retroarch-cheat-install` - the command that actually creates
+files, backups, and journals using [`CheatInstallRun`]/
+[`CheatInstallEntryResult`]/[`CheatInstallSummary`]/
+[`CheatInstallRunStatus`] as defined here, and
+[`plan_cheat_install_entry`]/[`plan_cheat_install_entries`] as its starting
+point for every result it produces. This document's description of the
+*shape* of a result, a run, and a journal entry remains accurate; only the
+claim that nothing yet populates them for real is superseded.
