@@ -20359,19 +20359,21 @@ mod tests {
     #[test]
     fn start_alias_action_does_not_start_a_second_concurrent_action() {
         let mut app = app_for_operation_tests();
-        app.start_alias_action(
-            egui::Context::default(),
-            AliasAction::Add {
+        let (_sender, receiver) = mpsc::channel();
+        app.alias_action = Some(RunningAliasAction {
+            action: AliasAction::Add {
                 alias: "gc".to_string(),
                 platform: "GameCube".to_string(),
             },
-        );
-        assert!(app.alias_action.is_some());
+            receiver,
+        });
         let first_action = app.alias_action.as_ref().unwrap().action.clone();
 
         // A second alias action must not replace the first one's receiver
         // - mirrors start_operation_rejects_a_second_operation_without_replacing_the_receiver's
-        // existing convention for the archive-action channel.
+        // existing convention for the archive-action channel. Seed the
+        // running action directly so this test never spawns a production
+        // worker against the real default database path.
         app.start_alias_action(
             egui::Context::default(),
             AliasAction::Remove {
@@ -21791,10 +21793,17 @@ mod tests {
     #[test]
     fn start_source_action_does_not_start_a_second_concurrent_action() {
         let mut app = app_for_operation_tests();
-        app.start_source_action(egui::Context::default(), SourceAction::ScanAll);
-        assert!(app.source_action.is_some());
+        let (_sender, receiver) = mpsc::channel();
+        app.source_action = Some(RunningSourceAction {
+            action: SourceAction::ScanAll,
+            receiver,
+            worker: None,
+        });
         let first_action = app.source_action.as_ref().unwrap().action.clone();
 
+        // Seed the running action directly: calling start_source_action
+        // here would launch the production ScanAll worker against the
+        // process's real default config and database paths.
         app.start_source_action(
             egui::Context::default(),
             SourceAction::Add(PathBuf::from("/mnt/games/roms")),
@@ -22090,13 +22099,16 @@ mod tests {
     #[test]
     fn start_library_view_action_does_not_start_a_second_concurrent_action() {
         let mut app = app_for_operation_tests();
-        app.start_library_view_action(
-            egui::Context::default(),
-            LibraryViewAction::Preview("view-1".to_string()),
-        );
-        assert!(app.library_view_action.is_some());
+        let (_sender, receiver) = mpsc::channel();
+        app.library_view_action = Some(RunningLibraryViewAction {
+            action: LibraryViewAction::Preview("view-1".to_string()),
+            receiver,
+        });
         let first_action = app.library_view_action.as_ref().unwrap().action.clone();
 
+        // Do not spawn a production worker from a unit test, even for a
+        // read-only preview: tests must never resolve paths through the
+        // developer's real HOME.
         app.start_library_view_action(
             egui::Context::default(),
             LibraryViewAction::Preview("view-2".to_string()),
