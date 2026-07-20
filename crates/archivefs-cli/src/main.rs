@@ -11,12 +11,15 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
-    CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatInstallOptions,
-    CheatInstallRunOutcome, CheatInstallRunStatus, CheatRollbackOptions, CoreSelectionSource,
-    DestinationKind, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
-    RetroArchAdvisoryPlan, build_cheat_availability_report, execute_cheat_install_run,
-    execute_cheat_rollback_run, load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot,
-    preview_retroarch_patch_and_cheat_destinations,
+    CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatBackupAssessment,
+    CheatDestinationAssessment, CheatHistoryOptions, CheatHistoryReport, CheatInstallOptions,
+    CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
+    CheatJournalInspectionError, CheatRollbackAvailability, CheatRollbackOptions,
+    CoreSelectionSource, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
+    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
+    discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
+    inspect_cheat_install_journal, load_catalogue_evidence_read_only,
+    load_cheat_catalogue_snapshot, preview_retroarch_patch_and_cheat_destinations,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -406,6 +409,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if real_run_failed || (outcome.journal_error.is_some() && !outcome.run.dry_run) {
                 return Err("retroarch-cheat-install: one or more eligible entries did not complete successfully"
                     .into());
+            }
+        }
+        "retroarch-cheat-history" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let journal_root = extract_named_path_flag(&mut input_args, "--journal-root")?;
+            if !input_args.is_empty() {
+                return Err(
+                    "retroarch-cheat-history accepts only --journal-root <path> and --json".into(),
+                );
+            }
+            let options = cheat_history_options(journal_root)?;
+            let report = discover_cheat_history(&options);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_cheat_history(&report));
+            }
+        }
+        "retroarch-cheat-inspect" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            if input_args.len() != 1 {
+                return Err(
+                    "retroarch-cheat-inspect requires one journal path and optionally --json"
+                        .into(),
+                );
+            }
+            let journal_path = PathBuf::from(&input_args[0]);
+            let options = cheat_history_options(None)?;
+            match inspect_cheat_install_journal(&journal_path, &options) {
+                Ok(inspection) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&CheatInspectJson::success(&inspection))?
+                        );
+                    } else {
+                        print!("{}", format_cheat_inspection(&inspection));
+                    }
+                }
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&CheatInspectJson::failure(&error))?
+                        );
+                    }
+                    return Err(error.into());
+                }
             }
         }
         "retroarch-cheat-rollback" => {
@@ -1638,6 +1691,175 @@ fn format_cheat_install_run(outcome: &CheatInstallRunOutcome) -> String {
     }
 
     output
+}
+
+#[derive(Serialize)]
+struct CheatInspectJson<'a> {
+    schema_version: u32,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inspection: Option<&'a CheatJournalInspection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a CheatJournalInspectionError>,
+}
+
+impl<'a> CheatInspectJson<'a> {
+    fn success(inspection: &'a CheatJournalInspection) -> Self {
+        Self {
+            schema_version: archivefs_core::patch_manager::CHEAT_HISTORY_RESULT_SCHEMA_VERSION,
+            ok: true,
+            inspection: Some(inspection),
+            error: None,
+        }
+    }
+
+    fn failure(error: &'a CheatJournalInspectionError) -> Self {
+        Self {
+            schema_version: archivefs_core::patch_manager::CHEAT_HISTORY_RESULT_SCHEMA_VERSION,
+            ok: false,
+            inspection: None,
+            error: Some(error),
+        }
+    }
+}
+
+fn format_cheat_history(report: &CheatHistoryReport) -> String {
+    let mut output = format!(
+        "RetroArch cheat installation history\n  journal root: {}\n  runs: {}\n",
+        report.journal_root.display,
+        report.entries.len()
+    );
+    if report.entries.is_empty() {
+        output.push_str("  No installation journals found.\n");
+    }
+    for inspection in &report.entries {
+        output.push('\n');
+        output.push_str(&format_cheat_inspection(inspection));
+    }
+    if !report.warnings.is_empty() {
+        output.push_str("\nWarnings:\n");
+        for warning in &report.warnings {
+            output.push_str(&format!(
+                "  - {}: {} ({})\n",
+                warning.code, warning.message, warning.path.display
+            ));
+        }
+    }
+    output
+}
+
+fn format_cheat_inspection(inspection: &CheatJournalInspection) -> String {
+    let mut output = format!(
+        "Run {}\n  journal: {}\n  created: {}\n  catalogue: {}\n  destination root: {}\n  install status: {:?}\n  entries: {}\n",
+        inspection.run_id,
+        inspection.journal_path.display,
+        inspection.started_at_unix_seconds,
+        inspection.catalogue_source,
+        inspection
+            .destination_root
+            .as_ref()
+            .map_or("unknown", |path| path.display.as_str()),
+        inspection.install_status,
+        inspection.entries.len()
+    );
+    if inspection.rollback.ambiguous {
+        output.push_str("  rollback journal: ambiguous association\n");
+    } else if inspection.rollback.exists {
+        output.push_str(&format!(
+            "  rollback journal: {} ({})\n",
+            inspection
+                .rollback
+                .journal_path
+                .as_ref()
+                .map_or("unknown", |path| path.display.as_str()),
+            if inspection.rollback.completed_successfully == Some(true) {
+                "completed successfully"
+            } else {
+                "present, not validated as completed"
+            }
+        ));
+    } else {
+        output.push_str("  rollback journal: none\n");
+    }
+    for (index, entry) in inspection.entries.iter().enumerate() {
+        output.push_str(&format!(
+            "  [{}] {}\n      platform: {}\n      source: {}\n      destination: {}\n      install action: {}\n      current destination: {}\n      backup: {}\n      rollback: {}\n",
+            index + 1,
+            entry.display_title.as_deref().unwrap_or("unknown title"),
+            entry.platform.as_deref().unwrap_or("unknown"),
+            entry.source_path.display,
+            entry
+                .destination_path
+                .as_ref()
+                .map_or("unknown", |path| path.display.as_str()),
+            install_outcome_name(entry.original_outcome),
+            destination_assessment_name(entry.destination),
+            backup_assessment_name(entry.backup),
+            rollback_availability_name(entry.rollback_availability),
+        ));
+        for reason in &entry.rollback_reasons {
+            output.push_str(&format!("        reason: {reason}\n"));
+        }
+    }
+    for warning in &inspection.warnings {
+        output.push_str(&format!("  warning: {warning}\n"));
+    }
+    output
+}
+
+fn destination_assessment_name(value: CheatDestinationAssessment) -> &'static str {
+    match value {
+        CheatDestinationAssessment::UnchangedSinceInstall => "unchanged_since_install",
+        CheatDestinationAssessment::Missing => "missing",
+        CheatDestinationAssessment::Changed => "changed",
+        CheatDestinationAssessment::Inaccessible => "inaccessible",
+        CheatDestinationAssessment::UnsafePath => "unsafe_path",
+        CheatDestinationAssessment::Unknown => "unknown",
+    }
+}
+
+fn install_outcome_name(value: archivefs_core::patch_manager::CheatInstallOutcome) -> &'static str {
+    use archivefs_core::patch_manager::CheatInstallOutcome;
+    match value {
+        CheatInstallOutcome::InstalledNew => "installed_new",
+        CheatInstallOutcome::AlreadyInstalled => "already_installed",
+        CheatInstallOutcome::ReplacedWithBackup => "replaced_with_backup",
+        CheatInstallOutcome::SkippedReplaceNotAllowed => "skipped_replace_not_allowed",
+        CheatInstallOutcome::SkippedNotEligible => "skipped_not_eligible",
+        CheatInstallOutcome::SkippedConflict => "skipped_conflict",
+        CheatInstallOutcome::SkippedSourceChanged => "skipped_source_changed",
+        CheatInstallOutcome::SkippedDestinationChanged => "skipped_destination_changed",
+        CheatInstallOutcome::FailedUnsafePath => "failed_unsafe_path",
+        CheatInstallOutcome::FailedBackup => "failed_backup",
+        CheatInstallOutcome::FailedWrite => "failed_write",
+        CheatInstallOutcome::FailedVerification => "failed_verification",
+    }
+}
+
+fn backup_assessment_name(value: CheatBackupAssessment) -> &'static str {
+    match value {
+        CheatBackupAssessment::NotApplicable => "not_applicable",
+        CheatBackupAssessment::PresentAndValid => "present_and_valid",
+        CheatBackupAssessment::Missing => "missing",
+        CheatBackupAssessment::Changed => "changed",
+        CheatBackupAssessment::Inaccessible => "inaccessible",
+        CheatBackupAssessment::UnsafePath => "unsafe_path",
+        CheatBackupAssessment::Unknown => "unknown",
+    }
+}
+
+fn rollback_availability_name(value: CheatRollbackAvailability) -> &'static str {
+    match value {
+        CheatRollbackAvailability::Available => "available",
+        CheatRollbackAvailability::Unnecessary => "unnecessary",
+        CheatRollbackAvailability::AlreadyCompleted => "already_completed",
+        CheatRollbackAvailability::BlockedDestinationChanged => "blocked_destination_changed",
+        CheatRollbackAvailability::BlockedMissingBackup => "blocked_missing_backup",
+        CheatRollbackAvailability::BlockedBackupChanged => "blocked_backup_changed",
+        CheatRollbackAvailability::BlockedUnsafePath => "blocked_unsafe_path",
+        CheatRollbackAvailability::BlockedInvalidJournal => "blocked_invalid_journal",
+        CheatRollbackAvailability::Unknown => "unknown",
+    }
 }
 
 fn format_retroarch_environment_report(report: &RetroArchEnvironmentReport) -> String {
@@ -3151,6 +3373,44 @@ fn extract_cheat_destination_root_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_path_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(PathBuf::from(value)))
+}
+
+fn cheat_history_options(
+    journal_root_override: Option<PathBuf>,
+) -> Result<CheatHistoryOptions, Box<dyn std::error::Error>> {
+    let data_directory = default_database_path()?
+        .parent()
+        .ok_or("could not determine the ArchiveFS data directory")?
+        .to_path_buf();
+    Ok(CheatHistoryOptions {
+        journal_root: journal_root_override
+            .unwrap_or_else(|| data_directory.join(CHEAT_INSTALL_RUNS_DIRECTORY_NAME)),
+        backup_root: data_directory.join(CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME),
+        rollback_journal_root: data_directory.join(CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME),
+    })
+}
+
 /// A unique-enough run identifier for one `retroarch-cheat-install`
 /// invocation - used as the journal filename stem and as part of every
 /// backup filename in that run. Never read back or parsed; only ever
@@ -3784,6 +4044,12 @@ fn print_help() {
         "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
     );
     println!(
+        "  retroarch-cheat-history  Inspect cheat-install journals (read-only; --journal-root <path>/--json accepted)"
+    );
+    println!(
+        "  retroarch-cheat-inspect <journal-path>  Inspect one cheat-install journal and rollback safety (read-only; --json accepted)"
+    );
+    println!(
         "  retroarch-cheat-rollback <journal-path>  Safely roll back one cheat-install journal (requires --cheat-destination-root; defaults to dry-run; --yes/--dry-run/--json accepted)"
     );
     println!("  status         Show archive paths, mount paths, and mount states");
@@ -3865,6 +4131,11 @@ fn print_help() {
     );
     println!(
         "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json"
+    );
+    println!("  archivefs retroarch-cheat-history");
+    println!("  archivefs retroarch-cheat-history --json");
+    println!(
+        "  archivefs retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json"
     );
     println!("  archivefs status --json");
     println!("  archivefs stats");
@@ -7196,5 +7467,98 @@ mod tests {
             scan_id_before
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cheat_history_human_and_json_output_have_stable_useful_shapes() {
+        use archivefs_core::patch_manager::{
+            CheatBackupAssessment, CheatDestinationAssessment, CheatHistoryEntry,
+            CheatHistoryReport, CheatInspectionPath, CheatInstallOutcome, CheatInstallPath,
+            CheatInstallRunStatus, CheatInstallSummary, CheatJournalInspection,
+            CheatRollbackAvailability, CheatRollbackJournalMatch,
+        };
+
+        let inspection = CheatJournalInspection {
+            journal_path: CheatInspectionPath::from_path(Path::new(
+                "/data/cheat-install-runs/run.json",
+            )),
+            run_id: "run-1".into(),
+            started_at_unix_seconds: 100,
+            completed_at_unix_seconds: Some(101),
+            dry_run: false,
+            catalogue_source: "local-catalogue".into(),
+            destination_root: Some(CheatInstallPath::from_path(Path::new("/retroarch/cheats"))),
+            install_status: CheatInstallRunStatus::Success,
+            install_summary: CheatInstallSummary {
+                requested: 1,
+                eligible: 1,
+                installed_new: 1,
+                writes_required: 1,
+                writes_attempted: 1,
+                writes_succeeded: 1,
+                ..CheatInstallSummary::default()
+            },
+            entries: vec![CheatHistoryEntry {
+                source_path: CheatInstallPath::from_path(Path::new("/catalogue/Mario.cht")),
+                platform: Some("NES".into()),
+                display_title: Some("Mario".into()),
+                destination_path: Some(CheatInstallPath::from_path(Path::new(
+                    "/retroarch/cheats/NES/Mario.cht",
+                ))),
+                original_outcome: CheatInstallOutcome::InstalledNew,
+                applied: true,
+                previous_hash: None,
+                installed_hash: Some("abc".into()),
+                backup_path: None,
+                backup_expected_hash: None,
+                destination: CheatDestinationAssessment::UnchangedSinceInstall,
+                destination_observed_hash: Some("abc".into()),
+                backup: CheatBackupAssessment::NotApplicable,
+                backup_observed_hash: None,
+                rollback_availability: CheatRollbackAvailability::Available,
+                rollback_reasons: Vec::new(),
+            }],
+            rollback: CheatRollbackJournalMatch {
+                exists: false,
+                completed_successfully: None,
+                ambiguous: false,
+                journal_path: None,
+                run_id: None,
+                status: None,
+            },
+            warnings: Vec::new(),
+        };
+        let report = CheatHistoryReport {
+            schema_version: 1,
+            journal_root: CheatInspectionPath::from_path(Path::new("/data/cheat-install-runs")),
+            entries: vec![inspection],
+            warnings: Vec::new(),
+        };
+        let human = format_cheat_history(&report);
+        assert!(human.contains("Run run-1"));
+        assert!(human.contains("current destination: unchanged_since_install"));
+        assert!(human.contains("rollback: available"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["entries"][0]["run_id"], "run-1");
+        assert_eq!(
+            json["entries"][0]["entries"][0]["destination"],
+            "unchanged_since_install"
+        );
+    }
+
+    #[test]
+    fn cheat_inspect_json_failure_is_structured() {
+        use archivefs_core::patch_manager::CheatInspectionPath;
+        let error = CheatJournalInspectionError {
+            code: "malformed_journal".into(),
+            path: CheatInspectionPath::from_path(Path::new("/data/bad.json")),
+            message: "malformed cheat install run".into(),
+        };
+        let json = serde_json::to_value(CheatInspectJson::failure(&error)).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "malformed_journal");
+        assert!(json.get("inspection").is_none());
     }
 }

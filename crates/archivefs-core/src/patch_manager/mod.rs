@@ -21,6 +21,7 @@
 
 mod adapter;
 mod cheat_catalogue;
+mod cheat_history;
 mod cheat_install_result;
 mod cheat_installer;
 mod cheat_rollback;
@@ -52,6 +53,13 @@ pub use cheat_catalogue::{
     CheatInstalledState, CheatMatchCandidate, CheatMatchConfidence, CheatMatchEvidence,
     JsonManifestSource, RetroarchChtDirectorySource, build_cheat_availability_report,
     load_cheat_catalogue_snapshot, match_cheat_game_record,
+};
+pub use cheat_history::{
+    CHEAT_HISTORY_RESULT_SCHEMA_VERSION, CheatBackupAssessment, CheatDestinationAssessment,
+    CheatHistoryEntry, CheatHistoryOptions, CheatHistoryReport, CheatHistoryWarning,
+    CheatInspectionPath, CheatJournalInspection, CheatJournalInspectionError,
+    CheatRollbackAvailability, CheatRollbackJournalMatch, discover_cheat_history,
+    inspect_cheat_install_journal,
 };
 pub use cheat_install_result::{
     CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,

@@ -124,6 +124,11 @@ These are implemented, tested, and in current use today:
 
 - Safe, journal-driven rollback for RetroArch cheat installations is now
   available via `retroarch-cheat-rollback`; GUI support remains out of scope.
+- Read-only RetroArch cheat installation history and journal inspection are
+  available via `retroarch-cheat-history` and `retroarch-cheat-inspect`, with
+  destination/backup hash assessment, strongly bound rollback-journal
+  discovery, stable JSON, and fail-closed path/symlink handling; see
+  [`docs/RETROARCH_CHEAT_HISTORY.md`](docs/RETROARCH_CHEAT_HISTORY.md).
 
 ## Current development
 

@@ -659,6 +659,18 @@ the staging preview already marked `exact`/`strong` and actionable can
 ever be written; a `weak`/`ambiguous`/`unsupported` match is never
 installed, under any command-line flag.
 
+### RetroArch cheat journal history and inspection (shipped, read-only)
+
+`patch_manager::cheat_history` and the `retroarch-cheat-history`/
+`retroarch-cheat-inspect` commands expose install-journal metadata, current
+destination and backup hash assessment, and rollback availability through core
+result models suitable for a later GUI. They reuse the versioned install and
+rollback parsers plus the destination safety layer. Rollback association is
+validated from the recorded install run ID, original journal path, destination
+root, entry paths, and hashes rather than filenames. This adds no journal
+format and performs no repair, migration, directory creation, or other write;
+see [`docs/RETROARCH_CHEAT_HISTORY.md`](RETROARCH_CHEAT_HISTORY.md).
+
 ## Auditing and Observability
 
 Persistent audit storage begins only in a later approved phase; Phase 1 emits bounded in-memory diagnostics and CLI output. Later audit events record source ID/version, metadata snapshot hash, optional artifact hash, verification result, adapter/installation ID, match evidence, plan ID, user or unattended-policy decision, operation ID, changed manifest IDs, result, and sanitized error category. They do not record secrets or unnecessary game paths in exported diagnostics. CLI and GUI can derive a chronological report and answer: what source supplied this file, why it matched this game, what bytes were installed, what was replaced, and whether rollback is available.
