@@ -191,6 +191,11 @@ or currently implemented in any form:
   where that is practical without ArchiveFS taking over their role.
 - Remote-play workflow documentation (for example Sunshine/Moonlight) for
   users who already use ArchiveFS-managed libraries with those tools.
+- Docker deployment, staged from a non-root catalogue-only mode before any
+  FUSE-enabled mode. Host-visible FUSE remains a separate security and
+  integration milestone requiring explicit device/capability review, mount
+  propagation diagnostics, stale-mount recovery, and real Linux Docker Engine
+  testing; see [`docs/DOCKER_FUSE_RESEARCH.md`](docs/DOCKER_FUSE_RESEARCH.md).
 
 ## Explicitly out of scope for now
 
