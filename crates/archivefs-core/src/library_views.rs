@@ -1333,10 +1333,16 @@ pub fn resolve_library_view_identifier(
 /// Loads the catalogue (every `PersistedArchive` row, joined with its
 /// current platform, plus every `SourceFolderRecord`) needed to plan any
 /// view, from the default database path - mirrors the CLI `health`
-/// command's `default_database_path` + `Database::open_or_create` +
+/// command's `default_database_path` + `Database::open_read_only` +
 /// `load_archives`/`list_source_folders` shape.
 fn load_catalogue_for_planning() -> Result<(Vec<PersistedArchive>, Vec<SourceFolderRecord>)> {
-    let database = Database::open_or_create(&default_database_path()?)?;
+    load_catalogue_for_planning_at(&default_database_path()?)
+}
+
+fn load_catalogue_for_planning_at(
+    database_path: &Path,
+) -> Result<(Vec<PersistedArchive>, Vec<SourceFolderRecord>)> {
+    let database = Database::open_read_only(database_path)?;
     let archives = database.load_archives()?;
     let source_folders = database.list_source_folders()?;
     Ok((archives, source_folders))
@@ -1631,6 +1637,34 @@ mod tests {
     fn write_file(path: &Path, contents: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn catalogue_planning_load_is_strictly_read_only() {
+        let root = temp_dir("catalogue-planning-read-only");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let before = fs::read(&database_path).unwrap();
+        let before_modified = fs::metadata(&database_path).unwrap().modified().unwrap();
+
+        let (archives, sources) = load_catalogue_for_planning_at(&database_path).unwrap();
+
+        assert!(archives.is_empty());
+        assert!(sources.is_empty());
+        assert_eq!(fs::read(&database_path).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().modified().unwrap(),
+            before_modified
+        );
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = database_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(!PathBuf::from(sidecar).exists());
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn make_source(id: i64, path: &Path) -> SourceFolderRecord {

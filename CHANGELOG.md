@@ -17,6 +17,13 @@ Work merged to `main` since the `v0.4.3-alpha` tag, not yet released.
 
 ### Added
 
+- Database diagnostics now distinguish SQLite hot-header evidence, zeroed and
+  truncated non-hot journals, malformed headers, and the extended
+  `SQLITE_READONLY_ROLLBACK` recovery-required result. Catalogue status, list,
+  health, alias/source/list-view previews, and normal GUI catalogue loading use
+  the explicit read-only database path. The GUI retains scan worker handles,
+  refuses to replace a scan already in progress, and waits for scan/source
+  workers during normal shutdown; SQLite durability remains unchanged.
 - `database-check` and `database-check --json`: bounded, structured,
   explicitly read-only SQLite health diagnostics with main-file metadata,
   rollback-journal/WAL/SHM evidence, journal mode, schema version,

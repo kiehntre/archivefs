@@ -371,7 +371,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "health" => {
             let json = args.any(|arg| arg == "--json");
             let database_path = default_database_path()?;
-            let database = Database::open_or_create(&database_path)?;
+            let database = Database::open_read_only(&database_path)?;
             let archives = database.load_archives()?;
             let report = catalogue_health_report(&archives);
             if json {
@@ -1724,7 +1724,7 @@ struct LibraryStatusView {
 fn build_library_status_view(database_path: &Path) -> LibraryStatusView {
     let health = check_database_health(database_path);
     let (stats, last_completed_scan) = if health.database_opens && health.migrations_current {
-        match Database::open_or_create(database_path) {
+        match Database::open_read_only(database_path) {
             Ok(database) => (
                 database.catalogue_stats().ok(),
                 database.latest_completed_scan().ok().flatten(),
@@ -1810,6 +1810,9 @@ fn format_database_health_report(report: &DatabaseHealthReport) -> String {
             sidecar.kind,
             if sidecar.present { "present" } else { "absent" }
         ));
+        if let Some(state) = sidecar.rollback_journal_header {
+            output.push_str(&format!("    Header: {state:?}\n"));
+        }
     }
     output.push_str("Diagnostics:\n");
     if report.diagnostics.is_empty() {
@@ -2117,7 +2120,7 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
 fn resolve_source_identifier(identifier: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let sources = load_source_folder_configs_default().map_err(|error| error.to_string())?;
     let database_path = default_database_path()?;
-    let database = Database::open_or_create(&database_path)?;
+    let database = Database::open_read_only(&database_path)?;
     let records = database.list_source_folders()?;
     resolve_source_folder_identifier(identifier, &sources, &records)
         .map_err(|error| error.to_string().into())
@@ -2471,7 +2474,7 @@ fn build_library_entries(
     if !database_path.exists() {
         return Ok(Vec::new());
     }
-    let database = Database::open_or_create(database_path)?;
+    let database = Database::open_read_only(database_path)?;
     Ok(database
         .load_archives()?
         .iter()
@@ -2557,7 +2560,7 @@ fn list_platform_aliases_or_empty(
     if !database_path.exists() {
         return Ok(Vec::new());
     }
-    let database = Database::open_or_create(database_path)?;
+    let database = Database::open_read_only(database_path)?;
     Ok(database.list_platform_aliases()?)
 }
 
@@ -4791,8 +4794,49 @@ mod tests {
         let second_json = serde_json::to_string_pretty(&report).unwrap();
         assert_eq!(first_json, second_json);
         let value: serde_json::Value = serde_json::from_str(&first_json).unwrap();
-        assert_eq!(value["format_version"], 1);
+        assert_eq!(value["format_version"], 2);
         assert_eq!(value["open_outcome"], "opened_read_only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observational_catalogue_views_do_not_write_or_create_sidecars() {
+        let root = temp_dir("observational-catalogue-no-writes");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let before = std::fs::read(&database_path).unwrap();
+        let before_modified = std::fs::metadata(&database_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let status = build_library_status_view(&database_path);
+        assert!(status.health.database_opens);
+        assert!(
+            build_library_entries(&database_path, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_platform_aliases_or_empty(&database_path)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&database_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before_modified
+        );
+        for suffix in ["-journal", "-wal", "-shm"] {
+            assert!(!PathBuf::from(format!("{}{}", database_path.display(), suffix)).exists());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

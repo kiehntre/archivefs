@@ -108,6 +108,7 @@ dependencies = [
 name = "archivefs-core"
 version = "0.4.3-alpha"
 dependencies = [
+ "libc",
  "log",
  "notify",
  "rusqlite",

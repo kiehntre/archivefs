@@ -23,8 +23,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -148,17 +151,10 @@ impl Database {
             )));
         }
 
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|error| {
-            ArchiveFsError::Database(format!(
-                "failed to open {} read-only: {error}",
-                path.display()
-            ))
-        })?;
-        let current_version = schema_version(&connection)?;
+        let connection = open_read_only_connection(path)?;
+        let current_version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(|error| read_only_database_error(path, "read schema version", &error))?;
         let expected_version = latest_known_version(MIGRATIONS);
         if current_version != expected_version {
             return Err(ArchiveFsError::Database(format!(
@@ -184,10 +180,8 @@ impl Database {
     }
 
     /// True if `PRAGMA foreign_keys` reports enabled on this connection.
-    /// `open_connection` always enables it, so this should only ever
-    /// report `false` if the SQLite build in use cannot honor it - the
-    /// value is read back rather than assumed, per the design's "enable
-    /// and verify" requirement.
+    /// Normal read-write opens enable it. Explicit read-only opens leave
+    /// every pragma untouched and only report SQLite's connection default.
     pub fn foreign_keys_enabled(&self) -> Result<bool> {
         foreign_keys_enabled(&self.connection)
     }
@@ -214,6 +208,10 @@ pub enum DatabaseDiagnosticCode {
     DatabaseLocked,
     DatabaseBusy,
     RollbackJournalPresent,
+    HotRollbackJournal,
+    NonHotRollbackJournal,
+    MalformedRollbackJournal,
+    RollbackRecoveryRequired,
     WalPresent,
     ShmPresent,
     CorruptDatabase,
@@ -261,6 +259,23 @@ pub struct DatabaseSidecarFinding {
     pub path: EncodedPath,
     pub present: bool,
     pub size_bytes: Option<u64>,
+    pub rollback_journal_header: Option<RollbackJournalHeaderState>,
+}
+
+/// Bounded evidence from the first eight bytes of a rollback journal.
+/// `HotCandidate` means SQLite's journal magic is present; SQLite still
+/// decides whether recovery is required after considering locks and the
+/// complete header. Zeroed and truncated headers are non-hot. An invalid
+/// non-zero header is reported separately as malformed evidence, not as
+/// database corruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackJournalHeaderState {
+    HotCandidate,
+    ZeroedNonHot,
+    TruncatedNonHot,
+    Malformed,
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -362,35 +377,103 @@ pub fn diagnose_database(path: impl AsRef<Path>) -> DatabaseHealthReport {
                 None
             }
         };
-        let present = metadata.as_ref().is_some_and(|value| value.is_file());
-        if present {
-            let code = match kind {
-                DatabaseSidecarKind::RollbackJournal => {
-                    DatabaseDiagnosticCode::RollbackJournalPresent
+        let present = metadata.is_some();
+        let regular_file = metadata.as_ref().is_some_and(|value| value.is_file());
+        let rollback_journal_header = if present && kind == DatabaseSidecarKind::RollbackJournal {
+            Some(match inspect_rollback_journal_header(&sidecar_path, metadata.as_ref().unwrap()) {
+                Ok(state) => state,
+                Err(error) => {
+                    diagnostics.push(io_diagnostic(
+                        "failed to read rollback journal header",
+                        &error,
+                    ));
+                    RollbackJournalHeaderState::Unreadable
                 }
+            })
+        } else {
+            None
+        };
+        if present {
+            if kind == DatabaseSidecarKind::RollbackJournal {
+                diagnostics.push(diagnostic(
+                    DatabaseDiagnosticCode::RollbackJournalPresent,
+                    DatabaseDiagnosticSeverity::Warning,
+                    "rollback journal is present; presence alone does not imply corruption",
+                    None,
+                ));
+            }
+            let code = match kind {
+                DatabaseSidecarKind::RollbackJournal => match rollback_journal_header {
+                    Some(RollbackJournalHeaderState::HotCandidate) => {
+                        DatabaseDiagnosticCode::HotRollbackJournal
+                    }
+                    Some(
+                        RollbackJournalHeaderState::ZeroedNonHot
+                        | RollbackJournalHeaderState::TruncatedNonHot,
+                    ) => {
+                        DatabaseDiagnosticCode::NonHotRollbackJournal
+                    }
+                    Some(RollbackJournalHeaderState::Malformed) => {
+                        DatabaseDiagnosticCode::MalformedRollbackJournal
+                    }
+                    Some(RollbackJournalHeaderState::Unreadable) | None => {
+                        DatabaseDiagnosticCode::RollbackJournalPresent
+                    }
+                },
                 DatabaseSidecarKind::Wal => DatabaseDiagnosticCode::WalPresent,
                 DatabaseSidecarKind::Shm => DatabaseDiagnosticCode::ShmPresent,
             };
-            diagnostics.push(diagnostic(
-                code,
-                DatabaseDiagnosticSeverity::Warning,
-                "sidecar file is present; presence alone does not imply corruption",
-                None,
-            ));
+            let message = match rollback_journal_header {
+                Some(RollbackJournalHeaderState::HotCandidate) => {
+                    "rollback journal has SQLite's hot-journal magic; recovery may be required, subject to SQLite's lock checks"
+                }
+                Some(RollbackJournalHeaderState::ZeroedNonHot) => {
+                    "rollback journal is present with a zeroed non-hot header"
+                }
+                Some(RollbackJournalHeaderState::TruncatedNonHot) => {
+                    "rollback journal is too short to contain a complete SQLite rollback-journal header and is non-hot"
+                }
+                Some(RollbackJournalHeaderState::Malformed) => {
+                    "rollback journal has an unrecognised non-zero header; this does not by itself imply database corruption"
+                }
+                Some(RollbackJournalHeaderState::Unreadable) => {
+                    "rollback journal is present but its header could not be read"
+                }
+                None => "sidecar file is present; presence alone does not imply corruption",
+            };
+            if kind != DatabaseSidecarKind::RollbackJournal
+                || code != DatabaseDiagnosticCode::RollbackJournalPresent
+            {
+                diagnostics.push(diagnostic(
+                    code,
+                    if matches!(
+                        rollback_journal_header,
+                        Some(
+                            RollbackJournalHeaderState::ZeroedNonHot
+                                | RollbackJournalHeaderState::TruncatedNonHot
+                        )
+                    ) {
+                        DatabaseDiagnosticSeverity::Info
+                    } else {
+                        DatabaseDiagnosticSeverity::Warning
+                    },
+                    message,
+                    None,
+                ));
+            }
         }
         DatabaseSidecarFinding {
             kind,
             path: EncodedPath::from_path(&sidecar_path),
             present,
-            size_bytes: metadata
-                .filter(|value| value.is_file())
-                .map(|value| value.len()),
+            size_bytes: regular_file.then(|| metadata.as_ref().unwrap().len()),
+            rollback_journal_header,
         }
     })
     .collect();
 
     let mut report = DatabaseHealthReport {
-        format_version: 1,
+        format_version: 2,
         database_path: EncodedPath::from_path(path),
         database_present,
         main_file,
@@ -414,7 +497,9 @@ pub fn diagnose_database(path: impl AsRef<Path>) -> DatabaseHealthReport {
 
     let connection = match Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     ) {
         Ok(connection) => connection,
         Err(error) => {
@@ -449,6 +534,17 @@ pub fn diagnose_database(path: impl AsRef<Path>) -> DatabaseHealthReport {
         Err(error) => push_unique_diagnostic(&mut report.diagnostics, sqlite_diagnostic(&error)),
     }
     report.quick_check = run_check(&connection, "PRAGMA quick_check", &mut report.diagnostics);
+    if report
+        .diagnostics
+        .iter()
+        .any(|item| item.code == DatabaseDiagnosticCode::RollbackRecoveryRequired)
+    {
+        // SQLite opens connections lazily. Creating the connection can
+        // succeed even though the first real read discovers a hot journal
+        // whose rollback requires write access. Report the usable open as
+        // failed rather than claiming the database opened read-only.
+        report.open_outcome = DatabaseOpenOutcome::Failed;
+    }
     let _ = connection.close();
     report
 }
@@ -497,6 +593,46 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+const SQLITE_ROLLBACK_JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+fn inspect_rollback_journal_header(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> std::io::Result<RollbackJournalHeaderState> {
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rollback journal path is not a regular file",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rollback journal path is not a regular file",
+        ));
+    }
+    if opened_metadata.len() < SQLITE_ROLLBACK_JOURNAL_MAGIC.len() as u64 {
+        return Ok(RollbackJournalHeaderState::TruncatedNonHot);
+    }
+    let mut header = [0_u8; SQLITE_ROLLBACK_JOURNAL_MAGIC.len()];
+    file.read_exact(&mut header)?;
+    Ok(if opened_metadata.len() <= 512 {
+        RollbackJournalHeaderState::TruncatedNonHot
+    } else if header == SQLITE_ROLLBACK_JOURNAL_MAGIC {
+        RollbackJournalHeaderState::HotCandidate
+    } else if header == [0; SQLITE_ROLLBACK_JOURNAL_MAGIC.len()] {
+        RollbackJournalHeaderState::ZeroedNonHot
+    } else {
+        RollbackJournalHeaderState::Malformed
+    })
 }
 
 fn file_finding(path: &Path, metadata: &fs::Metadata) -> DatabaseFileFinding {
@@ -571,17 +707,23 @@ fn sqlite_diagnostic(error: &rusqlite::Error) -> DatabaseDiagnostic {
     let raw = error.to_string();
     let (code, extended_code) = match error.sqlite_error() {
         Some(sqlite) => {
-            let code = match sqlite.code {
-                ErrorCode::PermissionDenied => DatabaseDiagnosticCode::PermissionDenied,
-                ErrorCode::CannotOpen if raw.to_ascii_lowercase().contains("permission denied") => {
-                    DatabaseDiagnosticCode::PermissionDenied
+            let code = if sqlite.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK {
+                DatabaseDiagnosticCode::RollbackRecoveryRequired
+            } else {
+                match sqlite.code {
+                    ErrorCode::PermissionDenied => DatabaseDiagnosticCode::PermissionDenied,
+                    ErrorCode::CannotOpen
+                        if raw.to_ascii_lowercase().contains("permission denied") =>
+                    {
+                        DatabaseDiagnosticCode::PermissionDenied
+                    }
+                    ErrorCode::DatabaseLocked => DatabaseDiagnosticCode::DatabaseLocked,
+                    ErrorCode::DatabaseBusy => DatabaseDiagnosticCode::DatabaseBusy,
+                    ErrorCode::DatabaseCorrupt => DatabaseDiagnosticCode::CorruptDatabase,
+                    ErrorCode::NotADatabase => DatabaseDiagnosticCode::MalformedDatabase,
+                    ErrorCode::SystemIoFailure => DatabaseDiagnosticCode::IoError,
+                    _ => DatabaseDiagnosticCode::SqliteError,
                 }
-                ErrorCode::DatabaseLocked => DatabaseDiagnosticCode::DatabaseLocked,
-                ErrorCode::DatabaseBusy => DatabaseDiagnosticCode::DatabaseBusy,
-                ErrorCode::DatabaseCorrupt => DatabaseDiagnosticCode::CorruptDatabase,
-                ErrorCode::NotADatabase => DatabaseDiagnosticCode::MalformedDatabase,
-                ErrorCode::SystemIoFailure => DatabaseDiagnosticCode::IoError,
-                _ => DatabaseDiagnosticCode::SqliteError,
             };
             (code, Some(sqlite.extended_code))
         }
@@ -590,7 +732,12 @@ fn sqlite_diagnostic(error: &rusqlite::Error) -> DatabaseDiagnostic {
     DatabaseDiagnostic {
         code,
         severity: DatabaseDiagnosticSeverity::Error,
-        message: "SQLite operation failed".to_string(),
+        message: if code == DatabaseDiagnosticCode::RollbackRecoveryRequired {
+            "SQLite requires rollback recovery, which a read-only diagnostic must not perform; preserve the database and sidecars, close active users cleanly, and follow the recovery procedure"
+                .to_string()
+        } else {
+            "SQLite operation failed".to_string()
+        },
         sqlite_extended_code: extended_code,
         raw_sqlite_message: Some(raw),
     }
@@ -606,6 +753,36 @@ fn open_connection(path: &Path) -> Result<Connection> {
             ArchiveFsError::Database(format!("failed to enable foreign keys: {error}"))
         })?;
     Ok(connection)
+}
+
+fn open_read_only_connection(path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| read_only_database_error(path, "open database", &error))
+}
+
+fn read_only_database_error(
+    path: &Path,
+    operation: &str,
+    error: &rusqlite::Error,
+) -> ArchiveFsError {
+    if error
+        .sqlite_error()
+        .is_some_and(|sqlite| sqlite.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK)
+    {
+        return ArchiveFsError::Database(format!(
+            "failed to {operation} at {} read-only because SQLite requires rollback recovery; preserve the database and sidecars, close active users cleanly, and follow the copy-first recovery procedure: {error}",
+            path.display()
+        ));
+    }
+    ArchiveFsError::Database(format!(
+        "failed to {operation} at {} read-only: {error}",
+        path.display()
+    ))
 }
 
 fn schema_version(connection: &Connection) -> Result<i64> {
@@ -725,7 +902,7 @@ pub fn check_database_health(path: impl AsRef<Path>) -> DatabaseHealth {
         };
     }
 
-    match open_connection(&path) {
+    match open_read_only_connection(&path) {
         Ok(connection) => {
             // Connection::open is lazy - SQLite does not validate the file
             // header until the first real read, so a corrupt or
@@ -3798,7 +3975,7 @@ mod tests {
 
         let report = diagnose_database(&path);
 
-        assert_eq!(report.format_version, 1);
+        assert_eq!(report.format_version, 2);
         assert!(report.database_present);
         assert_eq!(report.open_outcome, DatabaseOpenOutcome::OpenedReadOnly);
         assert_eq!(report.schema_version, Some(latest_schema_version()));
@@ -3883,6 +4060,16 @@ mod tests {
             report
                 .diagnostics
                 .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::NonHotRollbackJournal })
+        );
+        assert_eq!(
+            report.sidecars[0].rollback_journal_header,
+            Some(RollbackJournalHeaderState::TruncatedNonHot)
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
                 .any(|item| item.code == DatabaseDiagnosticCode::WalPresent)
         );
         assert!(
@@ -3899,6 +4086,66 @@ mod tests {
                 before[index].1
             );
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_distinguishes_hot_candidate_journal_header() {
+        let root = temp_dir("database-diagnostic-hot-journal-header");
+        let path = root.join("library.sqlite3");
+        Database::open_or_create(&path).unwrap().close().unwrap();
+        let journal_path = sidecar_path(&path, "-journal");
+        let mut journal = vec![0_u8; 8_720];
+        journal[..SQLITE_ROLLBACK_JOURNAL_MAGIC.len()]
+            .copy_from_slice(&SQLITE_ROLLBACK_JOURNAL_MAGIC);
+        fs::write(&journal_path, &journal).unwrap();
+
+        let report = diagnose_database(&path);
+
+        assert_eq!(
+            report.sidecars[0].rollback_journal_header,
+            Some(RollbackJournalHeaderState::HotCandidate)
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::HotRollbackJournal })
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), journal);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_diagnostic_distinguishes_zeroed_and_malformed_journal_headers() {
+        let root = temp_dir("database-diagnostic-non-hot-journal-headers");
+        let path = root.join("library.sqlite3");
+        Database::open_or_create(&path).unwrap().close().unwrap();
+        let journal_path = sidecar_path(&path, "-journal");
+
+        let zeroed = vec![0_u8; 8_720];
+        fs::write(&journal_path, &zeroed).unwrap();
+        let zeroed_report = diagnose_database(&path);
+        assert_eq!(
+            zeroed_report.sidecars[0].rollback_journal_header,
+            Some(RollbackJournalHeaderState::ZeroedNonHot)
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), zeroed);
+
+        let malformed = vec![0x5a_u8; 8_720];
+        fs::write(&journal_path, &malformed).unwrap();
+        let malformed_report = diagnose_database(&path);
+        assert_eq!(
+            malformed_report.sidecars[0].rollback_journal_header,
+            Some(RollbackJournalHeaderState::Malformed)
+        );
+        assert!(
+            malformed_report
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::MalformedRollbackJournal })
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), malformed);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3966,6 +4213,10 @@ mod tests {
                 DatabaseDiagnosticCode::MalformedDatabase,
             ),
             (rusqlite::ffi::SQLITE_IOERR, DatabaseDiagnosticCode::IoError),
+            (
+                rusqlite::ffi::SQLITE_READONLY_ROLLBACK,
+                DatabaseDiagnosticCode::RollbackRecoveryRequired,
+            ),
         ];
         for (sqlite_code, expected) in cases {
             let error = rusqlite::Error::SqliteFailure(
@@ -3974,6 +4225,22 @@ mod tests {
             );
             assert_eq!(sqlite_diagnostic(&error).code, expected);
         }
+        let recovery_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY_ROLLBACK),
+            Some("attempt to write a readonly database".to_string()),
+        );
+        let recovery_diagnostic = sqlite_diagnostic(&recovery_error);
+        assert_eq!(recovery_diagnostic.sqlite_extended_code, Some(776));
+        assert!(recovery_diagnostic.message.contains("rollback recovery"));
+        assert!(recovery_diagnostic.message.contains("preserve"));
+        let open_error = read_only_database_error(
+            Path::new("/fixture/library.sqlite3"),
+            "read schema version",
+            &recovery_error,
+        );
+        let open_message = open_error.to_string();
+        assert!(open_message.contains("rollback recovery"));
+        assert!(open_message.contains("copy-first"));
     }
 
     #[test]
@@ -3989,6 +4256,22 @@ mod tests {
             (
                 DatabaseDiagnosticCode::RollbackJournalPresent,
                 "rollback_journal_present",
+            ),
+            (
+                DatabaseDiagnosticCode::HotRollbackJournal,
+                "hot_rollback_journal",
+            ),
+            (
+                DatabaseDiagnosticCode::NonHotRollbackJournal,
+                "non_hot_rollback_journal",
+            ),
+            (
+                DatabaseDiagnosticCode::MalformedRollbackJournal,
+                "malformed_rollback_journal",
+            ),
+            (
+                DatabaseDiagnosticCode::RollbackRecoveryRequired,
+                "rollback_recovery_required",
             ),
             (DatabaseDiagnosticCode::WalPresent, "wal_present"),
             (DatabaseDiagnosticCode::ShmPresent, "shm_present"),
@@ -4013,6 +4296,26 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),
                 format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_journal_header_json_names_are_stable_lower_snake_case() {
+        let cases = [
+            (RollbackJournalHeaderState::HotCandidate, "hot_candidate"),
+            (RollbackJournalHeaderState::ZeroedNonHot, "zeroed_non_hot"),
+            (
+                RollbackJournalHeaderState::TruncatedNonHot,
+                "truncated_non_hot",
+            ),
+            (RollbackJournalHeaderState::Malformed, "malformed"),
+            (RollbackJournalHeaderState::Unreadable, "unreadable"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::Value::String(expected.to_string())
             );
         }
     }
@@ -5838,7 +6141,8 @@ mod tests {
     #[test]
     fn interrupted_upsert_transaction_rolls_back_safely() {
         let root = temp_dir("interrupted-upsert-rollback");
-        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let database_path = root.join("library.sqlite3");
+        let mut database = Database::open_or_create(&database_path).unwrap();
 
         // A source_folder_id that was never registered violates the
         // archives.source_folder_id foreign key, forcing the INSERT
@@ -5856,7 +6160,136 @@ mod tests {
             archive_count, 0,
             "a failed upsert_archive transaction must leave no partial row behind"
         );
+        assert!(!sidecar_path(&database_path, "-journal").exists());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clean_scan_commits_without_leaving_a_rollback_journal() {
+        let root = temp_dir("clean-scan-no-journal");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let database_path = root.join("library.sqlite3");
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "test-clean-shutdown").unwrap();
+        database.close().unwrap();
+
+        assert_eq!(summary.counts.archives_added, 1);
+        assert!(!sidecar_path(&database_path, "-journal").exists());
+        assert_eq!(
+            diagnose_database(&database_path).quick_check.status,
+            DatabaseCheckStatus::Ok
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hot_journal_child_helper() {
+        let Some(database_path) = std::env::var_os("ARCHIVEFS_TEST_HOT_JOURNAL_DB") else {
+            return;
+        };
+        let marker_path = std::env::var_os("ARCHIVEFS_TEST_HOT_JOURNAL_MARKER").unwrap();
+        let connection = Connection::open(PathBuf::from(database_path)).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA cache_size = 1;
+                 BEGIN IMMEDIATE;
+                 UPDATE schema_migrations
+                 SET description = description || printf('%100000s', 'x')
+                 WHERE version = 1;",
+            )
+            .unwrap();
+        fs::write(marker_path, b"transaction pages written").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn killed_fixture_transaction_leaves_a_recoverable_hot_journal() {
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let root = temp_dir("killed-fixture-hot-journal");
+        let database_path = root.join("library.sqlite3");
+        let marker_path = root.join("transaction-ready");
+        Database::open_or_create(&database_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let migration_description_before: String = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT description FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("database::tests::hot_journal_child_helper")
+            .arg("--nocapture")
+            .env("ARCHIVEFS_TEST_HOT_JOURNAL_DB", &database_path)
+            .env("ARCHIVEFS_TEST_HOT_JOURNAL_MARKER", &marker_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !marker_path.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture child did not reach its open write transaction");
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let journal_path = sidecar_path(&database_path, "-journal");
+        let journal = fs::read(&journal_path).unwrap();
+        assert!(journal.len() > 512);
+        assert_eq!(
+            &journal[..SQLITE_ROLLBACK_JOURNAL_MAGIC.len()],
+            SQLITE_ROLLBACK_JOURNAL_MAGIC.as_slice()
+        );
+
+        let report = diagnose_database(&database_path);
+        assert_eq!(report.open_outcome, DatabaseOpenOutcome::Failed);
+        assert_eq!(
+            report.sidecars[0].rollback_journal_header,
+            Some(RollbackJournalHeaderState::HotCandidate)
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DatabaseDiagnosticCode::RollbackRecoveryRequired })
+        );
+
+        let connection = Connection::open(&database_path).unwrap();
+        let migration_description_after: String = connection
+            .query_row(
+                "SELECT description FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quick_check: String = connection
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .unwrap();
+        connection.close().unwrap();
+        assert_eq!(migration_description_after, migration_description_before);
+        assert_eq!(quick_check, "ok");
+        assert!(!journal_path.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

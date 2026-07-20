@@ -44,9 +44,12 @@ schema_version
 diagnostics
 ```
 
-`format_version` is currently `1`. `database_path` and every sidecar path use
+`format_version` is currently `2`. `database_path` and every sidecar path use
 the byte-safe `{ "display": string, "lossy": boolean }` representation.
 `open_outcome` is one of `opened_read_only`, `missing_database`, or `failed`.
+Because SQLite opens lazily, `failed` also covers a connection whose first real
+read returns `rollback_recovery_required` even if the connection object itself
+was created successfully.
 Check statuses are `ok`, `failed`, `error`, or `not_run`. The bounded default
 runs `quick_check`; `integrity_check` is present as `not_run` rather than
 silently doing an unbounded full check.
@@ -54,12 +57,21 @@ silently doing an unbounded full check.
 Every diagnostic has `code`, `severity`, `message`,
 `sqlite_extended_code`, and `raw_sqlite_message`. Codes are stable
 lower-snake-case values including `missing_database`, `permission_denied`,
-`database_locked`, `database_busy`, `rollback_journal_present`, `wal_present`,
+`database_locked`, `database_busy`, `rollback_journal_present`,
+`hot_rollback_journal`, `non_hot_rollback_journal`,
+`malformed_rollback_journal`, `rollback_recovery_required`, `wal_present`,
 `shm_present`, `corrupt_database`, `malformed_database`,
 `integrity_check_failed`, `schema_version_unsupported`, `migration_failed`,
 `io_error`, and `sqlite_error`. `raw_sqlite_message` is explicitly unstable
 presentation detail and must not be parsed. Sidecar presence is reported as
 evidence and never treated as proof of corruption.
+
+Format version 2 adds `rollback_journal_header` to each sidecar finding. It is
+`hot_candidate`, `zeroed_non_hot`, `truncated_non_hot`, `malformed`, or
+`unreadable` for the rollback journal and `null` for WAL/SHM. `hot_candidate`
+is header evidence, not a substitute for SQLite's lock-aware recovery
+decision. `malformed` describes only the sidecar header; it does not classify
+the main database as corrupt.
 
 The command never creates a missing file or parent directory, runs a migration,
 changes journal mode, checkpoints WAL, deletes a sidecar, or repairs data.

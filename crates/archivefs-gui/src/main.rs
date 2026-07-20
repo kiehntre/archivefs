@@ -1547,6 +1547,7 @@ enum DatabaseState {
     Loading {
         generation: DatabaseGeneration,
         receiver: Receiver<DatabaseMessage>,
+        worker: Option<thread::JoinHandle<()>>,
         previous: Option<Box<CachedLibrarySnapshot>>,
         scanning: bool,
     },
@@ -1605,7 +1606,7 @@ fn start_database_load(
     run_scan_first: bool,
 ) -> DatabaseState {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let result = load_database_snapshot(run_scan_first);
         let _ = sender.send((generation, result));
         context.request_repaint();
@@ -1613,6 +1614,7 @@ fn start_database_load(
     DatabaseState::Loading {
         generation,
         receiver,
+        worker: Some(worker),
         previous,
         scanning: run_scan_first,
     }
@@ -1682,7 +1684,7 @@ fn load_database_snapshot_at(
     }
 
     let database =
-        Database::open_or_create(database_path).map_err(|error| DatabaseLoadError::Failed {
+        Database::open_read_only(database_path).map_err(|error| DatabaseLoadError::Failed {
             message: error.to_string(),
         })?;
     let snapshot = load_snapshot_from(&database, database_path, config_path)?;
@@ -1872,6 +1874,7 @@ enum SourceActionOutcome {
 struct RunningSourceAction {
     action: SourceAction,
     receiver: Receiver<Result<SourceActionOutcome, String>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 /// The "Add Folder" dialog's state - `Some` on `ArchiveFsApp` exactly
@@ -2909,13 +2912,13 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Starts (or restarts) a background database load. `run_scan_first =
+    /// Starts a background database load. `run_scan_first =
     /// true` is "Scan Library" (runs `scan_and_persist` before reloading);
     /// `false` is "Refresh Database Status" / "Retry Database Load" (a
     /// read-only reload). Never blocks the UI thread - mirrors
     /// `refresh`/`start_load` exactly.
     fn start_database_action(&mut self, context: egui::Context, run_scan_first: bool) {
-        if self.missing_removal.is_some() {
+        if self.missing_removal.is_some() || self.database_state.is_loading() {
             return;
         }
         self.database_generation = self.database_generation.next();
@@ -2928,9 +2931,10 @@ impl ArchiveFsApp {
             },
         ) {
             DatabaseState::Ready { snapshot, .. } => Some(snapshot),
-            DatabaseState::Loading { previous, .. }
-            | DatabaseState::Outdated { previous, .. }
-            | DatabaseState::Error { previous, .. } => previous,
+            DatabaseState::Outdated { previous, .. } | DatabaseState::Error { previous, .. } => {
+                previous
+            }
+            DatabaseState::Loading { .. } => unreachable!("loading state was rejected above"),
             DatabaseState::NotCreated { .. } => None,
         };
         if run_scan_first {
@@ -2979,7 +2983,7 @@ impl ArchiveFsApp {
         if generation != self.database_generation {
             return;
         }
-        let previous = match std::mem::replace(
+        let (previous, worker) = match std::mem::replace(
             &mut self.database_state,
             DatabaseState::Error {
                 message: "database load result pending".to_string(),
@@ -2989,13 +2993,17 @@ impl ArchiveFsApp {
             DatabaseState::Loading {
                 generation: state_generation,
                 previous,
+                worker,
                 ..
-            } if state_generation == generation => previous,
+            } if state_generation == generation => (previous, worker),
             other => {
                 self.database_state = other;
                 return;
             }
         };
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
 
         self.database_state = match result {
             Ok(DatabaseOutcome::Loaded(snapshot)) => DatabaseState::Ready {
@@ -3656,12 +3664,14 @@ impl ArchiveFsApp {
         self.source_action = Some(RunningSourceAction {
             action: action.clone(),
             receiver,
+            worker: None,
         });
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let result = run_source_action(&action).map_err(|error| error.to_string());
             let _ = sender.send(result);
             context.request_repaint();
         });
+        self.source_action.as_mut().unwrap().worker = Some(worker);
     }
 
     /// Mirrors `poll_alias_action`: on success, refreshes only the cached
@@ -3682,7 +3692,13 @@ impl ArchiveFsApp {
         let Some((action, result)) = result else {
             return;
         };
-        self.source_action = None;
+        let worker = self
+            .source_action
+            .take()
+            .and_then(|mut running| running.worker.take());
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
         let log_category = source_action_log_category(&action);
         let path = source_action_path(&action);
         match result {
@@ -4858,6 +4874,26 @@ struct ActionFeedback {
 struct CleanupFeedback {
     succeeded: bool,
     message: String,
+}
+
+impl Drop for ArchiveFsApp {
+    fn drop(&mut self) {
+        // Database and source actions include the GUI's catalogue scan paths.
+        // Retaining and joining these handles prevents a normal window close
+        // from abandoning SQLite in the middle of a write transaction. This
+        // cannot run for SIGKILL, power loss, or process abort; SQLite's
+        // rollback journal remains the safety boundary for those cases.
+        if let DatabaseState::Loading { worker, .. } = &mut self.database_state
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
+        }
+        if let Some(mut action) = self.source_action.take()
+            && let Some(worker) = action.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl eframe::App for ArchiveFsApp {
@@ -16516,6 +16552,39 @@ mod tests {
     }
 
     #[test]
+    fn gui_database_refresh_is_read_only_and_creates_no_sidecars() {
+        let dir = database_test_dir("read-only-refresh");
+        let database_path = dir.join("library.sqlite3");
+        Database::open_or_create(&database_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let before = std::fs::read(&database_path).unwrap();
+        let before_modified = std::fs::metadata(&database_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let result = load_database_snapshot_at(&database_path, &dir.join("config.toml"), None);
+
+        assert!(matches!(result, Ok(DatabaseOutcome::Loaded(_))));
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&database_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before_modified
+        );
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = database_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(!PathBuf::from(sidecar).exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cached_rows_appear_before_live_refresh_completes() {
         let snapshot = cached_snapshot(vec![
             persisted_archive(PathBuf::from("/roms/present.zip"), false),
@@ -16877,6 +16946,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -16901,6 +16971,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation: stale_generation,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -17005,6 +17076,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation,
             receiver,
+            worker: None,
             previous: None,
             scanning: true,
         };
@@ -17015,6 +17087,40 @@ mod tests {
             app.database_state,
             DatabaseState::Loading { scanning: true, .. }
         ));
+    }
+
+    #[test]
+    fn active_database_worker_cannot_be_replaced_and_is_joined_on_shutdown() {
+        let mut app = app_for_operation_tests();
+        let generation = DatabaseGeneration::INITIAL.next();
+        app.database_generation = generation;
+        let (_sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker_completed = Arc::clone(&completed);
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            worker_completed.store(true, Ordering::SeqCst);
+        });
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            worker: Some(worker),
+            previous: None,
+            scanning: true,
+        };
+
+        app.start_database_action(egui::Context::default(), false);
+        assert_eq!(app.database_generation, generation);
+        assert!(matches!(
+            app.database_state,
+            DatabaseState::Loading { scanning: true, .. }
+        ));
+
+        barrier.wait();
+        drop(app);
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -17031,6 +17137,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -17222,6 +17329,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation: DatabaseGeneration::INITIAL,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -17339,6 +17447,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation,
             receiver,
+            worker: None,
             previous: Some(Box::new(cached_snapshot(vec![persisted_archive(
                 archive_path.clone(),
                 false,
@@ -17398,6 +17507,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation,
             receiver,
+            worker: None,
             previous: Some(Box::new(cached_snapshot(vec![
                 persisted_archive_with_platform(
                     archive_path.clone(),
@@ -17438,6 +17548,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -17453,10 +17564,11 @@ mod tests {
 
         let recomputed = app
             .filtered_rows
+            .as_ref()
             .expect("filtered_rows must be recomputed, not left stale");
         assert_eq!(
             recomputed,
-            vec![0],
+            &vec![0],
             "must be freshly computed against the new merged row set, not the stale placeholder"
         );
     }
@@ -19917,6 +20029,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation: DatabaseGeneration::INITIAL,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -20236,6 +20349,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation: DatabaseGeneration::INITIAL,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -21652,6 +21766,7 @@ mod tests {
         app.source_action = Some(RunningSourceAction {
             action: SourceAction::ScanAll,
             receiver,
+            worker: None,
         });
         assert!(!app.source_action_available());
         // Every other action-availability check must also refuse to
@@ -21666,6 +21781,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation: DatabaseGeneration::INITIAL,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };
@@ -21964,6 +22080,7 @@ mod tests {
         app.database_state = DatabaseState::Loading {
             generation: DatabaseGeneration::INITIAL,
             receiver,
+            worker: None,
             previous: None,
             scanning: false,
         };

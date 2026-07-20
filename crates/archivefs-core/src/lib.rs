@@ -2031,7 +2031,7 @@ pub fn list_source_folder_views_at(
     database_path: &Path,
 ) -> Result<Vec<SourceFolderView>> {
     let sources = load_source_folder_configs_from(config_path)?;
-    let database = Database::open_or_create(database_path)?;
+    let database = Database::open_read_only(database_path)?;
     let records = database.list_source_folders()?;
     Ok(build_source_folder_views(&sources, &records))
 }
@@ -9927,6 +9927,9 @@ mod tests {
         assert!(added.enabled);
         assert!(added.created_at.is_some());
 
+        let database_before = fs::read(&database_path).unwrap();
+        let modified_before = fs::metadata(&database_path).unwrap().modified().unwrap();
+
         let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].path, archives_dir);
@@ -9936,6 +9939,16 @@ mod tests {
         );
         assert_eq!(views[0].last_archive_count, None, "adding must never scan");
         assert_eq!(views[0].availability, SourceAvailability::Available);
+        assert_eq!(fs::read(&database_path).unwrap(), database_before);
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().modified().unwrap(),
+            modified_before
+        );
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = database_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(!PathBuf::from(sidecar).exists());
+        }
     }
 
     #[test]
