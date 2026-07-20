@@ -11,10 +11,11 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
-    CheatAvailabilityReport, CheatInstallOptions, CheatInstallRunOutcome, CheatInstallRunStatus,
-    CoreSelectionSource, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
-    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
-    execute_cheat_install_run, load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot,
+    CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatInstallOptions,
+    CheatInstallRunOutcome, CheatInstallRunStatus, CheatRollbackOptions, CoreSelectionSource,
+    DestinationKind, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
+    RetroArchAdvisoryPlan, build_cheat_availability_report, execute_cheat_install_run,
+    execute_cheat_rollback_run, load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot,
     preview_retroarch_patch_and_cheat_destinations,
 };
 use archivefs_core::{
@@ -405,6 +406,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if real_run_failed || (outcome.journal_error.is_some() && !outcome.run.dry_run) {
                 return Err("retroarch-cheat-install: one or more eligible entries did not complete successfully"
                     .into());
+            }
+        }
+        "retroarch-cheat-rollback" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let dry_run = extract_flag(&mut input_args, "--dry-run");
+            let confirmed = extract_flag(&mut input_args, "--yes");
+            let destination_root = extract_cheat_destination_root_flag(&mut input_args)?
+                .ok_or("retroarch-cheat-rollback requires --cheat-destination-root <path>")?;
+            if input_args.len() != 1 {
+                return Err("retroarch-cheat-rollback requires one journal path, --cheat-destination-root <path>, --dry-run, --yes, and --json".into());
+            }
+            let journal_path = PathBuf::from(&input_args[0]);
+            let data_directory = default_database_path()?
+                .parent()
+                .ok_or("could not determine the ArchiveFS data directory")?
+                .to_path_buf();
+            let options = CheatRollbackOptions {
+                journal_path: journal_path.clone(),
+                destination_root,
+                backup_directory: data_directory.join(CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME),
+                rollback_journal_directory: data_directory.join(CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME),
+                run_id: generate_cheat_rollback_run_id(),
+                started_at_unix_seconds: unix_seconds_now(),
+                dry_run,
+                confirmed,
+            };
+            let outcome = execute_cheat_rollback_run(&journal_path, &options);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome.run)?);
+            } else {
+                print_cheat_rollback_run(&outcome);
+            }
+            if let Some(path) = &outcome.journal_path {
+                log::info!("retroarch-cheat-rollback: wrote journal {}", path.display());
+            }
+            if let Some(error) = &outcome.journal_error {
+                log::error!("retroarch-cheat-rollback: journal write failed: {error}");
+            }
+            if !outcome.run.dry_run
+                && (outcome.run.status
+                    != archivefs_core::patch_manager::CheatRollbackRunStatus::Success
+                    || outcome.journal_error.is_some())
+            {
+                return Err("retroarch-cheat-rollback: one or more entries failed".into());
             }
         }
         "index-build" => {
@@ -3117,6 +3163,28 @@ fn generate_cheat_install_run_id() -> String {
     format!("cheat-install-{nanos:x}-{}", std::process::id())
 }
 
+fn generate_cheat_rollback_run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("cheat-rollback-{nanos:x}-{}", std::process::id())
+}
+
+fn print_cheat_rollback_run(outcome: &archivefs_core::patch_manager::CheatRollbackRunOutcome) {
+    let run = &outcome.run;
+    println!("RetroArch cheat rollback: {:?}", run.status);
+    println!("  original run: {}", run.original_install_run_id);
+    println!("  entries: {}", run.summary.requested);
+    println!(
+        "  removed: {}  restored: {}  already restored: {}  failed: {}",
+        run.summary.removed, run.summary.restored, run.summary.already_restored, run.summary.failed
+    );
+    if let Some(path) = &run.rollback_journal_path {
+        println!("  journal: {}", path.display);
+    }
+}
+
 fn unix_seconds_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3714,6 +3782,9 @@ fn print_help() {
     );
     println!(
         "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
+    );
+    println!(
+        "  retroarch-cheat-rollback <journal-path>  Safely roll back one cheat-install journal (requires --cheat-destination-root; defaults to dry-run; --yes/--dry-run/--json accepted)"
     );
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");

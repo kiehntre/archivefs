@@ -122,6 +122,9 @@ These are implemented, tested, and in current use today:
   enables, or applies a cheat. No network access; local sources only. See
   [`docs/RETROARCH_CHEAT_CATALOGUE.md`](docs/RETROARCH_CHEAT_CATALOGUE.md).
 
+- Safe, journal-driven rollback for RetroArch cheat installations is now
+  available via `retroarch-cheat-rollback`; GUI support remains out of scope.
+
 ## Current development
 
 Work in progress or the immediate next slice of work on top of the

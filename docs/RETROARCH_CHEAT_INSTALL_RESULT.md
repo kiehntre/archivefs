@@ -1,5 +1,10 @@
 # RetroArch Cheat Installation Result and Journal Data Model
 
+Successful writing runs are rollbackable through the journal using
+[`retroarch-cheat-rollback`](RETROARCH_CHEAT_ROLLBACK.md). The rollback parser
+consumes this journal's recorded outcomes and hashes; it does not trust stored
+absolute paths without revalidating them against the caller's destination root.
+
 This document covers `patch_manager::cheat_install_result` - stable,
 serializable Rust types and pure conversion logic describing what would
 happen, and now (via `archivefs retroarch-cheat-install`; see
