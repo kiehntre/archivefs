@@ -38,8 +38,12 @@ Catalogue retrieval alone does not install cheats, modify RetroArch, or copy
 files into RetroArch's cheat directory. The first-class GUI workspace currently
 provides an in-page archive picker, profile discovery, trusted catalogue
 retrieval, and a bounded read-only inventory of the selected profile's existing
-RetroArch cheat directory. Archive matching, GUI installation, and all mod
-adapters remain unavailable there.
+RetroArch cheat directory. A PS2-only PCSX2 adapter can also discover eligible
+or blocked native and Flatpak profiles and inspect existing PNACH files in
+`cheats`, `cheats_ws`, and an existing `patches` directory. It categorizes by
+directory, parses bounded metadata, and records CRC/title candidates without
+claiming exact identity. No PCSX2 installation or mutation action exists. See
+[`PCSX2_READONLY_ADAPTER.md`](PCSX2_READONLY_ADAPTER.md).
 
 The archive picker searches the already loaded ArchiveFS library by displayed
 name, platform, source, mount state, and path. Its tentative selection is
@@ -99,7 +103,8 @@ When an implemented adapter performs safety inspection, ArchiveFS scans the
 supported imported files locally on your device to help identify unsafe paths,
 unexpected executables or scripts, unsupported formats, archive bombs, and
 other structural risks. Today this applies to the trusted RetroArch catalogue
-retrieval pipeline; it does not describe a general local-import scanner.
+retrieval pipeline and bounded read-only inspection of an already managed
+PCSX2 profile; it does not describe a general local-import scanner.
 
 Scan results, filenames, file contents, hashes, and metadata are not sent to the
 ArchiveFS developers or any third party. ArchiveFS has no telemetry, remote file

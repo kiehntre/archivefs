@@ -33,6 +33,7 @@ mod destination_safety;
 mod import_safety;
 mod matching;
 mod pcsx2;
+mod pcsx2_local;
 mod retrieval;
 mod retroarch;
 mod retroarch_cheat_library;
@@ -121,6 +122,17 @@ pub use import_safety::{
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
+};
+pub use pcsx2_local::{
+    PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
+    PCSX2_MAX_LINE_BYTES, PCSX2_MAX_LINES_PER_FILE, PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE,
+    PCSX2_MAX_PNACH_FILE_BYTES, PCSX2_MAX_PNACH_FILES, PCSX2_MAX_PROFILES,
+    PCSX2_MAX_TOTAL_PNACH_BYTES, Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2InspectionError,
+    Pcsx2InspectionWarning, Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2MatchResult,
+    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
+    Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
+    Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
+    discover_pcsx2_profiles, inspect_pcsx2_profile, match_pcsx2_inventory,
 };
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
 pub use retroarch::{

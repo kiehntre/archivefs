@@ -82,9 +82,12 @@ user-facing version at
   source trust, inspection, destination, and installation state distinct. Its
   in-page picker changes only workspace context; it can inventory an eligible
   profile's existing cheat directory with fixed read-only bounds or retrieve a
-  trusted cached catalogue. It does not yet match archives, install cheats,
-  inspect arbitrary local imports, or provide mod adapters; see
-  [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md).
+  trusted cached catalogue. For PS2 archives it also offers a read-only PCSX2
+  adapter that discovers safe native/Flatpak profiles and inventories existing
+  `cheats`, `cheats_ws`, and present `patches` PNACH files. It does not yet
+  derive a verified game CRC, install cheats or patches, or inspect arbitrary
+  local imports; see [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md)
+  and [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
   pinned snapshots remain protected, and retrieval and maintenance coordinate
@@ -468,6 +471,7 @@ Platforms:
 - [Persistent database](docs/database.md) / [database design](docs/DATABASE_DESIGN.md) / [ADR 0001](docs/adr/0001-persistent-library-database.md)
 - [Managed library views](docs/library-views.md)
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
+- [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)
