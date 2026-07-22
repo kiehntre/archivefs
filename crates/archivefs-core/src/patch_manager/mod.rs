@@ -20,6 +20,7 @@
 //! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
+mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_catalogue;
 mod cheat_history;

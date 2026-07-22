@@ -27,7 +27,10 @@ struct JsonFailure<'a> {
 
 pub fn run_list(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_source_options(args, false)?;
-    let report = list_retroarch_cheat_sources(&options.cache_root);
+    let report = match list_retroarch_cheat_sources(&options.cache_root) {
+        Ok(report) => report,
+        Err(error) => return render_failure(error, options.json),
+    };
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -334,7 +337,7 @@ mod tests {
             "archivefs-empty-source-list-{}",
             std::process::id()
         ));
-        let value = serde_json::to_value(list_retroarch_cheat_sources(&root)).unwrap();
+        let value = serde_json::to_value(list_retroarch_cheat_sources(&root).unwrap()).unwrap();
         assert_eq!(value["schema_version"], 1);
         assert!(value["entries"].is_array());
         assert_eq!(

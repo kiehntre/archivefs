@@ -4115,7 +4115,7 @@ fn print_help() {
     println!("  mount-one      Mount one archive by path or name");
     println!("  unmount        Unmount ArchiveFS mountpoints under mount_root");
     println!("  unmount-one    Unmount one archive by path or name");
-    println!("  clean          Remove empty directories under mount_root");
+    println!("  clean          Remove empty current ArchiveFS mount directories");
     println!("  watch          Watch source folders and refresh the JSON index");
     println!("  index-build    Build the JSON archive index");
     println!("  index-show     Show a summary of the JSON archive index");

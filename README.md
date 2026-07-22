@@ -34,7 +34,7 @@ for the detailed safety model behind these principles.
 
 ## What ArchiveFS does today
 
-- Scans configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping obvious split-archive continuation parts).
+- Safely scans absolute, non-symlinked configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping symlink/special-file entries and obvious split-archive continuation parts, with bounded traversal).
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
 - Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. Catalogue reports and previews use an explicit read-only open; `database-check` additionally distinguishes hot-header evidence, zeroed/truncated non-hot journals, malformed headers, and recovery-required read-only failures without creating, migrating, repairing, or checkpointing anything.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
@@ -64,7 +64,8 @@ for the detailed safety model behind these principles.
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
-  pinned snapshots remain protected; see
+  pinned snapshots remain protected, and retrieval and maintenance coordinate
+  through one bounded cross-process cache lock; see
   [`docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
