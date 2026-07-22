@@ -1,1447 +1,1447 @@
 {
-  "schema_version": "1.0.0",
-  "campaign_base_commit": "fd0b4b143d64d9f8d681054eb60e8b4b8a41edd6",
-  "generated_at": "2026-07-22T03:04:40Z",
-  "milestones": [
-    {
-      "id": "integration-architecture",
-      "title": "Integration architecture",
-      "description": "Initializer harness, campaign docs, and architecture plan. No production code changes."
-    },
-    {
-      "id": "gui-application-service-foundation",
-      "title": "GUI application-service foundation",
-      "description": "Typed command/result/progress envelope, shared background-worker plumbing, and the mechanical archivefs-gui/src/main.rs module split."
-    },
-    {
-      "id": "library-integration",
-      "title": "Library integration",
-      "description": "Extend the existing Library screen to match design intent: listing, search, filters, selection, inspection, manual platform assignment, missing records, duplicates, refresh."
-    },
-    {
-      "id": "sources-integration",
-      "title": "Sources integration",
-      "description": "Extend the existing Sources screen: listing, availability, add, enable/disable, scan one, scan all, remove (retain vs delete records)."
-    },
-    {
-      "id": "doctor-integration",
-      "title": "Doctor integration",
-      "description": "Promote Doctor from a ToolsOverlay to a full design-matching screen with structured checks, severity, technical details, suggested actions."
-    },
-    {
-      "id": "history-and-logs-integration",
-      "title": "History and Logs integration",
-      "description": "Give the in-memory OperationHistory a persisted backing store and build the History & Logs screen: inspection, filtering, export."
-    },
-    {
-      "id": "mount-preview",
-      "title": "Mount preview",
-      "description": "New Mount screen: destination preview, validation, collision handling, queueing, before any mount is executed."
-    },
-    {
-      "id": "mount-execution",
-      "title": "Mount execution",
-      "description": "Single-archive mount execution wired to the new Mount screen via the application-service foundation."
-    },
-    {
-      "id": "batch-mount-outcomes",
-      "title": "Batch mount outcomes",
-      "description": "Batch/mount-all execution with per-item outcomes, partial success reporting, and progress."
-    },
-    {
-      "id": "active-mounts-integration",
-      "title": "Active Mounts integration",
-      "description": "New Active Mounts screen: refresh, normal unmount, lazy unmount, cleanup, remount offer, stale-mount recovery."
-    },
-    {
-      "id": "normal-unmount",
-      "title": "Normal unmount",
-      "description": "Single and batch normal unmount wired into Active Mounts via the application-service foundation."
-    },
-    {
-      "id": "lazy-unmount",
-      "title": "Lazy unmount",
-      "description": "Lazy unmount workflow, including its existing progress-channel precedent, wired into Active Mounts."
-    },
-    {
-      "id": "stale-mount-recovery",
-      "title": "Stale mount recovery",
-      "description": "Cleanup and stale-mount recovery workflows surfaced in Active Mounts and Doctor."
-    },
-    {
-      "id": "progress-and-activity",
-      "title": "Progress and activity",
-      "description": "Shared ProgressEvent model and an Activity feed generalized from the existing OperationHistory panel."
-    },
-    {
-      "id": "structured-errors",
-      "title": "Structured errors",
-      "description": "Shared DisplayError model generalized from the existing ActionFeedback.more_information pattern."
-    },
-    {
-      "id": "notifications",
-      "title": "Notifications",
-      "description": "Toast/banner notification surface for background-operation completion, built on the progress/error models."
-    },
-    {
-      "id": "trusted-retroarch-source-workflow",
-      "title": "Trusted RetroArch source workflow",
-      "description": "GUI workflow for the fixed trusted cheat-source list: view, fetch (backgrounded), inspect, offline reuse."
-    },
-    {
-      "id": "catalogue-provenance",
-      "title": "Catalogue provenance",
-      "description": "Surface cheat-catalogue and cheat-source provenance/freshness/schema-version metadata in the GUI."
-    },
-    {
-      "id": "retroarch-profile-selection",
-      "title": "RetroArch profile selection",
-      "description": "GUI workflow for discovering and selecting a RetroArch profile for cheat setup."
-    },
-    {
-      "id": "cheat-preview",
-      "title": "Cheat preview",
-      "description": "GUI workflow for matching a selected archive against the cheat catalogue and previewing the install plan."
-    },
-    {
-      "id": "cheat-installation",
-      "title": "Cheat installation",
-      "description": "GUI workflow for executing a cheat install run, including replacement backups."
-    },
-    {
-      "id": "installation-history",
-      "title": "Installation history",
-      "description": "GUI workflow for inspecting cheat install/rollback journals and history."
-    },
-    {
-      "id": "rollback",
-      "title": "Rollback",
-      "description": "GUI workflow for executing a cheat rollback run from history."
-    },
-    {
-      "id": "settings-integration",
-      "title": "Settings integration",
-      "description": "New Settings screen limited to backend-supported configuration; prototype-only settings explicitly deferred."
-    },
-    {
-      "id": "about-and-support-information",
-      "title": "About and support information",
-      "description": "New About screen: version/build/licence/environment info from existing ConfigIdentity-style data; support-bundle export scoped down or deferred."
-    },
-    {
-      "id": "final-hardening",
-      "title": "Final hardening",
-      "description": "Cross-screen consistency pass, error-path review, and isolated acceptance testing."
-    },
-    {
-      "id": "release-readiness",
-      "title": "Release readiness",
-      "description": "Final validation, changelog/docs update, and release-checklist review."
-    }
-  ],
-  "features": [
-    {
-      "id": "ARCH-000",
-      "milestone": "integration-architecture",
-      "title": "Campaign initializer harness",
-      "description": "Create campaign plan, progress ledger, feature ledger, capability matrix, and preflight script; verify preconditions.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a (planning only)",
-      "relevant_modules": [
-        "docs/FABLE_CAMPAIGN_PLAN.md",
-        "docs/FABLE_PROGRESS.md",
-        "docs/FABLE_FEATURES.json",
-        "docs/GUI_BACKEND_CAPABILITY_MATRIX.md",
-        "scripts/fable-preflight.sh"
-      ],
-      "safety_constraints": [
-        "No production Rust source changed",
-        "design-reference/ left untouched and unstaged",
-        "No other worktree touched"
-      ],
-      "acceptance_steps": [
-        "Preconditions verified via git status/branch/HEAD/origin comparison",
-        "Five campaign files created",
-        "fable-preflight.sh passes",
-        "FABLE_FEATURES.json validates as JSON",
-        "Single commit made, not pushed"
-      ],
-      "required_tests": [],
-      "status": "complete",
-      "evidence": "This initializer commit itself; see docs/FABLE_PROGRESS.md 'Files and modules inspected'.",
-      "implementation_commit": null,
-      "notes": "Planning-only; no code capability implied."
-    },
-    {
-      "id": "GUI-ARCH-001",
-      "milestone": "gui-application-service-foundation",
-      "title": "Split archivefs-gui/src/main.rs into modules",
-      "description": "Mechanically extract the existing 25.4k-line main.rs into per-feature modules (library, sources, doctor, mount, history, retroarch, settings, about) with no behavioral change.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a \u2014 refactor of existing GUI code only",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "No behavioral change; pure code motion",
-        "cargo build -p archivefs-gui succeeds before and after with identical warnings"
-      ],
-      "acceptance_steps": [
-        "cargo build -p archivefs-gui succeeds",
-        "All existing archivefs-gui tests still pass unchanged",
-        "git diff shows only moved code, no logic edits"
-      ],
-      "required_tests": [
-        "existing archivefs-gui test suite (~347 #[test] fns) unchanged"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "GUI-ARCH-002",
-      "milestone": "gui-application-service-foundation",
-      "title": "Typed Command/CommandOutcome envelope",
-      "description": "Define a shared Command enum and CommandOutcome enum to replace the ~14 hand-rolled per-feature request/result type pairs identified in FABLE_CAMPAIGN_PLAN.md section 5.",
-      "design_screen": null,
-      "existing_backend_capability": "archivefs-core free functions already return typed Result<T, E> values suitable as CommandOutcome payloads",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (OperationRequest, AppOperationRequest, SourceAction, PlatformAction, LibraryViewAction)"
-      ],
-      "safety_constraints": [
-        "Additive only \u2014 existing workflows are not required to migrate in this feature"
-      ],
-      "acceptance_steps": [
-        "New Command/CommandOutcome types compile and are unit-testable independent of eframe",
-        "At least one new (not previously existing) workflow uses them end to end"
-      ],
-      "required_tests": [
-        "unit tests for Command -> CommandOutcome mapping"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "GUI-ARCH-003",
-      "milestone": "gui-application-service-foundation",
-      "title": "Shared spawn-and-poll worker plumbing",
-      "description": "Provide one reusable function/struct that spawns a thread for a Command and exposes an mpsc::Receiver<CommandOutcome>, replacing per-call-site mpsc::channel()+thread::spawn boilerplate for new workflows.",
-      "design_screen": null,
-      "existing_backend_capability": "std::thread + std::sync::mpsc pattern already proven at ~14 call sites in main.rs",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "No async runtime introduced",
-        "No new dependency added"
-      ],
-      "acceptance_steps": [
-        "New workflows built in Milestones 2-4 use this plumbing instead of hand-rolled channels"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "GUI-ARCH-004",
-      "milestone": "gui-application-service-foundation",
-      "title": "ProgressEvent model",
-      "description": "Define a closed ProgressEvent enum (started/substep/cleanup/finished) generalizing the existing single-purpose OperationProgress::CleanupStarted variant.",
-      "design_screen": null,
-      "existing_backend_capability": "Existing precedent: OperationProgress enum and mpsc::Sender<OperationProgress> argument in the mount/unmount worker closure (main.rs:4020)",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "Send-safe across thread::mpsc boundary",
-        "Workflows without meaningful progress may skip intermediate events"
-      ],
-      "acceptance_steps": [
-        "ProgressEvent is exercised by at least the Mount and RetroArch install workflows"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "LIBRARY-001",
-      "milestone": "library-integration",
-      "title": "Library listing and search parity check",
-      "description": "Verify existing Library MainView listing/search against the design's Library screen; extend query/highlight behavior only where a gap is found.",
-      "design_screen": "Library",
-      "existing_backend_capability": "ArchiveRecord, ArchiveRow, current_archive_records, library-list/library-find CLI precedent",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (MainView::Library)",
-        "crates/archivefs-core/src/lib.rs"
-      ],
-      "safety_constraints": [
-        "Read-only; must not alter source archives"
-      ],
-      "acceptance_steps": [
-        "Manual comparison against design-reference Library screen",
-        "Existing Library tests still pass"
-      ],
-      "required_tests": [
-        "existing ArchiveRow / Library filter tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "LIBRARY-002",
-      "milestone": "library-integration",
-      "title": "Library filters parity (platform, health, presence)",
-      "description": "Confirm LibraryRowFilters covers the design's filter chips (All Platforms, All Health, All Presence, etc.); add missing filter dimensions only if the design requires one not already present.",
-      "design_screen": "Library",
-      "existing_backend_capability": "LibraryRowFilters, HealthIssueFilter, classify_archive_health, catalogue_health_report",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (LibraryRowFilters)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Each design filter chip maps to an existing or newly-added LibraryRowFilters field"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "LIBRARY-003",
-      "milestone": "library-integration",
-      "title": "Manual platform assignment integration",
-      "description": "Confirm single and bulk manual platform assignment (PlatformAction, BulkPlatformActionKind) match the design's 'Detected Platform / Override' interaction.",
-      "design_screen": "Selected",
-      "existing_backend_capability": "PlatformProvenanceDetails, MANUAL_PLATFORM_SOURCE, library-set-platform[-bulk] CLI precedent",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (PlatformAction, RunningPlatformAction)"
-      ],
-      "safety_constraints": [
-        "Manual assignment must not silently overwrite automatic detection provenance without the existing confirmation flow"
-      ],
-      "acceptance_steps": [
-        "Existing platform-assignment tests pass; new design-parity check documented"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "LIBRARY-004",
-      "milestone": "library-integration",
-      "title": "Missing records and duplicates parity",
-      "description": "Confirm 'Remove Missing Records' and the Duplicates dashboard match the design's ARCHIVES / MISSING and DUPLICATE GROUP interactions.",
-      "design_screen": "Library",
-      "existing_backend_capability": "MissingArchiveRemovalResult, catalogue_filename_duplicates, CatalogueDuplicateReport",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (RunningMissingRemoval, MainView::Duplicates)"
-      ],
-      "safety_constraints": [
-        "Deletion of catalogue records must never delete underlying archive files"
-      ],
-      "acceptance_steps": [
-        "Existing duplicate-review tests pass"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "LIBRARY-005",
-      "milestone": "library-integration",
-      "title": "Library refresh wired to application-service",
-      "description": "Migrate the Library refresh/scan-triggered reload path onto the GUI-ARCH-002/003 command envelope.",
-      "design_screen": "Library",
-      "existing_backend_capability": "scan_source_folder_at, DatabaseState reload path",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (DatabaseState)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Refresh still produces identical DatabaseState transitions after migration"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "SOURCES-001",
-      "milestone": "sources-integration",
-      "title": "Sources listing and availability parity",
-      "description": "Confirm SourceFolderView-backed Sources screen matches the design's listing/availability/Last Scanned display.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "SourceFolderView, build_source_folder_views, classify_source_availability",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (MainView::Sources)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Manual comparison against design Sources screen"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "SOURCES-002",
-      "milestone": "sources-integration",
-      "title": "Add / enable / disable source parity",
-      "description": "Confirm add-source (native folder picker via rfd), enable/disable toggling match design's 'Add Source' and 'Enabled' interactions.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "add_source_folder_at, set_source_folder_enabled_at, validate_new_source_folder",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (SourcesAddDialogState, SourceAction)"
-      ],
-      "safety_constraints": [
-        "validate_new_source_folder's existing path-safety checks must remain the only gate; no new path validation invented in the GUI layer"
-      ],
-      "acceptance_steps": [
-        "Existing source-add/toggle tests pass"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "SOURCES-003",
-      "milestone": "sources-integration",
-      "title": "Scan one / scan all parity",
-      "description": "Confirm 'Scan Now' (single source) and a design-required 'scan all' affordance both map to scan_source_folder_at / scan_all_enabled_sources_at.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "scan_source_folder_at, scan_all_enabled_sources_at, ScanPersistSummary",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Scan-all triggers one ScanPersistSummary per enabled source, matching CLI 'sources' behavior"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "SOURCES-004",
-      "milestone": "sources-integration",
-      "title": "Remove source: retain vs delete records",
-      "description": "Confirm the design's 'Remove Source (Keep Records)' vs 'Remove Source and Records' map exactly to RemoveSourceFolderOutcome's two modes.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "remove_source_folder_at, RemoveSourceFolderOutcome",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (SourcesRemoveDialogState)"
-      ],
-      "safety_constraints": [
-        "Never delete underlying archive files, only catalogue records and/or the source-folder registration"
-      ],
-      "acceptance_steps": [
-        "Existing remove-source tests pass; both modes covered"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "DOCTOR-001",
-      "milestone": "doctor-integration",
-      "title": "Reconcile DoctorReport vs ConfigCheckReport/SetupDiagnostics",
-      "description": "Decide and implement whether the new Doctor screen surfaces a merged report or both report types clearly separated; document the decision.",
-      "design_screen": "Doctor",
-      "existing_backend_capability": "run_doctor[_default], run_config_check*, run_setup_diagnostics*",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs (DoctorReport, ConfigCheckReport, SetupDiagnostics)"
-      ],
-      "safety_constraints": [
-        "Read-only; Doctor checks must not mutate config or database as a side effect of running"
-      ],
-      "acceptance_steps": [
-        "Decision documented in FABLE_PROGRESS.md before UI work begins"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "DOCTOR-002",
-      "milestone": "doctor-integration",
-      "title": "Promote Doctor to a full MainView screen",
-      "description": "Move Doctor from ToolsOverlay::DoctorChecks to a first-class screen matching the design's severity/technical-details/suggested-action layout.",
-      "design_screen": "Doctor",
-      "existing_backend_capability": "DoctorCheck, DoctorStatus, run_doctor_read_only[_default]",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (MainView, ToolsOverlay::DoctorChecks)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "'Run All Checks (F5)' and 'Retry Where Safe' interactions map to existing run_doctor* entry points"
-      ],
-      "required_tests": [
-        "existing DoctorChecks overlay tests adapted, not deleted"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "DOCTOR-003",
-      "milestone": "doctor-integration",
-      "title": "Database and mount diagnostics coverage",
-      "description": "Confirm DatabaseHealthReport and mount-related Doctor checks are represented as distinct, filterable check categories in the new screen.",
-      "design_screen": "Doctor",
-      "existing_backend_capability": "check_database_health, DatabaseHealthReport, DatabaseDiagnostic",
-      "relevant_modules": [
-        "crates/archivefs-core/src/database.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Each DoctorCheck / DatabaseDiagnostic surfaces its severity and suggested action verbatim"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "DOCTOR-004",
-      "milestone": "doctor-integration",
-      "title": "RetroArch diagnostics coverage",
-      "description": "Confirm RetroArch profile/environment diagnostics (retroarch-environment CLI precedent) are exposed as Doctor checks, not only as a separate RetroArch screen concern.",
-      "design_screen": "Doctor",
-      "existing_backend_capability": "emulator_environment::retroarch, retroarch-environment CLI command",
-      "relevant_modules": [
-        "crates/archivefs-core/src/emulator_environment/retroarch.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "At least one RetroArch-environment check appears in the Doctor screen's check list"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "HISTORY-001",
-      "milestone": "history-and-logs-integration",
-      "title": "Decide operation-history persistence approach",
-      "description": "Resolve the open question in FABLE_PROGRESS.md: persist OperationHistory to a GUI-local JSON log file (default lean) vs. a new archivefs-core module.",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "OperationHistory (GUI-local, in-memory only today)",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (OperationHistory)"
-      ],
-      "safety_constraints": [
-        "Log file writes must be additive/append-only and never block the UI thread synchronously for large logs"
-      ],
-      "acceptance_steps": [
-        "Decision documented before HISTORY-002 begins"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "HISTORY-002",
-      "milestone": "history-and-logs-integration",
-      "title": "History & Logs screen",
-      "description": "Build the new screen: RECENT OPERATIONS list, filtering by operation/date/result, 'Clear Logs', 'Export Log'/'Export Current Logs'.",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "HistoryEntry, ActivityAction, ActivityOutcome, OperationHistory::{record,clear,remove}",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "'Clear Logs' must only clear the persisted log, never any underlying operation records (mount state, catalogue, journals)"
-      ],
-      "acceptance_steps": [
-        "Existing OperationHistory tests extended, not duplicated"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "HISTORY-003",
-      "milestone": "history-and-logs-integration",
-      "title": "RetroArch journal history surfaced in History & Logs",
-      "description": "Cross-link cheat_history::discover_cheat_history entries into the general History & Logs view (or clearly document why they remain a separate RetroArch-only history).",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "discover_cheat_history, CheatHistoryReport, CheatHistoryEntry",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_history.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Decision (merged vs separate) documented"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-PREVIEW-001",
-      "milestone": "mount-preview",
-      "title": "Mount screen: destination preview",
-      "description": "New Mount screen showing MOUNT DESTINATION / PLANNED DESTINATION and MOUNT COMMAND preview before execution, per design's 'Mount' screen.",
-      "design_screen": "Mount",
-      "existing_backend_capability": "MountPlan, plan_mounts, safe_mount_name",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs (MountPlan, plan_mounts)",
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "Preview must never itself perform a mount"
-      ],
-      "acceptance_steps": [
-        "Mount screen shows a MountPlan-derived preview matching the design's MOUNT COMMAND panel"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-PREVIEW-002",
-      "milestone": "mount-preview",
-      "title": "Mount queue (Add to Mount Queue / Add to Queue)",
-      "description": "Implement the design's queueing interaction (select multiple archives, review before committing to Mount Selected).",
-      "design_screen": "Mount",
-      "existing_backend_capability": "MountAllItem, existing 'Mount Selected (Ctrl+M)' batch selection precedent",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (MountAllItem, MountAllConfirmation)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Queue add/remove does not trigger any mount call until explicit confirmation"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-PREVIEW-003",
-      "milestone": "mount-preview",
-      "title": "Destination collision handling in preview",
-      "description": "Surface MountBatchTargetValidation/MountBatchTargetSkipReason in the preview UI before mount execution, matching design collision-handling intent.",
-      "design_screen": "Mount",
-      "existing_backend_capability": "MountBatchTargetValidation, MountBatchTargetSkipReason",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Every MountBatchTargetSkipReason variant has a corresponding preview message"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-001",
-      "milestone": "mount-execution",
-      "title": "Single mount execution via application-service",
-      "description": "Wire 'Mount Selected' single-item execution through the GUI-ARCH command envelope, replacing the ad-hoc per-call-site channel where practical.",
-      "design_screen": "Mount",
-      "existing_backend_capability": "mount_one_archive_with_backend, RatarmountBackend",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs",
-        "crates/archivefs-gui/src/main.rs (ArchiveAction::Mount)"
-      ],
-      "safety_constraints": [
-        "Never mount without going through MountBackend; never bypass existing collision/validation checks"
-      ],
-      "acceptance_steps": [
-        "Existing single-mount tests pass after migration"
-      ],
-      "required_tests": [
-        "existing mount_one_archive_with_backend tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-002",
-      "milestone": "mount-execution",
-      "title": "Mount-with-read-only toggle parity",
-      "description": "Confirm the design's 'Mount read-only' checkbox maps to an existing or newly-needed MountPlan/backend option; document if unsupported.",
-      "design_screen": "Mount",
-      "existing_backend_capability": "MountPlan, RatarmountBackend",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Either confirmed supported end-to-end, or documented as intentionally unsupported in GUI_BACKEND_CAPABILITY_MATRIX.md"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-BATCH-001",
-      "milestone": "batch-mount-outcomes",
-      "title": "Batch mount execution with per-item outcomes",
-      "description": "Wire MountAllResult/MountAllFailure/MountAllSkipped reporting into the new Mount screen with partial-success presentation matching design intent.",
-      "design_screen": "Mount",
-      "existing_backend_capability": "MountAllResult, MountBatchTargetValidation, mount_archives_with_backend",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (RunningMountAll, MountAllEvent, MountAllProgress)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Existing batch-mount tests pass after any migration to the new command envelope"
-      ],
-      "required_tests": [
-        "existing MountAllResult tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-BATCH-002",
-      "milestone": "batch-mount-outcomes",
-      "title": "Batch mount progress reporting",
-      "description": "Extend MountAllProgress to use the shared ProgressEvent model (GUI-ARCH-004) instead of its bespoke progress type.",
-      "design_screen": "Mount",
-      "existing_backend_capability": "MountAllProgress, MountAllEvent",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Progress bar during batch mount still updates per-item"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "ACTIVE-MOUNTS-001",
-      "milestone": "active-mounts-integration",
-      "title": "Active Mounts screen: listing and refresh",
-      "description": "New Active Mounts screen listing currently-mounted archives (filtered from current_archive_records / current_statuses) with a Refresh action.",
-      "design_screen": "Active Mounts",
-      "existing_backend_capability": "current_statuses, ArchiveStatus, MountState::Mounted filter (existing precedent at multiple main.rs call sites)",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs",
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "No direct 'list active mounts' core API exists yet \u2014 reuse the existing filter-over-all-records pattern rather than inventing a new core query prematurely"
-      ],
-      "acceptance_steps": [
-        "Screen lists exactly the archives with MountState::Mounted"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "ACTIVE-MOUNTS-002",
-      "milestone": "active-mounts-integration",
-      "title": "Remount offer",
-      "description": "Implement the design's 'Remount' action using remount_one_archive_path.",
-      "design_screen": "Active Mounts",
-      "existing_backend_capability": "remount_one_archive_path",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Remount only offered for archives whose mount state indicates a valid remount target"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "UNMOUNT-001",
-      "milestone": "normal-unmount",
-      "title": "Single normal unmount via application-service",
-      "description": "Wire the design's Active Mounts 'Unmount' action through unmount_one_archive_with_backend and the new command envelope.",
-      "design_screen": "Active Mounts",
-      "existing_backend_capability": "unmount_one_archive_with_backend",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs",
-        "crates/archivefs-gui/src/main.rs (ArchiveAction::Unmount)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Existing single-unmount tests pass after migration"
-      ],
-      "required_tests": [
-        "existing unmount_one_archive_with_backend tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "UNMOUNT-002",
-      "milestone": "normal-unmount",
-      "title": "Batch normal unmount",
-      "description": "Wire UnmountAllResult/UnmountAllFailure reporting into Active Mounts with partial-success presentation.",
-      "design_screen": "Active Mounts",
-      "existing_backend_capability": "UnmountAllResult, unmount_archives_with_backend",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (RunningUnmountAll, UnmountAllEvent)"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Existing batch-unmount tests pass"
-      ],
-      "required_tests": [
-        "existing UnmountAllResult tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "UNMOUNT-LAZY-001",
-      "milestone": "lazy-unmount",
-      "title": "Lazy unmount workflow in Active Mounts",
-      "description": "Wire the design's 'Lazy Unmount' action through lazy_unmount_one_archive_path_with_progress, preserving its existing progress-channel behavior.",
-      "design_screen": "Active Mounts",
-      "existing_backend_capability": "lazy_unmount_one_archive_path_with_progress, LazyUnmountResult, LazyUnmountCleanupResult",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs",
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [
-        "Lazy unmount's existing progress-sender pattern (main.rs:4020) is the precedent for GUI-ARCH-004's ProgressEvent \u2014 generalize, do not discard"
-      ],
-      "acceptance_steps": [
-        "Existing lazy-unmount tests pass"
-      ],
-      "required_tests": [
-        "existing lazy_unmount tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "MOUNT-RECOVERY-001",
-      "milestone": "stale-mount-recovery",
-      "title": "Cleanup and stale-mount recovery in Active Mounts",
-      "description": "Surface cleanup_selected_mount_dir/cleanup_selected_mount_tree/clean_mount_root as the design's 'Cleanup'/'Retry Where Safe' actions.",
-      "design_screen": "Active Mounts",
-      "existing_backend_capability": "cleanup_selected_mount_dir, cleanup_selected_mount_tree, clean_mount_root, CleanupOutcome",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs",
-        "crates/archivefs-gui/src/main.rs (CleanupOutcome)"
-      ],
-      "safety_constraints": [
-        "Cleanup must only ever remove empty/stale mount-point directories, never archive or catalogue data"
-      ],
-      "acceptance_steps": [
-        "Existing cleanup tests pass"
-      ],
-      "required_tests": [
-        "existing cleanup_* tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "PROGRESS-001",
-      "milestone": "progress-and-activity",
-      "title": "Unified Activity feed",
-      "description": "Generalize the existing Activity panel (show_activity_panel) to consume the shared ProgressEvent/OperationHistory across all screens, not just mount/unmount.",
-      "design_screen": null,
-      "existing_backend_capability": "show_activity_panel, ActivityPanelAction, OperationHistory",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Every new workflow (Mount, RetroArch, Sources) reports into the same Activity feed"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "ERRORS-001",
-      "milestone": "structured-errors",
-      "title": "Shared DisplayError model",
-      "description": "Generalize ActionFeedback.more_information into a reusable DisplayError { message, more_information } used by every new workflow's failure path.",
-      "design_screen": null,
-      "existing_backend_capability": "ActionFeedback (existing precedent, main.rs:4867), ArchiveFsError and domain error enums (PatchManagerError, CheatSourceError, DestinationSafetyError)",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs (ActionFeedback)"
-      ],
-      "safety_constraints": [
-        "Underlying core Result/error types remain the source of truth; DisplayError is a presentation-only mapping"
-      ],
-      "acceptance_steps": [
-        "Every new workflow's failure path renders via DisplayError"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "NOTIFY-001",
-      "milestone": "notifications",
-      "title": "Background-operation completion notifications",
-      "description": "Add a toast/banner surface for background command completion (success/failure), built on ProgressEvent/DisplayError.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a \u2014 new GUI-only presentation layer over existing result types",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Notifications appear for at least Mount, Unmount, and RetroArch install completion"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-SOURCE-001",
-      "milestone": "trusted-retroarch-source-workflow",
-      "title": "Trusted source list screen",
-      "description": "GUI listing of trusted_retroarch_cheat_sources() \u2014 the fixed, code-defined list only; no free-text URL entry.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "trusted_retroarch_cheat_sources, list_retroarch_cheat_sources",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
-      ],
-      "safety_constraints": [
-        "Must not introduce a second trust boundary (no user-supplied URL field)"
-      ],
-      "acceptance_steps": [
-        "GUI list matches trusted_retroarch_cheat_sources() output exactly"
-      ],
-      "required_tests": [
-        "existing cheat_sources tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-SOURCE-002",
-      "milestone": "trusted-retroarch-source-workflow",
-      "title": "Backgrounded fetch",
-      "description": "Wire fetch_retroarch_cheat_source through a background thread (GUI-ARCH-003) since it performs blocking ureq HTTP I/O \u2014 must never run on the UI thread.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "fetch_retroarch_cheat_source, HttpsCheatSourceTransport, CheatSourceFetchResult",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
-      ],
-      "safety_constraints": [
-        "Blocking network call must run off the UI thread; enforce via code review, not just testing"
-      ],
-      "acceptance_steps": [
-        "Fetch does not freeze the UI during a live network call (manual test)"
-      ],
-      "required_tests": [
-        "existing fetch_retroarch_cheat_source tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-SOURCE-003",
-      "milestone": "trusted-retroarch-source-workflow",
-      "title": "Inspect and offline reuse",
-      "description": "GUI action for inspect_retroarch_cheat_source[_snapshot] allowing offline reuse of a previously-fetched source without re-fetching.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "inspect_retroarch_cheat_source, inspect_retroarch_cheat_source_snapshot, CheatSourceFreshness",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Offline inspect works with no network access (manual test)"
-      ],
-      "required_tests": [
-        "existing inspect_retroarch_cheat_source tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-PROVENANCE-001",
-      "milestone": "catalogue-provenance",
-      "title": "Catalogue and source provenance display",
-      "description": "Surface CheatCatalogueSnapshot / CheatSourceCacheMetadata provenance, schema version, and freshness fields in the GUI wherever catalogue data is shown.",
-      "design_screen": "Sources",
-      "existing_backend_capability": "load_cheat_catalogue_snapshot, CheatCatalogueSnapshot, CheatSourceCacheMetadata, CHEAT_CATALOGUE_FORMAT_VERSION",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_catalogue.rs",
-        "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
-      ],
-      "safety_constraints": [
-        "Never alter or strip provenance metadata; display verbatim"
-      ],
-      "acceptance_steps": [
-        "Provenance fields visible next to any cheat catalogue data in the GUI"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-PROFILE-001",
-      "milestone": "retroarch-profile-selection",
-      "title": "Profile discovery screen",
-      "description": "GUI listing of discover_retroarch_cheat_setup_profiles() results ('Discovered Profiles', 'Rescan Profiles').",
-      "design_screen": "Selected",
-      "existing_backend_capability": "discover_retroarch_cheat_setup_profiles, RetroArchCheatSetupProfile, RetroArchCheatSetupProfileState",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/retroarch_cheat_setup.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Rescan re-runs discovery and updates the list without restarting the app"
-      ],
-      "required_tests": [
-        "existing retroarch_cheat_setup discovery tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-PROFILE-002",
-      "milestone": "retroarch-profile-selection",
-      "title": "Profile selection with blocker surfacing",
-      "description": "GUI selection of a profile via resolve_retroarch_cheat_setup_profile, surfacing RetroArchCheatSetupProfileBlocker reasons when a profile cannot be used.",
-      "design_screen": "Selected",
-      "existing_backend_capability": "resolve_retroarch_cheat_setup_profile, RetroArchCheatSetupProfileBlocker",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/retroarch_cheat_setup.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Every RetroArchCheatSetupProfileBlocker variant has a corresponding user-facing message"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-PREVIEW-001",
-      "milestone": "cheat-preview",
-      "title": "Cheat match and availability preview",
-      "description": "GUI workflow matching a selected archive against the cheat catalogue (match_cheat_game_record) and showing build_cheat_availability_report / confidence.",
-      "design_screen": "Selected",
-      "existing_backend_capability": "match_cheat_game_record, build_cheat_availability_report, CheatMatchConfidence",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_catalogue.rs"
-      ],
-      "safety_constraints": [
-        "Preview must not write any files"
-      ],
-      "acceptance_steps": [
-        "Confidence levels shown match CheatMatchConfidence exactly"
-      ],
-      "required_tests": [
-        "existing cheat_catalogue matching tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-PREVIEW-002",
-      "milestone": "cheat-preview",
-      "title": "Install plan preview",
-      "description": "GUI display of build_retroarch_cheat_setup_plan()'s RetroArchCheatSetupPlan / RetroArchCheatSetupPreviewSummary before install, matching design's PLANNED ACTION / PLANNED DESTINATION labels.",
-      "design_screen": "Selected",
-      "existing_backend_capability": "build_retroarch_cheat_setup_plan, RetroArchCheatSetupPlan, RetroArchCheatSetupPreviewSummary",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/retroarch_cheat_setup.rs"
-      ],
-      "safety_constraints": [
-        "Preview must not execute any install action"
-      ],
-      "acceptance_steps": [
-        "Preview PLANNED ACTION list matches plan.planned_entries exactly"
-      ],
-      "required_tests": [
-        "existing build_retroarch_cheat_setup_plan tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-INSTALL-001",
-      "milestone": "cheat-installation",
-      "title": "Cheat install execution",
-      "description": "GUI action executing execute_cheat_install_run via the application-service command envelope, backgrounded like all other write operations.",
-      "design_screen": "Selected",
-      "existing_backend_capability": "execute_cheat_install_run, CheatInstallOptions, CheatInstallRunOutcome",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_installer.rs"
-      ],
-      "safety_constraints": [
-        "Must go through destination_safety::assess_destination / construct_safe_destination exactly as the CLI does \u2014 no GUI-side shortcut"
-      ],
-      "acceptance_steps": [
-        "Existing cheat_installer tests pass; GUI install produces an identical CheatInstallRun to the CLI for the same inputs"
-      ],
-      "required_tests": [
-        "existing cheat_installer tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-INSTALL-002",
-      "milestone": "cheat-installation",
-      "title": "Replacement backup confirmation",
-      "description": "Surface CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME backup creation in the GUI's install confirmation/result screen.",
-      "design_screen": "Selected",
-      "existing_backend_capability": "CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, PreviousDestinationState",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_installer.rs",
-        "crates/archivefs-core/src/patch_manager/cheat_install_result.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Backup path shown to the user when a replacement occurs"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-HISTORY-001",
-      "milestone": "installation-history",
-      "title": "Cheat install/rollback history screen",
-      "description": "GUI listing of discover_cheat_history() entries, matching the design's history/journal inspection intent for RetroArch operations.",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "discover_cheat_history, CheatHistoryReport, CheatHistoryEntry, CheatHistoryOptions",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_history.rs"
-      ],
-      "safety_constraints": [
-        "Read-only inspection; must not modify journal files"
-      ],
-      "acceptance_steps": [
-        "Existing cheat_history tests pass"
-      ],
-      "required_tests": [
-        "existing cheat_history tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-HISTORY-002",
-      "milestone": "installation-history",
-      "title": "Journal inspection detail view",
-      "description": "GUI detail view for inspect_cheat_install_journal(), surfacing CheatJournalInspection / CheatDestinationAssessment / CheatBackupAssessment.",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "inspect_cheat_install_journal, CheatJournalInspection, CheatDestinationAssessment, CheatBackupAssessment",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_history.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Every CheatJournalInspectionError variant maps to a user-facing message"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-ROLLBACK-001",
-      "milestone": "rollback",
-      "title": "Cheat rollback execution",
-      "description": "GUI action executing execute_cheat_rollback_run from a selected history entry, gated by CheatRollbackAvailability.",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "execute_cheat_rollback_run, CheatRollbackOptions, CheatRollbackAvailability, CheatRollbackRunOutcome",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_rollback.rs",
-        "crates/archivefs-core/src/patch_manager/cheat_history.rs"
-      ],
-      "safety_constraints": [
-        "Rollback must only be offered when CheatRollbackAvailability indicates it is safe"
-      ],
-      "acceptance_steps": [
-        "Existing cheat_rollback tests pass"
-      ],
-      "required_tests": [
-        "existing cheat_rollback tests"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RA-CHEAT-ROLLBACK-002",
-      "milestone": "rollback",
-      "title": "Post-rollback guidance",
-      "description": "Display CheatRollbackSummary / CheatRollbackRunStatus outcome with the design's post-install/post-rollback guidance messaging.",
-      "design_screen": "History & Logs",
-      "existing_backend_capability": "CheatRollbackSummary, CheatRollbackRunStatus, CheatRollbackEntryResult",
-      "relevant_modules": [
-        "crates/archivefs-core/src/patch_manager/cheat_rollback_result.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Every CheatRollbackRunStatus variant has distinct, correct guidance text"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "SETTINGS-001",
-      "milestone": "settings-integration",
-      "title": "Backend-supported settings screen",
-      "description": "New Settings screen limited to what archivefs-core actually persists: source folder configs, mount root, config path (Config, default_config_path).",
-      "design_screen": "Settings",
-      "existing_backend_capability": "Config, parse_config, default_config_path, save_source_folder_configs_to",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs"
-      ],
-      "safety_constraints": [
-        "Must not fabricate settings with no backing store"
-      ],
-      "acceptance_steps": [
-        "Every control in the Settings screen maps to a real, persisted Config field"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "SETTINGS-002",
-      "milestone": "settings-integration",
-      "title": "Prototype-only settings deferred",
-      "description": "Explicitly mark design-only settings (e.g. 'Comfortable/Compact' density, 'Reset All Settings') as deferred/unsupported in GUI_BACKEND_CAPABILITY_MATRIX.md rather than fabricating backend state for them.",
-      "design_screen": "Settings",
-      "existing_backend_capability": "n/a \u2014 explicitly unsupported",
-      "relevant_modules": [],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "GUI_BACKEND_CAPABILITY_MATRIX.md lists each deferred setting under 'intentionally unsupported'"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "ABOUT-001",
-      "milestone": "about-and-support-information",
-      "title": "About screen: build and environment info",
-      "description": "New About screen showing version/build/licence/OS/desktop-environment info from existing ConfigIdentity-style data and Cargo package metadata.",
-      "design_screen": "About",
-      "existing_backend_capability": "ConfigIdentity, command_available, workspace.package.version",
-      "relevant_modules": [
-        "crates/archivefs-core/src/lib.rs",
-        "Cargo.toml"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Version shown matches workspace.package.version exactly"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "ABOUT-002",
-      "milestone": "about-and-support-information",
-      "title": "Support bundle export scoped down",
-      "description": "Document that 'Export Support Bundle'/'Check for Updates' have no backend today (per FABLE_CAMPAIGN_PLAN.md section 16); scope a minimal version (e.g. copy Doctor report + config summary) or defer entirely.",
-      "design_screen": "About",
-      "existing_backend_capability": "n/a \u2014 no existing backend for update-check or bundling",
-      "relevant_modules": [],
-      "safety_constraints": [
-        "Must not perform any network call for 'Check for Updates' unless a future milestone explicitly adds one"
-      ],
-      "acceptance_steps": [
-        "Decision (minimal implementation vs. deferred) documented before ABOUT-001 UI ships a button for it"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "HARDEN-001",
-      "milestone": "final-hardening",
-      "title": "Cross-screen consistency pass",
-      "description": "Review all new screens for consistent error presentation (ERRORS-001), consistent progress presentation (PROGRESS-001), and consistent navigation with MainView/ToolsOverlay conventions.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a \u2014 review task",
-      "relevant_modules": [
-        "crates/archivefs-gui/src/main.rs"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "No screen bypasses the shared DisplayError/ProgressEvent/Command models introduced in Milestone 1"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "HARDEN-002",
-      "milestone": "final-hardening",
-      "title": "Isolated acceptance testing",
-      "description": "Run full workspace validation (fmt, clippy, test) and manual acceptance against design-reference for every screen.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a \u2014 validation task",
-      "relevant_modules": [],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "cargo fmt --all -- --check",
-        "cargo clippy --workspace --all-targets -- -D warnings",
-        "cargo test --workspace all pass"
-      ],
-      "required_tests": [
-        "full workspace test suite"
-      ],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RELEASE-001",
-      "milestone": "release-readiness",
-      "title": "Release checklist review",
-      "description": "Update docs/release-checklist.md and docs/roadmap.md to reflect the completed Fable integration; confirm no campaign-only artifacts (fable-preflight.sh assumptions) leak into release requirements.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a \u2014 documentation task",
-      "relevant_modules": [
-        "docs/release-checklist.md",
-        "docs/roadmap.md"
-      ],
-      "safety_constraints": [],
-      "acceptance_steps": [
-        "Release checklist accurately reflects shipped GUI screens"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    },
-    {
-      "id": "RELEASE-002",
-      "milestone": "release-readiness",
-      "title": "Performance review",
-      "description": "Confirm no new screen introduces a UI-thread-blocking call (especially RetroArch fetch and mount/unmount), per the concurrency risks in FABLE_CAMPAIGN_PLAN.md section 20.",
-      "design_screen": null,
-      "existing_backend_capability": "n/a \u2014 review task",
-      "relevant_modules": [],
-      "safety_constraints": [
-        "No synchronous I/O call reachable from the UI thread"
-      ],
-      "acceptance_steps": [
-        "Manual review of every thread::spawn/direct-call site added during the campaign"
-      ],
-      "required_tests": [],
-      "status": "not_started",
-      "evidence": "",
-      "implementation_commit": null,
-      "notes": ""
-    }
-  ]
+ "schema_version": "1.0.0",
+ "campaign_base_commit": "fd0b4b143d64d9f8d681054eb60e8b4b8a41edd6",
+ "generated_at": "2026-07-22T03:04:40Z",
+ "milestones": [
+  {
+   "id": "integration-architecture",
+   "title": "Integration architecture",
+   "description": "Initializer harness, campaign docs, and architecture plan. No production code changes."
+  },
+  {
+   "id": "gui-application-service-foundation",
+   "title": "GUI application-service foundation",
+   "description": "Typed command/result/progress envelope, shared background-worker plumbing, and the mechanical archivefs-gui/src/main.rs module split."
+  },
+  {
+   "id": "library-integration",
+   "title": "Library integration",
+   "description": "Extend the existing Library screen to match design intent: listing, search, filters, selection, inspection, manual platform assignment, missing records, duplicates, refresh."
+  },
+  {
+   "id": "sources-integration",
+   "title": "Sources integration",
+   "description": "Extend the existing Sources screen: listing, availability, add, enable/disable, scan one, scan all, remove (retain vs delete records)."
+  },
+  {
+   "id": "doctor-integration",
+   "title": "Doctor integration",
+   "description": "Promote Doctor from a ToolsOverlay to a full design-matching screen with structured checks, severity, technical details, suggested actions."
+  },
+  {
+   "id": "history-and-logs-integration",
+   "title": "History and Logs integration",
+   "description": "Give the in-memory OperationHistory a persisted backing store and build the History & Logs screen: inspection, filtering, export."
+  },
+  {
+   "id": "mount-preview",
+   "title": "Mount preview",
+   "description": "New Mount screen: destination preview, validation, collision handling, queueing, before any mount is executed."
+  },
+  {
+   "id": "mount-execution",
+   "title": "Mount execution",
+   "description": "Single-archive mount execution wired to the new Mount screen via the application-service foundation."
+  },
+  {
+   "id": "batch-mount-outcomes",
+   "title": "Batch mount outcomes",
+   "description": "Batch/mount-all execution with per-item outcomes, partial success reporting, and progress."
+  },
+  {
+   "id": "active-mounts-integration",
+   "title": "Active Mounts integration",
+   "description": "New Active Mounts screen: refresh, normal unmount, lazy unmount, cleanup, remount offer, stale-mount recovery."
+  },
+  {
+   "id": "normal-unmount",
+   "title": "Normal unmount",
+   "description": "Single and batch normal unmount wired into Active Mounts via the application-service foundation."
+  },
+  {
+   "id": "lazy-unmount",
+   "title": "Lazy unmount",
+   "description": "Lazy unmount workflow, including its existing progress-channel precedent, wired into Active Mounts."
+  },
+  {
+   "id": "stale-mount-recovery",
+   "title": "Stale mount recovery",
+   "description": "Cleanup and stale-mount recovery workflows surfaced in Active Mounts and Doctor."
+  },
+  {
+   "id": "progress-and-activity",
+   "title": "Progress and activity",
+   "description": "Shared ProgressEvent model and an Activity feed generalized from the existing OperationHistory panel."
+  },
+  {
+   "id": "structured-errors",
+   "title": "Structured errors",
+   "description": "Shared DisplayError model generalized from the existing ActionFeedback.more_information pattern."
+  },
+  {
+   "id": "notifications",
+   "title": "Notifications",
+   "description": "Toast/banner notification surface for background-operation completion, built on the progress/error models."
+  },
+  {
+   "id": "trusted-retroarch-source-workflow",
+   "title": "Trusted RetroArch source workflow",
+   "description": "GUI workflow for the fixed trusted cheat-source list: view, fetch (backgrounded), inspect, offline reuse."
+  },
+  {
+   "id": "catalogue-provenance",
+   "title": "Catalogue provenance",
+   "description": "Surface cheat-catalogue and cheat-source provenance/freshness/schema-version metadata in the GUI."
+  },
+  {
+   "id": "retroarch-profile-selection",
+   "title": "RetroArch profile selection",
+   "description": "GUI workflow for discovering and selecting a RetroArch profile for cheat setup."
+  },
+  {
+   "id": "cheat-preview",
+   "title": "Cheat preview",
+   "description": "GUI workflow for matching a selected archive against the cheat catalogue and previewing the install plan."
+  },
+  {
+   "id": "cheat-installation",
+   "title": "Cheat installation",
+   "description": "GUI workflow for executing a cheat install run, including replacement backups."
+  },
+  {
+   "id": "installation-history",
+   "title": "Installation history",
+   "description": "GUI workflow for inspecting cheat install/rollback journals and history."
+  },
+  {
+   "id": "rollback",
+   "title": "Rollback",
+   "description": "GUI workflow for executing a cheat rollback run from history."
+  },
+  {
+   "id": "settings-integration",
+   "title": "Settings integration",
+   "description": "New Settings screen limited to backend-supported configuration; prototype-only settings explicitly deferred."
+  },
+  {
+   "id": "about-and-support-information",
+   "title": "About and support information",
+   "description": "New About screen: version/build/licence/environment info from existing ConfigIdentity-style data; support-bundle export scoped down or deferred."
+  },
+  {
+   "id": "final-hardening",
+   "title": "Final hardening",
+   "description": "Cross-screen consistency pass, error-path review, and isolated acceptance testing."
+  },
+  {
+   "id": "release-readiness",
+   "title": "Release readiness",
+   "description": "Final validation, changelog/docs update, and release-checklist review."
+  }
+ ],
+ "features": [
+  {
+   "id": "ARCH-000",
+   "milestone": "integration-architecture",
+   "title": "Campaign initializer harness",
+   "description": "Create campaign plan, progress ledger, feature ledger, capability matrix, and preflight script; verify preconditions.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a (planning only)",
+   "relevant_modules": [
+    "docs/FABLE_CAMPAIGN_PLAN.md",
+    "docs/FABLE_PROGRESS.md",
+    "docs/FABLE_FEATURES.json",
+    "docs/GUI_BACKEND_CAPABILITY_MATRIX.md",
+    "scripts/fable-preflight.sh"
+   ],
+   "safety_constraints": [
+    "No production Rust source changed",
+    "design-reference/ left untouched and unstaged",
+    "No other worktree touched"
+   ],
+   "acceptance_steps": [
+    "Preconditions verified via git status/branch/HEAD/origin comparison",
+    "Five campaign files created",
+    "fable-preflight.sh passes",
+    "FABLE_FEATURES.json validates as JSON",
+    "Single commit made, not pushed"
+   ],
+   "required_tests": [],
+   "status": "complete",
+   "evidence": "This initializer commit itself; see docs/FABLE_PROGRESS.md 'Files and modules inspected'.",
+   "implementation_commit": null,
+   "notes": "Planning-only; no code capability implied."
+  },
+  {
+   "id": "GUI-ARCH-001",
+   "milestone": "gui-application-service-foundation",
+   "title": "Split archivefs-gui/src/main.rs into modules",
+   "description": "Mechanically extract the existing 25.4k-line main.rs into per-feature modules (library, sources, doctor, mount, history, retroarch, settings, about) with no behavioral change.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a \u2014 refactor of existing GUI code only",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "No behavioral change; pure code motion",
+    "cargo build -p archivefs-gui succeeds before and after with identical warnings"
+   ],
+   "acceptance_steps": [
+    "cargo build -p archivefs-gui succeeds",
+    "All existing archivefs-gui tests still pass unchanged",
+    "git diff shows only moved code, no logic edits"
+   ],
+   "required_tests": [
+    "existing archivefs-gui test suite (~347 #[test] fns) unchanged"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "GUI-ARCH-002",
+   "milestone": "gui-application-service-foundation",
+   "title": "Typed Command/CommandOutcome envelope",
+   "description": "Define a shared Command enum and CommandOutcome enum to replace the ~14 hand-rolled per-feature request/result type pairs identified in FABLE_CAMPAIGN_PLAN.md section 5.",
+   "design_screen": null,
+   "existing_backend_capability": "archivefs-core free functions already return typed Result<T, E> values suitable as CommandOutcome payloads",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (OperationRequest, AppOperationRequest, SourceAction, PlatformAction, LibraryViewAction)"
+   ],
+   "safety_constraints": [
+    "Additive only \u2014 existing workflows are not required to migrate in this feature"
+   ],
+   "acceptance_steps": [
+    "New Command/CommandOutcome types compile and are unit-testable independent of eframe",
+    "At least one new (not previously existing) workflow uses them end to end"
+   ],
+   "required_tests": [
+    "unit tests for Command -> CommandOutcome mapping"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "GUI-ARCH-003",
+   "milestone": "gui-application-service-foundation",
+   "title": "Shared spawn-and-poll worker plumbing",
+   "description": "Provide one reusable function/struct that spawns a thread for a Command and exposes an mpsc::Receiver<CommandOutcome>, replacing per-call-site mpsc::channel()+thread::spawn boilerplate for new workflows.",
+   "design_screen": null,
+   "existing_backend_capability": "std::thread + std::sync::mpsc pattern already proven at ~14 call sites in main.rs",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "No async runtime introduced",
+    "No new dependency added"
+   ],
+   "acceptance_steps": [
+    "New workflows built in Milestones 2-4 use this plumbing instead of hand-rolled channels"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "GUI-ARCH-004",
+   "milestone": "gui-application-service-foundation",
+   "title": "ProgressEvent model",
+   "description": "Define a closed ProgressEvent enum (started/substep/cleanup/finished) generalizing the existing single-purpose OperationProgress::CleanupStarted variant.",
+   "design_screen": null,
+   "existing_backend_capability": "Existing precedent: OperationProgress enum and mpsc::Sender<OperationProgress> argument in the mount/unmount worker closure (main.rs:4020)",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "Send-safe across thread::mpsc boundary",
+    "Workflows without meaningful progress may skip intermediate events"
+   ],
+   "acceptance_steps": [
+    "ProgressEvent is exercised by at least the Mount and RetroArch install workflows"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "LIBRARY-001",
+   "milestone": "library-integration",
+   "title": "Library listing and search parity check",
+   "description": "Verify existing Library MainView listing/search against the design's Library screen; extend query/highlight behavior only where a gap is found.",
+   "design_screen": "Library",
+   "existing_backend_capability": "ArchiveRecord, ArchiveRow, current_archive_records, library-list/library-find CLI precedent",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (MainView::Library)",
+    "crates/archivefs-core/src/lib.rs"
+   ],
+   "safety_constraints": [
+    "Read-only; must not alter source archives"
+   ],
+   "acceptance_steps": [
+    "Manual comparison against design-reference Library screen",
+    "Existing Library tests still pass"
+   ],
+   "required_tests": [
+    "existing ArchiveRow / Library filter tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "LIBRARY-002",
+   "milestone": "library-integration",
+   "title": "Library filters parity (platform, health, presence)",
+   "description": "Confirm LibraryRowFilters covers the design's filter chips (All Platforms, All Health, All Presence, etc.); add missing filter dimensions only if the design requires one not already present.",
+   "design_screen": "Library",
+   "existing_backend_capability": "LibraryRowFilters, HealthIssueFilter, classify_archive_health, catalogue_health_report",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (LibraryRowFilters)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Each design filter chip maps to an existing or newly-added LibraryRowFilters field"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "LIBRARY-003",
+   "milestone": "library-integration",
+   "title": "Manual platform assignment integration",
+   "description": "Confirm single and bulk manual platform assignment (PlatformAction, BulkPlatformActionKind) match the design's 'Detected Platform / Override' interaction.",
+   "design_screen": "Selected",
+   "existing_backend_capability": "PlatformProvenanceDetails, MANUAL_PLATFORM_SOURCE, library-set-platform[-bulk] CLI precedent",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (PlatformAction, RunningPlatformAction)"
+   ],
+   "safety_constraints": [
+    "Manual assignment must not silently overwrite automatic detection provenance without the existing confirmation flow"
+   ],
+   "acceptance_steps": [
+    "Existing platform-assignment tests pass; new design-parity check documented"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "LIBRARY-004",
+   "milestone": "library-integration",
+   "title": "Missing records and duplicates parity",
+   "description": "Confirm 'Remove Missing Records' and the Duplicates dashboard match the design's ARCHIVES / MISSING and DUPLICATE GROUP interactions.",
+   "design_screen": "Library",
+   "existing_backend_capability": "MissingArchiveRemovalResult, catalogue_filename_duplicates, CatalogueDuplicateReport",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (RunningMissingRemoval, MainView::Duplicates)"
+   ],
+   "safety_constraints": [
+    "Deletion of catalogue records must never delete underlying archive files"
+   ],
+   "acceptance_steps": [
+    "Existing duplicate-review tests pass"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "LIBRARY-005",
+   "milestone": "library-integration",
+   "title": "Library refresh wired to application-service",
+   "description": "Migrate the Library refresh/scan-triggered reload path onto the GUI-ARCH-002/003 command envelope.",
+   "design_screen": "Library",
+   "existing_backend_capability": "scan_source_folder_at, DatabaseState reload path",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (DatabaseState)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Refresh still produces identical DatabaseState transitions after migration"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "SOURCES-001",
+   "milestone": "sources-integration",
+   "title": "Sources listing and availability parity",
+   "description": "Confirm SourceFolderView-backed Sources screen matches the design's listing/availability/Last Scanned display.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "SourceFolderView, build_source_folder_views, classify_source_availability",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (MainView::Sources)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Manual comparison against design Sources screen"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "SOURCES-002",
+   "milestone": "sources-integration",
+   "title": "Add / enable / disable source parity",
+   "description": "Confirm add-source (native folder picker via rfd), enable/disable toggling match design's 'Add Source' and 'Enabled' interactions.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "add_source_folder_at, set_source_folder_enabled_at, validate_new_source_folder",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (SourcesAddDialogState, SourceAction)"
+   ],
+   "safety_constraints": [
+    "validate_new_source_folder's existing path-safety checks must remain the only gate; no new path validation invented in the GUI layer"
+   ],
+   "acceptance_steps": [
+    "Existing source-add/toggle tests pass"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "SOURCES-003",
+   "milestone": "sources-integration",
+   "title": "Scan one / scan all parity",
+   "description": "Confirm 'Scan Now' (single source) and a design-required 'scan all' affordance both map to scan_source_folder_at / scan_all_enabled_sources_at.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "scan_source_folder_at, scan_all_enabled_sources_at, ScanPersistSummary",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Scan-all triggers one ScanPersistSummary per enabled source, matching CLI 'sources' behavior"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "SOURCES-004",
+   "milestone": "sources-integration",
+   "title": "Remove source: retain vs delete records",
+   "description": "Confirm the design's 'Remove Source (Keep Records)' vs 'Remove Source and Records' map exactly to RemoveSourceFolderOutcome's two modes.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "remove_source_folder_at, RemoveSourceFolderOutcome",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (SourcesRemoveDialogState)"
+   ],
+   "safety_constraints": [
+    "Never delete underlying archive files, only catalogue records and/or the source-folder registration"
+   ],
+   "acceptance_steps": [
+    "Existing remove-source tests pass; both modes covered"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "DOCTOR-001",
+   "milestone": "doctor-integration",
+   "title": "Reconcile DoctorReport vs ConfigCheckReport/SetupDiagnostics",
+   "description": "Decide and implement whether the new Doctor screen surfaces a merged report or both report types clearly separated; document the decision.",
+   "design_screen": "Doctor",
+   "existing_backend_capability": "run_doctor[_default], run_config_check*, run_setup_diagnostics*",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs (DoctorReport, ConfigCheckReport, SetupDiagnostics)"
+   ],
+   "safety_constraints": [
+    "Read-only; Doctor checks must not mutate config or database as a side effect of running"
+   ],
+   "acceptance_steps": [
+    "Decision documented in FABLE_PROGRESS.md before UI work begins"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "DOCTOR-002",
+   "milestone": "doctor-integration",
+   "title": "Promote Doctor to a full MainView screen",
+   "description": "Move Doctor from ToolsOverlay::DoctorChecks to a first-class screen matching the design's severity/technical-details/suggested-action layout.",
+   "design_screen": "Doctor",
+   "existing_backend_capability": "DoctorCheck, DoctorStatus, run_doctor_read_only[_default]",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (MainView, ToolsOverlay::DoctorChecks)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "'Run All Checks (F5)' and 'Retry Where Safe' interactions map to existing run_doctor* entry points"
+   ],
+   "required_tests": [
+    "existing DoctorChecks overlay tests adapted, not deleted"
+   ],
+   "status": "in_progress",
+   "evidence": "Redesigned shell adds MainView::Doctor rendering show_doctor_checks_panel as a primary destination; ToolsOverlay::DoctorChecks retained. Full design parity (severity layout, suggested actions) still open.",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "DOCTOR-003",
+   "milestone": "doctor-integration",
+   "title": "Database and mount diagnostics coverage",
+   "description": "Confirm DatabaseHealthReport and mount-related Doctor checks are represented as distinct, filterable check categories in the new screen.",
+   "design_screen": "Doctor",
+   "existing_backend_capability": "check_database_health, DatabaseHealthReport, DatabaseDiagnostic",
+   "relevant_modules": [
+    "crates/archivefs-core/src/database.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Each DoctorCheck / DatabaseDiagnostic surfaces its severity and suggested action verbatim"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "DOCTOR-004",
+   "milestone": "doctor-integration",
+   "title": "RetroArch diagnostics coverage",
+   "description": "Confirm RetroArch profile/environment diagnostics (retroarch-environment CLI precedent) are exposed as Doctor checks, not only as a separate RetroArch screen concern.",
+   "design_screen": "Doctor",
+   "existing_backend_capability": "emulator_environment::retroarch, retroarch-environment CLI command",
+   "relevant_modules": [
+    "crates/archivefs-core/src/emulator_environment/retroarch.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "At least one RetroArch-environment check appears in the Doctor screen's check list"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "HISTORY-001",
+   "milestone": "history-and-logs-integration",
+   "title": "Decide operation-history persistence approach",
+   "description": "Resolve the open question in FABLE_PROGRESS.md: persist OperationHistory to a GUI-local JSON log file (default lean) vs. a new archivefs-core module.",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "OperationHistory (GUI-local, in-memory only today)",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (OperationHistory)"
+   ],
+   "safety_constraints": [
+    "Log file writes must be additive/append-only and never block the UI thread synchronously for large logs"
+   ],
+   "acceptance_steps": [
+    "Decision documented before HISTORY-002 begins"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "HISTORY-002",
+   "milestone": "history-and-logs-integration",
+   "title": "History & Logs screen",
+   "description": "Build the new screen: RECENT OPERATIONS list, filtering by operation/date/result, 'Clear Logs', 'Export Log'/'Export Current Logs'.",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "HistoryEntry, ActivityAction, ActivityOutcome, OperationHistory::{record,clear,remove}",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "'Clear Logs' must only clear the persisted log, never any underlying operation records (mount state, catalogue, journals)"
+   ],
+   "acceptance_steps": [
+    "Existing OperationHistory tests extended, not duplicated"
+   ],
+   "required_tests": [],
+   "status": "in_progress",
+   "evidence": "Redesigned shell adds MainView::HistoryLogs full-screen page over the in-memory OperationHistory (listing, per-entry copy, clear). Filtering/export/persistence still open.",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "HISTORY-003",
+   "milestone": "history-and-logs-integration",
+   "title": "RetroArch journal history surfaced in History & Logs",
+   "description": "Cross-link cheat_history::discover_cheat_history entries into the general History & Logs view (or clearly document why they remain a separate RetroArch-only history).",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "discover_cheat_history, CheatHistoryReport, CheatHistoryEntry",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_history.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Decision (merged vs separate) documented"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-PREVIEW-001",
+   "milestone": "mount-preview",
+   "title": "Mount screen: destination preview",
+   "description": "New Mount screen showing MOUNT DESTINATION / PLANNED DESTINATION and MOUNT COMMAND preview before execution, per design's 'Mount' screen.",
+   "design_screen": "Mount",
+   "existing_backend_capability": "MountPlan, plan_mounts, safe_mount_name",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs (MountPlan, plan_mounts)",
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "Preview must never itself perform a mount"
+   ],
+   "acceptance_steps": [
+    "Mount screen shows a MountPlan-derived preview matching the design's MOUNT COMMAND panel"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-PREVIEW-002",
+   "milestone": "mount-preview",
+   "title": "Mount queue (Add to Mount Queue / Add to Queue)",
+   "description": "Implement the design's queueing interaction (select multiple archives, review before committing to Mount Selected).",
+   "design_screen": "Mount",
+   "existing_backend_capability": "MountAllItem, existing 'Mount Selected (Ctrl+M)' batch selection precedent",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (MountAllItem, MountAllConfirmation)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Queue add/remove does not trigger any mount call until explicit confirmation"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-PREVIEW-003",
+   "milestone": "mount-preview",
+   "title": "Destination collision handling in preview",
+   "description": "Surface MountBatchTargetValidation/MountBatchTargetSkipReason in the preview UI before mount execution, matching design collision-handling intent.",
+   "design_screen": "Mount",
+   "existing_backend_capability": "MountBatchTargetValidation, MountBatchTargetSkipReason",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Every MountBatchTargetSkipReason variant has a corresponding preview message"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-001",
+   "milestone": "mount-execution",
+   "title": "Single mount execution via application-service",
+   "description": "Wire 'Mount Selected' single-item execution through the GUI-ARCH command envelope, replacing the ad-hoc per-call-site channel where practical.",
+   "design_screen": "Mount",
+   "existing_backend_capability": "mount_one_archive_with_backend, RatarmountBackend",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs",
+    "crates/archivefs-gui/src/main.rs (ArchiveAction::Mount)"
+   ],
+   "safety_constraints": [
+    "Never mount without going through MountBackend; never bypass existing collision/validation checks"
+   ],
+   "acceptance_steps": [
+    "Existing single-mount tests pass after migration"
+   ],
+   "required_tests": [
+    "existing mount_one_archive_with_backend tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-002",
+   "milestone": "mount-execution",
+   "title": "Mount-with-read-only toggle parity",
+   "description": "Confirm the design's 'Mount read-only' checkbox maps to an existing or newly-needed MountPlan/backend option; document if unsupported.",
+   "design_screen": "Mount",
+   "existing_backend_capability": "MountPlan, RatarmountBackend",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Either confirmed supported end-to-end, or documented as intentionally unsupported in GUI_BACKEND_CAPABILITY_MATRIX.md"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-BATCH-001",
+   "milestone": "batch-mount-outcomes",
+   "title": "Batch mount execution with per-item outcomes",
+   "description": "Wire MountAllResult/MountAllFailure/MountAllSkipped reporting into the new Mount screen with partial-success presentation matching design intent.",
+   "design_screen": "Mount",
+   "existing_backend_capability": "MountAllResult, MountBatchTargetValidation, mount_archives_with_backend",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (RunningMountAll, MountAllEvent, MountAllProgress)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Existing batch-mount tests pass after any migration to the new command envelope"
+   ],
+   "required_tests": [
+    "existing MountAllResult tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-BATCH-002",
+   "milestone": "batch-mount-outcomes",
+   "title": "Batch mount progress reporting",
+   "description": "Extend MountAllProgress to use the shared ProgressEvent model (GUI-ARCH-004) instead of its bespoke progress type.",
+   "design_screen": "Mount",
+   "existing_backend_capability": "MountAllProgress, MountAllEvent",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Progress bar during batch mount still updates per-item"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "ACTIVE-MOUNTS-001",
+   "milestone": "active-mounts-integration",
+   "title": "Active Mounts screen: listing and refresh",
+   "description": "New Active Mounts screen listing currently-mounted archives (filtered from current_archive_records / current_statuses) with a Refresh action.",
+   "design_screen": "Active Mounts",
+   "existing_backend_capability": "current_statuses, ArchiveStatus, MountState::Mounted filter (existing precedent at multiple main.rs call sites)",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs",
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "No direct 'list active mounts' core API exists yet \u2014 reuse the existing filter-over-all-records pattern rather than inventing a new core query prematurely"
+   ],
+   "acceptance_steps": [
+    "Screen lists exactly the archives with MountState::Mounted"
+   ],
+   "required_tests": [],
+   "status": "in_progress",
+   "evidence": "Redesigned shell adds MainView::ActiveMounts read-only listing via pending_unmount_items over the live snapshot. Refresh/unmount/cleanup actions on the page still open.",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "ACTIVE-MOUNTS-002",
+   "milestone": "active-mounts-integration",
+   "title": "Remount offer",
+   "description": "Implement the design's 'Remount' action using remount_one_archive_path.",
+   "design_screen": "Active Mounts",
+   "existing_backend_capability": "remount_one_archive_path",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Remount only offered for archives whose mount state indicates a valid remount target"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "UNMOUNT-001",
+   "milestone": "normal-unmount",
+   "title": "Single normal unmount via application-service",
+   "description": "Wire the design's Active Mounts 'Unmount' action through unmount_one_archive_with_backend and the new command envelope.",
+   "design_screen": "Active Mounts",
+   "existing_backend_capability": "unmount_one_archive_with_backend",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs",
+    "crates/archivefs-gui/src/main.rs (ArchiveAction::Unmount)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Existing single-unmount tests pass after migration"
+   ],
+   "required_tests": [
+    "existing unmount_one_archive_with_backend tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "UNMOUNT-002",
+   "milestone": "normal-unmount",
+   "title": "Batch normal unmount",
+   "description": "Wire UnmountAllResult/UnmountAllFailure reporting into Active Mounts with partial-success presentation.",
+   "design_screen": "Active Mounts",
+   "existing_backend_capability": "UnmountAllResult, unmount_archives_with_backend",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (RunningUnmountAll, UnmountAllEvent)"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Existing batch-unmount tests pass"
+   ],
+   "required_tests": [
+    "existing UnmountAllResult tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "UNMOUNT-LAZY-001",
+   "milestone": "lazy-unmount",
+   "title": "Lazy unmount workflow in Active Mounts",
+   "description": "Wire the design's 'Lazy Unmount' action through lazy_unmount_one_archive_path_with_progress, preserving its existing progress-channel behavior.",
+   "design_screen": "Active Mounts",
+   "existing_backend_capability": "lazy_unmount_one_archive_path_with_progress, LazyUnmountResult, LazyUnmountCleanupResult",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs",
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [
+    "Lazy unmount's existing progress-sender pattern (main.rs:4020) is the precedent for GUI-ARCH-004's ProgressEvent \u2014 generalize, do not discard"
+   ],
+   "acceptance_steps": [
+    "Existing lazy-unmount tests pass"
+   ],
+   "required_tests": [
+    "existing lazy_unmount tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "MOUNT-RECOVERY-001",
+   "milestone": "stale-mount-recovery",
+   "title": "Cleanup and stale-mount recovery in Active Mounts",
+   "description": "Surface cleanup_selected_mount_dir/cleanup_selected_mount_tree/clean_mount_root as the design's 'Cleanup'/'Retry Where Safe' actions.",
+   "design_screen": "Active Mounts",
+   "existing_backend_capability": "cleanup_selected_mount_dir, cleanup_selected_mount_tree, clean_mount_root, CleanupOutcome",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs",
+    "crates/archivefs-gui/src/main.rs (CleanupOutcome)"
+   ],
+   "safety_constraints": [
+    "Cleanup must only ever remove empty/stale mount-point directories, never archive or catalogue data"
+   ],
+   "acceptance_steps": [
+    "Existing cleanup tests pass"
+   ],
+   "required_tests": [
+    "existing cleanup_* tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "PROGRESS-001",
+   "milestone": "progress-and-activity",
+   "title": "Unified Activity feed",
+   "description": "Generalize the existing Activity panel (show_activity_panel) to consume the shared ProgressEvent/OperationHistory across all screens, not just mount/unmount.",
+   "design_screen": null,
+   "existing_backend_capability": "show_activity_panel, ActivityPanelAction, OperationHistory",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Every new workflow (Mount, RetroArch, Sources) reports into the same Activity feed"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "ERRORS-001",
+   "milestone": "structured-errors",
+   "title": "Shared DisplayError model",
+   "description": "Generalize ActionFeedback.more_information into a reusable DisplayError { message, more_information } used by every new workflow's failure path.",
+   "design_screen": null,
+   "existing_backend_capability": "ActionFeedback (existing precedent, main.rs:4867), ArchiveFsError and domain error enums (PatchManagerError, CheatSourceError, DestinationSafetyError)",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs (ActionFeedback)"
+   ],
+   "safety_constraints": [
+    "Underlying core Result/error types remain the source of truth; DisplayError is a presentation-only mapping"
+   ],
+   "acceptance_steps": [
+    "Every new workflow's failure path renders via DisplayError"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "NOTIFY-001",
+   "milestone": "notifications",
+   "title": "Background-operation completion notifications",
+   "description": "Add a toast/banner surface for background command completion (success/failure), built on ProgressEvent/DisplayError.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a \u2014 new GUI-only presentation layer over existing result types",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Notifications appear for at least Mount, Unmount, and RetroArch install completion"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-SOURCE-001",
+   "milestone": "trusted-retroarch-source-workflow",
+   "title": "Trusted source list screen",
+   "description": "GUI listing of trusted_retroarch_cheat_sources() \u2014 the fixed, code-defined list only; no free-text URL entry.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "trusted_retroarch_cheat_sources, list_retroarch_cheat_sources",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
+   ],
+   "safety_constraints": [
+    "Must not introduce a second trust boundary (no user-supplied URL field)"
+   ],
+   "acceptance_steps": [
+    "GUI list matches trusted_retroarch_cheat_sources() output exactly"
+   ],
+   "required_tests": [
+    "existing cheat_sources tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-SOURCE-002",
+   "milestone": "trusted-retroarch-source-workflow",
+   "title": "Backgrounded fetch",
+   "description": "Wire fetch_retroarch_cheat_source through a background thread (GUI-ARCH-003) since it performs blocking ureq HTTP I/O \u2014 must never run on the UI thread.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "fetch_retroarch_cheat_source, HttpsCheatSourceTransport, CheatSourceFetchResult",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
+   ],
+   "safety_constraints": [
+    "Blocking network call must run off the UI thread; enforce via code review, not just testing"
+   ],
+   "acceptance_steps": [
+    "Fetch does not freeze the UI during a live network call (manual test)"
+   ],
+   "required_tests": [
+    "existing fetch_retroarch_cheat_source tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-SOURCE-003",
+   "milestone": "trusted-retroarch-source-workflow",
+   "title": "Inspect and offline reuse",
+   "description": "GUI action for inspect_retroarch_cheat_source[_snapshot] allowing offline reuse of a previously-fetched source without re-fetching.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "inspect_retroarch_cheat_source, inspect_retroarch_cheat_source_snapshot, CheatSourceFreshness",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Offline inspect works with no network access (manual test)"
+   ],
+   "required_tests": [
+    "existing inspect_retroarch_cheat_source tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-PROVENANCE-001",
+   "milestone": "catalogue-provenance",
+   "title": "Catalogue and source provenance display",
+   "description": "Surface CheatCatalogueSnapshot / CheatSourceCacheMetadata provenance, schema version, and freshness fields in the GUI wherever catalogue data is shown.",
+   "design_screen": "Sources",
+   "existing_backend_capability": "load_cheat_catalogue_snapshot, CheatCatalogueSnapshot, CheatSourceCacheMetadata, CHEAT_CATALOGUE_FORMAT_VERSION",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_catalogue.rs",
+    "crates/archivefs-core/src/patch_manager/cheat_sources.rs"
+   ],
+   "safety_constraints": [
+    "Never alter or strip provenance metadata; display verbatim"
+   ],
+   "acceptance_steps": [
+    "Provenance fields visible next to any cheat catalogue data in the GUI"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-PROFILE-001",
+   "milestone": "retroarch-profile-selection",
+   "title": "Profile discovery screen",
+   "description": "GUI listing of discover_retroarch_cheat_setup_profiles() results ('Discovered Profiles', 'Rescan Profiles').",
+   "design_screen": "Selected",
+   "existing_backend_capability": "discover_retroarch_cheat_setup_profiles, RetroArchCheatSetupProfile, RetroArchCheatSetupProfileState",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/retroarch_cheat_setup.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Rescan re-runs discovery and updates the list without restarting the app"
+   ],
+   "required_tests": [
+    "existing retroarch_cheat_setup discovery tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-PROFILE-002",
+   "milestone": "retroarch-profile-selection",
+   "title": "Profile selection with blocker surfacing",
+   "description": "GUI selection of a profile via resolve_retroarch_cheat_setup_profile, surfacing RetroArchCheatSetupProfileBlocker reasons when a profile cannot be used.",
+   "design_screen": "Selected",
+   "existing_backend_capability": "resolve_retroarch_cheat_setup_profile, RetroArchCheatSetupProfileBlocker",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/retroarch_cheat_setup.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Every RetroArchCheatSetupProfileBlocker variant has a corresponding user-facing message"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-PREVIEW-001",
+   "milestone": "cheat-preview",
+   "title": "Cheat match and availability preview",
+   "description": "GUI workflow matching a selected archive against the cheat catalogue (match_cheat_game_record) and showing build_cheat_availability_report / confidence.",
+   "design_screen": "Selected",
+   "existing_backend_capability": "match_cheat_game_record, build_cheat_availability_report, CheatMatchConfidence",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_catalogue.rs"
+   ],
+   "safety_constraints": [
+    "Preview must not write any files"
+   ],
+   "acceptance_steps": [
+    "Confidence levels shown match CheatMatchConfidence exactly"
+   ],
+   "required_tests": [
+    "existing cheat_catalogue matching tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-PREVIEW-002",
+   "milestone": "cheat-preview",
+   "title": "Install plan preview",
+   "description": "GUI display of build_retroarch_cheat_setup_plan()'s RetroArchCheatSetupPlan / RetroArchCheatSetupPreviewSummary before install, matching design's PLANNED ACTION / PLANNED DESTINATION labels.",
+   "design_screen": "Selected",
+   "existing_backend_capability": "build_retroarch_cheat_setup_plan, RetroArchCheatSetupPlan, RetroArchCheatSetupPreviewSummary",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/retroarch_cheat_setup.rs"
+   ],
+   "safety_constraints": [
+    "Preview must not execute any install action"
+   ],
+   "acceptance_steps": [
+    "Preview PLANNED ACTION list matches plan.planned_entries exactly"
+   ],
+   "required_tests": [
+    "existing build_retroarch_cheat_setup_plan tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-INSTALL-001",
+   "milestone": "cheat-installation",
+   "title": "Cheat install execution",
+   "description": "GUI action executing execute_cheat_install_run via the application-service command envelope, backgrounded like all other write operations.",
+   "design_screen": "Selected",
+   "existing_backend_capability": "execute_cheat_install_run, CheatInstallOptions, CheatInstallRunOutcome",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_installer.rs"
+   ],
+   "safety_constraints": [
+    "Must go through destination_safety::assess_destination / construct_safe_destination exactly as the CLI does \u2014 no GUI-side shortcut"
+   ],
+   "acceptance_steps": [
+    "Existing cheat_installer tests pass; GUI install produces an identical CheatInstallRun to the CLI for the same inputs"
+   ],
+   "required_tests": [
+    "existing cheat_installer tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-INSTALL-002",
+   "milestone": "cheat-installation",
+   "title": "Replacement backup confirmation",
+   "description": "Surface CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME backup creation in the GUI's install confirmation/result screen.",
+   "design_screen": "Selected",
+   "existing_backend_capability": "CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, PreviousDestinationState",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_installer.rs",
+    "crates/archivefs-core/src/patch_manager/cheat_install_result.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Backup path shown to the user when a replacement occurs"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-HISTORY-001",
+   "milestone": "installation-history",
+   "title": "Cheat install/rollback history screen",
+   "description": "GUI listing of discover_cheat_history() entries, matching the design's history/journal inspection intent for RetroArch operations.",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "discover_cheat_history, CheatHistoryReport, CheatHistoryEntry, CheatHistoryOptions",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_history.rs"
+   ],
+   "safety_constraints": [
+    "Read-only inspection; must not modify journal files"
+   ],
+   "acceptance_steps": [
+    "Existing cheat_history tests pass"
+   ],
+   "required_tests": [
+    "existing cheat_history tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-HISTORY-002",
+   "milestone": "installation-history",
+   "title": "Journal inspection detail view",
+   "description": "GUI detail view for inspect_cheat_install_journal(), surfacing CheatJournalInspection / CheatDestinationAssessment / CheatBackupAssessment.",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "inspect_cheat_install_journal, CheatJournalInspection, CheatDestinationAssessment, CheatBackupAssessment",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_history.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Every CheatJournalInspectionError variant maps to a user-facing message"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-ROLLBACK-001",
+   "milestone": "rollback",
+   "title": "Cheat rollback execution",
+   "description": "GUI action executing execute_cheat_rollback_run from a selected history entry, gated by CheatRollbackAvailability.",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "execute_cheat_rollback_run, CheatRollbackOptions, CheatRollbackAvailability, CheatRollbackRunOutcome",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_rollback.rs",
+    "crates/archivefs-core/src/patch_manager/cheat_history.rs"
+   ],
+   "safety_constraints": [
+    "Rollback must only be offered when CheatRollbackAvailability indicates it is safe"
+   ],
+   "acceptance_steps": [
+    "Existing cheat_rollback tests pass"
+   ],
+   "required_tests": [
+    "existing cheat_rollback tests"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RA-CHEAT-ROLLBACK-002",
+   "milestone": "rollback",
+   "title": "Post-rollback guidance",
+   "description": "Display CheatRollbackSummary / CheatRollbackRunStatus outcome with the design's post-install/post-rollback guidance messaging.",
+   "design_screen": "History & Logs",
+   "existing_backend_capability": "CheatRollbackSummary, CheatRollbackRunStatus, CheatRollbackEntryResult",
+   "relevant_modules": [
+    "crates/archivefs-core/src/patch_manager/cheat_rollback_result.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Every CheatRollbackRunStatus variant has distinct, correct guidance text"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "SETTINGS-001",
+   "milestone": "settings-integration",
+   "title": "Backend-supported settings screen",
+   "description": "New Settings screen limited to what archivefs-core actually persists: source folder configs, mount root, config path (Config, default_config_path).",
+   "design_screen": "Settings",
+   "existing_backend_capability": "Config, parse_config, default_config_path, save_source_folder_configs_to",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs"
+   ],
+   "safety_constraints": [
+    "Must not fabricate settings with no backing store"
+   ],
+   "acceptance_steps": [
+    "Every control in the Settings screen maps to a real, persisted Config field"
+   ],
+   "required_tests": [],
+   "status": "in_progress",
+   "evidence": "Redesigned shell adds MainView::Settings read-only page (config path, database path). Editable settings still open.",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "SETTINGS-002",
+   "milestone": "settings-integration",
+   "title": "Prototype-only settings deferred",
+   "description": "Explicitly mark design-only settings (e.g. 'Comfortable/Compact' density, 'Reset All Settings') as deferred/unsupported in GUI_BACKEND_CAPABILITY_MATRIX.md rather than fabricating backend state for them.",
+   "design_screen": "Settings",
+   "existing_backend_capability": "n/a \u2014 explicitly unsupported",
+   "relevant_modules": [],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "GUI_BACKEND_CAPABILITY_MATRIX.md lists each deferred setting under 'intentionally unsupported'"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "ABOUT-001",
+   "milestone": "about-and-support-information",
+   "title": "About screen: build and environment info",
+   "description": "New About screen showing version/build/licence/OS/desktop-environment info from existing ConfigIdentity-style data and Cargo package metadata.",
+   "design_screen": "About",
+   "existing_backend_capability": "ConfigIdentity, command_available, workspace.package.version",
+   "relevant_modules": [
+    "crates/archivefs-core/src/lib.rs",
+    "Cargo.toml"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Version shown matches workspace.package.version exactly"
+   ],
+   "required_tests": [],
+   "status": "in_progress",
+   "evidence": "Redesigned shell adds MainView::About page sharing show_about_contents with the existing About window (version, database path, config path). Environment info still open.",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "ABOUT-002",
+   "milestone": "about-and-support-information",
+   "title": "Support bundle export scoped down",
+   "description": "Document that 'Export Support Bundle'/'Check for Updates' have no backend today (per FABLE_CAMPAIGN_PLAN.md section 16); scope a minimal version (e.g. copy Doctor report + config summary) or defer entirely.",
+   "design_screen": "About",
+   "existing_backend_capability": "n/a \u2014 no existing backend for update-check or bundling",
+   "relevant_modules": [],
+   "safety_constraints": [
+    "Must not perform any network call for 'Check for Updates' unless a future milestone explicitly adds one"
+   ],
+   "acceptance_steps": [
+    "Decision (minimal implementation vs. deferred) documented before ABOUT-001 UI ships a button for it"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "HARDEN-001",
+   "milestone": "final-hardening",
+   "title": "Cross-screen consistency pass",
+   "description": "Review all new screens for consistent error presentation (ERRORS-001), consistent progress presentation (PROGRESS-001), and consistent navigation with MainView/ToolsOverlay conventions.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a \u2014 review task",
+   "relevant_modules": [
+    "crates/archivefs-gui/src/main.rs"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "No screen bypasses the shared DisplayError/ProgressEvent/Command models introduced in Milestone 1"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "HARDEN-002",
+   "milestone": "final-hardening",
+   "title": "Isolated acceptance testing",
+   "description": "Run full workspace validation (fmt, clippy, test) and manual acceptance against design-reference for every screen.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a \u2014 validation task",
+   "relevant_modules": [],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "cargo fmt --all -- --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo test --workspace all pass"
+   ],
+   "required_tests": [
+    "full workspace test suite"
+   ],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RELEASE-001",
+   "milestone": "release-readiness",
+   "title": "Release checklist review",
+   "description": "Update docs/release-checklist.md and docs/roadmap.md to reflect the completed Fable integration; confirm no campaign-only artifacts (fable-preflight.sh assumptions) leak into release requirements.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a \u2014 documentation task",
+   "relevant_modules": [
+    "docs/release-checklist.md",
+    "docs/roadmap.md"
+   ],
+   "safety_constraints": [],
+   "acceptance_steps": [
+    "Release checklist accurately reflects shipped GUI screens"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  },
+  {
+   "id": "RELEASE-002",
+   "milestone": "release-readiness",
+   "title": "Performance review",
+   "description": "Confirm no new screen introduces a UI-thread-blocking call (especially RetroArch fetch and mount/unmount), per the concurrency risks in FABLE_CAMPAIGN_PLAN.md section 20.",
+   "design_screen": null,
+   "existing_backend_capability": "n/a \u2014 review task",
+   "relevant_modules": [],
+   "safety_constraints": [
+    "No synchronous I/O call reachable from the UI thread"
+   ],
+   "acceptance_steps": [
+    "Manual review of every thread::spawn/direct-call site added during the campaign"
+   ],
+   "required_tests": [],
+   "status": "not_started",
+   "evidence": "",
+   "implementation_commit": null,
+   "notes": ""
+  }
+ ]
 }

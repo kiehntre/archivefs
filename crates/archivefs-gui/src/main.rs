@@ -2284,6 +2284,22 @@ enum MainView {
     Duplicates,
     Sources,
     LibraryViews,
+    /// Redesigned-shell destination: mount planning and preview.
+    Mount,
+    /// Redesigned-shell destination: the selected archive's detail page.
+    Selected,
+    /// Redesigned-shell destination: currently mounted archives.
+    ActiveMounts,
+    /// Redesigned-shell destination: doctor checks as a full screen
+    /// (the `ToolsOverlay::DoctorChecks` overlay remains reachable from
+    /// the Tools menu; this is the same content as a primary page).
+    Doctor,
+    /// Redesigned-shell destination: operation history and logs.
+    HistoryLogs,
+    /// Redesigned-shell destination: backend-supported settings.
+    Settings,
+    /// Redesigned-shell destination: application information.
+    About,
 }
 
 /// A secondary, full-panel destination - distinct from `MainView` because
@@ -2409,19 +2425,52 @@ fn apply_readability_style(context: &egui::Context) {
     });
 }
 
-/// The four primary destinations, rendered as one always-visible row
-/// directly below the menu bar (milestone requirement: "visually
-/// prominent, easy to find" navigation, never buried in a submenu).
-/// `SelectableLabel`-style highlighting matches ordinary desktop tab
-/// conventions. Extracted from `update` (rather than inlined) so it can
-/// be driven by a real `egui::Context` frame in tests independent of
-/// `eframe::Frame`, which production code can only obtain from the
-/// eframe runtime itself. Health and Duplicates are disabled - not
-/// hidden, per the milestone's "use disabled states + explanatory text
-/// rather than hiding context" - until a database snapshot exists,
-/// since both pages render real catalogue data with nothing meaningful
-/// to show before then; Library and Sources remain reachable at any
-/// time. Returns the newly clicked view, if any, leaving `tools_overlay`
+/// The redesigned shell's destination list, in design order - the nine
+/// design-reference screens (Mount, Selected, Active Mounts, Library,
+/// Sources, Doctor, History & Logs, Settings, About), always visible in
+/// the persistent navigation rail.
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 9] = [
+    (MainView::Mount, "Mount"),
+    (MainView::Selected, "Selected"),
+    (MainView::ActiveMounts, "Active Mounts"),
+    (MainView::Library, "Library"),
+    (MainView::Sources, "Sources"),
+    (MainView::Doctor, "Doctor"),
+    (MainView::HistoryLogs, "History & Logs"),
+    (MainView::Settings, "Settings"),
+    (MainView::About, "About"),
+];
+
+/// Pre-redesign catalogue views that are not one of the nine design
+/// destinations but must remain reachable (requirement: preserve all
+/// existing working views and route them into the new shell). Rendered
+/// as a secondary group below the primary destinations.
+const SECONDARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 3] = [
+    (MainView::Health, "Health"),
+    (MainView::Duplicates, "Duplicates"),
+    (MainView::LibraryViews, "Library Views"),
+];
+
+/// Health and Duplicates are disabled - not hidden, per the milestone's
+/// "use disabled states + explanatory text rather than hiding context" -
+/// until a database snapshot exists, since both pages render real
+/// catalogue data with nothing meaningful to show before then. Every
+/// other destination remains reachable at any time (destinations whose
+/// content needs data render their own empty states instead).
+fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
+    !matches!(view, MainView::Health | MainView::Duplicates) || has_database
+}
+
+/// The redesigned persistent navigation rail: every design destination
+/// (see `PRIMARY_NAVIGATION_DESTINATIONS`) rendered as one always-visible
+/// vertical list, with the pre-redesign catalogue views (see
+/// `SECONDARY_NAVIGATION_DESTINATIONS`) in a secondary group below a
+/// separator so no existing screen is lost. `SelectableLabel`-style
+/// highlighting matches ordinary desktop sidebar conventions. Extracted
+/// from `update` (rather than inlined) so it can be driven by a real
+/// `egui::Context` frame in tests independent of `eframe::Frame`, which
+/// production code can only obtain from the eframe runtime itself.
+/// Returns the newly clicked view, if any, leaving `tools_overlay`
 /// handling to the caller.
 fn show_primary_navigation(
     ui: &mut egui::Ui,
@@ -2429,18 +2478,20 @@ fn show_primary_navigation(
     has_database: bool,
 ) -> Option<MainView> {
     let mut clicked_view = None;
-    ui.horizontal(|ui| {
-        for (view, label) in [
-            (MainView::Library, "Library"),
-            (MainView::Health, "Health"),
-            (MainView::Duplicates, "Duplicates"),
-            (MainView::Sources, "Sources"),
-            (MainView::LibraryViews, "Library Views"),
-        ] {
-            let enabled = matches!(
-                view,
-                MainView::Library | MainView::Sources | MainView::LibraryViews
-            ) || has_database;
+    ui.vertical(|ui| {
+        for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
+            let enabled = navigation_destination_enabled(view, has_database);
+            if ui
+                .add_enabled(enabled, egui::Button::selectable(current == view, label))
+                .clicked()
+            {
+                clicked_view = Some(view);
+            }
+        }
+        ui.separator();
+        ui.label("Catalogue views");
+        for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
+            let enabled = navigation_destination_enabled(view, has_database);
             if ui
                 .add_enabled(enabled, egui::Button::selectable(current == view, label))
                 .clicked()
@@ -5052,14 +5103,18 @@ impl eframe::App for ArchiveFsApp {
                     }
                 });
             });
-
-            ui.add_space(4.0);
-            if let Some(clicked) = show_primary_navigation(ui, self.view, has_database) {
-                self.view = clicked;
-                self.tools_overlay = ToolsOverlay::None;
-            }
-            ui.add_space(4.0);
         });
+
+        egui::SidePanel::left("app_navigation")
+            .resizable(false)
+            .default_width(180.0)
+            .show(context, |ui| {
+                ui.add_space(6.0);
+                if let Some(clicked) = show_primary_navigation(ui, self.view, has_database) {
+                    self.view = clicked;
+                    self.tools_overlay = ToolsOverlay::None;
+                }
+            });
 
         if let Some(ActivityPanelAction::ShowRelatedArchive(path)) = show_activity_panel(
             context,
@@ -5323,6 +5378,98 @@ impl eframe::App for ArchiveFsApp {
                 } else {
                     ui.label("Scan the library to see the health dashboard.");
                 }
+                return;
+            }
+
+            if self.view == MainView::Mount {
+                ui.heading("Mount");
+                ui.add_space(4.0);
+                ui.label(
+                    "The redesigned mount preview page is being built. Mount and \
+                     unmount actions remain available from the Library page's \
+                     selected-archive panel and context menus.",
+                );
+                if ui.button("Go to Library").clicked() {
+                    self.view = MainView::Library;
+                }
+                return;
+            }
+
+            if self.view == MainView::Selected {
+                ui.heading("Selected");
+                ui.add_space(4.0);
+                match self.selected_archive.clone() {
+                    Some(path) => {
+                        ui.add(
+                            egui::Label::new(format!("Selected archive: {}", path.display()))
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            "Full details, platform assignment, and mount/unmount \
+                             actions for this archive are on the Library page's \
+                             selected-archive panel while the redesigned Selected \
+                             page is built out.",
+                        );
+                        if ui.button("Open in Library").clicked() {
+                            self.view = MainView::Library;
+                        }
+                    }
+                    None => {
+                        ui.label("No archive is selected. Select an archive in the Library.");
+                        if ui.button("Go to Library").clicked() {
+                            self.view = MainView::Library;
+                        }
+                    }
+                }
+                return;
+            }
+
+            if self.view == MainView::ActiveMounts {
+                let live_records = match &self.state {
+                    LoadState::Ready(data) => Some(data.records.as_slice()),
+                    _ => None,
+                };
+                show_active_mounts_page(ui, live_records);
+                return;
+            }
+
+            if self.view == MainView::Doctor {
+                ui.heading("Doctor");
+                ui.add_space(4.0);
+                let doctor = match &self.state {
+                    LoadState::Ready(data) => Some(&data.doctor),
+                    _ => None,
+                };
+                show_doctor_checks_panel(ui, doctor);
+                return;
+            }
+
+            if self.view == MainView::HistoryLogs {
+                show_history_logs_page(ui, &mut self.history, &mut self.clipboard);
+                return;
+            }
+
+            if self.view == MainView::Settings {
+                show_settings_page(
+                    ui,
+                    &self.database_state,
+                    &self.diagnostics,
+                    &mut self.clipboard,
+                );
+                return;
+            }
+
+            if self.view == MainView::About {
+                ui.heading("About");
+                ui.add_space(4.0);
+                show_about_contents(
+                    ui,
+                    &self.database_state,
+                    &self.diagnostics,
+                    &mut self.clipboard,
+                );
                 return;
             }
 
@@ -8176,45 +8323,203 @@ fn show_about_window(
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
-            ui.strong(format!("ArchiveFS {}", env!("CARGO_PKG_VERSION")));
-            ui.add_space(8.0);
+            show_about_contents(ui, database_state, diagnostics, clipboard);
+        });
+}
 
-            let database_path =
-                database_state_path(database_state).map(|path| path.display().to_string());
-            let config_path = match diagnostics {
-                DiagnosticsState::Ready { report, .. } => report
-                    .config_path
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                _ => None,
-            };
+/// The About information itself - version plus key paths - shared by the
+/// pre-redesign About window (Help menu) and the redesigned shell's
+/// About page, so the two can never drift apart.
+fn show_about_contents(
+    ui: &mut egui::Ui,
+    database_state: &DatabaseState,
+    diagnostics: &DiagnosticsState,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    ui.strong(format!("ArchiveFS {}", env!("CARGO_PKG_VERSION")));
+    ui.add_space(8.0);
 
-            egui::Grid::new("about_paths_grid")
-                .num_columns(2)
+    let database_path = database_state_path(database_state).map(|path| path.display().to_string());
+    let config_path = match diagnostics {
+        DiagnosticsState::Ready { report, .. } => report
+            .config_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        _ => None,
+    };
+
+    egui::Grid::new("about_paths_grid")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.strong("Database path");
+            ui.horizontal(|ui| {
+                ui.label(database_path.as_deref().unwrap_or("unknown"));
+                if let Some(path) = &database_path
+                    && ui.small_button("Copy").clicked()
+                {
+                    let _ = clipboard.set_text(path.clone());
+                }
+            });
+            ui.end_row();
+
+            ui.strong("Configuration path");
+            ui.horizontal(|ui| {
+                ui.label(config_path.as_deref().unwrap_or("unknown"));
+                if let Some(path) = &config_path
+                    && ui.small_button("Copy").clicked()
+                {
+                    let _ = clipboard.set_text(path.clone());
+                }
+            });
+            ui.end_row();
+        });
+}
+
+/// The redesigned Active Mounts page: the currently mounted archives
+/// from the live snapshot, read-only. Reuses `pending_unmount_items` -
+/// the exact mounted-archive filter the proven unmount-all workflow
+/// uses - so this page can never disagree with the unmount machinery
+/// about what is mounted. Unmount/cleanup actions on this page are a
+/// later deliverable of the active-mounts milestone; the proven unmount
+/// workflows remain on the Library page meanwhile.
+fn show_active_mounts_page(ui: &mut egui::Ui, live_records: Option<&[ArchiveRecord]>) {
+    ui.heading("Active Mounts");
+    ui.add_space(4.0);
+    let Some(records) = live_records else {
+        ui.label("Live mount state is not loaded yet.");
+        return;
+    };
+    let mounted = pending_unmount_items(records);
+    if mounted.is_empty() {
+        ui.label("No archives are currently mounted.");
+        return;
+    }
+    if mounted.len() == 1 {
+        ui.label("1 mounted archive.");
+    } else {
+        ui.label(format!("{} mounted archives.", mounted.len()));
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("active_mounts_grid")
+                .num_columns(3)
+                .striped(true)
                 .show(ui, |ui| {
-                    ui.strong("Database path");
-                    ui.horizontal(|ui| {
-                        ui.label(database_path.as_deref().unwrap_or("unknown"));
-                        if let Some(path) = &database_path
-                            && ui.small_button("Copy").clicked()
-                        {
-                            let _ = clipboard.set_text(path.clone());
-                        }
-                    });
+                    ui.strong("Name");
+                    ui.strong("Archive path");
+                    ui.strong("Mount path");
                     ui.end_row();
-
-                    ui.strong("Configuration path");
-                    ui.horizontal(|ui| {
-                        ui.label(config_path.as_deref().unwrap_or("unknown"));
-                        if let Some(path) = &config_path
-                            && ui.small_button("Copy").clicked()
-                        {
-                            let _ = clipboard.set_text(path.clone());
-                        }
-                    });
-                    ui.end_row();
+                    for item in &mounted {
+                        ui.label(&item.display_name);
+                        ui.add(
+                            egui::Label::new(item.archive_path.display().to_string())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(item.mount_path.display().to_string())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.end_row();
+                    }
                 });
         });
+}
+
+/// The redesigned History & Logs page: the same operation history the
+/// bottom Activity panel shows, as a full screen - listing plus
+/// per-entry copy and a clear-all action. Filtering and export are
+/// later deliverables of the history-and-logs milestone.
+fn show_history_logs_page(
+    ui: &mut egui::Ui,
+    history: &mut OperationHistory,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    ui.heading("History & Logs");
+    ui.add_space(4.0);
+    if history.entries().next().is_none() {
+        ui.label("No operations have run in this session yet.");
+        return;
+    }
+    if ui.button("Clear history").clicked() {
+        history.clear();
+        return;
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for entry in history.entries() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Copy").clicked() {
+                        let _ = clipboard.set_text(history_entry_text(entry));
+                    }
+                    ui.add(
+                        egui::Label::new(history_entry_text(entry))
+                            .selectable(true)
+                            .wrap(),
+                    );
+                });
+            }
+        });
+}
+
+/// The redesigned Settings page, limited to backend-supported and
+/// currently read-only information (campaign constraint: prototype-only
+/// settings such as UI density are deferred; editable settings arrive
+/// with the settings-integration milestone).
+fn show_settings_page(
+    ui: &mut egui::Ui,
+    database_state: &DatabaseState,
+    diagnostics: &DiagnosticsState,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    ui.heading("Settings");
+    ui.add_space(4.0);
+
+    let database_path = database_state_path(database_state).map(|path| path.display().to_string());
+    let config_path = match diagnostics {
+        DiagnosticsState::Ready { report, .. } => report
+            .config_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        _ => None,
+    };
+
+    egui::Grid::new("settings_paths_grid")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.strong("Configuration path");
+            ui.horizontal(|ui| {
+                ui.label(config_path.as_deref().unwrap_or("unknown"));
+                if let Some(path) = &config_path
+                    && ui.small_button("Copy").clicked()
+                {
+                    let _ = clipboard.set_text(path.clone());
+                }
+            });
+            ui.end_row();
+
+            ui.strong("Database path");
+            ui.horizontal(|ui| {
+                ui.label(database_path.as_deref().unwrap_or("unknown"));
+                if let Some(path) = &database_path
+                    && ui.small_button("Copy").clicked()
+                {
+                    let _ = clipboard.set_text(path.clone());
+                }
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(8.0);
+    ui.label(
+        "Source folders are managed on the Sources page. Editable settings \
+         arrive with the Settings milestone of the redesign.",
+    );
 }
 
 fn history_entry_text(entry: &HistoryEntry) -> String {
@@ -21300,8 +21605,11 @@ mod tests {
     /// order, same enabled predicate) purely to discover each button's
     /// rendered `Rect` for click simulation. The production function
     /// itself only returns `Option<MainView>`, not per-button geometry;
-    /// egui's horizontal layout is fully deterministic from widget order
+    /// egui's vertical layout is fully deterministic from widget order
     /// and size alone, so this mirror's rects match the real function's.
+    /// Iterates the same `PRIMARY_NAVIGATION_DESTINATIONS` /
+    /// `SECONDARY_NAVIGATION_DESTINATIONS` consts production uses, so the
+    /// mirror cannot drift from the real destination list.
     /// The actual click below is driven through the real production
     /// function, not this mirror.
     fn primary_nav_rects(
@@ -21312,18 +21620,17 @@ mod tests {
         let mut rects = Vec::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for (view, label) in [
-                        (MainView::Library, "Library"),
-                        (MainView::Health, "Health"),
-                        (MainView::Duplicates, "Duplicates"),
-                        (MainView::Sources, "Sources"),
-                        (MainView::LibraryViews, "Library Views"),
-                    ] {
-                        let enabled = matches!(
-                            view,
-                            MainView::Library | MainView::Sources | MainView::LibraryViews
-                        ) || has_database;
+                ui.vertical(|ui| {
+                    for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
+                        let enabled = navigation_destination_enabled(view, has_database);
+                        let resp = ui
+                            .add_enabled(enabled, egui::Button::selectable(current == view, label));
+                        rects.push((view, resp.rect));
+                    }
+                    ui.separator();
+                    ui.label("Catalogue views");
+                    for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
+                        let enabled = navigation_destination_enabled(view, has_database);
                         let resp = ui
                             .add_enabled(enabled, egui::Button::selectable(current == view, label));
                         rects.push((view, resp.rect));
@@ -21335,15 +21642,14 @@ mod tests {
     }
 
     #[test]
-    fn all_four_primary_destinations_are_reachable_via_a_real_click() {
+    fn all_navigation_destinations_are_reachable_via_a_real_click() {
         let ctx = egui::Context::default();
 
-        for target in [
-            MainView::Library,
-            MainView::Health,
-            MainView::Duplicates,
-            MainView::Sources,
-        ] {
+        let all_destinations = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .chain(SECONDARY_NAVIGATION_DESTINATIONS.iter())
+            .map(|(view, _)| *view);
+        for target in all_destinations {
             let rects = primary_nav_rects(&ctx, MainView::Library, true);
             let target_rect = rects
                 .iter()

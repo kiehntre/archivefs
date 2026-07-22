@@ -166,12 +166,54 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## Next milestone
+## Campaign direction change (2026-07-22)
 
-Milestone 1 — GUI application-service foundation (typed `Command`/
-`CommandOutcome`/`ProgressEvent`, shared spawn-and-poll plumbing, and the
-mechanical `main.rs` → module split). See campaign plan §21–24 before
-starting.
+Per explicit operator instruction, the campaign switched from
+"foundation-first" (Milestone 1 module split + command envelope) to
+"feature-first": use the Claude Design export as the target interface,
+implement visible missing features directly, do **not** broadly refactor
+`main.rs`, and extract code only when a feature directly requires it.
+The Milestone 1 module split and Command/ProgressEvent envelope are
+deferred indefinitely unless a feature forces them.
+
+## Redesigned application shell (2026-07-22)
+
+Landed in commit "Add redesigned ArchiveFS application shell":
+
+- `MainView` extended with the redesign destinations `Mount`, `Selected`,
+  `ActiveMounts`, `Doctor`, `HistoryLogs`, `Settings`, `About` (existing
+  `Library`/`Health`/`Duplicates`/`Sources`/`LibraryViews` retained).
+- Navigation moved from a horizontal top row to a persistent left
+  `egui::SidePanel` rail (`show_primary_navigation`), driven by shared
+  `PRIMARY_NAVIGATION_DESTINATIONS` (the nine design screens, in design
+  order) and `SECONDARY_NAVIGATION_DESTINATIONS` (pre-redesign catalogue
+  views Health/Duplicates/Library Views, preserved under a "Catalogue
+  views" group). `navigation_destination_enabled` keeps the existing
+  Health/Duplicates disabled-until-database behaviour.
+- New destination content, reusing proven code wherever it exists:
+  Doctor = `show_doctor_checks_panel` as a full page; History & Logs =
+  full-screen `OperationHistory` listing (`show_history_logs_page`);
+  Active Mounts = read-only mounted-archive listing reusing
+  `pending_unmount_items` (`show_active_mounts_page`); Settings =
+  read-only paths page (`show_settings_page`); About = shared
+  `show_about_contents` (factored out of `show_about_window`, which now
+  delegates to it). Mount and Selected are honest interim pages routing
+  to the Library's proven panels; the redesigned Mount screen is the
+  next deliverable.
+- All `ToolsOverlay` overlays, menus, and existing workflows unchanged.
+- Tests: `primary_nav_rects` test mirror now iterates the same
+  destination consts as production (cannot drift); click-reachability
+  test extended to all twelve destinations and renamed
+  `all_navigation_destinations_are_reachable_via_a_real_click`.
+  Full `archivefs-gui` suite: 347 passed, 0 failed.
+
+## Next deliverable
+
+Redesigned Mount screen (destination preview against the design
+reference: `MountPlan`/`plan_mounts`/`safe_mount_name`, validation via
+`MountBatchTargetValidation`, collision handling via
+`MountBatchTargetSkipReason` — see capability matrix "Mount" rows;
+preview must never mount).
 
 ## Latest clean commit
 
