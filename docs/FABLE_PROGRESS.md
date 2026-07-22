@@ -1,5 +1,12 @@
 # Fable Integration Campaign — Progress Ledger
 
+> **Integrated GUI audit notice (2026-07-22):** This ledger records real
+> functional integration, but its use of “redesigned” is not a visual
+> acceptance result. The campaign did not inspect layout, spacing, hierarchy,
+> or interaction sequencing, and the integrated presentation was rejected as
+> release-ready. See `docs/INTEGRATED_GUI_AUDIT.md` for the adversarial audit
+> and rescue recommendations.
+
 This file is the durable, resumable record of the Fable/ArchiveFS GUI
 integration campaign. Future sessions must be able to resume from this file
 and Git history alone, without depending on prior conversation context.
