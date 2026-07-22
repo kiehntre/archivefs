@@ -26,6 +26,12 @@ If your own setup doesn't have a separate "Saltbox"-style machine, treat
 and adapt paths accordingly - the expected result is what matters, not the
 exact machine name.
 
+Section 27 (PCSX2) is conditional: it covers a read-only PCSX2 adapter
+implemented and validated on a separate branch that has **not** been
+merged into `sonnet-v0.5-release-prep`. Skip it - explicitly, on the
+sign-off checklist below, not silently - unless you are testing a build
+that actually contains that merge.
+
 Test with a small, disposable, non-important set of archives. Do not run
 this plan against your only copy of anything you cannot afford to lose,
 even though every action described here is documented as non-destructive.
@@ -602,9 +608,116 @@ display/window).
 
 ---
 
+## 27. PCSX2 read-only adapter (only after `codex-pcsx2-readonly-adapter` is merged)
+
+**Do not run this section against a build from `sonnet-v0.5-release-prep`
+as it stands today.** The PCSX2 read-only adapter described here has been
+implemented and validated on a separate branch,
+`codex-pcsx2-readonly-adapter`, and has **not** been merged into this
+branch. Run this section only once that merge has happened and you are
+testing a build that actually contains it - otherwise "PCSX2 does not
+appear" is expected, not a defect.
+
+- [ ] **Action (On Saltbox):** Build and prepare the merged branch/tag for
+      deployment to the Nobara test machine; no PCSX2-specific action is
+      needed on Saltbox beyond normal build/deploy.
+  - Expected: a build containing the merged PCSX2 adapter is available on
+    the Nobara desktop.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Launch the new build.
+  - Expected: the app starts normally with no new crash or hang introduced
+    by the PCSX2 code.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Confirm a PCSX2 installation (native
+      or Flatpak) is present on the test machine, with at least one
+      `cheats` or `cheats_ws` directory existing under its configuration
+      root.
+  - Expected: PCSX2's configuration directory and at least one patch
+    subdirectory exist and are readable.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Prepare a safe, disposable `.pnach`
+      fixture (or use an existing read-only one you don't mind ArchiveFS
+      reading) in that `cheats` directory - do not use anything
+      irreplaceable.
+  - Expected: the fixture file is present and readable before continuing.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Select a PlayStation 2 archive in
+      Library, then open **Cheats & Mods**.
+  - Expected: PCSX2 appears as the default adapter for this archive;
+    RetroArch remains separately selectable.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Select a non-PS2 archive (e.g. a
+      RetroArch-platform title) and open **Cheats & Mods**.
+  - Expected: PCSX2 does **not** appear for this archive - it is
+    PS2-only.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** With the PS2 archive selected, inspect
+      the listed PCSX2 profiles.
+  - Expected: eligible profiles are shown distinctly from blocked ones,
+    each blocked profile carrying a concrete, typed reason rather than a
+    vague "unavailable"; if exactly one profile is eligible it is
+    pre-selected, and if more than one is eligible you must choose
+    explicitly.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Inspect the selected profile's
+      `cheats` and `cheats_ws` path reporting.
+  - Expected: both configured paths are shown; a missing directory is
+    reported as missing/normal, not as an error, and is not created by
+    ArchiveFS as a side effect of viewing it.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Inspect the PNACH inventory for the
+      fixture file prepared above.
+  - Expected: the fixture appears with its filename-derived CRC/serial
+    candidate, category, size, and any warnings; nothing about the file
+    is modified by inspecting it.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** After the inspection above, check the
+      fixture file's modification time and contents in a terminal.
+  - Expected: unchanged from before ArchiveFS inspected it.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Read the match-state wording shown for
+      the fixture (exact / ambiguous / no-match / unavailable).
+  - Expected: the wording never claims an "exact match" unless a verified
+    PS2 executable CRC was supplied - in ArchiveFS's current state that
+    should not happen, so an exact-match claim here would itself be a
+    defect to report.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Look across the entire PCSX2 section
+      for any Install, Apply, Enable, Disable, Delete, Replace, Fix, or
+      rollback control.
+  - Expected: none exists. Every action available is inspection-only
+    (viewing, scanning, choosing a profile, choosing an archive).
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** With the PCSX2 inventory loaded for
+      archive A, switch to a different PS2 archive B in Library, then
+      switch back to A.
+  - Expected: B's inventory replaces A's cleanly; switching back to A
+    re-scans or restores A's own data - a stale result from A must never
+    be shown labelled as B's, or vice versa.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Before, during, and after the PCSX2
+      inspection above, check the Mount queue, Active Mounts, and the
+      selected archive's platform assignment in Library.
+  - Expected: none of these change as a side effect of opening Cheats &
+    Mods, choosing a PCSX2 profile, or inspecting PNACH files.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Resize the window to laptop
+      (~1280px), ~1536x864, and ultrawide widths with the PCSX2 section
+      open.
+  - Expected: the PCSX2 profile/PNACH content reflows the same way the
+    rest of Cheats & Mods does at each width, with no clipped or
+    inaccessible control.
+  - Failure notes:
+
+---
+
 ## Sign-off
 
-- [ ] All sections above completed.
+- [ ] Sections 1-26 completed.
+- [ ] Section 27 (PCSX2) completed **only if** `codex-pcsx2-readonly-adapter`
+      has been merged into the build under test; otherwise explicitly
+      marked "not applicable - PCSX2 not yet merged" rather than left
+      blank or skipped silently.
 - [ ] Every failure note either resolved or explicitly deferred with a
       linked issue/tracking note.
 - [ ] `docs/release-checklist.md`'s Code section re-run and green on the

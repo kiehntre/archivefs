@@ -24,7 +24,11 @@ for what's actually new and what remains unavailable, and
 [`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
 manual acceptance checklist. Nothing here has been tagged yet - the
 workspace version in `Cargo.toml` still reads `0.4.3-alpha` until that
-release-checklist step happens.
+release-checklist step happens. A read-only PCSX2 profile/PNACH
+inspection adapter has separately been implemented and validated but is
+**not yet merged into this branch**; see the release notes' "PCSX2
+read-only adapter" section before assuming it is present in any build
+from this branch today.
 
 ## Principles
 

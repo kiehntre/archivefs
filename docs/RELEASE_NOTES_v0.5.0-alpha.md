@@ -97,6 +97,60 @@ install from that journal, and `retroarch-cheat-history` /
 `retroarch-cheat-inspect` give read-only history and single-run inspection.
 None of this is reachable from the GUI yet - see Known limitations.
 
+### PCSX2 read-only adapter (implemented, pending merge into this branch)
+
+A read-only PCSX2 adapter for Cheats & Mods has been implemented and
+validated on the separate `codex-pcsx2-readonly-adapter` branch. **It has
+not been merged into this branch and is not part of any build produced
+from `sonnet-v0.5-release-prep` today.** It is documented here so the
+release notes are accurate once the merge happens; nothing below should be
+read as available in the current branch.
+
+Once merged, it is a **read-only inspection foundation**, not a complete
+cheat manager - it does not install cheats, apply mods, or change any
+PCSX2 file:
+
+- Discovers native, Flatpak-user, and Flatpak-system PCSX2 profiles, plus
+  an explicitly supplied portable/AppImage configuration root (never
+  auto-searched). A profile is eligible only with an absolute, non-root,
+  symlink-free path, a readable directory, and PCSX2-specific
+  configuration evidence; ineligible profiles remain visible with a typed
+  blocker reason.
+- Inspects the `cheats`, `cheats_ws` (widescreen patches), and `patches`
+  directories where present, reporting a missing directory normally
+  rather than creating one.
+- Parses existing `.pnach` files read-only (path, filename-derived CRC/
+  serial candidates, title/region/comment fields, enabled/disabled/
+  unknown syntax counts, category, size, SHA-256, duplicate detection,
+  and malformed-syntax warnings), opening files with `O_NOFOLLOW` and
+  skipping symlinks and special files.
+- Supports exact CRC matching **only** when given a separately verified
+  PCSX2 executable CRC. ArchiveFS's current archive records do not
+  contain one, so the GUI never claims an exact match and never guesses a
+  CRC from a filename; it reports exact, ambiguous, unavailable, or
+  no-match states truthfully instead.
+- In the GUI, PCSX2 appears only for PS2 archives and defaults a PS2
+  context to the PCSX2 adapter without changing queue, mount, selection,
+  or platform state; RetroArch remains independently selectable. A single
+  eligible profile may be auto-selected; multiple eligible profiles
+  require an explicit choice. No Install, Apply, Enable, Disable, Delete,
+  Replace, Fix, or rollback control exists.
+- No PCSX2 file is written, copied, renamed, deleted, generated, or
+  sanitized; nothing is uploaded; there is no telemetry, no network
+  retrieval path in this adapter, and PCSX2/imported content is never
+  executed.
+
+Validated with 15 focused core tests and 4 GUI tests on that branch,
+reported alongside a full `cargo fmt`/`clippy -D warnings`/
+`cargo test --workspace` (1,348 tests: CLI 127, core 822, GUI 399) pass
+and a successful release build.
+
+Deferred even once merged: verified PS2 executable-CRC extraction (no
+bounded ISO/CHD/CSO identity reader yet), any preview/installation/
+conflict-resolution/backup/journal/rollback/enable/disable workflow, and
+automatic discovery of AppImage/portable configuration roots (an exact
+root must be supplied by a trusted caller).
+
 ### Trusted cheat-catalogue retrieval and cache maintenance
 
 `retroarch-cheat-source-list` / `-fetch` / `-inspect` retrieve from a fixed,
@@ -147,7 +201,9 @@ across every process sharing that cache.
 | Local/community import inspection | Not implemented anywhere |
 | Arbitrary remote sources | Not accepted anywhere |
 | Mod installation, mod adapters | Not implemented anywhere |
-| PCSX2 read-only adapter | Under separate, parallel development; not part of this release |
+| PCSX2 read-only profile/PNACH inspection | Implemented and validated on branch `codex-pcsx2-readonly-adapter`; **not yet merged into this branch** |
+| PCSX2 exact CRC matching | Deferred - requires a verified PS2 executable CRC, which ArchiveFS does not yet have |
+| PCSX2 installation, rollback, mutation of any kind | Not implemented anywhere |
 
 ## Privacy and safety model
 
@@ -192,9 +248,12 @@ across every process sharing that cache.
   session only; it is not persisted across restarts.
 - Settings is read-only for backend-supported configuration; there is no
   editable appearance/density setting and no update-check mechanism.
-- A read-only PCSX2 adapter is being developed in parallel and is not part
-  of this release; PCSX2 support here remains limited to the existing
-  read-only patch-preview.
+- A read-only PCSX2 adapter has been implemented and validated on a
+  separate branch (see "PCSX2 read-only adapter" above) but has not been
+  merged into this branch; PCSX2 support here remains limited to the
+  existing read-only patch-preview until that merge happens. Once merged,
+  it remains a read-only inspection foundation - it will not install
+  cheats or apply mods.
 - This is alpha software. See [`CHANGELOG.md`](../CHANGELOG.md) for the
   full, itemized list of what changed.
 
