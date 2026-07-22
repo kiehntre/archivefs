@@ -2423,6 +2423,12 @@ enum ToolsOverlay {
     DatabaseStatus,
     DoctorChecks,
     ArchiveInspector,
+    /// The staged RetroArch cheat workflow. Like `ArchiveInspector`,
+    /// never reached from the Tools menu: only the Selected screen's
+    /// "RetroArch Cheats" entry (or the Library row context menu) opens
+    /// it, for exactly one selected archive, and its state lives in
+    /// `ArchiveFsApp::cheat_workflow`.
+    RetroArchCheats,
 }
 
 /// The Archive Inspector's column/sort choices - path (its exact stored
@@ -2635,6 +2641,10 @@ struct ArchiveFsApp {
     /// scanned automatically - filesystem probing only happens on an
     /// explicit "Scan/Rescan Profiles" click.
     retroarch_profiles: RetroArchProfilesState,
+    /// The RetroArch cheat workflow, when open - see
+    /// `CheatWorkflowState`. `Some` only while
+    /// `ToolsOverlay::RetroArchCheats` is (or was just) showing.
+    cheat_workflow: Option<CheatWorkflowState>,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2855,6 +2865,7 @@ impl ArchiveFsApp {
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            cheat_workflow: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -4402,7 +4413,76 @@ impl ArchiveFsApp {
                 self.view = MainView::Mount;
                 self.tools_overlay = ToolsOverlay::None;
             }
+            Some(MountPageAction::OpenCheatWorkflow(archive_path)) => {
+                self.open_cheat_workflow(archive_path);
+            }
+            Some(MountPageAction::ScanRetroArchProfiles) => {
+                self.start_retroarch_profile_scan(context.clone());
+            }
             None => {}
+        }
+    }
+
+    /// Opens the RetroArch cheat workflow for exactly one archive,
+    /// replacing any previous workflow state wholesale. Identity and
+    /// display details are copied from the live record at open time;
+    /// the single eligible profile is preselected only when it is the
+    /// only one (the CLI's own auto-selection rule).
+    fn open_cheat_workflow(&mut self, archive_path: PathBuf) {
+        let record_details = match &self.state {
+            LoadState::Ready(data) => data
+                .records
+                .iter()
+                .find(|record| record.mount_plan.archive.path == archive_path)
+                .map(|record| {
+                    (
+                        record.identity.display_name.clone(),
+                        record.identity.platform.clone(),
+                        record.identity.source_root.clone(),
+                        record.identity.size_bytes,
+                    )
+                }),
+            _ => None,
+        };
+        let Some((display_name, platform, source_root, size_bytes)) = record_details else {
+            return;
+        };
+        let selected_profile_id = match &self.retroarch_profiles {
+            RetroArchProfilesState::Ready(discovery) => {
+                let eligible = eligible_profile_ids(discovery);
+                if eligible.len() == 1 {
+                    Some(eligible[0].to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.cheat_workflow = Some(CheatWorkflowState {
+            archive_path,
+            display_name,
+            platform,
+            source_root,
+            size_bytes,
+            selected_profile_id,
+        });
+        self.tools_overlay = ToolsOverlay::RetroArchCheats;
+    }
+
+    /// The cheat workflow is keyed to the canonical selected archive.
+    /// If that identity changes (or the selection is cleared) while the
+    /// workflow is open, close the workflow rather than carry on
+    /// against a stale archive. Never touches the selection itself.
+    fn close_cheat_workflow_if_selection_changed(&mut self) {
+        if self.tools_overlay != ToolsOverlay::RetroArchCheats {
+            return;
+        }
+        let workflow_matches_selection = self.cheat_workflow.as_ref().is_some_and(|workflow| {
+            self.selected_archive.as_deref() == Some(workflow.archive_path.as_path())
+        });
+        if !workflow_matches_selection {
+            self.tools_overlay = ToolsOverlay::None;
+            self.cheat_workflow = None;
         }
     }
 
@@ -5049,6 +5129,9 @@ enum AppOperationRequest {
     /// *previously run* preview already said about this archive, since
     /// jumping pages must never bypass Preview's own safety gate.
     ShowInLibraryViews(PathBuf),
+    /// Opens the RetroArch cheat workflow for this exact archive - see
+    /// `ArchiveFsApp::open_cheat_workflow`.
+    OpenCheatWorkflow(PathBuf),
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -5372,6 +5455,8 @@ impl eframe::App for ArchiveFsApp {
         let mut stop_mount_all = false;
         let mut stop_unmount_all = false;
         egui::CentralPanel::default().show(context, |ui| {
+            self.close_cheat_workflow_if_selection_changed();
+
             if self.tools_overlay != ToolsOverlay::None {
                 match self.tools_overlay {
                     ToolsOverlay::Diagnostics => {
@@ -5435,6 +5520,28 @@ impl eframe::App for ArchiveFsApp {
                             && show_archive_inspector_panel(ui, inspector, &mut self.clipboard)
                         {
                             self.tools_overlay = ToolsOverlay::None;
+                        }
+                    }
+                    ToolsOverlay::RetroArchCheats => {
+                        if show_tools_overlay_header(ui, "RetroArch Cheats") {
+                            self.tools_overlay = ToolsOverlay::None;
+                            self.cheat_workflow = None;
+                        }
+                        if let Some(workflow) = self.cheat_workflow.as_mut() {
+                            let action = show_cheat_workflow_step1(
+                                ui,
+                                workflow,
+                                &self.retroarch_profiles,
+                                busy,
+                            );
+                            match action {
+                                Some(CheatWorkflowAction::RescanProfiles) => {
+                                    self.start_retroarch_profile_scan(context.clone());
+                                }
+                                None => {}
+                            }
+                        } else {
+                            ui.label("No archive is selected for cheat setup.");
                         }
                     }
                     ToolsOverlay::None => unreachable!(),
@@ -5639,6 +5746,9 @@ impl eframe::App for ArchiveFsApp {
                     ui,
                     live,
                     self.mount_all_result.as_ref(),
+                    self.selected_archive.as_deref(),
+                    self.selected_archives.len(),
+                    &self.retroarch_profiles,
                     &mut self.mount_queue,
                     &mut self.confirm_mount_queue,
                     archive_actions_blocked,
@@ -5860,6 +5970,7 @@ impl eframe::App for ArchiveFsApp {
                                                     busy: true,
                                                     block_reason: None,
                                                     platform_busy: false,
+                                                    retroarch_profiles: &self.retroarch_profiles,
                                                     library_views_configured: false,
                                                     library_view_last_plan: None,
                                                 },
@@ -5913,6 +6024,7 @@ impl eframe::App for ArchiveFsApp {
                             platform_choice: &mut self.platform_choice,
                             platform_custom_text: &mut self.platform_custom_text,
                             platform_busy: self.platform_action.is_some(),
+                            retroarch_profiles: &self.retroarch_profiles,
                             selected_archives: &mut self.selected_archives,
                             bulk_platform_choice: &mut self.bulk_platform_choice,
                             bulk_platform_busy: self.bulk_platform_action.is_some(),
@@ -6048,6 +6160,9 @@ impl eframe::App for ArchiveFsApp {
                 AppOperationRequest::ShowInLibraryViews(archive_path) => {
                     self.view = MainView::LibraryViews;
                     self.library_view_focus_archive = Some(archive_path);
+                }
+                AppOperationRequest::OpenCheatWorkflow(archive_path) => {
+                    self.open_cheat_workflow(archive_path);
                 }
             }
         }
@@ -8862,6 +8977,13 @@ enum MountPageAction {
     /// Navigate to the Mount page (the Selected page's empty-queue
     /// affordance).
     GoToMount,
+    /// Open the RetroArch cheat workflow for this exact archive (the
+    /// Selected page's entry point; only offered when
+    /// `cheat_entry_blocker` returns `None`).
+    OpenCheatWorkflow(PathBuf),
+    /// Start the shared background RetroArch profile scan from the
+    /// Selected page's entry section.
+    ScanRetroArchProfiles,
 }
 
 /// What the user chose in the shared mount-queue confirmation strip.
@@ -8926,6 +9048,9 @@ fn show_selected_page(
     ui: &mut egui::Ui,
     live: Option<&LoadedData>,
     mount_all_result: Option<&MountAllResult>,
+    selected_archive: Option<&Path>,
+    selected_count: usize,
+    retroarch_profiles: &RetroArchProfilesState,
     queue: &mut Vec<PathBuf>,
     confirm: &mut bool,
     busy: bool,
@@ -8938,9 +9063,55 @@ fn show_selected_page(
         show_mount_all_result(ui, result);
         ui.separator();
     }
+
+    ui.strong("Selected archive");
+    match selected_archive {
+        Some(path) => {
+            ui.add(
+                egui::Label::new(path.display().to_string())
+                    .selectable(true)
+                    .wrap(),
+            );
+        }
+        None => {
+            ui.label("No archive is selected in the Library.");
+        }
+    }
+    let entry_blocker = cheat_entry_blocker(
+        selected_archive,
+        selected_count,
+        live.map(|data| data.records.as_slice()),
+        retroarch_profiles,
+    );
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                entry_blocker.is_none() && !busy,
+                egui::Button::new("RetroArch Cheats"),
+            )
+            .clicked()
+            && let Some(path) = selected_archive
+        {
+            action = Some(MountPageAction::OpenCheatWorkflow(path.to_path_buf()));
+        }
+        if matches!(
+            retroarch_profiles,
+            RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
+        ) && ui
+            .add_enabled(!busy, egui::Button::new("Scan for RetroArch profiles"))
+            .clicked()
+        {
+            action = Some(MountPageAction::ScanRetroArchProfiles);
+        }
+    });
+    if let Some(reason) = entry_blocker {
+        ui.label(reason);
+    }
+    ui.separator();
+
     let Some(data) = live else {
         ui.label("Live mount state is not loaded yet.");
-        return None;
+        return action;
     };
     prune_mount_queue(queue, &data.records);
     if queue.is_empty() {
@@ -9518,6 +9689,200 @@ fn show_history_logs_page(
 /// currently read-only information (campaign constraint: prototype-only
 /// settings such as UI density are deferred; editable settings arrive
 /// with the settings-integration milestone).
+/// The RetroArch cheat workflow's identity and staged state. Created
+/// only from the Selected screen (or the Library row context menu) for
+/// exactly one archive; replaced wholesale on every open (the
+/// `ArchiveInspectorState` precedent) and dropped when the workflow
+/// closes or the canonical selected archive changes, so stray state can
+/// never leak between archives.
+struct CheatWorkflowState {
+    /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
+    /// .path` identity the rest of the app uses, never a filename.
+    archive_path: PathBuf,
+    display_name: String,
+    platform: Option<String>,
+    source_root: PathBuf,
+    size_bytes: Option<u64>,
+    /// The explicitly selected profile. Preselected only when exactly
+    /// one eligible profile exists (the CLI's own auto-selection rule);
+    /// with several eligible profiles the user must choose - never
+    /// silently picked.
+    selected_profile_id: Option<String>,
+}
+
+/// What the cheat workflow panel asks `update` to do.
+enum CheatWorkflowAction {
+    RescanProfiles,
+}
+
+/// Why the Selected screen's "RetroArch Cheats" entry point is
+/// unavailable, or `None` when it can truthfully be offered. Pure, so
+/// every gating rule is unit-testable.
+fn cheat_entry_blocker(
+    selected_archive: Option<&Path>,
+    selected_count: usize,
+    live_records: Option<&[ArchiveRecord]>,
+    profiles: &RetroArchProfilesState,
+) -> Option<&'static str> {
+    let Some(path) = selected_archive else {
+        return Some("Select exactly one archive in the Library first.");
+    };
+    if selected_count > 1 {
+        return Some(
+            "RetroArch cheat setup works on exactly one archive; reduce the selection to one.",
+        );
+    }
+    let Some(records) = live_records else {
+        return Some("The live snapshot is still loading.");
+    };
+    if !records
+        .iter()
+        .any(|record| record.mount_plan.archive.path == path)
+    {
+        return Some("The selected archive is no longer present in the live snapshot.");
+    }
+    match profiles {
+        RetroArchProfilesState::NotScanned => Some("RetroArch profiles have not been scanned yet."),
+        RetroArchProfilesState::Scanning { .. } => {
+            Some("The RetroArch profile scan is still running.")
+        }
+        RetroArchProfilesState::Error(_) => {
+            Some("RetroArch profile discovery failed; rescan profiles.")
+        }
+        RetroArchProfilesState::Ready(discovery) => {
+            if discovery.profiles.iter().any(|profile| profile.eligible) {
+                None
+            } else {
+                Some("No eligible RetroArch profile was found.")
+            }
+        }
+    }
+}
+
+/// The eligible profile IDs in a discovery, in discovery order.
+fn eligible_profile_ids(discovery: &RetroArchCheatSetupDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+/// Step 1 of the cheat workflow: archive identity plus explicit profile
+/// selection. Renders from the shared `RetroArchProfilesState` (the
+/// same discovery the Settings page shows) and mutates only the
+/// workflow's own `selected_profile_id`. A selection that no longer
+/// exists in the current discovery (profile vanished on rescan) is
+/// cleared here rather than silently kept.
+fn show_cheat_workflow_step1(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+    busy: bool,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.strong("Step 1 — Archive and profile");
+    ui.add_space(4.0);
+    egui::Grid::new("cheat_workflow_archive_grid")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.strong("Archive");
+            ui.add(
+                egui::Label::new(workflow.archive_path.display().to_string())
+                    .selectable(true)
+                    .wrap(),
+            );
+            ui.end_row();
+            ui.strong("Name");
+            ui.label(&workflow.display_name);
+            ui.end_row();
+            ui.strong("Platform");
+            ui.label(workflow.platform.as_deref().unwrap_or("Unknown"));
+            ui.end_row();
+            ui.strong("Source root");
+            ui.add(
+                egui::Label::new(workflow.source_root.display().to_string())
+                    .selectable(true)
+                    .wrap(),
+            );
+            ui.end_row();
+            ui.strong("Size");
+            ui.label(format_size(workflow.size_bytes));
+            ui.end_row();
+        });
+    ui.add_space(8.0);
+    ui.strong("RetroArch profile");
+    match profiles {
+        RetroArchProfilesState::NotScanned => {
+            ui.label("Profiles have not been scanned yet.");
+        }
+        RetroArchProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning for RetroArch profiles...");
+            });
+        }
+        RetroArchProfilesState::Error(message) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Profile discovery failed: {message}"),
+            );
+        }
+        RetroArchProfilesState::Ready(discovery) => {
+            let eligible = eligible_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_profile_id = None;
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "The previously selected profile is no longer eligible; choose again.",
+                );
+            }
+            if eligible.is_empty() {
+                ui.label("No eligible RetroArch profile was found.");
+            } else if eligible.len() > 1 && workflow.selected_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. ArchiveFS never silently picks \
+                     between them — choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                ui.horizontal(|ui| {
+                    if profile.eligible {
+                        let selected =
+                            workflow.selected_profile_id.as_deref() == Some(&profile.profile_id);
+                        if ui.radio(selected, &profile.profile_id).clicked() {
+                            workflow.selected_profile_id = Some(profile.profile_id.clone());
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::selectable(false, &profile.profile_id));
+                        ui.colored_label(ui.visuals().warn_fg_color, "Blocked");
+                    }
+                    ui.label(format!(
+                        "{} / {}",
+                        profile_kind_label(&profile.installation_type),
+                        profile_scope_label(&profile.scope)
+                    ));
+                });
+                for blocker in &profile.blockers {
+                    ui.label(format!("    {} — {}", blocker.code, blocker.detail));
+                }
+            }
+        }
+    }
+    ui.add_space(4.0);
+    if ui
+        .add_enabled(!busy, egui::Button::new("Rescan Profiles"))
+        .clicked()
+    {
+        action = Some(CheatWorkflowAction::RescanProfiles);
+    }
+    action
+}
+
 /// The Settings page's RetroArch profile discovery state - mirrors
 /// `DiagnosticsState`'s Loading-holds-its-own-receiver shape. Discovery
 /// is blocking filesystem probing, so it always runs on a background
@@ -11280,6 +11645,10 @@ struct LoadedViewState<'a> {
     platform_choice: &'a mut Option<String>,
     platform_custom_text: &'a mut String,
     platform_busy: bool,
+    /// Shared RetroArch profile discovery state - gates the row context
+    /// menu's "RetroArch Cheats" entry exactly like the Selected page's
+    /// button (`cheat_entry_blocker` is the single source of truth).
+    retroarch_profiles: &'a RetroArchProfilesState,
     selected_archives: &'a mut HashSet<PathBuf>,
     bulk_platform_choice: &'a mut Option<String>,
     bulk_platform_busy: bool,
@@ -11400,6 +11769,7 @@ fn show_loaded_data(
         platform_choice,
         platform_custom_text,
         platform_busy,
+        retroarch_profiles,
         selected_archives,
         bulk_platform_choice,
         bulk_platform_busy,
@@ -12223,6 +12593,7 @@ fn show_loaded_data(
                 busy,
                 block_reason,
                 platform_busy,
+                retroarch_profiles,
                 library_views_configured,
                 library_view_last_plan,
             };
@@ -12351,6 +12722,10 @@ fn show_loaded_data(
                     RowContextMenuAction::ShowInLibraryViews(archive_path) => {
                         requested_action =
                             Some(AppOperationRequest::ShowInLibraryViews(archive_path));
+                    }
+                    RowContextMenuAction::RetroArchCheats(archive_path) => {
+                        requested_action =
+                            Some(AppOperationRequest::OpenCheatWorkflow(archive_path));
                     }
                     RowContextMenuAction::ClearSelection => {
                         selected_archives.clear();
@@ -12719,6 +13094,9 @@ enum RowContextMenuAction {
     /// "Show in Library View preview" - see
     /// `AppOperationRequest::ShowInLibraryViews`'s doc comment.
     ShowInLibraryViews(PathBuf),
+    /// Open the RetroArch cheat workflow for this exact archive - same
+    /// gating as the Selected page's entry (`cheat_entry_blocker`).
+    RetroArchCheats(PathBuf),
     ClearSelection,
 }
 
@@ -12732,6 +13110,9 @@ struct RowMenuContext<'a> {
     busy: bool,
     block_reason: Option<&'static str>,
     platform_busy: bool,
+    /// See `LoadedViewState::retroarch_profiles` - same single source
+    /// of truth for the "RetroArch Cheats" context entry.
+    retroarch_profiles: &'a RetroArchProfilesState,
     /// Whether any Library View is configured at all - gates "Show in
     /// Library View preview" (milestone Section 8: "only if a view
     /// exists").
@@ -12871,6 +13252,28 @@ fn show_single_row_context_menu(
     };
     if inspect_button.clicked() {
         action = Some(RowContextMenuAction::Inspect(row.path.clone()));
+        ui.close();
+    }
+
+    // Same gating as the Selected page's entry button - this menu only
+    // renders for a single-row selection, so the count is truthfully 1.
+    let cheat_blocker = cheat_entry_blocker(
+        Some(&row.path),
+        1,
+        Some(ctx.records),
+        ctx.retroarch_profiles,
+    );
+    let cheat_button = ui.add_enabled(
+        cheat_blocker.is_none(),
+        egui::Button::new("RetroArch Cheats"),
+    );
+    let cheat_button = if let Some(reason) = cheat_blocker {
+        cheat_button.on_disabled_hover_text(reason)
+    } else {
+        cheat_button
+    };
+    if cheat_button.clicked() {
+        action = Some(RowContextMenuAction::RetroArchCheats(row.path.clone()));
         ui.close();
     }
 
@@ -14651,6 +15054,12 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::emulator_environment::EncodedPath;
+    use archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport;
+    use archivefs_core::patch_manager::{
+        RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupProfile,
+        RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState,
+    };
     use archivefs_core::{
         Archive, ArchiveHealth, ArchiveMetadata, DoctorCheck, LibraryViewPlanCounts, MountPlan,
         SetupDiagnostic, SourceScanStatus, classify_entry,
@@ -14819,6 +15228,229 @@ mod tests {
         assert_eq!(
             mount_validation_label(MountState::MountPathExists),
             "Destination already exists — will be skipped"
+        );
+    }
+
+    fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
+        RetroArchCheatSetupProfile {
+            profile_id: profile_id.to_string(),
+            installation_type: ProfileKind::Native,
+            scope: ProfileScope::User,
+            state: if eligible {
+                RetroArchCheatSetupProfileState::Eligible
+            } else {
+                RetroArchCheatSetupProfileState::Ineligible
+            },
+            eligible,
+            executable_evidence: Vec::new(),
+            configuration_path: EncodedPath::from_path(Path::new("/isolated/retroarch.cfg")),
+            cheat_destination_root: eligible
+                .then(|| EncodedPath::from_path(Path::new("/isolated/cheats"))),
+            blockers: if eligible {
+                Vec::new()
+            } else {
+                vec![RetroArchCheatSetupProfileBlocker {
+                    code: "cheats_destination_unresolved".to_string(),
+                    detail: "no resolved cheats destination".to_string(),
+                }]
+            },
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn cheat_discovery(profiles: Vec<RetroArchCheatSetupProfile>) -> RetroArchCheatSetupDiscovery {
+        RetroArchCheatSetupDiscovery {
+            schema_version: RETROARCH_CHEAT_SETUP_SCHEMA_VERSION,
+            profiles,
+            diagnostics: Vec::new(),
+            environment: RetroArchEnvironmentReport {
+                format_version: 1,
+                profiles: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn cheat_entry_is_offered_only_for_one_existing_archive_with_an_eligible_profile() {
+        let records = vec![record("/roms/a.zip", MountState::Pending)];
+        let ready = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+            "native-user",
+            true,
+        )]));
+        let path = Some(Path::new("/roms/a.zip"));
+
+        assert_eq!(cheat_entry_blocker(path, 1, Some(&records), &ready), None);
+
+        assert!(cheat_entry_blocker(None, 0, Some(&records), &ready).is_some());
+        assert!(
+            cheat_entry_blocker(path, 2, Some(&records), &ready).is_some(),
+            "a multi-selection must disable the entry"
+        );
+        assert!(
+            cheat_entry_blocker(Some(Path::new("/roms/gone.zip")), 1, Some(&records), &ready)
+                .is_some(),
+            "an archive missing from the live snapshot must disable the entry"
+        );
+        assert!(cheat_entry_blocker(path, 1, None, &ready).is_some());
+        assert!(
+            cheat_entry_blocker(path, 1, Some(&records), &RetroArchProfilesState::NotScanned)
+                .is_some()
+        );
+        let (_sender, receiver) = mpsc::channel();
+        assert!(
+            cheat_entry_blocker(
+                path,
+                1,
+                Some(&records),
+                &RetroArchProfilesState::Scanning { receiver }
+            )
+            .is_some()
+        );
+        assert!(
+            cheat_entry_blocker(
+                path,
+                1,
+                Some(&records),
+                &RetroArchProfilesState::Error("boom".to_string())
+            )
+            .is_some()
+        );
+        let no_eligible = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+            "blocked-profile",
+            false,
+        )]));
+        assert!(
+            cheat_entry_blocker(path, 1, Some(&records), &no_eligible).is_some(),
+            "a discovery with no eligible profile must disable the entry"
+        );
+    }
+
+    #[test]
+    fn open_cheat_workflow_preselects_only_a_single_eligible_profile() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+
+        // Two eligible profiles: no silent choice.
+        app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+            cheat_profile("native-user", true),
+            cheat_profile("flatpak-user", true),
+        ]));
+        app.open_cheat_workflow(PathBuf::from("/roms/a.zip"));
+        let workflow = app.cheat_workflow.as_ref().expect("workflow must open");
+        assert_eq!(workflow.selected_profile_id, None);
+        assert_eq!(app.tools_overlay, ToolsOverlay::RetroArchCheats);
+
+        // Exactly one eligible profile: preselected (the CLI's rule).
+        app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+            cheat_profile("native-user", true),
+            cheat_profile("blocked-profile", false),
+        ]));
+        app.open_cheat_workflow(PathBuf::from("/roms/a.zip"));
+        let workflow = app.cheat_workflow.as_ref().expect("workflow must reopen");
+        assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
+
+        // Opening for an archive missing from the snapshot does nothing.
+        app.cheat_workflow = None;
+        app.open_cheat_workflow(PathBuf::from("/roms/gone.zip"));
+        assert!(app.cheat_workflow.is_none());
+    }
+
+    #[test]
+    fn cheat_workflow_open_and_close_never_alter_the_selection() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.retroarch_profiles =
+            RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+                "native-user",
+                true,
+            )]));
+
+        app.open_cheat_workflow(PathBuf::from("/roms/a.zip"));
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(Path::new("/roms/a.zip"))
+        );
+        assert_eq!(app.selected_archives.len(), 1);
+
+        // Matching selection: the workflow stays open.
+        app.close_cheat_workflow_if_selection_changed();
+        assert!(app.cheat_workflow.is_some());
+        assert_eq!(app.tools_overlay, ToolsOverlay::RetroArchCheats);
+
+        // Selection changed: the workflow closes, the selection stays.
+        app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
+        app.close_cheat_workflow_if_selection_changed();
+        assert!(app.cheat_workflow.is_none());
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(Path::new("/roms/other.zip"))
+        );
+        assert_eq!(app.selected_archives.len(), 1);
+    }
+
+    #[test]
+    fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
+        let ctx = egui::Context::default();
+        let mut workflow = CheatWorkflowState {
+            archive_path: PathBuf::from("/roms/a.zip"),
+            display_name: "a".to_string(),
+            platform: None,
+            source_root: PathBuf::from("/roms"),
+            size_bytes: None,
+            selected_profile_id: None,
+        };
+
+        // Ineligible profile: blocker code and detail are rendered.
+        let profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+            "blocked-profile",
+            false,
+        )]));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_workflow_step1(ui, &mut workflow, &profiles, false);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Blocked"));
+        assert!(rendered_text_contains(
+            &output,
+            "cheats_destination_unresolved"
+        ));
+
+        // Two eligible profiles: explicit-choice message, no selection.
+        let profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+            cheat_profile("native-user", true),
+            cheat_profile("flatpak-user", true),
+        ]));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_workflow_step1(ui, &mut workflow, &profiles, false);
+            });
+        });
+        assert!(rendered_text_contains(&output, "never silently picks"));
+        assert_eq!(workflow.selected_profile_id, None);
+
+        // A previously selected profile that vanished is cleared, not kept.
+        workflow.selected_profile_id = Some("gone-profile".to_string());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_workflow_step1(ui, &mut workflow, &profiles, false);
+            });
+        });
+        assert_eq!(
+            workflow.selected_profile_id, None,
+            "a stale profile selection must be cleared, never silently kept"
         );
     }
 
@@ -15116,6 +15748,7 @@ mod tests {
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            cheat_workflow: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -20310,6 +20943,7 @@ mod tests {
                             platform_choice: &mut platform_choice,
                             platform_custom_text: &mut platform_custom_text,
                             platform_busy: false,
+                            retroarch_profiles: &RetroArchProfilesState::NotScanned,
                             selected_archives: &mut self.selected_archives,
                             bulk_platform_choice: &mut bulk_platform_choice,
                             bulk_platform_busy: false,
@@ -23379,6 +24013,7 @@ mod tests {
                         platform_choice: &mut platform_choice,
                         platform_custom_text: &mut platform_custom_text,
                         platform_busy: false,
+                        retroarch_profiles: &RetroArchProfilesState::NotScanned,
                         selected_archives,
                         bulk_platform_choice: &mut bulk_platform_choice,
                         bulk_platform_busy: false,
@@ -25984,6 +26619,7 @@ mod tests {
             busy: false,
             block_reason: None,
             platform_busy: false,
+            retroarch_profiles: &RetroArchProfilesState::NotScanned,
             library_views_configured: false,
             library_view_last_plan: None,
         }
@@ -26012,6 +26648,7 @@ mod tests {
             busy: false,
             block_reason: None,
             platform_busy: false,
+            retroarch_profiles: &RetroArchProfilesState::NotScanned,
             library_views_configured: false,
             library_view_last_plan: None,
         };
@@ -26179,6 +26816,7 @@ mod tests {
             busy: true,
             block_reason: Some(reason),
             platform_busy: false,
+            retroarch_profiles: &RetroArchProfilesState::NotScanned,
             library_views_configured: false,
             library_view_last_plan: None,
         };
@@ -27193,6 +27831,7 @@ mod tests {
                         platform_choice: &mut platform_choice,
                         platform_custom_text: &mut platform_custom_text,
                         platform_busy: false,
+                        retroarch_profiles: &RetroArchProfilesState::NotScanned,
                         selected_archives: &mut selected_archives,
                         bulk_platform_choice: &mut bulk_platform_choice,
                         bulk_platform_busy: false,

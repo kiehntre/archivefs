@@ -1092,8 +1092,8 @@
     "Every RetroArchCheatSetupProfileBlocker variant has a corresponding user-facing message"
    ],
    "required_tests": [],
-   "status": "not_started",
-   "evidence": "",
+   "status": "in_progress",
+   "evidence": "Cheat workflow Step 1 (show_cheat_workflow_step1): explicit profile selection among eligible profiles (radio), single-eligible preselection matching the CLI rule, blocker code+detail lines for ineligible profiles, stale selection cleared when the profile vanishes on rescan. Entry gating via cheat_entry_blocker (pure, tested) on the Selected page and the Library row context menu; workflow closes if the canonical selected archive changes (close_cheat_workflow_if_selection_changed, tested). Selection itself is never altered by open/close (tested).",
    "implementation_commit": null,
    "notes": ""
   },

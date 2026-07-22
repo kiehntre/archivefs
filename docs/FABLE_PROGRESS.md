@@ -380,16 +380,50 @@ first RetroArch surface in the GUI:
   filter list).
 - Tests: 358 passed, 0 failed.
 
+## RetroArch cheat vertical — placement decision (2026-07-22)
+
+Operator decision: the cheat workflow lives inside the
+Selected-archive experience. The Selected screen (plus the Library
+row context menu) is the only entry point; the workflow itself renders
+as `ToolsOverlay::RetroArchCheats` — the `ArchiveInspector` precedent
+(a full-panel overlay reachable only from the selected archive, never
+from the Tools menu). No new primary navigation destination.
+
+## Cheat workflow — Step 1, entry point (2026-07-22)
+
+Landed in commit "Add RetroArch cheat workflow to Selected archives":
+
+- `CheatWorkflowState`: workflow identity keyed to the exact archive
+  path (never filename), replaced wholesale on open, dropped on close.
+- `cheat_entry_blocker` (pure, tested): entry offered only for exactly
+  one selected archive that still exists in the live snapshot with at
+  least one eligible RetroArch profile; every other state yields a
+  concise reason shown under the disabled button/menu item.
+- Entry points: "RetroArch Cheats" on the Selected page (with a
+  scan-profiles affordance when discovery hasn't run) and the same
+  gated action on the Library single-row context menu
+  (`RowContextMenuAction::RetroArchCheats` →
+  `AppOperationRequest::OpenCheatWorkflow`). Multi-selection semantics
+  untouched.
+- Step 1 (`show_cheat_workflow_step1`): archive identity grid (path,
+  name, platform, source root, size), shared profile discovery state,
+  explicit profile choice when several are eligible ("ArchiveFS never
+  silently picks"), single-eligible preselection matching the CLI
+  rule, blocker code+detail for ineligible profiles, stale profile
+  selection cleared on rescan, Rescan Profiles action.
+- `close_cheat_workflow_if_selection_changed`: the workflow closes if
+  the canonical selected archive changes; the selection itself is
+  never altered by opening or closing (both tested).
+- Tests (4 new; 362 passing): entry gating matrix, preselection rule,
+  selection invariance, blocker rendering + explicit-choice message +
+  stale-selection clearing.
+
 ## Next deliverable
 
-Working through the remaining RetroArch vertical in backend order:
-trusted cheat-source list/fetch/inspect (Backend complete per matrix;
-fetch is blocking `ureq` and must be backgrounded), then cheat
-matching/preview, then install/history/rollback. Where these live in
-the redesigned shell needs a decision — the design has no dedicated
-RetroArch screen beyond Settings' profile section; a `ToolsOverlay` or
-a Selected-archive integration are the candidates consistent with the
-existing navigation model.
+Cheat workflow Step 2: trusted source and snapshot (list built-in
+trusted sources, background fetch via `fetch_retroarch_cheat_source`,
+cached-snapshot inspection/offline reuse, freshness/digest display),
+then Step 3 matching.
 
 ## Latest clean commit
 
