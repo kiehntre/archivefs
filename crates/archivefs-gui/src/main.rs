@@ -2304,6 +2304,7 @@ enum MainView {
     LibraryViews,
     Mount,
     Selected,
+    CheatsMods,
     ActiveMounts,
     Doctor,
     HistoryLogs,
@@ -2319,12 +2320,6 @@ enum ToolsOverlay {
     DatabaseStatus,
     DoctorChecks,
     ArchiveInspector,
-    /// The staged RetroArch cheat workflow. Like `ArchiveInspector`,
-    /// never reached from the Tools menu: only the Selected screen's
-    /// "RetroArch Cheats" entry (or the Library row context menu) opens
-    /// it, for exactly one selected archive, and its state lives in
-    /// `ArchiveFsApp::cheat_workflow`.
-    RetroArchCheats,
 }
 
 /// The Archive Inspector's column/sort choices - path (its exact stored
@@ -2405,9 +2400,10 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 9] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 10] = [
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
+    (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::Sources, "Sources"),
@@ -2425,6 +2421,10 @@ fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
     !matches!(view, MainView::Health | MainView::Duplicates) || has_database
 }
 
+fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
+    current == candidate
+}
+
 fn main_view_title(view: MainView) -> &'static str {
     match view {
         MainView::Library => "Library",
@@ -2434,6 +2434,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::LibraryViews => "Library Views",
         MainView::Mount => "Mount",
         MainView::Selected => "Selected",
+        MainView::CheatsMods => "Cheats & Mods",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
         MainView::HistoryLogs => "History & Logs",
@@ -2446,6 +2447,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
     match view {
         MainView::Mount
         | MainView::Selected
+        | MainView::CheatsMods
         | MainView::ActiveMounts
         | MainView::Library
         | MainView::Health
@@ -2474,7 +2476,7 @@ fn show_primary_navigation(
         );
         for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
             let enabled = navigation_destination_enabled(view, has_database);
-            let selected = current == view;
+            let selected = navigation_destination_selected(current, view);
             let button = egui::Button::selectable(selected, label)
                 .min_size(egui::vec2(ui.available_width(), 34.0));
             if ui.add_enabled(enabled, button).clicked() {
@@ -2490,8 +2492,9 @@ fn show_primary_navigation(
         );
         for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
             let enabled = navigation_destination_enabled(view, has_database);
-            let button = egui::Button::selectable(current == view, label)
-                .min_size(egui::vec2(ui.available_width(), 34.0));
+            let button =
+                egui::Button::selectable(navigation_destination_selected(current, view), label)
+                    .min_size(egui::vec2(ui.available_width(), 34.0));
             if ui.add_enabled(enabled, button).clicked() {
                 clicked_view = Some(view);
             }
@@ -2527,9 +2530,10 @@ struct ArchiveFsApp {
     /// scanned automatically - filesystem probing only happens on an
     /// explicit "Scan/Rescan Profiles" click.
     retroarch_profiles: RetroArchProfilesState,
-    /// The RetroArch cheat workflow, when open - see
-    /// `CheatWorkflowState`. `Some` only while
-    /// `ToolsOverlay::RetroArchCheats` is (or was just) showing.
+    /// The full-page Cheats & Mods workspace's current archive and
+    /// trusted-catalogue state. It survives ordinary page navigation so
+    /// returning to the same exact archive does not discard a completed
+    /// cache inspection or retrieval.
     cheat_workflow: Option<CheatWorkflowState>,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
@@ -4252,8 +4256,8 @@ impl ArchiveFsApp {
                 self.view = MainView::Mount;
                 self.tools_overlay = ToolsOverlay::None;
             }
-            Some(MountPageAction::OpenCheatWorkflow(archive_path)) => {
-                self.open_cheat_workflow(context, archive_path);
+            Some(MountPageAction::OpenCheatsMods(archive_path)) => {
+                self.open_cheats_mods_workspace(context, archive_path);
             }
             Some(MountPageAction::ScanRetroArchProfiles) => {
                 self.start_retroarch_profile_scan(context.clone());
@@ -4262,15 +4266,27 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Opens the RetroArch cheat workflow for exactly one archive,
-    /// replacing any previous workflow state wholesale. Identity and
-    /// display details are copied from the live record at open time;
-    /// the single eligible profile is preselected only when it is the
-    /// only one (the CLI's own auto-selection rule).
-    fn open_cheat_workflow(&mut self, context: &egui::Context, archive_path: PathBuf) {
+    /// Selects the full-page Cheats & Mods workspace context without
+    /// starting I/O. Returning to the same exact archive preserves the
+    /// existing workflow; changing archive replaces it wholesale. The
+    /// return value says whether a new source-list load is needed.
+    fn prepare_cheats_mods_workspace(&mut self, archive_path: PathBuf) -> bool {
+        self.view = MainView::CheatsMods;
+        self.tools_overlay = ToolsOverlay::None;
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.archive_path == archive_path)
+        {
+            return false;
+        }
         let record_details = match &self.state {
-            LoadState::Ready(data) => data
-                .records
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        }
+        .and_then(|data| {
+            data.records
                 .iter()
                 .find(|record| record.mount_plan.archive.path == archive_path)
                 .map(|record| {
@@ -4280,11 +4296,11 @@ impl ArchiveFsApp {
                         record.identity.source_root.clone(),
                         record.identity.size_bytes,
                     )
-                }),
-            _ => None,
-        };
+                })
+        });
         let Some((display_name, platform, source_root, size_bytes)) = record_details else {
-            return;
+            self.cheat_workflow = None;
+            return false;
         };
         let selected_profile_id = match &self.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
@@ -4309,7 +4325,15 @@ impl ArchiveFsApp {
             selected_source_id: None,
             fetch_force_refresh: false,
         });
-        self.tools_overlay = ToolsOverlay::RetroArchCheats;
+        true
+    }
+
+    /// Opens the full-page workspace and starts its read-only trusted
+    /// source inventory only when the exact archive context is new.
+    fn open_cheats_mods_workspace(&mut self, context: &egui::Context, archive_path: PathBuf) {
+        if !self.prepare_cheats_mods_workspace(archive_path) {
+            return;
+        }
         // Read-only listing of the local trusted-source cache; safe to
         // start immediately (no network, background thread).
         self.start_cheat_source_list(context.clone());
@@ -4461,19 +4485,24 @@ impl ArchiveFsApp {
         }
     }
 
-    /// The cheat workflow is keyed to the canonical selected archive.
-    /// If that identity changes (or the selection is cleared) while the
-    /// workflow is open, close the workflow rather than carry on
-    /// against a stale archive. Never touches the selection itself.
-    fn close_cheat_workflow_if_selection_changed(&mut self) {
-        if self.tools_overlay != ToolsOverlay::RetroArchCheats {
+    /// Revalidates the page context against both the canonical selection
+    /// and the live snapshot. It never changes selection or queue state;
+    /// a stale context becomes the truthful no-archive page instead.
+    fn reconcile_cheats_mods_context(&mut self) {
+        if self.view != MainView::CheatsMods {
             return;
         }
-        let workflow_matches_selection = self.cheat_workflow.as_ref().is_some_and(|workflow| {
+        let context_is_current = self.cheat_workflow.as_ref().is_some_and(|workflow| {
             self.selected_archive.as_deref() == Some(workflow.archive_path.as_path())
+                && match &self.state {
+                    LoadState::Ready(data) => data
+                        .records
+                        .iter()
+                        .any(|record| record.mount_plan.archive.path == workflow.archive_path),
+                    LoadState::Loading { .. } | LoadState::Error(_) => true,
+                }
         });
-        if !workflow_matches_selection {
-            self.tools_overlay = ToolsOverlay::None;
+        if !context_is_current {
             self.cheat_workflow = None;
         }
     }
@@ -5121,9 +5150,9 @@ enum AppOperationRequest {
     /// *previously run* preview already said about this archive, since
     /// jumping pages must never bypass Preview's own safety gate.
     ShowInLibraryViews(PathBuf),
-    /// Opens the RetroArch cheat workflow for this exact archive - see
-    /// `ArchiveFsApp::open_cheat_workflow`.
-    OpenCheatWorkflow(PathBuf),
+    /// Opens the first-class Cheats & Mods workspace for this exact
+    /// archive - see `ArchiveFsApp::open_cheats_mods_workspace`.
+    OpenCheatsMods(PathBuf),
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -5402,16 +5431,28 @@ impl eframe::App for ArchiveFsApp {
             });
         });
 
+        let mut navigation_request = None;
         egui::SidePanel::left("app_navigation")
             .resizable(false)
             .exact_width(218.0)
             .show(context, |ui| {
                 ui.add_space(14.0);
-                if let Some(clicked) = show_primary_navigation(ui, self.view, has_database) {
-                    self.view = clicked;
-                    self.tools_overlay = ToolsOverlay::None;
-                }
+                navigation_request = show_primary_navigation(ui, self.view, has_database);
             });
+        if let Some(clicked) = navigation_request {
+            if clicked == MainView::CheatsMods {
+                if let Some(path) = self.selected_archive.clone() {
+                    self.open_cheats_mods_workspace(context, path);
+                } else {
+                    self.view = MainView::CheatsMods;
+                    self.tools_overlay = ToolsOverlay::None;
+                    self.cheat_workflow = None;
+                }
+            } else {
+                self.view = clicked;
+                self.tools_overlay = ToolsOverlay::None;
+            }
+        }
 
         if let Some(ActivityPanelAction::ShowRelatedArchive(path)) = show_activity_panel(
             context,
@@ -5454,621 +5495,676 @@ impl eframe::App for ArchiveFsApp {
                 ui_layout::ContentWidth::Normal
             };
             ui_layout::page(ui, width, |ui| {
-            self.close_cheat_workflow_if_selection_changed();
+                self.reconcile_cheats_mods_context();
 
-            if self.tools_overlay != ToolsOverlay::None {
-                match self.tools_overlay {
-                    ToolsOverlay::Diagnostics => {
-                        diagnostics_action = show_setup_diagnostics(
-                            ui,
-                            &self.diagnostics,
-                            self.setup_action.is_some(),
-                            self.feedback.as_ref(),
-                            self.refresh_error.as_deref(),
-                            self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
-                        );
-                    }
-                    ToolsOverlay::PlatformAliases => {
-                        if show_tools_overlay_header(ui, "Platform Aliases") {
-                            self.tools_overlay = ToolsOverlay::None;
+                if self.tools_overlay != ToolsOverlay::None {
+                    match self.tools_overlay {
+                        ToolsOverlay::Diagnostics => {
+                            diagnostics_action = show_setup_diagnostics(
+                                ui,
+                                &self.diagnostics,
+                                self.setup_action.is_some(),
+                                self.feedback.as_ref(),
+                                self.refresh_error.as_deref(),
+                                self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
+                            );
                         }
-                        let cached_aliases = self
-                            .database_state
-                            .snapshot()
-                            .map(|snapshot| snapshot.platform_aliases.as_slice())
-                            .unwrap_or(&[]);
-                        if let Some(action) = show_platform_aliases_panel(
-                            ui,
-                            cached_aliases,
-                            &mut self.new_alias_text,
-                            &mut self.new_alias_platform_choice,
-                            self.alias_action.is_some(),
-                            &mut self.clipboard,
-                        ) {
-                            self.start_alias_action(context.clone(), action);
+                        ToolsOverlay::PlatformAliases => {
+                            if show_tools_overlay_header(ui, "Platform Aliases") {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                            let cached_aliases = self
+                                .database_state
+                                .snapshot()
+                                .map(|snapshot| snapshot.platform_aliases.as_slice())
+                                .unwrap_or(&[]);
+                            if let Some(action) = show_platform_aliases_panel(
+                                ui,
+                                cached_aliases,
+                                &mut self.new_alias_text,
+                                &mut self.new_alias_platform_choice,
+                                self.alias_action.is_some(),
+                                &mut self.clipboard,
+                            ) {
+                                self.start_alias_action(context.clone(), action);
+                            }
                         }
-                    }
-                    ToolsOverlay::DatabaseStatus => {
-                        if show_tools_overlay_header(ui, "Database Status") {
-                            self.tools_overlay = ToolsOverlay::None;
-                        }
-                        if let Some(action) = show_database_panel(ui, &self.database_state) {
-                            match action {
-                                DatabasePanelAction::ScanLibrary => {
-                                    self.start_database_action(context.clone(), true);
-                                }
-                                DatabasePanelAction::RefreshStatus
-                                | DatabasePanelAction::RetryLoad => {
-                                    self.start_database_action(context.clone(), false);
+                        ToolsOverlay::DatabaseStatus => {
+                            if show_tools_overlay_header(ui, "Database Status") {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                            if let Some(action) = show_database_panel(ui, &self.database_state) {
+                                match action {
+                                    DatabasePanelAction::ScanLibrary => {
+                                        self.start_database_action(context.clone(), true);
+                                    }
+                                    DatabasePanelAction::RefreshStatus
+                                    | DatabasePanelAction::RetryLoad => {
+                                        self.start_database_action(context.clone(), false);
+                                    }
                                 }
                             }
                         }
-                    }
-                    ToolsOverlay::DoctorChecks => {
-                        if show_tools_overlay_header(ui, "Doctor Checks") {
-                            self.tools_overlay = ToolsOverlay::None;
+                        ToolsOverlay::DoctorChecks => {
+                            if show_tools_overlay_header(ui, "Doctor Checks") {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                            let doctor = match &self.state {
+                                LoadState::Ready(data) => Some(&data.doctor),
+                                _ => None,
+                            };
+                            show_doctor_checks_panel(ui, doctor);
                         }
-                        let doctor = match &self.state {
-                            LoadState::Ready(data) => Some(&data.doctor),
+                        ToolsOverlay::ArchiveInspector => {
+                            if let Some(inspector) = self.archive_inspector.as_mut()
+                                && show_archive_inspector_panel(ui, inspector, &mut self.clipboard)
+                            {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                        }
+                        ToolsOverlay::None => unreachable!(),
+                    }
+                    return;
+                }
+
+                if let Some(error) = &self.refresh_error {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Refresh failed; showing the last known snapshot: {error}"),
+                    );
+                    ui.separator();
+                }
+                if let Some(batch) = self.mount_all.as_ref() {
+                    stop_mount_all = show_mount_all_progress(ui, &batch.progress);
+                    ui.separator();
+                }
+                if let Some(batch) = self.unmount_all.as_ref() {
+                    stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
+                    ui.separator();
+                }
+
+                if self.view == MainView::Sources {
+                    let sources = self
+                        .database_state
+                        .snapshot()
+                        .map(|snapshot| snapshot.source_views.as_slice())
+                        .unwrap_or(&[]);
+                    let mount_root = match &self.state {
+                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                        LoadState::Loading { .. } | LoadState::Error(_) => None,
+                    };
+                    let sources_action = show_sources_page(
+                        ui,
+                        sources,
+                        mount_root,
+                        self.source_action.is_some(),
+                        &mut self.sources_add_dialog,
+                        &mut self.sources_remove_dialog,
+                        &mut self.clipboard,
+                    );
+                    if let Some(sources_action) = sources_action {
+                        match sources_action {
+                            SourcesPageAction::AddFolder(path) => {
+                                self.start_source_action(context.clone(), SourceAction::Add(path));
+                            }
+                            SourcesPageAction::ScanOne(path) => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::ScanOne(path),
+                                );
+                            }
+                            SourcesPageAction::ScanAll => {
+                                self.start_source_action(context.clone(), SourceAction::ScanAll);
+                            }
+                            SourcesPageAction::RefreshStatus => {
+                                self.start_database_action(context.clone(), false);
+                            }
+                            SourcesPageAction::SetEnabled { path, enabled } => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::SetEnabled { path, enabled },
+                                );
+                            }
+                            SourcesPageAction::ConfirmRemove {
+                                path,
+                                keep_catalogue,
+                            } => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::Remove {
+                                        path,
+                                        keep_catalogue,
+                                    },
+                                );
+                            }
+                            SourcesPageAction::ViewInLibrary(path) => {
+                                self.view = MainView::Library;
+                                self.library_source_filter = Some(Some(path));
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if self.view == MainView::LibraryViews {
+                    let all_source_folders = self
+                        .database_state
+                        .snapshot()
+                        .map(|snapshot| snapshot.source_views.as_slice())
+                        .unwrap_or(&[]);
+                    let library_view_action = show_library_views_page(
+                        ui,
+                        &self.library_views,
+                        all_source_folders,
+                        self.library_view_action.is_some(),
+                        self.library_view_last_plan.as_ref(),
+                        self.library_view_focus_archive.as_deref(),
+                        &mut self.library_view_plan_filter,
+                        &mut self.library_view_form_dialog,
+                        &mut self.library_view_remove_dialog,
+                        &mut self.clipboard,
+                    );
+                    if let Some(library_view_action) = library_view_action {
+                        self.start_library_view_action(context.clone(), library_view_action);
+                    }
+                    return;
+                }
+
+                if self.view == MainView::Duplicates {
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        match show_duplicate_review_panel(
+                            ui,
+                            &snapshot.duplicate_report,
+                            DuplicateReviewViewState {
+                                filters: &mut self.duplicate_filters,
+                                sort_field: &mut self.duplicate_sort_field,
+                                sort_ascending: &mut self.duplicate_sort_ascending,
+                                selected_group: &mut self.selected_duplicate_group,
+                                selected_archive: &mut self.selected_duplicate_archive,
+                                clipboard: &mut self.clipboard,
+                            },
+                        ) {
+                            Some(DuplicateReviewAction::Close) => {
+                                self.view = MainView::Library;
+                            }
+                            Some(DuplicateReviewAction::ViewInLibrary(path)) => {
+                                self.view = MainView::Library;
+                                self.selected_archive = Some(path.clone());
+                                self.selected_archives = [path].into_iter().collect();
+                            }
+                            Some(DuplicateReviewAction::Inspect(path)) => {
+                                self.start_archive_inspection(context.clone(), path);
+                            }
+                            None => {}
+                        }
+                    } else {
+                        ui.label("Scan the library to review duplicates.");
+                    }
+                    return;
+                }
+
+                if self.view == MainView::Health {
+                    // `cached_health_issues` needs `&mut self` (it may rebuild
+                    // and store the cache); `.to_vec()` copies the small
+                    // already-built `Vec<HealthIssue>` out and ends that
+                    // mutable borrow immediately, so the immutable borrows of
+                    // `self.database_state`/`self.state` just below (for the
+                    // much larger `LoadedData`/`CachedLibrarySnapshot`, passed
+                    // by reference rather than cloned) never conflict with it.
+                    let issues = self.cached_health_issues().to_vec();
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        let live_data = match &self.state {
+                            LoadState::Ready(data) => Some(data.as_ref()),
                             _ => None,
                         };
-                        show_doctor_checks_panel(ui, doctor);
-                    }
-                    ToolsOverlay::ArchiveInspector => {
-                        if let Some(inspector) = self.archive_inspector.as_mut()
-                            && show_archive_inspector_panel(ui, inspector, &mut self.clipboard)
-                        {
-                            self.tools_overlay = ToolsOverlay::None;
-                        }
-                    }
-                    ToolsOverlay::RetroArchCheats => {
-                        widgets::page_header(
+                        health_dashboard_action = show_health_dashboard_panel(
                             ui,
-                            "RetroArch Cheats",
-                            "Choose an eligible profile and retrieve a reviewed built-in catalogue for one archive.",
+                            live_data,
+                            snapshot,
+                            &issues,
+                            HealthDashboardViewState {
+                                filters: &mut self.health_filters,
+                                sort_field: &mut self.health_sort_field,
+                                sort_ascending: &mut self.health_sort_ascending,
+                                selected_issue: &mut self.selected_health_issue,
+                                busy: archive_actions_blocked,
+                                clipboard: &mut self.clipboard,
+                            },
                         );
-                        if widgets::action_button(ui, "Back to Library", widgets::ActionStyle::Quiet, true).clicked() {
-                            self.view = MainView::Library;
-                            self.tools_overlay = ToolsOverlay::None;
-                            self.cheat_workflow = None;
-                        }
-                        if let Some(workflow) = self.cheat_workflow.as_mut() {
-                            let mut action = show_cheat_workflow_step1(
+                    } else {
+                        ui.label("Scan the library to see the health dashboard.");
+                    }
+                    return;
+                }
+
+                if self.view == MainView::CheatsMods {
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        LoadState::Loading { previous, .. } => previous.as_deref(),
+                        LoadState::Error(_) => None,
+                    };
+                    let action = egui::ScrollArea::vertical()
+                        .id_salt("cheats_mods_workspace_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            show_cheats_mods_page(
                                 ui,
-                                workflow,
+                                self.cheat_workflow.as_mut(),
                                 &self.retroarch_profiles,
+                                live,
+                                self.database_state.snapshot(),
+                                &self.history,
                                 busy,
-                            );
-                            ui.separator();
-                            if let Some(step2_action) =
-                                show_cheat_workflow_step2(ui, workflow, busy)
-                            {
-                                action = Some(step2_action);
-                            }
-                            match action {
-                                Some(CheatWorkflowAction::RescanProfiles) => {
-                                    self.start_retroarch_profile_scan(context.clone());
-                                }
-                                Some(CheatWorkflowAction::RefreshSources) => {
-                                    self.start_cheat_source_list(context.clone());
-                                }
-                                Some(CheatWorkflowAction::FetchSource) => {
-                                    self.start_cheat_source_fetch(context.clone(), false);
-                                }
-                                Some(CheatWorkflowAction::UseCachedSnapshot) => {
-                                    self.start_cheat_source_fetch(context.clone(), true);
-                                }
-                                None => {}
-                            }
-                        } else {
-                            ui.label("No archive is selected for cheat setup.");
-                        }
-                    }
-                    ToolsOverlay::None => unreachable!(),
-                }
-                return;
-            }
-
-            if let Some(error) = &self.refresh_error {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Refresh failed; showing the last known snapshot: {error}"),
-                );
-                ui.separator();
-            }
-            if let Some(batch) = self.mount_all.as_ref() {
-                stop_mount_all = show_mount_all_progress(ui, &batch.progress);
-                ui.separator();
-            }
-            if let Some(batch) = self.unmount_all.as_ref() {
-                stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
-                ui.separator();
-            }
-
-            if self.view == MainView::Sources {
-                let sources = self
-                    .database_state
-                    .snapshot()
-                    .map(|snapshot| snapshot.source_views.as_slice())
-                    .unwrap_or(&[]);
-                let mount_root = match &self.state {
-                    LoadState::Ready(data) => Some(data.mount_root.as_path()),
-                    LoadState::Loading { .. } | LoadState::Error(_) => None,
-                };
-                let sources_action = show_sources_page(
-                    ui,
-                    sources,
-                    mount_root,
-                    self.source_action.is_some(),
-                    &mut self.sources_add_dialog,
-                    &mut self.sources_remove_dialog,
-                    &mut self.clipboard,
-                );
-                if let Some(sources_action) = sources_action {
-                    match sources_action {
-                        SourcesPageAction::AddFolder(path) => {
-                            self.start_source_action(context.clone(), SourceAction::Add(path));
-                        }
-                        SourcesPageAction::ScanOne(path) => {
-                            self.start_source_action(context.clone(), SourceAction::ScanOne(path));
-                        }
-                        SourcesPageAction::ScanAll => {
-                            self.start_source_action(context.clone(), SourceAction::ScanAll);
-                        }
-                        SourcesPageAction::RefreshStatus => {
-                            self.start_database_action(context.clone(), false);
-                        }
-                        SourcesPageAction::SetEnabled { path, enabled } => {
-                            self.start_source_action(
-                                context.clone(),
-                                SourceAction::SetEnabled { path, enabled },
-                            );
-                        }
-                        SourcesPageAction::ConfirmRemove {
-                            path,
-                            keep_catalogue,
-                        } => {
-                            self.start_source_action(
-                                context.clone(),
-                                SourceAction::Remove {
-                                    path,
-                                    keep_catalogue,
-                                },
-                            );
-                        }
-                        SourcesPageAction::ViewInLibrary(path) => {
+                                &mut self.clipboard,
+                            )
+                        })
+                        .inner;
+                    match action {
+                        Some(CheatWorkflowAction::ChooseArchive) => {
                             self.view = MainView::Library;
-                            self.library_source_filter = Some(Some(path));
                         }
+                        Some(CheatWorkflowAction::RescanProfiles) => {
+                            self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RefreshSources) => {
+                            self.start_cheat_source_list(context.clone());
+                        }
+                        Some(CheatWorkflowAction::FetchSource) => {
+                            self.start_cheat_source_fetch(context.clone(), false);
+                        }
+                        Some(CheatWorkflowAction::UseCachedSnapshot) => {
+                            self.start_cheat_source_fetch(context.clone(), true);
+                        }
+                        None => {}
                     }
+                    return;
                 }
-                return;
-            }
 
-            if self.view == MainView::LibraryViews {
-                let all_source_folders = self
-                    .database_state
-                    .snapshot()
-                    .map(|snapshot| snapshot.source_views.as_slice())
-                    .unwrap_or(&[]);
-                let library_view_action = show_library_views_page(
-                    ui,
-                    &self.library_views,
-                    all_source_folders,
-                    self.library_view_action.is_some(),
-                    self.library_view_last_plan.as_ref(),
-                    self.library_view_focus_archive.as_deref(),
-                    &mut self.library_view_plan_filter,
-                    &mut self.library_view_form_dialog,
-                    &mut self.library_view_remove_dialog,
-                    &mut self.clipboard,
-                );
-                if let Some(library_view_action) = library_view_action {
-                    self.start_library_view_action(context.clone(), library_view_action);
-                }
-                return;
-            }
-
-            if self.view == MainView::Duplicates {
-                if let Some(snapshot) = self.database_state.snapshot() {
-                    match show_duplicate_review_panel(
+                if self.view == MainView::Mount {
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        _ => None,
+                    };
+                    let action = show_mount_page(
                         ui,
-                        &snapshot.duplicate_report,
-                        DuplicateReviewViewState {
-                            filters: &mut self.duplicate_filters,
-                            sort_field: &mut self.duplicate_sort_field,
-                            sort_ascending: &mut self.duplicate_sort_ascending,
-                            selected_group: &mut self.selected_duplicate_group,
-                            selected_archive: &mut self.selected_duplicate_archive,
-                            clipboard: &mut self.clipboard,
+                        live,
+                        self.mount_all_result.as_ref(),
+                        MountPageViewState {
+                            queue: &mut self.mount_queue,
+                            search: &mut self.mount_search,
+                            confirm: &mut self.confirm_mount_queue,
+                            busy: archive_actions_blocked,
+                            block_reason: archive_action_block_reason,
                         },
-                    ) {
-                        Some(DuplicateReviewAction::Close) => {
-                            self.view = MainView::Library;
+                    );
+                    self.handle_mount_page_action(context, action);
+                    return;
+                }
+
+                if self.view == MainView::Selected {
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        _ => None,
+                    };
+                    let action = show_selected_page(
+                        ui,
+                        live,
+                        self.mount_all_result.as_ref(),
+                        SelectedPageViewState {
+                            selected_archive: self.selected_archive.as_deref(),
+                            selected_count: self.selected_archives.len(),
+                            retroarch_profiles: &self.retroarch_profiles,
+                            queue: &mut self.mount_queue,
+                            confirm: &mut self.confirm_mount_queue,
+                            busy: archive_actions_blocked,
+                            block_reason: archive_action_block_reason,
+                        },
+                    );
+                    self.handle_mount_page_action(context, action);
+                    return;
+                }
+
+                if self.view == MainView::ActiveMounts {
+                    let live_records = match &self.state {
+                        LoadState::Ready(data) => Some(data.records.as_slice()),
+                        _ => None,
+                    };
+                    let action = show_active_mounts_page(
+                        ui,
+                        live_records,
+                        &mut self.active_mounts_confirm_unmount,
+                        &mut self.cleanup_after_unmount,
+                        self.feedback.as_ref(),
+                        archive_actions_blocked,
+                    );
+                    match action {
+                        Some(ActiveMountsPageAction::Unmount(archive_path)) => {
+                            requested_action =
+                                Some(AppOperationRequest::Archive(OperationRequest {
+                                    action: ArchiveAction::Unmount,
+                                    archive_path,
+                                    cleanup_after_unmount: self.cleanup_after_unmount,
+                                }));
                         }
-                        Some(DuplicateReviewAction::ViewInLibrary(path)) => {
+                        Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
                             self.view = MainView::Library;
                             self.selected_archive = Some(path.clone());
                             self.selected_archives = [path].into_iter().collect();
                         }
-                        Some(DuplicateReviewAction::Inspect(path)) => {
-                            self.start_archive_inspection(context.clone(), path);
+                        Some(ActiveMountsPageAction::Refresh) => self.refresh(context),
+                        None => {}
+                    }
+                    return;
+                }
+
+                if self.view == MainView::Doctor {
+                    widgets::page_header(
+                        ui,
+                        "Doctor",
+                        "Check ArchiveFS health, with blocking issues and warnings shown first.",
+                    );
+                    let mut run_requested = false;
+                    {
+                        let doctor = match &self.state {
+                            LoadState::Ready(data) => Some(&data.doctor),
+                            _ => None,
+                        };
+                        if let Some(report) = doctor {
+                            widgets::card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    let failures = report
+                                        .checks
+                                        .iter()
+                                        .filter(|check| check.status == DoctorStatus::Fail)
+                                        .count();
+                                    let warnings = report
+                                        .checks
+                                        .iter()
+                                        .filter(|check| check.status == DoctorStatus::Warn)
+                                        .count();
+                                    widgets::status_badge(
+                                        ui,
+                                        if failures == 0 {
+                                            "Healthy"
+                                        } else {
+                                            "Needs attention"
+                                        },
+                                        if failures == 0 {
+                                            widgets::StatusTone::Success
+                                        } else {
+                                            widgets::StatusTone::Blocked
+                                        },
+                                    );
+                                    ui.label(doctor_summary_text(report));
+                                    if widgets::action_button(
+                                        ui,
+                                        "Run all checks",
+                                        widgets::ActionStyle::Primary,
+                                        !loading && !busy,
+                                    )
+                                    .clicked()
+                                    {
+                                        run_requested = true;
+                                    }
+                                    if widgets::action_button(
+                                        ui,
+                                        "Copy summary",
+                                        widgets::ActionStyle::Secondary,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        let _ = self.clipboard.set_text(doctor_report_text(report));
+                                    }
+                                    if warnings > 0 {
+                                        widgets::status_badge(
+                                            ui,
+                                            format!("{warnings} warnings"),
+                                            widgets::StatusTone::Warning,
+                                        );
+                                    }
+                                })
+                                .inner
+                            });
+                            ui.add_space(12.0);
+                        }
+                        show_doctor_checks_panel(ui, doctor);
+                    }
+                    if run_requested {
+                        self.refresh(context);
+                    }
+                    return;
+                }
+
+                if self.view == MainView::HistoryLogs {
+                    show_history_logs_page(
+                        ui,
+                        &mut self.history,
+                        &mut self.history_filters,
+                        &mut self.clipboard,
+                    );
+                    return;
+                }
+
+                if self.view == MainView::Settings {
+                    let mount_root = match &self.state {
+                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                        _ => None,
+                    };
+                    let action = show_settings_page(
+                        ui,
+                        &self.database_state,
+                        &self.diagnostics,
+                        &self.retroarch_profiles,
+                        mount_root,
+                        busy,
+                        &mut self.clipboard,
+                    );
+                    match action {
+                        Some(SettingsPageAction::OpenConfigFolder) => {
+                            self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder);
+                        }
+                        Some(SettingsPageAction::ValidateConfiguration) => {
+                            self.refresh_diagnostics(context);
+                        }
+                        Some(SettingsPageAction::OpenDiagnostics) => {
+                            self.tools_overlay = ToolsOverlay::Diagnostics;
+                            self.refresh_diagnostics(context);
+                        }
+                        Some(SettingsPageAction::RescanRetroArchProfiles) => {
+                            self.start_retroarch_profile_scan(context.clone());
                         }
                         None => {}
                     }
-                } else {
-                    ui.label("Scan the library to review duplicates.");
+                    return;
                 }
-                return;
-            }
 
-            if self.view == MainView::Health {
-                // `cached_health_issues` needs `&mut self` (it may rebuild
-                // and store the cache); `.to_vec()` copies the small
-                // already-built `Vec<HealthIssue>` out and ends that
-                // mutable borrow immediately, so the immutable borrows of
-                // `self.database_state`/`self.state` just below (for the
-                // much larger `LoadedData`/`CachedLibrarySnapshot`, passed
-                // by reference rather than cloned) never conflict with it.
-                let issues = self.cached_health_issues().to_vec();
-                if let Some(snapshot) = self.database_state.snapshot() {
-                    let live_data = match &self.state {
-                        LoadState::Ready(data) => Some(data.as_ref()),
+                if self.view == MainView::About {
+                    let mount_root = match &self.state {
+                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
                         _ => None,
                     };
-                    health_dashboard_action = show_health_dashboard_panel(
+                    show_about_contents(
                         ui,
-                        live_data,
-                        snapshot,
-                        &issues,
-                        HealthDashboardViewState {
-                            filters: &mut self.health_filters,
-                            sort_field: &mut self.health_sort_field,
-                            sort_ascending: &mut self.health_sort_ascending,
-                            selected_issue: &mut self.selected_health_issue,
-                            busy: archive_actions_blocked,
-                            clipboard: &mut self.clipboard,
-                        },
+                        &self.database_state,
+                        &self.diagnostics,
+                        mount_root,
+                        &mut self.clipboard,
                     );
-                } else {
-                    ui.label("Scan the library to see the health dashboard.");
+                    return;
                 }
-                return;
-            }
 
-            if self.view == MainView::Mount {
-                let live = match &self.state {
-                    LoadState::Ready(data) => Some(data.as_ref()),
-                    _ => None,
-                };
-                let action = show_mount_page(
-                    ui,
-                    live,
-                    self.mount_all_result.as_ref(),
-                    MountPageViewState {
-                        queue: &mut self.mount_queue,
-                        search: &mut self.mount_search,
-                        confirm: &mut self.confirm_mount_queue,
-                        busy: archive_actions_blocked,
-                        block_reason: archive_action_block_reason,
-                    },
-                );
-                self.handle_mount_page_action(context, action);
-                return;
-            }
-
-            if self.view == MainView::Selected {
-                let live = match &self.state {
-                    LoadState::Ready(data) => Some(data.as_ref()),
-                    _ => None,
-                };
-                let action = show_selected_page(
-                    ui,
-                    live,
-                    self.mount_all_result.as_ref(),
-                    SelectedPageViewState {
-                        selected_archive: self.selected_archive.as_deref(),
-                        selected_count: self.selected_archives.len(),
-                        retroarch_profiles: &self.retroarch_profiles,
-                        queue: &mut self.mount_queue,
-                        confirm: &mut self.confirm_mount_queue,
-                        busy: archive_actions_blocked,
-                        block_reason: archive_action_block_reason,
-                    },
-                );
-                self.handle_mount_page_action(context, action);
-                return;
-            }
-
-            if self.view == MainView::ActiveMounts {
-                let live_records = match &self.state {
-                    LoadState::Ready(data) => Some(data.records.as_slice()),
-                    _ => None,
-                };
-                let action = show_active_mounts_page(
-                    ui,
-                    live_records,
-                    &mut self.active_mounts_confirm_unmount,
-                    &mut self.cleanup_after_unmount,
-                    self.feedback.as_ref(),
-                    archive_actions_blocked,
-                );
-                match action {
-                    Some(ActiveMountsPageAction::Unmount(archive_path)) => {
-                        requested_action = Some(AppOperationRequest::Archive(OperationRequest {
-                            action: ArchiveAction::Unmount,
-                            archive_path,
-                            cleanup_after_unmount: self.cleanup_after_unmount,
-                        }));
-                    }
-                    Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
-                        self.view = MainView::Library;
-                        self.selected_archive = Some(path.clone());
-                        self.selected_archives = [path].into_iter().collect();
-                    }
-                    Some(ActiveMountsPageAction::Refresh) => self.refresh(context),
-                    None => {}
-                }
-                return;
-            }
-
-            if self.view == MainView::Doctor {
-                widgets::page_header(
-                    ui,
-                    "Doctor",
-                    "Check ArchiveFS health, with blocking issues and warnings shown first.",
-                );
-                let mut run_requested = false;
-                {
-                    let doctor = match &self.state {
-                        LoadState::Ready(data) => Some(&data.doctor),
-                        _ => None,
-                    };
-                    if let Some(report) = doctor {
-                        widgets::card(ui, |ui| ui.horizontal_wrapped(|ui| {
-                            let failures = report.checks.iter().filter(|check| check.status == DoctorStatus::Fail).count();
-                            let warnings = report.checks.iter().filter(|check| check.status == DoctorStatus::Warn).count();
-                            widgets::status_badge(ui, if failures == 0 { "Healthy" } else { "Needs attention" }, if failures == 0 { widgets::StatusTone::Success } else { widgets::StatusTone::Blocked });
-                            ui.label(doctor_summary_text(report));
-                            if widgets::action_button(ui, "Run all checks", widgets::ActionStyle::Primary, !loading && !busy).clicked()
-                            {
-                                run_requested = true;
-                            }
-                            if widgets::action_button(ui, "Copy summary", widgets::ActionStyle::Secondary, true).clicked() {
-                                let _ = self.clipboard.set_text(doctor_report_text(report));
-                            }
-                            if warnings > 0 { widgets::status_badge(ui, format!("{warnings} warnings"), widgets::StatusTone::Warning); }
-                        }).inner);
-                        ui.add_space(12.0);
-                    }
-                    show_doctor_checks_panel(ui, doctor);
-                }
-                if run_requested {
-                    self.refresh(context);
-                }
-                return;
-            }
-
-            if self.view == MainView::HistoryLogs {
-                show_history_logs_page(
-                    ui,
-                    &mut self.history,
-                    &mut self.history_filters,
-                    &mut self.clipboard,
-                );
-                return;
-            }
-
-            if self.view == MainView::Settings {
-                let mount_root = match &self.state {
-                    LoadState::Ready(data) => Some(data.mount_root.as_path()),
-                    _ => None,
-                };
-                let action = show_settings_page(
-                    ui,
-                    &self.database_state,
-                    &self.diagnostics,
-                    &self.retroarch_profiles,
-                    mount_root,
-                    busy,
-                    &mut self.clipboard,
-                );
-                match action {
-                    Some(SettingsPageAction::OpenConfigFolder) => {
-                        self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder);
-                    }
-                    Some(SettingsPageAction::ValidateConfiguration) => {
-                        self.refresh_diagnostics(context);
-                    }
-                    Some(SettingsPageAction::OpenDiagnostics) => {
-                        self.tools_overlay = ToolsOverlay::Diagnostics;
-                        self.refresh_diagnostics(context);
-                    }
-                    Some(SettingsPageAction::RescanRetroArchProfiles) => {
-                        self.start_retroarch_profile_scan(context.clone());
-                    }
-                    None => {}
-                }
-                return;
-            }
-
-            if self.view == MainView::About {
-                let mount_root = match &self.state {
-                    LoadState::Ready(data) => Some(data.mount_root.as_path()),
-                    _ => None,
-                };
-                show_about_contents(
-                    ui,
-                    &self.database_state,
-                    &self.diagnostics,
-                    mount_root,
-                    &mut self.clipboard,
-                );
-                return;
-            }
-
-            match &self.state {
-                LoadState::Loading { .. } => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.spinner();
-                        ui.heading("Loading ArchiveFS data...");
-                        ui.label("Scanning runs in the background.");
-                    });
-                    // Requirement 1: show cached library rows before the
-                    // live snapshot finishes loading, clearly labelled as
-                    // last-known state. This is a read-only preview -
-                    // built with the same ArchiveRow/show_archive_rows
-                    // machinery as the live table, but with no selection
-                    // or action wiring at all, so it cannot expose a mount
-                    // or unmount button even in principle.
-                    if let Some(snapshot) = self.database_state.snapshot() {
-                        ui.separator();
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "Showing last-known catalogue state while the live snapshot loads.",
-                        );
-                        let preview_rows: Vec<ArchiveRow> = snapshot
-                            .archives
-                            .iter()
-                            .map(|persisted| {
-                                let path_exists = persisted.absolute_path.exists();
-                                ArchiveRow::from_cached(persisted, path_exists)
-                            })
-                            .collect();
-                        let row_height = fixed_row_height(
-                            ui.text_style_height(&egui::TextStyle::Body),
-                            ui.spacing().interact_size.y,
-                        );
-                        let horizontal_spacing = ui.spacing().item_spacing.x;
-                        let preview_widths = self.library_column_widths.as_array();
-                        egui::ScrollArea::horizontal()
-                            .id_salt("cache_preview_horizontal")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_min_width(table_width(horizontal_spacing, &preview_widths));
-                                // This cache-only loading preview has no sort
-                                // state of its own to wire up (it disappears
-                                // the moment the live snapshot loads) - the
-                                // headers render inertly, unsorted. Still
-                                // resizable (shares `self.library_column_widths`
-                                // with the real table) so a resize made here
-                                // is not lost once the live snapshot loads.
-                                let _ = show_header_row(
-                                    ui,
-                                    &COLUMN_HEADERS,
-                                    &COLUMN_SORT_FIELDS,
-                                    row_height,
-                                    None,
-                                    true,
-                                    &mut self.library_column_widths,
-                                );
-                                ui.separator();
-                                let body_height = ui.available_height().max(row_height);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("cache_preview_vertical")
-                                    .max_height(body_height)
-                                    .auto_shrink([false, false])
-                                    .show_rows(
+                match &self.state {
+                    LoadState::Loading { .. } => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(80.0);
+                            ui.spinner();
+                            ui.heading("Loading ArchiveFS data...");
+                            ui.label("Scanning runs in the background.");
+                        });
+                        // Requirement 1: show cached library rows before the
+                        // live snapshot finishes loading, clearly labelled as
+                        // last-known state. This is a read-only preview -
+                        // built with the same ArchiveRow/show_archive_rows
+                        // machinery as the live table, but with no selection
+                        // or action wiring at all, so it cannot expose a mount
+                        // or unmount button even in principle.
+                        if let Some(snapshot) = self.database_state.snapshot() {
+                            ui.separator();
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "Showing last-known catalogue state while the live snapshot loads.",
+                            );
+                            let preview_rows: Vec<ArchiveRow> = snapshot
+                                .archives
+                                .iter()
+                                .map(|persisted| {
+                                    let path_exists = persisted.absolute_path.exists();
+                                    ArchiveRow::from_cached(persisted, path_exists)
+                                })
+                                .collect();
+                            let row_height = fixed_row_height(
+                                ui.text_style_height(&egui::TextStyle::Body),
+                                ui.spacing().interact_size.y,
+                            );
+                            let horizontal_spacing = ui.spacing().item_spacing.x;
+                            let preview_widths = self.library_column_widths.as_array();
+                            egui::ScrollArea::horizontal()
+                                .id_salt("cache_preview_horizontal")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(table_width(
+                                        horizontal_spacing,
+                                        &preview_widths,
+                                    ));
+                                    // This cache-only loading preview has no sort
+                                    // state of its own to wire up (it disappears
+                                    // the moment the live snapshot loads) - the
+                                    // headers render inertly, unsorted. Still
+                                    // resizable (shares `self.library_column_widths`
+                                    // with the real table) so a resize made here
+                                    // is not lost once the live snapshot loads.
+                                    let _ = show_header_row(
                                         ui,
+                                        &COLUMN_HEADERS,
+                                        &COLUMN_SORT_FIELDS,
                                         row_height,
-                                        preview_rows.len(),
-                                        |ui, row_range| {
-                                            // Discard the result: this preview never sets
-                                            // selected_archive, so it can never drive
-                                            // show_selected_archive's action buttons, and
-                                            // `records: &[]` means its context menu (if
-                                            // right-clicked) offers nothing live either.
-                                            let _ = show_archive_rows(
-                                                ui,
-                                                &preview_rows,
-                                                None,
-                                                row_range,
-                                                row_height,
-                                                None,
-                                                &mut HashSet::new(),
-                                                &mut None,
-                                                &preview_widths,
-                                                &RowMenuContext {
-                                                    records: &[],
-                                                    cached: None,
-                                                    busy: true,
-                                                    block_reason: None,
-                                                    platform_busy: false,
-                                                    retroarch_profiles: &self.retroarch_profiles,
-                                                    library_views_configured: false,
-                                                    library_view_last_plan: None,
-                                                },
-                                            );
-                                        },
+                                        None,
+                                        true,
+                                        &mut self.library_column_widths,
                                     );
-                            });
+                                    ui.separator();
+                                    let body_height = ui.available_height().max(row_height);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("cache_preview_vertical")
+                                        .max_height(body_height)
+                                        .auto_shrink([false, false])
+                                        .show_rows(
+                                            ui,
+                                            row_height,
+                                            preview_rows.len(),
+                                            |ui, row_range| {
+                                                // Discard the result: this preview never sets
+                                                // selected_archive, so it can never drive
+                                                // show_selected_archive's action buttons, and
+                                                // `records: &[]` means its context menu (if
+                                                // right-clicked) offers nothing live either.
+                                                let _ = show_archive_rows(
+                                                    ui,
+                                                    &preview_rows,
+                                                    None,
+                                                    row_range,
+                                                    row_height,
+                                                    None,
+                                                    &mut HashSet::new(),
+                                                    &mut None,
+                                                    &preview_widths,
+                                                    &RowMenuContext {
+                                                        records: &[],
+                                                        cached: None,
+                                                        busy: true,
+                                                        block_reason: None,
+                                                        platform_busy: false,
+                                                        retroarch_profiles: &self
+                                                            .retroarch_profiles,
+                                                        library_views_configured: false,
+                                                        library_view_last_plan: None,
+                                                    },
+                                                );
+                                            },
+                                        );
+                                });
+                        }
+                    }
+                    LoadState::Error(error) => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(80.0);
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                "Could not load ArchiveFS",
+                            );
+                            ui.label(error);
+                            ui.add_space(8.0);
+                            retry = ui.button("Try again").clicked();
+                        });
+                    }
+                    LoadState::Ready(data) => {
+                        requested_action = show_loaded_data(
+                            ui,
+                            data,
+                            LoadedViewState {
+                                filter: &mut self.filter,
+                                filtered_rows: &mut self.filtered_rows,
+                                selected_archive: &mut self.selected_archive,
+                                operation: self.operation.as_ref(),
+                                busy: archive_actions_blocked,
+                                block_reason: archive_action_block_reason,
+                                action_readiness_debug_lines: &action_readiness_debug_lines,
+                                feedback: self.feedback.as_ref(),
+                                confirm_unmount: &mut self.confirm_unmount,
+                                confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
+                                confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
+                                confirm_mount_all: &mut self.confirm_mount_all,
+                                focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
+                                confirm_unmount_all: &mut self.confirm_unmount_all,
+                                focus_unmount_all_cancel: &mut self.focus_unmount_all_cancel,
+                                confirm_unmount_selected: &mut self.confirm_unmount_selected,
+                                focus_unmount_selected_cancel: &mut self
+                                    .focus_unmount_selected_cancel,
+                                focus_lazy_cancel: &mut self.focus_lazy_cancel,
+                                focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
+                                lazy_unmount_offers: &self.lazy_unmount_offers,
+                                remount_offers: &self.remount_offers,
+                                cleanup_after_unmount: &mut self.cleanup_after_unmount,
+                                mount_all_result: self.mount_all_result.as_ref(),
+                                unmount_all_result: self.unmount_all_result.as_ref(),
+                                history: &mut self.history,
+                                cached: self.database_state.snapshot(),
+                                library_filters: &mut self.library_filters,
+                                platform_choice: &mut self.platform_choice,
+                                platform_custom_text: &mut self.platform_custom_text,
+                                platform_busy: self.platform_action.is_some(),
+                                retroarch_profiles: &self.retroarch_profiles,
+                                selected_archives: &mut self.selected_archives,
+                                bulk_platform_choice: &mut self.bulk_platform_choice,
+                                bulk_platform_busy: self.bulk_platform_action.is_some(),
+                                missing_removal_available,
+                                missing_removal_busy: self.missing_removal.is_some(),
+                                confirm_remove_missing: &mut self.confirm_remove_missing,
+                                sort_field: &mut self.sort_field,
+                                sort_ascending: &mut self.sort_ascending,
+                                library_scroll_offset: &mut self.library_scroll_offset,
+                                clipboard: &mut self.clipboard,
+                                select_all_visible_requested: &mut self
+                                    .select_all_visible_requested,
+                                library_source_filter: &mut self.library_source_filter,
+                                library_column_widths: &mut self.library_column_widths,
+                                library_views_configured: !self.library_views.is_empty(),
+                                library_view_last_plan: self.library_view_last_plan.as_ref(),
+                            },
+                        );
                     }
                 }
-                LoadState::Error(error) => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.colored_label(ui.visuals().error_fg_color, "Could not load ArchiveFS");
-                        ui.label(error);
-                        ui.add_space(8.0);
-                        retry = ui.button("Try again").clicked();
-                    });
-                }
-                LoadState::Ready(data) => {
-                    requested_action = show_loaded_data(
-                        ui,
-                        data,
-                        LoadedViewState {
-                            filter: &mut self.filter,
-                            filtered_rows: &mut self.filtered_rows,
-                            selected_archive: &mut self.selected_archive,
-                            operation: self.operation.as_ref(),
-                            busy: archive_actions_blocked,
-                            block_reason: archive_action_block_reason,
-                            action_readiness_debug_lines: &action_readiness_debug_lines,
-                            feedback: self.feedback.as_ref(),
-                            confirm_unmount: &mut self.confirm_unmount,
-                            confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
-                            confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
-                            confirm_mount_all: &mut self.confirm_mount_all,
-                            focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
-                            confirm_unmount_all: &mut self.confirm_unmount_all,
-                            focus_unmount_all_cancel: &mut self.focus_unmount_all_cancel,
-                            confirm_unmount_selected: &mut self.confirm_unmount_selected,
-                            focus_unmount_selected_cancel: &mut self.focus_unmount_selected_cancel,
-                            focus_lazy_cancel: &mut self.focus_lazy_cancel,
-                            focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
-                            lazy_unmount_offers: &self.lazy_unmount_offers,
-                            remount_offers: &self.remount_offers,
-                            cleanup_after_unmount: &mut self.cleanup_after_unmount,
-                            mount_all_result: self.mount_all_result.as_ref(),
-                            unmount_all_result: self.unmount_all_result.as_ref(),
-                            history: &mut self.history,
-                            cached: self.database_state.snapshot(),
-                            library_filters: &mut self.library_filters,
-                            platform_choice: &mut self.platform_choice,
-                            platform_custom_text: &mut self.platform_custom_text,
-                            platform_busy: self.platform_action.is_some(),
-                            retroarch_profiles: &self.retroarch_profiles,
-                            selected_archives: &mut self.selected_archives,
-                            bulk_platform_choice: &mut self.bulk_platform_choice,
-                            bulk_platform_busy: self.bulk_platform_action.is_some(),
-                            missing_removal_available,
-                            missing_removal_busy: self.missing_removal.is_some(),
-                            confirm_remove_missing: &mut self.confirm_remove_missing,
-                            sort_field: &mut self.sort_field,
-                            sort_ascending: &mut self.sort_ascending,
-                            library_scroll_offset: &mut self.library_scroll_offset,
-                            clipboard: &mut self.clipboard,
-                            select_all_visible_requested: &mut self.select_all_visible_requested,
-                            library_source_filter: &mut self.library_source_filter,
-                            library_column_widths: &mut self.library_column_widths,
-                            library_views_configured: !self.library_views.is_empty(),
-                            library_view_last_plan: self.library_view_last_plan.as_ref(),
-                        },
-                    );
-                }
-            }
             });
         });
         if stop_mount_all {
@@ -6187,8 +6283,8 @@ impl eframe::App for ArchiveFsApp {
                     self.view = MainView::LibraryViews;
                     self.library_view_focus_archive = Some(archive_path);
                 }
-                AppOperationRequest::OpenCheatWorkflow(archive_path) => {
-                    self.open_cheat_workflow(context, archive_path);
+                AppOperationRequest::OpenCheatsMods(archive_path) => {
+                    self.open_cheats_mods_workspace(context, archive_path);
                 }
             }
         }
@@ -9137,10 +9233,9 @@ enum MountPageAction {
     /// Navigate to the Mount page (the Selected page's empty-queue
     /// affordance).
     GoToMount,
-    /// Open the RetroArch cheat workflow for this exact archive (the
-    /// Selected page's entry point; only offered when
-    /// `cheat_entry_blocker` returns `None`).
-    OpenCheatWorkflow(PathBuf),
+    /// Open the first-class Cheats & Mods workspace for this exact
+    /// archive (the Selected page's entry point).
+    OpenCheatsMods(PathBuf),
     /// Start the shared background RetroArch profile scan from the
     /// Selected page's entry section.
     ScanRetroArchProfiles,
@@ -9238,8 +9333,8 @@ fn show_selected_page(
 
     widgets::section_header(
         ui,
-        "RetroArch cheats",
-        Some("Optional setup for the archive selected in Library."),
+        "Cheats & Mods",
+        Some("Open the dedicated workspace for the archive selected in Library."),
     );
     match selected_archive {
         Some(path) => {
@@ -9260,14 +9355,14 @@ fn show_selected_page(
     ui.horizontal(|ui| {
         if widgets::action_button(
             ui,
-            "Open RetroArch cheats",
+            "Open Cheats & Mods",
             widgets::ActionStyle::Secondary,
             entry_blocker.is_none() && !busy,
         )
         .clicked()
             && let Some(path) = selected_archive
         {
-            action = Some(MountPageAction::OpenCheatWorkflow(path.to_path_buf()));
+            action = Some(MountPageAction::OpenCheatsMods(path.to_path_buf()));
         }
         if matches!(
             retroarch_profiles,
@@ -10139,10 +10234,267 @@ fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
 
 /// What the cheat workflow panel asks `update` to do.
 enum CheatWorkflowAction {
+    ChooseArchive,
     RescanProfiles,
     RefreshSources,
     FetchSource,
     UseCachedSnapshot,
+}
+
+const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
+const CHEAT_STAGE3_BODY: &str = "Catalogue retrieval is available. Archive matching and cheat installation are not yet implemented in this GUI workflow.";
+
+fn retroarch_integration_presentation(
+    profiles: &RetroArchProfilesState,
+) -> (String, widgets::StatusTone) {
+    match profiles {
+        RetroArchProfilesState::NotScanned => (
+            "RetroArch profiles not scanned".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        RetroArchProfilesState::Scanning { .. } => (
+            "Scanning RetroArch profiles".to_string(),
+            widgets::StatusTone::Active,
+        ),
+        RetroArchProfilesState::Error(_) => (
+            "RetroArch profile scan needs attention".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        RetroArchProfilesState::Ready(discovery) => {
+            let eligible = discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .count();
+            if eligible == 0 {
+                (
+                    "No eligible RetroArch profile".to_string(),
+                    widgets::StatusTone::Warning,
+                )
+            } else {
+                (
+                    format!(
+                        "{eligible} eligible RetroArch profile{}",
+                        if eligible == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                )
+            }
+        }
+    }
+}
+
+fn show_cheat_archive_context(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    live: Option<&LoadedData>,
+    cached: Option<&CachedLibrarySnapshot>,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    let record = live.and_then(|data| {
+        data.records
+            .iter()
+            .find(|record| record.mount_plan.archive.path == workflow.archive_path)
+    });
+    let persisted = selected_persisted_archive(cached, Some(&workflow.archive_path));
+    widgets::section_header(
+        ui,
+        "Selected archive context",
+        Some(
+            "This exact archive remains selected; opening this workspace changes no mount, queue, or platform state.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(&workflow.display_name)
+                    .size(19.0)
+                    .strong(),
+            );
+            widgets::status_badge(
+                ui,
+                persisted
+                    .and_then(|archive| archive.platform.as_deref())
+                    .or(workflow.platform.as_deref())
+                    .unwrap_or("Unknown platform"),
+                widgets::StatusTone::Info,
+            );
+            if let Some(record) = record {
+                widgets::status_badge(
+                    ui,
+                    mount_validation_label(record.mount_state),
+                    match record.mount_state {
+                        MountState::Mounted => widgets::StatusTone::Active,
+                        MountState::Pending => widgets::StatusTone::Success,
+                        MountState::MountPathExists => widgets::StatusTone::Warning,
+                    },
+                );
+            }
+            if persisted.is_some_and(|archive| {
+                archive.platform_source.as_deref() == Some(MANUAL_PLATFORM_SOURCE)
+            }) {
+                widgets::status_badge(ui, "Manual platform assignment", widgets::StatusTone::Info);
+            }
+            ui.label(egui::RichText::new(format_size(workflow.size_bytes)).color(theme::muted(ui)));
+        });
+        if widgets::path_value(ui, "Archive", &workflow.archive_path) {
+            let _ = clipboard.set_text(workflow.archive_path.display().to_string());
+        }
+        if widgets::path_value(ui, "Source", &workflow.source_root) {
+            let _ = clipboard.set_text(workflow.source_root.display().to_string());
+        }
+        if let Some(record) = record
+            && widgets::path_value(ui, "Mount destination", &record.mount_plan.mount_path)
+        {
+            let _ = clipboard.set_text(record.mount_plan.mount_path.display().to_string());
+        }
+    });
+}
+
+fn show_recent_cheat_activity(ui: &mut egui::Ui, history: &OperationHistory) {
+    let entries: Vec<&HistoryEntry> = history
+        .entries()
+        .filter(|entry| {
+            matches!(
+                entry.action,
+                ActivityAction::RetroArchProfileScan | ActivityAction::CheatSourceRetrieval
+            )
+        })
+        .take(4)
+        .collect();
+    widgets::section_header(
+        ui,
+        "Recent related activity",
+        Some("A compact view of this session's RetroArch scans and trusted catalogue retrievals."),
+    );
+    if entries.is_empty() {
+        ui.weak("No related activity has been recorded in this session.");
+        return;
+    }
+    for entry in entries {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    entry.outcome.to_string(),
+                    activity_outcome_tone(entry.outcome),
+                );
+                ui.strong(entry.action.to_string());
+                ui.label(
+                    egui::RichText::new(format_history_timestamp(entry.timestamp))
+                        .color(theme::muted(ui)),
+                );
+            });
+            ui.add(egui::Label::new(&entry.message).truncate())
+                .on_hover_text(&entry.message);
+        });
+        ui.add_space(4.0);
+    }
+}
+
+fn show_cheat_unavailable_stage(ui: &mut egui::Ui) {
+    widgets::section_header(ui, "Stage 3 · Matching and installation", None);
+    widgets::banner(
+        ui,
+        "Not available",
+        CHEAT_STAGE3_BODY,
+        widgets::StatusTone::Pending,
+    );
+}
+
+fn show_mods_section(ui: &mut egui::Ui) {
+    widgets::section_header(
+        ui,
+        "Mods",
+        Some("A stable future home for verified, emulator-specific mod adapters."),
+    );
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Planned", widgets::StatusTone::Pending);
+        ui.label(MODS_UNAVAILABLE_BODY);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_cheats_mods_page(
+    ui: &mut egui::Ui,
+    workflow: Option<&mut CheatWorkflowState>,
+    profiles: &RetroArchProfilesState,
+    live: Option<&LoadedData>,
+    cached: Option<&CachedLibrarySnapshot>,
+    history: &OperationHistory,
+    busy: bool,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::page_header(
+        ui,
+        "Cheats & Mods",
+        "Inspect RetroArch integration and retrieve trusted cheat catalogues for one exact archive.",
+    );
+    let (integration_label, integration_tone) = retroarch_integration_presentation(profiles);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, integration_label, integration_tone);
+            if let Some(workflow) = workflow.as_deref() {
+                ui.strong(format!("Current archive: {}", workflow.display_name));
+            } else {
+                ui.label("No archive context selected");
+            }
+            if widgets::action_button(
+                ui,
+                if workflow.is_some() {
+                    "Choose another archive"
+                } else {
+                    "Choose an archive"
+                },
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ChooseArchive);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                "Trusted catalogue retrieval available",
+                widgets::StatusTone::Success,
+            );
+            widgets::status_badge(ui, "Matching unavailable", widgets::StatusTone::Pending);
+            widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
+        });
+    });
+    ui.add_space(theme::SECTION_GAP);
+
+    widgets::section_header(
+        ui,
+        "Cheats",
+        Some(
+            "Profile discovery and reviewed catalogue retrieval use the existing safe RetroArch workflow.",
+        ),
+    );
+    if let Some(workflow) = workflow {
+        show_cheat_archive_context(ui, workflow, live, cached, clipboard);
+        ui.add_space(theme::SECTION_GAP);
+        action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
+        action = show_cheat_workflow_step2(ui, workflow, busy).or(action);
+        ui.add_space(theme::SECTION_GAP);
+        show_cheat_unavailable_stage(ui);
+    } else {
+        widgets::empty_state(
+            ui,
+            "Choose one archive",
+            "Select an archive in Library, then return here. ArchiveFS never fabricates a default archive context.",
+            None,
+        );
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    show_mods_section(ui);
+    ui.add_space(theme::SECTION_GAP);
+    show_recent_cheat_activity(ui, history);
+    action
 }
 
 /// Step 2 of the cheat workflow: the built-in trusted source list, the
@@ -10160,14 +10512,14 @@ fn show_cheat_workflow_step2(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        "Step 2 · Trusted catalogue source",
+        "Stage 2 · Trusted cheat catalogue",
         Some("Only reviewed, built-in sources are available. Custom URLs are not accepted."),
     );
     if workflow.selected_profile_id.is_none() {
         widgets::banner(
             ui,
             "Waiting for profile",
-            "Choose an eligible RetroArch profile in Step 1 to continue.",
+            "Choose an eligible RetroArch profile in Stage 1 to continue.",
             widgets::StatusTone::Pending,
         );
         return None;
@@ -10420,25 +10772,19 @@ fn show_cheat_workflow_step2(
                         }
                     });
             });
-            widgets::banner(
-                ui,
-                "Retrieval complete",
-                "Catalogue matching and cheat installation are not yet available in this GUI workflow.",
-                widgets::StatusTone::Info,
-            );
         }
     }
     action
 }
 
-/// Why the Selected screen's "RetroArch Cheats" entry point is
-/// unavailable, or `None` when it can truthfully be offered. Pure, so
-/// every gating rule is unit-testable.
+/// Why an exact-archive Cheats & Mods entry point is unavailable. Profile
+/// readiness is deliberately not a navigation gate: the full page owns
+/// profile discovery and truthfully presents blocked states.
 fn cheat_entry_blocker(
     selected_archive: Option<&Path>,
     selected_count: usize,
     live_records: Option<&[ArchiveRecord]>,
-    profiles: &RetroArchProfilesState,
+    _profiles: &RetroArchProfilesState,
 ) -> Option<&'static str> {
     let Some(path) = selected_archive else {
         return Some("Select exactly one archive in the Library first.");
@@ -10457,22 +10803,7 @@ fn cheat_entry_blocker(
     {
         return Some("The selected archive is no longer present in the live snapshot.");
     }
-    match profiles {
-        RetroArchProfilesState::NotScanned => Some("RetroArch profiles have not been scanned yet."),
-        RetroArchProfilesState::Scanning { .. } => {
-            Some("The RetroArch profile scan is still running.")
-        }
-        RetroArchProfilesState::Error(_) => {
-            Some("RetroArch profile discovery failed; rescan profiles.")
-        }
-        RetroArchProfilesState::Ready(discovery) => {
-            if discovery.profiles.iter().any(|profile| profile.eligible) {
-                None
-            } else {
-                Some("No eligible RetroArch profile was found.")
-            }
-        }
-    }
+    None
 }
 
 /// The eligible profile IDs in a discovery, in discovery order.
@@ -10500,39 +10831,11 @@ fn show_cheat_workflow_step1(
     let mut action = None;
     widgets::section_header(
         ui,
-        "Step 1 · Archive and RetroArch profile",
+        "Stage 1 · Archive and RetroArch profile",
         Some(
-            "The archive is fixed for this workflow. ArchiveFS selects a profile automatically only when exactly one is eligible.",
+            "The archive context above is fixed. ArchiveFS selects a profile automatically only when exactly one is eligible.",
         ),
     );
-    widgets::card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(&workflow.display_name)
-                    .size(19.0)
-                    .strong(),
-            );
-            widgets::status_badge(
-                ui,
-                workflow.platform.as_deref().unwrap_or("Unknown platform"),
-                widgets::StatusTone::Info,
-            );
-            ui.label(egui::RichText::new(format_size(workflow.size_bytes)).color(theme::muted(ui)));
-        });
-        egui::CollapsingHeader::new("Archive details")
-            .default_open(false)
-            .show(ui, |ui| {
-                if widgets::path_value(ui, "Archive", &workflow.archive_path) {
-                    ui.ctx()
-                        .copy_text(workflow.archive_path.display().to_string());
-                }
-                if widgets::path_value(ui, "Source root", &workflow.source_root) {
-                    ui.ctx()
-                        .copy_text(workflow.source_root.display().to_string());
-                }
-            });
-    });
-    ui.add_space(10.0);
     widgets::section_header(ui, "RetroArch profile", None);
     match profiles {
         RetroArchProfilesState::NotScanned => {
@@ -12435,9 +12738,9 @@ struct LoadedViewState<'a> {
     platform_choice: &'a mut Option<String>,
     platform_custom_text: &'a mut String,
     platform_busy: bool,
-    /// Shared RetroArch profile discovery state - gates the row context
-    /// menu's "RetroArch Cheats" entry exactly like the Selected page's
-    /// button (`cheat_entry_blocker` is the single source of truth).
+    /// Shared RetroArch profile discovery state. Navigation itself is
+    /// gated only by exact archive identity; the destination page uses
+    /// this state to present scan, eligible, and blocked profile states.
     retroarch_profiles: &'a RetroArchProfilesState,
     selected_archives: &'a mut HashSet<PathBuf>,
     bulk_platform_choice: &'a mut Option<String>,
@@ -12866,54 +13169,56 @@ fn show_loaded_data(
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
-    let (operation_request, platform_request, inspect_request) =
-        egui::TopBottomPanel::top("library_selected_archive_panel")
-            .resizable(true)
-            .default_height(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT)
-            .height_range(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT..=SELECTED_ARCHIVE_PANEL_MAX_HEIGHT)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("library_selected_archive_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        show_selected_archive(
-                            ui,
-                            selected_record(&data.records, selected_archive.as_deref()),
-                            selected_persisted,
-                            selected_platform_details(cached, selected_persisted),
-                            selected_source_path,
-                            SelectedArchiveViewState {
-                                operation,
-                                busy,
-                                block_reason,
-                                action_readiness_debug_lines,
-                                confirm_unmount,
-                                confirm_lazy_unmount,
-                                focus_lazy_cancel,
-                                lazy_unmount_offers,
-                                remount_offers,
-                                cleanup_after_unmount,
-                                platform_choice,
-                                platform_custom_text,
-                                platform_busy,
-                                clipboard,
-                            },
-                        )
-                    })
-                    .inner
-            })
-            .inner;
-    if let Some(request) = operation_request {
+    let selected_actions = egui::TopBottomPanel::top("library_selected_archive_panel")
+        .resizable(true)
+        .default_height(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT)
+        .height_range(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT..=SELECTED_ARCHIVE_PANEL_MAX_HEIGHT)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("library_selected_archive_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    show_selected_archive(
+                        ui,
+                        selected_record(&data.records, selected_archive.as_deref()),
+                        selected_persisted,
+                        selected_platform_details(cached, selected_persisted),
+                        selected_source_path,
+                        SelectedArchiveViewState {
+                            operation,
+                            busy,
+                            block_reason,
+                            action_readiness_debug_lines,
+                            confirm_unmount,
+                            confirm_lazy_unmount,
+                            focus_lazy_cancel,
+                            lazy_unmount_offers,
+                            remount_offers,
+                            cleanup_after_unmount,
+                            platform_choice,
+                            platform_custom_text,
+                            platform_busy,
+                            clipboard,
+                        },
+                    )
+                })
+                .inner
+        })
+        .inner;
+    if let Some(request) = selected_actions.operation {
         requested_action = Some(AppOperationRequest::Archive(request));
     }
-    if let Some((archive_path, action)) = platform_request {
+    if let Some((archive_path, action)) = selected_actions.platform {
         requested_action = Some(AppOperationRequest::PlatformAssignment {
             archive_path,
             action,
         });
     }
-    if let Some(archive_path) = inspect_request {
+    if let Some(archive_path) = selected_actions.inspect {
         requested_action = Some(AppOperationRequest::InspectArchive(archive_path));
+    }
+    if let Some(archive_path) = selected_actions.cheats_mods {
+        requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
     }
 
     if let Some(archive_path) = confirm_lazy_unmount.clone() {
@@ -13483,9 +13788,8 @@ fn show_loaded_data(
                         requested_action =
                             Some(AppOperationRequest::ShowInLibraryViews(archive_path));
                     }
-                    RowContextMenuAction::RetroArchCheats(archive_path) => {
-                        requested_action =
-                            Some(AppOperationRequest::OpenCheatWorkflow(archive_path));
+                    RowContextMenuAction::CheatsMods(archive_path) => {
+                        requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
                     }
                     RowContextMenuAction::ClearSelection => {
                         selected_archives.clear();
@@ -13795,9 +14099,9 @@ enum RowContextMenuAction {
     /// "Show in Library View preview" - see
     /// `AppOperationRequest::ShowInLibraryViews`'s doc comment.
     ShowInLibraryViews(PathBuf),
-    /// Open the RetroArch cheat workflow for this exact archive - same
-    /// gating as the Selected page's entry (`cheat_entry_blocker`).
-    RetroArchCheats(PathBuf),
+    /// Open the first-class Cheats & Mods workspace for this exact
+    /// archive - same gating as the Selected page's entry.
+    CheatsMods(PathBuf),
     ClearSelection,
 }
 
@@ -13811,8 +14115,8 @@ struct RowMenuContext<'a> {
     busy: bool,
     block_reason: Option<&'static str>,
     platform_busy: bool,
-    /// See `LoadedViewState::retroarch_profiles` - same single source
-    /// of truth for the "RetroArch Cheats" context entry.
+    /// See `LoadedViewState::retroarch_profiles`; profile readiness is
+    /// presented on the destination page rather than used to hide it.
     retroarch_profiles: &'a RetroArchProfilesState,
     library_views_configured: bool,
     library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
@@ -13827,6 +14131,10 @@ fn apply_row_right_click(
         selected_archives.insert(path.clone());
         *selected_archive = Some(path);
     }
+}
+
+fn cheats_mods_row_action(path: &Path) -> RowContextMenuAction {
+    RowContextMenuAction::CheatsMods(path.to_path_buf())
 }
 fn show_row_context_menu(
     ui: &mut egui::Ui,
@@ -13928,17 +14236,14 @@ fn show_single_row_context_menu(
         Some(ctx.records),
         ctx.retroarch_profiles,
     );
-    let cheat_button = ui.add_enabled(
-        cheat_blocker.is_none(),
-        egui::Button::new("RetroArch Cheats"),
-    );
+    let cheat_button = ui.add_enabled(cheat_blocker.is_none(), egui::Button::new("Cheats & Mods"));
     let cheat_button = if let Some(reason) = cheat_blocker {
         cheat_button.on_disabled_hover_text(reason)
     } else {
         cheat_button
     };
     if cheat_button.clicked() {
-        action = Some(RowContextMenuAction::RetroArchCheats(row.path.clone()));
+        action = Some(cheats_mods_row_action(&row.path));
         ui.close();
     }
 
@@ -14676,6 +14981,14 @@ struct SelectedArchiveViewState<'a> {
     clipboard: &'a mut dyn ClipboardBackend,
 }
 
+#[derive(Default)]
+struct SelectedArchiveActions {
+    operation: Option<OperationRequest>,
+    platform: Option<(PathBuf, PlatformAction)>,
+    inspect: Option<PathBuf>,
+    cheats_mods: Option<PathBuf>,
+}
+
 fn show_selected_archive(
     ui: &mut egui::Ui,
     record: Option<&ArchiveRecord>,
@@ -14683,11 +14996,7 @@ fn show_selected_archive(
     platform_details: Option<&PlatformProvenanceDetails>,
     source_path: Option<&Path>,
     view_state: SelectedArchiveViewState<'_>,
-) -> (
-    Option<OperationRequest>,
-    Option<(PathBuf, PlatformAction)>,
-    Option<PathBuf>,
-) {
+) -> SelectedArchiveActions {
     let SelectedArchiveViewState {
         operation,
         busy,
@@ -14707,6 +15016,7 @@ fn show_selected_archive(
     let mut request = None;
     let mut platform_request = None;
     let mut inspect_request = None;
+    let mut cheats_mods_request = None;
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
@@ -14836,18 +15146,25 @@ fn show_selected_archive(
             available_action(record.mount_state)
         };
         ui.strong("Options");
-        if ui
-            .add_enabled(
-                is_inspectable(&record.mount_plan.archive.path),
-                egui::Button::new("Inspect contents"),
-            )
-            .on_hover_text(
-                "Read-only: view this archive's internal entries without extracting them.",
-            )
-            .clicked()
-        {
-            inspect_request = Some(record.mount_plan.archive.path.clone());
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    is_inspectable(&record.mount_plan.archive.path),
+                    egui::Button::new("Inspect contents"),
+                )
+                .on_hover_text(
+                    "Read-only: view this archive's internal entries without extracting them.",
+                )
+                .clicked()
+            {
+                inspect_request = Some(record.mount_plan.archive.path.clone());
+            }
+            if widgets::action_button(ui, "Cheats & Mods", widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                cheats_mods_request = Some(record.mount_plan.archive.path.clone());
+            }
+        });
         ui.add_enabled_ui(!busy, |ui| {
             ui.checkbox(
                 cleanup_after_unmount,
@@ -14946,7 +15263,12 @@ fn show_selected_archive(
             platform_request = Some((record.mount_plan.archive.path.clone(), action));
         }
     });
-    (request, platform_request, inspect_request)
+    SelectedArchiveActions {
+        operation: request,
+        platform: platform_request,
+        inspect: inspect_request,
+        cheats_mods: cheats_mods_request,
+    }
 }
 
 /// Renders the "Set platform" / "Clear manual platform" controls tucked
@@ -16011,7 +16333,33 @@ mod tests {
         }
     }
 
-    fn app_with_open_cheat_workflow() -> ArchiveFsApp {
+    fn cheat_source_list_fixture() -> (String, String, CheatSourceList) {
+        let source = trusted_retroarch_cheat_sources()
+            .into_iter()
+            .next()
+            .expect("a built-in trusted source exists");
+        let source_id = source.source_id.clone();
+        (
+            source_id,
+            source.display_name.clone(),
+            CheatSourceList {
+                schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+                entries: vec![CheatSourceListEntry {
+                    source,
+                    trust_status: "built_in_reviewed".to_string(),
+                    freshness: CheatSourceFreshness::Fresh,
+                    current_cached_version: Some("fixture".to_string()),
+                    fetched_at_unix_seconds: Some(0),
+                    archive_sha256: Some("fixture-digest".to_string()),
+                    catalogue_file_count: Some(4),
+                    setup_usable: true,
+                    warnings: Vec::new(),
+                }],
+            },
+        )
+    }
+
+    fn app_with_cheats_mods_context() -> ArchiveFsApp {
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
             data.records
@@ -16036,7 +16384,8 @@ mod tests {
             selected_source_id: Some("source-a".to_string()),
             fetch_force_refresh: false,
         });
-        app.tools_overlay = ToolsOverlay::RetroArchCheats;
+        app.view = MainView::CheatsMods;
+        app.tools_overlay = ToolsOverlay::None;
         app
     }
 
@@ -16068,7 +16417,7 @@ mod tests {
 
     #[test]
     fn stale_cheat_source_fetch_result_is_discarded_not_applied() {
-        let mut app = app_with_open_cheat_workflow();
+        let mut app = app_with_cheats_mods_context();
         let (sender, receiver) = mpsc::channel();
         app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading { receiver };
 
@@ -16092,7 +16441,7 @@ mod tests {
 
     #[test]
     fn superseded_cheat_fetch_receiver_cannot_deliver_a_result() {
-        let mut app = app_with_open_cheat_workflow();
+        let mut app = app_with_cheats_mods_context();
         let (old_sender, old_receiver) = mpsc::channel();
         app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
             receiver: old_receiver,
@@ -16116,7 +16465,7 @@ mod tests {
 
     #[test]
     fn offline_cached_snapshot_reuse_applies_and_is_recorded() {
-        let mut app = app_with_open_cheat_workflow();
+        let mut app = app_with_cheats_mods_context();
         let (sender, receiver) = mpsc::channel();
         app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading { receiver };
         sender
@@ -16151,7 +16500,7 @@ mod tests {
     }
 
     #[test]
-    fn cheat_entry_is_offered_only_for_one_existing_archive_with_an_eligible_profile() {
+    fn cheat_entry_requires_one_existing_archive_but_not_a_completed_profile_scan() {
         let records = vec![record("/roms/a.zip", MountState::Pending)];
         let ready = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
             "native-user",
@@ -16172,41 +16521,41 @@ mod tests {
             "an archive missing from the live snapshot must disable the entry"
         );
         assert!(cheat_entry_blocker(path, 1, None, &ready).is_some());
-        assert!(
-            cheat_entry_blocker(path, 1, Some(&records), &RetroArchProfilesState::NotScanned)
-                .is_some()
+        assert_eq!(
+            cheat_entry_blocker(path, 1, Some(&records), &RetroArchProfilesState::NotScanned),
+            None
         );
         let (_sender, receiver) = mpsc::channel();
-        assert!(
+        assert_eq!(
             cheat_entry_blocker(
                 path,
                 1,
                 Some(&records),
                 &RetroArchProfilesState::Scanning { receiver }
-            )
-            .is_some()
+            ),
+            None
         );
-        assert!(
+        assert_eq!(
             cheat_entry_blocker(
                 path,
                 1,
                 Some(&records),
                 &RetroArchProfilesState::Error("boom".to_string())
-            )
-            .is_some()
+            ),
+            None
         );
         let no_eligible = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
             "blocked-profile",
             false,
         )]));
-        assert!(
-            cheat_entry_blocker(path, 1, Some(&records), &no_eligible).is_some(),
-            "a discovery with no eligible profile must disable the entry"
+        assert_eq!(
+            cheat_entry_blocker(path, 1, Some(&records), &no_eligible),
+            None
         );
     }
 
     #[test]
-    fn open_cheat_workflow_preselects_only_a_single_eligible_profile() {
+    fn cheats_mods_context_preselects_only_a_single_eligible_profile() {
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
             data.records
@@ -16220,28 +16569,30 @@ mod tests {
             cheat_profile("native-user", true),
             cheat_profile("flatpak-user", true),
         ]));
-        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/a.zip"));
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
         let workflow = app.cheat_workflow.as_ref().expect("workflow must open");
         assert_eq!(workflow.selected_profile_id, None);
-        assert_eq!(app.tools_overlay, ToolsOverlay::RetroArchCheats);
+        assert_eq!(app.view, MainView::CheatsMods);
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
 
         // Exactly one eligible profile: preselected (the CLI's rule).
         app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
             cheat_profile("native-user", true),
             cheat_profile("blocked-profile", false),
         ]));
-        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/a.zip"));
+        app.cheat_workflow = None;
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
         let workflow = app.cheat_workflow.as_ref().expect("workflow must reopen");
         assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
 
         // Opening for an archive missing from the snapshot does nothing.
         app.cheat_workflow = None;
-        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/gone.zip"));
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/gone.zip"));
         assert!(app.cheat_workflow.is_none());
     }
 
     #[test]
-    fn cheat_workflow_open_and_close_never_alter_the_selection() {
+    fn cheats_mods_navigation_and_reconciliation_never_alter_selection_or_queue() {
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
             data.records
@@ -16249,34 +16600,267 @@ mod tests {
         }
         app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
         app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
         app.retroarch_profiles =
             RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
                 "native-user",
                 true,
             )]));
 
-        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/a.zip"));
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
         assert_eq!(
             app.selected_archive.as_deref(),
             Some(Path::new("/roms/a.zip"))
         );
         assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
 
-        // Matching selection: the workflow stays open.
-        app.close_cheat_workflow_if_selection_changed();
+        // Matching selection: the full-page workflow stays available.
+        app.reconcile_cheats_mods_context();
         assert!(app.cheat_workflow.is_some());
-        assert_eq!(app.tools_overlay, ToolsOverlay::RetroArchCheats);
+        assert_eq!(app.view, MainView::CheatsMods);
 
-        // Selection changed: the workflow closes, the selection stays.
+        // Selection changed: stale context clears, selection and queue stay.
         app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
-        app.close_cheat_workflow_if_selection_changed();
+        app.reconcile_cheats_mods_context();
         assert!(app.cheat_workflow.is_none());
-        assert_eq!(app.tools_overlay, ToolsOverlay::None);
         assert_eq!(
             app.selected_archive.as_deref(),
             Some(Path::new("/roms/other.zip"))
         );
         assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    }
+
+    #[test]
+    fn cheats_mods_is_a_primary_active_navigation_destination() {
+        let position = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .position(|(view, label)| *view == MainView::CheatsMods && *label == "Cheats & Mods")
+            .expect("Cheats & Mods must be in the primary workflow navigation");
+        let selected_position = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .position(|(view, _)| *view == MainView::Selected)
+            .unwrap();
+
+        assert_eq!(position, selected_position + 1);
+        assert!(navigation_destination_selected(
+            MainView::CheatsMods,
+            MainView::CheatsMods
+        ));
+        assert!(!navigation_destination_selected(
+            MainView::Library,
+            MainView::CheatsMods
+        ));
+        assert_eq!(main_view_title(MainView::CheatsMods), "Cheats & Mods");
+    }
+
+    #[test]
+    fn row_context_action_preserves_the_exact_archive_for_cheats_mods() {
+        let exact = PathBuf::from("/roms/SNES/Game [Rev A].zip");
+        match cheats_mods_row_action(&exact) {
+            RowContextMenuAction::CheatsMods(path) => assert_eq!(path, exact),
+            _ => panic!("the Cheats & Mods row action must retain the exact archive path"),
+        }
+
+        let records = vec![record("/roms/a.zip", MountState::Pending)];
+        let row = row_with_fields("/roms/a.zip", "SNES", "Pending", "a.zip", "/mount/a");
+        let menu_context = row_menu_context_for(&records);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_single_row_context_menu(ui, &row, &menu_context);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Cheats & Mods"));
+    }
+
+    #[test]
+    fn returning_to_cheats_mods_preserves_completed_workflow_state_and_queue() {
+        let mut app = app_with_cheats_mods_context();
+        app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Ready(
+            cheat_fetch_result_for("source-a", CheatSourceFetchStatus::OfflineReused),
+        );
+        app.view = MainView::Library;
+
+        let replaced = app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
+
+        assert!(
+            !replaced,
+            "returning to the same exact archive must reuse state"
+        );
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().source_fetch,
+            CheatStepResource::Ready(_)
+        ));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.view, MainView::CheatsMods);
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
+    }
+
+    #[test]
+    fn cheats_mods_page_has_a_truthful_no_archive_empty_state() {
+        let ctx = egui::Context::default();
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    None,
+                    &RetroArchProfilesState::NotScanned,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        for expected in [
+            "Cheats & Mods",
+            "No archive context selected",
+            "Choose one archive",
+            "Select an archive in Library",
+            "Mods",
+        ] {
+            assert!(rendered_text_contains(&output, expected));
+        }
+        assert!(!rendered_text_contains(&output, "/roms/"));
+    }
+
+    #[test]
+    fn cheats_mods_page_presents_real_profiles_trusted_source_and_unavailable_stage3() {
+        let mut app = app_with_cheats_mods_context();
+        let (source_id, source_name, list) = cheat_source_list_fixture();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.selected_source_id = Some(source_id);
+        workflow.source_list = CheatStepResource::Ready(list);
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        for expected in [
+            "Stage 1 · Archive and RetroArch profile",
+            "native-user",
+            "Stage 2 · Trusted cheat catalogue",
+            source_name.as_str(),
+            "Trusted built-in",
+            "Stage 3 · Matching and installation",
+            "Catalogue retrieval is available",
+            "Archive matching and cheat installation are not yet implemented",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "Cheats & Mods page did not render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheats_mods_archive_context_shows_mount_and_manual_platform_state() {
+        let app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let live =
+            loaded_data_with_records("/mount", vec![record("/roms/a.zip", MountState::Pending)]);
+        let cached = cached_snapshot(vec![persisted_archive_with_platform(
+            PathBuf::from("/roms/a.zip"),
+            1,
+            "SNES",
+            MANUAL_PLATFORM_SOURCE,
+        )]);
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheat_archive_context(
+                    ui,
+                    workflow,
+                    Some(&live),
+                    Some(&cached),
+                    &mut clipboard,
+                );
+            });
+        });
+
+        for expected in [
+            "Selected archive context",
+            "Ready to mount",
+            "Manual platform assignment",
+            "/roms/a.zip",
+            "/roms",
+        ] {
+            assert!(rendered_text_contains(&output, expected));
+        }
+    }
+
+    #[test]
+    fn recent_cheat_activity_is_filtered_and_compact() {
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Completed,
+            "unrelated mount",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::RetroArchProfileScan,
+            None,
+            ActivityOutcome::Completed,
+            "profile scan complete",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            None,
+            ActivityOutcome::Failed,
+            "trusted catalogue failed",
+        ));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_recent_cheat_activity(ui, &history);
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "profile scan complete"));
+        assert!(rendered_text_contains(&output, "trusted catalogue failed"));
+        assert!(!rendered_text_contains(&output, "unrelated mount"));
+    }
+
+    #[test]
+    fn mods_section_has_no_fake_user_actions() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, show_mods_section);
+        });
+
+        assert!(rendered_text_contains(&output, "Mods"));
+        assert!(rendered_text_contains(
+            &output,
+            "No mod workflow is available yet"
+        ));
+        for forbidden in ["Install", "Browse", "Download", "Apply", "Remove"] {
+            assert!(
+                !rendered_text_contains(&output, forbidden),
+                "Mods must not render a fake {forbidden} action"
+            );
+        }
     }
 
     #[test]
@@ -26770,10 +27354,11 @@ mod tests {
             !rendered_text_contains(&output, "Inspect contents"),
             "no archive is selected, so the entry point must not even be offered"
         );
+        assert!(!rendered_text_contains(&output, "Cheats & Mods"));
     }
 
     #[test]
-    fn inspect_contents_button_appears_for_a_selected_zip_archive() {
+    fn selected_archive_tools_include_inspection_and_cheats_mods() {
         let ctx = egui::Context::default();
         let EmptySelectedArchiveViewStateParts {
             mut confirm_unmount,
@@ -26817,6 +27402,7 @@ mod tests {
         });
 
         assert!(rendered_text_contains(&output, "Inspect contents"));
+        assert!(rendered_text_contains(&output, "Cheats & Mods"));
     }
 
     /// Renders `show_selected_archive` for one live `record` with the given
