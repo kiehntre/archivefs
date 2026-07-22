@@ -156,7 +156,7 @@ entirely, e.g. `unknown`). Stable lower-snake-case JSON values:
   `unsupported`, or no installed-artifact association exists for the
   matched game at all.
 
-Comparing installed content uses a fresh bounded read (the same 2 MiB limit
+Comparing installed content uses a fresh bounded read (the same 8 MiB limit
 as a catalogue `.cht` file) of the expected destination through the same
 no-write, no-follow filesystem trait used everywhere else in this command -
 never a write, never an execute, never a second copy left on disk.
@@ -278,7 +278,7 @@ its destination would otherwise resolve to.
 Fixed in code:
 
 - catalogue files scanned: 50,000;
-- one `.cht` file or the JSON manifest body: 2 MiB / 8 MiB respectively;
+- one `.cht` file or the JSON manifest body: 8 MiB / 8 MiB respectively;
 - directories visited: 50,000;
 - entries in one directory listing: 8,192;
 - cheats per game record: 16,384;

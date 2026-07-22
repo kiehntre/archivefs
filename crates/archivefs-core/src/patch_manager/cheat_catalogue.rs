@@ -85,7 +85,7 @@ use crate::canonical_platform_for_alias;
 pub const CHEAT_CATALOGUE_FORMAT_VERSION: u32 = 1;
 /// Mirrors `retroarch_inventory::MAX_CHEAT_FILE_BYTES` - one catalogue
 /// `.cht` file or the JSON manifest body, bounded-read.
-pub const MAX_CATALOGUE_FILE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CATALOGUE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// A JSON manifest describes many games in one file; it gets its own,
 /// larger bound distinct from a single `.cht` file's bound.
 pub const MAX_CATALOGUE_MANIFEST_BYTES: usize = 8 * 1024 * 1024;

@@ -134,6 +134,11 @@ These are implemented, tested, and in current use today:
   exact profile IDs, read-only matching, destination safety, and the existing
   installer/history/journal/rollback systems; it adds no downloader or GUI.
   See [`docs/RETROARCH_CHEAT_SETUP.md`](docs/RETROARCH_CHEAT_SETUP.md).
+- Trusted RetroArch catalogue retrieval is available through a reviewed
+  registry, bounded HTTPS, redirect/SSRF policy, safe ZIP extraction, strict
+  existing-parser validation, immutable content-addressed snapshots,
+  provenance inspection, offline reuse, and guided `--source` setup. See
+  [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
 
 ## Current development
 

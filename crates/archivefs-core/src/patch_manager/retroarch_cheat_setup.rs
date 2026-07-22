@@ -189,6 +189,8 @@ pub struct RetroArchCheatSetupResult {
     pub configuration_path: Option<EncodedPath>,
     pub cheat_destination_root: Option<EncodedPath>,
     pub catalogue_path: EncodedPath,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieved_source: Option<super::CheatSourceSetupContext>,
     pub database_path: EncodedPath,
     pub preview: Option<RetroArchCheatSetupPreview>,
     pub planned_entries: Vec<RetroArchCheatSetupPlannedEntry>,
@@ -234,6 +236,7 @@ impl RetroArchCheatSetupResult {
             configuration_path: None,
             cheat_destination_root: None,
             catalogue_path: EncodedPath::from_path(catalogue_path),
+            retrieved_source: None,
             database_path: EncodedPath::from_path(database_path),
             preview: None,
             planned_entries: Vec::new(),

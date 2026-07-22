@@ -683,6 +683,14 @@ JSON, and exit codes; approved writes still flow only through
 `execute_cheat_install_run`. See
 [`docs/RETROARCH_CHEAT_SETUP.md`](RETROARCH_CHEAT_SETUP.md).
 
+`patch_manager::cheat_sources` adds trusted RetroArch retrieval without adding
+URL handling to the installer. A compiled registry, manual HTTPS
+redirect/SSRF checks, bounded transport, safe ZIP extraction, existing-parser
+validation, content-addressed cache, atomic metadata pointer, and provenance
+models produce an immutable local catalogue path. Guided setup consumes that
+path through `--source`; local setup is unchanged. See
+[`docs/RETROARCH_CHEAT_SOURCES.md`](RETROARCH_CHEAT_SOURCES.md).
+
 ## Auditing and Observability
 
 Persistent audit storage begins only in a later approved phase; Phase 1 emits bounded in-memory diagnostics and CLI output. Later audit events record source ID/version, metadata snapshot hash, optional artifact hash, verification result, adapter/installation ID, match evidence, plan ID, user or unattended-policy decision, operation ID, changed manifest IDs, result, and sanitized error category. They do not record secrets or unnecessary game paths in exported diagnostics. CLI and GUI can derive a chronological report and answer: what source supplied this file, why it matched this game, what bytes were installed, what was replaced, and whether rollback is available.

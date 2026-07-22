@@ -26,6 +26,7 @@ mod cheat_install_result;
 mod cheat_installer;
 mod cheat_rollback;
 mod cheat_rollback_result;
+mod cheat_sources;
 mod destination_safety;
 mod matching;
 mod pcsx2;
@@ -80,6 +81,16 @@ pub use cheat_rollback_result::{
     CHEAT_ROLLBACK_RUN_SCHEMA_VERSION, CheatRollbackEntryResult, CheatRollbackOutcome,
     CheatRollbackRun, CheatRollbackRunSchemaError, CheatRollbackRunStatus, CheatRollbackSummary,
     parse_cheat_rollback_run,
+};
+pub use cheat_sources::{
+    CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceCacheMetadata, CheatSourceDefinition,
+    CheatSourceError, CheatSourceErrorStage, CheatSourceFetchOptions, CheatSourceFetchResult,
+    CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceHttpResponse, CheatSourceInspection,
+    CheatSourceList, CheatSourceListEntry, CheatSourceManifest, CheatSourceManifestFile,
+    CheatSourceSetupContext, CheatSourceTransport, HttpsCheatSourceTransport,
+    default_cheat_source_cache_root, fetch_retroarch_cheat_source, inspect_retroarch_cheat_source,
+    inspect_retroarch_cheat_source_snapshot, list_retroarch_cheat_sources,
+    trusted_retroarch_cheat_sources,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,
