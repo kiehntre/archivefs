@@ -15,6 +15,17 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
+**Release status:** `v0.5.0-alpha` is currently in preparation - a hardening
+release (mount lifecycle postcondition checks, transactional catalogue
+refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
+GUI and a first-class Cheats & Mods workspace. See
+[`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+for what's actually new and what remains unavailable, and
+[`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
+manual acceptance checklist. Nothing here has been tagged yet - the
+workspace version in `Cargo.toml` still reads `0.4.3-alpha` until that
+release-checklist step happens.
+
 ## Principles
 
 - **Local-first.** No telemetry, no required cloud account, and it keeps
@@ -33,7 +44,9 @@ See [`docs/security.md`](docs/security.md) and [`SECURITY.md`](SECURITY.md)
 for the detailed safety model behind these principles.
 Cheat and mod trust, local inspection, unknown-code, privacy, original-file,
 and responsible-use boundaries are documented separately in
-[`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md).
+[`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md), with a shorter
+user-facing version at
+[`docs/CHEATS_MODS_USER_POLICY.md`](docs/CHEATS_MODS_USER_POLICY.md).
 
 ## What ArchiveFS does today
 
@@ -461,11 +474,19 @@ Platforms:
 - [RetroArch playlist identity and content matching](docs/RETROARCH_PLAYLISTS.md)
 - [RetroArch AppImage detection](docs/RETROARCH_APPIMAGE.md)
 - [RetroArch cheat installation history and journal inspection](docs/RETROARCH_CHEAT_HISTORY.md)
+- [RetroArch guided cheat setup](docs/RETROARCH_CHEAT_SETUP.md)
+- [RetroArch cheat installer and install-result model](docs/RETROARCH_CHEAT_INSTALL.md) / [install result](docs/RETROARCH_CHEAT_INSTALL_RESULT.md)
+- [RetroArch cheat rollback](docs/RETROARCH_CHEAT_ROLLBACK.md)
+- [Trusted RetroArch cheat-source retrieval](docs/RETROARCH_CHEAT_SOURCES.md) / [cheat catalogue](docs/RETROARCH_CHEAT_CATALOGUE.md)
+- [RetroArch cheat-source cache maintenance](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md) / [cache locking](docs/RETROARCH_CHEAT_CACHE_LOCKING.md)
+- [Cheats & Mods trust, safety, and privacy model](docs/CHEATS_MODS_SAFETY.md) / [user-facing policy](docs/CHEATS_MODS_USER_POLICY.md)
 - [Watcher](docs/watcher.md)
 - [Provider pipeline](docs/provider-pipeline.md)
 - [Duplicate detector](docs/duplicate-detector.md)
 - [Security model](docs/security.md)
 - [JSON API](docs/json-api.md)
+- [v0.5.0-alpha release notes](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+- [v0.5.0-alpha manual QA plan](docs/MANUAL_QA_v0.5.0-alpha.md)
 - [Release checklist](docs/release-checklist.md)
 - [Paper cuts / small usability notes](docs/paper-cuts.md)
 - [Contributing](CONTRIBUTING.md)
