@@ -85,9 +85,13 @@ user-facing version at
   trusted cached catalogue. For PS2 archives it also offers a read-only PCSX2
   adapter that discovers safe native/Flatpak profiles and inventories existing
   `cheats`, `cheats_ws`, and present `patches` PNACH files. It does not yet
-  derive a verified game CRC, install cheats or patches, or inspect arbitrary
-  local imports; see [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md)
-  and [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md).
+  derive a verified game CRC or install cheats or patches. GameCube and Wii
+  archives can use a similarly read-only Dolphin adapter to discover native or
+  Flatpak user directories and inspect bounded `GameSettings/*.ini` metadata.
+  Neither adapter inspects arbitrary local imports; see
+  [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
+  [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md), and
+  [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
   pinned snapshots remain protected, and retrieval and maintenance coordinate
@@ -104,9 +108,9 @@ user-facing version at
   `pcsx2-patch-preview` and `retroarch-patch-preview` are preview only.
   Guided cheat setup installs only after confirmation and never enables cheats;
   trusted retrieval remains separate from installation.
-- No broad multi-emulator support yet - PCSX2 and RetroArch are the only
-  two emulators with any patch/cheat preview today, and neither launches,
-  configures, or manages the emulator itself.
+- No broad multi-emulator support yet - PCSX2, RetroArch, and Dolphin are the
+  only emulators with any patch/cheat preview or inventory today, and none is
+  launched or configured by these read-only workflows.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
@@ -472,6 +476,7 @@ Platforms:
 - [Managed library views](docs/library-views.md)
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
 - [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
+- [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)

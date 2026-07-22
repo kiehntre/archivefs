@@ -30,6 +30,7 @@ mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
 mod destination_safety;
+mod dolphin_local;
 mod import_safety;
 mod matching;
 mod pcsx2;
@@ -113,6 +114,17 @@ pub use destination_safety::{
     DestinationSafetyFailureReason, DestinationState, InspectedParent, InspectedParentState,
     SafeDestination, ValidatedDestinationRoot, assess_destination, construct_safe_destination,
     inspect_safe_destination, validate_destination_root,
+};
+pub use dolphin_local::{
+    DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
+    DOLPHIN_MAX_LINE_BYTES, DOLPHIN_MAX_LINES_PER_FILE, DOLPHIN_MAX_PROFILES,
+    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinDirectoryIdentity,
+    DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory, DolphinInspectionError,
+    DolphinInspectionWarning, DolphinInspectionWarningKind, DolphinInstallationType,
+    DolphinMatchResult, DolphinMatchState, DolphinProfile, DolphinProfileBlocker,
+    DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
+    inspect_dolphin_profile, match_dolphin_inventory,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,

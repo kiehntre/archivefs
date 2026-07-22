@@ -45,6 +45,15 @@ directory, parses bounded metadata, and records CRC/title candidates without
 claiming exact identity. No PCSX2 installation or mutation action exists. See
 [`PCSX2_READONLY_ADAPTER.md`](PCSX2_READONLY_ADAPTER.md).
 
+For GameCube and Wii archives, the Dolphin adapter discovers documented native
+and Flatpak user directories and inspects existing, regular
+`GameSettings/*.ini` files. It records filename Game ID/revision candidates and
+the names declared or enabled by supported frame-patch, Action Replay, Gecko,
+and Riivolution sections. It never evaluates codes or follows mod references,
+and a filename is not treated as verified archive identity. No Dolphin
+installation or mutation action exists. See
+[`DOLPHIN_READONLY_ADAPTER.md`](DOLPHIN_READONLY_ADAPTER.md).
+
 The archive picker searches the already loaded ArchiveFS library by displayed
 name, platform, source, mount state, and path. Its tentative selection is
 separate from Library focus and mount queues. Applying a choice changes only the
@@ -104,7 +113,7 @@ supported imported files locally on your device to help identify unsafe paths,
 unexpected executables or scripts, unsupported formats, archive bombs, and
 other structural risks. Today this applies to the trusted RetroArch catalogue
 retrieval pipeline and bounded read-only inspection of an already managed
-PCSX2 profile; it does not describe a general local-import scanner.
+PCSX2 or Dolphin profile; it does not describe a general local-import scanner.
 
 Scan results, filenames, file contents, hashes, and metadata are not sent to the
 ArchiveFS developers or any third party. ArchiveFS has no telemetry, remote file
