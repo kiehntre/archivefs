@@ -23,9 +23,15 @@ archivefs retroarch-cheat-cache-prune [policy] [--cache-root <path>] [--json]
 
 The default root remains
 `~/.local/share/archivefs/cheat-sources/`. `--cache-root` is explicit and uses
-the same traversal and no-symlink validation as retrieval. A missing root is
-an empty read-only inventory; listing, verification and prune preview do not
-create it.
+the same traversal and no-symlink validation as retrieval. Maintenance cache
+roots must resolve to an absolute non-filesystem-root path, so a saved prune
+plan cannot change meaning if a caller changes its working directory. A
+missing root is an empty read-only inventory; listing, verification and prune
+preview do not create it.
+
+Human and JSON paths include a readable rendering and a lossy marker. Security
+binding does not use that rendering: in-memory prune plans retain and compare
+the original operating-system path bytes, including non-UTF-8 cache roots.
 
 ## Inventory and verification
 
@@ -44,6 +50,9 @@ unexpected files, size and digest mismatches, unsafe paths, unsupported
 schemas, unreadable paths, and unpublished staging artifacts. It is strictly
 read-only and returns a non-zero command status when an inspected entry is
 invalid. It never repairs, rewrites, migrates or deletes an invalid snapshot.
+Inventory walks and maintenance metadata reads have explicit entry and byte
+limits. Exceeding a limit fails safely or leaves affected snapshots protected;
+forged size fields use saturating accounting and cannot wrap a cache budget.
 
 ArchiveFS does not infer a last-use time from filesystem access times because
 that would be unreliable and platform-dependent. `last_successful_use` is
@@ -56,8 +65,8 @@ Pins are stored atomically in `<cache-root>/<source-id>/pins.json`, outside
 both the snapshot and immutable manifest. Pin and unpin are idempotent and
 survive later fetches. A snapshot ID must resolve uniquely to a valid,
 manifest-bound snapshot. Malformed, wrongly bound or symlinked pin metadata is
-rejected; pruning then protects every affected snapshot because pin state is
-unknown.
+rejected, including duplicate pin entries; pruning then protects every
+affected snapshot because pin state is unknown.
 
 A pin only prevents ArchiveFS pruning. It cannot prevent the filesystem owner
 from manually changing or deleting cache data. Verification detects such
@@ -119,7 +128,8 @@ preview-only until the same explicit `--yes` confirmation.
 ## JSON, failures and history
 
 Every command supports stable schema-versioned JSON with lower-snake-case
-states and encoded paths. JSON never prompts or mixes prose into stdout.
+states and encoded paths. Argument-validation failures are structured in JSON
+too. JSON never prompts or mixes prose into stdout.
 Malformed entries remain visible as structured findings instead of aborting a
 whole inventory; an unsafe cache root or malformed pin operation is a clear
 failure.

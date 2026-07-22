@@ -9,12 +9,16 @@ use archivefs_core::patch_manager::{
     verify_retroarch_cheat_snapshots,
 };
 use serde::Serialize;
+use serde_json::{Value, json};
+
+type CommandResult = Result<(), Box<dyn std::error::Error>>;
+type CommandRunner = fn(Vec<String>) -> CommandResult;
 
 #[derive(Serialize)]
-struct JsonFailure<'a> {
+struct JsonFailure {
     schema_version: u32,
     status: &'static str,
-    error: &'a CheatSourceError,
+    error: Value,
 }
 
 #[derive(Serialize)]
@@ -25,7 +29,11 @@ struct PruneOutput<'a> {
     execution: &'a CachePruneExecutionResult,
 }
 
-pub fn run_list(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_list(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_json_failure(args, run_list_inner)
+}
+
+fn run_list_inner(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = take_flag(&mut args, "--json")?;
     let source = take_value(&mut args, "--source")?;
     let cache_root = cache_root(&mut args)?;
@@ -44,7 +52,11 @@ pub fn run_list(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
-pub fn run_verify(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_verify(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_json_failure(args, run_verify_inner)
+}
+
+fn run_verify_inner(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = take_flag(&mut args, "--json")?;
     let all = take_flag(&mut args, "--all")?;
     let source = take_value(&mut args, "--source")?;
@@ -77,6 +89,12 @@ pub fn run_verify(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error
 }
 
 pub fn run_pin(args: Vec<String>, pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let json = args.iter().any(|argument| argument == "--json");
+    let result = run_pin_inner(args, pinned);
+    render_failure_if_json(result, json)
+}
+
+fn run_pin_inner(args: Vec<String>, pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut args = args;
     let json = take_flag(&mut args, "--json")?;
     let cache_root = cache_root(&mut args)?;
@@ -92,7 +110,11 @@ pub fn run_pin(args: Vec<String>, pinned: bool) -> Result<(), Box<dyn std::error
     }
 }
 
-pub fn run_prune(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_prune(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_json_failure(args, run_prune_inner)
+}
+
+fn run_prune_inner(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = take_flag(&mut args, "--json")?;
     let yes = take_flag(&mut args, "--yes")?;
     let dry_run = take_flag(&mut args, "--dry-run")?;
@@ -292,18 +314,45 @@ fn render_prune(
     Ok(())
 }
 
-fn fail(error: CheatSourceError, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&JsonFailure {
-                schema_version: CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
-                status: "failed",
-                error: &error,
-            })?
-        );
-    }
+fn fail(error: CheatSourceError, _json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Err(Box::new(error))
+}
+
+fn run_with_json_failure(args: Vec<String>, command: CommandRunner) -> CommandResult {
+    let json = args.iter().any(|argument| argument == "--json");
+    render_failure_if_json(command(args), json)
+}
+
+fn render_failure_if_json(
+    result: Result<(), Box<dyn std::error::Error>>,
+    json_requested: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(error) = &result
+        && json_requested
+    {
+        println!("{}", format_json_failure(error.as_ref())?);
+    }
+    result
+}
+
+fn format_json_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> Result<String, serde_json::Error> {
+    let detail = if let Some(error) = error.downcast_ref::<CheatSourceError>() {
+        serde_json::to_value(error)?
+    } else {
+        json!({
+            "schema_version": CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
+            "stage": "command",
+            "code": "invalid_arguments",
+            "message": error.to_string(),
+        })
+    };
+    serde_json::to_string_pretty(&JsonFailure {
+        schema_version: CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
+        status: "failed",
+        error: detail,
+    })
 }
 
 fn cache_root(args: &mut Vec<String>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -386,6 +435,13 @@ mod tests {
         assert!(args.is_empty());
         assert!(take_flag(&mut vec!["--json".into(), "--json".into()], "--json").is_err());
         assert!(parse_u64(Some("bad".into()), "--keep").is_err());
+        let error: Box<dyn std::error::Error> = "--keep requires a non-negative integer".into();
+        let failure: serde_json::Value =
+            serde_json::from_str(&format_json_failure(error.as_ref()).unwrap()).unwrap();
+        assert_eq!(failure["schema_version"], 1);
+        assert_eq!(failure["status"], "failed");
+        assert_eq!(failure["error"]["stage"], "command");
+        assert_eq!(failure["error"]["code"], "invalid_arguments");
     }
 
     #[test]
