@@ -4262,6 +4262,38 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Applies a `MountPageAction` returned by the Mount or Selected
+    /// page. Queue execution re-derives eligibility from the live
+    /// snapshot at the moment of the click (queue order, `Pending`
+    /// only), then hands the items to the proven `start_mount_all`
+    /// batch engine - never a stale item list captured at render time.
+    fn handle_mount_page_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<MountPageAction>,
+    ) {
+        match action {
+            Some(MountPageAction::MountQueue) => {
+                let items = match &self.state {
+                    LoadState::Ready(data) => {
+                        let eligible = queued_pending_paths(&self.mount_queue, &data.records);
+                        mount_all_items_for_paths(&data.records, &eligible)
+                    }
+                    _ => Vec::new(),
+                };
+                if !items.is_empty() {
+                    self.start_mount_all(context.clone(), items);
+                }
+            }
+            Some(MountPageAction::Refresh) => self.refresh(context),
+            Some(MountPageAction::GoToMount) => {
+                self.view = MainView::Mount;
+                self.tools_overlay = ToolsOverlay::None;
+            }
+            None => {}
+        }
+    }
+
     fn start_mount_all(&mut self, context: egui::Context, items: Vec<MountAllItem>) -> bool {
         if self.is_busy() {
             let message = "Another archive operation is already running.".to_string();
@@ -5413,54 +5445,25 @@ impl eframe::App for ArchiveFsApp {
                         block_reason: archive_action_block_reason.as_deref(),
                     },
                 );
-                match action {
-                    Some(MountPageAction::MountQueue) => {
-                        let items = match &self.state {
-                            LoadState::Ready(data) => {
-                                let eligible =
-                                    queued_pending_paths(&self.mount_queue, &data.records);
-                                mount_all_items_for_paths(&data.records, &eligible)
-                            }
-                            _ => Vec::new(),
-                        };
-                        if !items.is_empty() {
-                            self.start_mount_all(context.clone(), items);
-                        }
-                    }
-                    Some(MountPageAction::Refresh) => self.refresh(context),
-                    None => {}
-                }
+                self.handle_mount_page_action(context, action);
                 return;
             }
 
             if self.view == MainView::Selected {
-                ui.heading("Selected");
-                ui.add_space(4.0);
-                match self.selected_archive.clone() {
-                    Some(path) => {
-                        ui.add(
-                            egui::Label::new(format!("Selected archive: {}", path.display()))
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            "Full details, platform assignment, and mount/unmount \
-                             actions for this archive are on the Library page's \
-                             selected-archive panel while the redesigned Selected \
-                             page is built out.",
-                        );
-                        if ui.button("Open in Library").clicked() {
-                            self.view = MainView::Library;
-                        }
-                    }
-                    None => {
-                        ui.label("No archive is selected. Select an archive in the Library.");
-                        if ui.button("Go to Library").clicked() {
-                            self.view = MainView::Library;
-                        }
-                    }
-                }
+                let live = match &self.state {
+                    LoadState::Ready(data) => Some(data.as_ref()),
+                    _ => None,
+                };
+                let action = show_selected_page(
+                    ui,
+                    live,
+                    self.mount_all_result.as_ref(),
+                    &mut self.mount_queue,
+                    &mut self.confirm_mount_queue,
+                    archive_actions_blocked,
+                    archive_action_block_reason.as_deref(),
+                );
+                self.handle_mount_page_action(context, action);
                 return;
             }
 
@@ -8481,6 +8484,183 @@ fn mount_row_matches(record: &ArchiveRecord, filter: &str) -> bool {
 enum MountPageAction {
     MountQueue,
     Refresh,
+    /// Navigate to the Mount page (the Selected page's empty-queue
+    /// affordance).
+    GoToMount,
+}
+
+/// What the user chose in the shared mount-queue confirmation strip.
+enum QueueConfirmChoice {
+    Mount,
+    Cancel,
+}
+
+/// The inline "mount the queue" confirmation strip shared by the Mount
+/// and Selected pages, so their wording and gating can never drift.
+fn show_mount_queue_confirmation(
+    ui: &mut egui::Ui,
+    attempted: usize,
+    busy: bool,
+) -> Option<QueueConfirmChoice> {
+    let mut choice = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        if attempted == 1 {
+            ui.strong("Mount 1 queued archive?");
+        } else {
+            ui.strong(format!("Mount {attempted} queued archives?"));
+        }
+        ui.label(
+            "Only archives that are ready to mount are attempted; already-mounted \
+             archives and existing destinations are skipped by the batch engine.",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!busy && attempted > 0, egui::Button::new("Mount now"))
+                .clicked()
+            {
+                choice = Some(QueueConfirmChoice::Mount);
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(QueueConfirmChoice::Cancel);
+            }
+        });
+    });
+    choice
+}
+
+/// The design's "Planned Action" label for a queued archive - what the
+/// batch engine will do with it, derived purely from `MountState` (the
+/// action-verb counterpart of `mount_validation_label`).
+fn planned_action_label(state: MountState) -> &'static str {
+    match state {
+        MountState::Pending => "Mount",
+        MountState::Mounted => "Skip — already mounted",
+        MountState::MountPathExists => "Skip — destination already exists",
+    }
+}
+
+/// The redesigned Selected page: review of the mount queue built on the
+/// Mount page - archive, platform, planned destination, and planned
+/// action per queued entry, with per-row removal and the same inline
+/// confirmation-then-`start_mount_all` execution path as the Mount
+/// page. Rendering never mounts anything. The design's mount-command
+/// preview is deliberately absent: the configured ratarmount binary is
+/// not part of any GUI-held state today, and showing a guessed command
+/// would be untruthful.
+fn show_selected_page(
+    ui: &mut egui::Ui,
+    live: Option<&LoadedData>,
+    mount_all_result: Option<&MountAllResult>,
+    queue: &mut Vec<PathBuf>,
+    confirm: &mut bool,
+    busy: bool,
+    block_reason: Option<&str>,
+) -> Option<MountPageAction> {
+    let mut action = None;
+    ui.heading("Selected");
+    ui.add_space(4.0);
+    if let Some(result) = mount_all_result {
+        show_mount_all_result(ui, result);
+        ui.separator();
+    }
+    let Some(data) = live else {
+        ui.label("Live mount state is not loaded yet.");
+        return None;
+    };
+    prune_mount_queue(queue, &data.records);
+    if queue.is_empty() {
+        ui.label("No archives queued.");
+        ui.label("Add archives to the queue from the Mount screen.");
+        if ui.button("Go to Mount").clicked() {
+            action = Some(MountPageAction::GoToMount);
+        }
+        return action;
+    }
+    let attempted = queued_pending_paths(queue, &data.records);
+
+    ui.horizontal(|ui| {
+        if queue.len() == 1 {
+            ui.label("1 archive queued.");
+        } else {
+            ui.label(format!("{} archives queued.", queue.len()));
+        }
+        if attempted.len() < queue.len() {
+            ui.label(format!(
+                "{} will be skipped (already mounted or destination exists).",
+                queue.len() - attempted.len()
+            ));
+        }
+        if ui.button("Clear queue").clicked() {
+            queue.clear();
+            *confirm = false;
+        }
+        let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
+        if ui
+            .add_enabled(
+                mount_enabled,
+                egui::Button::new(format!("Mount queue ({})", attempted.len())),
+            )
+            .clicked()
+        {
+            *confirm = true;
+        }
+    });
+    if busy && let Some(reason) = block_reason {
+        ui.label(reason);
+    }
+    if *confirm {
+        match show_mount_queue_confirmation(ui, attempted.len(), busy) {
+            Some(QueueConfirmChoice::Mount) => {
+                action = Some(MountPageAction::MountQueue);
+                *confirm = false;
+            }
+            Some(QueueConfirmChoice::Cancel) => *confirm = false,
+            None => {}
+        }
+    }
+    ui.separator();
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("selected_queue_grid")
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Archive");
+                    ui.strong("Platform");
+                    ui.strong("Planned destination");
+                    ui.strong("Planned action");
+                    ui.strong("");
+                    ui.end_row();
+                    let mut remove: Option<PathBuf> = None;
+                    for path in queue.iter() {
+                        let Some(record) = data
+                            .records
+                            .iter()
+                            .find(|record| record.mount_plan.archive.path == *path)
+                        else {
+                            continue;
+                        };
+                        ui.label(&record.identity.display_name);
+                        ui.label(record.identity.platform.as_deref().unwrap_or("Unknown"));
+                        ui.add(
+                            egui::Label::new(record.mount_plan.mount_path.display().to_string())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.label(planned_action_label(record.mount_state));
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(path.clone());
+                        }
+                        ui.end_row();
+                    }
+                    if let Some(path) = remove {
+                        queue.retain(|queued_path| *queued_path != path);
+                    }
+                });
+        });
+    action
 }
 
 /// The Mount page's mutable UI state, borrowed field-by-field from
@@ -8594,32 +8774,14 @@ fn show_mount_page(
     }
 
     if *confirm {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            if attempted.len() == 1 {
-                ui.strong("Mount 1 queued archive?");
-            } else {
-                ui.strong(format!("Mount {} queued archives?", attempted.len()));
+        match show_mount_queue_confirmation(ui, attempted.len(), busy) {
+            Some(QueueConfirmChoice::Mount) => {
+                action = Some(MountPageAction::MountQueue);
+                *confirm = false;
             }
-            ui.label(
-                "Only archives that are ready to mount are attempted; already-mounted \
-                 archives and existing destinations are skipped by the batch engine.",
-            );
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !busy && !attempted.is_empty(),
-                        egui::Button::new("Mount now"),
-                    )
-                    .clicked()
-                {
-                    action = Some(MountPageAction::MountQueue);
-                    *confirm = false;
-                }
-                if ui.button("Cancel").clicked() {
-                    *confirm = false;
-                }
-            });
-        });
+            Some(QueueConfirmChoice::Cancel) => *confirm = false,
+            None => {}
+        }
     }
     ui.separator();
 
@@ -13893,6 +14055,19 @@ mod tests {
         assert_eq!(
             mount_validation_label(MountState::MountPathExists),
             "Destination already exists — will be skipped"
+        );
+    }
+
+    #[test]
+    fn planned_action_labels_distinguish_mount_from_both_skip_reasons() {
+        assert_eq!(planned_action_label(MountState::Pending), "Mount");
+        assert_eq!(
+            planned_action_label(MountState::Mounted),
+            "Skip — already mounted"
+        );
+        assert_eq!(
+            planned_action_label(MountState::MountPathExists),
+            "Skip — destination already exists"
         );
     }
 

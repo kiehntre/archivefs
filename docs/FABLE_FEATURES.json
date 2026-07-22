@@ -631,7 +631,7 @@
    ],
    "required_tests": [],
    "status": "in_progress",
-   "evidence": "Redesigned Mount page (show_mount_page) lists live archives with planned destination (record.mount_plan.mount_path) and per-archive validation label; rendering never mounts. Design inspector panel (size/source library detail) still open.",
+   "evidence": "Redesigned Mount page (show_mount_page) lists live archives with planned destination (record.mount_plan.mount_path) and per-archive validation label; rendering never mounts. Design inspector panel (size/source library detail) still open. Selected page (show_selected_page) adds queue review: per-entry planned destination and planned_action_label (Mount / skip reasons), per-row Remove, shared confirmation strip (show_mount_queue_confirmation). Mount-command preview deliberately deferred (configured ratarmount binary not in GUI state).",
    "implementation_commit": null,
    "notes": ""
   },

@@ -238,13 +238,34 @@ inspector side panel (size / source library / confidence), Format/Size
 columns, Ctrl+M shortcut, density toggle (prototype-only), and the
 FUSE-options Advanced block (no backend).
 
+## Redesigned Selected screen (2026-07-22)
+
+Landed in commit "Add redesigned Selected screen for mount queue review":
+
+- `show_selected_page`: queue review over the same `mount_queue` state
+  the Mount page builds — Archive / Platform / Planned destination /
+  Planned action table in queue order, per-row Remove, Clear queue,
+  and the shared confirmation-then-`start_mount_all` execution path.
+- `planned_action_label`: pure `MountState` → action-verb mapping
+  ("Mount" / "Skip — already mounted" / "Skip — destination already
+  exists"), the action counterpart of `mount_validation_label`.
+- `show_mount_queue_confirmation` + `QueueConfirmChoice`: confirmation
+  strip factored out and shared by Mount and Selected so wording and
+  gating cannot drift; `handle_mount_page_action` on `ArchiveFsApp`
+  shares the action handling (queue eligibility re-derived from the
+  live snapshot at click time, never captured at render time).
+- Deliberate deviation: the design's MOUNT COMMAND preview is absent —
+  the configured ratarmount binary name is not part of any GUI-held
+  state (`ConfigIdentity` has only path + digest), and guessing it
+  would be untruthful. Revisit only with a core-provided command
+  preview.
+- Tests: planned-action label mapping added (352 passed, 0 failed).
+
 ## Next deliverable
 
-Redesigned Selected screen (design: queue review — Archive /
-Destination / Planned Action table, per-item Remove, inspector with
-planned action + mount command preview) reusing the Mount page's queue
-state, then Active Mounts actions (Unmount / Lazy Unmount / Cleanup /
-Remount) wired to the existing proven per-archive workflows.
+Active Mounts actions (design: Open, Unmount, Lazy Unmount, Cleanup,
+Remount per mounted archive) wired to the existing proven per-archive
+workflows on the Active Mounts page.
 
 ## Latest clean commit
 
