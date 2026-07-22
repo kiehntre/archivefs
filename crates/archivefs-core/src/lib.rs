@@ -1721,6 +1721,12 @@ pub fn save_source_folder_configs_to(
     mount_root: &Path,
     ratarmount_bin: &str,
 ) -> Result<()> {
+    if let Some(source) = sources.iter().find(|source| source.path.to_str().is_none()) {
+        return Err(ArchiveFsError::Config(format!(
+            "source path cannot be stored losslessly in the UTF-8 configuration file: {}",
+            source.path.display()
+        )));
+    }
     let contents = render_source_folder_configs(sources, mount_root, ratarmount_bin);
     atomic_write_text(path.as_ref(), &contents)
 }
@@ -1805,6 +1811,101 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FilesystemIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_identity(metadata: &fs::Metadata) -> FilesystemIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FilesystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn filesystem_identity(_metadata: &fs::Metadata) -> FilesystemIdentity {
+    FilesystemIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+fn validate_source_root_shape(path: &Path) -> Result<()> {
+    if !path.is_absolute() || path.parent().is_none() {
+        return Err(ArchiveFsError::Config(format!(
+            "source root must be an absolute non-root path: {}",
+            path.display()
+        )));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(ArchiveFsError::Config(format!(
+            "source root contains traversal components: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_source_root(path: &Path) -> Result<FilesystemIdentity> {
+    validate_source_root_shape(path)?;
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|source| ArchiveFsError::io(current.clone(), source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArchiveFsError::Scanner(format!(
+                "refusing symlinked source component {}",
+                current.display()
+            )));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    if !metadata.is_dir() {
+        return Err(ArchiveFsError::Scanner(format!(
+            "source root is not a directory: {}",
+            path.display()
+        )));
+    }
+    fs::read_dir(path).map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    Ok(filesystem_identity(&metadata))
+}
+
+pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> {
+    const MAX_CONFIGURED_SOURCE_ROOTS: usize = 4_096;
+    if paths.len() > MAX_CONFIGURED_SOURCE_ROOTS {
+        return Err(ArchiveFsError::Config(format!(
+            "configured source count exceeds the {MAX_CONFIGURED_SOURCE_ROOTS} source limit"
+        )));
+    }
+    let mut normalized: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        validate_source_root_shape(path)?;
+        let path: PathBuf = path.components().collect();
+        if let Some(existing) = normalized.iter().find(|existing| {
+            path == **existing || path.starts_with(existing) || existing.starts_with(&path)
+        }) {
+            return Err(ArchiveFsError::Config(format!(
+                "duplicate or overlapping source roots are not supported: {} and {}",
+                existing.display(),
+                path.display()
+            )));
+        }
+        normalized.push(path);
+    }
+    Ok(())
+}
+
 /// Validates a user-supplied path as a candidate new source folder,
 /// against the currently configured sources - the multi-source
 /// milestone's shared validation, used identically by the GUI's Add
@@ -1819,12 +1920,20 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
 /// milestone's stated preference, since nothing in this schema
 /// deduplicates a file discovered under two different source folders.
 ///
-/// Returns the path to store: the original input with only its path
-/// components re-collected (which drops a harmless trailing separator),
-/// never canonicalized - so a symlinked source folder is stored exactly
-/// as the user typed it, not silently resolved to wherever it points.
+/// Returns the exact absolute path to store with a harmless trailing
+/// separator removed. Symlink components, traversal, filesystem-root paths,
+/// and paths that cannot be represented losslessly in the UTF-8 config are
+/// rejected rather than stored as aliases or lossy text.
 pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Result<PathBuf> {
     let normalized: PathBuf = candidate.components().collect();
+
+    validate_source_root_shape(candidate)?;
+    if normalized.to_str().is_none() {
+        return Err(ArchiveFsError::Config(format!(
+            "source path cannot be stored losslessly in the UTF-8 configuration file: {}",
+            normalized.display()
+        )));
+    }
 
     match inspect_path(&normalized) {
         PathInspection::Missing => {
@@ -1854,6 +1963,8 @@ pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Res
         PathInspection::Directory => {}
     }
 
+    validate_source_root(&normalized)?;
+
     if let Err(error) = fs::read_dir(&normalized) {
         return Err(ArchiveFsError::Config(format!(
             "{} cannot be read: {error}",
@@ -1865,8 +1976,28 @@ pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Res
         .map_err(|source| ArchiveFsError::io(normalized.clone(), source))?;
 
     for existing_path in existing {
-        let existing_canonical =
-            fs::canonicalize(existing_path).unwrap_or_else(|_| existing_path.clone());
+        validate_source_root_shape(existing_path)?;
+        let existing_normalized: PathBuf = existing_path.components().collect();
+        let existing_canonical = match inspect_path(&existing_normalized) {
+            PathInspection::Missing => existing_normalized,
+            PathInspection::Directory => {
+                validate_source_root(&existing_normalized)?;
+                fs::canonicalize(&existing_normalized)
+                    .map_err(|source| ArchiveFsError::io(existing_normalized.clone(), source))?
+            }
+            PathInspection::Other => {
+                return Err(ArchiveFsError::Config(format!(
+                    "configured source root is not a directory: {}",
+                    existing_normalized.display()
+                )));
+            }
+            PathInspection::PermissionDenied(detail) | PathInspection::MetadataError(detail) => {
+                return Err(ArchiveFsError::Config(format!(
+                    "configured source root cannot be safely compared: {} ({detail})",
+                    existing_normalized.display()
+                )));
+            }
+        };
         if candidate_canonical == existing_canonical {
             return Err(ArchiveFsError::Config(format!(
                 "{} is already a configured source folder",
@@ -2285,6 +2416,11 @@ pub fn scan_source_folder_at(
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
     let sources = load_source_folder_configs_from(config_path)?;
+    let configured_paths = sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    validate_configured_source_roots(&configured_paths)?;
     if !sources.iter().any(|source| source.path == target) {
         return Err(ArchiveFsError::Config(format!(
             "{} is not a configured source folder",
@@ -2329,6 +2465,7 @@ pub fn scan_all_enabled_sources_at(
 ) -> Result<ScanPersistSummary> {
     let sources = load_source_folder_configs_from(config_path)?;
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    validate_configured_source_roots(&all_paths)?;
     let mut database = Database::open_or_create(database_path)?;
     let registered = database.register_source_folders(&all_paths)?;
 
@@ -2585,6 +2722,10 @@ pub struct ArchiveIdentity {
     pub content_hash: Option<String>,
     pub archive_hash: Option<String>,
     pub internal_listing_hash: Option<String>,
+    pub filesystem_device: Option<u64>,
+    pub filesystem_inode: Option<u64>,
+    pub source_filesystem_device: Option<u64>,
+    pub source_filesystem_inode: Option<u64>,
 }
 
 impl ArchiveIdentity {
@@ -2594,6 +2735,9 @@ impl ArchiveIdentity {
         metadata: Option<&fs::Metadata>,
     ) -> Self {
         let source_root = source_root.into();
+        let source_metadata = fs::symlink_metadata(&source_root).ok();
+        let file_identity = metadata.map(filesystem_identity);
+        let source_identity = source_metadata.as_ref().map(filesystem_identity);
         let detection = detect_platform_with_provenance(path, &source_root);
         let (platform, platform_provenance) = match detection {
             Some(detection) => (Some(detection.platform), Some(detection.provenance)),
@@ -2611,6 +2755,10 @@ impl ArchiveIdentity {
             content_hash: None,
             archive_hash: None,
             internal_listing_hash: None,
+            filesystem_device: file_identity.map(|identity| identity.device),
+            filesystem_inode: file_identity.map(|identity| identity.inode),
+            source_filesystem_device: source_identity.map(|identity| identity.device),
+            source_filesystem_inode: source_identity.map(|identity| identity.inode),
         }
     }
 
@@ -2705,7 +2853,9 @@ impl Archive {
     ) -> Option<Self> {
         let path = path.as_ref();
         let kind = archive_kind(path)?;
-        let metadata = fs::metadata(path).ok();
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
         Some(Self {
             path: path.to_path_buf(),
             kind,
@@ -3742,6 +3892,7 @@ impl<'a> ArchiveScanner<'a> {
             "starting archive scan across {} source folder(s)",
             self.config.source_folders.len()
         );
+        validate_configured_source_roots(&self.config.source_folders)?;
         let mut archives = Vec::new();
         for source in &self.config.source_folders {
             debug!("scanning source folder {}", source.display());
@@ -3808,38 +3959,99 @@ impl<'a> ArchiveScanner<'a> {
         source: &Path,
         archives: &mut Vec<Archive>,
     ) -> Result<()> {
-        let entries = fs::read_dir(source)
-            .map_err(|source_error| ArchiveFsError::io(source.to_path_buf(), source_error))?;
+        const MAX_SCAN_ENTRIES: usize = 250_000;
+        const MAX_SCAN_DEPTH: usize = 128;
 
-        for entry in entries {
-            let entry = entry
-                .map_err(|source_error| ArchiveFsError::io(source.to_path_buf(), source_error))?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|source_error| ArchiveFsError::io(path.clone(), source_error))?;
+        let source_identity = validate_source_root(source_root)?;
+        let mut directories = vec![(source.to_path_buf(), 0_usize)];
+        let mut entries_seen = 0_usize;
+        while let Some((directory, depth)) = directories.pop() {
+            let before = fs::symlink_metadata(&directory)
+                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            if before.file_type().is_symlink() || !before.is_dir() {
+                return Err(ArchiveFsError::Scanner(format!(
+                    "source directory changed or became unsafe during scan: {}",
+                    directory.display()
+                )));
+            }
+            let read_dir = fs::read_dir(&directory)
+                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            let mut entries = Vec::new();
+            for entry in read_dir {
+                entries_seen = entries_seen.checked_add(1).ok_or_else(|| {
+                    ArchiveFsError::Scanner("source entry count overflow".to_string())
+                })?;
+                if entries_seen > MAX_SCAN_ENTRIES {
+                    return Err(ArchiveFsError::Scanner(format!(
+                        "source scan exceeded the {MAX_SCAN_ENTRIES} entry limit at {}",
+                        directory.display()
+                    )));
+                }
+                entries.push(entry.map_err(|error| ArchiveFsError::io(directory.clone(), error))?);
+            }
+            entries.sort_by_key(|entry| entry.path());
 
-            if file_type.is_dir() {
-                if path
-                    .file_name()
-                    .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
-                {
-                    debug!(
-                        "not descending into container directory {} - its contents are internal \
-                         payload, not separate library archives",
-                        path.display()
-                    );
+            let mut child_directories = Vec::new();
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+                if file_type.is_symlink() {
                     continue;
                 }
-                self.scan_source(source_root, &path, archives)?;
-            } else if file_type.is_file()
-                && let Some(archive) = Archive::from_path_in_root(&path, source_root)
-            {
-                debug!("discovered archive {}", archive.path.display());
-                archives.push(archive);
+                if file_type.is_dir() {
+                    if path
+                        .file_name()
+                        .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
+                    {
+                        debug!(
+                            "not descending into container directory {} - its contents are internal \
+                             payload, not separate library archives",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    if depth >= MAX_SCAN_DEPTH {
+                        return Err(ArchiveFsError::Scanner(format!(
+                            "source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}",
+                            path.display()
+                        )));
+                    }
+                    child_directories.push((path, depth + 1));
+                } else if file_type.is_file()
+                    && let Some(archive) = Archive::from_path_in_root(&path, source_root)
+                {
+                    if archive.identity.size_bytes.is_none() {
+                        return Err(ArchiveFsError::Scanner(format!(
+                            "archive changed or became unreadable during scan: {}",
+                            path.display()
+                        )));
+                    }
+                    debug!("discovered archive {}", archive.path.display());
+                    archives.push(archive);
+                }
             }
+            let after = fs::symlink_metadata(&directory)
+                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            if after.file_type().is_symlink()
+                || !after.is_dir()
+                || filesystem_identity(&before) != filesystem_identity(&after)
+            {
+                return Err(ArchiveFsError::Scanner(format!(
+                    "source directory changed during scan: {}",
+                    directory.display()
+                )));
+            }
+            child_directories.reverse();
+            directories.extend(child_directories);
         }
-
+        if validate_source_root(source_root)? != source_identity {
+            return Err(ArchiveFsError::Scanner(format!(
+                "source root changed during scan: {}",
+                source_root.display()
+            )));
+        }
         Ok(())
     }
 }
@@ -3874,6 +4086,55 @@ fn is_container_directory(name: &str) -> bool {
 
 pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     ArchiveScanner::new(config).scan_archives()
+}
+
+pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> {
+    let source_identity = validate_source_root(&archive.identity.source_root)?;
+    if archive.identity.source_filesystem_device != Some(source_identity.device)
+        || archive.identity.source_filesystem_inode != Some(source_identity.inode)
+    {
+        return Err(ArchiveFsError::Scanner(format!(
+            "source root changed after scan: {}",
+            archive.identity.source_root.display()
+        )));
+    }
+    if !archive.path.starts_with(&archive.identity.source_root) {
+        return Err(ArchiveFsError::Scanner(format!(
+            "archive escaped source root: {}",
+            archive.path.display()
+        )));
+    }
+    let relative = archive
+        .path
+        .strip_prefix(&archive.identity.source_root)
+        .map_err(|_| ArchiveFsError::Scanner("archive source binding changed".to_string()))?;
+    let mut current = archive.identity.source_root.clone();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArchiveFsError::Scanner(format!(
+                "archive path contains a symlink after scan: {}",
+                current.display()
+            )));
+        }
+    }
+    let metadata = fs::symlink_metadata(&archive.path)
+        .map_err(|error| ArchiveFsError::io(archive.path.clone(), error))?;
+    let identity = filesystem_identity(&metadata);
+    if !metadata.is_file()
+        || archive.identity.filesystem_device != Some(identity.device)
+        || archive.identity.filesystem_inode != Some(identity.inode)
+        || archive.identity.size_bytes != Some(metadata.len())
+        || archive.identity.modified_time != metadata.modified().ok()
+    {
+        return Err(ArchiveFsError::Scanner(format!(
+            "archive changed after scan: {}",
+            archive.path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn plan_mounts(archives: &[Archive], mount_root: impl AsRef<Path>) -> Vec<MountPlan> {
@@ -9726,6 +9987,121 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scanner_refuses_a_symlinked_source_root_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("scanner_symlink_source");
+        let real_source = root.join("real-source");
+        let linked_source = root.join("linked-source");
+        fs::create_dir_all(&real_source).unwrap();
+        fs::write(real_source.join("outside.zip"), b"contents").unwrap();
+        symlink(&real_source, &linked_source).unwrap();
+
+        let error = ArchiveScanner::new(&scanner_config(&linked_source))
+            .scan_archives()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("symlinked source component"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_skips_a_symlink_escape_beneath_a_valid_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("scanner_nested_symlink_escape");
+        let source = root.join("source");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(source.join("inside.zip"), b"inside").unwrap();
+        fs::write(outside.join("outside.zip"), b"outside").unwrap();
+        symlink(&outside, source.join("escape")).unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&source))
+            .scan_archives()
+            .unwrap();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].path, source.join("inside.zip"));
+    }
+
+    #[test]
+    fn scanner_rejects_duplicate_and_nested_roots_but_not_prefix_siblings() {
+        let root = test_root("scanner_source_overlap");
+        let source = root.join("cache");
+        let child = source.join("nested");
+        let prefix_sibling = root.join("cache-old");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&prefix_sibling).unwrap();
+
+        let duplicate = Config {
+            source_folders: vec![source.clone(), source.clone()],
+            ..scanner_config(&root)
+        };
+        assert!(
+            ArchiveScanner::new(&duplicate)
+                .scan_archives()
+                .unwrap_err()
+                .to_string()
+                .contains("overlapping")
+        );
+
+        let nested = Config {
+            source_folders: vec![source.clone(), child],
+            ..scanner_config(&root)
+        };
+        assert!(
+            ArchiveScanner::new(&nested)
+                .scan_archives()
+                .unwrap_err()
+                .to_string()
+                .contains("overlapping")
+        );
+
+        let prefix_collision = Config {
+            source_folders: vec![source, prefix_sibling],
+            ..scanner_config(&root)
+        };
+        assert!(
+            ArchiveScanner::new(&prefix_collision)
+                .scan_archives()
+                .is_ok(),
+            "lexical prefix siblings are distinct roots"
+        );
+    }
+
+    #[test]
+    fn scanner_rejects_relative_and_filesystem_root_sources() {
+        for source in [PathBuf::from("relative/source"), PathBuf::from("/")] {
+            let config = Config {
+                source_folders: vec![source],
+                mount_root: PathBuf::from("/tmp/archivefs-test-mounts"),
+                ratarmount_bin: "ratarmount".to_string(),
+            };
+            let error = ArchiveScanner::new(&config).scan_archives().unwrap_err();
+            assert!(error.to_string().contains("absolute non-root"));
+        }
+    }
+
+    #[test]
+    fn scanner_enforces_a_bounded_directory_depth() {
+        let root = test_root("scanner_depth_limit");
+        let mut directory = root.clone();
+        for _ in 0..=128 {
+            directory.push("d");
+            fs::create_dir(&directory).unwrap();
+        }
+
+        let error = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("directory depth limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn non_utf8_sibling_paths_do_not_panic_during_container_boundary_scan() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -9752,6 +10128,25 @@ mod tests {
 
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].path, invalid_dir.join("Game.zip"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_preserves_a_programmatic_non_utf8_source_root_losslessly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("scanner_non_utf8_source");
+        let source = root.join(std::ffi::OsString::from_vec(vec![b's', 0x80, b'c']));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Game.zip"), b"contents").unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&source))
+            .scan_archives()
+            .unwrap();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].identity.source_root, source);
+        assert_eq!(archives[0].path, source.join("Game.zip"));
     }
 
     #[test]
@@ -10444,6 +10839,33 @@ mod tests {
         let validated = validate_new_source_folder(&new_source, &[existing]).unwrap();
 
         assert_eq!(validated, new_source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_config_save_rejects_non_utf8_without_replacing_existing_config() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("source_config_non_utf8");
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, b"mount_root = \"/safe/existing\"\n").unwrap();
+        let before = fs::read(&config_path).unwrap();
+        let source = SourceFolderConfig {
+            path: root.join(std::ffi::OsString::from_vec(vec![b's', 0x80, b'c'])),
+            enabled: true,
+            created_at: None,
+        };
+
+        let error = save_source_folder_configs_to(
+            &config_path,
+            &[source],
+            &root.join("mounts"),
+            "ratarmount",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("losslessly"));
+        assert_eq!(fs::read(&config_path).unwrap(), before);
     }
 
     fn write_starter_config(config_path: &Path, mount_root: &Path) {

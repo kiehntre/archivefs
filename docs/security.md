@@ -37,7 +37,12 @@ The config controls source folders, mount root, and the ratarmount binary path. 
 
 Security rules:
 
-- Source folders must be explicit.
+- Source folders must be explicit absolute non-root paths. Scans reject duplicate or
+  nested roots and refuse symlink components; symlink entries encountered below a
+  valid root are never followed.
+- Recursive scans are deterministic and bounded by entry and depth limits. They skip
+  special files and revalidate source/archive filesystem identity before catalogue
+  persistence.
 - Mounts must be created under the configured `mount_root`.
 - Unmount operations must never target paths outside `mount_root`.
 
@@ -52,6 +57,9 @@ Security rules:
 - Do not trust archive filenames as safe path components.
 - Skip obvious split archive continuation parts to avoid mounting incomplete fragments.
 - Mark unsupported, corrupt, missing-part, and permission failures in archive health instead of guessing.
+- Catalogue refreshes use one SQLite write transaction with per-source savepoints, so
+  a failed source cannot leave partial rows and a fatal refresh cannot expose a
+  half-updated catalogue.
 
 ### Mount Root
 

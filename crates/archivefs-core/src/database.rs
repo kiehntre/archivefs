@@ -39,6 +39,7 @@ use crate::emulator_environment::EncodedPath;
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
     canonical_platform_names, detect_platform_with_details, normalize_path_segment,
+    revalidate_archive_for_catalogue, validate_configured_source_roots,
 };
 
 /// Resolves the default library database path:
@@ -108,6 +109,43 @@ pub struct Database {
 }
 
 impl Database {
+    fn begin_catalogue_refresh(&mut self) -> Result<()> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| db_error("failed to acquire catalogue refresh transaction", error))
+    }
+
+    fn commit_catalogue_refresh(&mut self) -> Result<()> {
+        self.connection
+            .execute_batch("COMMIT")
+            .map_err(|error| db_error("failed to commit catalogue refresh", error))
+    }
+
+    fn rollback_catalogue_refresh(&mut self) {
+        let _ = self.connection.execute_batch("ROLLBACK");
+    }
+
+    fn begin_folder_refresh(&mut self) -> Result<()> {
+        self.connection
+            .execute_batch("SAVEPOINT archivefs_folder_refresh")
+            .map_err(|error| db_error("failed to start source refresh savepoint", error))
+    }
+
+    fn commit_folder_refresh(&mut self) -> Result<()> {
+        self.connection
+            .execute_batch("RELEASE SAVEPOINT archivefs_folder_refresh")
+            .map_err(|error| db_error("failed to commit source refresh savepoint", error))
+    }
+
+    fn rollback_folder_refresh(&mut self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "ROLLBACK TO SAVEPOINT archivefs_folder_refresh; \
+                 RELEASE SAVEPOINT archivefs_folder_refresh",
+            )
+            .map_err(|error| db_error("failed to roll back source refresh savepoint", error))
+    }
+
     /// Opens the database at `path`, creating the file and its parent
     /// directory if needed, and applying any pending migrations inside
     /// transactions. Fails clearly, without mutating the file, if its
@@ -744,9 +782,23 @@ fn sqlite_diagnostic(error: &rusqlite::Error) -> DatabaseDiagnostic {
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {
-    let connection = Connection::open(path).map_err(|error| {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| {
         ArchiveFsError::Database(format!("failed to open {}: {error}", path.display()))
     })?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            ArchiveFsError::Database(format!(
+                "failed to configure database busy timeout: {error}"
+            ))
+        })?;
     connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(|error| {
@@ -1555,10 +1607,9 @@ impl Database {
     }
 
     /// Starts a new `scan_runs` row with `status = 'running'` and returns
-    /// its id. Committed immediately in its own transaction, so it is
-    /// durably visible even if the process dies moments later - this is
-    /// what makes [`Database::mark_interrupted_scan_runs`] able to detect
-    /// a scan that never finished.
+    /// its id. Direct callers commit according to their surrounding SQLite
+    /// transaction; the catalogue refresh pipeline includes this row in its
+    /// all-or-nothing refresh transaction.
     pub fn start_scan_run(
         &mut self,
         triggered_by: &str,
@@ -1578,10 +1629,10 @@ impl Database {
     }
 
     /// Marks every `scan_runs` row still `status = 'running'` as
-    /// `'interrupted'`. Scanning is synchronous and single-process today,
-    /// so any such row at the start of a new process can only be left
-    /// over from a previous process that did not exit cleanly. Returns
-    /// how many rows were fixed.
+    /// `'interrupted'`. The refresh pipeline acquires an immediate write
+    /// transaction before calling this method, so a concurrent refresh
+    /// cannot have a live row misclassified as interrupted. Returns how
+    /// many rows were fixed.
     pub fn mark_interrupted_scan_runs(&mut self) -> Result<usize> {
         self.connection
             .execute(
@@ -1627,7 +1678,7 @@ impl Database {
 
         let tx = self
             .connection
-            .transaction()
+            .savepoint()
             .map_err(|error| db_error("failed to start upsert_archive transaction", error))?;
 
         let existing: Option<ExistingArchiveRow> = tx
@@ -1861,7 +1912,7 @@ impl Database {
 
         let tx = self
             .connection
-            .transaction()
+            .savepoint()
             .map_err(|error| db_error("failed to start assign_platform transaction", error))?;
         tx.execute(
             "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1 AND is_current = 1",
@@ -2793,7 +2844,7 @@ impl Database {
         let now = now_utc_string();
         let tx = self
             .connection
-            .transaction()
+            .savepoint()
             .map_err(|error| db_error("failed to start mark-missing transaction", error))?;
         for archive_id in &missing {
             tx.execute(
@@ -2848,13 +2899,9 @@ impl Database {
     }
 
     /// Marks `scan_run_id` as `'failed'` with `error_message`, for a
-    /// fatal error that stopped the run before it could complete. Prior
-    /// catalogue state (archives, observations, platform assignments
-    /// already committed earlier in this run) is left exactly as it was -
-    /// a failed run never marks anything missing, because
-    /// [`Database::mark_unseen_archives_missing`] is only ever reached
-    /// after [`Database::complete_scan_run`] in [`scan_and_persist`]'s
-    /// control flow.
+    /// fatal error that stopped the run before it could complete. When used
+    /// inside the catalogue refresh transaction, a later rollback also
+    /// rolls this status update back together with every catalogue mutation.
     pub fn fail_scan_run(&mut self, scan_run_id: i64, error_message: &str) -> Result<()> {
         self.connection
             .execute(
@@ -3146,6 +3193,7 @@ pub fn scan_and_persist(
     config: &Config,
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
+    validate_configured_source_roots(&config.source_folders)?;
     let registered_folders = database.register_source_folders(&config.source_folders)?;
     scan_and_persist_folders(database, &registered_folders, triggered_by)
 }
@@ -3167,6 +3215,28 @@ pub fn scan_and_persist(
 /// register disabled ones (to keep them "configured" rather than
 /// "removed") without asking this function to scan them.
 pub(crate) fn scan_and_persist_folders(
+    database: &mut Database,
+    folders: &[RegisteredSourceFolder],
+    triggered_by: &str,
+) -> Result<ScanPersistSummary> {
+    database.begin_catalogue_refresh()?;
+    let result = scan_and_persist_folders_transaction(database, folders, triggered_by);
+    match result {
+        Ok(summary) => {
+            if let Err(error) = database.commit_catalogue_refresh() {
+                database.rollback_catalogue_refresh();
+                return Err(error);
+            }
+            Ok(summary)
+        }
+        Err(error) => {
+            database.rollback_catalogue_refresh();
+            Err(error)
+        }
+    }
+}
+
+fn scan_and_persist_folders_transaction(
     database: &mut Database,
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
@@ -3200,6 +3270,7 @@ pub(crate) fn scan_and_persist_folders(
             }
         };
 
+        database.begin_folder_refresh()?;
         match persist_one_folder(database, scan_run_id, folder, &archives) {
             Ok(folder_counts) => {
                 counts.source_folders_scanned += 1;
@@ -3216,8 +3287,10 @@ pub(crate) fn scan_and_persist_folders(
                     None,
                     Some(archives.len() as i64),
                 )?;
+                database.commit_folder_refresh()?;
             }
             Err(error) => {
+                database.rollback_folder_refresh()?;
                 counts.errors_count += 1;
                 let message = error.to_string();
                 database.record_source_scan_result(
@@ -3272,6 +3345,7 @@ fn persist_one_folder(
     let mut seen_archive_ids = Vec::with_capacity(archives.len());
 
     for archive in archives {
+        revalidate_archive_for_catalogue(archive)?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
         seen_archive_ids.push(outcome.archive_id);
         counts.archives_seen += 1;
@@ -3761,6 +3835,26 @@ mod tests {
         );
 
         second.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_database_open_refuses_a_symlinked_database_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("writable-database-symlink");
+        let real_path = root.join("real.sqlite3");
+        Database::open_or_create(&real_path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let linked_path = root.join("linked.sqlite3");
+        symlink(&real_path, &linked_path).unwrap();
+
+        let error = Database::open_or_create(&linked_path).unwrap_err();
+
+        assert!(error.to_string().contains("failed to open"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -6135,6 +6229,138 @@ mod tests {
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].relative_path, PathBuf::from(&non_utf8_name));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_replacement_after_scan_is_rejected_before_catalogue_persistence() {
+        let root = temp_dir("archive-replaced-after-scan");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let archive_path = write_archive_file(&source, "game.zip", b"old");
+        let archives = ArchiveScanner::new(&config_for(&source, &mount))
+            .scan_archives()
+            .unwrap();
+        let old_file = fs::File::open(&archive_path).unwrap();
+        fs::remove_file(&archive_path).unwrap();
+        fs::write(&archive_path, b"new").unwrap();
+
+        let error = revalidate_archive_for_catalogue(&archives[0]).unwrap_err();
+
+        assert!(error.to_string().contains("archive changed after scan"));
+        drop(old_file);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_replacement_after_scan_is_rejected_before_catalogue_persistence() {
+        let root = temp_dir("source-replaced-after-scan");
+        let source = root.join("source");
+        let displaced = root.join("source-old");
+        let mount = root.join("mount");
+        write_archive_file(&source, "game.zip", b"old");
+        let archives = ArchiveScanner::new(&config_for(&source, &mount))
+            .scan_archives()
+            .unwrap();
+        fs::rename(&source, &displaced).unwrap();
+        write_archive_file(&source, "game.zip", b"new");
+
+        let error = revalidate_archive_for_catalogue(&archives[0]).unwrap_err();
+
+        assert!(error.to_string().contains("source root changed after scan"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_source_persistence_failure_rolls_back_every_row_for_that_source() {
+        let root = temp_dir("source-persistence-rollback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "a.zip", b"a");
+        write_archive_file(&source, "b.zip", b"b");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_second_scan_observation \
+                 BEFORE INSERT ON archive_scan_observations \
+                 WHEN (SELECT COUNT(*) FROM archive_scan_observations) >= 1 \
+                 BEGIN SELECT RAISE(ABORT, 'forced second observation failure'); END;",
+            )
+            .unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+
+        assert_eq!(summary.folder_errors.len(), 1);
+        assert_eq!(summary.counts.archives_seen, 0);
+        assert!(database.load_archives().unwrap().is_empty());
+        let observations: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_scan_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fatal_scan_completion_failure_rolls_back_the_complete_refresh() {
+        let root = temp_dir("fatal-refresh-rollback");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "game.zip", b"contents");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_scan_completion BEFORE UPDATE ON scan_runs \
+                 WHEN NEW.status = 'completed' \
+                 BEGIN SELECT RAISE(ABORT, 'forced completion failure'); END;",
+            )
+            .unwrap();
+
+        assert!(scan_and_persist(&mut database, &config, "test").is_err());
+
+        assert!(database.load_archives().unwrap().is_empty());
+        let scan_runs: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            scan_runs, 0,
+            "the running row belongs to the rolled-back refresh"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_catalogue_refreshes_are_serialized_with_a_bounded_wait() {
+        let root = temp_dir("concurrent-refresh-serialization");
+        let database_path = root.join("library.sqlite3");
+        let mut first = Database::open_or_create(&database_path).unwrap();
+        let mut second = Database::open_or_create(&database_path).unwrap();
+        second
+            .connection
+            .busy_timeout(Duration::from_millis(25))
+            .unwrap();
+
+        first.begin_catalogue_refresh().unwrap();
+        let error = second.begin_catalogue_refresh().unwrap_err();
+        assert!(
+            error.to_string().contains("locked") || error.to_string().contains("busy"),
+            "unexpected contention error: {error}"
+        );
+
+        first.rollback_catalogue_refresh();
+        second.begin_catalogue_refresh().unwrap();
+        second.rollback_catalogue_refresh();
         let _ = fs::remove_dir_all(&root);
     }
 

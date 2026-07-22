@@ -184,9 +184,11 @@ CREATE UNIQUE INDEX source_folders_path ON source_folders(path);
 ```
 
 - `path` is `BLOB`, not `TEXT` - see [section 3](#3-archive-identity) for why. It holds
-  the exact `PathBuf` bytes of one entry from `Config.source_folders`, resolved but not
-  otherwise normalized (no canonicalization, so a symlinked source folder keeps
-  whatever path the user actually configured, matching how `Config` treats it today).
+  the exact `PathBuf` bytes of one entry from `Config.source_folders`. Scan-time
+  validation requires an absolute, non-root, non-overlapping path and refuses every
+  symlink component. The UTF-8 TOML configuration cannot represent a non-UTF-8 source
+  root losslessly, so source-management writes reject such a root instead of changing
+  its bytes; archive names below a valid source remain byte-preserving BLOB values.
 - `last_seen_in_config_at` is updated every time a config load still contains this
   path. `removed_from_config_at` is set (once, on first detection) when a config load
   no longer contains a path that used to be present. Rows are never deleted - archives
@@ -554,27 +556,25 @@ The task's four candidate identity signals, and how this design uses them:
     and treating them identically would make the database actively misleading. A scan
     only writes `missing` observations for a source folder it successfully finished
     listing.
-- **Interrupted scans.** Because scanning is synchronous and single-process today (no
-  daemon, no background thread doing this concurrently), any `scan_runs` row found
-  with `status = 'running'` and `finished_at IS NULL` at the *start* of a new process
-  can only be left over from a previous process that did not exit cleanly. The next
-  process to open the database marks it `'interrupted'`. Whatever `archives`/
-  `archive_scan_observations` rows that interrupted run did manage to write remain
-  valid - an archive that really was observed, was observed - the only thing
-  incomplete is that not every configured source folder was necessarily reached
-  before the process died, which is exactly why "only mark missing for a source
-  folder whose listing fully completed" (above) also protects against an interrupted
-  scan incorrectly flagging unvisited archives as missing.
-- **Transaction boundaries.** The `scan_runs` row itself is inserted and committed
-  in its own short transaction *before* scanning starts, so it is durably visible as
-  `'running'` even if the process is killed moments later - this is what makes
-  interrupted-scan detection possible at all. The actual per-archive work is then
-  committed in bounded batches (for example, once per fully-scanned source folder, or
-  every N archives for a very large single folder) rather than one transaction for
-  the entire scan: this bounds how much work is lost and re-scanned after a crash to
-  at most one batch, and avoids holding a single very large transaction open (lock
-  contention, WAL growth) against a large library. `scan_runs.finished_at` and
-  `status = 'completed'` are the last thing written, in their own final transaction.
+- **Interrupted and concurrent scans.** A refresh first acquires a bounded SQLite
+  `BEGIN IMMEDIATE` write transaction. This serializes refresh writers before any
+  existing `running` row is classified as interrupted. The new `scan_runs` row and all
+  catalogue observations belong to the same transaction; process termination lets
+  SQLite roll the transaction back instead of exposing a half-refreshed catalogue.
+- **Transaction boundaries.** One refresh is an all-or-nothing outer transaction.
+  Each source uses a savepoint: filesystem or persistence failure rolls back every
+  catalogue mutation for that source, records a truthful per-source failure, and lets
+  independent sources continue. A fatal database or completion failure rolls back
+  the whole outer transaction. The normal database connection has a five-second busy
+  timeout, so concurrent writers fail clearly rather than waiting forever.
+- **Traversal limits and revalidation.** Scans reject relative, filesystem-root,
+  duplicate, nested, and symlinked source roots. Traversal is iterative, sorted,
+  limited to 250,000 entries and 128 directory levels, skips symlinks and special
+  files, and revalidates source-directory identities. Immediately before persistence,
+  the source root and every archive path are checked again for symlinks, device/inode,
+  size, and modification-time changes. These checks do not hash ordinary archives;
+  an owner capable of changing bytes in place while restoring all observed metadata
+  remains outside the routine scan's inexpensive identity guarantees.
 - **Rebuilding the catalogue from scratch.** Because the database is explicitly a
   cache/observation-log and never the only copy of anything (see
   [section 1](#1-goals-and-non-goals)), deleting `~/.local/share/archivefs/library.db`

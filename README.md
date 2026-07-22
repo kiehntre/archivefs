@@ -34,7 +34,7 @@ for the detailed safety model behind these principles.
 
 ## What ArchiveFS does today
 
-- Scans configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping obvious split-archive continuation parts).
+- Safely scans absolute, non-symlinked configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping symlink/special-file entries and obvious split-archive continuation parts, with bounded traversal).
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
 - Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. Catalogue reports and previews use an explicit read-only open; `database-check` additionally distinguishes hot-header evidence, zeroed/truncated non-hot journals, malformed headers, and recovery-required read-only failures without creating, migrating, repairing, or checkpointing anything.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
