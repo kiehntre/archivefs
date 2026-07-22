@@ -5623,7 +5623,7 @@ impl eframe::App for ArchiveFsApp {
                         search: &mut self.mount_search,
                         confirm: &mut self.confirm_mount_queue,
                         busy: archive_actions_blocked,
-                        block_reason: archive_action_block_reason.as_deref(),
+                        block_reason: archive_action_block_reason,
                     },
                 );
                 self.handle_mount_page_action(context, action);
@@ -5642,7 +5642,7 @@ impl eframe::App for ArchiveFsApp {
                     &mut self.mount_queue,
                     &mut self.confirm_mount_queue,
                     archive_actions_blocked,
-                    archive_action_block_reason.as_deref(),
+                    archive_action_block_reason,
                 );
                 self.handle_mount_page_action(context, action);
                 return;

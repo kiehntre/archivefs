@@ -400,12 +400,15 @@ auto-updated).
 
 ## Latest complete workspace test totals
 
-Not run in this session (initializer cost-discipline: full workspace test
-suite intentionally not executed). Approximate `#[test]` function counts by
-grep at initializer time: `archivefs-core` 739, `archivefs-cli` 118,
-`archivefs-gui` 347 (1204 total). These are function counts, not a test-run
-result — run `cargo test --workspace` for actual pass/fail totals before
-relying on this number.
+Full validation run 2026-07-22 after the eight redesign commits
+(`a8c9c86`..`92e547b` + lint fix):
+
+- `cargo fmt --all -- --check`: clean
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (two
+  `needless_option_as_deref` lints found and fixed in the Mount/
+  Selected page wiring)
+- `cargo test --workspace`: **1242 passed, 0 failed** —
+  `archivefs-cli` 127, `archivefs-core` 757, `archivefs-gui` 358.
 
 ## Known limitations
 
