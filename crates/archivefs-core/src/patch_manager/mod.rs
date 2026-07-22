@@ -35,6 +35,7 @@ mod matching;
 mod pcsx2;
 mod retrieval;
 mod retroarch;
+mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
 
@@ -127,6 +128,10 @@ pub use retroarch::{
     PlaylistMatchConfidence, ProposedDestination, RetroArchAdvisoryEntry, RetroArchAdvisoryPlan,
     RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
+};
+pub use retroarch_cheat_library::{
+    RETROARCH_CHEAT_LIBRARY_MAX_DEPTH, RETROARCH_CHEAT_LIBRARY_MAX_ENTRIES,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, inspect_retroarch_cheat_library,
 };
 pub use retroarch_cheat_setup::{
     RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupDiscovery, RetroArchCheatSetupError,

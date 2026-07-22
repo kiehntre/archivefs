@@ -66,9 +66,11 @@ and responsible-use boundaries are documented separately in
   immutable local snapshot and never installs cheats. See
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
 - Presents Cheats & Mods as a first-class GUI workspace while keeping profile,
-  source trust, inspection, destination, and installation state distinct. The
-  current GUI retrieves trusted catalogues but does not yet match archives,
-  install cheats, inspect arbitrary local imports, or provide mod adapters; see
+  source trust, inspection, destination, and installation state distinct. Its
+  in-page picker changes only workspace context; it can inventory an eligible
+  profile's existing cheat directory with fixed read-only bounds or retrieve a
+  trusted cached catalogue. It does not yet match archives, install cheats,
+  inspect arbitrary local imports, or provide mod adapters; see
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
