@@ -17,9 +17,10 @@ use archivefs_core::emulator_environment::retroarch::{
 use archivefs_core::patch_manager::{
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, HttpsCheatSourceTransport, ImportSourceKind,
-    ImportTrustState, LocalSafetyScanningState, RetroArchCheatSetupDiscovery, UNKNOWN_CODE_POLICY,
+    ImportTrustState, LocalSafetyScanningState, RetroArchCheatLibraryInspection,
+    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, UNKNOWN_CODE_POLICY,
     default_cheat_source_cache_root, discover_retroarch_cheat_setup_profiles,
-    fetch_retroarch_cheat_source, list_retroarch_cheat_sources,
+    fetch_retroarch_cheat_source, inspect_retroarch_cheat_library, list_retroarch_cheat_sources,
 };
 mod ui;
 
@@ -2536,6 +2537,12 @@ struct ArchiveFsApp {
     /// returning to the same exact archive does not discard a completed
     /// cache inspection or retrieval.
     cheat_workflow: Option<CheatWorkflowState>,
+    /// A tentative archive choice is isolated here until the picker is
+    /// applied. It never mutates Library focus or multi-selection.
+    cheat_archive_picker: Option<CheatArchivePickerState>,
+    /// A different archive requires confirmation when fetched catalogue
+    /// state would otherwise be discarded.
+    confirm_cheat_archive_change: Option<PathBuf>,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2733,6 +2740,8 @@ impl ArchiveFsApp {
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             cheat_workflow: None,
+            cheat_archive_picker: None,
+            confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -4281,6 +4290,23 @@ impl ArchiveFsApp {
         {
             return false;
         }
+        let (source_mode, selected_source_id, fetch_force_refresh, previous_profile_id) = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| {
+                (
+                    workflow.source_mode,
+                    workflow.selected_source_id.clone(),
+                    workflow.fetch_force_refresh,
+                    workflow.selected_profile_id.clone(),
+                )
+            })
+            .unwrap_or((
+                CheatSourceMode::ArchiveFsTrustedCatalogue,
+                None,
+                false,
+                None,
+            ));
         let record_details = match &self.state {
             LoadState::Ready(data) => Some(data.as_ref()),
             LoadState::Loading { previous, .. } => previous.as_deref(),
@@ -4306,7 +4332,11 @@ impl ArchiveFsApp {
         let selected_profile_id = match &self.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
                 let eligible = eligible_profile_ids(discovery);
-                if eligible.len() == 1 {
+                if let Some(previous) =
+                    previous_profile_id.filter(|previous| eligible.contains(&previous.as_str()))
+                {
+                    Some(previous)
+                } else if eligible.len() == 1 {
                     Some(eligible[0].to_string())
                 } else {
                     None
@@ -4321,10 +4351,13 @@ impl ArchiveFsApp {
             source_root,
             size_bytes,
             selected_profile_id,
+            source_mode,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
             source_list: CheatStepResource::NotLoaded,
             source_fetch: CheatStepResource::NotLoaded,
-            selected_source_id: None,
-            fetch_force_refresh: false,
+            selected_source_id,
+            fetch_force_refresh,
         });
         true
     }
@@ -4338,6 +4371,29 @@ impl ArchiveFsApp {
         // Read-only listing of the local trusted-source cache; safe to
         // start immediately (no network, background thread).
         self.start_cheat_source_list(context.clone());
+    }
+
+    fn open_cheat_archive_picker(&mut self) {
+        self.cheat_archive_picker = Some(CheatArchivePickerState::for_current(
+            self.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+        ));
+    }
+
+    /// Applies one explicit picker choice without touching Library focus,
+    /// multi-selection, queue membership, or mount state.
+    fn apply_cheat_archive_choice(&mut self, context: &egui::Context, archive_path: PathBuf) {
+        self.confirm_cheat_archive_change = None;
+        self.cheat_archive_picker = None;
+        let needs_profile_scan = matches!(
+            self.retroarch_profiles,
+            RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
+        );
+        self.open_cheats_mods_workspace(context, archive_path);
+        if self.cheat_workflow.is_some() && needs_profile_scan {
+            self.start_retroarch_profile_scan(context.clone());
+        }
     }
 
     /// Lists the trusted cheat sources and their cached snapshots in
@@ -4359,6 +4415,40 @@ impl ArchiveFsApp {
         });
     }
 
+    fn start_existing_retroarch_library_inspection(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(profile_id) = workflow.selected_profile_id.clone() else {
+            return;
+        };
+        let destination = match &self.retroarch_profiles {
+            RetroArchProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .and_then(|profile| profile.cheat_destination_root.as_ref())
+                .filter(|path| !path.lossy)
+                .map(|path| PathBuf::from(&path.display)),
+            _ => None,
+        };
+        let Some(destination) = destination else {
+            workflow.existing_library_profile_id = Some(profile_id);
+            workflow.existing_library = CheatStepResource::Failed(
+                "The selected profile has no safely resolved cheat destination.".to_string(),
+            );
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        workflow.existing_library_profile_id = Some(profile_id);
+        workflow.existing_library = CheatStepResource::Loading { receiver };
+        thread::spawn(move || {
+            let result = inspect_retroarch_cheat_library(&destination);
+            let _ = sender.send(Ok(result));
+            context.request_repaint();
+        });
+    }
+
     /// Retrieves the selected trusted source's catalogue in the
     /// background - a real network fetch, or offline reuse of the
     /// cached snapshot when `offline` is set. All size/digest/redirect
@@ -4371,12 +4461,13 @@ impl ArchiveFsApp {
         let Some(source_id) = workflow.selected_source_id.clone() else {
             return;
         };
+        let archive_path = workflow.archive_path.clone();
         let force_refresh = workflow.fetch_force_refresh && !offline;
         let (sender, receiver) = mpsc::channel();
         workflow.source_fetch = CheatStepResource::Loading { receiver };
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
-            None,
+            Some(archive_path),
             ActivityOutcome::Started,
             if offline {
                 format!("Cheat source '{source_id}': reusing cached snapshot (offline).")
@@ -4439,6 +4530,22 @@ impl ArchiveFsApp {
                 }
             }
         }
+        if let CheatStepResource::Loading { receiver } = &workflow.existing_library {
+            match receiver.try_recv() {
+                Ok(Ok(inspection)) => {
+                    workflow.existing_library = CheatStepResource::Ready(inspection);
+                }
+                Ok(Err(message)) => {
+                    workflow.existing_library = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.existing_library = CheatStepResource::Failed(
+                        "RetroArch library inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
         let mut history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.source_fetch {
             match receiver.try_recv() {
@@ -4448,7 +4555,7 @@ impl ArchiveFsApp {
                     {
                         history_entry = Some(HistoryEntry::new(
                             ActivityAction::CheatSourceRetrieval,
-                            None,
+                            Some(workflow.archive_path.clone()),
                             ActivityOutcome::Completed,
                             format!(
                                 "Cheat source '{}': {} (digest {}).",
@@ -4467,7 +4574,7 @@ impl ArchiveFsApp {
                 Ok(Err(message)) => {
                     history_entry = Some(HistoryEntry::new(
                         ActivityAction::CheatSourceRetrieval,
-                        None,
+                        Some(workflow.archive_path.clone()),
                         ActivityOutcome::Failed,
                         format!("Cheat source retrieval failed: {message}"),
                     ));
@@ -4486,23 +4593,23 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Revalidates the page context against both the canonical selection
-    /// and the live snapshot. It never changes selection or queue state;
-    /// a stale context becomes the truthful no-archive page instead.
+    /// Revalidates the independent workspace context against the live
+    /// snapshot. Library focus is intentionally irrelevant: clearing or
+    /// changing it must not silently replace this explicit context.
     fn reconcile_cheats_mods_context(&mut self) {
         if self.view != MainView::CheatsMods {
             return;
         }
-        let context_is_current = self.cheat_workflow.as_ref().is_some_and(|workflow| {
-            self.selected_archive.as_deref() == Some(workflow.archive_path.as_path())
-                && match &self.state {
+        let context_is_current =
+            self.cheat_workflow
+                .as_ref()
+                .is_some_and(|workflow| match &self.state {
                     LoadState::Ready(data) => data
                         .records
                         .iter()
                         .any(|record| record.mount_plan.archive.path == workflow.archive_path),
                     LoadState::Loading { .. } | LoadState::Error(_) => true,
-                }
-        });
+                });
         if !context_is_current {
             self.cheat_workflow = None;
         }
@@ -4550,7 +4657,18 @@ impl ArchiveFsApp {
                             eligible
                         ),
                     ));
+                    let automatic_profile = {
+                        let eligible = eligible_profile_ids(&discovery);
+                        (eligible.len() == 1).then(|| eligible[0].to_string())
+                    };
                     self.retroarch_profiles = RetroArchProfilesState::Ready(discovery);
+                    if let Some(workflow) = self.cheat_workflow.as_mut()
+                        && workflow.selected_profile_id.is_none()
+                    {
+                        workflow.selected_profile_id = automatic_profile;
+                        workflow.existing_library_profile_id = None;
+                        workflow.existing_library = CheatStepResource::NotLoaded;
+                    }
                 }
                 Ok(Err(message)) => {
                     self.history.record(HistoryEntry::new(
@@ -5760,12 +5878,27 @@ impl eframe::App for ArchiveFsApp {
                             )
                         })
                         .inner;
+                    let picker_rows = live
+                        .map(|data| {
+                            build_display_rows(
+                                &data.records,
+                                &data.rows,
+                                self.database_state.snapshot(),
+                            )
+                        })
+                        .unwrap_or_default();
                     match action {
                         Some(CheatWorkflowAction::ChooseArchive) => {
+                            self.open_cheat_archive_picker();
+                        }
+                        Some(CheatWorkflowAction::OpenLibrary) => {
                             self.view = MainView::Library;
                         }
                         Some(CheatWorkflowAction::RescanProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::InspectExistingLibrary) => {
+                            self.start_existing_retroarch_library_inspection(context.clone());
                         }
                         Some(CheatWorkflowAction::RefreshSources) => {
                             self.start_cheat_source_list(context.clone());
@@ -5777,6 +5910,59 @@ impl eframe::App for ArchiveFsApp {
                             self.start_cheat_source_fetch(context.clone(), true);
                         }
                         None => {}
+                    }
+                    let picker_action = self.cheat_archive_picker.as_mut().and_then(|picker| {
+                        show_cheat_archive_picker(
+                            context,
+                            picker,
+                            &picker_rows,
+                            &mut self.clipboard,
+                        )
+                    });
+                    match picker_action {
+                        Some(CheatArchivePickerAction::Cancel) => {
+                            self.cheat_archive_picker = None;
+                        }
+                        Some(CheatArchivePickerAction::Select(path)) => {
+                            let requires_confirmation = cheat_archive_change_requires_confirmation(
+                                self.cheat_workflow.as_ref(),
+                                &path,
+                            );
+                            self.cheat_archive_picker = None;
+                            if requires_confirmation {
+                                self.confirm_cheat_archive_change = Some(path);
+                            } else {
+                                self.apply_cheat_archive_choice(context, path);
+                            }
+                        }
+                        None => {}
+                    }
+                    if let Some(path) = self.confirm_cheat_archive_change.clone() {
+                        let candidate_still_exists = picker_rows
+                            .iter()
+                            .any(|row| row.origin == RowOrigin::Live && row.path == path);
+                        egui::Window::new("Change Cheats & Mods archive?")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .show(context, |ui| {
+                                ui.label("The current archive has catalogue retrieval state. Changing archive discards that page state; it does not alter either archive or RetroArch.");
+                                ui.label(path.display().to_string());
+                                ui.horizontal(|ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        self.confirm_cheat_archive_change = None;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            candidate_still_exists,
+                                            egui::Button::new("Change archive"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.apply_cheat_archive_choice(context, path.clone());
+                                    }
+                                });
+                            });
                     }
                     return;
                 }
@@ -10151,6 +10337,13 @@ struct CheatWorkflowState {
     /// with several eligible profiles the user must choose - never
     /// silently picked.
     selected_profile_id: Option<String>,
+    /// Independent source mode. Changing it never changes the archive,
+    /// profile, destination, or any fetched result retained by another mode.
+    source_mode: CheatSourceMode,
+    /// The profile identity bound to the current read-only installed-library
+    /// inspection. A profile change invalidates only this observation.
+    existing_library_profile_id: Option<String>,
+    existing_library: CheatStepResource<RetroArchCheatLibraryInspection>,
     /// Step 2: the trusted-source cache listing, loaded in the
     /// background when the workflow opens.
     source_list: CheatStepResource<CheatSourceList>,
@@ -10166,6 +10359,309 @@ struct CheatWorkflowState {
     /// short-circuit (the CLI's `--force-refresh`). Never applies to
     /// offline reuse.
     fetch_force_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheatSourceMode {
+    ExistingRetroArchLibrary,
+    ArchiveFsTrustedCatalogue,
+}
+
+impl CheatSourceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExistingRetroArchLibrary => "Existing RetroArch library",
+            Self::ArchiveFsTrustedCatalogue => "ArchiveFS cached catalogue",
+        }
+    }
+}
+
+fn cheat_archive_change_requires_confirmation(
+    workflow: Option<&CheatWorkflowState>,
+    candidate: &Path,
+) -> bool {
+    workflow.is_some_and(|workflow| {
+        workflow.archive_path != candidate
+            && !matches!(workflow.source_fetch, CheatStepResource::NotLoaded)
+    })
+}
+
+#[derive(Default)]
+struct CheatArchivePickerState {
+    search: String,
+    platform_filter: Option<String>,
+    source_filter: Option<PathBuf>,
+    candidate: Option<PathBuf>,
+}
+
+impl CheatArchivePickerState {
+    fn for_current(current: Option<&Path>) -> Self {
+        Self {
+            candidate: current.map(Path::to_path_buf),
+            ..Self::default()
+        }
+    }
+}
+
+enum CheatArchivePickerAction {
+    Cancel,
+    Select(PathBuf),
+}
+
+fn cheat_picker_row_matches(
+    row: &ArchiveRow,
+    search: &str,
+    platform_filter: Option<&str>,
+    source_filter: Option<&Path>,
+) -> bool {
+    if row.origin != RowOrigin::Live {
+        return false;
+    }
+    let normalized = search.trim().to_lowercase();
+    let source_matches =
+        source_filter.is_none_or(|wanted| row.source_path.as_deref() == Some(wanted));
+    let platform_matches = platform_filter.is_none_or(|wanted| row.platform == wanted);
+    let text_matches = normalized.is_empty()
+        || row.matches(&normalized)
+        || row.source_path.as_ref().is_some_and(|source| {
+            source
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&normalized)
+        });
+    source_matches && platform_matches && text_matches
+}
+
+fn cheat_picker_visible_indices(
+    rows: &[ArchiveRow],
+    picker: &CheatArchivePickerState,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            cheat_picker_row_matches(
+                row,
+                &picker.search,
+                picker.platform_filter.as_deref(),
+                picker.source_filter.as_deref(),
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+    indices.sort_by(|left, right| rows[*left].path.cmp(&rows[*right].path));
+    indices
+}
+
+fn move_cheat_picker_candidate(
+    rows: &[ArchiveRow],
+    visible: &[usize],
+    current: Option<&Path>,
+    direction: ArrowDirection,
+) -> Option<PathBuf> {
+    if visible.is_empty() {
+        return None;
+    }
+    let current_position = current.and_then(|current| {
+        visible
+            .iter()
+            .position(|index| rows[*index].path == current)
+    });
+    let position = match (current_position, direction) {
+        (Some(position), ArrowDirection::Down) => (position + 1).min(visible.len() - 1),
+        (Some(position), ArrowDirection::Up) => position.saturating_sub(1),
+        (None, ArrowDirection::Down) => 0,
+        (None, ArrowDirection::Up) => visible.len() - 1,
+    };
+    Some(rows[visible[position]].path.clone())
+}
+
+fn show_cheat_archive_picker(
+    context: &egui::Context,
+    picker: &mut CheatArchivePickerState,
+    rows: &[ArchiveRow],
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatArchivePickerAction> {
+    let default_size = cheat_archive_picker_size(context.input(|input| input.screen_rect().size()));
+    let mut action = None;
+    let mut open = true;
+    egui::Window::new("Choose an archive for Cheats & Mods")
+        .id(egui::Id::new("cheats_mods_archive_picker"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(default_size)
+        .min_size(egui::vec2(520.0, 420.0))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(context, |ui| {
+            ui.label("This changes only the Cheats & Mods context. It does not mount, queue, fetch, or modify the archive.");
+            let search_has_focus = ui
+                .add(
+                egui::TextEdit::singleline(&mut picker.search)
+                    .hint_text("Search name, platform, source, mount state, or path")
+                    .desired_width(f32::INFINITY),
+                )
+                .has_focus();
+
+            let mut platforms: Vec<String> = rows
+                .iter()
+                .filter(|row| row.origin == RowOrigin::Live)
+                .map(|row| row.platform.clone())
+                .collect();
+            platforms.sort();
+            platforms.dedup();
+            let mut sources: Vec<PathBuf> = rows
+                .iter()
+                .filter(|row| row.origin == RowOrigin::Live)
+                .filter_map(|row| row.source_path.clone())
+                .collect();
+            sources.sort();
+            sources.dedup();
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("cheat_picker_platform")
+                    .selected_text(picker.platform_filter.as_deref().unwrap_or("All platforms"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut picker.platform_filter, None, "All platforms");
+                        for platform in &platforms {
+                            ui.selectable_value(
+                                &mut picker.platform_filter,
+                                Some(platform.clone()),
+                                platform,
+                            );
+                        }
+                    });
+                egui::ComboBox::from_id_salt("cheat_picker_source")
+                    .selected_text(
+                        picker
+                            .source_filter
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "All sources".to_string()),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut picker.source_filter, None, "All sources");
+                        for source in &sources {
+                            ui.selectable_value(
+                                &mut picker.source_filter,
+                                Some(source.clone()),
+                                source.display().to_string(),
+                            );
+                        }
+                    });
+            });
+
+            let visible = cheat_picker_visible_indices(rows, picker);
+            if !search_has_focus && ui.input(|input| input.key_pressed(egui::Key::ArrowDown)) {
+                picker.candidate = move_cheat_picker_candidate(
+                    rows,
+                    &visible,
+                    picker.candidate.as_deref(),
+                    ArrowDirection::Down,
+                );
+            }
+            if !search_has_focus && ui.input(|input| input.key_pressed(egui::Key::ArrowUp)) {
+                picker.candidate = move_cheat_picker_candidate(
+                    rows,
+                    &visible,
+                    picker.candidate.as_deref(),
+                    ArrowDirection::Up,
+                );
+            }
+
+            ui.separator();
+            ui.label(format!("{} matching archives", visible.len()));
+            egui::ScrollArea::vertical()
+                .id_salt("cheat_archive_picker_rows")
+                .max_height((ui.available_height() * 0.52).max(160.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for index in &visible {
+                        let row = &rows[*index];
+                        let title = row
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_else(|| row.path.as_os_str().to_string_lossy());
+                        let selected = picker.candidate.as_deref() == Some(row.path.as_path());
+                        let response = ui
+                            .add(
+                                egui::Button::selectable(
+                                selected,
+                                format!("{title}  ·  {}  ·  {}", row.platform, row.state),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(row.path.display().to_string());
+                        if response.clicked() {
+                            picker.candidate = Some(row.path.clone());
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Copy archive path").clicked() {
+                                let _ = clipboard.set_text(row.path.display().to_string());
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+
+            if let Some(candidate) = picker.candidate.as_ref()
+                && let Some(row) = rows.iter().find(|row| row.path == *candidate)
+            {
+                widgets::card(ui, |ui| {
+                    ui.strong("Selected archive preview");
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(ui, &row.platform, widgets::StatusTone::Info);
+                        widgets::status_badge(ui, &row.state, widgets::StatusTone::Pending);
+                    });
+                    if widgets::path_value(ui, "Archive", &row.path) {
+                        let _ = clipboard.set_text(row.path.display().to_string());
+                    }
+                    if let Some(source) = &row.source_path
+                        && widgets::path_value(ui, "Source", source)
+                    {
+                        let _ = clipboard.set_text(source.display().to_string());
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    action = Some(CheatArchivePickerAction::Cancel);
+                }
+                let choose = ui.add_enabled(
+                    picker.candidate.as_ref().is_some_and(|candidate| {
+                        rows.iter().any(|row| {
+                            row.origin == RowOrigin::Live && row.path == *candidate
+                        })
+                    }),
+                    egui::Button::new("Use selected archive"),
+                );
+                if choose.clicked()
+                    || (!search_has_focus
+                        && choose.enabled()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                {
+                    action = picker
+                        .candidate
+                        .clone()
+                        .map(CheatArchivePickerAction::Select);
+                }
+            });
+        });
+    if !open && action.is_none() {
+        action = Some(CheatArchivePickerAction::Cancel);
+    }
+    if action.is_none() && context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        action = Some(CheatArchivePickerAction::Cancel);
+    }
+    action
+}
+
+fn cheat_archive_picker_size(screen: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        (screen.x * 0.82).clamp(620.0, 1080.0),
+        (screen.y * 0.82).clamp(480.0, 760.0),
+    )
 }
 
 /// A background-loaded cheat-workflow resource. Stale-result protection
@@ -10236,7 +10732,9 @@ fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
 /// What the cheat workflow panel asks `update` to do.
 enum CheatWorkflowAction {
     ChooseArchive,
+    OpenLibrary,
     RescanProfiles,
+    InspectExistingLibrary,
     RefreshSources,
     FetchSource,
     UseCachedSnapshot,
@@ -10305,6 +10803,74 @@ fn show_cheats_mods_workflow_states(
     profiles: &RetroArchProfilesState,
 ) {
     let (profile_label, profile_tone) = retroarch_integration_presentation(profiles);
+    let source_label = workflow
+        .map(|workflow| workflow.source_mode.label())
+        .unwrap_or("No source mode selected");
+    let (source_tone, trust_label, trust_tone) = match workflow.map(|workflow| workflow.source_mode)
+    {
+        Some(CheatSourceMode::ExistingRetroArchLibrary) => (
+            widgets::StatusTone::Info,
+            import_trust_label(ImportTrustState::Unverified),
+            import_trust_tone(ImportTrustState::Unverified),
+        ),
+        Some(CheatSourceMode::ArchiveFsTrustedCatalogue) => (
+            widgets::StatusTone::Success,
+            import_trust_label(ImportTrustState::Trusted),
+            import_trust_tone(ImportTrustState::Trusted),
+        ),
+        None => (
+            widgets::StatusTone::Pending,
+            "Not selected",
+            widgets::StatusTone::Pending,
+        ),
+    };
+    let (inspection_label, inspection_tone) = match workflow {
+        Some(workflow) if workflow.source_mode == CheatSourceMode::ExistingRetroArchLibrary => {
+            match &workflow.existing_library {
+                CheatStepResource::Ready(result) if result.complete => (
+                    "Local bounded inventory complete",
+                    widgets::StatusTone::Success,
+                ),
+                CheatStepResource::Ready(_) => {
+                    ("Local inventory incomplete", widgets::StatusTone::Warning)
+                }
+                CheatStepResource::Loading { .. } => {
+                    ("Inspecting locally", widgets::StatusTone::Active)
+                }
+                CheatStepResource::Failed(_) => {
+                    ("Local inventory unavailable", widgets::StatusTone::Warning)
+                }
+                CheatStepResource::NotLoaded => {
+                    ("Local inventory pending", widgets::StatusTone::Pending)
+                }
+            }
+        }
+        Some(_) => (
+            "Trusted retrieval validation available",
+            widgets::StatusTone::Success,
+        ),
+        None => ("Not started", widgets::StatusTone::Pending),
+    };
+    let destination_label = workflow
+        .and_then(|workflow| {
+            let selected = workflow.selected_profile_id.as_deref()?;
+            let RetroArchProfilesState::Ready(discovery) = profiles else {
+                return None;
+            };
+            discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .and_then(|profile| profile.cheat_destination_root.as_ref())
+                .map(|path| path.display.clone())
+        })
+        .unwrap_or_else(|| {
+            if workflow.is_some() {
+                "Not selected — choose an eligible profile".to_string()
+            } else {
+                "No archive context".to_string()
+            }
+        });
     widgets::section_header(
         ui,
         "Workflow state",
@@ -10315,28 +10881,12 @@ fn show_cheats_mods_workflow_states(
     widgets::card(ui, |ui| {
         for (label, value, tone) in [
             ("Emulator profile", profile_label.as_str(), profile_tone),
-            (
-                "Cheat or mod source",
-                "ArchiveFS trusted catalogue available",
-                widgets::StatusTone::Success,
-            ),
-            (
-                "Trust state",
-                import_trust_label(ImportTrustState::Trusted),
-                import_trust_tone(ImportTrustState::Trusted),
-            ),
-            (
-                "Inspection state",
-                "Trusted retrieval validation available",
-                widgets::StatusTone::Success,
-            ),
+            ("Cheat or mod source", source_label, source_tone),
+            ("Trust state", trust_label, trust_tone),
+            ("Inspection state", inspection_label, inspection_tone),
             (
                 "Destination",
-                if workflow.is_some() {
-                    "Not selected — matching is unavailable"
-                } else {
-                    "No archive context"
-                },
+                destination_label.as_str(),
                 widgets::StatusTone::Pending,
             ),
             (
@@ -10373,28 +10923,6 @@ fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
                 ui.label("ArchiveFS never silently rewrites, deletes, or sanitizes an original import source. A future sanitized import would be a separate copy with an exclusion report.");
                 ui.label(IMPORT_CONSENT_COPY);
                 ui.label(format!("Future scanning control: {SCANNING_DISABLED_WARNING}"));
-                ui.add_space(6.0);
-                ui.strong("Source model");
-                for kind in [
-                    ImportSourceKind::EmulatorManagedLibrary,
-                    ImportSourceKind::ArchiveFsTrustedCatalogue,
-                    ImportSourceKind::LocalUnverifiedSource,
-                    ImportSourceKind::RemoteUnverifiedSource,
-                ] {
-                    let (label, state) = import_source_presentation(kind);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(label);
-                        widgets::status_badge(
-                            ui,
-                            state,
-                            if kind == ImportSourceKind::ArchiveFsTrustedCatalogue {
-                                widgets::StatusTone::Success
-                            } else {
-                                widgets::StatusTone::Pending
-                            },
-                        );
-                    });
-                }
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     for state in [
@@ -10524,14 +11052,18 @@ fn show_cheat_archive_context(
     });
 }
 
-fn show_recent_cheat_activity(ui: &mut egui::Ui, history: &OperationHistory) {
+fn show_recent_cheat_activity(
+    ui: &mut egui::Ui,
+    history: &OperationHistory,
+    archive_path: Option<&Path>,
+) {
     let entries: Vec<&HistoryEntry> = history
         .entries()
         .filter(|entry| {
-            matches!(
-                entry.action,
-                ActivityAction::RetroArchProfileScan | ActivityAction::CheatSourceRetrieval
-            )
+            entry.action == ActivityAction::RetroArchProfileScan
+                || (entry.action == ActivityAction::CheatSourceRetrieval
+                    && archive_path.is_some()
+                    && entry.archive_path.as_deref() == archive_path)
         })
         .take(4)
         .collect();
@@ -10599,6 +11131,9 @@ fn show_cheats_mods_page(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
+    let activity_archive = workflow
+        .as_deref()
+        .map(|workflow| workflow.archive_path.clone());
     widgets::page_header(
         ui,
         "Cheats & Mods",
@@ -10656,23 +11191,267 @@ fn show_cheats_mods_page(
         show_cheat_archive_context(ui, workflow, live, cached, clipboard);
         ui.add_space(theme::SECTION_GAP);
         action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
-        action = show_cheat_workflow_step2(ui, workflow, busy).or(action);
+        action = show_cheat_source_modes(ui, workflow, profiles).or(action);
+        let source_action = match workflow.source_mode {
+            CheatSourceMode::ExistingRetroArchLibrary => {
+                show_existing_retroarch_library(ui, workflow, profiles, clipboard)
+            }
+            CheatSourceMode::ArchiveFsTrustedCatalogue => {
+                show_cheat_workflow_step2(ui, workflow, busy)
+            }
+        };
+        action = action.or(source_action);
         ui.add_space(theme::SECTION_GAP);
         show_cheat_unavailable_stage(ui);
     } else {
-        widgets::empty_state(
-            ui,
-            "Choose one archive",
-            "Select an archive in Library, then return here. ArchiveFS never fabricates a default archive context.",
-            None,
-        );
+        widgets::card(ui, |ui| {
+            widgets::section_header(
+                ui,
+                "Choose one archive",
+                Some("ArchiveFS never fabricates a default archive context."),
+            );
+            ui.label("Choose an archive here to discover RetroArch profiles and inspect or retrieve a trusted catalogue. Selection alone never mounts, queues, fetches, or changes the archive.");
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    "Profile discovery available",
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    "Trusted retrieval available",
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(ui, "Matching unavailable", widgets::StatusTone::Pending);
+                widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
+                widgets::status_badge(ui, "Mods unavailable", widgets::StatusTone::Pending);
+            });
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "Choose archive", widgets::ActionStyle::Primary, true)
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::ChooseArchive);
+                }
+                if widgets::action_button(ui, "Open Library", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::OpenLibrary);
+                }
+            });
+        });
     }
 
     ui.add_space(theme::SECTION_GAP);
     show_mods_section(ui);
     ui.add_space(theme::SECTION_GAP);
-    show_recent_cheat_activity(ui, history);
+    show_recent_cheat_activity(ui, history, activity_archive.as_deref());
     action
+}
+
+fn show_cheat_source_modes(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    _profiles: &RetroArchProfilesState,
+) -> Option<CheatWorkflowAction> {
+    widgets::section_header(
+        ui,
+        "Stage 2 · Cheat source",
+        Some(
+            "Source choice is independent from the archive, emulator profile, destination, and installation state.",
+        ),
+    );
+    let show_existing = |ui: &mut egui::Ui, selected: bool| {
+        let mut clicked = false;
+        widgets::card(ui, |ui| {
+            clicked = ui.radio(selected, "Existing RetroArch library").clicked();
+            widgets::status_badge(ui, "Existing local content", widgets::StatusTone::Info);
+            ui.label("Read-only bounded inventory of the selected profile's configured cheat directory. No compatibility claim.");
+        });
+        clicked
+    };
+    let show_trusted = |ui: &mut egui::Ui, selected: bool| {
+        let mut clicked = false;
+        widgets::card(ui, |ui| {
+            clicked = ui.radio(selected, "ArchiveFS trusted catalogue").clicked();
+            widgets::status_badge(ui, "Trusted reviewed source", widgets::StatusTone::Success);
+            ui.label("A validated immutable ArchiveFS cache snapshot. It is not the same as RetroArch installed cheats.");
+        });
+        clicked
+    };
+    let existing_selected = workflow.source_mode == CheatSourceMode::ExistingRetroArchLibrary;
+    let trusted_selected = workflow.source_mode == CheatSourceMode::ArchiveFsTrustedCatalogue;
+    let (existing_clicked, trusted_clicked) = if ui.available_width() >= 760.0 {
+        let mut existing_clicked = false;
+        let mut trusted_clicked = false;
+        ui.columns(2, |columns| {
+            existing_clicked = show_existing(&mut columns[0], existing_selected);
+            trusted_clicked = show_trusted(&mut columns[1], trusted_selected);
+        });
+        (existing_clicked, trusted_clicked)
+    } else {
+        (
+            show_existing(ui, existing_selected),
+            show_trusted(ui, trusted_selected),
+        )
+    };
+    if existing_clicked {
+        workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+    } else if trusted_clicked {
+        workflow.source_mode = CheatSourceMode::ArchiveFsTrustedCatalogue;
+    }
+    let show_planned = |ui: &mut egui::Ui, kind, body| {
+        let (label, state) = import_source_presentation(kind);
+        widgets::card(ui, |ui| {
+            ui.strong(label);
+            widgets::status_badge(ui, state, widgets::StatusTone::Pending);
+            ui.label(body);
+        });
+    };
+    let local_body =
+        "A real bounded local inspection backend is required before selection can be offered.";
+    let remote_body = "User-defined remote sources are a future workflow.";
+    if ui.available_width() >= 760.0 {
+        ui.columns(2, |columns| {
+            show_planned(
+                &mut columns[0],
+                ImportSourceKind::LocalUnverifiedSource,
+                local_body,
+            );
+            show_planned(
+                &mut columns[1],
+                ImportSourceKind::RemoteUnverifiedSource,
+                remote_body,
+            );
+        });
+    } else {
+        show_planned(ui, ImportSourceKind::LocalUnverifiedSource, local_body);
+        show_planned(ui, ImportSourceKind::RemoteUnverifiedSource, remote_body);
+    }
+    None
+}
+
+fn show_existing_retroarch_library(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let selected_profile_id = workflow.selected_profile_id.as_deref();
+    if selected_profile_id.is_none() {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible RetroArch profile before inspecting its configured cheat directory.",
+            widgets::StatusTone::Pending,
+        );
+        return None;
+    }
+    let selected_profile_id = selected_profile_id.unwrap();
+    let destination = match profiles {
+        RetroArchProfilesState::Ready(discovery) => discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.eligible && profile.profile_id == selected_profile_id)
+            .and_then(|profile| profile.cheat_destination_root.as_ref()),
+        _ => None,
+    };
+    let Some(destination) = destination else {
+        widgets::banner(
+            ui,
+            "Destination unavailable",
+            "The selected profile does not currently expose a safely resolved cheat destination.",
+            widgets::StatusTone::Warning,
+        );
+        return None;
+    };
+    if destination.lossy {
+        widgets::banner(
+            ui,
+            "Destination unavailable",
+            "The configured path cannot be represented losslessly and will not be inspected.",
+            widgets::StatusTone::Blocked,
+        );
+        return None;
+    }
+    let path = Path::new(&destination.display);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
+            widgets::status_badge(
+                ui,
+                "Modified by this workspace · No",
+                widgets::StatusTone::Info,
+            );
+        });
+        if widgets::path_value(ui, "RetroArch cheat directory", path) {
+            let _ = clipboard.set_text(destination.display.clone());
+        }
+        ui.label("This inventory counts cheat-like filenames only; it does not prove format compatibility or safety.");
+    });
+
+    if workflow.existing_library_profile_id.as_deref() != Some(selected_profile_id) {
+        workflow.existing_library_profile_id = None;
+        workflow.existing_library = CheatStepResource::NotLoaded;
+    }
+    match &workflow.existing_library {
+        CheatStepResource::NotLoaded => Some(CheatWorkflowAction::InspectExistingLibrary),
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting the directory locally with fixed limits...");
+            });
+            None
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Inspection unavailable",
+                message,
+                widgets::StatusTone::Warning,
+            );
+            None
+        }
+        CheatStepResource::Ready(inspection) => {
+            let (label, tone) = retroarch_library_state_presentation(inspection.state);
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, label, tone);
+                    ui.label(format!(
+                        "Approximately {} cheat-like file{}",
+                        inspection.approximate_cheat_file_count,
+                        if inspection.approximate_cheat_file_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ));
+                    ui.label(format!("{} entries examined", inspection.entries_examined));
+                });
+                if let Some(warning) = &inspection.warning {
+                    ui.label(warning);
+                }
+            });
+            None
+        }
+    }
+}
+
+fn retroarch_library_state_presentation(
+    state: RetroArchCheatLibraryState,
+) -> (&'static str, widgets::StatusTone) {
+    match state {
+        RetroArchCheatLibraryState::Missing => ("Directory missing", widgets::StatusTone::Pending),
+        RetroArchCheatLibraryState::Available => ("Directory exists", widgets::StatusTone::Success),
+        RetroArchCheatLibraryState::Inaccessible => {
+            ("Directory inaccessible", widgets::StatusTone::Warning)
+        }
+        RetroArchCheatLibraryState::UnsafePath => {
+            ("Unsafe path refused", widgets::StatusTone::Blocked)
+        }
+        RetroArchCheatLibraryState::LimitReached => {
+            ("Inspection limit reached", widgets::StatusTone::Warning)
+        }
+    }
 }
 
 /// Step 2 of the cheat workflow: the built-in trusted source list, the
@@ -10690,7 +11469,7 @@ fn show_cheat_workflow_step2(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        "Stage 2 · Trusted cheat catalogue",
+        "Trusted catalogue details",
         Some("Only reviewed, built-in sources are available. Custom URLs are not accepted."),
     );
     if workflow.selected_profile_id.is_none() {
@@ -11037,6 +11816,8 @@ fn show_cheat_workflow_step1(
                 && !eligible.contains(&selected.as_str())
             {
                 workflow.selected_profile_id = None;
+                workflow.existing_library_profile_id = None;
+                workflow.existing_library = CheatStepResource::NotLoaded;
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
                     "The previously selected profile is no longer eligible; choose again.",
@@ -11064,6 +11845,8 @@ fn show_cheat_workflow_step1(
                                 == Some(&profile.profile_id);
                             if ui.radio(selected, &profile.profile_id).clicked() {
                                 workflow.selected_profile_id = Some(profile.profile_id.clone());
+                                workflow.existing_library_profile_id = None;
+                                workflow.existing_library = CheatStepResource::NotLoaded;
                             }
                         } else {
                             ui.add_enabled(
@@ -16557,6 +17340,9 @@ mod tests {
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             selected_profile_id: Some("native-user".to_string()),
+            source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
             source_list: CheatStepResource::NotLoaded,
             source_fetch: CheatStepResource::NotLoaded,
             selected_source_id: Some("source-a".to_string()),
@@ -16639,6 +17425,34 @@ mod tests {
             stale.is_err(),
             "the superseded worker's send must fail once its receiver is gone"
         );
+    }
+
+    #[test]
+    fn changing_cheats_mods_archive_discards_previous_background_result() {
+        let mut app = app_with_cheats_mods_context();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/b.zip", MountState::Pending));
+        }
+        let (old_sender, old_receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
+            receiver: old_receiver,
+        };
+
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/b.zip")));
+        assert!(
+            old_sender
+                .send(Ok(cheat_fetch_result_for(
+                    "source-a",
+                    CheatSourceFetchStatus::Fetched,
+                )))
+                .is_err(),
+            "replacing the exact archive context must drop its old receiver"
+        );
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().source_fetch,
+            CheatStepResource::NotLoaded
+        ));
     }
 
     #[test]
@@ -16798,16 +17612,225 @@ mod tests {
         assert!(app.cheat_workflow.is_some());
         assert_eq!(app.view, MainView::CheatsMods);
 
-        // Selection changed: stale context clears, selection and queue stay.
+        // Library focus changes and clearing are independent from this context.
         app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
         app.reconcile_cheats_mods_context();
-        assert!(app.cheat_workflow.is_none());
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(Path::new("/roms/a.zip"))
+        );
+        app.selected_archive = None;
+        app.reconcile_cheats_mods_context();
+        assert!(app.cheat_workflow.is_some());
+        assert_eq!(app.selected_archive.as_deref(), None);
+        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    }
+
+    #[test]
+    fn cheats_mods_archive_picker_open_and_cancel_preserve_context() {
+        let mut app = app_with_cheats_mods_context();
+        let original = app.cheat_workflow.as_ref().unwrap().archive_path.clone();
+
+        app.open_cheat_archive_picker();
+        assert_eq!(
+            app.cheat_archive_picker
+                .as_ref()
+                .and_then(|picker| picker.candidate.as_deref()),
+            Some(original.as_path())
+        );
+        app.cheat_archive_picker = None;
+
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(original.as_path())
+        );
+
+        assert!(app.confirm_cheat_archive_change.is_none());
+    }
+
+    #[test]
+    fn cheats_mods_archive_picker_search_and_filters_cover_every_displayed_field() {
+        let rows = vec![
+            row_with_fields(
+                "/roms/snes/Chrono Trigger.zip",
+                "SNES",
+                "Ready to mount",
+                "/roms/snes/Chrono Trigger.zip",
+                "/mount/Chrono Trigger",
+            )
+            .with_source_path(Some(PathBuf::from("/roms/snes"))),
+            row_with_fields(
+                "/backup/psx/Chrono Cross.zip",
+                "PlayStation",
+                "Already mounted",
+                "/backup/psx/Chrono Cross.zip",
+                "/mount/Chrono Cross",
+            )
+            .with_source_path(Some(PathBuf::from("/backup/psx"))),
+        ];
+
+        for search in [
+            "chrono trigger",
+            "snes",
+            "/roms/snes",
+            "ready to mount",
+            "/mount/chrono trigger",
+        ] {
+            assert!(cheat_picker_row_matches(&rows[0], search, None, None));
+        }
+        assert!(!cheat_picker_row_matches(
+            &rows[0],
+            "chrono",
+            Some("PlayStation"),
+            None
+        ));
+        assert!(cheat_picker_row_matches(
+            &rows[1],
+            "",
+            Some("PlayStation"),
+            Some(Path::new("/backup/psx"))
+        ));
+        assert!(!cheat_picker_row_matches(
+            &rows[1],
+            "",
+            None,
+            Some(Path::new("/roms/snes"))
+        ));
+        let picker = CheatArchivePickerState::default();
+        let visible = cheat_picker_visible_indices(&rows, &picker);
+        assert_eq!(
+            move_cheat_picker_candidate(&rows, &visible, None, ArrowDirection::Down).as_deref(),
+            Some(Path::new("/backup/psx/Chrono Cross.zip"))
+        );
+        assert_eq!(
+            cheat_archive_picker_size(egui::vec2(1536.0, 864.0)),
+            egui::vec2(1080.0, 708.48)
+        );
+        assert_eq!(
+            cheat_archive_picker_size(egui::vec2(3440.0, 1440.0)),
+            egui::vec2(1080.0, 760.0)
+        );
+    }
+
+    #[test]
+    fn explicit_cheat_archive_choice_changes_only_workspace_context() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records = vec![
+                record("/roms/a.zip", MountState::Mounted),
+                record("/roms/b.zip", MountState::Pending),
+            ];
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip")));
+        {
+            let workflow = app.cheat_workflow.as_mut().unwrap();
+            workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+            workflow.selected_source_id = Some("source-a".to_string());
+            workflow.fetch_force_refresh = true;
+        }
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/b.zip")));
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(Path::new("/roms/b.zip"))
+        );
         assert_eq!(
             app.selected_archive.as_deref(),
-            Some(Path::new("/roms/other.zip"))
+            Some(Path::new("/roms/a.zip"))
         );
         assert_eq!(app.selected_archives.len(), 1);
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        let LoadState::Ready(data) = &app.state else {
+            panic!("test fixture must remain ready");
+        };
+        assert_eq!(data.records[0].mount_state, MountState::Mounted);
+        assert_eq!(data.records[1].mount_state, MountState::Pending);
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().source_mode,
+            CheatSourceMode::ExistingRetroArchLibrary
+        );
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .selected_source_id
+                .as_deref(),
+            Some("source-a")
+        );
+        assert!(app.cheat_workflow.as_ref().unwrap().fetch_force_refresh);
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().source_fetch,
+            CheatStepResource::NotLoaded
+        ));
+    }
+
+    #[test]
+    fn fetched_state_requires_confirmation_before_changing_archive() {
+        let mut app = app_with_cheats_mods_context();
+        assert!(!cheat_archive_change_requires_confirmation(
+            app.cheat_workflow.as_ref(),
+            Path::new("/roms/b.zip")
+        ));
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Ready(
+            cheat_fetch_result_for("source-a", CheatSourceFetchStatus::OfflineReused),
+        );
+        assert!(cheat_archive_change_requires_confirmation(
+            app.cheat_workflow.as_ref(),
+            Path::new("/roms/b.zip")
+        ));
+        assert!(!cheat_archive_change_requires_confirmation(
+            app.cheat_workflow.as_ref(),
+            Path::new("/roms/a.zip")
+        ));
+    }
+
+    #[test]
+    fn source_mode_is_independent_and_local_unverified_has_no_action() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let archive = workflow.archive_path.clone();
+        let profile = workflow.selected_profile_id.clone();
+        workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+        assert_eq!(workflow.archive_path, archive);
+        assert_eq!(workflow.selected_profile_id, profile);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_source_modes(ui, workflow, &RetroArchProfilesState::NotScanned);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Local unverified source"));
+        assert!(rendered_text_contains(&output, "Planned"));
+        for fake_action in ["Browse local", "Choose local", "Import local"] {
+            assert!(!rendered_text_contains(&output, fake_action));
+        }
+    }
+
+    #[test]
+    fn retroarch_library_states_distinguish_missing_inaccessible_and_unsafe() {
+        assert_eq!(
+            retroarch_library_state_presentation(RetroArchCheatLibraryState::Missing).0,
+            "Directory missing"
+        );
+        assert_eq!(
+            retroarch_library_state_presentation(RetroArchCheatLibraryState::Inaccessible).0,
+            "Directory inaccessible"
+        );
+        assert_eq!(
+            retroarch_library_state_presentation(RetroArchCheatLibraryState::UnsafePath).0,
+            "Unsafe path refused"
+        );
     }
 
     #[test]
@@ -16901,7 +17924,10 @@ mod tests {
             "Cheats & Mods",
             "No archive context selected",
             "Choose one archive",
-            "Select an archive in Library",
+            "Choose archive",
+            "Open Library",
+            "Profile discovery available",
+            "Matching unavailable",
             "Mods",
         ] {
             assert!(rendered_text_contains(&output, expected));
@@ -16937,7 +17963,8 @@ mod tests {
         for expected in [
             "Stage 1 · Archive and RetroArch profile",
             "native-user",
-            "Stage 2 · Trusted cheat catalogue",
+            "Stage 2 · Cheat source",
+            "Trusted catalogue details",
             source_name.as_str(),
             "Trusted built-in",
             "Stage 3 · Matching and installation",
@@ -16973,7 +18000,7 @@ mod tests {
             "Destination",
             "Installation state",
             "Trusted",
-            "Not selected — matching is unavailable",
+            "/isolated/cheats",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
@@ -17077,20 +18104,27 @@ mod tests {
         ));
         history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
-            None,
+            Some(PathBuf::from("/roms/a.zip")),
             ActivityOutcome::Failed,
             "trusted catalogue failed",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(PathBuf::from("/roms/other.zip")),
+            ActivityOutcome::Completed,
+            "unrelated catalogue",
         ));
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_recent_cheat_activity(ui, &history);
+                show_recent_cheat_activity(ui, &history, Some(Path::new("/roms/a.zip")));
             });
         });
 
         assert!(rendered_text_contains(&output, "profile scan complete"));
         assert!(rendered_text_contains(&output, "trusted catalogue failed"));
         assert!(!rendered_text_contains(&output, "unrelated mount"));
+        assert!(!rendered_text_contains(&output, "unrelated catalogue"));
     }
 
     #[test]
@@ -17123,6 +18157,9 @@ mod tests {
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             selected_profile_id: None,
+            source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
             source_list: CheatStepResource::NotLoaded,
             source_fetch: CheatStepResource::NotLoaded,
             selected_source_id: None,
@@ -17466,6 +18503,8 @@ mod tests {
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             cheat_workflow: None,
+            cheat_archive_picker: None,
+            confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,

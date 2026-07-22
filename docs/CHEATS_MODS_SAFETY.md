@@ -36,8 +36,26 @@ records provenance and SHA-256 information in an immutable local snapshot.
 
 Catalogue retrieval alone does not install cheats, modify RetroArch, or copy
 files into RetroArch's cheat directory. The first-class GUI workspace currently
-provides profile discovery and trusted catalogue retrieval. Archive matching,
-GUI installation, and all mod adapters remain unavailable there.
+provides an in-page archive picker, profile discovery, trusted catalogue
+retrieval, and a bounded read-only inventory of the selected profile's existing
+RetroArch cheat directory. Archive matching, GUI installation, and all mod
+adapters remain unavailable there.
+
+The archive picker searches the already loaded ArchiveFS library by displayed
+name, platform, source, mount state, and path. Its tentative selection is
+separate from Library focus and mount queues. Applying a choice changes only the
+Cheats & Mods context; it never mounts, fetches, installs, or modifies the
+archive. Changing away from a context with catalogue retrieval state requires
+confirmation.
+
+The existing RetroArch library and ArchiveFS cached catalogue are separate
+source modes. Existing-library inspection validates the configured destination
+root, refuses symlinked or unsafe paths, and examines at most 10,000 directory
+entries to a depth of 16. It counts regular `.cht`-named files without opening
+their contents and does not claim compatibility. Missing destinations are not
+created. Inaccessible paths and limit exhaustion remain explicit incomplete
+results. The inspection itself makes no writes, and the GUI reports that this
+workspace has not modified the directory.
 
 There is not yet a general-purpose inspection pipeline for arbitrary local or
 community cheat and mod sources. Consequently **Local safety scanning** is
