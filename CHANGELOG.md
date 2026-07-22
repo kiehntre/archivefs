@@ -21,8 +21,29 @@ for a narrative overview and
 [`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
 manual acceptance plan.
 
+Cheats & Mods now spans **three read-only emulator adapters**: RetroArch and
+PCSX2 (merged) plus Dolphin (implemented and validated, pending merge - see
+"Pending merge" below). Adapter expansion pauses here - see
+[`ROADMAP.md`](ROADMAP.md#medium-term-plans).
+
 ### Added
 
+- **Three-adapter Cheats & Mods architecture.** Cheats & Mods now
+  integrates three read-only emulator adapters - RetroArch, PCSX2, and
+  Dolphin - each gated to its own platform(s) with explicit profile
+  selection and no install/apply/rollback control anywhere. RetroArch and
+  PCSX2 are merged; Dolphin is implemented and validated, pending merge
+  (see "Pending merge" below). This is the intended stopping point for
+  adapter expansion for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
+- Read-only PCSX2 profile and PNACH inspection in Cheats & Mods: discovers
+  native, Flatpak, and explicitly supplied portable PCSX2 profiles, and
+  inspects existing `cheats`/`cheats_ws`/`patches` directories and `.pnach`
+  files - read-only, nothing written or created. Exact matching requires a
+  separately verified PCSX2 executable CRC, which ArchiveFS does not yet
+  have, so no exact match is ever claimed. No Install, Apply, Enable,
+  Disable, or rollback control exists. See "PCSX2 read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+  for full detail.
 - Redesigned desktop GUI navigation: `Mount`, `Selected`, `Active Mounts`,
   `Doctor`, `History & Logs`, `Settings`, and `About` are now dedicated
   pages, alongside the existing `Library`, `Sources`, `Health`,
@@ -265,8 +286,35 @@ manual acceptance plan.
 - Settings remains read-only for backend-supported configuration;
   appearance/density and other GUI-only preferences are not yet editable,
   and there is no update-check mechanism.
-- A read-only PCSX2 adapter is under separate, parallel development and is
-  not part of this release.
+- PCSX2's exact CRC matching remains deferred (requires a separately
+  verified PCSX2 executable CRC, which ArchiveFS does not yet have), and
+  there is no PCSX2 preview, installation, or rollback support.
+- A read-only Dolphin adapter has been implemented and validated (see
+  "Pending merge" below) but has not been merged into this branch. Further
+  emulator adapter expansion beyond Dolphin is paused for now - see
+  [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
+
+### Pending merge (not yet part of this branch)
+
+- **Read-only Dolphin profile and Game INI inspection**, implemented and
+  validated on branch `codex-dolphin-readonly-adapter` (not yet merged
+  here): discovers native, Flatpak, and explicitly supplied Dolphin
+  configuration roots, and inspects existing `GameSettings/*.ini` files
+  for GameCube/Wii archives - read-only, nothing written or created, and
+  no texture pack, graphics mod, resource pack, or Riivolution asset is
+  inspected. Exact matching requires a separately verified Dolphin Game
+  ID, which ArchiveFS does not yet have, so no exact match is ever
+  claimed. No Install, Apply, Enable, Disable, or rollback control exists.
+  Proven by 6 core tests and 2 GUI tests; full workspace validation on
+  that branch reported 1,356 tests passing (CLI 127, core 828, GUI 401).
+  A Nobara-specific manual run remains outstanding (the available
+  environment was Ubuntu 24.04.4 LTS). See "Dolphin read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+  for full detail.
+
+With Dolphin, Cheats & Mods reaches its intended three-adapter shape
+(RetroArch, PCSX2, Dolphin); further emulator adapter expansion is paused
+for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 
 ## v0.4.3-alpha
 

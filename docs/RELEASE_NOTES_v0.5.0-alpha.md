@@ -24,9 +24,15 @@ things:
    an internal adversarial audit that rejected the first pass as
    functionally sound but not visually release-ready.
 3. Introduces a first-class **Cheats & Mods** workspace and a public trust
-   model (**Trusted** / **Unverified** / **Blocked**) for cheat and mod
-   content, while being explicit that matching, installation, and mod
-   support are not implemented in that workspace yet.
+   model (**Trusted** / **Unverified** / **Blocked**) for cheat content
+   today - the same model is intended to extend to mod content once any
+   mod adapter exists, but no mod adapter is implemented yet - while being
+   explicit that matching and installation are not implemented in that
+   workspace yet either.
+4. Brings Cheats & Mods to its intended **three-adapter architecture**:
+   RetroArch and PCSX2 (merged) plus Dolphin (implemented and validated,
+   pending merge). Further emulator adapter expansion is paused after
+   Dolphin for now - see [`ROADMAP.md`](../ROADMAP.md#medium-term-plans).
 
 ## Major user-visible changes
 
@@ -73,15 +79,22 @@ rescue record are kept in `docs/FABLE_PROGRESS.md` and
 
 ### Cheats & Mods workspace
 
-A new **Cheats & Mods** page keeps three previously separate concerns
-together for one selected archive: RetroArch profile discovery, trusted
-cheat-catalogue retrieval, and the trust/safety model. It is explicit about
-what it does and does not do:
+A new **Cheats & Mods** page keeps profile discovery, trusted-catalogue
+retrieval, and the trust/safety model together for one selected archive,
+across three read-only emulator adapters: **RetroArch** (cheat catalogue
+retrieval and profile discovery), **PCSX2** (PNACH inspection, PS2-only),
+and **Dolphin** (Game INI inspection, GameCube/Wii-only, implemented and
+validated but pending merge - see below). Only one adapter applies to a
+given archive's platform at a time, and each is explicit about what it does
+and does not do:
 
-- Available: choosing an archive, discovering eligible RetroArch profiles,
-  and fetching or reusing a trusted, reviewed cheat catalogue snapshot.
-- Not available yet, and labelled as such rather than hidden: matching the
-  archive against the catalogue, installing a cheat, and any mod adapter.
+- Available today (RetroArch and PCSX2): choosing an archive, discovering
+  eligible emulator profiles, and - for RetroArch - fetching or reusing a
+  trusted, reviewed cheat catalogue snapshot; for PCSX2, inspecting
+  existing on-disk `.pnach` files.
+- Not available yet, and labelled as such rather than hidden, for any
+  adapter: matching the archive against a catalogue with a verified
+  identity, installing anything, and any mod adapter.
 
 See [`docs/CHEATS_MODS_USER_POLICY.md`](CHEATS_MODS_USER_POLICY.md) for the
 user-facing policy and [`docs/CHEATS_MODS_SAFETY.md`](CHEATS_MODS_SAFETY.md)
@@ -96,6 +109,155 @@ and writes a journal, `retroarch-cheat-rollback` can undo a completed
 install from that journal, and `retroarch-cheat-history` /
 `retroarch-cheat-inspect` give read-only history and single-run inspection.
 None of this is reachable from the GUI yet - see Known limitations.
+
+### PCSX2 read-only adapter
+
+A read-only PCSX2 adapter for Cheats & Mods is merged into this release. It
+is a **read-only inspection foundation**, not a complete cheat manager - it
+does not install cheats, apply mods, or change any PCSX2 file:
+
+- Discovers native, Flatpak-user, and Flatpak-system PCSX2 profiles, plus
+  an explicitly supplied portable/AppImage configuration root (never
+  auto-searched). A profile is eligible only with an absolute, non-root,
+  symlink-free path, a readable directory, and PCSX2-specific
+  configuration evidence; ineligible profiles remain visible with a typed
+  blocker reason.
+- Inspects the `cheats`, `cheats_ws` (widescreen patches), and `patches`
+  directories where present, reporting a missing directory normally
+  rather than creating one.
+- Parses existing `.pnach` files read-only (path, filename-derived CRC/
+  serial candidates, title/region/comment fields, enabled/disabled/
+  unknown syntax counts, category, size, SHA-256, duplicate detection,
+  and malformed-syntax warnings), opening files with `O_NOFOLLOW` and
+  skipping symlinks and special files.
+- Supports exact CRC matching **only** when given a separately verified
+  PCSX2 executable CRC. ArchiveFS's current archive records do not
+  contain one, so the GUI never claims an exact match and never guesses a
+  CRC from a filename; it reports exact, ambiguous, unavailable, or
+  no-match states truthfully instead.
+- In the GUI, PCSX2 appears only for PS2 archives and defaults a PS2
+  context to the PCSX2 adapter without changing queue, mount, selection,
+  or platform state; RetroArch remains independently selectable. A single
+  eligible profile may be auto-selected; multiple eligible profiles
+  require an explicit choice. No Install, Apply, Enable, Disable, Delete,
+  Replace, Fix, or rollback control exists.
+- No PCSX2 file is written, copied, renamed, deleted, generated, or
+  sanitized; nothing is uploaded; there is no telemetry, no network
+  retrieval path in this adapter, and PCSX2/imported content is never
+  executed.
+
+Validated with 15 focused core tests and 4 GUI tests, reported alongside a
+full `cargo fmt`/`clippy -D warnings`/`cargo test --workspace` (1,348
+tests: CLI 127, core 822, GUI 399) pass and a successful release build.
+
+Deferred: verified PS2 executable-CRC extraction (no bounded ISO/CHD/CSO
+identity reader yet), any preview/installation/conflict-resolution/
+backup/journal/rollback/enable/disable workflow, and automatic discovery
+of AppImage/portable configuration roots (an exact root must be supplied
+by a trusted caller).
+
+### Dolphin read-only adapter (implemented, pending merge into this branch)
+
+A read-only Dolphin adapter for Cheats & Mods has been implemented and
+validated on the separate `codex-dolphin-readonly-adapter` branch. **It has
+not been merged into this branch and is not part of any build produced
+from `sonnet-v0.5-release-prep` today.** It is documented here so the
+release notes are accurate once the merge happens; nothing below should be
+read as available in the current branch.
+
+Once merged, it is a **read-only inspection foundation**, not a complete
+cheat manager - it does not install cheats, apply mods, inspect texture
+packs, or change any Dolphin file:
+
+- Discovers native (`$XDG_CONFIG_HOME/dolphin-emu`, falling back to
+  `~/.config/dolphin-emu`) and Flatpak
+  (`~/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu`) Dolphin
+  profiles, plus an exact configuration root supplied by another trusted
+  caller (never searched arbitrarily, never inferred from a filename). A
+  profile is eligible only with an absolute, non-root path resolving
+  through existing real directories with no symlinked components, that
+  exists as a directory and contains a regular, non-symlink `Dolphin.ini`
+  at its root, with identity checked for staying unchanged between
+  discovery and inspection where device/inode identity is available.
+  Missing standard native/Flatpak paths are ignored; missing explicit
+  roots remain visible as blocked; a missing `GameSettings` directory is
+  normal and does not make a profile ineligible; missing paths are never
+  created.
+- Inspects only regular, lowercase `*.ini` entries immediately inside a
+  game's `GameSettings` directory - non-recursive, with symlinks,
+  directories, and special files never opened. **No texture pack,
+  graphics mod, resource pack, Riivolution asset, save, NAND, SD-card, or
+  executable directory is inspected**; texture-pack support
+  (`Load/Textures`, `Load/GraphicMods`, `ResourcePacks`, `Dump/Textures`)
+  is explicitly not implemented.
+- The bounded structural parser recognizes `[OnFrame]`/`[OnFrame_Enabled]`,
+  `[ActionReplay]`/`[ActionReplay_Enabled]`, `[Gecko]`/`[Gecko_Enabled]`,
+  and `[Riivolution]`/`[Riivolution_Enabled]` sections, recording named
+  definitions and enabled-name references as inert text - codes are never
+  evaluated or executed. Each retained file also records a
+  filename-derived Game ID candidate, an optional revision candidate, a
+  region candidate conservatively derived from the Game ID, file size,
+  SHA-256, duplicate identity/filename/content observations, and
+  malformed-syntax/encoding/resource-limit warnings.
+- Supports exact matching **only** when given a separately verified
+  Dolphin Game ID (three to six ASCII letters/digits), optionally with a
+  verified `u16` revision. ArchiveFS's GUI has no reviewed GameCube/Wii
+  disc-header reader and therefore supplies no verified Game ID; INI
+  filename identities remain observations only and never prove that an
+  INI belongs to the selected archive. The adapter distinguishes exact
+  Game ID match, exact Game ID and revision match, multiple matching
+  INIs, revision mismatch, no matching INI, invalid verified Game ID, no
+  verified Game ID, and deferred identity extraction - it never
+  fabricates a match.
+- In the GUI, Dolphin appears only for GameCube/Wii archives (canonical
+  platforms GameCube, Nintendo GameCube, Wii, Nintendo Wii) and defaults
+  such a context to itself without changing queue, mount, selection, or
+  platform state. A single eligible profile may be auto-selected; multiple
+  eligible profiles require an explicit choice. No Install, Apply, Enable,
+  Disable, Delete, Replace, Fix, or rollback control exists.
+- No Dolphin file is written, copied, renamed, deleted, generated, or
+  sanitized; missing directories are never created; nothing is uploaded;
+  there is no telemetry, and a full audit of every filesystem-mutation
+  call in the adapter's production source confined all of them to
+  `#[cfg(test)]` fixtures. Dolphin and any inspected content are never
+  executed; production code exposes no network, process-execution,
+  shell, or socket path.
+
+Bounded by fixed limits: 16 profiles, 10,000 `GameSettings` entries
+visited, 2,048 Game INI files, 256 KiB per file, 16 MiB total input, 8,192
+lines per file, 8 KiB per line, 128 retained names per supported section
+kind, and 100 file cards / 50 warning lines rendered in the GUI; limit
+exhaustion marks the result incomplete.
+
+Validated with 6 focused core tests and 2 GUI tests on that branch
+(native/Flatpak/exact-root discovery, supported-section parsing without
+file modification, verified identity matching, symlinked profile/INI
+refusal, missing/unsafe explicit-root blocking, invalid identity and
+resource-limit reporting, GameCube/Wii-only visibility, and read-only
+rendering with no install/apply/enable/delete control), reported
+alongside a full `cargo fmt -- --check`/`clippy -D warnings`/
+`cargo test --workspace --all-targets` (1,356 tests: CLI 127, core 828,
+GUI 401) pass and `git diff --check` pass. Manual read-only checks
+against a real native and Flatpak-style Dolphin configuration (with real
+`[ActionReplay]`/`[Gecko]` INI sections) were performed on Ubuntu
+24.04.4 LTS; **a Nobara-specific manual run remains outstanding** because
+that was not the available environment. That manual check also corrected
+an initial marker assumption: Dolphin uses a root-level `Dolphin.ini`, not
+`Config/Dolphin.ini`.
+
+Deferred even once merged: verified archive Game ID/revision extraction,
+recursive `GameSettings` traversal (lowercase `.ini` extension only),
+texture-pack or graphics-mod inventory, inspection of referenced
+Riivolution assets, code semantic validation or any compatibility claim,
+emulator launch or version detection, and any download, preview,
+installation, enabling, disabling, replacement, deletion, backup,
+journal, or rollback workflow. Structural inspection is not antivirus
+scanning.
+
+With Dolphin, Cheats & Mods reaches its intended three-adapter shape
+(RetroArch, PCSX2, Dolphin). **Further emulator adapter expansion is
+paused after Dolphin for now** - see
+[`ROADMAP.md`](../ROADMAP.md#medium-term-plans).
 
 ### Trusted cheat-catalogue retrieval and cache maintenance
 
@@ -147,7 +309,14 @@ across every process sharing that cache.
 | Local/community import inspection | Not implemented anywhere |
 | Arbitrary remote sources | Not accepted anywhere |
 | Mod installation, mod adapters | Not implemented anywhere |
-| PCSX2 read-only adapter | Under separate, parallel development; not part of this release |
+| PCSX2 read-only profile/PNACH inspection | **Available** (GUI, merged) |
+| PCSX2 exact CRC matching | Deferred - requires a verified PS2 executable CRC, which ArchiveFS does not yet have |
+| PCSX2 installation, rollback, mutation of any kind | Not implemented anywhere |
+| Dolphin read-only profile/Game INI inspection | Implemented and validated on branch `codex-dolphin-readonly-adapter`; **not yet merged into this branch** |
+| Dolphin exact Game ID matching | Deferred - requires a verified GameCube/Wii Game ID, which ArchiveFS does not yet have |
+| Dolphin texture-pack/graphics-mod inspection | Not implemented anywhere |
+| Dolphin installation, rollback, mutation of any kind | Not implemented anywhere |
+| Further emulator adapters beyond RetroArch/PCSX2/Dolphin | Paused for now - see [`ROADMAP.md`](../ROADMAP.md#medium-term-plans) |
 
 ## Privacy and safety model
 
@@ -192,9 +361,18 @@ across every process sharing that cache.
   session only; it is not persisted across restarts.
 - Settings is read-only for backend-supported configuration; there is no
   editable appearance/density setting and no update-check mechanism.
-- A read-only PCSX2 adapter is being developed in parallel and is not part
-  of this release; PCSX2 support here remains limited to the existing
-  read-only patch-preview.
+- PCSX2's exact CRC matching remains deferred pending a verified PS2
+  executable CRC; there is no PCSX2 preview, installation, or rollback
+  workflow (see "PCSX2 read-only adapter" above).
+- A read-only Dolphin adapter has been implemented and validated on a
+  separate branch (see "Dolphin read-only adapter" above) but has not
+  been merged into this branch; it is not part of this release until
+  that merge happens. Once merged, it remains a read-only inspection
+  foundation - no texture-pack inspection, no verified GameCube/Wii
+  identity extraction, and no preview, install, enable, disable, backup,
+  journal, or rollback workflow.
+- Further emulator adapter expansion is paused after Dolphin for now -
+  see [`ROADMAP.md`](../ROADMAP.md#medium-term-plans).
 - This is alpha software. See [`CHANGELOG.md`](../CHANGELOG.md) for the
   full, itemized list of what changed.
 

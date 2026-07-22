@@ -18,7 +18,13 @@ explicit list of what it deliberately does not do.
 **Release status:** `v0.5.0-alpha` is currently in preparation - a hardening
 release (mount lifecycle postcondition checks, transactional catalogue
 refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
-GUI and a first-class Cheats & Mods workspace. See
+GUI and a first-class Cheats & Mods workspace that now spans **three
+read-only emulator adapters**: RetroArch and PCSX2, plus Dolphin, which
+has been implemented and validated but is **not yet merged into this
+branch** (see the release notes' "Dolphin read-only adapter" section
+before assuming it is present in any build from this branch today).
+Further emulator adapter expansion is paused after Dolphin for now - see
+[`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
 [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
 for what's actually new and what remains unavailable, and
 [`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the

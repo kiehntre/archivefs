@@ -144,23 +144,38 @@ These are implemented, tested, and in current use today:
   confirmed per-candidate deletion revalidation, and deliberate abandoned
   staging cleanup. There is no automatic pruning. See
   [`docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
+- A read-only PCSX2 profile and PNACH inspection adapter in the Cheats &
+  Mods GUI workspace: discovers native/Flatpak/portable PCSX2 profiles and
+  inspects existing `cheats`/`cheats_ws`/`patches` directories, gated to
+  PS2 archives only. Exact CRC matching remains deferred pending a
+  verified PS2 executable CRC. See "PCSX2 read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md).
 
 ## Current development
 
 Work in progress or the immediate next slice of work on top of the
 foundations above:
 
+- A read-only Dolphin profile and Game INI inspection adapter in the
+  Cheats & Mods GUI workspace has been implemented and validated
+  (GameCube/Wii archives only; no texture-pack or graphics-mod inspection;
+  exact matching deferred pending a verified Dolphin Game ID) but is not
+  yet merged into the release branch. It ships as its own module
+  (`patch_manager::dolphin_local`), not a change to the `EmulatorAdapter`
+  trait or the shared orchestration layer below. See "Dolphin read-only
+  adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md).
 - The shared `patch_manager` orchestration layer (platform filtering,
   ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
-  PCSX2-specific and adapter-parameterized only through `EmulatorAdapter`'s
-  narrow read-only surface. RetroArch's own preview
-  (`retroarch-patch-preview`) deliberately did not generalize this layer
-  or extend `EmulatorAdapter` - its multi-root, core-selection-ambiguous
-  shape did not fit that trait, so it shipped as an independent module
-  instead; see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
-  and [`docs/RETROARCH_PATCH_PREVIEW.md`](docs/RETROARCH_PATCH_PREVIEW.md).
-  Whether a future third adapter should generalize either layer remains
-  open, not scheduled.
+  specific to the original PCSX2 patch-preview foundation and
+  adapter-parameterized only through `EmulatorAdapter`'s narrow read-only
+  surface; see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
+  RetroArch's preview and Dolphin's new adapter both deliberately did not
+  generalize or extend this layer - each shipped as its own independent
+  module instead, since neither shape fit `EmulatorAdapter`'s
+  PCSX2-patch-preview-specific design. Whether the newer PCSX2 Cheats &
+  Mods adapter itself extends `EmulatorAdapter` or is likewise
+  independent has not been separately confirmed here.
 - Ongoing library inspection and catalogue-health improvements building on
   the archive inspector and `CatalogueHealthReport`.
 - Documentation maintenance to keep this roadmap, the architecture docs, and
@@ -178,9 +193,13 @@ Realistic, concrete next steps, not yet started:
 Directions consistent with the architecture already in place, not yet
 scheduled:
 
-- Additional emulator adapters beyond PCSX2 and RetroArch - candidates
-  include Dolphin, RPCS3, PPSSPP, DuckStation, Cemu, and Xenia - each
-  following the same adapter boundary and read-only-preview-first pattern.
+- **Emulator adapter expansion pauses after Dolphin.** With RetroArch,
+  PCSX2, and Dolphin, Cheats & Mods reaches its intended three-adapter
+  shape for now. Further read-only emulator adapters - RPCS3, PPSSPP,
+  DuckStation, Cemu, Xenia, and similar candidates - are not scheduled and
+  should not be implied as forthcoming; each would still follow the same
+  read-only-inspection-first pattern if and when real user demand and an
+  architecture review justify revisiting this pause.
 - Library health reporting beyond today's `CatalogueHealthReport`: damaged
   or unreadable archives, likely duplicates, missing BIOS/firmware
   detection, and region/revision information, where that information can be
