@@ -19,13 +19,31 @@ no tag has been created yet - both remain separate release-checklist steps.
 See [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
 for a narrative overview and
 [`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
-manual acceptance plan. A separate "Pending merge" subsection below documents
-a read-only PCSX2 adapter that has been implemented and validated on another
-branch but is **not yet part of this branch** - it is not reachable in any
-build produced from this branch today.
+manual acceptance plan.
+
+Cheats & Mods now spans **three read-only emulator adapters**: RetroArch and
+PCSX2 (merged) plus Dolphin (implemented and validated, pending merge - see
+"Pending merge" below). Adapter expansion pauses here - see
+[`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 
 ### Added
 
+- **Three-adapter Cheats & Mods architecture.** Cheats & Mods now
+  integrates three read-only emulator adapters - RetroArch, PCSX2, and
+  Dolphin - each gated to its own platform(s) with explicit profile
+  selection and no install/apply/rollback control anywhere. RetroArch and
+  PCSX2 are merged; Dolphin is implemented and validated, pending merge
+  (see "Pending merge" below). This is the intended stopping point for
+  adapter expansion for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
+- Read-only PCSX2 profile and PNACH inspection in Cheats & Mods: discovers
+  native, Flatpak, and explicitly supplied portable PCSX2 profiles, and
+  inspects existing `cheats`/`cheats_ws`/`patches` directories and `.pnach`
+  files - read-only, nothing written or created. Exact matching requires a
+  separately verified PCSX2 executable CRC, which ArchiveFS does not yet
+  have, so no exact match is ever claimed. No Install, Apply, Enable,
+  Disable, or rollback control exists. See "PCSX2 read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+  for full detail.
 - Redesigned desktop GUI navigation: `Mount`, `Selected`, `Active Mounts`,
   `Doctor`, `History & Logs`, `Settings`, and `About` are now dedicated
   pages, alongside the existing `Library`, `Sources`, `Health`,
@@ -268,84 +286,35 @@ build produced from this branch today.
 - Settings remains read-only for backend-supported configuration;
   appearance/density and other GUI-only preferences are not yet editable,
   and there is no update-check mechanism.
-- A read-only PCSX2 adapter has been implemented and validated (see
-  "Pending merge" below) but has not been merged into this branch. It is
-  not part of this release until that merge happens.
+- PCSX2's exact CRC matching remains deferred (requires a separately
+  verified PCSX2 executable CRC, which ArchiveFS does not yet have), and
+  there is no PCSX2 preview, installation, or rollback support.
+- A read-only Dolphin adapter has been implemented and validated (see
+  "Pending merge" below) but has not been merged into this branch. Further
+  emulator adapter expansion beyond Dolphin is paused for now - see
+  [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 
 ### Pending merge (not yet part of this branch)
 
-- **Read-only PCSX2 profile and PNACH inspection**, implemented and
-  validated on branch `codex-pcsx2-readonly-adapter` (not yet merged
-  here): native, Flatpak-user, and Flatpak-system-with-per-user-config
-  PCSX2 profile discovery, plus explicitly supplied portable/AppImage
-  configuration roots (never auto-searched or guessed). Eligibility
-  requires an absolute non-root path with no symlink components, a
-  readable directory, and PCSX2-specific evidence (`inis` or
-  `PCSX2.ini`); blocked profiles remain visible with a typed reason.
-  Inspects the `cheats`, `cheats_ws` (widescreen patches), and `patches`
-  directories where present - missing directories are reported normally
-  and never created.
-- Bounded, read-only **PNACH file inspection**: exact path, filename
-  stem, filename-derived CRC/serial candidates, `gametitle=`/`region=`/
-  bounded comment fields, enabled/disabled/unknown patch-syntax counts,
-  directory-derived category, file size, SHA-256, and duplicate-CRC/
-  filename/content detection, with malformed-syntax and safety warnings.
-  Files are opened read-only with `O_NOFOLLOW` on Unix; symlinks and
-  special files are skipped; directory/parent identity is revalidated
-  immediately before traversal and file access. Bounded by fixed limits
-  (16 profiles, 4 patch directories per profile, 256 traversed
-  directories, 10,000 visited entries, depth 4, 2,048 PNACH files,
-  256 KiB per file, 16 MiB total input, 8,192 lines per file, 8 KiB per
-  line).
-- **CRC matching only when a separately verified PCSX2 executable CRC is
-  supplied** - distinguishing exact match, multiple PNACH files for one
-  CRC, no matching PNACH, invalid verified CRC, filename/comment-title
-  candidate, and no-verified-CRC-available. Current ArchiveFS archive
-  records do not contain a verified PS2 executable CRC, so the GUI never
-  claims an exact match and never infers a CRC from an archive filename.
-  A bounded ISO/CHD/CSO identity reader remains future work.
-- **Cheats & Mods GUI integration**: PCSX2 appears only for PS2 archives,
-  defaulting a PS2 context to the PCSX2 adapter without changing queue,
-  mount, selection, or platform state; RetroArch remains independently
-  selectable. Shows eligible/blocked profiles, configuration paths,
-  directory states, inventory summaries, categories, match confidence,
-  warnings, and technical details. A single eligible profile may be
-  selected automatically; multiple eligible profiles require an explicit
-  choice, matching the existing RetroArch profile-selection rule.
-  Profile and PNACH scans run off the UI thread, and archive/adapter/
-  profile changes discard superseded inventory results so a stale scan
-  can never apply. No Install, Apply, Enable, Disable, Delete, Replace,
-  Fix, or rollback control exists anywhere in this integration.
-- Safety guarantees proven by 15 focused core tests and 4 GUI tests
-  (discovery, Flatpak scope, blocked paths, symlinks, special files,
-  identity changes, non-UTF-8 paths, bounds, malformed files, duplicate
-  detection, CRC matching, PS2-only visibility, stale-result rejection,
-  and state preservation): no PCSX2 file is written, copied, renamed,
-  deleted, generated, or sanitized; missing directories are never
-  created; nothing is uploaded; there is no telemetry or remote
-  analysis; PCSX2 and any imported content are never executed; there is
-  no network retrieval path in this adapter; PNACH directives are parsed
-  as bounded text and never evaluated; original files remain untouched.
-  Reported full workspace validation on that branch: `cargo fmt --all
-  --check` passed, `cargo clippy --workspace --all-targets -- -D
-  warnings` passed, `cargo test --workspace` reported 1,348 tests passing
-  (CLI 127, core 822, GUI 399), `git diff --check` passed, and `cargo
-  build --workspace --release` succeeded.
-- **Known limitations of the pending PCSX2 work itself:** no verified
-  PS2 executable-CRC extraction yet; no preview, installation, conflict
-  resolution, backup, journal, rollback, enable, or disable support; an
-  AppImage/portable configuration requires an exact root supplied by a
-  trusted caller rather than being discovered automatically; the GUI
-  summarizes at most 100 PNACH cards and 50 warnings from the bounded
-  core result; and while Unix no-follow opens plus immediate identity
-  revalidation reduce filesystem-replacement races, an owner who controls
-  the directories in question could still race a path replacement -
-  inspection remains strictly read-only regardless.
+- **Read-only Dolphin profile and Game INI inspection**, implemented and
+  validated on branch `codex-dolphin-readonly-adapter` (not yet merged
+  here): discovers native, Flatpak, and explicitly supplied Dolphin
+  configuration roots, and inspects existing `GameSettings/*.ini` files
+  for GameCube/Wii archives - read-only, nothing written or created, and
+  no texture pack, graphics mod, resource pack, or Riivolution asset is
+  inspected. Exact matching requires a separately verified Dolphin Game
+  ID, which ArchiveFS does not yet have, so no exact match is ever
+  claimed. No Install, Apply, Enable, Disable, or rollback control exists.
+  Proven by 6 core tests and 2 GUI tests; full workspace validation on
+  that branch reported 1,356 tests passing (CLI 127, core 828, GUI 401).
+  A Nobara-specific manual run remains outstanding (the available
+  environment was Ubuntu 24.04.4 LTS). See "Dolphin read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+  for full detail.
 
-This is documented here as **prepared for v0.5.0-alpha pending merge**,
-not as already part of this branch. Treat it as a "read-only inspection
-foundation," not a complete cheat manager: it does not install cheats,
-apply mods, or offer any mutation of existing PCSX2 configuration.
+With Dolphin, Cheats & Mods reaches its intended three-adapter shape
+(RetroArch, PCSX2, Dolphin); further emulator adapter expansion is paused
+for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 
 ## v0.4.3-alpha
 

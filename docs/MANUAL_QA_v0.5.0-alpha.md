@@ -26,11 +26,13 @@ If your own setup doesn't have a separate "Saltbox"-style machine, treat
 and adapt paths accordingly - the expected result is what matters, not the
 exact machine name.
 
-Section 27 (PCSX2) is conditional: it covers a read-only PCSX2 adapter
-implemented and validated on a separate branch that has **not** been
-merged into `sonnet-v0.5-release-prep`. Skip it - explicitly, on the
-sign-off checklist below, not silently - unless you are testing a build
-that actually contains that merge.
+Sections 15-19 cover the Cheats & Mods workspace's three adapters -
+RetroArch, PCSX2, and Dolphin - grouped together. Section 20 (Dolphin) is
+conditional: it covers a read-only Dolphin adapter implemented and
+validated on a separate branch that has **not** been merged into
+`sonnet-v0.5-release-prep`. Skip it - explicitly, on the sign-off
+checklist below, not silently - unless you are testing a build that
+actually contains that merge.
 
 Test with a small, disposable, non-important set of archives. Do not run
 this plan against your only copy of anything you cannot afford to lose,
@@ -377,7 +379,7 @@ even though every action described here is documented as non-destructive.
     explanatory text, not disabled-but-implied-working controls.
   - Failure notes:
 
-## 15. RetroArch profile discovery
+## 15. RetroArch adapter - profile discovery
 
 - [ ] **Action (In ArchiveFS GUI):** In Cheats & Mods, with profiles not
       yet scanned, look at Stage 1.
@@ -404,7 +406,7 @@ even though every action described here is documented as non-destructive.
     kept.
   - Failure notes:
 
-## 16. Trusted catalogue fetch
+## 16. RetroArch adapter - trusted catalogue fetch
 
 - [ ] **Action (In ArchiveFS GUI):** With an eligible profile chosen, open
       Stage 2 and click "List trusted sources".
@@ -427,7 +429,7 @@ even though every action described here is documented as non-destructive.
   - Expected: subsequent fetches succeed again.
   - Failure notes:
 
-## 17. Cached reuse
+## 17. RetroArch adapter - cached reuse
 
 - [ ] **Action (In ArchiveFS GUI):** After a successful fetch above, click
       "Use cached snapshot".
@@ -443,7 +445,7 @@ even though every action described here is documented as non-destructive.
   - Expected: normal operation resumes.
   - Failure notes:
 
-## 18. Force refresh
+## 18. RetroArch adapter - force refresh
 
 - [ ] **Action (In ArchiveFS GUI):** With a fresh cached snapshot already
       present, check "Force a full refresh instead of reusing a fresh
@@ -457,177 +459,8 @@ even though every action described here is documented as non-destructive.
   - Expected: the now-fresh cache is reused instead of a new download.
   - Failure notes:
 
-## 19. No-archive state
+## 19. PCSX2 adapter
 
-- [ ] **Action (In ArchiveFS GUI):** Clear the Library selection entirely
-      (e.g. "Clear selection"), then open **Selected** and **Cheats &
-      Mods**.
-  - Expected: both pages show a calm "no archive selected" empty state
-    with a way back to Library, not an error or blank screen.
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** With zero archives scanned at all
-      (fresh source folder), open **Library**, **Mount**, and
-      **Active Mounts**.
-  - Expected: each shows an appropriate empty state describing what to do
-    next (e.g. "scan a source"), not a crash.
-  - Failure notes:
-
-## 20. Archive context preservation
-
-- [ ] **Action (In ArchiveFS GUI):** Select an archive in Library, open
-      Cheats & Mods, scan profiles and list trusted sources, then
-      navigate to another page (e.g. Doctor) and back to Cheats & Mods.
-  - Expected: the same archive context and Stage 1/2 state are still
-    present - nothing resets just from navigating away and back.
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** With the Cheats & Mods workflow open
-      for archive A, go to Library and select a different archive B.
-  - Expected: returning to Cheats & Mods shows archive B's context, not a
-    stale mix of A and B; the workflow does not silently keep A's data
-    under B's name.
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** Right-click a Library row and choose
-      "RetroArch Cheats" for a different archive than the one currently
-      open in Cheats & Mods.
-  - Expected: the workflow correctly switches to the newly chosen archive.
-  - Failure notes:
-
-## 21. Activity collapsed/expanded state
-
-- [ ] **Action (In ArchiveFS GUI):** Launch the app fresh and look at the
-      Activity panel at the bottom.
-  - Expected: it starts **collapsed** (compact), not taking up a large
-    portion of the window by default.
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** Perform an operation that fails (for
-      example, try to mount an archive whose source file was moved/
-      deleted), with Activity collapsed.
-  - Expected: the collapsed summary makes the failure noticeable rather
-    than only showing a bare count.
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** Expand Activity, then collapse it
-      again.
-  - Expected: toggling works from both the panel itself and, if present,
-    the Tools menu equivalent, without desyncing.
-  - Failure notes:
-
-## 22. Safe mount
-
-- [ ] **Action (In ArchiveFS GUI):** Mount a test archive and confirm.
-  - Expected: only the destination shown in the preview is created;
-    nothing outside the configured `mount_root` is touched.
-  - Failure notes:
-- [ ] **Action (On Nobara desktop):** Check file permissions/ownership of
-      the mounted content.
-  - Expected: the mount is read-only; attempting to write into it (e.g.
-    `touch <mount_path>/testfile`) fails.
-  - Failure notes:
-- [ ] **Action (On Saltbox):** Confirm the original source archive file is
-      unchanged (size/modification time) after mounting and unmounting.
-  - Expected: no change to the original file.
-  - Failure notes:
-
-## 23. Inspect mounted contents
-
-- [ ] **Action (In ArchiveFS GUI):** With an archive mounted, select it in
-      Library and click "Inspect contents".
-  - Expected: internal entries are listed read-only; nothing is extracted
-    to a persistent location.
-  - Failure notes:
-- [ ] **Action (On Nobara desktop):** Browse the actual mount point in a
-      file manager or terminal while the inspector is open.
-  - Expected: the files visible on disk match what the inspector lists.
-  - Failure notes:
-
-## 24. Normal unmount
-
-- [ ] **Action (In ArchiveFS GUI):** Unmount a mounted archive from
-      Active Mounts (see section 5) or from Library's selected-archive
-      panel.
-  - Expected: an explicit confirmation is required; after confirming, the
-    archive shows as unmounted everywhere in the app (Library, Active
-    Mounts, Mount).
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** Attempt to unmount while a terminal
-      or file manager still has the mount point open as its current
-      directory (On Nobara desktop, `cd` into the mount point in another
-      terminal first).
-  - Expected: ArchiveFS reports a truthful failure/recovery guidance
-    (e.g. suggesting the file manager/terminal be closed) rather than
-    silently forcing anything; Lazy Unmount, if offered, is a distinct,
-    clearly-labelled recovery step, not the default action.
-  - Failure notes:
-
-## 25. Restart persistence where applicable
-
-- [ ] **Action (On Nobara desktop):** Close `archivefs-gui` entirely and
-      relaunch it.
-  - Expected: source folders, library views, and cached RetroArch
-    trusted-catalogue snapshots persist across the restart; the History &
-    Logs panel is empty again (this is documented as in-memory/
-    per-session in this release, not a bug).
-  - Failure notes:
-- [ ] **Action (In ArchiveFS GUI):** After restarting, confirm previously
-      mounted archives are shown with their true current mount state
-      (not assumed still-mounted).
-  - Expected: mount state reflects the real filesystem, refreshed on
-    launch/refresh, not a stale assumption from before the restart.
-  - Failure notes:
-
-## 26. Window resizing
-
-Test at three widths: a small laptop width (~1280px), the reference
-~1536x864 size, and an ultrawide width (~3440px or your widest available
-display/window).
-
-- [ ] **Action (On Nobara desktop):** Resize the ArchiveFS window to a
-      small laptop width (~1280px wide) In ArchiveFS GUI's own window,
-      then check Library, Mount, and Cheats & Mods.
-  - Expected: content reflows to a compact layout; tables scroll
-    horizontally rather than clipping unreadably; no control becomes
-    inaccessible.
-  - Failure notes:
-- [ ] **Action (On Nobara desktop):** Resize the window to approximately
-      1536x864.
-  - Expected: this is the primary reference size; layout should look
-    balanced with no excessive empty gutters or cramped controls.
-  - Failure notes:
-- [ ] **Action (On Nobara desktop):** Resize the window to an ultrawide
-      width (or maximize on an ultrawide display).
-  - Expected: page content uses a bounded maximum width rather than
-    stretching every control across the full screen; wide tables (e.g.
-    Library, Mount) may use more width than prose pages (e.g. Settings,
-    About).
-  - Failure notes:
-- [ ] **Action (On Nobara desktop):** At each width above, confirm the
-      left-hand navigation list remains usable and every page destination
-      stays clickable.
-  - Expected: navigation does not break, overlap, or get clipped at any
-    tested width.
-  - Failure notes:
-
----
-
-## 27. PCSX2 read-only adapter (only after `codex-pcsx2-readonly-adapter` is merged)
-
-**Do not run this section against a build from `sonnet-v0.5-release-prep`
-as it stands today.** The PCSX2 read-only adapter described here has been
-implemented and validated on a separate branch,
-`codex-pcsx2-readonly-adapter`, and has **not** been merged into this
-branch. Run this section only once that merge has happened and you are
-testing a build that actually contains it - otherwise "PCSX2 does not
-appear" is expected, not a defect.
-
-- [ ] **Action (On Saltbox):** Build and prepare the merged branch/tag for
-      deployment to the Nobara test machine; no PCSX2-specific action is
-      needed on Saltbox beyond normal build/deploy.
-  - Expected: a build containing the merged PCSX2 adapter is available on
-    the Nobara desktop.
-  - Failure notes:
-- [ ] **Action (On Nobara desktop):** Launch the new build.
-  - Expected: the app starts normally with no new crash or hang introduced
-    by the PCSX2 code.
-  - Failure notes:
 - [ ] **Action (On Nobara desktop):** Confirm a PCSX2 installation (native
       or Flatpak) is present on the test machine, with at least one
       `cheats` or `cheats_ws` directory existing under its configuration
@@ -709,14 +542,276 @@ appear" is expected, not a defect.
     inaccessible control.
   - Failure notes:
 
+## 20. Dolphin adapter (only after `codex-dolphin-readonly-adapter` is merged)
+
+**Do not run this section against a build from `sonnet-v0.5-release-prep`
+as it stands today.** The Dolphin read-only adapter described here has
+been implemented and validated on a separate branch,
+`codex-dolphin-readonly-adapter`, and has **not** been merged into this
+branch. Run this section only once that merge has happened and you are
+testing a build that actually contains it - otherwise "Dolphin does not
+appear" is expected, not a defect. Even once merged, note that Codex's own
+validation ran on Ubuntu 24.04.4 LTS, not Nobara - a genuine Nobara run is
+still owed and this section is the place to record it.
+
+- [ ] **Action (On Saltbox):** Build and prepare the merged branch/tag for
+      deployment to the Nobara test machine; no Dolphin-specific action is
+      needed on Saltbox beyond normal build/deploy.
+  - Expected: a build containing the merged Dolphin adapter is available
+    on the Nobara desktop.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Launch the new build.
+  - Expected: the app starts normally with no new crash or hang introduced
+    by the Dolphin code.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Confirm a Dolphin installation
+      (native or Flatpak) is present on the test machine, with a
+      root-level `Dolphin.ini` at its configuration root.
+  - Expected: Dolphin's configuration directory and root-level
+    `Dolphin.ini` exist and are readable. If the displayed configuration
+    path anywhere in ArchiveFS shows `Config/Dolphin.ini` instead of the
+    real root-level file, that is a defect to report.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Prepare a safe, disposable
+      `GameSettings/<id>.ini` fixture (lowercase `.ini`) containing an
+      `[ActionReplay]` or `[Gecko]` section for one game folder under that
+      Dolphin profile - do not use anything irreplaceable.
+  - Expected: the fixture file is present and readable before continuing.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Select a GameCube or Wii archive in
+      Library, then open **Cheats & Mods**.
+  - Expected: Dolphin appears as the default adapter for this archive;
+    RetroArch and PCSX2 remain separately selectable and do not appear as
+    the default.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Select a non-GameCube/Wii archive
+      (e.g. a PS2 or RetroArch-platform title) and open **Cheats & Mods**.
+  - Expected: Dolphin does **not** appear for this archive - it is
+    GameCube/Wii-only.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** With the GameCube/Wii archive
+      selected, inspect the listed Dolphin profiles.
+  - Expected: eligible profiles are shown distinctly from blocked ones,
+    each blocked profile carrying a concrete, typed reason; if exactly one
+    profile is eligible it is pre-selected, and if more than one is
+    eligible you must choose explicitly.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Select a Dolphin profile for a game
+      that has no `GameSettings` directory at all.
+  - Expected: the profile remains eligible - a missing `GameSettings`
+    directory is reported as normal, not as a blocker, and nothing is
+    created by ArchiveFS as a side effect of viewing it.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Inspect the Game INI inventory for the
+      fixture prepared above.
+  - Expected: the fixture appears with its filename-derived Game ID
+    candidate, category, size, and any warnings; nothing about the file
+    is modified by inspecting it.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** After the inspection above, check the
+      fixture file's modification time and contents in a terminal.
+  - Expected: unchanged from before ArchiveFS inspected it.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Confirm your Dolphin data root's
+      texture, `GraphicMods`, `ResourcePacks`, and Riivolution asset
+      directories exist (if you have any), then check whether ArchiveFS
+      represents them anywhere in the Dolphin section.
+  - Expected: they are **not** represented anywhere - no texture pack,
+    graphics mod, resource pack, or Riivolution asset is inspected or
+    listed. Any such content appearing would be a defect to report.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Read the match-state wording shown for
+      the fixture (exact / ambiguous / no-match / unavailable).
+  - Expected: the wording never claims an "exact match" unless a verified
+    Dolphin Game ID was supplied - in ArchiveFS's current state that
+    should not happen, so an exact-match claim here would itself be a
+    defect to report.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Look across the entire Dolphin section
+      for any Install, Apply, Enable, Disable, Delete, Replace, Fix, or
+      rollback control.
+  - Expected: none exists. Every action available is inspection-only
+    (viewing, scanning, choosing a profile, choosing an archive).
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** With the Dolphin inventory loaded for
+      archive A, switch to a different GameCube/Wii archive B in Library,
+      then switch back to A.
+  - Expected: B's inventory replaces A's cleanly; switching back to A
+    re-scans or restores A's own data - a stale result from A must never
+    be shown labelled as B's, or vice versa.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Before, during, and after the Dolphin
+      inspection above, check the Mount queue, Active Mounts, and the
+      selected archive's platform assignment in Library.
+  - Expected: none of these change as a side effect of opening Cheats &
+    Mods, choosing a Dolphin profile, or inspecting Game INI files.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Resize the window to laptop
+      (~1280px), ~1536x864, and ultrawide widths with the Dolphin section
+      open.
+  - Expected: the Dolphin profile/Game INI content reflows the same way
+    the rest of Cheats & Mods does at each width, with no clipped or
+    inaccessible control.
+  - Failure notes:
+
+## 21. No-archive state
+
+- [ ] **Action (In ArchiveFS GUI):** Clear the Library selection entirely
+      (e.g. "Clear selection"), then open **Selected** and **Cheats &
+      Mods**.
+  - Expected: both pages show a calm "no archive selected" empty state
+    with a way back to Library, not an error or blank screen.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** With zero archives scanned at all
+      (fresh source folder), open **Library**, **Mount**, and
+      **Active Mounts**.
+  - Expected: each shows an appropriate empty state describing what to do
+    next (e.g. "scan a source"), not a crash.
+  - Failure notes:
+
+## 22. Archive context preservation
+
+- [ ] **Action (In ArchiveFS GUI):** Select an archive in Library, open
+      Cheats & Mods, scan profiles and list trusted sources, then
+      navigate to another page (e.g. Doctor) and back to Cheats & Mods.
+  - Expected: the same archive context and Stage 1/2 state are still
+    present - nothing resets just from navigating away and back.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** With the Cheats & Mods workflow open
+      for archive A, go to Library and select a different archive B.
+  - Expected: returning to Cheats & Mods shows archive B's context, not a
+    stale mix of A and B; the workflow does not silently keep A's data
+    under B's name, regardless of which adapter (RetroArch, PCSX2, or
+    Dolphin) applies to each archive.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Right-click a Library row and choose
+      "RetroArch Cheats" for a different archive than the one currently
+      open in Cheats & Mods.
+  - Expected: the workflow correctly switches to the newly chosen archive.
+  - Failure notes:
+
+## 23. Activity collapsed/expanded state
+
+- [ ] **Action (In ArchiveFS GUI):** Launch the app fresh and look at the
+      Activity panel at the bottom.
+  - Expected: it starts **collapsed** (compact), not taking up a large
+    portion of the window by default.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Perform an operation that fails (for
+      example, try to mount an archive whose source file was moved/
+      deleted), with Activity collapsed.
+  - Expected: the collapsed summary makes the failure noticeable rather
+    than only showing a bare count.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Expand Activity, then collapse it
+      again.
+  - Expected: toggling works from both the panel itself and, if present,
+    the Tools menu equivalent, without desyncing.
+  - Failure notes:
+
+## 24. Safe mount
+
+- [ ] **Action (In ArchiveFS GUI):** Mount a test archive and confirm.
+  - Expected: only the destination shown in the preview is created;
+    nothing outside the configured `mount_root` is touched.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Check file permissions/ownership of
+      the mounted content.
+  - Expected: the mount is read-only; attempting to write into it (e.g.
+    `touch <mount_path>/testfile`) fails.
+  - Failure notes:
+- [ ] **Action (On Saltbox):** Confirm the original source archive file is
+      unchanged (size/modification time) after mounting and unmounting.
+  - Expected: no change to the original file.
+  - Failure notes:
+
+## 25. Inspect mounted contents
+
+- [ ] **Action (In ArchiveFS GUI):** With an archive mounted, select it in
+      Library and click "Inspect contents".
+  - Expected: internal entries are listed read-only; nothing is extracted
+    to a persistent location.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Browse the actual mount point in a
+      file manager or terminal while the inspector is open.
+  - Expected: the files visible on disk match what the inspector lists.
+  - Failure notes:
+
+## 26. Normal unmount
+
+- [ ] **Action (In ArchiveFS GUI):** Unmount a mounted archive from
+      Active Mounts (see section 5) or from Library's selected-archive
+      panel.
+  - Expected: an explicit confirmation is required; after confirming, the
+    archive shows as unmounted everywhere in the app (Library, Active
+    Mounts, Mount).
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Attempt to unmount while a terminal
+      or file manager still has the mount point open as its current
+      directory (On Nobara desktop, `cd` into the mount point in another
+      terminal first).
+  - Expected: ArchiveFS reports a truthful failure/recovery guidance
+    (e.g. suggesting the file manager/terminal be closed) rather than
+    silently forcing anything; Lazy Unmount, if offered, is a distinct,
+    clearly-labelled recovery step, not the default action.
+  - Failure notes:
+
+## 27. Restart persistence where applicable
+
+- [ ] **Action (On Nobara desktop):** Close `archivefs-gui` entirely and
+      relaunch it.
+  - Expected: source folders, library views, and cached RetroArch
+    trusted-catalogue snapshots persist across the restart; the History &
+    Logs panel is empty again (this is documented as in-memory/
+    per-session in this release, not a bug).
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** After restarting, confirm previously
+      mounted archives are shown with their true current mount state
+      (not assumed still-mounted).
+  - Expected: mount state reflects the real filesystem, refreshed on
+    launch/refresh, not a stale assumption from before the restart.
+  - Failure notes:
+
+## 28. Window resizing
+
+Test at three widths: a small laptop width (~1280px), the reference
+~1536x864 size, and an ultrawide width (~3440px or your widest available
+display/window).
+
+- [ ] **Action (On Nobara desktop):** Resize the ArchiveFS window to a
+      small laptop width (~1280px wide) In ArchiveFS GUI's own window,
+      then check Library, Mount, and Cheats & Mods.
+  - Expected: content reflows to a compact layout; tables scroll
+    horizontally rather than clipping unreadably; no control becomes
+    inaccessible.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Resize the window to approximately
+      1536x864.
+  - Expected: this is the primary reference size; layout should look
+    balanced with no excessive empty gutters or cramped controls.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Resize the window to an ultrawide
+      width (or maximize on an ultrawide display).
+  - Expected: page content uses a bounded maximum width rather than
+    stretching every control across the full screen; wide tables (e.g.
+    Library, Mount) may use more width than prose pages (e.g. Settings,
+    About).
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** At each width above, confirm the
+      left-hand navigation list remains usable and every page destination
+      stays clickable.
+  - Expected: navigation does not break, overlap, or get clipped at any
+    tested width.
+  - Failure notes:
+
 ---
 
 ## Sign-off
 
-- [ ] Sections 1-26 completed.
-- [ ] Section 27 (PCSX2) completed **only if** `codex-pcsx2-readonly-adapter`
+- [ ] Sections 1-19 and 21-28 completed.
+- [ ] Section 20 (Dolphin) completed **only if** `codex-dolphin-readonly-adapter`
       has been merged into the build under test; otherwise explicitly
-      marked "not applicable - PCSX2 not yet merged" rather than left
+      marked "not applicable - Dolphin not yet merged" rather than left
       blank or skipped silently.
 - [ ] Every failure note either resolved or explicitly deferred with a
       linked issue/tracking note.
