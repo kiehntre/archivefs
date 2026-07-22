@@ -184,6 +184,92 @@ enum ActivityAction {
     LibraryViewApply,
     LibraryViewRepair,
     LibraryViewRemoved,
+    /// Exporting the visible History & Logs entries to a file - recorded
+    /// in the history itself so the export's own outcome is auditable.
+    LogExport,
+}
+
+/// Every `ActivityAction`, for the History & Logs "Operation" filter.
+/// Must list each variant exactly once (checked by
+/// `activity_filter_lists_cover_every_variant`).
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 29] = [
+    ActivityAction::Refresh,
+    ActivityAction::Mount,
+    ActivityAction::MountAll,
+    ActivityAction::UnmountAll,
+    ActivityAction::Unmount,
+    ActivityAction::LazyUnmount,
+    ActivityAction::Remount,
+    ActivityAction::Cleanup,
+    ActivityAction::Diagnostics,
+    ActivityAction::Setup,
+    ActivityAction::LibraryDatabase,
+    ActivityAction::PlatformAssignment,
+    ActivityAction::BulkPlatformAssignment,
+    ActivityAction::PlatformAliasManagement,
+    ActivityAction::CatalogueCleanup,
+    ActivityAction::SourceAdded,
+    ActivityAction::SourceEnabled,
+    ActivityAction::SourceDisabled,
+    ActivityAction::SourceScan,
+    ActivityAction::SourceRemoved,
+    ActivityAction::LibraryViewAdded,
+    ActivityAction::LibraryViewEdited,
+    ActivityAction::LibraryViewEnabled,
+    ActivityAction::LibraryViewDisabled,
+    ActivityAction::LibraryViewPreview,
+    ActivityAction::LibraryViewApply,
+    ActivityAction::LibraryViewRepair,
+    ActivityAction::LibraryViewRemoved,
+    ActivityAction::LogExport,
+];
+
+/// Every `ActivityOutcome`, for the History & Logs "Result" filter.
+const ALL_ACTIVITY_OUTCOMES: [ActivityOutcome; 9] = [
+    ActivityOutcome::Started,
+    ActivityOutcome::Offered,
+    ActivityOutcome::Retried,
+    ActivityOutcome::Confirmed,
+    ActivityOutcome::Cancelled,
+    ActivityOutcome::Skipped,
+    ActivityOutcome::Completed,
+    ActivityOutcome::Failed,
+    ActivityOutcome::Rejected,
+];
+
+/// The History & Logs page's filter/sort state. `None` filters mean
+/// "show everything" (the design's "All Operations"/"All Results").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryLogFilters {
+    action: Option<ActivityAction>,
+    outcome: Option<ActivityOutcome>,
+    oldest_first: bool,
+}
+
+/// Whether one history entry passes the History & Logs filters - pure,
+/// so filtering can never mutate or reorder the history itself.
+fn history_entry_visible(entry: &HistoryEntry, filters: &HistoryLogFilters) -> bool {
+    filters.action.is_none_or(|action| entry.action == action)
+        && filters
+            .outcome
+            .is_none_or(|outcome| entry.outcome == outcome)
+}
+
+/// The filtered, ordered entries the History & Logs page shows.
+/// `OperationHistory::entries` iterates newest-first; `oldest_first`
+/// reverses the *filtered* list without touching the underlying order.
+fn visible_history_entries<'a>(
+    history: &'a OperationHistory,
+    filters: &HistoryLogFilters,
+) -> Vec<&'a HistoryEntry> {
+    let mut entries: Vec<&HistoryEntry> = history
+        .entries()
+        .filter(|entry| history_entry_visible(entry, filters))
+        .collect();
+    if filters.oldest_first {
+        entries.reverse();
+    }
+    entries
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -217,6 +303,7 @@ impl std::fmt::Display for ActivityAction {
             Self::LibraryViewApply => "Library View apply",
             Self::LibraryViewRepair => "Library View repair",
             Self::LibraryViewRemoved => "Library View removed",
+            Self::LogExport => "Log export",
         })
     }
 }
@@ -2530,6 +2617,8 @@ struct ArchiveFsApp {
     /// archive path awaiting "Unmount now"), cleared automatically when
     /// that archive stops being mounted.
     active_mounts_confirm_unmount: Option<PathBuf>,
+    /// The History & Logs page's filter/sort state.
+    history_filters: HistoryLogFilters,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2748,6 +2837,7 @@ impl ArchiveFsApp {
             mount_search: String::new(),
             confirm_mount_queue: false,
             active_mounts_confirm_unmount: None,
+            history_filters: HistoryLogFilters::default(),
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -5516,7 +5606,12 @@ impl eframe::App for ArchiveFsApp {
             }
 
             if self.view == MainView::HistoryLogs {
-                show_history_logs_page(ui, &mut self.history, &mut self.clipboard);
+                show_history_logs_page(
+                    ui,
+                    &mut self.history,
+                    &mut self.history_filters,
+                    &mut self.clipboard,
+                );
                 return;
             }
 
@@ -9036,6 +9131,7 @@ fn show_active_mounts_page(
 fn show_history_logs_page(
     ui: &mut egui::Ui,
     history: &mut OperationHistory,
+    filters: &mut HistoryLogFilters,
     clipboard: &mut dyn ClipboardBackend,
 ) {
     ui.heading("History & Logs");
@@ -9044,24 +9140,123 @@ fn show_history_logs_page(
         ui.label("No operations have run in this session yet.");
         return;
     }
-    if ui.button("Clear history").clicked() {
-        history.clear();
-        return;
+
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_label("Operation")
+            .selected_text(
+                filters
+                    .action
+                    .map_or_else(|| "All Operations".to_string(), |action| action.to_string()),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filters.action, None, "All Operations");
+                for action in ALL_ACTIVITY_ACTIONS {
+                    ui.selectable_value(&mut filters.action, Some(action), action.to_string());
+                }
+            });
+        egui::ComboBox::from_label("Result")
+            .selected_text(
+                filters
+                    .outcome
+                    .map_or_else(|| "All Results".to_string(), |outcome| outcome.to_string()),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filters.outcome, None, "All Results");
+                for outcome in ALL_ACTIVITY_OUTCOMES {
+                    ui.selectable_value(&mut filters.outcome, Some(outcome), outcome.to_string());
+                }
+            });
+        let sort_label = if filters.oldest_first {
+            "Sort: Oldest First"
+        } else {
+            "Sort: Newest First"
+        };
+        if ui.button(sort_label).clicked() {
+            filters.oldest_first = !filters.oldest_first;
+        }
+        if ui.button("Clear Filters").clicked() {
+            filters.action = None;
+            filters.outcome = None;
+        }
+    });
+
+    // Owned copies end the immutable borrow of `history` before the
+    // buttons below may mutate it (clear / record an export entry).
+    let visible_texts: Vec<String> = visible_history_entries(history, filters)
+        .into_iter()
+        .map(history_entry_text)
+        .collect();
+    let total = history.entries().count();
+
+    let mut export_requested = false;
+    ui.horizontal(|ui| {
+        if visible_texts.len() == total {
+            if total == 1 {
+                ui.label("1 entry.".to_string());
+            } else {
+                ui.label(format!("{total} entries."));
+            }
+        } else {
+            ui.label(format!("{} of {total} entries shown.", visible_texts.len()));
+        }
+        if ui
+            .add_enabled(
+                !visible_texts.is_empty(),
+                egui::Button::new("Copy Visible Log"),
+            )
+            .clicked()
+        {
+            let _ = clipboard.set_text(visible_texts.join("\n"));
+        }
+        if ui
+            .add_enabled(!visible_texts.is_empty(), egui::Button::new("Export Log"))
+            .clicked()
+        {
+            export_requested = true;
+        }
+        if ui.button("Clear history").clicked() {
+            history.clear();
+        }
+    });
+    if export_requested
+        && let Some(path) = rfd::FileDialog::new()
+            .set_file_name("archivefs-operations-log.txt")
+            .save_file()
+    {
+        match std::fs::write(&path, visible_texts.join("\n")) {
+            Ok(()) => history.record(HistoryEntry::new(
+                ActivityAction::LogExport,
+                None,
+                ActivityOutcome::Completed,
+                format!(
+                    "Exported {} log entries to {}",
+                    visible_texts.len(),
+                    path.display()
+                ),
+            )),
+            Err(error) => history.record(HistoryEntry::new(
+                ActivityAction::LogExport,
+                None,
+                ActivityOutcome::Failed,
+                format!("Could not export log to {}: {error}", path.display()),
+            )),
+        }
     }
     ui.separator();
+
+    if visible_texts.is_empty() {
+        ui.label("No operations match the current filters.");
+        return;
+    }
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for entry in history.entries() {
+            for text in &visible_texts {
                 ui.horizontal(|ui| {
                     if ui.small_button("Copy").clicked() {
-                        let _ = clipboard.set_text(history_entry_text(entry));
+                        let _ = clipboard.set_text(text.clone());
                     }
-                    ui.add(
-                        egui::Label::new(history_entry_text(entry))
-                            .selectable(true)
-                            .wrap(),
-                    );
+                    ui.add(egui::Label::new(text).selectable(true).wrap());
                 });
             }
         });
@@ -14175,6 +14370,109 @@ mod tests {
     }
 
     #[test]
+    fn activity_filter_lists_cover_every_variant() {
+        for action in ALL_ACTIVITY_ACTIONS {
+            assert_eq!(
+                ALL_ACTIVITY_ACTIONS
+                    .iter()
+                    .filter(|candidate| **candidate == action)
+                    .count(),
+                1,
+                "{action:?} must appear exactly once in the Operation filter list"
+            );
+        }
+        for outcome in ALL_ACTIVITY_OUTCOMES {
+            assert_eq!(
+                ALL_ACTIVITY_OUTCOMES
+                    .iter()
+                    .filter(|candidate| **candidate == outcome)
+                    .count(),
+                1,
+                "{outcome:?} must appear exactly once in the Result filter list"
+            );
+        }
+    }
+
+    #[test]
+    fn history_filters_select_by_action_and_outcome_without_reordering() {
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Completed,
+            "first",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Unmount,
+            None,
+            ActivityOutcome::Failed,
+            "second",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Failed,
+            "third",
+        ));
+
+        let all = visible_history_entries(&history, &HistoryLogFilters::default());
+        assert_eq!(
+            all.iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "second", "first"],
+            "default order is newest first"
+        );
+
+        let mounts = visible_history_entries(
+            &history,
+            &HistoryLogFilters {
+                action: Some(ActivityAction::Mount),
+                ..HistoryLogFilters::default()
+            },
+        );
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "first"]
+        );
+
+        let failed_mounts = visible_history_entries(
+            &history,
+            &HistoryLogFilters {
+                action: Some(ActivityAction::Mount),
+                outcome: Some(ActivityOutcome::Failed),
+                ..HistoryLogFilters::default()
+            },
+        );
+        assert_eq!(
+            failed_mounts
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third"]
+        );
+
+        let oldest_first = visible_history_entries(
+            &history,
+            &HistoryLogFilters {
+                oldest_first: true,
+                ..HistoryLogFilters::default()
+            },
+        );
+        assert_eq!(
+            oldest_first
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"],
+            "oldest-first reverses the filtered view only"
+        );
+    }
+
+    #[test]
     fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
         let records = vec![
             record("/roms/mounted.zip", MountState::Mounted),
@@ -14298,6 +14596,7 @@ mod tests {
             mount_search: String::new(),
             confirm_mount_queue: false,
             active_mounts_confirm_unmount: None,
+            history_filters: HistoryLogFilters::default(),
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,

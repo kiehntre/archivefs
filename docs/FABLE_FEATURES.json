@@ -565,8 +565,8 @@
     "Decision documented before HISTORY-002 begins"
    ],
    "required_tests": [],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "Decision documented in FABLE_PROGRESS.md (2026-07-22): history stays in-memory for this campaign phase; when persistence is prioritized it will be a GUI-local JSON log file (the initializer's default lean), not a new core module. Date filtering is deferred with it, since a session-scoped history makes Today/Yesterday filters meaningless.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -587,10 +587,10 @@
     "Existing OperationHistory tests extended, not duplicated"
    ],
    "required_tests": [],
-   "status": "in_progress",
-   "evidence": "Redesigned shell adds MainView::HistoryLogs full-screen page over the in-memory OperationHistory (listing, per-entry copy, clear). Filtering/export/persistence still open.",
+   "status": "complete",
+   "evidence": "show_history_logs_page: Operation and Result filters over ALL_ACTIVITY_ACTIONS/ALL_ACTIVITY_OUTCOMES, newest/oldest sort, Clear Filters, entry count, per-entry Copy, Copy Visible Log, Export Log via rfd save dialog (export outcome recorded in the history as ActivityAction::LogExport), Clear history. Tests: activity_filter_lists_cover_every_variant, history_filters_select_by_action_and_outcome_without_reordering.",
    "implementation_commit": null,
-   "notes": ""
+   "notes": "Deliberate deviation: no date filter while history is session-scoped in-memory (see HISTORY-001)."
   },
   {
    "id": "HISTORY-003",

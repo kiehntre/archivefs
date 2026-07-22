@@ -284,12 +284,38 @@ Landed in commit "Add unmount actions to the Active Mounts screen":
   confirmation, stale-confirmation clearing, and the confirm strip
   (353 passed, 0 failed).
 
+## History & Logs filtering and export (2026-07-22)
+
+Landed in commit "Add filtering and export to History & Logs":
+
+- Operation filter (`ALL_ACTIVITY_ACTIONS`) and Result filter
+  (`ALL_ACTIVITY_OUTCOMES`) as combo boxes with "All Operations"/"All
+  Results" defaults; newest/oldest sort toggle; Clear Filters; shown/
+  total entry count; empty-filter-result message.
+- Copy Visible Log (clipboard) and Export Log (rfd save dialog +
+  `std::fs::write`). The export's own outcome is recorded in the
+  history as a new `ActivityAction::LogExport` entry, so exports are
+  auditable in the same log.
+- Filtering is pure (`history_entry_visible` /
+  `visible_history_entries`) and never mutates or reorders the
+  underlying `OperationHistory`.
+- **HISTORY-001 decision (was an open question):** operation history
+  stays in-memory for this campaign phase. When persistence is
+  prioritized it will be a GUI-local JSON log file (the initializer's
+  default lean), not a new core module. The design's date filter is
+  deferred with it — a session-scoped history makes "Today/Yesterday"
+  filters meaningless. This supersedes the "decide before HISTORY-002"
+  sequencing: the screen was built against the in-memory scope with
+  the deviation documented here.
+- Tests: filter-list completeness and filter/sort behaviour
+  (355 passed, 0 failed).
+
 ## Next deliverable
 
-History & Logs parity: outcome/action filtering and log export per the
-design ("All Operations" / result filters, Export Log serializing the
-existing `HistoryEntry` fields), then Doctor screen parity (copy full
-details, suggested actions).
+Doctor screen parity: copy-full-details affordance and suggested
+actions on the Doctor page, plus surfacing the RetroArch environment
+diagnostics (backend `emulator_environment::retroarch`, CLI
+`retroarch-environment`) if scoping allows.
 
 ## Latest clean commit
 
