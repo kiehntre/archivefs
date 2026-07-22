@@ -17,12 +17,18 @@ use archivefs_core::emulator_environment::retroarch::{
 use archivefs_core::patch_manager::{
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, HttpsCheatSourceTransport, ImportSourceKind,
-    ImportTrustState, LocalSafetyScanningState, RetroArchCheatLibraryInspection,
-    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, UNKNOWN_CODE_POLICY,
-    default_cheat_source_cache_root, discover_retroarch_cheat_setup_profiles,
-    fetch_retroarch_cheat_source, inspect_retroarch_cheat_library, list_retroarch_cheat_sources,
+    ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState,
+    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    UNKNOWN_CODE_POLICY, default_cheat_source_cache_root, discover_pcsx2_profiles,
+    discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source, inspect_pcsx2_profile,
+    inspect_retroarch_cheat_library, list_retroarch_cheat_sources, match_pcsx2_inventory,
 };
 mod ui;
+
+#[cfg(test)]
+use archivefs_core::patch_manager::Pcsx2PatchDirectory;
 
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
@@ -226,12 +232,16 @@ enum ActivityAction {
     /// Trusted cheat-source catalogue retrieval (network fetch or
     /// offline cached-snapshot reuse) from the cheat workflow.
     CheatSourceRetrieval,
+    /// Read-only discovery of local PCSX2 configuration profiles.
+    Pcsx2ProfileScan,
+    /// Bounded read-only inventory of one PCSX2 profile's PNACH files.
+    Pcsx2PnachInspection,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 31] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 33] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -263,6 +273,8 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 31] = [
     ActivityAction::LogExport,
     ActivityAction::RetroArchProfileScan,
     ActivityAction::CheatSourceRetrieval,
+    ActivityAction::Pcsx2ProfileScan,
+    ActivityAction::Pcsx2PnachInspection,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -347,6 +359,8 @@ impl std::fmt::Display for ActivityAction {
             Self::LogExport => "Log export",
             Self::RetroArchProfileScan => "RetroArch profile scan",
             Self::CheatSourceRetrieval => "Cheat source retrieval",
+            Self::Pcsx2ProfileScan => "PCSX2 profile scan",
+            Self::Pcsx2PnachInspection => "PCSX2 PNACH inspection",
         })
     }
 }
@@ -2532,6 +2546,10 @@ struct ArchiveFsApp {
     /// scanned automatically - filesystem probing only happens on an
     /// explicit "Scan/Rescan Profiles" click.
     retroarch_profiles: RetroArchProfilesState,
+    /// Read-only PCSX2 profile discovery shared by every PS2 archive
+    /// context. Inventory results remain archive-bound inside
+    /// `CheatWorkflowState`.
+    pcsx2_profiles: Pcsx2ProfilesState,
     /// The full-page Cheats & Mods workspace's current archive and
     /// trusted-catalogue state. It survives ordinary page navigation so
     /// returning to the same exact archive does not discard a completed
@@ -2739,6 +2757,7 @@ impl ArchiveFsApp {
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -4290,7 +4309,14 @@ impl ArchiveFsApp {
         {
             return false;
         }
-        let (source_mode, selected_source_id, fetch_force_refresh, previous_profile_id) = self
+        let (
+            source_mode,
+            selected_source_id,
+            fetch_force_refresh,
+            previous_profile_id,
+            previous_pcsx2_profile_id,
+            previous_adapter,
+        ) = self
             .cheat_workflow
             .as_ref()
             .map(|workflow| {
@@ -4299,12 +4325,16 @@ impl ArchiveFsApp {
                     workflow.selected_source_id.clone(),
                     workflow.fetch_force_refresh,
                     workflow.selected_profile_id.clone(),
+                    workflow.selected_pcsx2_profile_id.clone(),
+                    Some(workflow.adapter),
                 )
             })
             .unwrap_or((
                 CheatSourceMode::ArchiveFsTrustedCatalogue,
                 None,
                 false,
+                None,
+                None,
                 None,
             ));
         let record_details = match &self.state {
@@ -4329,11 +4359,32 @@ impl ArchiveFsApp {
             self.cheat_workflow = None;
             return false;
         };
+        let ps2 = platform_is_ps2(platform.as_deref());
+        let adapter = if ps2 {
+            previous_adapter.unwrap_or(CheatEmulatorAdapter::Pcsx2)
+        } else {
+            CheatEmulatorAdapter::RetroArch
+        };
         let selected_profile_id = match &self.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
                 let eligible = eligible_profile_ids(discovery);
                 if let Some(previous) =
                     previous_profile_id.filter(|previous| eligible.contains(&previous.as_str()))
+                {
+                    Some(previous)
+                } else if eligible.len() == 1 {
+                    Some(eligible[0].to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let selected_pcsx2_profile_id = match &self.pcsx2_profiles {
+            Pcsx2ProfilesState::Ready(discovery) => {
+                let eligible = eligible_pcsx2_profile_ids(discovery);
+                if let Some(previous) = previous_pcsx2_profile_id
+                    .filter(|previous| eligible.contains(&previous.as_str()))
                 {
                     Some(previous)
                 } else if eligible.len() == 1 {
@@ -4350,7 +4401,11 @@ impl ArchiveFsApp {
             platform,
             source_root,
             size_bytes,
+            adapter,
             selected_profile_id,
+            selected_pcsx2_profile_id,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
             source_mode,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -4371,6 +4426,17 @@ impl ArchiveFsApp {
         // Read-only listing of the local trusted-source cache; safe to
         // start immediately (no network, background thread).
         self.start_cheat_source_list(context.clone());
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2)
+            && matches!(
+                self.pcsx2_profiles,
+                Pcsx2ProfilesState::NotScanned | Pcsx2ProfilesState::Error(_)
+            )
+        {
+            self.start_pcsx2_profile_scan(context.clone());
+        }
     }
 
     fn open_cheat_archive_picker(&mut self) {
@@ -4445,6 +4511,48 @@ impl ArchiveFsApp {
         thread::spawn(move || {
             let result = inspect_retroarch_cheat_library(&destination);
             let _ = sender.send(Ok(result));
+            context.request_repaint();
+        });
+    }
+
+    fn start_pcsx2_inventory(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Pcsx2 {
+            return;
+        }
+        let Some(profile_id) = workflow.selected_pcsx2_profile_id.clone() else {
+            return;
+        };
+        let profile = match &self.pcsx2_profiles {
+            Pcsx2ProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .cloned(),
+            _ => None,
+        };
+        let Some(profile) = profile else {
+            workflow.pcsx2_inventory_profile_id = Some(profile_id);
+            workflow.pcsx2_inventory = CheatStepResource::Failed(
+                "The selected PCSX2 profile is no longer eligible.".to_string(),
+            );
+            return;
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        workflow.pcsx2_inventory_profile_id = Some(profile_id.clone());
+        workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Pcsx2PnachInspection,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            format!("PCSX2 PNACH inspection started for profile '{profile_id}'."),
+        ));
+        thread::spawn(move || {
+            let result = inspect_pcsx2_profile(&profile).map_err(|error| error.to_string());
+            let _ = sender.send(result);
             context.request_repaint();
         });
     }
@@ -4546,6 +4654,48 @@ impl ArchiveFsApp {
                 }
             }
         }
+        let mut pcsx2_history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.pcsx2_inventory {
+            match receiver.try_recv() {
+                Ok(Ok(inventory)) => {
+                    if workflow.adapter == CheatEmulatorAdapter::Pcsx2
+                        && workflow.selected_pcsx2_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                        && workflow.pcsx2_inventory_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                    {
+                        pcsx2_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::Pcsx2PnachInspection,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "PCSX2 PNACH inspection found {} files ({} warnings).",
+                                inventory.files.len(),
+                                inventory.warnings.len()
+                            ),
+                        ));
+                        workflow.pcsx2_inventory = CheatStepResource::Ready(inventory);
+                    } else {
+                        workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    pcsx2_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::Pcsx2PnachInspection,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("PCSX2 PNACH inspection failed: {message}"),
+                    ));
+                    workflow.pcsx2_inventory = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.pcsx2_inventory = CheatStepResource::Failed(
+                        "PCSX2 PNACH inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
         let mut history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.source_fetch {
             match receiver.try_recv() {
@@ -4591,6 +4741,9 @@ impl ArchiveFsApp {
         if let Some(entry) = history_entry {
             self.history.record(entry);
         }
+        if let Some(entry) = pcsx2_history_entry {
+            self.history.record(entry);
+        }
     }
 
     /// Revalidates the independent workspace context against the live
@@ -4612,6 +4765,72 @@ impl ArchiveFsApp {
                 });
         if !context_is_current {
             self.cheat_workflow = None;
+        }
+    }
+
+    fn start_pcsx2_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Pcsx2ProfileScan,
+            None,
+            ActivityOutcome::Started,
+            "PCSX2 profile discovery started.",
+        ));
+        self.pcsx2_profiles = Pcsx2ProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result = Pcsx2ProfileDiscoveryRoots::from_environment()
+                .and_then(|roots| discover_pcsx2_profiles(&roots))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_pcsx2_profiles(&mut self) {
+        if let Pcsx2ProfilesState::Scanning { receiver } = &self.pcsx2_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(discovery)) => {
+                    let eligible = eligible_pcsx2_profile_ids(&discovery);
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Pcsx2ProfileScan,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!(
+                            "PCSX2 profile discovery found {} profiles ({} eligible).",
+                            discovery.profiles.len(),
+                            eligible.len()
+                        ),
+                    ));
+                    if let Some(workflow) = self.cheat_workflow.as_mut()
+                        && workflow.adapter == CheatEmulatorAdapter::Pcsx2
+                        && workflow
+                            .selected_pcsx2_profile_id
+                            .as_ref()
+                            .is_none_or(|selected| !eligible.contains(&selected.as_str()))
+                    {
+                        workflow.selected_pcsx2_profile_id =
+                            (eligible.len() == 1).then(|| eligible[0].to_string());
+                        workflow.pcsx2_inventory_profile_id = None;
+                        workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                    }
+                    self.pcsx2_profiles = Pcsx2ProfilesState::Ready(discovery);
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Pcsx2ProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("PCSX2 profile discovery failed: {message}"),
+                    ));
+                    self.pcsx2_profiles = Pcsx2ProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.pcsx2_profiles = Pcsx2ProfilesState::Error(
+                        "PCSX2 profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
         }
     }
 
@@ -5409,6 +5628,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
         self.poll_retroarch_profiles();
+        self.poll_pcsx2_profiles();
         self.poll_cheat_workflow();
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
@@ -5870,6 +6090,7 @@ impl eframe::App for ArchiveFsApp {
                                 ui,
                                 self.cheat_workflow.as_mut(),
                                 &self.retroarch_profiles,
+                                &self.pcsx2_profiles,
                                 live,
                                 self.database_state.snapshot(),
                                 &self.history,
@@ -5894,8 +6115,28 @@ impl eframe::App for ArchiveFsApp {
                         Some(CheatWorkflowAction::OpenLibrary) => {
                             self.view = MainView::Library;
                         }
+                        Some(CheatWorkflowAction::SelectAdapter(adapter)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                select_cheat_adapter(workflow, adapter);
+                            }
+                            if adapter == CheatEmulatorAdapter::Pcsx2
+                                && matches!(
+                                    self.pcsx2_profiles,
+                                    Pcsx2ProfilesState::NotScanned
+                                        | Pcsx2ProfilesState::Error(_)
+                                )
+                            {
+                                self.start_pcsx2_profile_scan(context.clone());
+                            }
+                        }
                         Some(CheatWorkflowAction::RescanProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RescanPcsx2Profiles) => {
+                            self.start_pcsx2_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::InspectPcsx2Profile) => {
+                            self.start_pcsx2_inventory(context.clone());
                         }
                         Some(CheatWorkflowAction::InspectExistingLibrary) => {
                             self.start_existing_retroarch_library_inspection(context.clone());
@@ -10332,11 +10573,18 @@ struct CheatWorkflowState {
     platform: Option<String>,
     source_root: PathBuf,
     size_bytes: Option<u64>,
+    /// The emulator adapter is explicit and independent from archive
+    /// selection. PCSX2 is offered only for a canonical PS2 archive.
+    adapter: CheatEmulatorAdapter,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never
     /// silently picked.
     selected_profile_id: Option<String>,
+    selected_pcsx2_profile_id: Option<String>,
+    /// The PCSX2 profile identity bound to this archive's inventory.
+    pcsx2_inventory_profile_id: Option<String>,
+    pcsx2_inventory: CheatStepResource<Pcsx2PnachInventory>,
     /// Independent source mode. Changing it never changes the archive,
     /// profile, destination, or any fetched result retained by another mode.
     source_mode: CheatSourceMode,
@@ -10362,6 +10610,12 @@ struct CheatWorkflowState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheatEmulatorAdapter {
+    RetroArch,
+    Pcsx2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheatSourceMode {
     ExistingRetroArchLibrary,
     ArchiveFsTrustedCatalogue,
@@ -10384,6 +10638,17 @@ fn cheat_archive_change_requires_confirmation(
         workflow.archive_path != candidate
             && !matches!(workflow.source_fetch, CheatStepResource::NotLoaded)
     })
+}
+
+fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulatorAdapter) {
+    if workflow.adapter == adapter {
+        return;
+    }
+    workflow.adapter = adapter;
+    // Dropping a loading receiver is the stale-result boundary: the
+    // superseded worker cannot apply its result to the new adapter.
+    workflow.pcsx2_inventory_profile_id = None;
+    workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
 }
 
 #[derive(Default)]
@@ -10733,7 +10998,10 @@ fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
 enum CheatWorkflowAction {
     ChooseArchive,
     OpenLibrary,
+    SelectAdapter(CheatEmulatorAdapter),
     RescanProfiles,
+    RescanPcsx2Profiles,
+    InspectPcsx2Profile,
     InspectExistingLibrary,
     RefreshSources,
     FetchSource,
@@ -10801,7 +11069,12 @@ fn show_cheats_mods_workflow_states(
     ui: &mut egui::Ui,
     workflow: Option<&CheatWorkflowState>,
     profiles: &RetroArchProfilesState,
+    pcsx2_profiles: &Pcsx2ProfilesState,
 ) {
+    if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2) {
+        show_pcsx2_workflow_states(ui, workflow.unwrap(), pcsx2_profiles);
+        return;
+    }
     let (profile_label, profile_tone) = retroarch_integration_presentation(profiles);
     let source_label = workflow
         .map(|workflow| workflow.source_mode.label())
@@ -10904,6 +11177,118 @@ fn show_cheats_mods_workflow_states(
             });
         }
     });
+}
+
+fn show_pcsx2_workflow_states(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    profiles: &Pcsx2ProfilesState,
+) {
+    let (profile_label, profile_tone) = pcsx2_integration_presentation(profiles);
+    let (inspection_label, inspection_tone) = match &workflow.pcsx2_inventory {
+        CheatStepResource::Ready(inventory) if inventory.complete => (
+            "Local PNACH inventory complete",
+            widgets::StatusTone::Success,
+        ),
+        CheatStepResource::Ready(_) => (
+            "Local PNACH inventory incomplete",
+            widgets::StatusTone::Warning,
+        ),
+        CheatStepResource::Loading { .. } => ("Inspecting locally", widgets::StatusTone::Active),
+        CheatStepResource::Failed(_) => {
+            ("Local inspection unavailable", widgets::StatusTone::Warning)
+        }
+        CheatStepResource::NotLoaded => ("Local inspection pending", widgets::StatusTone::Pending),
+    };
+    let destination = workflow
+        .selected_pcsx2_profile_id
+        .as_deref()
+        .and_then(|selected| match profiles {
+            Pcsx2ProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .map(|profile| profile.configuration_path.display().to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Not selected — choose an eligible profile".to_string());
+    widgets::section_header(
+        ui,
+        "Workflow state",
+        Some("Profile, source, inspection, destination, and installation remain separate states."),
+    );
+    widgets::card(ui, |ui| {
+        for (label, value, tone) in [
+            ("Emulator profile", profile_label.as_str(), profile_tone),
+            (
+                "Cheat or mod source",
+                "Existing PCSX2-managed files",
+                widgets::StatusTone::Info,
+            ),
+            (
+                "Trust state",
+                "Unverified local content",
+                widgets::StatusTone::Warning,
+            ),
+            ("Inspection state", inspection_label, inspection_tone),
+            (
+                "Destination",
+                destination.as_str(),
+                widgets::StatusTone::Pending,
+            ),
+            (
+                "Installation state",
+                "Unavailable · read-only adapter",
+                widgets::StatusTone::Pending,
+            ),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(label).strong()),
+                );
+                widgets::status_badge(ui, value, tone);
+            });
+        }
+    });
+}
+
+fn pcsx2_integration_presentation(profiles: &Pcsx2ProfilesState) -> (String, widgets::StatusTone) {
+    match profiles {
+        Pcsx2ProfilesState::NotScanned => (
+            "PCSX2 profiles not scanned".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        Pcsx2ProfilesState::Scanning { .. } => (
+            "Scanning PCSX2 profiles".to_string(),
+            widgets::StatusTone::Active,
+        ),
+        Pcsx2ProfilesState::Error(_) => (
+            "PCSX2 profile scan needs attention".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        Pcsx2ProfilesState::Ready(discovery) => {
+            let eligible = discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .count();
+            if eligible == 0 {
+                (
+                    "No eligible PCSX2 profile".to_string(),
+                    widgets::StatusTone::Warning,
+                )
+            } else {
+                (
+                    format!(
+                        "{eligible} eligible PCSX2 profile{}",
+                        if eligible == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                )
+            }
+        }
+    }
 }
 
 fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
@@ -11061,8 +11446,11 @@ fn show_recent_cheat_activity(
         .entries()
         .filter(|entry| {
             entry.action == ActivityAction::RetroArchProfileScan
-                || (entry.action == ActivityAction::CheatSourceRetrieval
-                    && archive_path.is_some()
+                || entry.action == ActivityAction::Pcsx2ProfileScan
+                || (matches!(
+                    entry.action,
+                    ActivityAction::CheatSourceRetrieval | ActivityAction::Pcsx2PnachInspection
+                ) && archive_path.is_some()
                     && entry.archive_path.as_deref() == archive_path)
         })
         .take(4)
@@ -11070,7 +11458,9 @@ fn show_recent_cheat_activity(
     widgets::section_header(
         ui,
         "Recent related activity",
-        Some("A compact view of this session's RetroArch scans and trusted catalogue retrievals."),
+        Some(
+            "A compact view of this session's emulator profile scans, local PNACH inspection, and trusted catalogue retrieval.",
+        ),
     );
     if entries.is_empty() {
         ui.weak("No related activity has been recorded in this session.");
@@ -11107,16 +11497,503 @@ fn show_cheat_unavailable_stage(ui: &mut egui::Ui) {
     );
 }
 
-fn show_mods_section(ui: &mut egui::Ui) {
+fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool) {
     widgets::section_header(
         ui,
         "Mods",
         Some("A stable future home for verified, emulator-specific mod adapters."),
     );
     widgets::card(ui, |ui| {
-        widgets::status_badge(ui, "Planned", widgets::StatusTone::Pending);
-        ui.label(MODS_UNAVAILABLE_BODY);
+        if pcsx2_read_only {
+            widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
+            ui.label("PCSX2 widescreen and other PNACH patch directories can be inspected above. Preview, installation, enabling, disabling, replacement, and rollback are unavailable.");
+        } else {
+            widgets::status_badge(ui, "Planned", widgets::StatusTone::Pending);
+            ui.label(MODS_UNAVAILABLE_BODY);
+        }
     });
+}
+
+fn platform_is_ps2(platform: Option<&str>) -> bool {
+    platform.is_some_and(|platform| platform.eq_ignore_ascii_case("PS2"))
+}
+
+fn show_cheat_emulator_adapter_selector(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    widgets::section_header(
+        ui,
+        "Emulator adapter",
+        Some(
+            "The adapter is separate from the archive, source, profile, destination, and installation state.",
+        ),
+    );
+    let mut selected = None;
+    widgets::card(ui, |ui| {
+        if ui
+            .radio(
+                workflow.adapter == CheatEmulatorAdapter::RetroArch,
+                "RetroArch",
+            )
+            .clicked()
+        {
+            selected = Some(CheatEmulatorAdapter::RetroArch);
+        }
+        ui.label("Profile discovery, existing cheat-directory inventory, and trusted catalogue retrieval.");
+    });
+    if platform_is_ps2(workflow.platform.as_deref()) {
+        widgets::card(ui, |ui| {
+            if ui
+                .radio(workflow.adapter == CheatEmulatorAdapter::Pcsx2, "PCSX2")
+                .clicked()
+            {
+                selected = Some(CheatEmulatorAdapter::Pcsx2);
+            }
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(ui, "PS2 only", widgets::StatusTone::Info);
+                widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            });
+            ui.label("Discovers local PCSX2 profiles and inspects existing PNACH files with fixed resource limits.");
+        });
+    }
+    selected
+        .filter(|selected| *selected != workflow.adapter)
+        .map(CheatWorkflowAction::SelectAdapter)
+}
+
+fn show_pcsx2_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &Pcsx2ProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 1 · PCSX2 profile",
+        Some(
+            "ArchiveFS selects automatically only when exactly one discovered profile is eligible.",
+        ),
+    );
+    match profiles {
+        Pcsx2ProfilesState::NotScanned => {
+            widgets::banner(
+                ui,
+                "Profiles not scanned",
+                "Run local read-only discovery of documented PCSX2 configuration paths.",
+                widgets::StatusTone::Pending,
+            );
+        }
+        Pcsx2ProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning PCSX2 profiles locally...");
+            });
+        }
+        Pcsx2ProfilesState::Error(message) => {
+            widgets::banner(
+                ui,
+                "PCSX2 discovery failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+        }
+        Pcsx2ProfilesState::Ready(discovery) => {
+            let eligible = eligible_pcsx2_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_pcsx2_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_pcsx2_profile_id = None;
+                workflow.pcsx2_inventory_profile_id = None;
+                workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+            }
+            if discovery.profiles.is_empty() {
+                widgets::banner(
+                    ui,
+                    "No PCSX2 profile found",
+                    "No documented PCSX2 configuration directory was discovered. Missing cheat directories are not created.",
+                    widgets::StatusTone::Pending,
+                );
+            } else if eligible.len() > 1 && workflow.selected_pcsx2_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. Choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                show_pcsx2_profile_card(ui, workflow, profile, clipboard);
+                ui.add_space(6.0);
+            }
+            for warning in &discovery.warnings {
+                widgets::banner(
+                    ui,
+                    "Discovery limit",
+                    &warning.detail,
+                    widgets::StatusTone::Warning,
+                );
+            }
+        }
+    }
+    if widgets::action_button(
+        ui,
+        "Rescan PCSX2 profiles",
+        widgets::ActionStyle::Quiet,
+        !matches!(profiles, Pcsx2ProfilesState::Scanning { .. }),
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::RescanPcsx2Profiles);
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Stage 2 · Existing PCSX2-managed files",
+        Some(
+            "Cheats, widescreen patches, and other PNACH categories are inferred only from documented directory locations.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
+            widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            widgets::status_badge(ui, "Uploaded · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Executed · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Changed · No", widgets::StatusTone::Info);
+        });
+        ui.label("ArchiveFS inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
+    });
+    let Some(selected_profile_id) = workflow.selected_pcsx2_profile_id.as_deref() else {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible PCSX2 profile before inspecting existing files.",
+            widgets::StatusTone::Pending,
+        );
+        show_pcsx2_installation_unavailable(ui);
+        return action;
+    };
+    if workflow.pcsx2_inventory_profile_id.as_deref() != Some(selected_profile_id) {
+        workflow.pcsx2_inventory_profile_id = None;
+        workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+    }
+    match &workflow.pcsx2_inventory {
+        CheatStepResource::NotLoaded => {
+            if widgets::action_button(
+                ui,
+                "Inspect existing PNACH files",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::InspectPcsx2Profile);
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting existing PNACH files locally...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "PCSX2 inspection failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+        }
+        CheatStepResource::Ready(inventory) => {
+            show_pcsx2_inventory(ui, workflow, inventory, clipboard);
+        }
+    }
+    show_pcsx2_installation_unavailable(ui);
+    action
+}
+
+fn show_pcsx2_profile_card(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profile: &Pcsx2Profile,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if profile.eligible {
+                let selected = workflow.selected_pcsx2_profile_id.as_deref()
+                    == Some(profile.profile_id.as_str());
+                if ui.radio(selected, &profile.profile_id).clicked() {
+                    workflow.selected_pcsx2_profile_id = Some(profile.profile_id.clone());
+                    workflow.pcsx2_inventory_profile_id = None;
+                    workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                }
+                widgets::status_badge(ui, "Eligible", widgets::StatusTone::Success);
+            } else {
+                ui.add_enabled(false, egui::Button::selectable(false, &profile.profile_id));
+                widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+            }
+            ui.label(format!(
+                "{} · {}",
+                pcsx2_installation_label(profile.installation_type),
+                pcsx2_scope_label(profile.scope)
+            ));
+        });
+        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+            let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+        }
+        for directory in &profile.patch_directories {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    pcsx2_directory_state_label(directory.state),
+                    pcsx2_directory_state_tone(directory.state),
+                );
+                ui.label(pcsx2_category_label(directory.category));
+                if widgets::path_value(ui, "Path", &directory.path) {
+                    let _ = clipboard.set_text(directory.path.display().to_string());
+                }
+            });
+        }
+        if let Some(blocker) = profile.blockers.first() {
+            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+        }
+        if profile.blockers.len() > 1 {
+            egui::CollapsingHeader::new("All technical blockers")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for blocker in &profile.blockers {
+                        ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+                    }
+                });
+        }
+    });
+}
+
+fn show_pcsx2_inventory(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    inventory: &Pcsx2PnachInventory,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    let category_count = |category| {
+        inventory
+            .files
+            .iter()
+            .filter(|file| file.category == category)
+            .count()
+    };
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                if inventory.complete {
+                    "Complete"
+                } else {
+                    "Incomplete"
+                },
+                if inventory.complete {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            ui.strong(format!("{} PNACH files", inventory.files.len()));
+            ui.label(format!("{} bytes inspected", inventory.bytes_inspected));
+            ui.label(format!("{} entries visited", inventory.entries_visited));
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (category, label) in [
+                (Pcsx2PatchCategory::Cheats, "Cheats"),
+                (Pcsx2PatchCategory::WidescreenPatches, "Widescreen"),
+                (Pcsx2PatchCategory::OtherPatches, "Other patches"),
+                (Pcsx2PatchCategory::Unknown, "Unknown"),
+            ] {
+                widgets::status_badge(
+                    ui,
+                    format!("{label} · {}", category_count(category)),
+                    widgets::StatusTone::Info,
+                );
+            }
+        });
+    });
+    let match_result = match_pcsx2_inventory(inventory, None, Some(&workflow.display_name));
+    let (match_label, match_tone) = pcsx2_match_presentation(match_result.state);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, match_label, match_tone);
+            ui.label(&match_result.reason);
+        });
+        ui.label("ArchiveFS currently has no safe PS2 executable-CRC extractor. Filename CRCs and comment titles remain candidates only; they never establish exact identity.");
+        for path in &match_result.matching_files {
+            if widgets::path_value(ui, "Candidate", path) {
+                let _ = clipboard.set_text(path.display().to_string());
+            }
+        }
+    });
+    egui::CollapsingHeader::new(format!("Inspected PNACH files ({})", inventory.files.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            const MAX_RENDERED_PNACH_FILES: usize = 100;
+            for file in inventory.files.iter().take(MAX_RENDERED_PNACH_FILES) {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(file.filename_stem.to_string_lossy());
+                        widgets::status_badge(
+                            ui,
+                            pcsx2_category_label(file.category),
+                            widgets::StatusTone::Info,
+                        );
+                        if let Some(crc) = &file.crc_candidate {
+                            widgets::status_badge(ui, format!("CRC candidate · {crc}"), widgets::StatusTone::Pending);
+                        }
+                        ui.label(format!("{} patch entries", file.patch_entry_count));
+                    });
+                    if widgets::path_value(ui, "PNACH", &file.path) {
+                        let _ = clipboard.set_text(file.path.display().to_string());
+                    }
+                    ui.label(format!(
+                        "Enabled syntax {} · disabled syntax {} · unknown syntax {}",
+                        file.enabled_patch_count,
+                        file.disabled_patch_count,
+                        file.unknown_patch_count
+                    ));
+                    if !file.title_candidates.is_empty() {
+                        ui.label(format!("Comment title candidates: {}", file.title_candidates.join("; ")));
+                    }
+                    if !file.comments.is_empty() {
+                        ui.label(format!(
+                            "Retained comments: {}",
+                            file.comments
+                                .iter()
+                                .take(3)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
+                    egui::CollapsingHeader::new("Technical metadata")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            widgets::copyable_value(ui, "SHA-256", &file.sha256);
+                            if file.duplicate_crc || file.duplicate_filename || file.duplicate_content {
+                                ui.label(format!(
+                                    "Duplicate CRC: {} · filename: {} · content: {}",
+                                    file.duplicate_crc, file.duplicate_filename, file.duplicate_content
+                                ));
+                            }
+                        });
+                });
+            }
+            if inventory.files.len() > MAX_RENDERED_PNACH_FILES {
+                ui.label(format!(
+                    "{} additional files are retained in the bounded result but omitted from this summary.",
+                    inventory.files.len() - MAX_RENDERED_PNACH_FILES
+                ));
+            }
+        });
+    if !inventory.warnings.is_empty() {
+        egui::CollapsingHeader::new(format!(
+            "Inspection warnings ({})",
+            inventory.warnings.len()
+        ))
+        .default_open(false)
+        .show(ui, |ui| {
+            for warning in inventory.warnings.iter().take(50) {
+                ui.label(format!("{:?}: {}", warning.kind, warning.detail));
+            }
+            if inventory.warnings.len() > 50 {
+                ui.label(format!(
+                    "{} additional warnings omitted from this view.",
+                    inventory.warnings.len() - 50
+                ));
+            }
+        });
+    }
+}
+
+fn show_pcsx2_installation_unavailable(ui: &mut egui::Ui) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "Stage 3 · Preview and controlled installation", None);
+    widgets::banner(
+        ui,
+        "Unavailable · read-only milestone",
+        "ArchiveFS does not install, apply, enable, disable, replace, fix, delete, generate, or roll back PCSX2 files.",
+        widgets::StatusTone::Pending,
+    );
+}
+
+fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static str {
+    match kind {
+        Pcsx2InstallationType::Native => "Native",
+        Pcsx2InstallationType::FlatpakUser => "Flatpak user",
+        Pcsx2InstallationType::FlatpakSystem => "Flatpak system",
+        Pcsx2InstallationType::Portable => "Portable / explicit configuration",
+    }
+}
+
+fn pcsx2_scope_label(scope: Pcsx2ProfileScope) -> &'static str {
+    match scope {
+        Pcsx2ProfileScope::User => "User profile",
+        Pcsx2ProfileScope::SystemInstallationUserProfile => "System install · user profile",
+        Pcsx2ProfileScope::Portable => "Portable scope",
+    }
+}
+
+fn pcsx2_category_label(category: Pcsx2PatchCategory) -> &'static str {
+    match category {
+        Pcsx2PatchCategory::Cheats => "Cheats",
+        Pcsx2PatchCategory::WidescreenPatches => "Widescreen patches",
+        Pcsx2PatchCategory::OtherPatches => "Other PNACH patches",
+        Pcsx2PatchCategory::Unknown => "Unknown PNACH category",
+    }
+}
+
+fn pcsx2_directory_state_label(state: Pcsx2PatchDirectoryState) -> &'static str {
+    match state {
+        Pcsx2PatchDirectoryState::Available => "Exists",
+        Pcsx2PatchDirectoryState::Missing => "Missing",
+        Pcsx2PatchDirectoryState::UnsafePath => "Unsafe path",
+        Pcsx2PatchDirectoryState::NotDirectory => "Not a directory",
+        Pcsx2PatchDirectoryState::Unreadable => "Unreadable",
+    }
+}
+
+fn pcsx2_directory_state_tone(state: Pcsx2PatchDirectoryState) -> widgets::StatusTone {
+    match state {
+        Pcsx2PatchDirectoryState::Available => widgets::StatusTone::Success,
+        Pcsx2PatchDirectoryState::Missing => widgets::StatusTone::Pending,
+        Pcsx2PatchDirectoryState::UnsafePath => widgets::StatusTone::Blocked,
+        Pcsx2PatchDirectoryState::NotDirectory | Pcsx2PatchDirectoryState::Unreadable => {
+            widgets::StatusTone::Warning
+        }
+    }
+}
+
+fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str, widgets::StatusTone) {
+    match state {
+        Pcsx2MatchState::ExactCrcMatch => ("Exact CRC match", widgets::StatusTone::Success),
+        Pcsx2MatchState::MultiplePnachFilesForSameCrc => {
+            ("Ambiguous CRC match", widgets::StatusTone::Warning)
+        }
+        Pcsx2MatchState::CandidateByFilenameOrTitleOnly => {
+            ("Unverified title candidate", widgets::StatusTone::Warning)
+        }
+        Pcsx2MatchState::NoVerifiedGameCrcAvailable => (
+            "Verified game CRC unavailable",
+            widgets::StatusTone::Pending,
+        ),
+        Pcsx2MatchState::NoMatchingPnachFound => {
+            ("No matching PNACH", widgets::StatusTone::Pending)
+        }
+        Pcsx2MatchState::InvalidVerifiedGameCrc => {
+            ("Invalid verified CRC", widgets::StatusTone::Blocked)
+        }
+        Pcsx2MatchState::IdentityExtractionDeferred => {
+            ("Identity extraction deferred", widgets::StatusTone::Pending)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11124,6 +12001,7 @@ fn show_cheats_mods_page(
     ui: &mut egui::Ui,
     workflow: Option<&mut CheatWorkflowState>,
     profiles: &RetroArchProfilesState,
+    pcsx2_profiles: &Pcsx2ProfilesState,
     live: Option<&LoadedData>,
     cached: Option<&CachedLibrarySnapshot>,
     history: &OperationHistory,
@@ -11134,12 +12012,20 @@ fn show_cheats_mods_page(
     let activity_archive = workflow
         .as_deref()
         .map(|workflow| workflow.archive_path.clone());
+    let pcsx2_read_only = workflow
+        .as_deref()
+        .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2);
     widgets::page_header(
         ui,
         "Cheats & Mods",
-        "Inspect RetroArch integration and retrieve trusted cheat catalogues for one exact archive.",
+        "Inspect emulator-managed cheats and patches or retrieve trusted catalogues for one exact archive.",
     );
-    let (integration_label, integration_tone) = retroarch_integration_presentation(profiles);
+    let (integration_label, integration_tone) = match workflow.as_deref() {
+        Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Pcsx2 => {
+            pcsx2_integration_presentation(pcsx2_profiles)
+        }
+        _ => retroarch_integration_presentation(profiles),
+    };
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, integration_label, integration_tone);
@@ -11175,34 +12061,43 @@ fn show_cheats_mods_page(
     });
     ui.add_space(theme::SECTION_GAP);
 
-    show_cheats_mods_workflow_states(ui, workflow.as_deref(), profiles);
+    show_cheats_mods_workflow_states(ui, workflow.as_deref(), profiles, pcsx2_profiles);
     ui.add_space(theme::SECTION_GAP);
     show_cheats_mods_safety_information(ui);
     ui.add_space(theme::SECTION_GAP);
 
     widgets::section_header(
         ui,
-        "Cheats",
+        "Cheats and emulator patches",
         Some(
-            "Profile discovery and reviewed catalogue retrieval use the existing safe RetroArch workflow.",
+            "Choose an emulator adapter explicitly. Every PCSX2 operation in this milestone is local and read-only.",
         ),
     );
     if let Some(workflow) = workflow {
         show_cheat_archive_context(ui, workflow, live, cached, clipboard);
         ui.add_space(theme::SECTION_GAP);
-        action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
-        action = show_cheat_source_modes(ui, workflow, profiles).or(action);
-        let source_action = match workflow.source_mode {
-            CheatSourceMode::ExistingRetroArchLibrary => {
-                show_existing_retroarch_library(ui, workflow, profiles, clipboard)
-            }
-            CheatSourceMode::ArchiveFsTrustedCatalogue => {
-                show_cheat_workflow_step2(ui, workflow, busy)
-            }
-        };
-        action = action.or(source_action);
+        action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
-        show_cheat_unavailable_stage(ui);
+        match workflow.adapter {
+            CheatEmulatorAdapter::RetroArch => {
+                action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
+                action = show_cheat_source_modes(ui, workflow, profiles).or(action);
+                let source_action = match workflow.source_mode {
+                    CheatSourceMode::ExistingRetroArchLibrary => {
+                        show_existing_retroarch_library(ui, workflow, profiles, clipboard)
+                    }
+                    CheatSourceMode::ArchiveFsTrustedCatalogue => {
+                        show_cheat_workflow_step2(ui, workflow, busy)
+                    }
+                };
+                action = action.or(source_action);
+                ui.add_space(theme::SECTION_GAP);
+                show_cheat_unavailable_stage(ui);
+            }
+            CheatEmulatorAdapter::Pcsx2 => {
+                action = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, clipboard).or(action);
+            }
+        }
     } else {
         widgets::card(ui, |ui| {
             widgets::section_header(
@@ -11242,7 +12137,7 @@ fn show_cheats_mods_page(
     }
 
     ui.add_space(theme::SECTION_GAP);
-    show_mods_section(ui);
+    show_mods_section(ui, pcsx2_read_only);
     ui.add_space(theme::SECTION_GAP);
     show_recent_cheat_activity(ui, history, activity_archive.as_deref());
     action
@@ -11773,6 +12668,15 @@ fn eligible_profile_ids(discovery: &RetroArchCheatSetupDiscovery) -> Vec<&str> {
         .collect()
 }
 
+fn eligible_pcsx2_profile_ids(discovery: &Pcsx2ProfileDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
 /// Step 1 of the cheat workflow: archive identity plus explicit profile
 /// selection. Renders from the shared `RetroArchProfilesState` (the
 /// same discovery the Settings page shows) and mutates only the
@@ -11893,6 +12797,15 @@ enum RetroArchProfilesState {
         receiver: Receiver<Result<RetroArchCheatSetupDiscovery, String>>,
     },
     Ready(RetroArchCheatSetupDiscovery),
+    Error(String),
+}
+
+enum Pcsx2ProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<Pcsx2ProfileDiscovery, String>>,
+    },
+    Ready(Pcsx2ProfileDiscovery),
     Error(String),
 }
 
@@ -17339,7 +18252,11 @@ mod tests {
             platform: None,
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
+            adapter: CheatEmulatorAdapter::RetroArch,
             selected_profile_id: Some("native-user".to_string()),
+            selected_pcsx2_profile_id: None,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -17351,6 +18268,160 @@ mod tests {
         app.view = MainView::CheatsMods;
         app.tools_overlay = ToolsOverlay::None;
         app
+    }
+
+    fn pcsx2_profile_fixture() -> Pcsx2Profile {
+        Pcsx2Profile {
+            profile_id: "pcsx2-native-test".to_string(),
+            installation_type: Pcsx2InstallationType::Native,
+            scope: Pcsx2ProfileScope::User,
+            configuration_path: PathBuf::from("/isolated/PCSX2"),
+            provenance: "test fixture",
+            eligible: true,
+            blockers: Vec::new(),
+            patch_directories: vec![
+                Pcsx2PatchDirectory {
+                    path: PathBuf::from("/isolated/PCSX2/cheats"),
+                    category: Pcsx2PatchCategory::Cheats,
+                    state: Pcsx2PatchDirectoryState::Available,
+                    warning: None,
+                    identity: None,
+                },
+                Pcsx2PatchDirectory {
+                    path: PathBuf::from("/isolated/PCSX2/cheats_ws"),
+                    category: Pcsx2PatchCategory::WidescreenPatches,
+                    state: Pcsx2PatchDirectoryState::Missing,
+                    warning: None,
+                    identity: None,
+                },
+            ],
+            configuration_identity: None,
+        }
+    }
+
+    fn empty_pcsx2_inventory() -> Pcsx2PnachInventory {
+        Pcsx2PnachInventory {
+            profile_id: "pcsx2-native-test".to_string(),
+            files: Vec::new(),
+            warnings: Vec::new(),
+            directories_traversed: 2,
+            entries_visited: 0,
+            bytes_inspected: 0,
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn pcsx2_adapter_is_visible_only_for_ps2_archives() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(&output, "PCSX2"));
+
+        workflow.platform = Some("PS3".to_string());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        assert!(!rendered_text_contains(&output, "PCSX2"));
+    }
+
+    #[test]
+    fn adapter_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
+        let mut app = app_with_cheats_mods_context();
+        app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.pcsx2_inventory_profile_id = Some("pcsx2-native-test".to_string());
+        let (sender, receiver) = mpsc::channel();
+        workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
+        let archive = workflow.archive_path.clone();
+
+        select_cheat_adapter(workflow, CheatEmulatorAdapter::RetroArch);
+
+        assert!(sender.send(Ok(empty_pcsx2_inventory())).is_err());
+        assert_eq!(workflow.archive_path, archive);
+        assert!(matches!(
+            workflow.pcsx2_inventory,
+            CheatStepResource::NotLoaded
+        ));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+    }
+
+    #[test]
+    fn pcsx2_workflow_presents_profiles_and_read_only_limits_without_fake_actions() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.pcsx2_inventory_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.pcsx2_inventory = CheatStepResource::Ready(empty_pcsx2_inventory());
+        let profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![pcsx2_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        for expected in [
+            "Stage 1 · PCSX2 profile",
+            "Eligible",
+            "Existing PCSX2-managed files",
+            "Uploaded · No",
+            "Executed · No",
+            "Changed · No",
+            "Verified game CRC unavailable",
+            "Unavailable · read-only milestone",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for forbidden in ["Install now", "Apply patch", "Enable patch", "Delete file"] {
+            assert!(!rendered_text_contains(&output, forbidden));
+        }
+    }
+
+    #[test]
+    fn ps2_archive_context_defaults_to_pcsx2_without_queue_or_mount_mutation() {
+        let mut app = app_for_operation_tests();
+        let mut ps2 = record("/roms/game.zip", MountState::Mounted);
+        ps2.identity.platform = Some("PS2".to_string());
+        ps2.mount_plan.archive.identity.platform = Some("PS2".to_string());
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records.push(ps2);
+        }
+        app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+        app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.zip")));
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
+        assert_eq!(workflow.archive_path, PathBuf::from("/roms/game.zip"));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/other.zip")));
+        let live = match &app.state {
+            LoadState::Ready(data) => &data.records[0],
+            _ => unreachable!(),
+        };
+        assert_eq!(live.mount_state, MountState::Mounted);
+        assert_eq!(live.identity.platform.as_deref(), Some("PS2"));
     }
 
     #[test]
@@ -17911,6 +18982,7 @@ mod tests {
                     ui,
                     None,
                     &RetroArchProfilesState::NotScanned,
+                    &Pcsx2ProfilesState::NotScanned,
                     None,
                     None,
                     &history,
@@ -17951,6 +19023,7 @@ mod tests {
                     ui,
                     app.cheat_workflow.as_mut(),
                     &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
                     None,
                     None,
                     &history,
@@ -17988,6 +19061,7 @@ mod tests {
                     ui,
                     app.cheat_workflow.as_ref(),
                     &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
                 );
             });
         });
@@ -18131,7 +19205,7 @@ mod tests {
     fn mods_section_has_no_fake_user_actions() {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, show_mods_section);
+            egui::CentralPanel::default().show(ctx, |ui| show_mods_section(ui, false));
         });
 
         assert!(rendered_text_contains(&output, "Mods"));
@@ -18156,7 +19230,11 @@ mod tests {
             platform: None,
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
+            adapter: CheatEmulatorAdapter::RetroArch,
             selected_profile_id: None,
+            selected_pcsx2_profile_id: None,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -18502,6 +19580,7 @@ mod tests {
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
