@@ -357,15 +357,39 @@ Landed in commit "Extend Settings and About within backend support":
   deliverable, as the first RetroArch surface.
 - Tests: 357 passed, 0 failed.
 
+## RetroArch profile discovery on Settings (2026-07-22)
+
+Landed in commit "Add RetroArch profile discovery to Settings" — the
+first RetroArch surface in the GUI:
+
+- `RetroArchProfilesState` (NotScanned / Scanning / Ready / Error)
+  mirroring `DiagnosticsState`'s receiver-holding shape;
+  `start_retroarch_profile_scan` runs
+  `discover_retroarch_cheat_setup_profiles` (with
+  `HostReadOnlyFilesystem` +
+  `DiscoveryEnvironment::from_process_environment`, exactly as the CLI
+  does) on a background thread; `poll_retroarch_profiles` in `update`.
+- Never scanned automatically — filesystem probing only on an explicit
+  Scan/Rescan click, honouring the "never silently" design wording.
+- Settings "Discovered Profiles" section: eligibility badge
+  (Eligible/Blocked), profile id, type/scope, configuration path,
+  cheat destination root ("unresolved" when absent), and per-profile
+  blocker code+detail lines.
+- Scan start/completion/failure recorded in the operation history as a
+  new `ActivityAction::RetroArchProfileScan` (also in the History
+  filter list).
+- Tests: 358 passed, 0 failed.
+
 ## Next deliverable
 
-RetroArch profile discovery on Settings (design: "Discovered Profiles"
-list with per-profile state, Rescan Profiles; backend
-`discover_retroarch_cheat_setup_profiles` →
-`RetroArchCheatSetupProfileState`/`Blocker`, run on a background
-thread like every other workflow). The design's "ArchiveFS will never
-silently pick between ambiguous or blocked profiles" wording matches
-the backend's blocker model exactly.
+Working through the remaining RetroArch vertical in backend order:
+trusted cheat-source list/fetch/inspect (Backend complete per matrix;
+fetch is blocking `ureq` and must be backgrounded), then cheat
+matching/preview, then install/history/rollback. Where these live in
+the redesigned shell needs a decision — the design has no dedicated
+RetroArch screen beyond Settings' profile section; a `ToolsOverlay` or
+a Selected-archive integration are the candidates consistent with the
+existing navigation model.
 
 ## Latest clean commit
 

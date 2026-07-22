@@ -1072,10 +1072,10 @@
    "required_tests": [
     "existing retroarch_cheat_setup discovery tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "Settings \"Discovered Profiles\" section: RetroArchProfilesState (NotScanned/Scanning/Ready/Error), background discover_retroarch_cheat_setup_profiles scan via start_retroarch_profile_scan (never on the UI thread, never automatic - explicit Scan/Rescan click only), per-profile eligibility badge, type/scope, configuration path, cheat destination, blocker lines, scan outcomes recorded in operation history as ActivityAction::RetroArchProfileScan. Test: retroarch_profile_labels_cover_every_kind_and_scope.",
    "implementation_commit": null,
-   "notes": ""
+   "notes": "Placed on the Settings screen where the design puts \"Discovered Profiles\". Profile *selection* for an actual cheat-setup run is RA-PROFILE-002, not started."
   },
   {
    "id": "RA-PROFILE-002",

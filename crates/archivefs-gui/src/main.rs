@@ -10,6 +10,13 @@ use std::sync::{
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
+use archivefs_core::emulator_environment::retroarch::{
+    DiscoveryEnvironment, ProfileKind, ProfileScope,
+};
+use archivefs_core::patch_manager::{
+    RetroArchCheatSetupDiscovery, discover_retroarch_cheat_setup_profiles,
+};
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
     ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
@@ -187,12 +194,15 @@ enum ActivityAction {
     /// Exporting the visible History & Logs entries to a file - recorded
     /// in the history itself so the export's own outcome is auditable.
     LogExport,
+    /// Background RetroArch profile discovery for cheat setup (the
+    /// Settings page's "Discovered Profiles" section).
+    RetroArchProfileScan,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 29] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 30] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -222,6 +232,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 29] = [
     ActivityAction::LibraryViewRepair,
     ActivityAction::LibraryViewRemoved,
     ActivityAction::LogExport,
+    ActivityAction::RetroArchProfileScan,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -304,6 +315,7 @@ impl std::fmt::Display for ActivityAction {
             Self::LibraryViewRepair => "Library View repair",
             Self::LibraryViewRemoved => "Library View removed",
             Self::LogExport => "Log export",
+            Self::RetroArchProfileScan => "RetroArch profile scan",
         })
     }
 }
@@ -2619,6 +2631,10 @@ struct ArchiveFsApp {
     active_mounts_confirm_unmount: Option<PathBuf>,
     /// The History & Logs page's filter/sort state.
     history_filters: HistoryLogFilters,
+    /// The Settings page's RetroArch profile discovery state. Never
+    /// scanned automatically - filesystem probing only happens on an
+    /// explicit "Scan/Rescan Profiles" click.
+    retroarch_profiles: RetroArchProfilesState,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2838,6 +2854,7 @@ impl ArchiveFsApp {
             confirm_mount_queue: false,
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
+            retroarch_profiles: RetroArchProfilesState::NotScanned,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -4389,6 +4406,69 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Starts a background RetroArch profile discovery scan - blocking
+    /// filesystem probing, so it never runs on the UI thread, exactly
+    /// like every other workflow. The result replaces the previous
+    /// discovery wholesale.
+    fn start_retroarch_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::RetroArchProfileScan,
+            None,
+            ActivityOutcome::Started,
+            "RetroArch profile discovery started.",
+        ));
+        self.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let filesystem = HostReadOnlyFilesystem;
+            let environment = DiscoveryEnvironment::from_process_environment();
+            let result = discover_retroarch_cheat_setup_profiles(&filesystem, &environment, None)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_retroarch_profiles(&mut self) {
+        if let RetroArchProfilesState::Scanning { receiver } = &self.retroarch_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(discovery)) => {
+                    let eligible = discovery
+                        .profiles
+                        .iter()
+                        .filter(|profile| profile.eligible)
+                        .count();
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::RetroArchProfileScan,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!(
+                            "RetroArch profile discovery found {} profiles ({} eligible).",
+                            discovery.profiles.len(),
+                            eligible
+                        ),
+                    ));
+                    self.retroarch_profiles = RetroArchProfilesState::Ready(discovery);
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::RetroArchProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("RetroArch profile discovery failed: {message}"),
+                    ));
+                    self.retroarch_profiles = RetroArchProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.retroarch_profiles = RetroArchProfilesState::Error(
+                        "RetroArch profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     fn start_mount_all(&mut self, context: egui::Context, items: Vec<MountAllItem>) -> bool {
         if self.is_busy() {
             let message = "Another archive operation is already running.".to_string();
@@ -5105,6 +5185,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_operation(context);
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
+        self.poll_retroarch_profiles();
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
@@ -5650,6 +5731,7 @@ impl eframe::App for ArchiveFsApp {
                     ui,
                     &self.database_state,
                     &self.diagnostics,
+                    &self.retroarch_profiles,
                     mount_root,
                     busy,
                     &mut self.clipboard,
@@ -5664,6 +5746,9 @@ impl eframe::App for ArchiveFsApp {
                     Some(SettingsPageAction::OpenDiagnostics) => {
                         self.tools_overlay = ToolsOverlay::Diagnostics;
                         self.refresh_diagnostics(context);
+                    }
+                    Some(SettingsPageAction::RescanRetroArchProfiles) => {
+                        self.start_retroarch_profile_scan(context.clone());
                     }
                     None => {}
                 }
@@ -9433,19 +9518,52 @@ fn show_history_logs_page(
 /// currently read-only information (campaign constraint: prototype-only
 /// settings such as UI density are deferred; editable settings arrive
 /// with the settings-integration milestone).
+/// The Settings page's RetroArch profile discovery state - mirrors
+/// `DiagnosticsState`'s Loading-holds-its-own-receiver shape. Discovery
+/// is blocking filesystem probing, so it always runs on a background
+/// thread (campaign constraint: never block the UI thread on I/O).
+enum RetroArchProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<RetroArchCheatSetupDiscovery, String>>,
+    },
+    Ready(RetroArchCheatSetupDiscovery),
+    Error(String),
+}
+
+/// Display label for a discovered profile's installation type.
+fn profile_kind_label(kind: &ProfileKind) -> &'static str {
+    match kind {
+        ProfileKind::Native => "Native",
+        ProfileKind::AppImage => "AppImage",
+        ProfileKind::Flatpak => "Flatpak",
+    }
+}
+
+/// Display label for a discovered profile's scope.
+fn profile_scope_label(scope: &ProfileScope) -> &'static str {
+    match scope {
+        ProfileScope::User => "User",
+        ProfileScope::System => "System",
+    }
+}
+
 /// What the Settings page asks `update` to do - each maps onto an
 /// existing proven workflow (`SetupAction::OpenConfigFolder`, the
-/// diagnostics refresh, the Diagnostics overlay), never new machinery.
+/// diagnostics refresh, the Diagnostics overlay, the background
+/// profile-discovery scan), never new machinery.
 enum SettingsPageAction {
     OpenConfigFolder,
     ValidateConfiguration,
     OpenDiagnostics,
+    RescanRetroArchProfiles,
 }
 
 fn show_settings_page(
     ui: &mut egui::Ui,
     database_state: &DatabaseState,
     diagnostics: &DiagnosticsState,
+    retroarch_profiles: &RetroArchProfilesState,
     mount_root: Option<&Path>,
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
@@ -9544,6 +9662,103 @@ fn show_settings_page(
             ));
         }
     });
+
+    ui.add_space(12.0);
+    ui.strong("Discovered Profiles");
+    ui.label(
+        "RetroArch installations discovered for cheat setup. ArchiveFS will \
+         never silently pick between ambiguous or blocked profiles.",
+    );
+    match retroarch_profiles {
+        RetroArchProfilesState::NotScanned => {
+            ui.label("Profiles have not been scanned yet.");
+            if ui
+                .add_enabled(!busy, egui::Button::new("Scan for Profiles"))
+                .clicked()
+            {
+                action = Some(SettingsPageAction::RescanRetroArchProfiles);
+            }
+        }
+        RetroArchProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning for RetroArch profiles...");
+            });
+        }
+        RetroArchProfilesState::Error(message) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Profile discovery failed: {message}"),
+            );
+            if ui
+                .add_enabled(!busy, egui::Button::new("Rescan Profiles"))
+                .clicked()
+            {
+                action = Some(SettingsPageAction::RescanRetroArchProfiles);
+            }
+        }
+        RetroArchProfilesState::Ready(discovery) => {
+            if discovery.profiles.is_empty() {
+                ui.label("No RetroArch installations were found.");
+            } else {
+                egui::Grid::new("retroarch_profiles_grid")
+                    .num_columns(5)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("State");
+                        ui.strong("Profile");
+                        ui.strong("Type / Scope");
+                        ui.strong("Configuration");
+                        ui.strong("Cheat destination");
+                        ui.end_row();
+                        for profile in &discovery.profiles {
+                            if profile.eligible {
+                                ui.colored_label(egui::Color32::from_rgb(70, 170, 90), "Eligible");
+                            } else {
+                                ui.colored_label(ui.visuals().warn_fg_color, "Blocked");
+                            }
+                            ui.label(&profile.profile_id);
+                            ui.label(format!(
+                                "{} / {}",
+                                profile_kind_label(&profile.installation_type),
+                                profile_scope_label(&profile.scope)
+                            ));
+                            ui.add(
+                                egui::Label::new(&profile.configuration_path.display)
+                                    .selectable(true)
+                                    .wrap(),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    profile
+                                        .cheat_destination_root
+                                        .as_ref()
+                                        .map(|path| path.display.as_str())
+                                        .unwrap_or("unresolved"),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                for profile in &discovery.profiles {
+                    for blocker in &profile.blockers {
+                        ui.label(format!(
+                            "{}: {} — {}",
+                            profile.profile_id, blocker.code, blocker.detail
+                        ));
+                    }
+                }
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Rescan Profiles"))
+                .clicked()
+            {
+                action = Some(SettingsPageAction::RescanRetroArchProfiles);
+            }
+        }
+    }
 
     ui.add_space(8.0);
     ui.label(
@@ -14608,6 +14823,15 @@ mod tests {
     }
 
     #[test]
+    fn retroarch_profile_labels_cover_every_kind_and_scope() {
+        assert_eq!(profile_kind_label(&ProfileKind::Native), "Native");
+        assert_eq!(profile_kind_label(&ProfileKind::AppImage), "AppImage");
+        assert_eq!(profile_kind_label(&ProfileKind::Flatpak), "Flatpak");
+        assert_eq!(profile_scope_label(&ProfileScope::User), "User");
+        assert_eq!(profile_scope_label(&ProfileScope::System), "System");
+    }
+
+    #[test]
     fn system_information_text_includes_all_labelled_fields() {
         let text = system_information_text(Some("/db/library.sqlite3"), None, Some("/mnt/root"));
         assert!(text.contains(&format!("ArchiveFS {}", env!("CARGO_PKG_VERSION"))));
@@ -14891,6 +15115,7 @@ mod tests {
             confirm_mount_queue: false,
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
+            retroarch_profiles: RetroArchProfilesState::NotScanned,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
