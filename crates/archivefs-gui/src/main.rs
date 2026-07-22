@@ -2514,6 +2514,18 @@ struct ArchiveFsApp {
     confirm_mount_all: Option<MountAllConfirmation>,
     focus_mount_all_cancel: bool,
     mount_all_result: Option<MountAllResult>,
+    /// The redesigned Mount page's queue: archive paths (exact-byte
+    /// identity, same as `ArchiveRow::path`) in the order they were
+    /// queued. Deduplicated on insert; entries whose archive leaves the
+    /// live snapshot are pruned when the page renders. Purely UI state -
+    /// mount safety still comes from the batch engine's own per-item
+    /// checks, never from this list.
+    mount_queue: Vec<PathBuf>,
+    /// The Mount page's free-text filter (name/platform/path substring).
+    mount_search: String,
+    /// Whether the Mount page's inline mount-the-queue confirmation is
+    /// showing - the Mount page's counterpart of `MountAllConfirmation`.
+    confirm_mount_queue: bool,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2728,6 +2740,9 @@ impl ArchiveFsApp {
             confirm_mount_all: None,
             focus_mount_all_cancel: false,
             mount_all_result: None,
+            mount_queue: Vec::new(),
+            mount_search: String::new(),
+            confirm_mount_queue: false,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -5382,15 +5397,38 @@ impl eframe::App for ArchiveFsApp {
             }
 
             if self.view == MainView::Mount {
-                ui.heading("Mount");
-                ui.add_space(4.0);
-                ui.label(
-                    "The redesigned mount preview page is being built. Mount and \
-                     unmount actions remain available from the Library page's \
-                     selected-archive panel and context menus.",
+                let live = match &self.state {
+                    LoadState::Ready(data) => Some(data.as_ref()),
+                    _ => None,
+                };
+                let action = show_mount_page(
+                    ui,
+                    live,
+                    self.mount_all_result.as_ref(),
+                    MountPageViewState {
+                        queue: &mut self.mount_queue,
+                        search: &mut self.mount_search,
+                        confirm: &mut self.confirm_mount_queue,
+                        busy: archive_actions_blocked,
+                        block_reason: archive_action_block_reason.as_deref(),
+                    },
                 );
-                if ui.button("Go to Library").clicked() {
-                    self.view = MainView::Library;
+                match action {
+                    Some(MountPageAction::MountQueue) => {
+                        let items = match &self.state {
+                            LoadState::Ready(data) => {
+                                let eligible =
+                                    queued_pending_paths(&self.mount_queue, &data.records);
+                                mount_all_items_for_paths(&data.records, &eligible)
+                            }
+                            _ => Vec::new(),
+                        };
+                        if !items.is_empty() {
+                            self.start_mount_all(context.clone(), items);
+                        }
+                    }
+                    Some(MountPageAction::Refresh) => self.refresh(context),
+                    None => {}
                 }
                 return;
             }
@@ -8373,6 +8411,290 @@ fn show_about_contents(
             });
             ui.end_row();
         });
+}
+
+/// The design's per-archive validation label on the Mount page - a pure
+/// mapping from the live `MountState`, so the preview can never disagree
+/// with what the batch engine will actually do (`Pending` is the only
+/// state `queued_pending_paths` lets through to a mount attempt).
+fn mount_validation_label(state: MountState) -> &'static str {
+    match state {
+        MountState::Pending => "Ready to mount",
+        MountState::Mounted => "Already mounted — will be skipped",
+        MountState::MountPathExists => "Destination already exists — will be skipped",
+    }
+}
+
+/// Drops queued paths whose archive no longer exists in the live
+/// snapshot (source removed, rescan, etc.). Deliberately keeps queued
+/// archives that are merely no longer `Pending` (mounted meanwhile, or a
+/// destination collision) - those stay visible on the Mount page with
+/// their skip reason instead of vanishing silently.
+fn prune_mount_queue(queue: &mut Vec<PathBuf>, records: &[ArchiveRecord]) {
+    queue.retain(|path| {
+        records
+            .iter()
+            .any(|record| record.mount_plan.archive.path == *path)
+    });
+}
+
+/// The queued paths that a "Mount queue" run will actually attempt - in
+/// queue order, `Pending` archives only, mirroring
+/// `show_bulk_row_context_menu`'s contract that
+/// `mount_all_items_for_paths` is only ever fed genuinely eligible
+/// archives.
+fn queued_pending_paths(queue: &[PathBuf], records: &[ArchiveRecord]) -> Vec<PathBuf> {
+    queue
+        .iter()
+        .filter(|path| {
+            records.iter().any(|record| {
+                record.mount_plan.archive.path == **path
+                    && record.mount_state == MountState::Pending
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Case-insensitive substring match over the fields the Mount page
+/// displays (name, platform, archive path, planned destination) - the
+/// Mount page's counterpart of the Library's `search_text` matching.
+fn mount_row_matches(record: &ArchiveRecord, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    format!(
+        "{} {} {} {}",
+        record.identity.display_name,
+        record.identity.platform.as_deref().unwrap_or(""),
+        record.mount_plan.archive.path.display(),
+        record.mount_plan.mount_path.display()
+    )
+    .to_lowercase()
+    .contains(&needle)
+}
+
+/// What the Mount page asks `update` to do - executing a mount goes
+/// through the app's own `start_mount_all` (the proven batch engine),
+/// never directly from render code.
+enum MountPageAction {
+    MountQueue,
+    Refresh,
+}
+
+/// The Mount page's mutable UI state, borrowed field-by-field from
+/// `ArchiveFsApp` (same pattern as `HealthDashboardViewState`).
+struct MountPageViewState<'a> {
+    queue: &'a mut Vec<PathBuf>,
+    search: &'a mut String,
+    confirm: &'a mut bool,
+    busy: bool,
+    block_reason: Option<&'a str>,
+}
+
+/// The redesigned Mount page: filterable archive table with per-row
+/// queueing, planned-destination preview, per-archive validation labels,
+/// and an inline confirmation before the queue is handed to the existing
+/// `start_mount_all` batch engine. Rendering never mounts anything -
+/// the returned `MountPageAction` is the only way anything happens.
+fn show_mount_page(
+    ui: &mut egui::Ui,
+    live: Option<&LoadedData>,
+    mount_all_result: Option<&MountAllResult>,
+    view_state: MountPageViewState<'_>,
+) -> Option<MountPageAction> {
+    let MountPageViewState {
+        queue,
+        search,
+        confirm,
+        busy,
+        block_reason,
+    } = view_state;
+    let mut action = None;
+    ui.heading("Mount");
+    ui.add_space(4.0);
+    if let Some(result) = mount_all_result {
+        show_mount_all_result(ui, result);
+        ui.separator();
+    }
+    let Some(data) = live else {
+        ui.label("Live mount state is not loaded yet.");
+        return None;
+    };
+    prune_mount_queue(queue, &data.records);
+    let attempted = queued_pending_paths(queue, &data.records);
+
+    ui.horizontal(|ui| {
+        ui.label("Filter:");
+        ui.add(egui::TextEdit::singleline(search).desired_width(240.0));
+        if ui.button("Clear").clicked() {
+            search.clear();
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new("Refresh"))
+            .clicked()
+        {
+            action = Some(MountPageAction::Refresh);
+        }
+    });
+    ui.add_space(4.0);
+
+    let visible: Vec<&ArchiveRecord> = data
+        .records
+        .iter()
+        .filter(|record| mount_row_matches(record, search))
+        .collect();
+
+    ui.horizontal(|ui| {
+        if queue.len() == 1 {
+            ui.label("1 archive queued.");
+        } else {
+            ui.label(format!("{} archives queued.", queue.len()));
+        }
+        let any_visible_unqueued_pending = visible.iter().any(|record| {
+            record.mount_state == MountState::Pending
+                && !queue.contains(&record.mount_plan.archive.path)
+        });
+        if ui
+            .add_enabled(
+                any_visible_unqueued_pending,
+                egui::Button::new("Queue all visible"),
+            )
+            .clicked()
+        {
+            for record in &visible {
+                if record.mount_state == MountState::Pending
+                    && !queue.contains(&record.mount_plan.archive.path)
+                {
+                    queue.push(record.mount_plan.archive.path.clone());
+                }
+            }
+        }
+        if ui
+            .add_enabled(!queue.is_empty(), egui::Button::new("Clear queue"))
+            .clicked()
+        {
+            queue.clear();
+            *confirm = false;
+        }
+        let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
+        if ui
+            .add_enabled(
+                mount_enabled,
+                egui::Button::new(format!("Mount queue ({})", attempted.len())),
+            )
+            .clicked()
+        {
+            *confirm = true;
+        }
+    });
+    if busy && let Some(reason) = block_reason {
+        ui.label(reason);
+    }
+
+    if *confirm {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if attempted.len() == 1 {
+                ui.strong("Mount 1 queued archive?");
+            } else {
+                ui.strong(format!("Mount {} queued archives?", attempted.len()));
+            }
+            ui.label(
+                "Only archives that are ready to mount are attempted; already-mounted \
+                 archives and existing destinations are skipped by the batch engine.",
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && !attempted.is_empty(),
+                        egui::Button::new("Mount now"),
+                    )
+                    .clicked()
+                {
+                    action = Some(MountPageAction::MountQueue);
+                    *confirm = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    *confirm = false;
+                }
+            });
+        });
+    }
+    ui.separator();
+
+    if data.records.is_empty() {
+        ui.label("No archives in the live snapshot. Add and scan sources first.");
+        return action;
+    }
+    if visible.is_empty() {
+        ui.label("No archives match the current filter.");
+        return action;
+    }
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("mount_page_grid")
+                .num_columns(6)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Queue");
+                    ui.strong("Name");
+                    ui.strong("Platform");
+                    ui.strong("Validation");
+                    ui.strong("Archive path");
+                    ui.strong("Planned destination");
+                    ui.end_row();
+                    let mut toggle: Option<(PathBuf, bool)> = None;
+                    for record in &visible {
+                        let path = &record.mount_plan.archive.path;
+                        let queued = queue.contains(path);
+                        if queued {
+                            if ui.small_button("Unqueue").clicked() {
+                                toggle = Some((path.clone(), false));
+                            }
+                        } else {
+                            let queueable = record.mount_state == MountState::Pending;
+                            if ui
+                                .add_enabled(queueable, egui::Button::new("Queue").small())
+                                .clicked()
+                            {
+                                toggle = Some((path.clone(), true));
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(&record.identity.display_name);
+                            if queued {
+                                ui.small("QUEUED");
+                            }
+                        });
+                        ui.label(record.identity.platform.as_deref().unwrap_or("Unknown"));
+                        ui.label(mount_validation_label(record.mount_state));
+                        ui.add(
+                            egui::Label::new(path.display().to_string())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(record.mount_plan.mount_path.display().to_string())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.end_row();
+                    }
+                    if let Some((path, add)) = toggle {
+                        if add {
+                            if !queue.contains(&path) {
+                                queue.push(path);
+                            }
+                        } else {
+                            queue.retain(|queued_path| *queued_path != path);
+                        }
+                    }
+                });
+        });
+    action
 }
 
 /// The redesigned Active Mounts page: the currently mounted archives
@@ -13518,6 +13840,77 @@ mod tests {
         )
     }
 
+    #[test]
+    fn queued_pending_paths_keeps_queue_order_and_only_pending_archives() {
+        let records = vec![
+            record("/roms/a.zip", MountState::Mounted),
+            record("/roms/b.zip", MountState::Pending),
+            record("/roms/c.zip", MountState::MountPathExists),
+            record("/roms/d.zip", MountState::Pending),
+        ];
+        let queue = vec![
+            PathBuf::from("/roms/d.zip"),
+            PathBuf::from("/roms/a.zip"),
+            PathBuf::from("/roms/b.zip"),
+            PathBuf::from("/roms/missing.zip"),
+        ];
+        assert_eq!(
+            queued_pending_paths(&queue, &records),
+            vec![PathBuf::from("/roms/d.zip"), PathBuf::from("/roms/b.zip")],
+            "only Pending queued archives are attempted, in queue order"
+        );
+    }
+
+    #[test]
+    fn prune_mount_queue_drops_only_archives_missing_from_the_snapshot() {
+        let records = vec![
+            record("/roms/a.zip", MountState::Mounted),
+            record("/roms/b.zip", MountState::MountPathExists),
+        ];
+        let mut queue = vec![
+            PathBuf::from("/roms/a.zip"),
+            PathBuf::from("/roms/gone.zip"),
+            PathBuf::from("/roms/b.zip"),
+        ];
+        prune_mount_queue(&mut queue, &records);
+        assert_eq!(
+            queue,
+            vec![PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")],
+            "non-Pending archives stay queued (with a skip label); only vanished paths are pruned"
+        );
+    }
+
+    #[test]
+    fn mount_validation_labels_distinguish_ready_mounted_and_collision() {
+        assert_eq!(
+            mount_validation_label(MountState::Pending),
+            "Ready to mount"
+        );
+        assert_eq!(
+            mount_validation_label(MountState::Mounted),
+            "Already mounted — will be skipped"
+        );
+        assert_eq!(
+            mount_validation_label(MountState::MountPathExists),
+            "Destination already exists — will be skipped"
+        );
+    }
+
+    #[test]
+    fn mount_row_matches_is_case_insensitive_over_name_platform_and_paths() {
+        let entry = record("/roms/Final Fantasy VII.zip", MountState::Pending);
+        assert!(mount_row_matches(&entry, ""));
+        assert!(mount_row_matches(&entry, "  "));
+        assert!(mount_row_matches(&entry, "final fantasy"));
+        assert!(mount_row_matches(&entry, "FINAL"));
+        assert!(mount_row_matches(&entry, "/roms/"));
+        assert!(
+            mount_row_matches(&entry, "/mnt/archivefs/"),
+            "planned destination is searchable"
+        );
+        assert!(!mount_row_matches(&entry, "chrono trigger"));
+    }
+
     fn default_config_identity() -> ConfigIdentity {
         ConfigIdentity {
             config_path: Some(PathBuf::from("/config/archivefs.toml")),
@@ -13542,6 +13935,9 @@ mod tests {
             confirm_mount_all: None,
             focus_mount_all_cancel: false,
             mount_all_result: None,
+            mount_queue: Vec::new(),
+            mount_search: String::new(),
+            confirm_mount_queue: false,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,

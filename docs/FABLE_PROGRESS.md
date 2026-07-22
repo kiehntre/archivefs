@@ -207,13 +207,44 @@ Landed in commit "Add redesigned ArchiveFS application shell":
   `all_navigation_destinations_are_reachable_via_a_real_click`.
   Full `archivefs-gui` suite: 347 passed, 0 failed.
 
+## Redesigned Mount screen (2026-07-22)
+
+Landed in commit "Add redesigned Mount screen with queue and preview":
+
+- `show_mount_page`: filterable live-archive table (name, platform,
+  validation, archive path, planned destination from
+  `record.mount_plan.mount_path`), per-row Queue/Unqueue with a QUEUED
+  badge, Queue-all-visible, Clear-queue, Refresh, and an inline
+  confirmation strip before execution. Rendering never mounts — the
+  returned `MountPageAction` is the only side-channel, handled in
+  `update`.
+- Queue state on `ArchiveFsApp` (`mount_queue`, `mount_search`,
+  `confirm_mount_queue`): order-preserving, deduplicated, pruned against
+  the live snapshot (`prune_mount_queue`); non-Pending queued archives
+  stay visible with a skip label rather than vanishing.
+- Validation labels are a pure `MountState` mapping
+  (`mount_validation_label`): Pending → "Ready to mount", Mounted →
+  already-mounted skip, `MountPathExists` → destination-collision skip.
+- Execution reuses the proven `start_mount_all` batch engine via
+  `queued_pending_paths` (queue order, Pending only) +
+  `mount_all_items_for_paths`; `MountAllResult` renders on the Mount
+  page as well as the Library page. No new mount machinery.
+- New tests (4): queue order/eligibility, pruning, validation labels,
+  case-insensitive row matching. Full `archivefs-gui` suite: 351
+  passed, 0 failed.
+
+Deferred from the design for later deliverables: the per-archive
+inspector side panel (size / source library / confidence), Format/Size
+columns, Ctrl+M shortcut, density toggle (prototype-only), and the
+FUSE-options Advanced block (no backend).
+
 ## Next deliverable
 
-Redesigned Mount screen (destination preview against the design
-reference: `MountPlan`/`plan_mounts`/`safe_mount_name`, validation via
-`MountBatchTargetValidation`, collision handling via
-`MountBatchTargetSkipReason` — see capability matrix "Mount" rows;
-preview must never mount).
+Redesigned Selected screen (design: queue review — Archive /
+Destination / Planned Action table, per-item Remove, inspector with
+planned action + mount command preview) reusing the Mount page's queue
+state, then Active Mounts actions (Unmount / Lazy Unmount / Cleanup /
+Remount) wired to the existing proven per-archive workflows.
 
 ## Latest clean commit
 

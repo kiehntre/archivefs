@@ -630,8 +630,8 @@
     "Mount screen shows a MountPlan-derived preview matching the design's MOUNT COMMAND panel"
    ],
    "required_tests": [],
-   "status": "not_started",
-   "evidence": "",
+   "status": "in_progress",
+   "evidence": "Redesigned Mount page (show_mount_page) lists live archives with planned destination (record.mount_plan.mount_path) and per-archive validation label; rendering never mounts. Design inspector panel (size/source library detail) still open.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -650,8 +650,8 @@
     "Queue add/remove does not trigger any mount call until explicit confirmation"
    ],
    "required_tests": [],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "Mount page queue: per-row Queue/Unqueue, Queue all visible, Clear queue, QUEUED badge, queue order preserved, dedup on insert, pruned against live snapshot (prune_mount_queue), inline confirmation before execution. Unit tests: queued_pending_paths_keeps_queue_order_and_only_pending_archives, prune_mount_queue_drops_only_archives_missing_from_the_snapshot.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -670,8 +670,8 @@
     "Every MountBatchTargetSkipReason variant has a corresponding preview message"
    ],
    "required_tests": [],
-   "status": "not_started",
-   "evidence": "",
+   "status": "in_progress",
+   "evidence": "MountState::MountPathExists surfaced in preview as \"Destination already exists \u2014 will be skipped\" (mount_validation_labels test); execution-side skip reporting was already in MountAllResult. Full MountBatchTargetValidation surfacing still open.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -737,8 +737,8 @@
    "required_tests": [
     "existing MountAllResult tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "in_progress",
+   "evidence": "Mount page queue execution reuses the proven start_mount_all batch engine (per-item outcomes/skips in MountAllResult, rendered on the Mount page). Application-service envelope deferred per 2026-07-22 direction change.",
    "implementation_commit": null,
    "notes": ""
   },
