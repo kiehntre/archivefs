@@ -16,14 +16,17 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::patch_manager::{
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, HttpsCheatSourceTransport, ImportSourceKind,
-    ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
+    CheatSourceList, CheatSourceListEntry, DolphinGameIniInventory, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
+    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType,
+    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory,
+    Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
     RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
-    UNKNOWN_CODE_POLICY, default_cheat_source_cache_root, discover_pcsx2_profiles,
-    discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source, inspect_pcsx2_profile,
-    inspect_retroarch_cheat_library, list_retroarch_cheat_sources, match_pcsx2_inventory,
+    UNKNOWN_CODE_POLICY, default_cheat_source_cache_root, discover_dolphin_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source,
+    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library,
+    list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
 };
 mod ui;
 
@@ -236,12 +239,16 @@ enum ActivityAction {
     Pcsx2ProfileScan,
     /// Bounded read-only inventory of one PCSX2 profile's PNACH files.
     Pcsx2PnachInspection,
+    /// Read-only discovery of local Dolphin user profiles.
+    DolphinProfileScan,
+    /// Bounded read-only inventory of Dolphin GameSettings INI files.
+    DolphinGameIniInspection,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 33] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 35] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -275,6 +282,8 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 33] = [
     ActivityAction::CheatSourceRetrieval,
     ActivityAction::Pcsx2ProfileScan,
     ActivityAction::Pcsx2PnachInspection,
+    ActivityAction::DolphinProfileScan,
+    ActivityAction::DolphinGameIniInspection,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -361,6 +370,8 @@ impl std::fmt::Display for ActivityAction {
             Self::CheatSourceRetrieval => "Cheat source retrieval",
             Self::Pcsx2ProfileScan => "PCSX2 profile scan",
             Self::Pcsx2PnachInspection => "PCSX2 PNACH inspection",
+            Self::DolphinProfileScan => "Dolphin profile scan",
+            Self::DolphinGameIniInspection => "Dolphin Game INI inspection",
         })
     }
 }
@@ -2550,6 +2561,8 @@ struct ArchiveFsApp {
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
     pcsx2_profiles: Pcsx2ProfilesState,
+    /// Read-only Dolphin profile discovery shared by GameCube and Wii archives.
+    dolphin_profiles: DolphinProfilesState,
     /// The full-page Cheats & Mods workspace's current archive and
     /// trusted-catalogue state. It survives ordinary page navigation so
     /// returning to the same exact archive does not discard a completed
@@ -2758,6 +2771,7 @@ impl ArchiveFsApp {
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
+            dolphin_profiles: DolphinProfilesState::NotScanned,
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -4315,6 +4329,7 @@ impl ArchiveFsApp {
             fetch_force_refresh,
             previous_profile_id,
             previous_pcsx2_profile_id,
+            previous_dolphin_profile_id,
             previous_adapter,
         ) = self
             .cheat_workflow
@@ -4326,6 +4341,7 @@ impl ArchiveFsApp {
                     workflow.fetch_force_refresh,
                     workflow.selected_profile_id.clone(),
                     workflow.selected_pcsx2_profile_id.clone(),
+                    workflow.selected_dolphin_profile_id.clone(),
                     Some(workflow.adapter),
                 )
             })
@@ -4333,6 +4349,7 @@ impl ArchiveFsApp {
                 CheatSourceMode::ArchiveFsTrustedCatalogue,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -4360,8 +4377,15 @@ impl ArchiveFsApp {
             return false;
         };
         let ps2 = platform_is_ps2(platform.as_deref());
+        let dolphin = platform_is_dolphin(platform.as_deref());
         let adapter = if ps2 {
-            previous_adapter.unwrap_or(CheatEmulatorAdapter::Pcsx2)
+            previous_adapter
+                .filter(|adapter| *adapter != CheatEmulatorAdapter::Dolphin)
+                .unwrap_or(CheatEmulatorAdapter::Pcsx2)
+        } else if dolphin {
+            previous_adapter
+                .filter(|adapter| *adapter != CheatEmulatorAdapter::Pcsx2)
+                .unwrap_or(CheatEmulatorAdapter::Dolphin)
         } else {
             CheatEmulatorAdapter::RetroArch
         };
@@ -4395,6 +4419,21 @@ impl ArchiveFsApp {
             }
             _ => None,
         };
+        let selected_dolphin_profile_id = match &self.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => {
+                let eligible = eligible_dolphin_profile_ids(discovery);
+                if let Some(previous) = previous_dolphin_profile_id
+                    .filter(|previous| eligible.contains(&previous.as_str()))
+                {
+                    Some(previous)
+                } else if eligible.len() == 1 {
+                    Some(eligible[0].to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         self.cheat_workflow = Some(CheatWorkflowState {
             archive_path,
             display_name,
@@ -4406,6 +4445,9 @@ impl ArchiveFsApp {
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
             source_mode,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -4436,6 +4478,17 @@ impl ArchiveFsApp {
             )
         {
             self.start_pcsx2_profile_scan(context.clone());
+        }
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin)
+            && matches!(
+                self.dolphin_profiles,
+                DolphinProfilesState::NotScanned | DolphinProfilesState::Error(_)
+            )
+        {
+            self.start_dolphin_profile_scan(context.clone());
         }
     }
 
@@ -4552,6 +4605,48 @@ impl ArchiveFsApp {
         ));
         thread::spawn(move || {
             let result = inspect_pcsx2_profile(&profile).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn start_dolphin_inventory(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Dolphin {
+            return;
+        }
+        let Some(profile_id) = workflow.selected_dolphin_profile_id.clone() else {
+            return;
+        };
+        let profile = match &self.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .cloned(),
+            _ => None,
+        };
+        let Some(profile) = profile else {
+            workflow.dolphin_inventory_profile_id = Some(profile_id);
+            workflow.dolphin_inventory = CheatStepResource::Failed(
+                "The selected Dolphin profile is no longer eligible.".to_string(),
+            );
+            return;
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        workflow.dolphin_inventory_profile_id = Some(profile_id.clone());
+        workflow.dolphin_inventory = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinGameIniInspection,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            format!("Dolphin GameSettings inspection started for profile '{profile_id}'."),
+        ));
+        thread::spawn(move || {
+            let result = inspect_dolphin_profile(&profile).map_err(|error| error.to_string());
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -4696,6 +4791,48 @@ impl ArchiveFsApp {
                 }
             }
         }
+        let mut dolphin_history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.dolphin_inventory {
+            match receiver.try_recv() {
+                Ok(Ok(inventory)) => {
+                    if workflow.adapter == CheatEmulatorAdapter::Dolphin
+                        && workflow.selected_dolphin_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                        && workflow.dolphin_inventory_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                    {
+                        dolphin_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::DolphinGameIniInspection,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "Dolphin GameSettings inspection found {} INI files ({} warnings).",
+                                inventory.files.len(),
+                                inventory.warnings.len()
+                            ),
+                        ));
+                        workflow.dolphin_inventory = CheatStepResource::Ready(inventory);
+                    } else {
+                        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    dolphin_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::DolphinGameIniInspection,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("Dolphin GameSettings inspection failed: {message}"),
+                    ));
+                    workflow.dolphin_inventory = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.dolphin_inventory = CheatStepResource::Failed(
+                        "Dolphin GameSettings inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
         let mut history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.source_fetch {
             match receiver.try_recv() {
@@ -4742,6 +4879,9 @@ impl ArchiveFsApp {
             self.history.record(entry);
         }
         if let Some(entry) = pcsx2_history_entry {
+            self.history.record(entry);
+        }
+        if let Some(entry) = dolphin_history_entry {
             self.history.record(entry);
         }
     }
@@ -4828,6 +4968,72 @@ impl ArchiveFsApp {
                 Err(TryRecvError::Disconnected) => {
                     self.pcsx2_profiles = Pcsx2ProfilesState::Error(
                         "PCSX2 profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn start_dolphin_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinProfileScan,
+            None,
+            ActivityOutcome::Started,
+            "Dolphin profile discovery started.",
+        ));
+        self.dolphin_profiles = DolphinProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result = DolphinProfileDiscoveryRoots::from_environment()
+                .and_then(|roots| discover_dolphin_profiles(&roots))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_dolphin_profiles(&mut self) {
+        if let DolphinProfilesState::Scanning { receiver } = &self.dolphin_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(discovery)) => {
+                    let eligible = eligible_dolphin_profile_ids(&discovery);
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::DolphinProfileScan,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!(
+                            "Dolphin profile discovery found {} profiles ({} eligible).",
+                            discovery.profiles.len(),
+                            eligible.len()
+                        ),
+                    ));
+                    if let Some(workflow) = self.cheat_workflow.as_mut()
+                        && workflow.adapter == CheatEmulatorAdapter::Dolphin
+                        && workflow
+                            .selected_dolphin_profile_id
+                            .as_ref()
+                            .is_none_or(|selected| !eligible.contains(&selected.as_str()))
+                    {
+                        workflow.selected_dolphin_profile_id =
+                            (eligible.len() == 1).then(|| eligible[0].to_string());
+                        workflow.dolphin_inventory_profile_id = None;
+                        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                    }
+                    self.dolphin_profiles = DolphinProfilesState::Ready(discovery);
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::DolphinProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("Dolphin profile discovery failed: {message}"),
+                    ));
+                    self.dolphin_profiles = DolphinProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.dolphin_profiles = DolphinProfilesState::Error(
+                        "Dolphin profile discovery stopped unexpectedly.".to_string(),
                     );
                 }
             }
@@ -5629,6 +5835,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_unmount_all(context);
         self.poll_retroarch_profiles();
         self.poll_pcsx2_profiles();
+        self.poll_dolphin_profiles();
         self.poll_cheat_workflow();
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
@@ -6091,6 +6298,7 @@ impl eframe::App for ArchiveFsApp {
                                 self.cheat_workflow.as_mut(),
                                 &self.retroarch_profiles,
                                 &self.pcsx2_profiles,
+                                &self.dolphin_profiles,
                                 live,
                                 self.database_state.snapshot(),
                                 &self.history,
@@ -6128,6 +6336,15 @@ impl eframe::App for ArchiveFsApp {
                             {
                                 self.start_pcsx2_profile_scan(context.clone());
                             }
+                            if adapter == CheatEmulatorAdapter::Dolphin
+                                && matches!(
+                                    self.dolphin_profiles,
+                                    DolphinProfilesState::NotScanned
+                                        | DolphinProfilesState::Error(_)
+                                )
+                            {
+                                self.start_dolphin_profile_scan(context.clone());
+                            }
                         }
                         Some(CheatWorkflowAction::RescanProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
@@ -6137,6 +6354,12 @@ impl eframe::App for ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::InspectPcsx2Profile) => {
                             self.start_pcsx2_inventory(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RescanDolphinProfiles) => {
+                            self.start_dolphin_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::InspectDolphinProfile) => {
+                            self.start_dolphin_inventory(context.clone());
                         }
                         Some(CheatWorkflowAction::InspectExistingLibrary) => {
                             self.start_existing_retroarch_library_inspection(context.clone());
@@ -10585,6 +10808,10 @@ struct CheatWorkflowState {
     /// The PCSX2 profile identity bound to this archive's inventory.
     pcsx2_inventory_profile_id: Option<String>,
     pcsx2_inventory: CheatStepResource<Pcsx2PnachInventory>,
+    selected_dolphin_profile_id: Option<String>,
+    /// The Dolphin profile identity bound to this archive's inventory.
+    dolphin_inventory_profile_id: Option<String>,
+    dolphin_inventory: CheatStepResource<DolphinGameIniInventory>,
     /// Independent source mode. Changing it never changes the archive,
     /// profile, destination, or any fetched result retained by another mode.
     source_mode: CheatSourceMode,
@@ -10613,6 +10840,7 @@ struct CheatWorkflowState {
 enum CheatEmulatorAdapter {
     RetroArch,
     Pcsx2,
+    Dolphin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10649,6 +10877,8 @@ fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulato
     // superseded worker cannot apply its result to the new adapter.
     workflow.pcsx2_inventory_profile_id = None;
     workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+    workflow.dolphin_inventory_profile_id = None;
+    workflow.dolphin_inventory = CheatStepResource::NotLoaded;
 }
 
 #[derive(Default)]
@@ -11002,6 +11232,8 @@ enum CheatWorkflowAction {
     RescanProfiles,
     RescanPcsx2Profiles,
     InspectPcsx2Profile,
+    RescanDolphinProfiles,
+    InspectDolphinProfile,
     InspectExistingLibrary,
     RefreshSources,
     FetchSource,
@@ -11070,9 +11302,14 @@ fn show_cheats_mods_workflow_states(
     workflow: Option<&CheatWorkflowState>,
     profiles: &RetroArchProfilesState,
     pcsx2_profiles: &Pcsx2ProfilesState,
+    dolphin_profiles: &DolphinProfilesState,
 ) {
     if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2) {
         show_pcsx2_workflow_states(ui, workflow.unwrap(), pcsx2_profiles);
+        return;
+    }
+    if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin) {
+        show_dolphin_workflow_states(ui, workflow.unwrap(), dolphin_profiles);
         return;
     }
     let (profile_label, profile_tone) = retroarch_integration_presentation(profiles);
@@ -11291,6 +11528,122 @@ fn pcsx2_integration_presentation(profiles: &Pcsx2ProfilesState) -> (String, wid
     }
 }
 
+fn show_dolphin_workflow_states(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+) {
+    let (profile_label, profile_tone) = dolphin_integration_presentation(profiles);
+    let (inspection_label, inspection_tone) = match &workflow.dolphin_inventory {
+        CheatStepResource::Ready(inventory) if inventory.complete => (
+            "Local Game INI inventory complete",
+            widgets::StatusTone::Success,
+        ),
+        CheatStepResource::Ready(_) => (
+            "Local Game INI inventory incomplete",
+            widgets::StatusTone::Warning,
+        ),
+        CheatStepResource::Loading { .. } => ("Inspecting locally", widgets::StatusTone::Active),
+        CheatStepResource::Failed(_) => {
+            ("Local inspection unavailable", widgets::StatusTone::Warning)
+        }
+        CheatStepResource::NotLoaded => ("Local inspection pending", widgets::StatusTone::Pending),
+    };
+    let destination = workflow
+        .selected_dolphin_profile_id
+        .as_deref()
+        .and_then(|selected| match profiles {
+            DolphinProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .map(|profile| profile.game_settings_path.display().to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Not selected — choose an eligible profile".to_string());
+    widgets::section_header(
+        ui,
+        "Workflow state",
+        Some(
+            "Profile, inspection, identity, destination, and installation remain separate states.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        for (label, value, tone) in [
+            ("Emulator profile", profile_label.as_str(), profile_tone),
+            (
+                "Cheat or mod source",
+                "Existing Dolphin-managed files",
+                widgets::StatusTone::Info,
+            ),
+            (
+                "Trust state",
+                "Unverified local content",
+                widgets::StatusTone::Warning,
+            ),
+            ("Inspection state", inspection_label, inspection_tone),
+            (
+                "Destination",
+                destination.as_str(),
+                widgets::StatusTone::Pending,
+            ),
+            (
+                "Installation state",
+                "Unavailable · read-only adapter",
+                widgets::StatusTone::Pending,
+            ),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(label).strong()),
+                );
+                widgets::status_badge(ui, value, tone);
+            });
+        }
+    });
+}
+
+fn dolphin_integration_presentation(
+    profiles: &DolphinProfilesState,
+) -> (String, widgets::StatusTone) {
+    match profiles {
+        DolphinProfilesState::NotScanned => (
+            "Dolphin profiles not scanned".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        DolphinProfilesState::Scanning { .. } => (
+            "Scanning Dolphin profiles".to_string(),
+            widgets::StatusTone::Active,
+        ),
+        DolphinProfilesState::Error(_) => (
+            "Dolphin profile scan needs attention".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        DolphinProfilesState::Ready(discovery) => {
+            let eligible = discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .count();
+            if eligible == 0 {
+                (
+                    "No eligible Dolphin profile".to_string(),
+                    widgets::StatusTone::Warning,
+                )
+            } else {
+                (
+                    format!(
+                        "{eligible} eligible Dolphin profile{}",
+                        if eligible == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                )
+            }
+        }
+    }
+}
+
 fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
     egui::CollapsingHeader::new("Safety, privacy, and responsible use")
         .default_open(false)
@@ -11497,7 +11850,7 @@ fn show_cheat_unavailable_stage(ui: &mut egui::Ui) {
     );
 }
 
-fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool) {
+fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only: bool) {
     widgets::section_header(
         ui,
         "Mods",
@@ -11507,6 +11860,9 @@ fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool) {
         if pcsx2_read_only {
             widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
             ui.label("PCSX2 widescreen and other PNACH patch directories can be inspected above. Preview, installation, enabling, disabling, replacement, and rollback are unavailable.");
+        } else if dolphin_read_only {
+            widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
+            ui.label("Dolphin frame patches, Action Replay, Gecko, and Riivolution declarations can be inspected above. Installation, enabling, disabling, replacement, and rollback are unavailable.");
         } else {
             widgets::status_badge(ui, "Planned", widgets::StatusTone::Pending);
             ui.label(MODS_UNAVAILABLE_BODY);
@@ -11516,6 +11872,14 @@ fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool) {
 
 fn platform_is_ps2(platform: Option<&str>) -> bool {
     platform.is_some_and(|platform| platform.eq_ignore_ascii_case("PS2"))
+}
+
+fn platform_is_dolphin(platform: Option<&str>) -> bool {
+    platform.is_some_and(|platform| {
+        ["GameCube", "Nintendo GameCube", "Wii", "Nintendo Wii"]
+            .iter()
+            .any(|candidate| platform.eq_ignore_ascii_case(candidate))
+    })
 }
 
 fn show_cheat_emulator_adapter_selector(
@@ -11555,6 +11919,21 @@ fn show_cheat_emulator_adapter_selector(
                 widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
             });
             ui.label("Discovers local PCSX2 profiles and inspects existing PNACH files with fixed resource limits.");
+        });
+    }
+    if platform_is_dolphin(workflow.platform.as_deref()) {
+        widgets::card(ui, |ui| {
+            if ui
+                .radio(workflow.adapter == CheatEmulatorAdapter::Dolphin, "Dolphin")
+                .clicked()
+            {
+                selected = Some(CheatEmulatorAdapter::Dolphin);
+            }
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(ui, "GameCube / Wii", widgets::StatusTone::Info);
+                widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            });
+            ui.label("Discovers local Dolphin profiles and inspects existing GameSettings INI files with fixed resource limits.");
         });
     }
     selected
@@ -11711,6 +12090,382 @@ fn show_pcsx2_workflow(
     }
     show_pcsx2_installation_unavailable(ui);
     action
+}
+
+fn show_dolphin_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 1 · Dolphin profile",
+        Some(
+            "ArchiveFS selects automatically only when exactly one discovered profile is eligible.",
+        ),
+    );
+    match profiles {
+        DolphinProfilesState::NotScanned => widgets::banner(
+            ui,
+            "Profiles not scanned",
+            "Run local read-only discovery of documented Dolphin user directories.",
+            widgets::StatusTone::Pending,
+        ),
+        DolphinProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning Dolphin profiles locally...");
+            });
+        }
+        DolphinProfilesState::Error(message) => widgets::banner(
+            ui,
+            "Dolphin discovery failed",
+            message,
+            widgets::StatusTone::Blocked,
+        ),
+        DolphinProfilesState::Ready(discovery) => {
+            let eligible = eligible_dolphin_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_dolphin_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_dolphin_profile_id = None;
+                workflow.dolphin_inventory_profile_id = None;
+                workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+            }
+            if discovery.profiles.is_empty() {
+                widgets::banner(
+                    ui,
+                    "No Dolphin profile found",
+                    "No documented Dolphin user directory was discovered. Missing GameSettings directories are not created.",
+                    widgets::StatusTone::Pending,
+                );
+            } else if eligible.len() > 1 && workflow.selected_dolphin_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. Choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                show_dolphin_profile_card(ui, workflow, profile, clipboard);
+                ui.add_space(6.0);
+            }
+            for warning in &discovery.warnings {
+                widgets::banner(
+                    ui,
+                    "Discovery limit",
+                    &warning.detail,
+                    widgets::StatusTone::Warning,
+                );
+            }
+        }
+    }
+    if widgets::action_button(
+        ui,
+        "Rescan Dolphin profiles",
+        widgets::ActionStyle::Quiet,
+        !matches!(profiles, DolphinProfilesState::Scanning { .. }),
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::RescanDolphinProfiles);
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Stage 2 · Existing Dolphin-managed files",
+        Some("GameSettings INI sections are parsed as bounded text and are never evaluated."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
+            widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            widgets::status_badge(ui, "Uploaded · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Executed · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Changed · No", widgets::StatusTone::Info);
+        });
+        ui.label("ArchiveFS inspects INI structure locally. It never invokes Dolphin, evaluates codes, follows referenced mod paths, or claims that structural inspection proves content is malware-free.");
+    });
+    let Some(selected_profile_id) = workflow.selected_dolphin_profile_id.as_deref() else {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible Dolphin profile before inspecting existing files.",
+            widgets::StatusTone::Pending,
+        );
+        show_dolphin_installation_unavailable(ui);
+        return action;
+    };
+    if workflow.dolphin_inventory_profile_id.as_deref() != Some(selected_profile_id) {
+        workflow.dolphin_inventory_profile_id = None;
+        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+    }
+    match &workflow.dolphin_inventory {
+        CheatStepResource::NotLoaded => {
+            if widgets::action_button(
+                ui,
+                "Inspect existing Game INI files",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::InspectDolphinProfile);
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting GameSettings INI files locally...");
+            });
+        }
+        CheatStepResource::Failed(message) => widgets::banner(
+            ui,
+            "Dolphin inspection failed",
+            message,
+            widgets::StatusTone::Blocked,
+        ),
+        CheatStepResource::Ready(inventory) => show_dolphin_inventory(ui, inventory, clipboard),
+    }
+    show_dolphin_installation_unavailable(ui);
+    action
+}
+
+fn show_dolphin_profile_card(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profile: &DolphinProfile,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if profile.eligible {
+                let selected = workflow.selected_dolphin_profile_id.as_deref()
+                    == Some(profile.profile_id.as_str());
+                if ui.radio(selected, &profile.profile_id).clicked() {
+                    workflow.selected_dolphin_profile_id = Some(profile.profile_id.clone());
+                    workflow.dolphin_inventory_profile_id = None;
+                    workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                }
+            } else {
+                widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                ui.strong(&profile.profile_id);
+            }
+            ui.label(format!(
+                "{} · {}",
+                dolphin_installation_label(profile.installation_type),
+                dolphin_scope_label(profile.scope)
+            ));
+        });
+        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+            let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+        }
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                dolphin_directory_state_label(profile.game_settings_state),
+                dolphin_directory_state_tone(profile.game_settings_state),
+            );
+            if widgets::path_value(ui, "GameSettings", &profile.game_settings_path) {
+                let _ = clipboard.set_text(profile.game_settings_path.display().to_string());
+            }
+        });
+        if let Some(warning) = &profile.game_settings_warning {
+            ui.label(warning);
+        }
+        for blocker in &profile.blockers {
+            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+        }
+    });
+}
+
+fn show_dolphin_inventory(
+    ui: &mut egui::Ui,
+    inventory: &DolphinGameIniInventory,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                if inventory.complete {
+                    "Complete"
+                } else {
+                    "Incomplete"
+                },
+                if inventory.complete {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            ui.strong(format!("{} Game INI files", inventory.files.len()));
+            ui.label(format!("{} bytes inspected", inventory.bytes_inspected));
+            ui.label(format!("{} entries visited", inventory.entries_visited));
+        });
+    });
+    let match_result = match_dolphin_inventory(inventory, None, None);
+    let (label, tone) = dolphin_match_presentation(match_result.state);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, label, tone);
+            ui.label(&match_result.reason);
+        });
+        ui.label("ArchiveFS currently has no reviewed disc-header identity reader. INI filename IDs are observations only until compared with a separately verified archive Game ID.");
+    });
+    egui::CollapsingHeader::new(format!(
+        "Inspected Game INI files ({})",
+        inventory.files.len()
+    ))
+    .default_open(false)
+    .show(ui, |ui| {
+        const MAX_RENDERED: usize = 100;
+        for file in inventory.files.iter().take(MAX_RENDERED) {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(file.filename_stem.to_string_lossy());
+                    if let Some(id) = &file.game_id_candidate {
+                        widgets::status_badge(
+                            ui,
+                            format!("Game ID candidate · {id}"),
+                            widgets::StatusTone::Pending,
+                        );
+                    }
+                    if let Some(revision) = file.revision_candidate {
+                        ui.label(format!("Revision {revision}"));
+                    }
+                });
+                if widgets::path_value(ui, "INI", &file.path) {
+                    let _ = clipboard.set_text(file.path.display().to_string());
+                }
+                ui.label(format!(
+                    "Definitions {} · enabled references {}",
+                    file.definition_count(),
+                    file.enabled_count()
+                ));
+                ui.label(format!(
+                    "Frame patches {} · Action Replay {} · Gecko {} · Riivolution {}",
+                    file.frame_patch_names.len(),
+                    file.action_replay_names.len(),
+                    file.gecko_names.len(),
+                    file.riivolution_names.len()
+                ));
+                egui::CollapsingHeader::new("Technical metadata")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        widgets::copyable_value(ui, "SHA-256", &file.sha256);
+                        if file.duplicate_game_identity
+                            || file.duplicate_filename
+                            || file.duplicate_content
+                        {
+                            ui.label(format!(
+                                "Duplicate identity: {} · filename: {} · content: {}",
+                                file.duplicate_game_identity,
+                                file.duplicate_filename,
+                                file.duplicate_content
+                            ));
+                        }
+                    });
+            });
+        }
+        if inventory.files.len() > MAX_RENDERED {
+            ui.label(format!(
+                "{} additional files omitted from this summary.",
+                inventory.files.len() - MAX_RENDERED
+            ));
+        }
+    });
+    if !inventory.warnings.is_empty() {
+        egui::CollapsingHeader::new(format!(
+            "Inspection warnings ({})",
+            inventory.warnings.len()
+        ))
+        .default_open(false)
+        .show(ui, |ui| {
+            for warning in inventory.warnings.iter().take(50) {
+                ui.label(format!("{:?}: {}", warning.kind, warning.detail));
+            }
+            if inventory.warnings.len() > 50 {
+                ui.label(format!(
+                    "{} additional warnings omitted from this view.",
+                    inventory.warnings.len() - 50
+                ));
+            }
+        });
+    }
+}
+
+fn show_dolphin_installation_unavailable(ui: &mut egui::Ui) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "Stage 3 · Preview and controlled installation", None);
+    widgets::banner(
+        ui,
+        "Unavailable · read-only milestone",
+        "ArchiveFS does not install, apply, enable, disable, replace, fix, delete, generate, or roll back Dolphin files.",
+        widgets::StatusTone::Pending,
+    );
+}
+
+fn dolphin_installation_label(kind: DolphinInstallationType) -> &'static str {
+    match kind {
+        DolphinInstallationType::Native => "Native",
+        DolphinInstallationType::FlatpakUser => "Flatpak user",
+        DolphinInstallationType::FlatpakSystem => "Flatpak system",
+        DolphinInstallationType::Explicit => "Explicit user directory",
+    }
+}
+
+fn dolphin_scope_label(scope: DolphinProfileScope) -> &'static str {
+    match scope {
+        DolphinProfileScope::User => "User profile",
+        DolphinProfileScope::SystemInstallationUserProfile => "System install · user profile",
+        DolphinProfileScope::Explicit => "Explicit scope",
+    }
+}
+
+fn dolphin_directory_state_label(state: DolphinSettingsDirectoryState) -> &'static str {
+    match state {
+        DolphinSettingsDirectoryState::Available => "Exists",
+        DolphinSettingsDirectoryState::Missing => "Missing",
+        DolphinSettingsDirectoryState::UnsafePath => "Unsafe path",
+        DolphinSettingsDirectoryState::NotDirectory => "Not a directory",
+        DolphinSettingsDirectoryState::Unreadable => "Unreadable",
+    }
+}
+
+fn dolphin_directory_state_tone(state: DolphinSettingsDirectoryState) -> widgets::StatusTone {
+    match state {
+        DolphinSettingsDirectoryState::Available => widgets::StatusTone::Success,
+        DolphinSettingsDirectoryState::Missing => widgets::StatusTone::Pending,
+        DolphinSettingsDirectoryState::UnsafePath => widgets::StatusTone::Blocked,
+        DolphinSettingsDirectoryState::NotDirectory | DolphinSettingsDirectoryState::Unreadable => {
+            widgets::StatusTone::Warning
+        }
+    }
+}
+
+fn dolphin_match_presentation(state: DolphinMatchState) -> (&'static str, widgets::StatusTone) {
+    match state {
+        DolphinMatchState::ExactGameIdMatch | DolphinMatchState::ExactGameIdAndRevisionMatch => (
+            "Exact verified identity match",
+            widgets::StatusTone::Success,
+        ),
+        DolphinMatchState::MultipleIniFilesForGame | DolphinMatchState::RevisionMismatch => {
+            ("Ambiguous identity", widgets::StatusTone::Warning)
+        }
+        DolphinMatchState::NoVerifiedGameIdAvailable
+        | DolphinMatchState::IdentityExtractionDeferred => {
+            ("Verified Game ID unavailable", widgets::StatusTone::Pending)
+        }
+        DolphinMatchState::NoMatchingIniFound => {
+            ("No matching Game INI", widgets::StatusTone::Pending)
+        }
+        DolphinMatchState::InvalidVerifiedGameId => {
+            ("Invalid verified Game ID", widgets::StatusTone::Blocked)
+        }
+    }
 }
 
 fn show_pcsx2_profile_card(
@@ -12002,6 +12757,7 @@ fn show_cheats_mods_page(
     workflow: Option<&mut CheatWorkflowState>,
     profiles: &RetroArchProfilesState,
     pcsx2_profiles: &Pcsx2ProfilesState,
+    dolphin_profiles: &DolphinProfilesState,
     live: Option<&LoadedData>,
     cached: Option<&CachedLibrarySnapshot>,
     history: &OperationHistory,
@@ -12015,6 +12771,9 @@ fn show_cheats_mods_page(
     let pcsx2_read_only = workflow
         .as_deref()
         .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2);
+    let dolphin_read_only = workflow
+        .as_deref()
+        .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin);
     widgets::page_header(
         ui,
         "Cheats & Mods",
@@ -12023,6 +12782,9 @@ fn show_cheats_mods_page(
     let (integration_label, integration_tone) = match workflow.as_deref() {
         Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Pcsx2 => {
             pcsx2_integration_presentation(pcsx2_profiles)
+        }
+        Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Dolphin => {
+            dolphin_integration_presentation(dolphin_profiles)
         }
         _ => retroarch_integration_presentation(profiles),
     };
@@ -12061,7 +12823,13 @@ fn show_cheats_mods_page(
     });
     ui.add_space(theme::SECTION_GAP);
 
-    show_cheats_mods_workflow_states(ui, workflow.as_deref(), profiles, pcsx2_profiles);
+    show_cheats_mods_workflow_states(
+        ui,
+        workflow.as_deref(),
+        profiles,
+        pcsx2_profiles,
+        dolphin_profiles,
+    );
     ui.add_space(theme::SECTION_GAP);
     show_cheats_mods_safety_information(ui);
     ui.add_space(theme::SECTION_GAP);
@@ -12070,7 +12838,7 @@ fn show_cheats_mods_page(
         ui,
         "Cheats and emulator patches",
         Some(
-            "Choose an emulator adapter explicitly. Every PCSX2 operation in this milestone is local and read-only.",
+            "Choose an emulator adapter explicitly. PCSX2 and Dolphin operations in this milestone are local and read-only.",
         ),
     );
     if let Some(workflow) = workflow {
@@ -12096,6 +12864,10 @@ fn show_cheats_mods_page(
             }
             CheatEmulatorAdapter::Pcsx2 => {
                 action = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, clipboard).or(action);
+            }
+            CheatEmulatorAdapter::Dolphin => {
+                action =
+                    show_dolphin_workflow(ui, workflow, dolphin_profiles, clipboard).or(action);
             }
         }
     } else {
@@ -12137,7 +12909,7 @@ fn show_cheats_mods_page(
     }
 
     ui.add_space(theme::SECTION_GAP);
-    show_mods_section(ui, pcsx2_read_only);
+    show_mods_section(ui, pcsx2_read_only, dolphin_read_only);
     ui.add_space(theme::SECTION_GAP);
     show_recent_cheat_activity(ui, history, activity_archive.as_deref());
     action
@@ -12677,6 +13449,15 @@ fn eligible_pcsx2_profile_ids(discovery: &Pcsx2ProfileDiscovery) -> Vec<&str> {
         .collect()
 }
 
+fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
 /// Step 1 of the cheat workflow: archive identity plus explicit profile
 /// selection. Renders from the shared `RetroArchProfilesState` (the
 /// same discovery the Settings page shows) and mutates only the
@@ -12806,6 +13587,15 @@ enum Pcsx2ProfilesState {
         receiver: Receiver<Result<Pcsx2ProfileDiscovery, String>>,
     },
     Ready(Pcsx2ProfileDiscovery),
+    Error(String),
+}
+
+enum DolphinProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<DolphinProfileDiscovery, String>>,
+    },
+    Ready(DolphinProfileDiscovery),
     Error(String),
 }
 
@@ -18257,6 +19047,9 @@ mod tests {
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id: None,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -18311,6 +19104,34 @@ mod tests {
         }
     }
 
+    fn dolphin_profile_fixture() -> DolphinProfile {
+        DolphinProfile {
+            profile_id: "dolphin-native-test".to_string(),
+            installation_type: DolphinInstallationType::Native,
+            scope: DolphinProfileScope::User,
+            configuration_path: PathBuf::from("/isolated/dolphin-emu"),
+            provenance: "test fixture",
+            eligible: true,
+            blockers: Vec::new(),
+            game_settings_path: PathBuf::from("/isolated/dolphin-emu/GameSettings"),
+            game_settings_state: DolphinSettingsDirectoryState::Available,
+            game_settings_warning: None,
+            configuration_identity: None,
+            game_settings_identity: None,
+        }
+    }
+
+    fn empty_dolphin_inventory() -> DolphinGameIniInventory {
+        DolphinGameIniInventory {
+            profile_id: "dolphin-native-test".to_string(),
+            files: Vec::new(),
+            warnings: Vec::new(),
+            entries_visited: 0,
+            bytes_inspected: 0,
+            complete: true,
+        }
+    }
+
     #[test]
     fn pcsx2_adapter_is_visible_only_for_ps2_archives() {
         let mut app = app_with_cheats_mods_context();
@@ -18331,6 +19152,69 @@ mod tests {
             });
         });
         assert!(!rendered_text_contains(&output, "PCSX2"));
+    }
+
+    #[test]
+    fn dolphin_adapter_is_visible_only_for_gamecube_and_wii_archives() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let ctx = egui::Context::default();
+        for platform in ["GameCube", "Nintendo Wii"] {
+            workflow.platform = Some(platform.to_string());
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+                });
+            });
+            assert!(rendered_text_contains(&output, "Dolphin"));
+        }
+        workflow.platform = Some("PS3".to_string());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        assert!(!rendered_text_contains(&output, "Dolphin"));
+    }
+
+    #[test]
+    fn dolphin_workflow_presents_read_only_inventory_without_fake_actions() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("GameCube".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Dolphin;
+        workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
+        workflow.dolphin_inventory_profile_id = Some("dolphin-native-test".to_string());
+        workflow.dolphin_inventory = CheatStepResource::Ready(empty_dolphin_inventory());
+        let profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![dolphin_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_dolphin_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        for expected in [
+            "Stage 1 · Dolphin profile",
+            "Existing Dolphin-managed files",
+            "Uploaded · No",
+            "Executed · No",
+            "Changed · No",
+            "Verified Game ID unavailable",
+            "Unavailable · read-only milestone",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for forbidden in ["Install now", "Apply patch", "Enable code", "Delete file"] {
+            assert!(!rendered_text_contains(&output, forbidden));
+        }
     }
 
     #[test]
@@ -18983,6 +19867,7 @@ mod tests {
                     None,
                     &RetroArchProfilesState::NotScanned,
                     &Pcsx2ProfilesState::NotScanned,
+                    &DolphinProfilesState::NotScanned,
                     None,
                     None,
                     &history,
@@ -19024,6 +19909,7 @@ mod tests {
                     app.cheat_workflow.as_mut(),
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
                     None,
                     None,
                     &history,
@@ -19062,6 +19948,7 @@ mod tests {
                     app.cheat_workflow.as_ref(),
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
                 );
             });
         });
@@ -19205,7 +20092,7 @@ mod tests {
     fn mods_section_has_no_fake_user_actions() {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_mods_section(ui, false));
+            egui::CentralPanel::default().show(ctx, |ui| show_mods_section(ui, false, false));
         });
 
         assert!(rendered_text_contains(&output, "Mods"));
@@ -19235,6 +20122,9 @@ mod tests {
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id: None,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -19581,6 +20471,7 @@ mod tests {
             history_filters: HistoryLogFilters::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
+            dolphin_profiles: DolphinProfilesState::NotScanned,
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
