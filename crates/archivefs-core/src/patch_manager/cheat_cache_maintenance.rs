@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::emulator_environment::EncodedPath;
 
+use super::cheat_cache_lock::LockedCheatCache;
 use super::cheat_sources::{
     CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceCacheMetadata, CheatSourceError,
     CheatSourceFreshness, CheatSourceManifest, MANIFESTS_DIRECTORY, METADATA_FILE,
@@ -264,8 +265,15 @@ pub struct CachePruneExecutionResult {
 pub fn inventory_retroarch_cheat_snapshots(
     cache_root: &Path,
 ) -> Result<SnapshotInventoryReport, CheatSourceError> {
-    validate_maintenance_cache_root(cache_root)?;
-    if !cache_root.exists() {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    inventory_retroarch_cheat_snapshots_locked(&locked)
+}
+
+fn inventory_retroarch_cheat_snapshots_locked(
+    locked: &LockedCheatCache,
+) -> Result<SnapshotInventoryReport, CheatSourceError> {
+    let cache_root = locked.root();
+    if !locked.present_at_acquisition() {
         return Ok(SnapshotInventoryReport {
             schema_version: CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
             cache_root: EncodedPath::from_path(cache_root),
@@ -782,7 +790,17 @@ pub fn verify_retroarch_cheat_snapshots(
     snapshot_id: Option<&str>,
     source_id: Option<&str>,
 ) -> Result<SnapshotVerificationReport, CheatSourceError> {
-    let inventory = inventory_retroarch_cheat_snapshots(cache_root)?;
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    verify_retroarch_cheat_snapshots_locked(&locked, snapshot_id, source_id)
+}
+
+fn verify_retroarch_cheat_snapshots_locked(
+    locked: &LockedCheatCache,
+    snapshot_id: Option<&str>,
+    source_id: Option<&str>,
+) -> Result<SnapshotVerificationReport, CheatSourceError> {
+    let cache_root = locked.root();
+    let inventory = inventory_retroarch_cheat_snapshots_locked(locked)?;
     let mut entries = if let Some(id) = snapshot_id {
         vec![resolve_snapshot(&inventory.entries, id)?.clone()]
     } else {
@@ -795,7 +813,9 @@ pub fn verify_retroarch_cheat_snapshots(
             .collect::<Vec<_>>()
     };
     if snapshot_id.is_none() {
-        entries.extend(staging_verification_entries(cache_root, source_id)?);
+        if locked.present_at_acquisition() {
+            entries.extend(staging_verification_entries(cache_root, source_id)?);
+        }
         entries.sort_by(|left, right| {
             left.source_id
                 .cmp(&right.source_id)
@@ -982,7 +1002,17 @@ pub fn set_retroarch_cheat_snapshot_pin(
     snapshot_id: &str,
     pinned: bool,
 ) -> Result<SnapshotPinResult, CheatSourceError> {
-    let inventory = inventory_retroarch_cheat_snapshots(cache_root)?;
+    let locked = LockedCheatCache::acquire_required(cache_root)?;
+    set_retroarch_cheat_snapshot_pin_locked(&locked, snapshot_id, pinned)
+}
+
+fn set_retroarch_cheat_snapshot_pin_locked(
+    locked: &LockedCheatCache,
+    snapshot_id: &str,
+    pinned: bool,
+) -> Result<SnapshotPinResult, CheatSourceError> {
+    let cache_root = locked.root();
+    let inventory = inventory_retroarch_cheat_snapshots_locked(locked)?;
     let entry = resolve_snapshot(&inventory.entries, snapshot_id)?;
     if !entry.valid() {
         return Err(cache_error(
@@ -1027,6 +1057,15 @@ pub fn plan_retroarch_cheat_cache_prune(
     cache_root: &Path,
     policy: &CachePrunePolicy,
 ) -> Result<CachePrunePlan, CheatSourceError> {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    plan_retroarch_cheat_cache_prune_locked(&locked, policy)
+}
+
+fn plan_retroarch_cheat_cache_prune_locked(
+    locked: &LockedCheatCache,
+    policy: &CachePrunePolicy,
+) -> Result<CachePrunePlan, CheatSourceError> {
+    let cache_root = locked.root();
     if policy.include_abandoned_staging
         && policy.abandoned_staging_min_age_seconds < MINIMUM_ABANDONED_STAGING_AGE_SECONDS
     {
@@ -1038,7 +1077,7 @@ pub fn plan_retroarch_cheat_cache_prune(
             ),
         ));
     }
-    let inventory = inventory_retroarch_cheat_snapshots(cache_root)?;
+    let inventory = inventory_retroarch_cheat_snapshots_locked(locked)?;
     let now = now_seconds();
     let mut entries = Vec::new();
     let mut source_rank = BTreeMap::<String, usize>::new();
@@ -1156,7 +1195,7 @@ pub fn plan_retroarch_cheat_cache_prune(
         });
     }
     apply_budget(policy.max_cache_bytes, &mut entries);
-    if policy.include_abandoned_staging {
+    if policy.include_abandoned_staging && locked.present_at_acquisition() {
         entries.extend(plan_staging(cache_root, policy, now)?);
     }
     entries.sort_by(|left, right| {
@@ -1413,7 +1452,16 @@ pub fn execute_retroarch_cheat_cache_prune(
     plan: &CachePrunePlan,
     confirmed: bool,
 ) -> Result<CachePruneExecutionResult, CheatSourceError> {
-    validate_maintenance_cache_root(cache_root)?;
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    execute_retroarch_cheat_cache_prune_locked(&locked, plan, confirmed)
+}
+
+fn execute_retroarch_cheat_cache_prune_locked(
+    locked: &LockedCheatCache,
+    plan: &CachePrunePlan,
+    confirmed: bool,
+) -> Result<CachePruneExecutionResult, CheatSourceError> {
+    let cache_root = locked.root();
     if plan.resolved_cache_root != cache_root {
         return Err(cache_error(
             "prune_plan_root_mismatch",
@@ -1438,7 +1486,7 @@ pub fn execute_retroarch_cheat_cache_prune(
         .filter(|entry| entry.disposition == CachePruneDisposition::Candidate)
     {
         results.push(match candidate.kind {
-            CachePruneEntryKind::Snapshot => execute_snapshot_candidate(cache_root, candidate),
+            CachePruneEntryKind::Snapshot => execute_snapshot_candidate(locked, candidate),
             CachePruneEntryKind::Staging => execute_staging_candidate(
                 cache_root,
                 candidate,
@@ -1484,9 +1532,10 @@ pub fn execute_retroarch_cheat_cache_prune(
 }
 
 fn execute_snapshot_candidate(
-    cache_root: &Path,
+    locked: &LockedCheatCache,
     candidate: &CachePrunePlanEntry,
 ) -> CachePruneExecutionEntry {
+    let cache_root = locked.root();
     let outcome = (|| -> Result<u64, (CachePruneEntryStatus, String)> {
         let source = candidate.source_id.as_deref().ok_or((
             CachePruneEntryStatus::Unsafe,
@@ -1517,7 +1566,7 @@ fn execute_snapshot_candidate(
                 "candidate path is not exactly bound beneath the cache root".into(),
             ));
         }
-        let inventory = inventory_retroarch_cheat_snapshots(cache_root)
+        let inventory = inventory_retroarch_cheat_snapshots_locked(locked)
             .map_err(|error| (CachePruneEntryStatus::Failed, error.to_string()))?;
         let current = inventory
             .entries
@@ -1863,17 +1912,6 @@ fn enforce_inventory_entry_limit(count: usize) -> Result<(), CheatSourceError> {
     }
 }
 
-fn validate_maintenance_cache_root(path: &Path) -> Result<(), CheatSourceError> {
-    validate_cache_path_for_read(path)?;
-    if !path.is_absolute() || path.parent().is_none() {
-        return Err(cache_error(
-            "unsafe_cache_root",
-            "maintenance cache roots must be absolute and cannot be filesystem roots",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1974,6 +2012,17 @@ mod tests {
         assert!(!missing.exists());
         assert!(inventory_retroarch_cheat_snapshots(Path::new("/")).is_err());
         assert!(inventory_retroarch_cheat_snapshots(Path::new("relative-cache")).is_err());
+    }
+
+    #[test]
+    fn missing_root_state_does_not_begin_unlocked_reads_if_root_appears() {
+        let temp = Temp::new();
+        let missing = temp.0.join("appears-later");
+        let locked = LockedCheatCache::acquire_existing(&missing).unwrap();
+        fs::create_dir(&missing).unwrap();
+        fixture(&missing, "source", &"10".repeat(32), 1, false);
+        let report = inventory_retroarch_cheat_snapshots_locked(&locked).unwrap();
+        assert!(report.entries.is_empty());
     }
 
     #[test]
@@ -2373,6 +2422,31 @@ mod tests {
         let result = execute_retroarch_cheat_cache_prune(&temp.0, &plan, true).unwrap();
         assert_eq!(result.entries[0].status, CachePruneEntryStatus::Skipped);
         assert!(old_path.exists());
+    }
+
+    #[test]
+    fn held_cache_lock_blocks_pin_and_prune_without_mutation() {
+        let temp = Temp::new();
+        let old = "b5".repeat(32);
+        let current = "b6".repeat(32);
+        let old_path = fixture(&temp.0, "source", &old, 1, false);
+        fixture(&temp.0, "source", &current, 2, true);
+        let _held =
+            super::super::cheat_cache_lock::LockedCheatCache::acquire_required(&temp.0).unwrap();
+
+        let pin_error = set_retroarch_cheat_snapshot_pin(&temp.0, &old, true).unwrap_err();
+        assert_eq!(pin_error.code, "cache_lock_timeout");
+        let prune_error = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                keep_newest_per_source: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(prune_error.code, "cache_lock_timeout");
+        assert!(old_path.exists());
+        assert!(!temp.0.join("source/pins.json").exists());
     }
 
     #[test]

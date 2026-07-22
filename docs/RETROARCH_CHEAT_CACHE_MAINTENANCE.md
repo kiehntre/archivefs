@@ -9,6 +9,11 @@ those snapshots.
 All commands are offline. They do not contact a source, install cheats, read a
 RetroArch configuration or library database, or enable cheats.
 
+All operations participate in the shared cache-root lock documented in
+[`RETROARCH_CHEAT_CACHE_LOCKING.md`](RETROARCH_CHEAT_CACHE_LOCKING.md).
+Prune execution retains immediate candidate revalidation after acquiring the
+lock.
+
 ## Commands
 
 ```text

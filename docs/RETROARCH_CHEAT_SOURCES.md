@@ -1,5 +1,10 @@
 # Trusted RetroArch cheat sources
 
+Trusted-source inspection, offline reuse, retrieval, and publication use the
+same exclusive cache-root lock as snapshot maintenance. See
+[`RETROARCH_CHEAT_CACHE_LOCKING.md`](RETROARCH_CHEAT_CACHE_LOCKING.md) for the
+timeout, platform, path-identity, and lock-ordering guarantees.
+
 ArchiveFS retrieves reviewed remote cheat catalogues without giving the
 installer network access:
 
