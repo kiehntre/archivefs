@@ -780,8 +780,8 @@
     "Screen lists exactly the archives with MountState::Mounted"
    ],
    "required_tests": [],
-   "status": "in_progress",
-   "evidence": "Redesigned shell adds MainView::ActiveMounts read-only listing via pending_unmount_items over the live snapshot. Refresh/unmount/cleanup actions on the page still open.",
+   "status": "complete",
+   "evidence": "show_active_mounts_page: mounted archives via pending_unmount_items (cannot disagree with the unmount engine), Refresh button (self.refresh), Open in Library per row, feedback banner. Rendered-frame test active_mounts_page_lists_only_mounted_archives_and_requires_confirmation.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -823,8 +823,8 @@
    "required_tests": [
     "existing unmount_one_archive_with_backend tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "in_progress",
+   "evidence": "Active Mounts per-row Unmount with inline confirmation (stale confirmations auto-cleared) routed through the existing AppOperationRequest::Archive / start_operation path with cleanup-after-unmount option. Application-service envelope deferred per 2026-07-22 direction change; Library flow unchanged.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -895,8 +895,8 @@
    "required_tests": [
     "existing cleanup_* tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "in_progress",
+   "evidence": "\"Clean empty mount directories after unmount\" exposed on Active Mounts (same cleanup_after_unmount field as the Library panel). Lazy unmount and remount stay gated behind the Library panel's failure-recovery offers by design; Open in Library is the route to them.",
    "implementation_commit": null,
    "notes": ""
   },

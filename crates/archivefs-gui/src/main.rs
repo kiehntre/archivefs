@@ -2526,6 +2526,10 @@ struct ArchiveFsApp {
     /// Whether the Mount page's inline mount-the-queue confirmation is
     /// showing - the Mount page's counterpart of `MountAllConfirmation`.
     confirm_mount_queue: bool,
+    /// The Active Mounts page's pending unmount confirmation (the
+    /// archive path awaiting "Unmount now"), cleared automatically when
+    /// that archive stops being mounted.
+    active_mounts_confirm_unmount: Option<PathBuf>,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2743,6 +2747,7 @@ impl ArchiveFsApp {
             mount_queue: Vec::new(),
             mount_search: String::new(),
             confirm_mount_queue: false,
+            active_mounts_confirm_unmount: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -5472,7 +5477,30 @@ impl eframe::App for ArchiveFsApp {
                     LoadState::Ready(data) => Some(data.records.as_slice()),
                     _ => None,
                 };
-                show_active_mounts_page(ui, live_records);
+                let action = show_active_mounts_page(
+                    ui,
+                    live_records,
+                    &mut self.active_mounts_confirm_unmount,
+                    &mut self.cleanup_after_unmount,
+                    self.feedback.as_ref(),
+                    archive_actions_blocked,
+                );
+                match action {
+                    Some(ActiveMountsPageAction::Unmount(archive_path)) => {
+                        requested_action = Some(AppOperationRequest::Archive(OperationRequest {
+                            action: ArchiveAction::Unmount,
+                            archive_path,
+                            cleanup_after_unmount: self.cleanup_after_unmount,
+                        }));
+                    }
+                    Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
+                        self.view = MainView::Library;
+                        self.selected_archive = Some(path.clone());
+                        self.selected_archives = [path].into_iter().collect();
+                    }
+                    Some(ActiveMountsPageAction::Refresh) => self.refresh(context),
+                    None => {}
+                }
                 return;
             }
 
@@ -8859,41 +8887,117 @@ fn show_mount_page(
     action
 }
 
+/// What the Active Mounts page asks `update` to do. `Unmount` is only
+/// ever returned after the page's own inline confirmation, and is then
+/// routed through the exact `AppOperationRequest::Archive` /
+/// `start_operation` path the Library's selected-archive panel uses.
+enum ActiveMountsPageAction {
+    Unmount(PathBuf),
+    OpenInLibrary(PathBuf),
+    Refresh,
+}
+
 /// The redesigned Active Mounts page: the currently mounted archives
-/// from the live snapshot, read-only. Reuses `pending_unmount_items` -
-/// the exact mounted-archive filter the proven unmount-all workflow
-/// uses - so this page can never disagree with the unmount machinery
-/// about what is mounted. Unmount/cleanup actions on this page are a
-/// later deliverable of the active-mounts milestone; the proven unmount
-/// workflows remain on the Library page meanwhile.
-fn show_active_mounts_page(ui: &mut egui::Ui, live_records: Option<&[ArchiveRecord]>) {
+/// from the live snapshot, with confirmed normal unmount per row.
+/// Reuses `pending_unmount_items` - the exact mounted-archive filter the
+/// proven unmount-all workflow uses - so this page can never disagree
+/// with the unmount machinery about what is mounted. Lazy unmount and
+/// remount stay deliberately absent here: both are failure-recovery
+/// offers the Library's selected-archive panel only unlocks after a
+/// failed or completed normal unmount (`lazy_unmount_offers` /
+/// `remount_offers`), and "Open in Library" is the honest route to that
+/// full recovery toolkit.
+fn show_active_mounts_page(
+    ui: &mut egui::Ui,
+    live_records: Option<&[ArchiveRecord]>,
+    confirm_unmount: &mut Option<PathBuf>,
+    cleanup_after_unmount: &mut bool,
+    feedback: Option<&ActionFeedback>,
+    busy: bool,
+) -> Option<ActiveMountsPageAction> {
+    let mut action = None;
     ui.heading("Active Mounts");
     ui.add_space(4.0);
+    if let Some(feedback) = feedback {
+        let color = if feedback.succeeded {
+            egui::Color32::from_rgb(70, 170, 90)
+        } else {
+            ui.visuals().error_fg_color
+        };
+        ui.colored_label(color, &feedback.message);
+        ui.separator();
+    }
     let Some(records) = live_records else {
         ui.label("Live mount state is not loaded yet.");
-        return;
+        return None;
     };
     let mounted = pending_unmount_items(records);
+    // A confirmation for an archive that is no longer mounted (unmounted
+    // meanwhile, snapshot refreshed) must not survive as a stale prompt.
+    if let Some(pending) = confirm_unmount.as_ref()
+        && !mounted.iter().any(|item| item.archive_path == *pending)
+    {
+        *confirm_unmount = None;
+    }
+    ui.horizontal(|ui| {
+        if mounted.len() == 1 {
+            ui.label("1 mounted archive.");
+        } else {
+            ui.label(format!("{} mounted archives.", mounted.len()));
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new("Refresh"))
+            .clicked()
+        {
+            action = Some(ActiveMountsPageAction::Refresh);
+        }
+    });
     if mounted.is_empty() {
         ui.label("No archives are currently mounted.");
-        return;
+        return action;
     }
-    if mounted.len() == 1 {
-        ui.label("1 mounted archive.");
-    } else {
-        ui.label(format!("{} mounted archives.", mounted.len()));
+    ui.add_enabled_ui(!busy, |ui| {
+        ui.checkbox(
+            cleanup_after_unmount,
+            "Clean empty mount directories after unmount",
+        );
+    });
+    if let Some(pending) = confirm_unmount.clone() {
+        let name = mounted
+            .iter()
+            .find(|item| item.archive_path == pending)
+            .map(|item| item.display_name.as_str())
+            .unwrap_or("this archive");
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong(format!("Unmount {name}?"));
+            ui.label("Close applications using this mount before unmounting.");
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Unmount now"))
+                    .clicked()
+                {
+                    action = Some(ActiveMountsPageAction::Unmount(pending.clone()));
+                    *confirm_unmount = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    *confirm_unmount = None;
+                }
+            });
+        });
     }
     ui.separator();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("active_mounts_grid")
-                .num_columns(3)
+                .num_columns(5)
                 .striped(true)
                 .show(ui, |ui| {
                     ui.strong("Name");
                     ui.strong("Archive path");
                     ui.strong("Mount path");
+                    ui.strong("");
+                    ui.strong("");
                     ui.end_row();
                     for item in &mounted {
                         ui.label(&item.display_name);
@@ -8907,10 +9011,22 @@ fn show_active_mounts_page(ui: &mut egui::Ui, live_records: Option<&[ArchiveReco
                                 .selectable(true)
                                 .wrap(),
                         );
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Unmount").small())
+                            .clicked()
+                        {
+                            *confirm_unmount = Some(item.archive_path.clone());
+                        }
+                        if ui.small_button("Open in Library").clicked() {
+                            action = Some(ActiveMountsPageAction::OpenInLibrary(
+                                item.archive_path.clone(),
+                            ));
+                        }
                         ui.end_row();
                     }
                 });
         });
+    action
 }
 
 /// The redesigned History & Logs page: the same operation history the
@@ -14059,6 +14175,74 @@ mod tests {
     }
 
     #[test]
+    fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
+        let records = vec![
+            record("/roms/mounted.zip", MountState::Mounted),
+            record("/roms/pending.zip", MountState::Pending),
+        ];
+        let ctx = egui::Context::default();
+        let mut confirm = None;
+        let mut cleanup = false;
+        let mut action = None;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show_active_mounts_page(
+                    ui,
+                    Some(&records),
+                    &mut confirm,
+                    &mut cleanup,
+                    None,
+                    false,
+                );
+            });
+        });
+        assert!(
+            action.is_none(),
+            "rendering alone must not unmount anything"
+        );
+        assert!(rendered_text_contains(&output, "/roms/mounted.zip"));
+        assert!(
+            !rendered_text_contains(&output, "/roms/pending.zip"),
+            "only mounted archives are listed"
+        );
+        assert!(confirm.is_none());
+
+        let mut stale = Some(PathBuf::from("/roms/pending.zip"));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_active_mounts_page(
+                    ui,
+                    Some(&records),
+                    &mut stale,
+                    &mut cleanup,
+                    None,
+                    false,
+                );
+            });
+        });
+        assert!(
+            stale.is_none(),
+            "a confirmation must not survive for a non-mounted archive"
+        );
+
+        let mut live_confirm = Some(PathBuf::from("/roms/mounted.zip"));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_active_mounts_page(
+                    ui,
+                    Some(&records),
+                    &mut live_confirm,
+                    &mut cleanup,
+                    None,
+                    false,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Unmount now"));
+        assert!(live_confirm.is_some());
+    }
+
+    #[test]
     fn planned_action_labels_distinguish_mount_from_both_skip_reasons() {
         assert_eq!(planned_action_label(MountState::Pending), "Mount");
         assert_eq!(
@@ -14113,6 +14297,7 @@ mod tests {
             mount_queue: Vec::new(),
             mount_search: String::new(),
             confirm_mount_queue: false,
+            active_mounts_confirm_unmount: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,

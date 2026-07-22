@@ -261,11 +261,35 @@ Landed in commit "Add redesigned Selected screen for mount queue review":
   preview.
 - Tests: planned-action label mapping added (352 passed, 0 failed).
 
+## Active Mounts actions (2026-07-22)
+
+Landed in commit "Add unmount actions to the Active Mounts screen":
+
+- Per-row Unmount with an inline confirmation strip; stale
+  confirmations (archive no longer mounted) are cleared automatically.
+  Confirmed unmounts are routed through the exact
+  `AppOperationRequest::Archive` → `start_operation` path the Library
+  panel uses — no new unmount machinery.
+- "Clean empty mount directories after unmount" checkbox on the page,
+  bound to the same `cleanup_after_unmount` field as the Library panel.
+- Refresh button, per-row "Open in Library" (selects the archive), and
+  the shared `ActionFeedback` banner on the page.
+- Deliberate deviation from the design: Lazy Unmount and Remount are
+  not offered on this page. Both are failure-recovery offers the
+  proven Library flow only unlocks after a failed/completed normal
+  unmount (`lazy_unmount_offers`/`remount_offers`); duplicating that
+  two-stage safety flow here would risk drift. "Open in Library" is
+  the route to the full recovery toolkit.
+- Rendered-frame test covers mounted-only listing, no action without
+  confirmation, stale-confirmation clearing, and the confirm strip
+  (353 passed, 0 failed).
+
 ## Next deliverable
 
-Active Mounts actions (design: Open, Unmount, Lazy Unmount, Cleanup,
-Remount per mounted archive) wired to the existing proven per-archive
-workflows on the Active Mounts page.
+History & Logs parity: outcome/action filtering and log export per the
+design ("All Operations" / result filters, Export Log serializing the
+existing `HistoryEntry` fields), then Doctor screen parity (copy full
+details, suggested actions).
 
 ## Latest clean commit
 
