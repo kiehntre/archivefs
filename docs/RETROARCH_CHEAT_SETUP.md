@@ -37,6 +37,9 @@ archivefs retroarch-cheat-setup --source <source-id> [options]
 Trusted-source preview provenance and cache behavior are documented in
 [`RETROARCH_CHEAT_SOURCES.md`](RETROARCH_CHEAT_SOURCES.md). Local catalogue
 behavior is unchanged.
+Snapshot verification, external pins and deliberate pruning are documented in
+[`RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](RETROARCH_CHEAT_CACHE_MAINTENANCE.md);
+setup never invokes maintenance automatically.
 
 No destination, journal, backup, installation-type, or RetroArch config path
 is needed normally. The destination comes from the selected profile's parsed

@@ -104,8 +104,9 @@ A snapshot is fresh for 24 hours. Normal fetch reuses a fresh snapshot and
 refreshes stale data. `--force-refresh` retains the previous snapshot until a
 replacement validates. `--offline` makes no network call, reports stale reuse,
 and fails without a valid current snapshot. No automatic deletion policy is
-implemented; content hashes deduplicate identical fetches and cleanup remains
-manual pending a separately reviewed conservative policy.
+implemented; content hashes deduplicate identical fetches, while deliberate
+preview-first cleanup and external pins are documented in
+[`RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
 
 The rolling built-in archive has no compiled-in archive digest or pinned
 version. Supply an
@@ -116,4 +117,4 @@ download, validation, extraction, cache, or offline errors.
 
 Current limitations are one reviewed source, ZIP only, synchronous fetching,
 no user-defined URLs, no automatic pruning, and DNS preflight rather than
-connection-pinned resolution.
+connection-pinned resolution. Maintenance never runs implicitly during fetch.
