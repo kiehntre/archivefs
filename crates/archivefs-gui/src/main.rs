@@ -133,6 +133,47 @@ fn responsive_library_column_widths(available_width: f32, spacing: f32) -> Libra
         mount_path: (path_space * 0.54).max(280.0),
     }
 }
+
+const HEALTH_METRIC_MIN_WIDTH: f32 = 148.0;
+const HEALTH_METRIC_HEIGHT: f32 = 58.0;
+const LIBRARY_VIEW_DIALOG_MAX_WIDTH: f32 = 780.0;
+const LIBRARY_VIEW_DIALOG_MAX_HEIGHT: f32 = 720.0;
+
+fn responsive_card_columns(
+    available_width: f32,
+    minimum_card_width: f32,
+    spacing: f32,
+    item_count: usize,
+) -> usize {
+    if item_count == 0 {
+        return 0;
+    }
+    (((available_width + spacing) / (minimum_card_width + spacing)).floor() as usize)
+        .clamp(1, item_count)
+}
+
+fn library_view_dialog_size(viewport_size: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        (viewport_size.x - 24.0).clamp(320.0, LIBRARY_VIEW_DIALOG_MAX_WIDTH),
+        (viewport_size.y - 24.0).clamp(360.0, LIBRARY_VIEW_DIALOG_MAX_HEIGHT),
+    )
+}
+
+fn library_view_selections_side_by_side(dialog_width: f32) -> bool {
+    dialog_width >= 680.0
+}
+
+fn library_view_submit_blocker(name: &str, destination: &str, busy: bool) -> Option<&'static str> {
+    if busy {
+        Some("Wait for the current Library View operation to finish.")
+    } else if name.trim().is_empty() {
+        Some("Enter a name for this Library View.")
+    } else if destination.trim().is_empty() {
+        Some("Choose a destination folder for this Library View.")
+    } else {
+        None
+    }
+}
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 const HISTORY_LIMIT: usize = 50;
 const ACTIVITY_EXPANDED_BY_DEFAULT: bool = false;
@@ -8376,6 +8417,70 @@ fn show_library_view_plan_summary(
             }
         });
 }
+
+fn show_library_view_source_selection(
+    ui: &mut egui::Ui,
+    sources: &[SourceFolderView],
+    selected: &mut HashSet<PathBuf>,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Sources",
+            Some("Leave every source unchecked to include all configured sources."),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("library_view_form_sources")
+            .max_height(210.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if sources.is_empty() {
+                    ui.weak("No source folders are configured.");
+                }
+                for source in sources {
+                    let mut checked = selected.contains(&source.path);
+                    if ui
+                        .checkbox(&mut checked, source.path.display().to_string())
+                        .on_hover_text(source.path.display().to_string())
+                        .changed()
+                    {
+                        if checked {
+                            selected.insert(source.path.clone());
+                        } else {
+                            selected.remove(&source.path);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+fn show_library_view_platform_selection(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Platforms",
+            Some("Leave every platform unchecked to include all known platforms."),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("library_view_form_platforms")
+            .max_height(210.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for platform in canonical_platform_names() {
+                    let mut checked = selected.contains(platform);
+                    if ui.checkbox(&mut checked, platform).changed() {
+                        if checked {
+                            selected.insert(platform.to_string());
+                        } else {
+                            selected.remove(platform);
+                        }
+                    }
+                }
+            });
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_library_views_page(
     ui: &mut egui::Ui,
@@ -8605,105 +8710,140 @@ fn show_library_views_page(
         } else {
             "Add Library View"
         };
+        let dialog_size =
+            library_view_dialog_size(ui.ctx().input(|input| input.screen_rect().size()));
         egui::Window::new(title)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size(dialog_size)
+            .min_size(egui::vec2(
+                dialog_size.x.min(460.0),
+                dialog_size.y.min(440.0),
+            ))
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    show_text_edit_with_context_menu(
-                        ui,
-                        &mut dialog.name,
-                        clipboard,
-                        |text_edit| {
-                            text_edit
-                                .id_salt("library_view_form_name")
-                                .desired_width(280.0)
-                        },
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Destination:");
-                    show_text_edit_with_context_menu(
-                        ui,
-                        &mut dialog.destination_text,
-                        clipboard,
-                        |text_edit| {
-                            text_edit
-                                .id_salt("library_view_form_destination")
-                                .desired_width(280.0)
-                        },
-                    );
-                    if ui.button("Browse...").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .set_title("Select Library View Destination Folder")
-                            .pick_folder()
-                    {
-                        dialog.destination_text = path.display().to_string();
-                        dialog.validation_message = None;
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.strong("Included source folders (none checked = all)");
-                for source in all_source_folders {
-                    let mut checked = dialog.selected_source_folders.contains(&source.path);
-                    if ui
-                        .checkbox(&mut checked, source.path.display().to_string())
-                        .changed()
-                    {
-                        if checked {
-                            dialog.selected_source_folders.insert(source.path.clone());
-                        } else {
-                            dialog.selected_source_folders.remove(&source.path);
-                        }
-                    }
-                }
-
-                ui.add_space(4.0);
-                ui.strong("Included platforms (none checked = all)");
+                let form_width = ui.available_width();
+                let form_scroll_height = (ui.available_height() - 94.0).max(220.0);
                 egui::ScrollArea::vertical()
-                    .id_salt("library_view_form_platforms")
-                    .max_height(160.0)
+                    .id_salt("library_view_form_content")
+                    .max_height(form_scroll_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for platform in canonical_platform_names() {
-                            let mut checked = dialog.selected_platforms.contains(platform);
-                            if ui.checkbox(&mut checked, platform).changed() {
-                                if checked {
-                                    dialog.selected_platforms.insert(platform.to_string());
-                                } else {
-                                    dialog.selected_platforms.remove(platform);
+                        widgets::card(ui, |ui| {
+                            widgets::section_header(
+                                ui,
+                                "View details",
+                                Some("Name the view and choose a destination outside every archive source."),
+                            );
+                            ui.label(egui::RichText::new("Name").strong());
+                            let name_width = ui.available_width().max(180.0);
+                            show_text_edit_with_context_menu(
+                                ui,
+                                &mut dialog.name,
+                                clipboard,
+                                |text_edit| {
+                                    text_edit
+                                        .id_salt("library_view_form_name")
+                                        .desired_width(name_width)
+                                },
+                            );
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Destination").strong());
+                            ui.horizontal(|ui| {
+                                let destination_width = (ui.available_width() - 100.0).max(180.0);
+                                show_text_edit_with_context_menu(
+                                    ui,
+                                    &mut dialog.destination_text,
+                                    clipboard,
+                                    |text_edit| {
+                                        text_edit
+                                            .id_salt("library_view_form_destination")
+                                            .desired_width(destination_width)
+                                    },
+                                );
+                                if ui.button("Browse...").clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_title("Select Library View Destination Folder")
+                                        .pick_folder()
+                                {
+                                    dialog.destination_text = path.display().to_string();
+                                    dialog.validation_message = None;
                                 }
-                            }
+                            });
+                        });
+                        ui.add_space(8.0);
+
+                        if library_view_selections_side_by_side(form_width) {
+                            ui.columns(2, |columns| {
+                                let (left, right) = columns.split_at_mut(1);
+                                show_library_view_source_selection(
+                                    &mut left[0],
+                                    all_source_folders,
+                                    &mut dialog.selected_source_folders,
+                                );
+                                show_library_view_platform_selection(
+                                    &mut right[0],
+                                    &mut dialog.selected_platforms,
+                                );
+                            });
+                        } else {
+                            show_library_view_source_selection(
+                                ui,
+                                all_source_folders,
+                                &mut dialog.selected_source_folders,
+                            );
+                            ui.add_space(8.0);
+                            show_library_view_platform_selection(
+                                ui,
+                                &mut dialog.selected_platforms,
+                            );
                         }
+                        ui.add_space(8.0);
+                        widgets::banner(
+                            ui,
+                            "Layout",
+                            "Creates {platform}/{filename}. No other layout is selected or implied.",
+                            widgets::StatusTone::Info,
+                        );
                     });
 
-                ui.add_space(4.0);
-                ui.label("Layout: {platform}/{filename} (the only layout this milestone supports)");
-
+                ui.separator();
                 if let Some(message) = &dialog.validation_message {
                     ui.colored_label(ui.visuals().error_fg_color, message);
                 }
-                ui.horizontal(|ui| {
+                let submit_blocker =
+                    library_view_submit_blocker(&dialog.name, &dialog.destination_text, busy);
+                if let Some(reason) = submit_blocker {
+                    ui.weak(reason);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let submit_label = if dialog.editing_id.is_some() {
                         "Save"
                     } else {
                         "Add"
                     };
                     if ui
-                        .add_enabled(
-                            !busy
-                                && !dialog.name.trim().is_empty()
-                                && !dialog.destination_text.trim().is_empty(),
-                            egui::Button::new(submit_label),
-                        )
+                        .add_enabled(submit_blocker.is_none(), egui::Button::new(submit_label))
+                        .on_disabled_hover_text(submit_blocker.unwrap_or_default())
                         .clicked()
                     {
                         submit = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if widgets::action_button(
+                        ui,
+                        "Cancel",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    )
+                    .clicked()
+                    {
                         cancel = true;
+                    }
+                    if submit_blocker.is_none() {
+                        ui.label(
+                            egui::RichText::new("Ready to validate and save")
+                                .color(theme::muted(ui)),
+                        );
                     }
                 });
             });
@@ -11875,19 +12015,64 @@ fn show_health_dashboard_panel(
         diagnostics_errors,
     );
 
-    ui.horizontal_wrapped(|ui| {
-        summary_value(ui, "Healthy / ready", overview.healthy);
-        summary_value(ui, "Mounted", overview.mounted);
-        summary_value(ui, "Pending", overview.pending);
-        summary_value(ui, "Missing", overview.missing);
-        summary_value(ui, "Awaiting validation", overview.awaiting_validation);
-        summary_value(ui, "Cached-only", overview.cached_only);
-        summary_value(ui, "Retryable failures", overview.retryable_failures);
-        summary_value(ui, "Terminal failures", overview.terminal_failures);
-        summary_value(ui, "Unknown platform", overview.unknown_platform);
-        summary_value(ui, "Recovery available", overview.recovery_available);
-        summary_value(ui, "Diagnostics errors", overview.diagnostics_errors);
-    });
+    let metrics = [
+        SummaryMetric {
+            label: "Healthy / ready",
+            value: overview.healthy,
+            tone: widgets::StatusTone::Success,
+        },
+        SummaryMetric {
+            label: "Mounted",
+            value: overview.mounted,
+            tone: widgets::StatusTone::Active,
+        },
+        SummaryMetric {
+            label: "Pending",
+            value: overview.pending,
+            tone: widgets::StatusTone::Pending,
+        },
+        SummaryMetric {
+            label: "Missing",
+            value: overview.missing,
+            tone: widgets::StatusTone::Blocked,
+        },
+        SummaryMetric {
+            label: "Retryable failures",
+            value: overview.retryable_failures,
+            tone: widgets::StatusTone::Warning,
+        },
+        SummaryMetric {
+            label: "Terminal failures",
+            value: overview.terminal_failures,
+            tone: widgets::StatusTone::Blocked,
+        },
+        SummaryMetric {
+            label: "Recovery available",
+            value: overview.recovery_available,
+            tone: widgets::StatusTone::Info,
+        },
+        SummaryMetric {
+            label: "Awaiting validation",
+            value: overview.awaiting_validation,
+            tone: widgets::StatusTone::Warning,
+        },
+        SummaryMetric {
+            label: "Cached-only",
+            value: overview.cached_only,
+            tone: widgets::StatusTone::Pending,
+        },
+        SummaryMetric {
+            label: "Unknown platform",
+            value: overview.unknown_platform,
+            tone: widgets::StatusTone::Info,
+        },
+        SummaryMetric {
+            label: "Diagnostics errors",
+            value: overview.diagnostics_errors,
+            tone: widgets::StatusTone::Blocked,
+        },
+    ];
+    show_health_metric_cards(ui, &metrics);
     ui.label(
         "Healthy/Mounted/Pending/Retryable/Terminal/Recovery available/Unknown platform: current \
          live snapshot. Missing/Awaiting validation/Cached-only: persisted catalogue. \
@@ -12906,160 +13091,166 @@ fn show_loaded_data(
         });
     }
 
-    let missing_count = merged_rows
-        .iter()
-        .filter(|row| row.origin == RowOrigin::CachedMissing)
-        .count();
-    let mut missing_only =
-        library_filters.missing && !library_filters.present && !library_filters.awaiting_validation;
-    let selected_missing = selected_missing_paths(cached, selected_archives);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!("Missing catalogue entries: {missing_count}"));
-        if ui
-            .checkbox(&mut missing_only, "Show missing only")
-            .changed()
-        {
-            set_missing_review_mode(library_filters, missing_only);
-        }
-        let enabled = missing_removal_available && selected_missing.is_ok();
-        let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
-        if !enabled && let Err(reason) = &selected_missing {
-            response.clone().on_hover_text(reason);
-        }
-        if response.clicked()
-            && let Ok(paths) = &selected_missing
-        {
-            *confirm_remove_missing = Some(paths.clone());
-        }
-        if missing_removal_busy {
-            ui.spinner();
-            ui.label("Removing catalogue entries...");
-        }
-    });
-
-    if let Some(paths) = confirm_remove_missing.clone() {
-        let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
-        let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
-        egui::Window::new(format!(
-            "Remove {} missing catalogue entr{}?",
-            paths.len(),
-            if paths.len() == 1 { "y" } else { "ies" }
-        ))
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ui.ctx(), |ui| {
-            ui.label(missing_removal_confirmation_text(paths.len()));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
-                    *confirm_remove_missing = None;
-                }
-                if ui
-                    .add_enabled(
-                        missing_removal_available && still_valid,
-                        egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
-                    )
-                    .clicked()
-                {
-                    requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
-                    *confirm_remove_missing = None;
-                }
-            });
-        });
-    }
-
-    let mut filter_changed = false;
     widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Find and filter",
+            Some("Search paths and metadata, then narrow the catalogue without changing it."),
+        );
+
+        let mut filter_changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.label("Search:");
+            let search_width = (ui.available_width() - 72.0).clamp(180.0, 520.0);
             filter_changed |=
                 show_text_edit_with_context_menu(ui, filter, clipboard, |text_edit| {
                     text_edit
                         .id(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID))
                         .hint_text("archive, mount path, platform, or state")
-                        .desired_width(360.0)
+                        .desired_width(search_width)
                 })
                 .changed();
             if !filter.is_empty() && ui.small_button("Clear").clicked() {
                 filter.clear();
                 filter_changed = true;
             }
-        })
-        .inner
-    });
-    if filter_changed {
-        *filtered_rows = matching_row_indices(&merged_rows, filter);
-    }
-
-    // Unknown-platform review workflow: a compact count plus a single
-    // "show unknown only" toggle, reusing the same `unknown_platform`
-    // filter field the "Filters:" row's platform group already reads
-    // (see `LibraryRowFilters`) - no separate filter state, no separate
-    // index generation, no rescan. The count covers every merged row
-    // (live and cache-only alike), independent of which filters are
-    // currently active - see requirement 7.
-    let unknown_count = merged_rows
-        .iter()
-        .filter(|row| row.unknown_platform)
-        .count();
-    let mut filters_changed = false;
-    ui.horizontal(|ui| {
-        ui.label(format!("Unknown platforms: {unknown_count}"));
-        filters_changed |= ui
-            .checkbox(&mut library_filters.unknown_platform, "Show unknown only")
-            .changed();
-    });
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Filters:");
-        filters_changed |= ui
-            .checkbox(&mut library_filters.present, "Present")
-            .changed();
-        filters_changed |= ui
-            .checkbox(&mut library_filters.missing, "Missing")
-            .changed();
-        filters_changed |= ui
-            .checkbox(
-                &mut library_filters.awaiting_validation,
-                "Awaiting validation",
-            )
-            .changed();
-        filters_changed |= ui
-            .checkbox(&mut library_filters.known_platform, "Known platform")
-            .changed();
-        if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
-            *library_filters = LibraryRowFilters::default();
-            filters_changed = true;
+        });
+        if filter_changed {
+            *filtered_rows = matching_row_indices(&merged_rows, filter);
         }
-    });
-    let _ = filters_changed;
-    let configured_sources: &[SourceFolderView] = cached
-        .map(|cached| cached.source_views.as_slice())
-        .unwrap_or(&[]);
-    if !configured_sources.is_empty() {
-        ui.horizontal(|ui| {
-            ui.label("Source:");
-            let selected_text = match library_source_filter {
-                None => "All sources".to_string(),
-                Some(None) => "Unassigned / Legacy".to_string(),
-                Some(Some(path)) => path.display().to_string(),
-            };
-            egui::ComboBox::from_id_salt("library_source_filter")
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(library_source_filter, None, "All sources");
-                    for source in configured_sources {
+
+        let unknown_count = merged_rows
+            .iter()
+            .filter(|row| row.unknown_platform)
+            .count();
+        let mut filters_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Show:");
+            filters_changed |= ui
+                .checkbox(&mut library_filters.present, "Present")
+                .changed();
+            filters_changed |= ui
+                .checkbox(&mut library_filters.missing, "Missing")
+                .changed();
+            filters_changed |= ui
+                .checkbox(
+                    &mut library_filters.awaiting_validation,
+                    "Awaiting validation",
+                )
+                .changed();
+            filters_changed |= ui
+                .checkbox(&mut library_filters.known_platform, "Known platform")
+                .changed();
+            filters_changed |= ui
+                .checkbox(
+                    &mut library_filters.unknown_platform,
+                    format!("Unknown platform ({unknown_count})"),
+                )
+                .changed();
+            if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
+                *library_filters = LibraryRowFilters::default();
+                filters_changed = true;
+            }
+        });
+        let _ = filters_changed;
+
+        let configured_sources: &[SourceFolderView] = cached
+            .map(|cached| cached.source_views.as_slice())
+            .unwrap_or(&[]);
+        if !configured_sources.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Source:");
+                let selected_text = match library_source_filter {
+                    None => "All sources".to_string(),
+                    Some(None) => "Unassigned / Legacy".to_string(),
+                    Some(Some(path)) => path.display().to_string(),
+                };
+                egui::ComboBox::from_id_salt("library_source_filter")
+                    .selected_text(selected_text)
+                    .width((ui.available_width() - 16.0).clamp(220.0, 520.0))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(library_source_filter, None, "All sources");
+                        for source in configured_sources {
+                            ui.selectable_value(
+                                library_source_filter,
+                                Some(Some(source.path.clone())),
+                                source.path.display().to_string(),
+                            );
+                        }
                         ui.selectable_value(
                             library_source_filter,
-                            Some(Some(source.path.clone())),
-                            source.path.display().to_string(),
+                            Some(None),
+                            "Unassigned / Legacy",
                         );
-                    }
-                    ui.selectable_value(library_source_filter, Some(None), "Unassigned / Legacy");
-                });
+                    });
+            });
+        }
+
+        let missing_count = merged_rows
+            .iter()
+            .filter(|row| row.origin == RowOrigin::CachedMissing)
+            .count();
+        let mut missing_only = library_filters.missing
+            && !library_filters.present
+            && !library_filters.awaiting_validation;
+        let selected_missing = selected_missing_paths(cached, selected_archives);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Missing catalogue entries: {missing_count}"));
+            if ui
+                .checkbox(&mut missing_only, "Show missing only")
+                .changed()
+            {
+                set_missing_review_mode(library_filters, missing_only);
+            }
+            let enabled = missing_removal_available && selected_missing.is_ok();
+            let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
+            if !enabled && let Err(reason) = &selected_missing {
+                response.clone().on_hover_text(reason);
+            }
+            if response.clicked()
+                && let Ok(paths) = &selected_missing
+            {
+                *confirm_remove_missing = Some(paths.clone());
+            }
+            if missing_removal_busy {
+                ui.spinner();
+                ui.label("Removing catalogue entries...");
+            }
         });
-    }
+
+        if let Some(paths) = confirm_remove_missing.clone() {
+            let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
+            let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
+            egui::Window::new(format!(
+                "Remove {} missing catalogue entr{}?",
+                paths.len(),
+                if paths.len() == 1 { "y" } else { "ies" }
+            ))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(missing_removal_confirmation_text(paths.len()));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
+                        *confirm_remove_missing = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            missing_removal_available && still_valid,
+                            egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
+                        )
+                        .clicked()
+                    {
+                        requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
+                        *confirm_remove_missing = None;
+                    }
+                });
+            });
+        }
+    });
+    ui.add_space(8.0);
 
     let base_indices: Vec<usize> = filtered_rows
         .clone()
@@ -14516,8 +14707,12 @@ fn show_selected_archive(
     let mut request = None;
     let mut platform_request = None;
     let mut inspect_request = None;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.strong("Selected archive");
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Selected archive",
+            Some("Inspect identity, mount state, health, and metadata for the focused row."),
+        );
         if record.is_none() && persisted.is_none() {
             ui.label("Select an archive row to view details.");
             return;
@@ -14526,13 +14721,9 @@ fn show_selected_archive(
         let Some(record) = record else {
             if let Some(persisted) = persisted {
                 let archive_path_text = persisted.absolute_path.display().to_string();
-                ui.label("Archive path:");
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(&archive_path_text).selectable(true).wrap());
-                    if ui.small_button("Copy").clicked() {
-                        let _ = clipboard.set_text(archive_path_text.clone());
-                    }
-                });
+                if widgets::copyable_value(ui, "Archive path", &archive_path_text) {
+                    let _ = clipboard.set_text(archive_path_text.clone());
+                }
                 let source_text = source_path
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "Unassigned / Legacy".to_string());
@@ -15321,12 +15512,14 @@ fn detail_row_with_copy(
 ) {
     ui.strong(label);
     ui.vertical(|ui| {
-        let response = ui.add(
-            egui::Label::new(value)
-                .selectable(true)
-                .wrap()
-                .sense(egui::Sense::click()),
-        );
+        let response = ui
+            .add(
+                egui::Label::new(value)
+                    .selectable(true)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(value);
         if ui.small_button("Copy").clicked() {
             let _ = clipboard.set_text(value.to_string());
         }
@@ -15378,6 +15571,68 @@ fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
                 ui.small(label);
             });
         });
+}
+
+#[derive(Clone, Copy)]
+struct SummaryMetric<'a> {
+    label: &'a str,
+    value: usize,
+    tone: widgets::StatusTone,
+}
+
+fn show_health_metric_card(ui: &mut egui::Ui, width: f32, metric: SummaryMetric<'_>) {
+    let color = metric.tone.color(ui);
+    let content_width = (width - 20.0).max(64.0);
+    let fill = if metric.value == 0 {
+        theme::card_fill(ui)
+    } else {
+        color.gamma_multiply(0.10)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(theme::border(ui))
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(content_width, HEALTH_METRIC_HEIGHT - 10.0));
+            ui.set_max_width(content_width);
+            ui.vertical_centered(|ui| {
+                let value = egui::RichText::new(metric.value.to_string()).strong();
+                ui.label(if metric.value == 0 {
+                    value.color(ui.visuals().weak_text_color())
+                } else {
+                    value.color(color)
+                });
+                ui.add_sized(
+                    [content_width, ui.text_style_height(&egui::TextStyle::Small)],
+                    egui::Label::new(egui::RichText::new(metric.label).small()).truncate(),
+                )
+                .on_hover_text(metric.label);
+            });
+        });
+}
+
+fn show_health_metric_cards(ui: &mut egui::Ui, metrics: &[SummaryMetric<'_>]) {
+    let spacing = ui.spacing().item_spacing.x;
+    let columns = responsive_card_columns(
+        ui.available_width(),
+        HEALTH_METRIC_MIN_WIDTH,
+        spacing,
+        metrics.len(),
+    );
+    if columns == 0 {
+        return;
+    }
+    for row in metrics.chunks(columns) {
+        let width = ((ui.available_width() - spacing * (columns.saturating_sub(1) as f32))
+            / columns as f32)
+            .max(1.0);
+        ui.horizontal(|ui| {
+            for metric in row {
+                show_health_metric_card(ui, width, *metric);
+            }
+        });
+    }
 }
 
 fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>> {
@@ -17431,6 +17686,55 @@ mod tests {
     #[test]
     fn library_column_widths_defaults_match_the_original_fixed_constants() {
         assert_eq!(LibraryColumnWidths::default().as_array(), COLUMN_WIDTHS);
+    }
+
+    #[test]
+    fn responsive_library_columns_expand_both_paths_and_prioritise_destination() {
+        let compact = responsive_library_column_widths(900.0, 10.0);
+        let wide = responsive_library_column_widths(1_536.0, 10.0);
+
+        assert!(compact.mount_path > compact.archive_path);
+        assert!(wide.mount_path > compact.mount_path);
+        assert!(wide.archive_path > compact.archive_path);
+        assert!(wide.archive_path >= 240.0);
+        assert!(wide.mount_path >= 280.0);
+    }
+
+    #[test]
+    fn health_metric_columns_wrap_before_cards_become_unreadably_narrow() {
+        assert_eq!(responsive_card_columns(120.0, 148.0, 10.0, 11), 1);
+        assert_eq!(responsive_card_columns(320.0, 148.0, 10.0, 11), 2);
+        assert_eq!(responsive_card_columns(700.0, 148.0, 10.0, 11), 4);
+        assert_eq!(responsive_card_columns(1_536.0, 148.0, 10.0, 11), 9);
+        assert_eq!(responsive_card_columns(1_536.0, 148.0, 10.0, 0), 0);
+    }
+
+    #[test]
+    fn library_view_dialog_sizing_is_bounded_and_uses_two_columns_only_when_readable() {
+        assert_eq!(
+            library_view_dialog_size(egui::vec2(1_536.0, 864.0)),
+            egui::vec2(780.0, 720.0)
+        );
+        assert_eq!(
+            library_view_dialog_size(egui::vec2(800.0, 600.0)),
+            egui::vec2(776.0, 576.0)
+        );
+        assert!(!library_view_selections_side_by_side(679.0));
+        assert!(library_view_selections_side_by_side(680.0));
+    }
+
+    #[test]
+    fn library_view_add_blocker_explains_each_missing_requirement() {
+        assert_eq!(
+            library_view_submit_blocker("", "/views", false),
+            Some("Enter a name for this Library View.")
+        );
+        assert_eq!(
+            library_view_submit_blocker("Arcade", "", false),
+            Some("Choose a destination folder for this Library View.")
+        );
+        assert!(library_view_submit_blocker("Arcade", "/views", false).is_none());
+        assert!(library_view_submit_blocker("Arcade", "/views", true).is_some());
     }
 
     #[test]
@@ -25085,6 +25389,61 @@ mod tests {
         });
         assert!(rendered_text_contains(&output, "retrodeck"));
     }
+
+    #[test]
+    fn library_view_form_keeps_required_sections_and_actions_visible_at_desktop_size() {
+        let ctx = egui::Context::default();
+        let views: Vec<LibraryViewConfig> = Vec::new();
+        let sources = three_source_views();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = Some(LibraryViewFormDialogState::default());
+        let mut remove_dialog = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_536.0, 864.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut render = |input| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_library_views_page(
+                        ui,
+                        &views,
+                        &sources,
+                        false,
+                        None,
+                        None,
+                        &mut plan_filter,
+                        &mut form_dialog,
+                        &mut remove_dialog,
+                        &mut clipboard,
+                    );
+                });
+            })
+        };
+        let _ = render(input.clone());
+        let output = render(input);
+
+        for required in [
+            "View details",
+            "Destination",
+            "Sources",
+            "Platforms",
+            "Enter a name",
+            "Cancel",
+            "Add",
+        ] {
+            assert!(
+                rendered_text_contains(&output, required),
+                "desktop Library View form did not render {required:?}"
+            );
+        }
+    }
+
     #[test]
     fn library_view_plan_summary_renders_a_long_path_without_panicking() {
         let ctx = egui::Context::default();
