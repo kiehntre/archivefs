@@ -15,7 +15,10 @@ use archivefs_core::emulator_environment::retroarch::{
     DiscoveryEnvironment, ProfileKind, ProfileScope,
 };
 use archivefs_core::patch_manager::{
-    RetroArchCheatSetupDiscovery, discover_retroarch_cheat_setup_profiles,
+    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
+    CheatSourceList, CheatSourceListEntry, HttpsCheatSourceTransport, RetroArchCheatSetupDiscovery,
+    default_cheat_source_cache_root, discover_retroarch_cheat_setup_profiles,
+    fetch_retroarch_cheat_source, list_retroarch_cheat_sources,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
@@ -197,12 +200,15 @@ enum ActivityAction {
     /// Background RetroArch profile discovery for cheat setup (the
     /// Settings page's "Discovered Profiles" section).
     RetroArchProfileScan,
+    /// Trusted cheat-source catalogue retrieval (network fetch or
+    /// offline cached-snapshot reuse) from the cheat workflow.
+    CheatSourceRetrieval,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 30] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 31] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -233,6 +239,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 30] = [
     ActivityAction::LibraryViewRemoved,
     ActivityAction::LogExport,
     ActivityAction::RetroArchProfileScan,
+    ActivityAction::CheatSourceRetrieval,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -316,6 +323,7 @@ impl std::fmt::Display for ActivityAction {
             Self::LibraryViewRemoved => "Library View removed",
             Self::LogExport => "Log export",
             Self::RetroArchProfileScan => "RetroArch profile scan",
+            Self::CheatSourceRetrieval => "Cheat source retrieval",
         })
     }
 }
@@ -4414,7 +4422,7 @@ impl ArchiveFsApp {
                 self.tools_overlay = ToolsOverlay::None;
             }
             Some(MountPageAction::OpenCheatWorkflow(archive_path)) => {
-                self.open_cheat_workflow(archive_path);
+                self.open_cheat_workflow(context, archive_path);
             }
             Some(MountPageAction::ScanRetroArchProfiles) => {
                 self.start_retroarch_profile_scan(context.clone());
@@ -4428,7 +4436,7 @@ impl ArchiveFsApp {
     /// display details are copied from the live record at open time;
     /// the single eligible profile is preselected only when it is the
     /// only one (the CLI's own auto-selection rule).
-    fn open_cheat_workflow(&mut self, archive_path: PathBuf) {
+    fn open_cheat_workflow(&mut self, context: &egui::Context, archive_path: PathBuf) {
         let record_details = match &self.state {
             LoadState::Ready(data) => data
                 .records
@@ -4465,8 +4473,159 @@ impl ArchiveFsApp {
             source_root,
             size_bytes,
             selected_profile_id,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: None,
+            fetch_force_refresh: false,
         });
         self.tools_overlay = ToolsOverlay::RetroArchCheats;
+        // Read-only listing of the local trusted-source cache; safe to
+        // start immediately (no network, background thread).
+        self.start_cheat_source_list(context.clone());
+    }
+
+    /// Lists the trusted cheat sources and their cached snapshots in
+    /// the background (read-only cache inspection, no network).
+    fn start_cheat_source_list(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        workflow.source_list = CheatStepResource::Loading { receiver };
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root()
+                .map(|cache_root| list_retroarch_cheat_sources(&cache_root))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Retrieves the selected trusted source's catalogue in the
+    /// background - a real network fetch, or offline reuse of the
+    /// cached snapshot when `offline` is set. All size/digest/redirect
+    /// protections live in `fetch_retroarch_cheat_source`; the GUI adds
+    /// nothing and bypasses nothing.
+    fn start_cheat_source_fetch(&mut self, context: egui::Context, offline: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(source_id) = workflow.selected_source_id.clone() else {
+            return;
+        };
+        let force_refresh = workflow.fetch_force_refresh && !offline;
+        let (sender, receiver) = mpsc::channel();
+        workflow.source_fetch = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            None,
+            ActivityOutcome::Started,
+            if offline {
+                format!("Cheat source '{source_id}': reusing cached snapshot (offline).")
+            } else {
+                format!("Cheat source '{source_id}': catalogue retrieval started.")
+            },
+        ));
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root()
+                .map_err(|error| error.to_string())
+                .and_then(|cache_root| {
+                    let options = CheatSourceFetchOptions {
+                        cache_root,
+                        force_refresh,
+                        offline,
+                        expected_sha256: None,
+                        max_download_bytes: None,
+                    };
+                    let transport = HttpsCheatSourceTransport::new();
+                    fetch_retroarch_cheat_source(&source_id, &options, &transport)
+                        .map_err(|error| error.to_string())
+                });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Polls the cheat workflow's background resources. A retrieval
+    /// result whose source no longer matches the current selection is
+    /// discarded (request-identity check); a superseded receiver was
+    /// already dropped when its state was replaced, so its result can
+    /// never arrive here at all.
+    fn poll_cheat_workflow(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if let CheatStepResource::Loading { receiver } = &workflow.source_list {
+            match receiver.try_recv() {
+                Ok(Ok(list)) => {
+                    if workflow.selected_source_id.is_none() {
+                        let enabled: Vec<&CheatSourceListEntry> = list
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.source.enabled)
+                            .collect();
+                        if enabled.len() == 1 {
+                            workflow.selected_source_id = Some(enabled[0].source.source_id.clone());
+                        }
+                    }
+                    workflow.source_list = CheatStepResource::Ready(list);
+                }
+                Ok(Err(message)) => {
+                    workflow.source_list = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.source_list = CheatStepResource::Failed(
+                        "Trusted-source listing stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        let mut history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.source_fetch {
+            match receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    if workflow.selected_source_id.as_deref()
+                        == Some(result.source.source_id.as_str())
+                    {
+                        history_entry = Some(HistoryEntry::new(
+                            ActivityAction::CheatSourceRetrieval,
+                            None,
+                            ActivityOutcome::Completed,
+                            format!(
+                                "Cheat source '{}': {} (digest {}).",
+                                result.source.source_id,
+                                cheat_fetch_status_label(result.status),
+                                result.manifest.archive_sha256
+                            ),
+                        ));
+                        workflow.source_fetch = CheatStepResource::Ready(result);
+                    } else {
+                        // The selection changed while this retrieval ran;
+                        // its result no longer applies to anything shown.
+                        workflow.source_fetch = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatSourceRetrieval,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("Cheat source retrieval failed: {message}"),
+                    ));
+                    workflow.source_fetch = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.source_fetch = CheatStepResource::Failed(
+                        "Catalogue retrieval stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(entry) = history_entry {
+            self.history.record(entry);
+        }
     }
 
     /// The cheat workflow is keyed to the canonical selected archive.
@@ -5269,6 +5428,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
         self.poll_retroarch_profiles();
+        self.poll_cheat_workflow();
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
@@ -5528,15 +5688,30 @@ impl eframe::App for ArchiveFsApp {
                             self.cheat_workflow = None;
                         }
                         if let Some(workflow) = self.cheat_workflow.as_mut() {
-                            let action = show_cheat_workflow_step1(
+                            let mut action = show_cheat_workflow_step1(
                                 ui,
                                 workflow,
                                 &self.retroarch_profiles,
                                 busy,
                             );
+                            ui.separator();
+                            if let Some(step2_action) =
+                                show_cheat_workflow_step2(ui, workflow, busy)
+                            {
+                                action = Some(step2_action);
+                            }
                             match action {
                                 Some(CheatWorkflowAction::RescanProfiles) => {
                                     self.start_retroarch_profile_scan(context.clone());
+                                }
+                                Some(CheatWorkflowAction::RefreshSources) => {
+                                    self.start_cheat_source_list(context.clone());
+                                }
+                                Some(CheatWorkflowAction::FetchSource) => {
+                                    self.start_cheat_source_fetch(context.clone(), false);
+                                }
+                                Some(CheatWorkflowAction::UseCachedSnapshot) => {
+                                    self.start_cheat_source_fetch(context.clone(), true);
                                 }
                                 None => {}
                             }
@@ -5746,13 +5921,15 @@ impl eframe::App for ArchiveFsApp {
                     ui,
                     live,
                     self.mount_all_result.as_ref(),
-                    self.selected_archive.as_deref(),
-                    self.selected_archives.len(),
-                    &self.retroarch_profiles,
-                    &mut self.mount_queue,
-                    &mut self.confirm_mount_queue,
-                    archive_actions_blocked,
-                    archive_action_block_reason,
+                    SelectedPageViewState {
+                        selected_archive: self.selected_archive.as_deref(),
+                        selected_count: self.selected_archives.len(),
+                        retroarch_profiles: &self.retroarch_profiles,
+                        queue: &mut self.mount_queue,
+                        confirm: &mut self.confirm_mount_queue,
+                        busy: archive_actions_blocked,
+                        block_reason: archive_action_block_reason,
+                    },
                 );
                 self.handle_mount_page_action(context, action);
                 return;
@@ -6162,7 +6339,7 @@ impl eframe::App for ArchiveFsApp {
                     self.library_view_focus_archive = Some(archive_path);
                 }
                 AppOperationRequest::OpenCheatWorkflow(archive_path) => {
-                    self.open_cheat_workflow(archive_path);
+                    self.open_cheat_workflow(context, archive_path);
                 }
             }
         }
@@ -9044,18 +9221,33 @@ fn planned_action_label(state: MountState) -> &'static str {
 /// preview is deliberately absent: the configured ratarmount binary is
 /// not part of any GUI-held state today, and showing a guessed command
 /// would be untruthful.
+/// The Selected page's borrowed state, bundled per the existing
+/// `MountPageViewState` pattern.
+struct SelectedPageViewState<'a> {
+    selected_archive: Option<&'a Path>,
+    selected_count: usize,
+    retroarch_profiles: &'a RetroArchProfilesState,
+    queue: &'a mut Vec<PathBuf>,
+    confirm: &'a mut bool,
+    busy: bool,
+    block_reason: Option<&'a str>,
+}
+
 fn show_selected_page(
     ui: &mut egui::Ui,
     live: Option<&LoadedData>,
     mount_all_result: Option<&MountAllResult>,
-    selected_archive: Option<&Path>,
-    selected_count: usize,
-    retroarch_profiles: &RetroArchProfilesState,
-    queue: &mut Vec<PathBuf>,
-    confirm: &mut bool,
-    busy: bool,
-    block_reason: Option<&str>,
+    view_state: SelectedPageViewState<'_>,
 ) -> Option<MountPageAction> {
+    let SelectedPageViewState {
+        selected_archive,
+        selected_count,
+        retroarch_profiles,
+        queue,
+        confirm,
+        busy,
+        block_reason,
+    } = view_state;
     let mut action = None;
     ui.heading("Selected");
     ui.add_space(4.0);
@@ -9708,11 +9900,294 @@ struct CheatWorkflowState {
     /// with several eligible profiles the user must choose - never
     /// silently picked.
     selected_profile_id: Option<String>,
+    /// Step 2: the trusted-source cache listing, loaded in the
+    /// background when the workflow opens.
+    source_list: CheatStepResource<CheatSourceList>,
+    /// Step 2: the most recent catalogue retrieval (network fetch or
+    /// offline cached-snapshot reuse). A result whose source no longer
+    /// matches `selected_source_id` at receive time is discarded.
+    source_fetch: CheatStepResource<CheatSourceFetchResult>,
+    /// The explicitly selected trusted source - preselected only when
+    /// exactly one enabled trusted source exists (same single-candidate
+    /// rule as profiles).
+    selected_source_id: Option<String>,
+    /// Whether "Fetch / Update catalogue" bypasses the fresh-cache
+    /// short-circuit (the CLI's `--force-refresh`). Never applies to
+    /// offline reuse.
+    fetch_force_refresh: bool,
+}
+
+/// A background-loaded cheat-workflow resource. Stale-result protection
+/// is ownership, the app's existing pattern: starting a new load
+/// replaces this state wholesale, dropping the previous receiver, so a
+/// superseded worker's `send` fails and its result can never apply.
+/// Closing the workflow - or the selected archive changing - drops the
+/// whole `CheatWorkflowState` the same way.
+enum CheatStepResource<T> {
+    NotLoaded,
+    Loading {
+        receiver: Receiver<Result<T, String>>,
+    },
+    Ready(T),
+    Failed(String),
+}
+
+/// Display label for a cached trusted-source snapshot's freshness.
+fn cheat_freshness_label(freshness: CheatSourceFreshness) -> &'static str {
+    match freshness {
+        CheatSourceFreshness::Fresh => "Fresh",
+        CheatSourceFreshness::Stale => "Stale",
+        CheatSourceFreshness::Missing => "Not cached",
+        CheatSourceFreshness::Unknown => "Unknown",
+    }
+}
+
+/// Display label for how a catalogue retrieval was satisfied.
+fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
+    match status {
+        CheatSourceFetchStatus::Fetched => "Downloaded fresh catalogue",
+        CheatSourceFetchStatus::CacheReused => "Reused cached snapshot",
+        CheatSourceFetchStatus::OfflineReused => "Offline: reused cached snapshot",
+    }
 }
 
 /// What the cheat workflow panel asks `update` to do.
 enum CheatWorkflowAction {
     RescanProfiles,
+    RefreshSources,
+    FetchSource,
+    UseCachedSnapshot,
+}
+
+/// Step 2 of the cheat workflow: the built-in trusted source list, the
+/// cached snapshot's provenance/digest/freshness, and retrieval
+/// actions. Only the fixed trusted list is ever shown - there is no
+/// user-supplied URL surface, and every retrieval runs on a background
+/// thread through `fetch_retroarch_cheat_source`'s existing size/
+/// digest/redirect protections.
+fn show_cheat_workflow_step2(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    busy: bool,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.strong("Step 2 — Trusted source and snapshot");
+    ui.add_space(4.0);
+    if workflow.selected_profile_id.is_none() {
+        ui.label("Choose a RetroArch profile in Step 1 to continue.");
+        return None;
+    }
+    match &workflow.source_list {
+        CheatStepResource::NotLoaded => {
+            ui.label("Trusted sources have not been listed yet.");
+            if ui.button("List trusted sources").clicked() {
+                action = Some(CheatWorkflowAction::RefreshSources);
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading the trusted-source cache...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Could not list trusted sources: {message}"),
+            );
+            if ui.button("Retry").clicked() {
+                action = Some(CheatWorkflowAction::RefreshSources);
+            }
+        }
+        CheatStepResource::Ready(list) => {
+            for entry in &list.entries {
+                let source = &entry.source;
+                ui.horizontal(|ui| {
+                    if source.enabled {
+                        let selected =
+                            workflow.selected_source_id.as_deref() == Some(&source.source_id);
+                        if ui.radio(selected, &source.display_name).clicked() {
+                            workflow.selected_source_id = Some(source.source_id.clone());
+                        }
+                    } else {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::selectable(false, &source.display_name),
+                        );
+                        ui.label("(disabled)");
+                    }
+                    if source.experimental {
+                        ui.colored_label(ui.visuals().warn_fg_color, "experimental");
+                    }
+                });
+                if workflow.selected_source_id.as_deref() == Some(&source.source_id) {
+                    egui::Grid::new(format!("cheat_source_grid_{}", source.source_id))
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.strong("Source ID");
+                            ui.label(&source.source_id);
+                            ui.end_row();
+                            ui.strong("URL");
+                            ui.add(
+                                egui::Label::new(&source.download_url)
+                                    .selectable(true)
+                                    .wrap(),
+                            );
+                            ui.end_row();
+                            ui.strong("Permitted host");
+                            ui.label(&source.permitted_host);
+                            ui.end_row();
+                            ui.strong("Provenance");
+                            ui.add(egui::Label::new(&source.provenance).selectable(true).wrap());
+                            ui.end_row();
+                            if let Some(licence) = &source.licence_url {
+                                ui.strong("Licence");
+                                ui.add(egui::Label::new(licence).selectable(true).wrap());
+                                ui.end_row();
+                            }
+                            if let Some(pinned) = &source.pinned_version {
+                                ui.strong("Pinned version");
+                                ui.label(pinned);
+                                ui.end_row();
+                            }
+                            ui.strong("Trust status");
+                            ui.label(&entry.trust_status);
+                            ui.end_row();
+                            ui.strong("Cached snapshot");
+                            ui.label(cheat_freshness_label(entry.freshness));
+                            ui.end_row();
+                            if let Some(version) = &entry.current_cached_version {
+                                ui.strong("Cached version");
+                                ui.label(version);
+                                ui.end_row();
+                            }
+                            if let Some(fetched_at) = entry.fetched_at_unix_seconds {
+                                ui.strong("Retrieved");
+                                ui.label(format_unix_timestamp_utc(fetched_at as i64));
+                                ui.end_row();
+                            }
+                            if let Some(digest) = &entry.archive_sha256 {
+                                ui.strong("Digest (SHA-256)");
+                                ui.add(egui::Label::new(digest).selectable(true).wrap());
+                                ui.end_row();
+                            }
+                            if let Some(count) = entry.catalogue_file_count {
+                                ui.strong("Catalogue files");
+                                ui.label(count.to_string());
+                                ui.end_row();
+                            }
+                            ui.strong("Usable for setup");
+                            ui.label(if entry.setup_usable { "Yes" } else { "No" });
+                            ui.end_row();
+                        });
+                    for warning in &entry.warnings {
+                        ui.colored_label(ui.visuals().warn_fg_color, warning);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            let fetching = matches!(workflow.source_fetch, CheatStepResource::Loading { .. });
+            let selected_entry = workflow.selected_source_id.as_deref().and_then(|id| {
+                list.entries
+                    .iter()
+                    .find(|entry| entry.source.source_id == id)
+            });
+            ui.horizontal(|ui| {
+                let can_fetch =
+                    !busy && !fetching && selected_entry.is_some_and(|entry| entry.source.enabled);
+                if ui
+                    .add_enabled(can_fetch, egui::Button::new("Fetch / Update catalogue"))
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchSource);
+                }
+                ui.checkbox(&mut workflow.fetch_force_refresh, "Force full refresh");
+                let cached_available = selected_entry
+                    .is_some_and(|entry| entry.freshness != CheatSourceFreshness::Missing);
+                if ui
+                    .add_enabled(
+                        !busy && !fetching && cached_available,
+                        egui::Button::new("Use cached snapshot (offline)"),
+                    )
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::UseCachedSnapshot);
+                }
+                if ui
+                    .add_enabled(!fetching, egui::Button::new("Refresh source list"))
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::RefreshSources);
+                }
+            });
+        }
+    }
+    match &workflow.source_fetch {
+        CheatStepResource::NotLoaded => {}
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Retrieving catalogue...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Catalogue retrieval failed: {message}"),
+            );
+        }
+        CheatStepResource::Ready(result) => {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong(cheat_fetch_status_label(result.status));
+                egui::Grid::new("cheat_fetch_result_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.strong("Snapshot digest");
+                        ui.add(
+                            egui::Label::new(&result.manifest.archive_sha256)
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.end_row();
+                        ui.strong("Retrieved");
+                        ui.label(format_unix_timestamp_utc(
+                            result.manifest.fetched_at_unix_seconds as i64,
+                        ));
+                        ui.end_row();
+                        ui.strong("Catalogue path");
+                        ui.add(
+                            egui::Label::new(&result.local_catalogue_path.display)
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.end_row();
+                        ui.strong("Snapshot");
+                        ui.add(
+                            egui::Label::new(&result.immutable_snapshot_path.display)
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.end_row();
+                        ui.strong("Freshness");
+                        ui.label(cheat_freshness_label(result.freshness));
+                        ui.end_row();
+                        ui.strong("Valid cheats");
+                        ui.label(result.manifest.valid_cheat_count.to_string());
+                        ui.end_row();
+                    });
+                if result.stale {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "This snapshot is stale; fetch to update it when online.",
+                    );
+                }
+                for warning in &result.warnings {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+            });
+        }
+    }
+    action
 }
 
 /// Why the Selected screen's "RetroArch Cheats" entry point is
@@ -15057,8 +15532,10 @@ mod tests {
     use archivefs_core::emulator_environment::EncodedPath;
     use archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport;
     use archivefs_core::patch_manager::{
+        CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceManifest,
         RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupProfile,
         RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState,
+        trusted_retroarch_cheat_sources,
     };
     use archivefs_core::{
         Archive, ArchiveHealth, ArchiveMetadata, DoctorCheck, LibraryViewPlanCounts, MountPlan,
@@ -15271,6 +15748,199 @@ mod tests {
         }
     }
 
+    fn cheat_manifest(source_id: &str) -> CheatSourceManifest {
+        CheatSourceManifest {
+            format_version: 1,
+            source_id: source_id.to_string(),
+            source_url: "https://example.invalid/catalogue.zip".to_string(),
+            pinned_version: None,
+            fetched_at_unix_seconds: 0,
+            downloaded_bytes: 0,
+            extracted_bytes: 0,
+            archive_entry_count: 0,
+            archive_sha256: "test-digest".to_string(),
+            response_content_type: None,
+            response_etag: None,
+            response_last_modified: None,
+            catalogue_file_count: 0,
+            valid_cheat_count: 0,
+            malformed_cheat_count: 0,
+            skipped_entry_count: 0,
+            discovered_platforms: Vec::new(),
+            validation_complete: true,
+            warnings: Vec::new(),
+            catalogue_relative_path: "catalogue.json".to_string(),
+            cache_relative_path: "cache".to_string(),
+            files: Vec::new(),
+        }
+    }
+
+    /// A fetch-result fixture built on a *real* trusted definition
+    /// (`CheatSourceArchiveType` is not exported, so the definition
+    /// cannot be constructed from scratch) with only its ID overridden.
+    /// No network and no real cache paths are involved.
+    fn cheat_fetch_result_for(
+        source_id: &str,
+        status: CheatSourceFetchStatus,
+    ) -> CheatSourceFetchResult {
+        let mut source = trusted_retroarch_cheat_sources()
+            .into_iter()
+            .next()
+            .expect("a built-in trusted source exists");
+        source.source_id = source_id.to_string();
+        CheatSourceFetchResult {
+            schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+            status,
+            source,
+            local_catalogue_path: EncodedPath::from_path(Path::new("/isolated/catalogue.json")),
+            immutable_snapshot_path: EncodedPath::from_path(Path::new("/isolated/snapshot")),
+            manifest: cheat_manifest(source_id),
+            freshness: CheatSourceFreshness::Fresh,
+            from_cache: status != CheatSourceFetchStatus::Fetched,
+            stale: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn app_with_open_cheat_workflow() -> ArchiveFsApp {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.retroarch_profiles =
+            RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+                "native-user",
+                true,
+            )]));
+        app.cheat_workflow = Some(CheatWorkflowState {
+            archive_path: PathBuf::from("/roms/a.zip"),
+            display_name: "a".to_string(),
+            platform: None,
+            source_root: PathBuf::from("/roms"),
+            size_bytes: None,
+            selected_profile_id: Some("native-user".to_string()),
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: Some("source-a".to_string()),
+            fetch_force_refresh: false,
+        });
+        app.tools_overlay = ToolsOverlay::RetroArchCheats;
+        app
+    }
+
+    #[test]
+    fn cheat_source_labels_cover_every_freshness_and_status() {
+        assert_eq!(cheat_freshness_label(CheatSourceFreshness::Fresh), "Fresh");
+        assert_eq!(cheat_freshness_label(CheatSourceFreshness::Stale), "Stale");
+        assert_eq!(
+            cheat_freshness_label(CheatSourceFreshness::Missing),
+            "Not cached"
+        );
+        assert_eq!(
+            cheat_freshness_label(CheatSourceFreshness::Unknown),
+            "Unknown"
+        );
+        assert_eq!(
+            cheat_fetch_status_label(CheatSourceFetchStatus::Fetched),
+            "Downloaded fresh catalogue"
+        );
+        assert_eq!(
+            cheat_fetch_status_label(CheatSourceFetchStatus::CacheReused),
+            "Reused cached snapshot"
+        );
+        assert_eq!(
+            cheat_fetch_status_label(CheatSourceFetchStatus::OfflineReused),
+            "Offline: reused cached snapshot"
+        );
+    }
+
+    #[test]
+    fn stale_cheat_source_fetch_result_is_discarded_not_applied() {
+        let mut app = app_with_open_cheat_workflow();
+        let (sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading { receiver };
+
+        // The user switched sources while the fetch ran: the result
+        // arriving for the *old* source must be discarded, never shown.
+        sender
+            .send(Ok(cheat_fetch_result_for(
+                "source-b",
+                CheatSourceFetchStatus::Fetched,
+            )))
+            .unwrap();
+        app.poll_cheat_workflow();
+        assert!(
+            matches!(
+                app.cheat_workflow.as_ref().unwrap().source_fetch,
+                CheatStepResource::NotLoaded
+            ),
+            "a result for a no-longer-selected source must be discarded"
+        );
+    }
+
+    #[test]
+    fn superseded_cheat_fetch_receiver_cannot_deliver_a_result() {
+        let mut app = app_with_open_cheat_workflow();
+        let (old_sender, old_receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
+            receiver: old_receiver,
+        };
+        // A newer operation supersedes the old one: replacing the state
+        // drops the old receiver, so the old worker's send fails and its
+        // result can never apply.
+        let (_new_sender, new_receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
+            receiver: new_receiver,
+        };
+        let stale = old_sender.send(Ok(cheat_fetch_result_for(
+            "source-a",
+            CheatSourceFetchStatus::Fetched,
+        )));
+        assert!(
+            stale.is_err(),
+            "the superseded worker's send must fail once its receiver is gone"
+        );
+    }
+
+    #[test]
+    fn offline_cached_snapshot_reuse_applies_and_is_recorded() {
+        let mut app = app_with_open_cheat_workflow();
+        let (sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading { receiver };
+        sender
+            .send(Ok(cheat_fetch_result_for(
+                "source-a",
+                CheatSourceFetchStatus::OfflineReused,
+            )))
+            .unwrap();
+        app.poll_cheat_workflow();
+        match &app.cheat_workflow.as_ref().unwrap().source_fetch {
+            CheatStepResource::Ready(result) => {
+                assert_eq!(result.status, CheatSourceFetchStatus::OfflineReused);
+            }
+            other => panic!("expected Ready, got {}", cheat_resource_debug(other)),
+        }
+        assert!(
+            app.history.entries().any(|entry| {
+                entry.action == ActivityAction::CheatSourceRetrieval
+                    && entry.outcome == ActivityOutcome::Completed
+            }),
+            "a completed retrieval must be recorded in the operation history"
+        );
+    }
+
+    fn cheat_resource_debug<T>(resource: &CheatStepResource<T>) -> &'static str {
+        match resource {
+            CheatStepResource::NotLoaded => "NotLoaded",
+            CheatStepResource::Loading { .. } => "Loading",
+            CheatStepResource::Ready(_) => "Ready",
+            CheatStepResource::Failed(_) => "Failed",
+        }
+    }
+
     #[test]
     fn cheat_entry_is_offered_only_for_one_existing_archive_with_an_eligible_profile() {
         let records = vec![record("/roms/a.zip", MountState::Pending)];
@@ -15341,7 +16011,7 @@ mod tests {
             cheat_profile("native-user", true),
             cheat_profile("flatpak-user", true),
         ]));
-        app.open_cheat_workflow(PathBuf::from("/roms/a.zip"));
+        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/a.zip"));
         let workflow = app.cheat_workflow.as_ref().expect("workflow must open");
         assert_eq!(workflow.selected_profile_id, None);
         assert_eq!(app.tools_overlay, ToolsOverlay::RetroArchCheats);
@@ -15351,13 +16021,13 @@ mod tests {
             cheat_profile("native-user", true),
             cheat_profile("blocked-profile", false),
         ]));
-        app.open_cheat_workflow(PathBuf::from("/roms/a.zip"));
+        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/a.zip"));
         let workflow = app.cheat_workflow.as_ref().expect("workflow must reopen");
         assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
 
         // Opening for an archive missing from the snapshot does nothing.
         app.cheat_workflow = None;
-        app.open_cheat_workflow(PathBuf::from("/roms/gone.zip"));
+        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/gone.zip"));
         assert!(app.cheat_workflow.is_none());
     }
 
@@ -15376,7 +16046,7 @@ mod tests {
                 true,
             )]));
 
-        app.open_cheat_workflow(PathBuf::from("/roms/a.zip"));
+        app.open_cheat_workflow(&egui::Context::default(), PathBuf::from("/roms/a.zip"));
         assert_eq!(
             app.selected_archive.as_deref(),
             Some(Path::new("/roms/a.zip"))
@@ -15410,6 +16080,10 @@ mod tests {
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             selected_profile_id: None,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: None,
+            fetch_force_refresh: false,
         };
 
         // Ineligible profile: blocker code and detail are rendered.

@@ -981,8 +981,8 @@
    "required_tests": [
     "existing cheat_sources tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "Cheat workflow Step 2 (show_cheat_workflow_step2): fixed trusted list only (radio selection, single-enabled preselection), per-source ID/URL/host/provenance/licence/pinned-version/trust-status details, cached snapshot freshness/version/retrieved-at/digest/file-count/setup-usable, warnings. No user-supplied URL surface exists.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -1005,8 +1005,8 @@
    "required_tests": [
     "existing fetch_retroarch_cheat_source tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "start_cheat_source_fetch: background thread around fetch_retroarch_cheat_source with HttpsCheatSourceTransport and default cache root; force-refresh toggle; start/completion/failure recorded as ActivityAction::CheatSourceRetrieval. Stale results cannot apply: superseded receivers are dropped (tested) and results for a no-longer-selected source are discarded at receive time (tested).",
    "implementation_commit": null,
    "notes": ""
   },
@@ -1027,8 +1027,8 @@
    "required_tests": [
     "existing inspect_retroarch_cheat_source tests"
    ],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "\"Use cached snapshot (offline)\" runs the same backend with offline=true (OfflineReused), enabled only when a cached snapshot exists; result panel shows status, digest, snapshot/catalogue paths, freshness, stale warning. Test: offline_cached_snapshot_reuse_applies_and_is_recorded.",
    "implementation_commit": null,
    "notes": ""
   },

@@ -418,12 +418,61 @@ Landed in commit "Add RetroArch cheat workflow to Selected archives":
   selection invariance, blocker rendering + explicit-choice message +
   stale-selection clearing.
 
-## Next deliverable
+## Cheat workflow — Step 2, trusted source and snapshot (2026-07-22)
 
-Cheat workflow Step 2: trusted source and snapshot (list built-in
-trusted sources, background fetch via `fetch_retroarch_cheat_source`,
-cached-snapshot inspection/offline reuse, freshness/digest display),
-then Step 3 matching.
+Landed in commit "Add trusted catalogue and snapshot controls":
+
+- `CheatStepResource<T>`: the workflow's background-resource state.
+  Stale-result protection is ownership (replacing the state drops the
+  superseded receiver, so its worker's send fails — tested), plus a
+  request-identity check discarding a retrieval whose source no longer
+  matches the current selection (tested).
+- Step 2 UI: fixed trusted-source list only (no user URL surface),
+  radio selection with single-enabled preselection, full provenance
+  details (ID, URL, permitted host, provenance, licence, pinned
+  version, trust status), cached snapshot state (freshness, version,
+  retrieved-at via `format_unix_timestamp_utc`, SHA-256 digest, file
+  count, setup-usable), warnings.
+- Actions: Fetch/Update catalogue (background
+  `fetch_retroarch_cheat_source` + `HttpsCheatSourceTransport`, all
+  core size/digest/redirect protections untouched), force-refresh
+  toggle, Use cached snapshot (offline reuse, enabled only when a
+  snapshot exists), Refresh source list. Retrieval outcomes recorded
+  in operation history as `ActivityAction::CheatSourceRetrieval`.
+- Result panel: retrieval status (fetched / cache reused / offline),
+  snapshot digest, immutable snapshot + catalogue paths, freshness,
+  stale warning, backend warnings.
+- Tests (4 new; 366 passing): label maps, stale-result discard,
+  superseded-receiver send failure, offline reuse applies + history.
+
+## Checkpoint (2026-07-22, usage-limit stop)
+
+The campaign stopped cleanly at the end of cheat-workflow Step 2 per
+operator instruction. Steps 1–2 are complete, validated (fmt clean,
+clippy `-D warnings` clean, 1250 workspace tests passing: cli 127,
+core 757, gui 366), and committed; no placeholder controls, dead code,
+or half-wired paths were left behind. Snapshot verification, pin/
+unpin, prune, and staging cleanup were deliberately **not** surfaced
+in Step 2 — no fake buttons exist for them; they are scoped to the
+cache-maintenance deliverable alongside rollback.
+
+## Next deliverable (exact Step 3 starting point)
+
+Cheat workflow Step 3/4 — matching and preview. Start from
+`CheatWorkflowState.source_fetch: CheatStepResource::Ready(result)`:
+`result.local_catalogue_path` is the catalogue input for
+`build_retroarch_cheat_setup_plan(&HostReadOnlyFilesystem,
+&discovery, &selected_profile, catalogue_path, database_path,
+journal_path, allow_replace_different)` (see the CLI's
+`retroarch_cheat_setup.rs` for the exact orchestration: data dir from
+`default_database_path().parent()`, run id, journal path under
+`CHEAT_INSTALL_RUNS_DIRECTORY_NAME`). Run the plan build in the
+background as a new `CheatStepResource<RetroArchCheatSetupPlan>`;
+filter `plan.preview` entries / `plan.installer_entries` to the
+workflow's exact archive path; render exact/ambiguous/no-match from
+the entries' `CheatMatchConfidence`/`CheatGameMatch` evidence with
+explicit user choice on ambiguity; the Install action stays disabled
+while `plan.preview` carries blocking errors and is Step 5's scope.
 
 ## Latest clean commit
 
