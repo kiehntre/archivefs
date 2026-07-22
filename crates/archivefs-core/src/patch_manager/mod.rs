@@ -20,6 +20,7 @@
 //! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
+mod cheat_cache_maintenance;
 mod cheat_catalogue;
 mod cheat_history;
 mod cheat_install_result;
@@ -47,6 +48,17 @@ use crate::{Database, PersistedArchive};
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
     HypotheticalDestination, InstallationCandidate,
+};
+pub use cheat_cache_maintenance::{
+    CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
+    CachePruneEntryStatus, CachePruneExecutionEntry, CachePruneExecutionResult,
+    CachePruneExecutionStatus, CachePrunePlan, CachePrunePlanEntry, CachePrunePolicy,
+    CachePruneReason, DEFAULT_ABANDONED_STAGING_MIN_AGE_SECONDS,
+    MINIMUM_ABANDONED_STAGING_AGE_SECONDS, SnapshotInventoryEntry, SnapshotInventoryReport,
+    SnapshotPinResult, SnapshotPinStatus, SnapshotVerificationFinding, SnapshotVerificationReport,
+    SnapshotVerificationState, execute_retroarch_cheat_cache_prune,
+    inventory_retroarch_cheat_snapshots, plan_retroarch_cheat_cache_prune,
+    set_retroarch_cheat_snapshot_pin, verify_retroarch_cheat_snapshots,
 };
 pub use cheat_catalogue::{
     CHEAT_CATALOGUE_FORMAT_VERSION, CatalogueDiagnostic, CheatAvailabilityEntry,

@@ -139,6 +139,11 @@ These are implemented, tested, and in current use today:
   existing-parser validation, immutable content-addressed snapshots,
   provenance inspection, offline reuse, and guided `--source` setup. See
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- Immutable RetroArch cheat snapshots have deterministic inventory, explicit
+  integrity verification, external atomic pins, conservative prune planning,
+  confirmed per-candidate deletion revalidation, and deliberate abandoned
+  staging cleanup. There is no automatic pruning. See
+  [`docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
 
 ## Current development
 

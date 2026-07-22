@@ -26,10 +26,10 @@ use super::load_cheat_catalogue_snapshot;
 
 pub const CHEAT_SOURCE_RESULT_SCHEMA_VERSION: u32 = 1;
 const CACHE_DIRECTORY: &str = "cheat-sources";
-const METADATA_FILE: &str = "metadata.json";
-const SNAPSHOTS_DIRECTORY: &str = "snapshots";
-const MANIFESTS_DIRECTORY: &str = "manifests";
-const STAGING_DIRECTORY: &str = ".staging";
+pub(super) const METADATA_FILE: &str = "metadata.json";
+pub(super) const SNAPSHOTS_DIRECTORY: &str = "snapshots";
+pub(super) const MANIFESTS_DIRECTORY: &str = "manifests";
+pub(super) const STAGING_DIRECTORY: &str = ".staging";
 const FRESH_SECONDS: u64 = 24 * 60 * 60;
 const REDIRECT_LIMIT: usize = 3;
 const HEADER_BYTES_LIMIT: usize = 32 * 1024;
@@ -107,7 +107,11 @@ pub struct CheatSourceError {
 }
 
 impl CheatSourceError {
-    fn new(stage: CheatSourceErrorStage, code: &str, message: impl Into<String>) -> Self {
+    pub(super) fn new(
+        stage: CheatSourceErrorStage,
+        code: &str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
             stage,
@@ -1236,11 +1240,12 @@ fn validate_unix_entry_mode(mode: u32, name: &str) -> Result<(), CheatSourceErro
     }
 }
 
-fn collect_catalogue_manifest(
+pub(super) fn collect_catalogue_manifest(
     root: &Path,
 ) -> Result<Vec<CheatSourceManifestFile>, CheatSourceError> {
     let mut pending = vec![root.to_path_buf()];
     let mut files = Vec::new();
+    let mut total_bytes = 0u64;
     while let Some(directory) = pending.pop() {
         validate_cache_path_for_read(&directory)?;
         let entries = fs::read_dir(&directory)
@@ -1265,6 +1270,22 @@ fn collect_catalogue_manifest(
                 return Err(cache_error(
                     "catalogue_manifest_special_file",
                     format!("special file in catalogue snapshot: {}", path.display()),
+                ));
+            }
+            if metadata.len() > FILE_SIZE_LIMIT {
+                return Err(cache_error(
+                    "catalogue_manifest_file_size_limit",
+                    format!(
+                        "catalogue file exceeds {FILE_SIZE_LIMIT} bytes: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if total_bytes > EXPANDED_SIZE_LIMIT {
+                return Err(cache_error(
+                    "catalogue_manifest_total_size_limit",
+                    "catalogue files exceed the expanded-size verification limit",
                 ));
             }
             let relative = path.strip_prefix(root).map_err(|_| {
@@ -1487,14 +1508,14 @@ fn zip_magic_valid(path: &Path) -> Result<bool, CheatSourceError> {
         [0x50, 0x4b, 0x03, 0x04] | [0x50, 0x4b, 0x05, 0x06] | [0x50, 0x4b, 0x07, 0x08]
     ))
 }
-fn manifest_freshness(manifest: &CheatSourceManifest) -> CheatSourceFreshness {
+pub(super) fn manifest_freshness(manifest: &CheatSourceManifest) -> CheatSourceFreshness {
     if now_seconds().saturating_sub(manifest.fetched_at_unix_seconds) <= FRESH_SECONDS {
         CheatSourceFreshness::Fresh
     } else {
         CheatSourceFreshness::Stale
     }
 }
-fn now_seconds() -> u64 {
+pub(super) fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1512,7 +1533,7 @@ fn prepare_cache_root(path: &Path) -> Result<(), CheatSourceError> {
     create_safe_directory(path)?;
     validate_cache_path_for_read(path)
 }
-fn validate_cache_path_for_read(path: &Path) -> Result<(), CheatSourceError> {
+pub(super) fn validate_cache_path_for_read(path: &Path) -> Result<(), CheatSourceError> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -1560,7 +1581,10 @@ fn reject_symlink(path: &Path) -> Result<(), CheatSourceError> {
     }
 }
 
-fn safe_regular_or_directory(path: &Path, directory: bool) -> Result<(), CheatSourceError> {
+pub(super) fn safe_regular_or_directory(
+    path: &Path,
+    directory: bool,
+) -> Result<(), CheatSourceError> {
     validate_cache_path_for_read(path)?;
     let metadata =
         fs::symlink_metadata(path).map_err(|error| cache_error("snapshot_inaccessible", error))?;
@@ -1576,7 +1600,7 @@ fn safe_regular_or_directory(path: &Path, directory: bool) -> Result<(), CheatSo
     Ok(())
 }
 
-fn validate_snapshot_name(value: &str) -> Result<(), CheatSourceError> {
+pub(super) fn validate_snapshot_name(value: &str) -> Result<(), CheatSourceError> {
     if !value.is_empty()
         && value.len() <= 128
         && value.bytes().all(|byte| {
@@ -1610,7 +1634,7 @@ fn validate_relative_path(value: &str) -> Result<(), CheatSourceError> {
     }
 }
 
-fn validate_catalogue_prefix(value: &str) -> Result<(), CheatSourceError> {
+pub(super) fn validate_catalogue_prefix(value: &str) -> Result<(), CheatSourceError> {
     if value.is_empty() {
         Ok(())
     } else {
@@ -1632,7 +1656,10 @@ fn sync_directory(path: &Path) -> Result<(), CheatSourceError> {
         .and_then(|file| file.sync_all())
         .map_err(|error| cache_error("directory_sync_failed", error))
 }
-fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), CheatSourceError> {
+pub(super) fn atomic_write_json(
+    path: &Path,
+    value: &impl Serialize,
+) -> Result<(), CheatSourceError> {
     let parent = path
         .parent()
         .ok_or_else(|| cache_error("metadata_path_invalid", "metadata path has no parent"))?;
@@ -1721,7 +1748,7 @@ fn record_fetch_failure(
 fn registry_error(code: &str, message: impl std::fmt::Display) -> CheatSourceError {
     CheatSourceError::new(CheatSourceErrorStage::Registry, code, message.to_string())
 }
-fn cache_error(code: &str, message: impl std::fmt::Display) -> CheatSourceError {
+pub(super) fn cache_error(code: &str, message: impl std::fmt::Display) -> CheatSourceError {
     CheatSourceError::new(CheatSourceErrorStage::Cache, code, message.to_string())
 }
 fn extraction_error(code: &str, message: impl std::fmt::Display) -> CheatSourceError {

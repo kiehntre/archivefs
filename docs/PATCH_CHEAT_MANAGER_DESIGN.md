@@ -691,6 +691,13 @@ models produce an immutable local catalogue path. Guided setup consumes that
 path through `--source`; local setup is unchanged. See
 [`docs/RETROARCH_CHEAT_SOURCES.md`](RETROARCH_CHEAT_SOURCES.md).
 
+`patch_manager::cheat_cache_maintenance` is a separate backend boundary.
+Inventory and verification are read-only, pins live outside immutable
+contents, and pruning must be explicitly planned, confirmed, and revalidated
+per candidate. It never runs as part of retrieval, setup, installation,
+history, or rollback. See
+[`docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
+
 ## Auditing and Observability
 
 Persistent audit storage begins only in a later approved phase; Phase 1 emits bounded in-memory diagnostics and CLI output. Later audit events record source ID/version, metadata snapshot hash, optional artifact hash, verification result, adapter/installation ID, match evidence, plan ID, user or unattended-policy decision, operation ID, changed manifest IDs, result, and sanitized error category. They do not record secrets or unnecessary game paths in exported diagnostics. CLI and GUI can derive a chronological report and answer: what source supplied this file, why it matched this game, what bytes were installed, what was replaced, and whether rollback is available.

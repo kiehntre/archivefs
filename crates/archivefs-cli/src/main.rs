@@ -46,6 +46,7 @@ use archivefs_core::{
 };
 use serde::Serialize;
 
+mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
 
@@ -425,6 +426,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "retroarch-cheat-source-inspect" => {
             retroarch_cheat_sources::run_inspect(args.collect())?;
+        }
+        "retroarch-cheat-snapshot-list" => {
+            retroarch_cheat_cache::run_list(args.collect())?;
+        }
+        "retroarch-cheat-snapshot-verify" => {
+            retroarch_cheat_cache::run_verify(args.collect())?;
+        }
+        "retroarch-cheat-snapshot-pin" => {
+            retroarch_cheat_cache::run_pin(args.collect(), true)?;
+        }
+        "retroarch-cheat-snapshot-unpin" => {
+            retroarch_cheat_cache::run_pin(args.collect(), false)?;
+        }
+        "retroarch-cheat-cache-prune" => {
+            retroarch_cheat_cache::run_prune(args.collect())?;
         }
         "retroarch-cheat-history" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -4071,6 +4087,18 @@ fn print_help() {
         "  retroarch-cheat-source-inspect <source-id|snapshot-path>  Inspect registry, provenance, cache integrity, and setup usability (read-only; --cache-root/--json accepted)"
     );
     println!(
+        "  retroarch-cheat-snapshot-list  Inventory immutable cheat snapshots (read-only; --source/--cache-root/--json accepted)"
+    );
+    println!(
+        "  retroarch-cheat-snapshot-verify <snapshot-id>|--source <source-id>|--all  Verify snapshot manifests and file digests (read-only)"
+    );
+    println!(
+        "  retroarch-cheat-snapshot-pin|retroarch-cheat-snapshot-unpin <snapshot-id>  Atomically manage prune-protection metadata"
+    );
+    println!(
+        "  retroarch-cheat-cache-prune  Preview conservative snapshot/staging cleanup; --yes is required to delete"
+    );
+    println!(
         "  retroarch-cheat-history  Inspect cheat-install journals (read-only; --journal-root <path>/--json accepted)"
     );
     println!(
@@ -4164,6 +4192,10 @@ fn print_help() {
     println!("  archivefs retroarch-cheat-source-list --json");
     println!("  archivefs retroarch-cheat-source-fetch libretro-buildbot-cheats");
     println!("  archivefs retroarch-cheat-source-inspect libretro-buildbot-cheats");
+    println!("  archivefs retroarch-cheat-snapshot-list --json");
+    println!("  archivefs retroarch-cheat-snapshot-verify --all");
+    println!("  archivefs retroarch-cheat-snapshot-pin <snapshot-id>");
+    println!("  archivefs retroarch-cheat-cache-prune --keep 3 --dry-run");
     println!(
         "  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --profile <profile-id> --yes"
     );
