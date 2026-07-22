@@ -3,6 +3,10 @@
 ArchiveFS can discover and inspect its RetroArch cheat installation journals
 without opening their JSON files manually:
 
+Journals produced by guided
+[`retroarch-cheat-setup`](RETROARCH_CHEAT_SETUP.md) use this same schema and
+default history root; there is no separate setup history implementation.
+
 ```console
 archivefs retroarch-cheat-history
 archivefs retroarch-cheat-history --journal-root /path/to/cheat-install-runs

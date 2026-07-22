@@ -671,6 +671,18 @@ root, entry paths, and hashes rather than filenames. This adds no journal
 format and performs no repair, migration, directory creation, or other write;
 see [`docs/RETROARCH_CHEAT_HISTORY.md`](RETROARCH_CHEAT_HISTORY.md).
 
+### Guided RetroArch cheat setup (shipped orchestration)
+
+`patch_manager::retroarch_cheat_setup` and `retroarch-cheat-setup` add a
+profile-aware end-user orchestration layer without adding a second installer.
+The core classifies existing native/Flatpak/AppImage discoveries, requires a
+complete readable config and lossless safe destination, filters the advisory
+plan to the selected exact profile, and returns the original staging entries
+as an installer-ready plan. The CLI owns selection, confirmation, rendering,
+JSON, and exit codes; approved writes still flow only through
+`execute_cheat_install_run`. See
+[`docs/RETROARCH_CHEAT_SETUP.md`](RETROARCH_CHEAT_SETUP.md).
+
 ## Auditing and Observability
 
 Persistent audit storage begins only in a later approved phase; Phase 1 emits bounded in-memory diagnostics and CLI output. Later audit events record source ID/version, metadata snapshot hash, optional artifact hash, verification result, adapter/installation ID, match evidence, plan ID, user or unattended-policy decision, operation ID, changed manifest IDs, result, and sanitized error category. They do not record secrets or unnecessary game paths in exported diagnostics. CLI and GUI can derive a chronological report and answer: what source supplied this file, why it matched this game, what bytes were installed, what was replaced, and whether rollback is available.

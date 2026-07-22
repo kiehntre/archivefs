@@ -51,6 +51,11 @@ for the detailed safety model behind these principles.
   `retroarch-cheat-history` and `retroarch-cheat-inspect`. Inspection validates
   current destination and backup hashes without changing files; see
   [`docs/RETROARCH_CHEAT_HISTORY.md`](docs/RETROARCH_CHEAT_HISTORY.md).
+- Provides guided local RetroArch cheat setup through
+  `retroarch-cheat-setup <catalogue-path>`: discovers safe native, Flatpak, and
+  verified portable profiles, previews conservative matches, and delegates
+  approved changes to the existing journaled installer. See
+  [`docs/RETROARCH_CHEAT_SETUP.md`](docs/RETROARCH_CHEAT_SETUP.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
@@ -60,6 +65,7 @@ for the detailed safety model behind these principles.
 
 - No automatic patch installation, cheat enabling, or artifact downloading -
   `pcsx2-patch-preview` and `retroarch-patch-preview` are preview only.
+  Guided cheat setup installs only after confirmation and never enables cheats.
 - No broad multi-emulator support yet - PCSX2 and RetroArch are the only
   two emulators with any patch/cheat preview today, and neither launches,
   configures, or manages the emulator itself.

@@ -373,7 +373,9 @@ pub fn preview_retroarch_patch_and_cheat_destinations(
 /// PCSX2 (whose destination lives entirely inside the PCSX2 installation),
 /// a RetroArch soft-patch sibling destination is computed from the
 /// archive's own path, which `CatalogueGameEvidence` does not carry.
-fn load_retroarch_catalogue_archives_read_only(path: &Path) -> Result<Vec<PersistedArchive>> {
+pub(super) fn load_retroarch_catalogue_archives_read_only(
+    path: &Path,
+) -> Result<Vec<PersistedArchive>> {
     let database = Database::open_read_only(path)
         .map_err(|error| PatchManagerError::Catalogue(error.to_string()))?;
     let archives = database

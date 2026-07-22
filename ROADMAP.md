@@ -129,6 +129,11 @@ These are implemented, tested, and in current use today:
   destination/backup hash assessment, strongly bound rollback-journal
   discovery, stable JSON, and fail-closed path/symlink handling; see
   [`docs/RETROARCH_CHEAT_HISTORY.md`](docs/RETROARCH_CHEAT_HISTORY.md).
+- Guided RetroArch cheat setup is available via
+  `retroarch-cheat-setup <catalogue-path>`. It reuses environment discovery,
+  exact profile IDs, read-only matching, destination safety, and the existing
+  installer/history/journal/rollback systems; it adds no downloader or GUI.
+  See [`docs/RETROARCH_CHEAT_SETUP.md`](docs/RETROARCH_CHEAT_SETUP.md).
 
 ## Current development
 

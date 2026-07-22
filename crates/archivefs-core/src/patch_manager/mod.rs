@@ -31,6 +31,7 @@ mod matching;
 mod pcsx2;
 mod retrieval;
 mod retroarch;
+mod retroarch_cheat_setup;
 mod retroarch_inventory;
 
 use std::collections::BTreeSet;
@@ -51,8 +52,8 @@ pub use cheat_catalogue::{
     CheatAvailabilityReport, CheatAvailabilitySummary, CheatCatalogueFormat,
     CheatCatalogueSnapshot, CheatCatalogueSource, CheatDefinition, CheatGameMatch, CheatGameRecord,
     CheatInstalledState, CheatMatchCandidate, CheatMatchConfidence, CheatMatchEvidence,
-    JsonManifestSource, RetroarchChtDirectorySource, build_cheat_availability_report,
-    load_cheat_catalogue_snapshot, match_cheat_game_record,
+    CheatStagingAction, CheatStagingPlan, JsonManifestSource, RetroarchChtDirectorySource,
+    build_cheat_availability_report, load_cheat_catalogue_snapshot, match_cheat_game_record,
 };
 pub use cheat_history::{
     CHEAT_HISTORY_RESULT_SCHEMA_VERSION, CheatBackupAssessment, CheatDestinationAssessment,
@@ -96,6 +97,15 @@ pub use retroarch::{
     PlaylistMatchConfidence, ProposedDestination, RetroArchAdvisoryEntry, RetroArchAdvisoryPlan,
     RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
+};
+pub use retroarch_cheat_setup::{
+    RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupDiscovery, RetroArchCheatSetupError,
+    RetroArchCheatSetupMessage, RetroArchCheatSetupNextStep, RetroArchCheatSetupPlan,
+    RetroArchCheatSetupPlannedAction, RetroArchCheatSetupPlannedEntry, RetroArchCheatSetupPreview,
+    RetroArchCheatSetupPreviewSummary, RetroArchCheatSetupProfile,
+    RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState, RetroArchCheatSetupResult,
+    RetroArchCheatSetupStatus, build_retroarch_cheat_setup_plan,
+    discover_retroarch_cheat_setup_profiles, resolve_retroarch_cheat_setup_profile,
 };
 pub use retroarch_inventory::{
     ArtifactAssociation, ArtifactAssociationConfidence, ArtifactCatalogueGame,
