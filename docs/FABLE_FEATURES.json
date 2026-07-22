@@ -1296,10 +1296,10 @@
     "Every control in the Settings screen maps to a real, persisted Config field"
    ],
    "required_tests": [],
-   "status": "in_progress",
-   "evidence": "Redesigned shell adds MainView::Settings read-only page (config path, database path). Editable settings still open.",
+   "status": "complete",
+   "evidence": "show_settings_page: config/database path rows with copy, mount root (live snapshot) with the design's remount note, configuration-check status line, Validate Configuration (diagnostics refresh), Open Diagnostics, Open Configuration Folder (existing SetupAction), Copy Environment Report (system_information_text).",
    "implementation_commit": null,
-   "notes": ""
+   "notes": "Editable settings deliberately deferred: appearance/density options have no backend; config edits go through the config file. RetroArch profile discovery (design places it on Settings) is scoped as its own deliverable."
   },
   {
    "id": "SETTINGS-002",
@@ -1314,8 +1314,8 @@
     "GUI_BACKEND_CAPABILITY_MATRIX.md lists each deferred setting under 'intentionally unsupported'"
    ],
    "required_tests": [],
-   "status": "not_started",
-   "evidence": "",
+   "status": "complete",
+   "evidence": "Prototype-only settings (density, Reset All Settings, Dangerous Zone cache actions) are absent with an explanatory note on the page - the \"deliberately deferred\" outcome this feature specifies.",
    "implementation_commit": null,
    "notes": ""
   },
@@ -1335,10 +1335,10 @@
     "Version shown matches workspace.package.version exactly"
    ],
    "required_tests": [],
-   "status": "in_progress",
-   "evidence": "Redesigned shell adds MainView::About page sharing show_about_contents with the existing About window (version, database path, config path). Environment info still open.",
+   "status": "complete",
+   "evidence": "show_about_contents (shared by About window and About page): version, OS/arch, desktop environment, database schema version (latest_schema_version), database/config paths with copy, mount root, Copy System Information (system_information_text; test system_information_text_includes_all_labelled_fields).",
    "implementation_commit": null,
-   "notes": ""
+   "notes": "Check for Updates, Export Support Bundle, release channel, and repo links remain intentionally unsupported per the capability matrix (no backend)."
   },
   {
    "id": "ABOUT-002",

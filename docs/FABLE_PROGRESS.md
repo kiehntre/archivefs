@@ -332,13 +332,40 @@ Landed in commit "Add summary, copy, and re-run to the Doctor screen":
 - Test: doctor_summary_and_report_text_reflect_exact_check_counts
   (356 passed, 0 failed).
 
+## Settings and About parity (2026-07-22)
+
+Landed in commit "Extend Settings and About within backend support":
+
+- Settings (`show_settings_page`, now action-returning): config and
+  database path rows with copy, mount root from the live snapshot with
+  the design's "only affects new mounts" note, a configuration-check
+  status line driven by `DiagnosticsState`, Validate Configuration
+  (diagnostics refresh), Open Diagnostics (overlay), Open Configuration
+  Folder (existing `SetupAction::OpenConfigFolder` workflow), and Copy
+  Environment Report.
+- About (`show_about_contents`, shared window + page): version, OS and
+  architecture, desktop environment, database schema version, paths
+  with copy, mount root, and Copy System Information — all from
+  compile-time constants, `latest_schema_version`, and environment
+  variables already surfaced by `clipboard_environment_summary`.
+- `system_information_text` is the shared pure payload for both copy
+  actions; missing inputs are reported as "unknown", never invented.
+- Deliberate deferrals recorded in FABLE_FEATURES.json: editable
+  settings (density/reset/cache actions have no backend), update
+  check, support bundle, repo links. RetroArch profile discovery —
+  which the design places on the Settings screen — is the next
+  deliverable, as the first RetroArch surface.
+- Tests: 357 passed, 0 failed.
+
 ## Next deliverable
 
-Settings parity within backend support (mount root / config visibility;
-prototype-only settings stay deferred) and About environment info, then
-assess the RetroArch surfaces (design has no RetroArch screen — decide
-where trusted-source/cheat workflows belong in the redesigned shell
-before building them).
+RetroArch profile discovery on Settings (design: "Discovered Profiles"
+list with per-profile state, Rescan Profiles; backend
+`discover_retroarch_cheat_setup_profiles` →
+`RetroArchCheatSetupProfileState`/`Blocker`, run on a background
+thread like every other workflow). The design's "ArchiveFS will never
+silently pick between ambiguous or blocked profiles" wording matches
+the backend's blocker model exactly.
 
 ## Latest clean commit
 

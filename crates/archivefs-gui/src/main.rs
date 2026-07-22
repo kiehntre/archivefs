@@ -5270,11 +5270,16 @@ impl eframe::App for ArchiveFsApp {
         }
 
         if self.show_about {
+            let mount_root = match &self.state {
+                LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                _ => None,
+            };
             show_about_window(
                 context,
                 &mut self.show_about,
                 &self.database_state,
                 &self.diagnostics,
+                mount_root,
                 &mut self.clipboard,
             );
         }
@@ -5637,22 +5642,46 @@ impl eframe::App for ArchiveFsApp {
             }
 
             if self.view == MainView::Settings {
-                show_settings_page(
+                let mount_root = match &self.state {
+                    LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                    _ => None,
+                };
+                let action = show_settings_page(
                     ui,
                     &self.database_state,
                     &self.diagnostics,
+                    mount_root,
+                    busy,
                     &mut self.clipboard,
                 );
+                match action {
+                    Some(SettingsPageAction::OpenConfigFolder) => {
+                        self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder);
+                    }
+                    Some(SettingsPageAction::ValidateConfiguration) => {
+                        self.refresh_diagnostics(context);
+                    }
+                    Some(SettingsPageAction::OpenDiagnostics) => {
+                        self.tools_overlay = ToolsOverlay::Diagnostics;
+                        self.refresh_diagnostics(context);
+                    }
+                    None => {}
+                }
                 return;
             }
 
             if self.view == MainView::About {
                 ui.heading("About");
                 ui.add_space(4.0);
+                let mount_root = match &self.state {
+                    LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                    _ => None,
+                };
                 show_about_contents(
                     ui,
                     &self.database_state,
                     &self.diagnostics,
+                    mount_root,
                     &mut self.clipboard,
                 );
                 return;
@@ -8561,6 +8590,7 @@ fn show_about_window(
     open: &mut bool,
     database_state: &DatabaseState,
     diagnostics: &DiagnosticsState,
+    mount_root: Option<&Path>,
     clipboard: &mut dyn ClipboardBackend,
 ) {
     egui::Window::new("About ArchiveFS")
@@ -8568,20 +8598,46 @@ fn show_about_window(
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
-            show_about_contents(ui, database_state, diagnostics, clipboard);
+            show_about_contents(ui, database_state, diagnostics, mount_root, clipboard);
         });
 }
 
 /// The About information itself - version plus key paths - shared by the
 /// pre-redesign About window (Help menu) and the redesigned shell's
 /// About page, so the two can never drift apart.
+/// The About page's "Copy System Information" and the Settings page's
+/// "Copy Environment Report" payload - version, platform, desktop
+/// session, database schema, and key paths as plain text. Pure given
+/// its inputs (the environment variables it reads are the same ones
+/// `clipboard_environment_summary` already reports).
+fn system_information_text(
+    database_path: Option<&str>,
+    config_path: Option<&str>,
+    mount_root: Option<&str>,
+) -> String {
+    format!(
+        "ArchiveFS {}\nOS: {} ({})\nDesktop: {}\nSession: {}\nDatabase schema: v{}\nDatabase path: {}\nConfiguration path: {}\nMount root: {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()),
+        clipboard_environment_summary(),
+        latest_schema_version(),
+        database_path.unwrap_or("unknown"),
+        config_path.unwrap_or("unknown"),
+        mount_root.unwrap_or("not loaded"),
+    )
+}
+
 fn show_about_contents(
     ui: &mut egui::Ui,
     database_state: &DatabaseState,
     diagnostics: &DiagnosticsState,
+    mount_root: Option<&Path>,
     clipboard: &mut dyn ClipboardBackend,
 ) {
     ui.strong(format!("ArchiveFS {}", env!("CARGO_PKG_VERSION")));
+    ui.label("Linux archive-management utility");
     ui.add_space(8.0);
 
     let database_path = database_state_path(database_state).map(|path| path.display().to_string());
@@ -8592,10 +8648,27 @@ fn show_about_contents(
             .map(|path| path.display().to_string()),
         _ => None,
     };
+    let mount_root = mount_root.map(|path| path.display().to_string());
 
     egui::Grid::new("about_paths_grid")
         .num_columns(2)
         .show(ui, |ui| {
+            ui.strong("Operating system");
+            ui.label(format!(
+                "{} ({})",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ));
+            ui.end_row();
+
+            ui.strong("Desktop environment");
+            ui.label(std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()));
+            ui.end_row();
+
+            ui.strong("Database schema");
+            ui.label(format!("v{}", latest_schema_version()));
+            ui.end_row();
+
             ui.strong("Database path");
             ui.horizontal(|ui| {
                 ui.label(database_path.as_deref().unwrap_or("unknown"));
@@ -8617,7 +8690,20 @@ fn show_about_contents(
                 }
             });
             ui.end_row();
+
+            ui.strong("Mount root");
+            ui.label(mount_root.as_deref().unwrap_or("not loaded"));
+            ui.end_row();
         });
+
+    ui.add_space(8.0);
+    if ui.button("Copy System Information").clicked() {
+        let _ = clipboard.set_text(system_information_text(
+            database_path.as_deref(),
+            config_path.as_deref(),
+            mount_root.as_deref(),
+        ));
+    }
 }
 
 /// The design's per-archive validation label on the Mount page - a pure
@@ -9347,12 +9433,24 @@ fn show_history_logs_page(
 /// currently read-only information (campaign constraint: prototype-only
 /// settings such as UI density are deferred; editable settings arrive
 /// with the settings-integration milestone).
+/// What the Settings page asks `update` to do - each maps onto an
+/// existing proven workflow (`SetupAction::OpenConfigFolder`, the
+/// diagnostics refresh, the Diagnostics overlay), never new machinery.
+enum SettingsPageAction {
+    OpenConfigFolder,
+    ValidateConfiguration,
+    OpenDiagnostics,
+}
+
 fn show_settings_page(
     ui: &mut egui::Ui,
     database_state: &DatabaseState,
     diagnostics: &DiagnosticsState,
+    mount_root: Option<&Path>,
+    busy: bool,
     clipboard: &mut dyn ClipboardBackend,
-) {
+) -> Option<SettingsPageAction> {
+    let mut action = None;
     ui.heading("Settings");
     ui.add_space(4.0);
 
@@ -9364,6 +9462,7 @@ fn show_settings_page(
             .map(|path| path.display().to_string()),
         _ => None,
     };
+    let mount_root_text = mount_root.map(|path| path.display().to_string());
 
     egui::Grid::new("settings_paths_grid")
         .num_columns(2)
@@ -9389,13 +9488,71 @@ fn show_settings_page(
                 }
             });
             ui.end_row();
+
+            ui.strong("Mount root");
+            ui.label(mount_root_text.as_deref().unwrap_or("not loaded"));
+            ui.end_row();
         });
+    ui.label(
+        "Changing the mount root only affects new mounts. Existing mounts \
+         stay at their current destinations until remounted.",
+    );
+
+    ui.add_space(8.0);
+    match diagnostics {
+        DiagnosticsState::Ready { report, .. } => {
+            if diagnostics_can_continue(report) {
+                ui.label("Configuration check: no blocking issues found.");
+            } else {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "Configuration check found issues — open Diagnostics for details.",
+                );
+            }
+        }
+        DiagnosticsState::Loading { .. } => {
+            ui.label("Configuration check running...");
+        }
+        DiagnosticsState::Error { message, .. } => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Configuration check failed: {message}"),
+            );
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy, egui::Button::new("Validate Configuration"))
+            .clicked()
+        {
+            action = Some(SettingsPageAction::ValidateConfiguration);
+        }
+        if ui.button("Open Diagnostics").clicked() {
+            action = Some(SettingsPageAction::OpenDiagnostics);
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new("Open Configuration Folder"))
+            .clicked()
+        {
+            action = Some(SettingsPageAction::OpenConfigFolder);
+        }
+        if ui.button("Copy Environment Report").clicked() {
+            let _ = clipboard.set_text(system_information_text(
+                database_path.as_deref(),
+                config_path.as_deref(),
+                mount_root_text.as_deref(),
+            ));
+        }
+    });
 
     ui.add_space(8.0);
     ui.label(
         "Source folders are managed on the Sources page. Editable settings \
-         arrive with the Settings milestone of the redesign.",
+         beyond these are deliberately deferred: appearance/density options \
+         from the design have no backend, and configuration edits go through \
+         the config file, not this page.",
     );
+    action
 }
 
 fn history_entry_text(entry: &HistoryEntry) -> String {
@@ -14448,6 +14605,19 @@ mod tests {
             mount_validation_label(MountState::MountPathExists),
             "Destination already exists — will be skipped"
         );
+    }
+
+    #[test]
+    fn system_information_text_includes_all_labelled_fields() {
+        let text = system_information_text(Some("/db/library.sqlite3"), None, Some("/mnt/root"));
+        assert!(text.contains(&format!("ArchiveFS {}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("Database schema: v"));
+        assert!(text.contains("Database path: /db/library.sqlite3"));
+        assert!(
+            text.contains("Configuration path: unknown"),
+            "missing inputs must be reported as unknown, never invented"
+        );
+        assert!(text.contains("Mount root: /mnt/root"));
     }
 
     #[test]
