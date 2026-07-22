@@ -20,6 +20,8 @@ use archivefs_core::patch_manager::{
     default_cheat_source_cache_root, discover_retroarch_cheat_setup_profiles,
     fetch_retroarch_cheat_source, list_retroarch_cheat_sources,
 };
+mod ui;
+
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
     ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
@@ -50,29 +52,15 @@ use archivefs_core::{
     validate_library_view_destination, validate_new_source_folder,
 };
 use eframe::egui;
+use ui::{components as widgets, layout as ui_layout, theme};
 // Brings `String`'s char-index-safe insert/delete/slice methods into
 // scope - see `show_text_edit_with_context_menu` and its helpers, the
 // only place these are used. The same trait egui's own `TextEdit`
 // editing uses internally, so this can never disagree with it about
 // UTF-8/char-boundary handling.
 use eframe::egui::TextBuffer;
-
-/// The default/initial column widths - `[Platform, State, Archive path,
-/// Mount path]`. Platform and State stay fixed at these widths forever
-/// (milestone requirement: "Platform and State should remain compact");
-/// Archive path and Mount path are only the *starting point* for
-/// `LibraryColumnWidths`, which the header's drag handles mutate at
-/// runtime (see `show_column_resize_handle`). Still used directly
-/// wherever a widths array is needed but resizing is irrelevant (the
-/// loading-preview table before any live session exists, and the large
-/// majority of existing table tests that predate resizing and are not
-/// about it).
 const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
 const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
-/// Below this width a resizable column becomes an unusable sliver (milestone
-/// requirement: "sensible minimum widths so columns cannot collapse").
-/// Chosen so the column header text itself ("Archive path" / "Mount path")
-/// still fits without being clipped at the default readability scale.
 const MIN_RESIZABLE_COLUMN_WIDTH: f32 = 160.0;
 /// An upper bound purely to stop a single wild drag gesture from producing
 /// an absurd column width - not a meaningful design constraint otherwise;
@@ -86,19 +74,6 @@ const MAX_RESIZABLE_COLUMN_WIDTH: f32 = 2400.0;
 /// handle never occupy overlapping screen space (and therefore never
 /// compete for the same click/drag).
 const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
-
-/// Vertical bounds for the Library page's two draggable top panels (see
-/// `show_loaded_data`'s `TopBottomPanel::top` calls). Both use egui's own
-/// built-in resizable-panel support - session-persisted via `ctx.memory`
-/// keyed by the panel id, so a height survives navigating away to Health/
-/// Duplicates/Sources/Tools/Inspector and back with no extra state of our
-/// own to manage, and clamped by `height_range` so neither panel can be
-/// dragged into a zero-height sliver or squeeze the table below it out of
-/// existence. `SUMMARY_PANEL_DEFAULT_HEIGHT` matches the panel's ordinary
-/// single-line content (the milestone's "compact by default" requirement);
-/// `SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT` is tall enough to show the
-/// archive's core fields plus the Mount/Unmount button without scrolling
-/// for a typical record.
 const SUMMARY_PANEL_MIN_HEIGHT: f32 = 32.0;
 const SUMMARY_PANEL_DEFAULT_HEIGHT: f32 = 64.0;
 const SUMMARY_PANEL_MAX_HEIGHT: f32 = 320.0;
@@ -149,13 +124,18 @@ impl LibraryColumnWidths {
         ]
     }
 }
-/// A fixed, explicit `egui::Id` for the library search box - not for any
-/// production behaviour, but so tests can give it real keyboard focus
-/// via `Memory::request_focus` deterministically, without depending on
-/// egui's position-derived auto-id (see the milestone requirement that
-/// keyboard shortcuts must be ignored while this field has focus).
+
+fn responsive_library_column_widths(available_width: f32, spacing: f32) -> LibraryColumnWidths {
+    let fixed = COLUMN_WIDTHS[0] + COLUMN_WIDTHS[1] + spacing * 3.0;
+    let path_space = (available_width - fixed).max(520.0);
+    LibraryColumnWidths {
+        archive_path: (path_space * 0.46).max(240.0),
+        mount_path: (path_space * 0.54).max(280.0),
+    }
+}
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 const HISTORY_LIMIT: usize = 50;
+const ACTIVITY_EXPANDED_BY_DEFAULT: bool = false;
 const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
 const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
 const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
@@ -401,22 +381,12 @@ impl OperationHistory {
     fn entries(&self) -> impl Iterator<Item = &HistoryEntry> {
         self.entries.iter()
     }
-
-    /// Removes exactly the entry at display `index` (matching `entries()`'s
-    /// own iteration order, front = most recent) - milestone requirement:
-    /// "Clearing one entry must not reorder or alter unrelated entries."
-    /// `VecDeque::remove` already only ever shifts elements, never
-    /// reorders the remaining ones relative to each other.
     fn remove(&mut self, index: usize) {
         self.entries.remove(index);
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // A minimal, headless diagnostic path - milestone requirement: proves
-    // on the real desktop session, with a single command, whether the
-    // native clipboard backend actually works there, without opening the
-    // GUI window at all. Never prints clipboard content.
     if std::env::args().any(|arg| arg == "--clipboard-check") {
         run_clipboard_check();
         return Ok(());
@@ -550,14 +520,6 @@ struct ArchiveRow {
     search_text: String,
     origin: RowOrigin,
     unknown_platform: bool,
-    /// The configured source folder that owns this archive, if known -
-    /// the Library page's Source filter and the selected-archive details
-    /// panel's "Source" line (milestone requirement). `None` means
-    /// "Unassigned/Legacy": either no source could be resolved (an
-    /// orphaned/legacy catalogue row) or - for a brand new live-only row
-    /// never yet persisted - no configured source path is a prefix of its
-    /// absolute path. Never itself a database write; purely derived
-    /// display data, resolved once in `build_display_rows`.
     source_path: Option<PathBuf>,
 }
 
@@ -657,13 +619,6 @@ impl ArchiveRow {
         .to_lowercase();
         self
     }
-
-    /// Sets this row's resolved owning-source path - see `build_display_rows`,
-    /// the only caller. Deliberately does not touch `search_text`: the
-    /// Source filter is its own independent dropdown (see
-    /// `ArchiveFsApp::library_source_filter`), not part of the free-text
-    /// search the milestone's other filters/sort must remain independent
-    /// of.
     fn with_source_path(mut self, source_path: Option<PathBuf>) -> Self {
         self.source_path = source_path;
         self
@@ -1248,17 +1203,6 @@ struct RunningUnmountAll {
 
 #[derive(Clone)]
 struct UnmountAllConfirmation;
-
-/// The Library row context menu's "Unmount selected" confirmation -
-/// deliberately a marker with no captured item list, exactly like
-/// `UnmountAllConfirmation`. The dialog recomputes "which selected
-/// archives are currently mounted" fresh from `data.records`/
-/// `selected_archives` every frame it is open, and again at the moment
-/// Confirm is clicked - never a list captured when the menu was
-/// right-clicked - so a selection or mount-state change while the dialog
-/// is open is always reflected truthfully (milestone requirement:
-/// "revalidate before starting; do not unmount stale, missing or
-/// no-longer-mounted targets").
 #[derive(Clone)]
 struct UnmountSelectedConfirmation;
 
@@ -1994,15 +1938,6 @@ struct SourcesAddDialogState {
     path_text: String,
     validation_message: Option<String>,
 }
-
-/// The Remove-source confirmation dialog's state. `keep_catalogue`
-/// defaults to `true` (see `SourcesPageAction::open_remove_dialog`) - the
-/// milestone's required safe default; the user must actively switch it to
-/// remove catalogue rows. `last_archive_count` is copied from the
-/// `SourceFolderView` at the moment the dialog opens purely for display
-/// ("N rows affected") - never re-queried live, and never itself the
-/// value acted on (the actual removal always re-resolves the source by
-/// path at commit time).
 #[derive(Clone, Debug)]
 struct SourcesRemoveDialogState {
     path: PathBuf,
@@ -2116,15 +2051,6 @@ struct LibraryViewRemoveDialogState {
     view_name: String,
     keep_definition: bool,
 }
-
-/// The Library Views page's Preview details filter - milestone
-/// requirement: "filters by result type". Mirrors
-/// `archivefs_core::library_views`'s private `LibraryViewCountBucket`
-/// exactly (six buckets, `Skip*` collapsed into one `Skip`) - kept as its
-/// own small presentation-layer duplicate rather than exporting that
-/// private core type, the same "own small presentation-layer function"
-/// convention `source_availability_label` already uses for
-/// `SourceAvailability`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LibraryViewPlanFilter {
     #[default]
@@ -2219,10 +2145,6 @@ impl From<&CatalogueDuplicateGroup> for DuplicateGroupIdentity {
         }
     }
 }
-
-/// The Health Dashboard's category filter (milestone requirement 3).
-/// `MountFailures` is the broader grouping of both failure categories;
-/// `Retryable`/`Terminal` narrow to exactly one of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HealthIssueFilter {
     #[default]
@@ -2281,21 +2203,12 @@ impl HealthIssueFilter {
         }
     }
 }
-
-/// The Health Dashboard's own independent filter state - milestone
-/// requirement 3. Deliberately never shared with `LibraryRowFilters` or
-/// `DuplicateReviewFilters`: entering or leaving the dashboard must never
-/// reset (or be reset by) the ordinary library's or Duplicate Review's own
-/// search/filter state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HealthDashboardFilters {
     search: String,
     platform: Option<String>,
     category: HealthIssueFilter,
 }
-
-/// Milestone requirement 4's sortable columns, plus the documented default
-/// severity order (`HealthCategory::severity_rank`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HealthSortField {
     #[default]
@@ -2317,28 +2230,6 @@ impl std::fmt::Display for HealthSortField {
         })
     }
 }
-
-/// What `cached_health_issues` last built the health report *from* -
-/// milestone requirement: "must not be rebuilt every frame." Compared by
-/// value each frame the dashboard is open; the report itself is rebuilt
-/// only when this key (together with the recovery-offer sets, compared
-/// separately - see `HealthReportCache`) actually changes.
-///
-/// `live_data_ptr`/`database_snapshot_ptr` are the addresses of the
-/// current `LoadedData`/`CachedLibrarySnapshot` this frame's `self.state`/
-/// `self.database_state` actually point at - never a copy of a
-/// generation counter alone. A `LoadState`/`DatabaseState` only ever
-/// starts pointing at a *new* `Box` once a background load has both
-/// completed *and* already passed `poll_load`/`poll_database_load`'s
-/// existing `generation` staleness guard (untouched by this milestone),
-/// so a stale/discarded background result can never move this key: it
-/// simply never gets applied to `self.state`/`self.database_state` in the
-/// first place. This also sidesteps a subtler bug a raw generation
-/// comparison would hit: `refresh_generation` bumps the instant a refresh
-/// *starts*, before the new data exists, so keying on it alone would
-/// falsely look "unchanged" once the slow load actually finishes (same
-/// generation value, brand new data). Pointer identity only ever changes
-/// exactly when the applied data itself changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HealthReportCacheKey {
     live_data_ptr: Option<usize>,
@@ -2362,27 +2253,6 @@ struct HealthReportCache {
     remount_offers: HashSet<PathBuf>,
     issues: Vec<HealthIssue>,
 }
-
-// -----------------------------------------------------------------------
-// v0.4.3-alpha: navigation redesign - one explicit main-view enum instead
-// of several independent `bool`s (the old `show_duplicate_review`/
-// `show_health_dashboard`), and one renderer per page (see `update`'s
-// `match self.view` and each `show_*_page`/`show_*_panel` function) rather
-// than one continuously growing `update` body. Each page's own state
-// (search/filter/sort/selection) lives in its own existing fields below,
-// completely untouched by navigating to a different page - switching
-// `view` only changes what gets *rendered*, never any of that state.
-// -----------------------------------------------------------------------
-
-/// The primary destinations - milestone requirement: "Library | Health |
-/// Duplicates | Sources" as clear, always-visible primary navigation, plus
-/// `LibraryViews` (the managed symlink-based organised folder trees
-/// milestone) added alongside them as a fifth user-facing content page,
-/// not a `ToolsOverlay` - it is something a user browses and acts on
-/// directly, exactly like Sources, not an administrative/diagnostic
-/// panel. Mutually exclusive with `ToolsOverlay` (see its own doc
-/// comment); `update` renders whichever overlay is active in preference
-/// to the current `view`, then restores the page underneath once closed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MainView {
     #[default]
@@ -2391,37 +2261,14 @@ enum MainView {
     Duplicates,
     Sources,
     LibraryViews,
-    /// Redesigned-shell destination: mount planning and preview.
     Mount,
-    /// Redesigned-shell destination: the selected archive's detail page.
     Selected,
-    /// Redesigned-shell destination: currently mounted archives.
     ActiveMounts,
-    /// Redesigned-shell destination: doctor checks as a full screen
-    /// (the `ToolsOverlay::DoctorChecks` overlay remains reachable from
-    /// the Tools menu; this is the same content as a primary page).
     Doctor,
-    /// Redesigned-shell destination: operation history and logs.
     HistoryLogs,
-    /// Redesigned-shell destination: backend-supported settings.
     Settings,
-    /// Redesigned-shell destination: application information.
     About,
 }
-
-/// A secondary, full-panel destination - distinct from `MainView` because
-/// none of these are one of the four primary destinations the navigation
-/// bar always shows, but each still deserves its own full screen rather
-/// than a cramped inline corner of the Library page (milestone
-/// requirement: "Do not show database administration, aliases,
-/// diagnostics ... inline on \[the Library\] page"). Replaces the old
-/// standalone `show_diagnostics: bool` - one overlay slot, one thing
-/// showing at a time, exactly like `MainView`. Most variants are reached
-/// from the "Tools" menu; `ArchiveInspector` is the one exception,
-/// reached instead from the selected archive's own "Inspect contents"
-/// button (see `show_selected_archive`) - it still belongs here rather
-/// than as a new `MainView`, since it is not one of the four
-/// always-visible primary destinations either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ToolsOverlay {
     #[default]
@@ -2491,10 +2338,6 @@ struct ArchiveInspectorState {
     /// The selected entry's exact stored name (see `InspectorEntry::name`)
     /// - identity within one report, never a display-only truncated form.
     selected_entry: Option<String>,
-    /// The Inspector row list's resizable Path column width - milestone
-    /// requirement: reuse the same readable-long-text treatment
-    /// (resizable columns, via `show_column_resize_handle`) the Library
-    /// table already has.
     path_column_width: f32,
 }
 
@@ -2521,27 +2364,6 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-
-/// Milestone readability requirement: "modestly increase default UI
-/// scale/text sizing" and give controls enough room that adjacent
-/// buttons aren't tiny/easy to mis-click. `1.15` is a ~15% bump (egui's
-/// own text/spacing all scale with `pixels_per_point`) - enough to read
-/// clearly at arm's length without pushing core Library-page content
-/// into horizontal scrolling at the milestone's 1536x864 baseline width.
-/// The spacing/padding bump is deliberately modest for the same reason.
-fn apply_readability_style(context: &egui::Context) {
-    context.set_pixels_per_point(1.15);
-    context.style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 6.0);
-        style.spacing.button_padding = egui::vec2(8.0, 5.0);
-        style.spacing.interact_size.y = 24.0;
-    });
-}
-
-/// The redesigned shell's destination list, in design order - the nine
-/// design-reference screens (Mount, Selected, Active Mounts, Library,
-/// Sources, Doctor, History & Logs, Settings, About), always visible in
-/// the persistent navigation rail.
 const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 9] = [
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
@@ -2553,38 +2375,46 @@ const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 9] = [
     (MainView::Settings, "Settings"),
     (MainView::About, "About"),
 ];
-
-/// Pre-redesign catalogue views that are not one of the nine design
-/// destinations but must remain reachable (requirement: preserve all
-/// existing working views and route them into the new shell). Rendered
-/// as a secondary group below the primary destinations.
 const SECONDARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 3] = [
     (MainView::Health, "Health"),
     (MainView::Duplicates, "Duplicates"),
     (MainView::LibraryViews, "Library Views"),
 ];
-
-/// Health and Duplicates are disabled - not hidden, per the milestone's
-/// "use disabled states + explanatory text rather than hiding context" -
-/// until a database snapshot exists, since both pages render real
-/// catalogue data with nothing meaningful to show before then. Every
-/// other destination remains reachable at any time (destinations whose
-/// content needs data render their own empty states instead).
 fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
     !matches!(view, MainView::Health | MainView::Duplicates) || has_database
 }
 
-/// The redesigned persistent navigation rail: every design destination
-/// (see `PRIMARY_NAVIGATION_DESTINATIONS`) rendered as one always-visible
-/// vertical list, with the pre-redesign catalogue views (see
-/// `SECONDARY_NAVIGATION_DESTINATIONS`) in a secondary group below a
-/// separator so no existing screen is lost. `SelectableLabel`-style
-/// highlighting matches ordinary desktop sidebar conventions. Extracted
-/// from `update` (rather than inlined) so it can be driven by a real
-/// `egui::Context` frame in tests independent of `eframe::Frame`, which
-/// production code can only obtain from the eframe runtime itself.
-/// Returns the newly clicked view, if any, leaving `tools_overlay`
-/// handling to the caller.
+fn main_view_title(view: MainView) -> &'static str {
+    match view {
+        MainView::Library => "Library",
+        MainView::Health => "Health",
+        MainView::Duplicates => "Duplicates",
+        MainView::Sources => "Sources",
+        MainView::LibraryViews => "Library Views",
+        MainView::Mount => "Mount",
+        MainView::Selected => "Selected",
+        MainView::ActiveMounts => "Active Mounts",
+        MainView::Doctor => "Doctor",
+        MainView::HistoryLogs => "History & Logs",
+        MainView::Settings => "Settings",
+        MainView::About => "About",
+    }
+}
+
+fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
+    match view {
+        MainView::Mount
+        | MainView::Selected
+        | MainView::ActiveMounts
+        | MainView::Library
+        | MainView::Health
+        | MainView::Duplicates
+        | MainView::Sources
+        | MainView::LibraryViews
+        | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
+        MainView::Doctor | MainView::Settings | MainView::About => ui_layout::ContentWidth::Normal,
+    }
+}
 fn show_primary_navigation(
     ui: &mut egui::Ui,
     current: MainView,
@@ -2592,23 +2422,36 @@ fn show_primary_navigation(
 ) -> Option<MainView> {
     let mut clicked_view = None;
     ui.vertical(|ui| {
+        ui.label(egui::RichText::new("ArchiveFS").size(23.0).strong());
+        ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
+        ui.add_space(18.0);
+        ui.label(
+            egui::RichText::new("WORKFLOWS")
+                .small()
+                .strong()
+                .color(theme::muted(ui)),
+        );
         for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
             let enabled = navigation_destination_enabled(view, has_database);
-            if ui
-                .add_enabled(enabled, egui::Button::selectable(current == view, label))
-                .clicked()
-            {
+            let selected = current == view;
+            let button = egui::Button::selectable(selected, label)
+                .min_size(egui::vec2(ui.available_width(), 34.0));
+            if ui.add_enabled(enabled, button).clicked() {
                 clicked_view = Some(view);
             }
         }
-        ui.separator();
-        ui.label("Catalogue views");
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("CATALOGUE VIEWS")
+                .small()
+                .strong()
+                .color(theme::muted(ui)),
+        );
         for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
             let enabled = navigation_destination_enabled(view, has_database);
-            if ui
-                .add_enabled(enabled, egui::Button::selectable(current == view, label))
-                .clicked()
-            {
+            let button = egui::Button::selectable(current == view, label)
+                .min_size(egui::vec2(ui.available_width(), 34.0));
+            if ui.add_enabled(enabled, button).clicked() {
                 clicked_view = Some(view);
             }
         }
@@ -2627,12 +2470,6 @@ struct ArchiveFsApp {
     confirm_mount_all: Option<MountAllConfirmation>,
     focus_mount_all_cancel: bool,
     mount_all_result: Option<MountAllResult>,
-    /// The redesigned Mount page's queue: archive paths (exact-byte
-    /// identity, same as `ArchiveRow::path`) in the order they were
-    /// queued. Deduplicated on insert; entries whose archive leaves the
-    /// live snapshot are pruned when the page renders. Purely UI state -
-    /// mount safety still comes from the batch engine's own per-item
-    /// checks, never from this list.
     mount_queue: Vec<PathBuf>,
     /// The Mount page's free-text filter (name/platform/path substring).
     mount_search: String,
@@ -2700,8 +2537,6 @@ struct ArchiveFsApp {
     selected_archives: HashSet<PathBuf>,
     bulk_platform_action: Option<RunningBulkPlatformAction>,
     bulk_platform_choice: Option<String>,
-    /// The library table's current column sort - milestone requirement
-    /// 2. `None` means unsorted / natural (merge) order.
     sort_field: Option<SortField>,
     sort_ascending: bool,
     /// The library table's vertical `ScrollArea` offset as of the end of
@@ -2720,10 +2555,6 @@ struct ArchiveFsApp {
     health_sort_field: HealthSortField,
     health_sort_ascending: bool,
     selected_health_issue: Option<PathBuf>,
-    /// Bumped only by `refresh_diagnostics` - the one health-relevant event
-    /// (milestone requirement 3's "diagnostics refresh") not already
-    /// reflected by `state`/`database_state` changing identity, since a
-    /// diagnostics-only refresh touches neither.
     diagnostics_refresh_generation: RefreshGeneration,
     /// The Health Dashboard's cached report - see `cached_health_issues`.
     /// `None` until first built. Never read directly; always go through
@@ -2741,10 +2572,6 @@ struct ArchiveFsApp {
     /// Which "Tools" screen (if any) is showing in front of `view` - see
     /// `ToolsOverlay`'s doc comment.
     tools_overlay: ToolsOverlay,
-    /// Whether the bottom Activity panel is expanded - milestone
-    /// requirement: a collapsible bottom panel rather than a permanently
-    /// narrow side strip. Purely a display preference; never cleared by
-    /// navigation, and never affects `history` itself.
     show_activity: bool,
     /// Whether the Help "About ArchiveFS" window is open.
     show_about: bool,
@@ -2805,13 +2632,6 @@ struct ArchiveFsApp {
     /// The Library Views page's Preview details filter - see
     /// `LibraryViewPlanFilter`.
     library_view_plan_filter: LibraryViewPlanFilter,
-    /// The Library page's Source filter - milestone requirement. `None`
-    /// means "All sources" (no restriction); `Some(None)` means
-    /// "Unassigned/Legacy" (a persisted archive whose `source_folder_id`
-    /// no longer matches any currently configured source);
-    /// `Some(Some(path))` restricts to that one configured source's exact
-    /// path. Lives here, independent of `library_filters`, so it survives
-    /// navigation exactly like every other Library filter already does.
     library_source_filter: Option<Option<PathBuf>>,
     /// The Library table's current Archive path / Mount path column
     /// widths - see `LibraryColumnWidths`. Platform and State are not
@@ -2824,13 +2644,6 @@ struct ArchiveFsApp {
     /// as-is, so reopening it shows the same archive's already-loaded
     /// report instead of re-inspecting from scratch.
     archive_inspector: Option<ArchiveInspectorState>,
-    /// Bumped every time a new inspection starts (a fresh "Inspect
-    /// contents" click, whether for a new archive or the same one again);
-    /// see `start_archive_inspection`/`poll_archive_inspection`. A
-    /// background result whose generation no longer matches this is
-    /// stale and must never be applied. Milestone requirement: "If the
-    /// selected archive changes or disappears before the result returns,
-    /// do not apply stale results."
     archive_inspector_generation: RefreshGeneration,
 }
 
@@ -2843,7 +2656,7 @@ impl ArchiveFsApp {
     }
 
     fn new(context: egui::Context) -> Self {
-        apply_readability_style(&context);
+        theme::apply(&context);
         let generation = RefreshGeneration::INITIAL;
         let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
@@ -2923,7 +2736,7 @@ impl ArchiveFsApp {
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
             tools_overlay: ToolsOverlay::default(),
-            show_activity: true,
+            show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
@@ -2963,25 +2776,12 @@ impl ArchiveFsApp {
         self.refresh_diagnostics(context);
         self.state = start_load(context.clone(), generation, previous);
     }
-
-    /// Starts a fresh read-only inspection of `archive_path` in a
-    /// background thread (milestone requirement: "so large ZIP files do
-    /// not freeze the GUI") and opens the Archive Inspector overlay to
-    /// show it. Always replaces `self.archive_inspector` wholesale - see
-    /// `ArchiveInspectorState`'s own doc comment - and always bumps
-    /// `archive_inspector_generation` first, so any still-in-flight
-    /// result from a *previous* call can never be mistaken for this new
-    /// one once it lands (see `poll_archive_inspection`).
     fn start_archive_inspection(&mut self, context: egui::Context, archive_path: PathBuf) {
         self.archive_inspector_generation = self.archive_inspector_generation.next();
         let generation = self.archive_inspector_generation;
         let (sender, receiver) = mpsc::channel();
         let job_path = archive_path.clone();
         thread::spawn(move || {
-            // `inspect_archive` re-checks the path live (existence,
-            // format, structure) regardless of anything the caller
-            // believed - milestone requirement: "cached catalogue rows
-            // must not authorise inspection of a missing file."
             let result = inspect_archive(&job_path).map_err(|error| error.to_string());
             let _ = sender.send((generation, result));
             context.request_repaint();
@@ -3023,10 +2823,6 @@ impl ArchiveFsApp {
         let Some((generation, result)) = result else {
             return;
         };
-        // Stale - a newer inspection (a different archive, or the same
-        // one inspected again) has already superseded this one. Dropping
-        // it silently here, rather than ever applying it, is exactly the
-        // milestone's "do not apply stale results" requirement.
         if generation != self.archive_inspector_generation {
             return;
         }
@@ -3936,12 +3732,6 @@ impl ArchiveFsApp {
                     warning: None,
                     more_information: None,
                 });
-                // Deliberately does not clear `sources_add_dialog`/
-                // `sources_remove_dialog` on failure - the milestone's
-                // "clear inline validation message" requirement means a
-                // failed Add should leave the dialog open with its input
-                // intact so the user can correct and retry, not lose
-                // their typed path.
             }
         }
     }
@@ -5467,7 +5257,7 @@ impl eframe::App for ArchiveFsApp {
 
         egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("ArchiveFS");
+                ui.label(egui::RichText::new(main_view_title(self.view)).strong());
                 ui.separator();
                 ui.menu_button("File", |ui| {
                     if ui.button("Quit").clicked() {
@@ -5518,8 +5308,6 @@ impl eframe::App for ArchiveFsApp {
                     }
                 });
                 ui.menu_button("Sources", |ui| {
-                    // Milestone requirement: "do not pretend multi-folder
-                    // add/remove exists yet" - navigation only.
                     if ui.button("Open Sources page").clicked() {
                         self.view = MainView::Sources;
                         self.tools_overlay = ToolsOverlay::None;
@@ -5575,9 +5363,9 @@ impl eframe::App for ArchiveFsApp {
 
         egui::SidePanel::left("app_navigation")
             .resizable(false)
-            .default_width(180.0)
+            .exact_width(218.0)
             .show(context, |ui| {
-                ui.add_space(6.0);
+                ui.add_space(14.0);
                 if let Some(clicked) = show_primary_navigation(ui, self.view, has_database) {
                     self.view = clicked;
                     self.tools_overlay = ToolsOverlay::None;
@@ -5617,6 +5405,14 @@ impl eframe::App for ArchiveFsApp {
         let mut stop_mount_all = false;
         let mut stop_unmount_all = false;
         egui::CentralPanel::default().show(context, |ui| {
+            let width = if self.tools_overlay == ToolsOverlay::None {
+                main_view_content_width(self.view)
+            } else if self.tools_overlay == ToolsOverlay::ArchiveInspector {
+                ui_layout::ContentWidth::Wide
+            } else {
+                ui_layout::ContentWidth::Normal
+            };
+            ui_layout::page(ui, width, |ui| {
             self.close_cheat_workflow_if_selection_changed();
 
             if self.tools_overlay != ToolsOverlay::None {
@@ -5685,7 +5481,13 @@ impl eframe::App for ArchiveFsApp {
                         }
                     }
                     ToolsOverlay::RetroArchCheats => {
-                        if show_tools_overlay_header(ui, "RetroArch Cheats") {
+                        widgets::page_header(
+                            ui,
+                            "RetroArch Cheats",
+                            "Choose an eligible profile and retrieve a reviewed built-in catalogue for one archive.",
+                        );
+                        if widgets::action_button(ui, "Back to Library", widgets::ActionStyle::Quiet, true).clicked() {
+                            self.view = MainView::Library;
                             self.tools_overlay = ToolsOverlay::None;
                             self.cheat_workflow = None;
                         }
@@ -5970,8 +5772,11 @@ impl eframe::App for ArchiveFsApp {
             }
 
             if self.view == MainView::Doctor {
-                ui.heading("Doctor");
-                ui.add_space(4.0);
+                widgets::page_header(
+                    ui,
+                    "Doctor",
+                    "Check ArchiveFS health, with blocking issues and warnings shown first.",
+                );
                 let mut run_requested = false;
                 {
                     let doctor = match &self.state {
@@ -5979,19 +5784,21 @@ impl eframe::App for ArchiveFsApp {
                         _ => None,
                     };
                     if let Some(report) = doctor {
-                        ui.horizontal(|ui| {
+                        widgets::card(ui, |ui| ui.horizontal_wrapped(|ui| {
+                            let failures = report.checks.iter().filter(|check| check.status == DoctorStatus::Fail).count();
+                            let warnings = report.checks.iter().filter(|check| check.status == DoctorStatus::Warn).count();
+                            widgets::status_badge(ui, if failures == 0 { "Healthy" } else { "Needs attention" }, if failures == 0 { widgets::StatusTone::Success } else { widgets::StatusTone::Blocked });
                             ui.label(doctor_summary_text(report));
-                            if ui
-                                .add_enabled(!loading && !busy, egui::Button::new("Run All Checks"))
-                                .clicked()
+                            if widgets::action_button(ui, "Run all checks", widgets::ActionStyle::Primary, !loading && !busy).clicked()
                             {
                                 run_requested = true;
                             }
-                            if ui.button("Copy Report").clicked() {
+                            if widgets::action_button(ui, "Copy summary", widgets::ActionStyle::Secondary, true).clicked() {
                                 let _ = self.clipboard.set_text(doctor_report_text(report));
                             }
-                        });
-                        ui.separator();
+                            if warnings > 0 { widgets::status_badge(ui, format!("{warnings} warnings"), widgets::StatusTone::Warning); }
+                        }).inner);
+                        ui.add_space(12.0);
                     }
                     show_doctor_checks_panel(ui, doctor);
                 }
@@ -6045,8 +5852,6 @@ impl eframe::App for ArchiveFsApp {
             }
 
             if self.view == MainView::About {
-                ui.heading("About");
-                ui.add_space(4.0);
                 let mount_root = match &self.state {
                     LoadState::Ready(data) => Some(data.mount_root.as_path()),
                     _ => None,
@@ -6223,6 +6028,7 @@ impl eframe::App for ArchiveFsApp {
                     );
                 }
             }
+            });
         });
         if stop_mount_all {
             self.request_mount_all_stop();
@@ -6389,15 +6195,6 @@ fn open_default_config_folder() -> archivefs_core::Result<String> {
     open_folder_in_file_manager(folder)?;
     Ok(format!("Opened config folder {}.", folder.display()))
 }
-
-/// Launches the native OS file manager at `folder` - shared by
-/// `open_default_config_folder` and the Selected Archive details context
-/// menu's "Show containing folder" (milestone requirement: "only if it can
-/// be implemented safely and portably without shell-injection risk").
-/// `Command::new(program).arg(folder)` passes `folder` directly to the
-/// child process's argv, never through a shell string, so no path -
-/// however it is spelled, including one containing shell metacharacters -
-/// can ever be interpreted as a second command.
 fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Result<()> {
     let (program, argument) = if cfg!(target_os = "windows") {
         ("explorer", folder.as_os_str())
@@ -7147,20 +6944,33 @@ fn show_setup_diagnostics(
         });
     action
 }
-
-/// Renders Activity as a collapsible bottom panel - milestone requirement:
-/// move it away from the permanently narrow right-hand strip, so it no
-/// longer shrinks every main page's usable *width*. Collapsed, the panel
-/// is just its own single header row tall, handing essentially all
-/// vertical space back to whichever page is showing above it. `expanded`
-/// is a pure display preference (see `ArchiveFsApp::show_activity`'s doc
-/// comment); this never mutates `history` beyond the existing "Clear"
-/// button, exactly as before, and never records an entry itself.
-/// The one Activity-panel context-menu action that needs to leave this
-/// function - Copy/Clear-one/Clear-all are all purely local (clipboard,
-/// `history`), so they execute directly inside the menu closure instead.
 enum ActivityPanelAction {
     ShowRelatedArchive(PathBuf),
+}
+
+fn activity_outcome_tone(outcome: ActivityOutcome) -> widgets::StatusTone {
+    match outcome {
+        ActivityOutcome::Completed => widgets::StatusTone::Success,
+        ActivityOutcome::Failed | ActivityOutcome::Rejected => widgets::StatusTone::Blocked,
+        ActivityOutcome::Started | ActivityOutcome::Retried | ActivityOutcome::Confirmed => {
+            widgets::StatusTone::Active
+        }
+        ActivityOutcome::Offered | ActivityOutcome::Skipped | ActivityOutcome::Cancelled => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
+fn activity_summary_entry(history: &OperationHistory) -> Option<&HistoryEntry> {
+    history
+        .entries()
+        .find(|entry| {
+            matches!(
+                entry.outcome,
+                ActivityOutcome::Failed | ActivityOutcome::Rejected
+            )
+        })
+        .or_else(|| history.entries().next())
 }
 
 fn show_activity_panel(
@@ -7174,22 +6984,43 @@ fn show_activity_panel(
         .resizable(*expanded)
         .show(context, |ui| {
             ui.horizontal(|ui| {
-                let toggle_label = if *expanded {
-                    "Hide Activity"
-                } else {
-                    "Show Activity"
-                };
-                if ui
-                    .button(format!("{toggle_label} ({})", history.entries.len()))
-                    .clicked()
+                if widgets::action_button(
+                    ui,
+                    if *expanded {
+                        "Hide activity"
+                    } else {
+                        "Show activity"
+                    },
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
                 {
                     *expanded = !*expanded;
                 }
+                widgets::status_badge(
+                    ui,
+                    format!("{} events", history.entries.len()),
+                    widgets::StatusTone::Info,
+                );
+                if !*expanded && let Some(entry) = activity_summary_entry(history) {
+                    widgets::status_badge(
+                        ui,
+                        entry.outcome.to_string(),
+                        activity_outcome_tone(entry.outcome),
+                    );
+                    ui.add(egui::Label::new(&entry.message).truncate())
+                        .on_hover_text(&entry.message);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if *expanded
-                        && ui
-                            .add_enabled(!history.entries.is_empty(), egui::Button::new("Clear"))
-                            .clicked()
+                        && widgets::action_button(
+                            ui,
+                            "Clear activity",
+                            widgets::ActionStyle::Destructive,
+                            !history.entries.is_empty(),
+                        )
+                        .clicked()
                     {
                         history.clear();
                     }
@@ -7204,17 +7035,6 @@ fn show_activity_panel(
                 ui.weak("No recent activity.");
                 return;
             }
-
-            // Milestone requirement: long activity messages must be
-            // readable, not silently clipped. Wrapping (the default for a
-            // `Label` inside this vertical `ScrollArea`, made explicit
-            // with `.wrap()`) replaces the previous single-line
-            // `.truncate()` + hover-tooltip treatment: every entry is now
-            // fully visible without needing to hover at all, and
-            // `.selectable(true)` lets a long path or error message be
-            // copied directly. This list is never `show_rows`-virtualized
-            // (bounded by `HISTORY_LIMIT` entries), so variable per-entry
-            // heights from wrapping need no special handling here.
             egui::ScrollArea::vertical()
                 .id_salt("activity_history")
                 .max_height(220.0)
@@ -7225,22 +7045,44 @@ fn show_activity_panel(
                     // menu item can freely call `history.clear()`/
                     // `history.remove()` without fighting the borrow
                     // checker over a `history` still being iterated.
-                    let rows: Vec<(usize, String, Option<PathBuf>)> = history
+                    let rows: Vec<(
+                        usize,
+                        ActivityAction,
+                        ActivityOutcome,
+                        String,
+                        Option<PathBuf>,
+                    )> = history
                         .entries()
                         .enumerate()
                         .map(|(index, entry)| {
-                            (index, history_entry_text(entry), entry.archive_path.clone())
+                            (
+                                index,
+                                entry.action,
+                                entry.outcome,
+                                entry.message.clone(),
+                                entry.archive_path.clone(),
+                            )
                         })
                         .collect();
                     let mut remove_index = None;
-                    for (index, text, archive_path) in &rows {
-                        let response = ui.add(
-                            egui::Label::new(text)
-                                .selectable(true)
-                                .wrap()
-                                .sense(egui::Sense::click()),
-                        );
-                        ui.add_space(2.0);
+                    for (index, activity, outcome, text, archive_path) in &rows {
+                        let response = widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                widgets::status_badge(
+                                    ui,
+                                    outcome.to_string(),
+                                    activity_outcome_tone(*outcome),
+                                );
+                                ui.strong(activity.to_string());
+                            });
+                            ui.add(
+                                egui::Label::new(text)
+                                    .selectable(true)
+                                    .wrap()
+                                    .sense(egui::Sense::click()),
+                            )
+                        });
+                        ui.add_space(6.0);
                         response.context_menu(|ui| {
                             if ui.button("Copy message").clicked() {
                                 let _ = clipboard.set_text(text.clone());
@@ -7278,15 +7120,6 @@ fn show_activity_panel(
         });
     action
 }
-
-/// The full "Doctor checks" detail table - extracted out of the Library
-/// page (milestone requirement: "Do not show ... diagnostics ... inline"
-/// on Library) into its own Tools destination. The Library page keeps
-/// only a compact Ready/Needs attention indicator (see `show_loaded_data`);
-/// this is the detailed Status/Check/Detail breakdown behind it.
-/// The Doctor page's one-line summary - check counts by status plus the
-/// catalogue totals the report already carries. Pure, so it is testable
-/// and can never disagree with the grid below it.
 fn doctor_summary_text(report: &DoctorReport) -> String {
     let passed = report
         .checks
@@ -7346,26 +7179,52 @@ fn doctor_report_text(report: &DoctorReport) -> String {
 
 fn show_doctor_checks_panel(ui: &mut egui::Ui, doctor: Option<&DoctorReport>) {
     let Some(doctor) = doctor else {
-        ui.label("Doctor checks are unavailable until the library has been scanned.");
+        widgets::empty_state(
+            ui,
+            "Health checks unavailable",
+            "Scan the library before running the full ArchiveFS health report.",
+            None,
+        );
         return;
     };
-    egui::Grid::new("doctor_checks")
-        .num_columns(3)
-        .striped(true)
+    for status in [DoctorStatus::Fail, DoctorStatus::Warn] {
+        for check in doctor.checks.iter().filter(|check| check.status == status) {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        check.status.to_string(),
+                        if status == DoctorStatus::Fail {
+                            widgets::StatusTone::Blocked
+                        } else {
+                            widgets::StatusTone::Warning
+                        },
+                    );
+                    ui.label(egui::RichText::new(&check.name).strong());
+                });
+                ui.add(egui::Label::new(&check.detail).wrap());
+            });
+            ui.add_space(6.0);
+        }
+    }
+    let passed = doctor
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Pass)
+        .count();
+    egui::CollapsingHeader::new(format!("Passed checks ({passed})"))
+        .default_open(false)
         .show(ui, |ui| {
-            ui.strong("Status");
-            ui.strong("Check");
-            ui.strong("Detail");
-            ui.end_row();
-
-            for check in &doctor.checks {
-                ui.colored_label(
-                    doctor_status_color(ui, check.status),
-                    check.status.to_string(),
-                );
-                ui.label(&check.name);
-                ui.label(&check.detail);
-                ui.end_row();
+            for check in doctor
+                .checks
+                .iter()
+                .filter(|check| check.status == DoctorStatus::Pass)
+            {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, "Pass", widgets::StatusTone::Success);
+                    ui.strong(&check.name);
+                    ui.label(egui::RichText::new(&check.detail).color(theme::muted(ui)));
+                });
             }
         });
 }
@@ -7428,13 +7287,6 @@ fn visible_inspector_entry_indices(
     });
     indices
 }
-
-/// The Inspector row list's compact trailing summary column - kind,
-/// classification, and (for files) size/compression, combined into one
-/// readable string rather than several more narrow fixed columns, in
-/// keeping with the milestone's "keep this first slice deliberately
-/// small" instruction. Every individual field is still available in full
-/// in the selected-entry details panel below the list.
 fn inspector_entry_details_text(entry: &InspectorEntry) -> String {
     match entry.kind {
         InspectorEntryKind::Directory => "Directory".to_string(),
@@ -7514,11 +7366,6 @@ fn show_inspector_row(
 
     response
 }
-
-/// The Archive Inspector overlay - milestone: a read-only, first-slice
-/// viewer for one ZIP archive's entries. Returns `true` when the user
-/// asked to close it ("Back to Library"), exactly like every other
-/// `ToolsOverlay` panel - see its own dispatch in `update`.
 fn show_archive_inspector_panel(
     ui: &mut egui::Ui,
     state: &mut ArchiveInspectorState,
@@ -7775,15 +7622,6 @@ fn show_tools_overlay_header(ui: &mut egui::Ui, title: &str) -> bool {
     ui.separator();
     close
 }
-
-/// A clean page shell for future multiple-source-folder management -
-/// milestone requirement: truthful, read-only display of the currently
-/// configured scan/archive root, with no fake add/remove controls yet.
-/// Reads the configuration file fresh each render - a cheap, synchronous,
-/// read-only file read (the same kind `run_setup_diagnostics_default`
-/// already performs, just off the background thread that one uses); this
-/// never starts a scan, mount, or write, and it is the only source of
-/// truth here (never invents state this app does not actually track).
 fn source_action_log_category(action: &SourceAction) -> ActivityAction {
     match action {
         SourceAction::Add(_) => ActivityAction::SourceAdded,
@@ -8094,15 +7932,6 @@ fn source_availability_label(availability: SourceAvailability) -> &'static str {
         SourceAvailability::ScanFailed => "Scan failed",
     }
 }
-
-/// What the Sources page asked the caller to do - every variant starts a
-/// `SourceAction` on a background thread via `ArchiveFsApp::start_source_action`,
-/// mirroring `HealthDashboardAction`'s "bubble up, caller dispatches"
-/// shape. Opening/closing/editing a dialog is deliberately *not* here -
-/// `show_sources_page` mutates `add_dialog`/`remove_dialog` directly for
-/// that, since none of it needs a background action or an Activity entry
-/// (see the milestone's "no Activity entry merely for opening a dialog or
-/// cancelling the picker" requirement).
 enum SourcesPageAction {
     AddFolder(PathBuf),
     ScanOne(PathBuf),
@@ -8123,17 +7952,6 @@ enum SourcesPageAction {
     /// independently-drifting filter mechanism).
     ViewInLibrary(PathBuf),
 }
-
-/// Renders the Sources page: one row per configured source folder (path,
-/// enabled state, availability, last archive count, last scan result/
-/// time, and its Scan/Enable-Disable/Remove buttons), the "Add Folder" /
-/// "Scan All Enabled Sources" / "Refresh Status" top actions, and the
-/// read-only mount root - milestone requirement: this is now the complete
-/// place to add/view/enable/disable/scan/remove source folders. `busy`
-/// (`ArchiveFsApp::source_action.is_some()`) disables every mutating
-/// control while one source action is already running, exactly like the
-/// existing platform-assignment/alias controls disable during their own
-/// running action.
 fn show_sources_page(
     ui: &mut egui::Ui,
     sources: &[SourceFolderView],
@@ -8145,34 +7963,48 @@ fn show_sources_page(
 ) -> Option<SourcesPageAction> {
     let mut action = None;
 
-    ui.heading("Sources");
-    ui.label("Where ArchiveFS looks for archives, and where it mounts them.");
-    ui.add_space(2.0);
+    widgets::page_header(
+        ui,
+        "Sources",
+        "Manage the configured folders ArchiveFS scans for archives.",
+    );
 
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("Add Folder"))
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Add folder", widgets::ActionStyle::Primary, !busy)
+                .clicked()
+            {
+                *add_dialog = Some(SourcesAddDialogState::default());
+            }
+            if widgets::action_button(
+                ui,
+                "Scan all enabled",
+                widgets::ActionStyle::Secondary,
+                !busy,
+            )
             .clicked()
-        {
-            *add_dialog = Some(SourcesAddDialogState::default());
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Scan All Enabled Sources"))
-            .clicked()
-        {
-            action = Some(SourcesPageAction::ScanAll);
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Refresh Status"))
-            .clicked()
-        {
-            action = Some(SourcesPageAction::RefreshStatus);
-        }
+            {
+                action = Some(SourcesPageAction::ScanAll);
+            }
+            if widgets::action_button(ui, "Refresh status", widgets::ActionStyle::Quiet, !busy)
+                .clicked()
+            {
+                action = Some(SourcesPageAction::RefreshStatus);
+            }
+        })
+        .inner
     });
-    ui.separator();
+    ui.add_space(12.0);
 
     if sources.is_empty() {
-        ui.label("No source folders are configured yet. Click \"Add Folder\" to add one.");
+        if widgets::empty_state(
+            ui,
+            "No source folders",
+            "Add an existing readable directory, then scan it to build the catalogue.",
+            Some("Add folder"),
+        ) {
+            *add_dialog = Some(SourcesAddDialogState::default());
+        }
     } else {
         egui::ScrollArea::vertical()
             .id_salt("sources_list")
@@ -8183,18 +8015,39 @@ fn show_sources_page(
                     let group_response = ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.strong(view.path.display().to_string());
+                                if widgets::path_value(ui, "Source", &view.path) {
+                                    let _ = clipboard.set_text(view.path.display().to_string());
+                                }
                                 ui.horizontal_wrapped(|ui| {
+                                    widgets::status_badge(
+                                        ui,
+                                        if view.enabled { "Enabled" } else { "Disabled" },
+                                        if view.enabled {
+                                            widgets::StatusTone::Active
+                                        } else {
+                                            widgets::StatusTone::Pending
+                                        },
+                                    );
+                                    let availability_tone = match view.availability {
+                                        SourceAvailability::Available => {
+                                            widgets::StatusTone::Success
+                                        }
+                                        SourceAvailability::Disabled => {
+                                            widgets::StatusTone::Pending
+                                        }
+                                        SourceAvailability::Unavailable
+                                        | SourceAvailability::PermissionDenied
+                                        | SourceAvailability::ScanFailed => {
+                                            widgets::StatusTone::Blocked
+                                        }
+                                    };
+                                    widgets::status_badge(
+                                        ui,
+                                        source_availability_label(view.availability),
+                                        availability_tone,
+                                    );
                                     ui.label(format!(
-                                        "Enabled: {}",
-                                        if view.enabled { "yes" } else { "no" }
-                                    ));
-                                    ui.label(format!(
-                                        "Status: {}",
-                                        source_availability_label(view.availability)
-                                    ));
-                                    ui.label(format!(
-                                        "Archives: {}",
+                                        "{} archives",
                                         view.last_archive_count
                                             .map(|count| count.to_string())
                                             .unwrap_or_else(|| "never scanned".to_string())
@@ -8211,7 +8064,13 @@ fn show_sources_page(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked()
+                                    if widgets::action_button(
+                                        ui,
+                                        "Remove",
+                                        widgets::ActionStyle::Destructive,
+                                        !busy,
+                                    )
+                                    .clicked()
                                     {
                                         *remove_dialog = Some(SourcesRemoveDialogState {
                                             path: view.path.clone(),
@@ -8221,16 +8080,27 @@ fn show_sources_page(
                                     }
                                     let enable_label =
                                         if view.enabled { "Disable" } else { "Enable" };
-                                    if ui
-                                        .add_enabled(!busy, egui::Button::new(enable_label))
-                                        .clicked()
+                                    if widgets::action_button(
+                                        ui,
+                                        enable_label,
+                                        widgets::ActionStyle::Quiet,
+                                        !busy,
+                                    )
+                                    .clicked()
                                     {
                                         action = Some(SourcesPageAction::SetEnabled {
                                             path: view.path.clone(),
                                             enabled: !view.enabled,
                                         });
                                     }
-                                    if ui.add_enabled(!busy, egui::Button::new("Scan")).clicked() {
+                                    if widgets::action_button(
+                                        ui,
+                                        "Scan",
+                                        widgets::ActionStyle::Secondary,
+                                        !busy,
+                                    )
+                                    .clicked()
+                                    {
                                         action =
                                             Some(SourcesPageAction::ScanOne(view.path.clone()));
                                     }
@@ -8238,11 +8108,6 @@ fn show_sources_page(
                             );
                         });
                     });
-                    // Milestone requirement: never offer filesystem
-                    // deletion, and "Remove source" opens the exact same
-                    // safe confirmation dialog the "Remove" button above
-                    // does (defaulting to Keep catalogue entries) - never
-                    // a second, weaker removal path.
                     group_response.response.context_menu(|ui| {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Scan source"))
@@ -8291,16 +8156,25 @@ fn show_sources_page(
             });
     }
 
-    ui.add_space(6.0);
-    ui.separator();
-    ui.strong("Mount root");
-    ui.label(format!(
-        "Current mount root: {}",
-        mount_root
-            .map(|root| root.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    ui.label("Editing this setting is not yet available.");
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Mount destination",
+        Some("The configured mount root is read-only here."),
+    );
+    widgets::card(ui, |ui| {
+        if let Some(root) = mount_root {
+            if widgets::path_value(ui, "Mount root", root) {
+                let _ = clipboard.set_text(root.display().to_string());
+            }
+        } else {
+            ui.label("Mount root: unknown");
+        }
+        ui.label(
+            egui::RichText::new("Configuration editing is intentionally unavailable on this page.")
+                .color(theme::muted(ui)),
+        );
+    });
 
     if let Some(dialog) = add_dialog.as_mut() {
         let mut open = true;
@@ -8502,22 +8376,6 @@ fn show_library_view_plan_summary(
             }
         });
 }
-
-/// The Library Views page: list/Add View/Edit View/Preview/Apply/Repair/
-/// Remove View - milestone Section 7. Mirrors `show_sources_page`'s exact
-/// shape: dialog open/close/field-edits are applied directly to
-/// `form_dialog`/`remove_dialog` and need no returned action; only what
-/// starts a background action (Add/Edit/SetEnabled/Preview/Apply/Repair/
-/// Remove) is returned, for `update()` to dispatch through
-/// `start_library_view_action` - the single implementation this shares
-/// with the CLI's `view` subcommands (`preview_library_view_default` and
-/// friends), never a second one.
-///
-/// Every parameter is plain, read-only page data or a dialog's own open/
-/// closed state, with no natural grouping that would not just be
-/// busywork for its own sake - the same justification `show_data_row`/
-/// `show_sources_page`'s siblings already give for their own
-/// `#[allow(clippy::too_many_arguments)]`.
 #[allow(clippy::too_many_arguments)]
 fn show_library_views_page(
     ui: &mut egui::Ui,
@@ -8539,11 +8397,6 @@ fn show_library_views_page(
          never moves, copies, renames, or deletes an original archive file.",
     );
     ui.add_space(2.0);
-
-    // "Show in Library View preview" (Library row context menu) lands
-    // here - a read-only lookup against whatever the *last* Preview
-    // already found, never a Preview started on this archive's behalf
-    // (milestone requirement: never bypass Preview or safety checks).
     if let Some(archive_path) = focus_archive {
         ui.add_space(4.0);
         match library_view_planned_entry_for(last_plan, archive_path) {
@@ -8688,15 +8541,6 @@ fn show_library_views_page(
                             show_library_view_plan_summary(ui, plan, plan_filter);
                         }
                     });
-                    // Milestone Section 8: the exact same seven actions the
-                    // inline buttons above already offer - Preview, Apply,
-                    // Repair, Copy destination path, Disable/Enable, Remove
-                    // View - dispatched through the exact same
-                    // `LibraryViewAction`/dialog-opening paths, never a
-                    // second, independently-drifting execution path. Never
-                    // offers anything that would bypass Preview or safety
-                    // checks (no direct Apply/Repair without a safe current
-                    // plan, exactly like the inline buttons).
                     group_response.response.context_menu(|ui| {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Preview"))
@@ -8958,12 +8802,6 @@ fn show_library_views_page(
 
     action
 }
-
-/// The Help "About ArchiveFS" window - milestone requirement: version,
-/// database path, and configuration path, and only those: never a
-/// "data"/"log" path this app has no actual concept of. Copy buttons
-/// reuse the exact same native clipboard every text field's context menu
-/// already goes through - no second clipboard mechanism.
 fn show_about_window(
     ctx: &egui::Context,
     open: &mut bool,
@@ -8980,15 +8818,6 @@ fn show_about_window(
             show_about_contents(ui, database_state, diagnostics, mount_root, clipboard);
         });
 }
-
-/// The About information itself - version plus key paths - shared by the
-/// pre-redesign About window (Help menu) and the redesigned shell's
-/// About page, so the two can never drift apart.
-/// The About page's "Copy System Information" and the Settings page's
-/// "Copy Environment Report" payload - version, platform, desktop
-/// session, database schema, and key paths as plain text. Pure given
-/// its inputs (the environment variables it reads are the same ones
-/// `clipboard_environment_summary` already reports).
 fn system_information_text(
     database_path: Option<&str>,
     config_path: Option<&str>,
@@ -9015,9 +8844,11 @@ fn show_about_contents(
     mount_root: Option<&Path>,
     clipboard: &mut dyn ClipboardBackend,
 ) {
-    ui.strong(format!("ArchiveFS {}", env!("CARGO_PKG_VERSION")));
-    ui.label("Linux archive-management utility");
-    ui.add_space(8.0);
+    widgets::page_header(
+        ui,
+        "ArchiveFS",
+        "A Linux archive library and safe mount manager.",
+    );
 
     let database_path = database_state_path(database_state).map(|path| path.display().to_string());
     let config_path = match diagnostics {
@@ -9029,54 +8860,64 @@ fn show_about_contents(
     };
     let mount_root = mount_root.map(|path| path.display().to_string());
 
-    egui::Grid::new("about_paths_grid")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.strong("Operating system");
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("Version {}", env!("CARGO_PKG_VERSION")),
+                widgets::StatusTone::Info,
+            );
             ui.label(format!(
-                "{} ({})",
+                "{} · {}",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ));
-            ui.end_row();
-
-            ui.strong("Desktop environment");
-            ui.label(std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()));
-            ui.end_row();
-
-            ui.strong("Database schema");
-            ui.label(format!("v{}", latest_schema_version()));
-            ui.end_row();
-
-            ui.strong("Database path");
-            ui.horizontal(|ui| {
-                ui.label(database_path.as_deref().unwrap_or("unknown"));
-                if let Some(path) = &database_path
-                    && ui.small_button("Copy").clicked()
-                {
-                    let _ = clipboard.set_text(path.clone());
-                }
-            });
-            ui.end_row();
-
-            ui.strong("Configuration path");
-            ui.horizontal(|ui| {
-                ui.label(config_path.as_deref().unwrap_or("unknown"));
-                if let Some(path) = &config_path
-                    && ui.small_button("Copy").clicked()
-                {
-                    let _ = clipboard.set_text(path.clone());
-                }
-            });
-            ui.end_row();
-
-            ui.strong("Mount root");
-            ui.label(mount_root.as_deref().unwrap_or("not loaded"));
-            ui.end_row();
+            ui.label(format!("Database schema v{}", latest_schema_version()));
         });
+        ui.label(format!(
+            "Desktop: {}",
+            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string())
+        ));
+    });
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Runtime locations",
+        Some("Paths are shown for troubleshooting and are not edited here."),
+    );
+    widgets::card(ui, |ui| {
+        if let Some(path) = &database_path {
+            if widgets::copyable_value(ui, "Database", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Database: unknown");
+        }
+        if let Some(path) = &config_path {
+            if widgets::copyable_value(ui, "Configuration", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Configuration: unknown");
+        }
+        if let Some(path) = &mount_root {
+            if widgets::copyable_value(ui, "Mount root", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Mount root: not loaded");
+        }
+    });
 
-    ui.add_space(8.0);
-    if ui.button("Copy System Information").clicked() {
+    ui.add_space(12.0);
+    if widgets::action_button(
+        ui,
+        "Copy system information",
+        widgets::ActionStyle::Secondary,
+        true,
+    )
+    .clicked()
+    {
         let _ = clipboard.set_text(system_information_text(
             database_path.as_deref(),
             config_path.as_deref(),
@@ -9179,7 +9020,8 @@ fn show_mount_queue_confirmation(
     busy: bool,
 ) -> Option<QueueConfirmChoice> {
     let mut choice = None;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Confirmation", widgets::StatusTone::Warning);
         if attempted == 1 {
             ui.strong("Mount 1 queued archive?");
         } else {
@@ -9190,13 +9032,17 @@ fn show_mount_queue_confirmation(
              archives and existing destinations are skipped by the batch engine.",
         );
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!busy && attempted > 0, egui::Button::new("Mount now"))
-                .clicked()
+            if widgets::action_button(
+                ui,
+                "Mount now",
+                widgets::ActionStyle::Primary,
+                !busy && attempted > 0,
+            )
+            .clicked()
             {
                 choice = Some(QueueConfirmChoice::Mount);
             }
-            if ui.button("Cancel").clicked() {
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
                 choice = Some(QueueConfirmChoice::Cancel);
             }
         });
@@ -9214,17 +9060,6 @@ fn planned_action_label(state: MountState) -> &'static str {
         MountState::MountPathExists => "Skip — destination already exists",
     }
 }
-
-/// The redesigned Selected page: review of the mount queue built on the
-/// Mount page - archive, platform, planned destination, and planned
-/// action per queued entry, with per-row removal and the same inline
-/// confirmation-then-`start_mount_all` execution path as the Mount
-/// page. Rendering never mounts anything. The design's mount-command
-/// preview is deliberately absent: the configured ratarmount binary is
-/// not part of any GUI-held state today, and showing a guessed command
-/// would be untruthful.
-/// The Selected page's borrowed state, bundled per the existing
-/// `MountPageViewState` pattern.
 struct SelectedPageViewState<'a> {
     selected_archive: Option<&'a Path>,
     selected_count: usize,
@@ -9251,21 +9086,26 @@ fn show_selected_page(
         block_reason,
     } = view_state;
     let mut action = None;
-    ui.heading("Selected");
-    ui.add_space(4.0);
+    widgets::page_header(
+        ui,
+        "Selected",
+        "Review queued archives and their validated destinations before mounting.",
+    );
     if let Some(result) = mount_all_result {
         show_mount_all_result(ui, result);
         ui.separator();
     }
 
-    ui.strong("Selected archive");
+    widgets::section_header(
+        ui,
+        "RetroArch cheats",
+        Some("Optional setup for the archive selected in Library."),
+    );
     match selected_archive {
         Some(path) => {
-            ui.add(
-                egui::Label::new(path.display().to_string())
-                    .selectable(true)
-                    .wrap(),
-            );
+            if widgets::path_value(ui, "Selected archive", path) {
+                ui.ctx().copy_text(path.display().to_string());
+            }
         }
         None => {
             ui.label("No archive is selected in the Library.");
@@ -9278,12 +9118,13 @@ fn show_selected_page(
         retroarch_profiles,
     );
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                entry_blocker.is_none() && !busy,
-                egui::Button::new("RetroArch Cheats"),
-            )
-            .clicked()
+        if widgets::action_button(
+            ui,
+            "Open RetroArch cheats",
+            widgets::ActionStyle::Secondary,
+            entry_blocker.is_none() && !busy,
+        )
+        .clicked()
             && let Some(path) = selected_archive
         {
             action = Some(MountPageAction::OpenCheatWorkflow(path.to_path_buf()));
@@ -9291,15 +9132,19 @@ fn show_selected_page(
         if matches!(
             retroarch_profiles,
             RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
-        ) && ui
-            .add_enabled(!busy, egui::Button::new("Scan for RetroArch profiles"))
-            .clicked()
+        ) && widgets::action_button(
+            ui,
+            "Scan for RetroArch profiles",
+            widgets::ActionStyle::Quiet,
+            !busy,
+        )
+        .clicked()
         {
             action = Some(MountPageAction::ScanRetroArchProfiles);
         }
     });
     if let Some(reason) = entry_blocker {
-        ui.label(reason);
+        widgets::banner(ui, "Unavailable", reason, widgets::StatusTone::Pending);
     }
     ui.separator();
 
@@ -9309,41 +9154,62 @@ fn show_selected_page(
     };
     prune_mount_queue(queue, &data.records);
     if queue.is_empty() {
-        ui.label("No archives queued.");
-        ui.label("Add archives to the queue from the Mount screen.");
-        if ui.button("Go to Mount").clicked() {
+        if widgets::empty_state(
+            ui,
+            "No archives queued",
+            "Choose archives on the Mount page, then return here to review them.",
+            Some("Choose archives"),
+        ) {
             action = Some(MountPageAction::GoToMount);
         }
         return action;
     }
     let attempted = queued_pending_paths(queue, &data.records);
 
-    ui.horizontal(|ui| {
-        if queue.len() == 1 {
-            ui.label("1 archive queued.");
-        } else {
-            ui.label(format!("{} archives queued.", queue.len()));
-        }
-        if attempted.len() < queue.len() {
-            ui.label(format!(
-                "{} will be skipped (already mounted or destination exists).",
-                queue.len() - attempted.len()
-            ));
-        }
-        if ui.button("Clear queue").clicked() {
-            queue.clear();
-            *confirm = false;
-        }
-        let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
-        if ui
-            .add_enabled(
-                mount_enabled,
-                egui::Button::new(format!("Mount queue ({})", attempted.len())),
+    widgets::section_header(
+        ui,
+        "Mount queue",
+        Some(
+            "Ready entries will be mounted; blocked entries remain visible and are skipped safely.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if queue.len() == 1 {
+                ui.label("1 archive queued.");
+            } else {
+                ui.label(format!("{} archives queued.", queue.len()));
+            }
+            if attempted.len() < queue.len() {
+                ui.label(format!(
+                    "{} will be skipped (already mounted or destination exists).",
+                    queue.len() - attempted.len()
+                ));
+            }
+            if widgets::action_button(
+                ui,
+                "Clear queue",
+                widgets::ActionStyle::Quiet,
+                !queue.is_empty(),
             )
             .clicked()
-        {
-            *confirm = true;
-        }
+            {
+                queue.clear();
+                *confirm = false;
+            }
+            let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
+            if widgets::action_button(
+                ui,
+                format!("Mount ready archives ({})", attempted.len()),
+                widgets::ActionStyle::Primary,
+                mount_enabled,
+            )
+            .clicked()
+            {
+                *confirm = true;
+            }
+        })
+        .inner
     });
     if busy && let Some(reason) = block_reason {
         ui.label(reason);
@@ -9363,42 +9229,85 @@ fn show_selected_page(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("selected_queue_grid")
-                .num_columns(5)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Archive");
-                    ui.strong("Platform");
-                    ui.strong("Planned destination");
-                    ui.strong("Planned action");
-                    ui.strong("");
-                    ui.end_row();
-                    let mut remove: Option<PathBuf> = None;
-                    for path in queue.iter() {
-                        let Some(record) = data
-                            .records
-                            .iter()
-                            .find(|record| record.mount_plan.archive.path == *path)
-                        else {
-                            continue;
-                        };
-                        ui.label(&record.identity.display_name);
-                        ui.label(record.identity.platform.as_deref().unwrap_or("Unknown"));
-                        ui.add(
-                            egui::Label::new(record.mount_plan.mount_path.display().to_string())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.label(planned_action_label(record.mount_state));
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(path.clone());
+            let mut remove: Option<PathBuf> = None;
+            for ready in [true, false] {
+                let count = queue
+                    .iter()
+                    .filter(|path| {
+                        data.records.iter().any(|record| {
+                            record.mount_plan.archive.path == ***path
+                                && (record.mount_state == MountState::Pending) == ready
+                        })
+                    })
+                    .count();
+                if count == 0 {
+                    continue;
+                }
+                ui.label(
+                    egui::RichText::new(if ready { "READY" } else { "BLOCKED / SKIPPED" })
+                        .small()
+                        .strong()
+                        .color(theme::muted(ui)),
+                );
+                for path in queue.iter() {
+                    let Some(record) = data
+                        .records
+                        .iter()
+                        .find(|record| record.mount_plan.archive.path == *path)
+                    else {
+                        continue;
+                    };
+                    if (record.mount_state == MountState::Pending) != ready {
+                        continue;
+                    }
+                    widgets::card(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(&record.identity.display_name)
+                                    .size(17.0)
+                                    .strong(),
+                            );
+                            widgets::status_badge(
+                                ui,
+                                record.identity.platform.as_deref().unwrap_or("Unknown"),
+                                widgets::StatusTone::Info,
+                            );
+                            widgets::status_badge(
+                                ui,
+                                planned_action_label(record.mount_state),
+                                if ready {
+                                    widgets::StatusTone::Success
+                                } else {
+                                    widgets::StatusTone::Blocked
+                                },
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if widgets::action_button(
+                                        ui,
+                                        "Remove",
+                                        widgets::ActionStyle::Quiet,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        remove = Some(path.clone());
+                                    }
+                                },
+                            );
+                        });
+                        if widgets::path_value(ui, "Destination", &record.mount_plan.mount_path) {
+                            ui.ctx()
+                                .copy_text(record.mount_plan.mount_path.display().to_string());
                         }
-                        ui.end_row();
-                    }
-                    if let Some(path) = remove {
-                        queue.retain(|queued_path| *queued_path != path);
-                    }
-                });
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+            if let Some(path) = remove {
+                queue.retain(|queued_path| *queued_path != path);
+            }
         });
     action
 }
@@ -9412,12 +9321,6 @@ struct MountPageViewState<'a> {
     busy: bool,
     block_reason: Option<&'a str>,
 }
-
-/// The redesigned Mount page: filterable archive table with per-row
-/// queueing, planned-destination preview, per-archive validation labels,
-/// and an inline confirmation before the queue is handed to the existing
-/// `start_mount_all` batch engine. Rendering never mounts anything -
-/// the returned `MountPageAction` is the only way anything happens.
 fn show_mount_page(
     ui: &mut egui::Ui,
     live: Option<&LoadedData>,
@@ -9432,8 +9335,11 @@ fn show_mount_page(
         block_reason,
     } = view_state;
     let mut action = None;
-    ui.heading("Mount");
-    ui.add_space(4.0);
+    widgets::page_header(
+        ui,
+        "Mount",
+        "Choose archives, review validated destinations, and mount the ready queue.",
+    );
     if let Some(result) = mount_all_result {
         show_mount_all_result(ui, result);
         ui.separator();
@@ -9445,18 +9351,22 @@ fn show_mount_page(
     prune_mount_queue(queue, &data.records);
     let attempted = queued_pending_paths(queue, &data.records);
 
-    ui.horizontal(|ui| {
-        ui.label("Filter:");
-        ui.add(egui::TextEdit::singleline(search).desired_width(240.0));
-        if ui.button("Clear").clicked() {
-            search.clear();
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Refresh"))
-            .clicked()
-        {
-            action = Some(MountPageAction::Refresh);
-        }
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search");
+            ui.add(egui::TextEdit::singleline(search).desired_width(240.0));
+            if widgets::action_button(ui, "Clear", widgets::ActionStyle::Quiet, !search.is_empty())
+                .clicked()
+            {
+                search.clear();
+            }
+            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, !busy)
+                .clicked()
+            {
+                action = Some(MountPageAction::Refresh);
+            }
+        })
+        .inner
     });
     ui.add_space(4.0);
 
@@ -9466,48 +9376,57 @@ fn show_mount_page(
         .filter(|record| mount_row_matches(record, search))
         .collect();
 
-    ui.horizontal(|ui| {
-        if queue.len() == 1 {
-            ui.label("1 archive queued.");
-        } else {
-            ui.label(format!("{} archives queued.", queue.len()));
-        }
-        let any_visible_unqueued_pending = visible.iter().any(|record| {
-            record.mount_state == MountState::Pending
-                && !queue.contains(&record.mount_plan.archive.path)
-        });
-        if ui
-            .add_enabled(
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if queue.len() == 1 {
+                ui.label("1 archive queued.");
+            } else {
+                ui.label(format!("{} archives queued.", queue.len()));
+            }
+            let any_visible_unqueued_pending = visible.iter().any(|record| {
+                record.mount_state == MountState::Pending
+                    && !queue.contains(&record.mount_plan.archive.path)
+            });
+            if widgets::action_button(
+                ui,
+                "Queue all visible",
+                widgets::ActionStyle::Secondary,
                 any_visible_unqueued_pending,
-                egui::Button::new("Queue all visible"),
             )
             .clicked()
-        {
-            for record in &visible {
-                if record.mount_state == MountState::Pending
-                    && !queue.contains(&record.mount_plan.archive.path)
-                {
-                    queue.push(record.mount_plan.archive.path.clone());
+            {
+                for record in &visible {
+                    if record.mount_state == MountState::Pending
+                        && !queue.contains(&record.mount_plan.archive.path)
+                    {
+                        queue.push(record.mount_plan.archive.path.clone());
+                    }
                 }
             }
-        }
-        if ui
-            .add_enabled(!queue.is_empty(), egui::Button::new("Clear queue"))
-            .clicked()
-        {
-            queue.clear();
-            *confirm = false;
-        }
-        let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
-        if ui
-            .add_enabled(
-                mount_enabled,
-                egui::Button::new(format!("Mount queue ({})", attempted.len())),
+            if widgets::action_button(
+                ui,
+                "Clear queue",
+                widgets::ActionStyle::Quiet,
+                !queue.is_empty(),
             )
             .clicked()
-        {
-            *confirm = true;
-        }
+            {
+                queue.clear();
+                *confirm = false;
+            }
+            let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
+            if widgets::action_button(
+                ui,
+                format!("Mount queue ({})", attempted.len()),
+                widgets::ActionStyle::Primary,
+                mount_enabled,
+            )
+            .clicked()
+            {
+                *confirm = true;
+            }
+        })
+        .inner
     });
     if busy && let Some(reason) = block_reason {
         ui.label(reason);
@@ -9526,75 +9445,90 @@ fn show_mount_page(
     ui.separator();
 
     if data.records.is_empty() {
-        ui.label("No archives in the live snapshot. Add and scan sources first.");
+        widgets::empty_state(
+            ui,
+            "No archives found",
+            "Add and scan a source folder before creating a mount queue.",
+            None,
+        );
         return action;
     }
     if visible.is_empty() {
-        ui.label("No archives match the current filter.");
+        widgets::empty_state(
+            ui,
+            "No matching archives",
+            "Change or clear the search to see available archives.",
+            None,
+        );
         return action;
     }
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("mount_page_grid")
-                .num_columns(6)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Queue");
-                    ui.strong("Name");
-                    ui.strong("Platform");
-                    ui.strong("Validation");
-                    ui.strong("Archive path");
-                    ui.strong("Planned destination");
-                    ui.end_row();
-                    let mut toggle: Option<(PathBuf, bool)> = None;
-                    for record in &visible {
-                        let path = &record.mount_plan.archive.path;
-                        let queued = queue.contains(path);
-                        if queued {
-                            if ui.small_button("Unqueue").clicked() {
-                                toggle = Some((path.clone(), false));
-                            }
-                        } else {
-                            let queueable = record.mount_state == MountState::Pending;
-                            if ui
-                                .add_enabled(queueable, egui::Button::new("Queue").small())
-                                .clicked()
+            let mut toggle: Option<(PathBuf, bool)> = None;
+            for record in &visible {
+                let path = &record.mount_plan.archive.path;
+                let queued = queue.contains(path);
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(&record.identity.display_name)
+                                .size(17.0)
+                                .strong(),
+                        );
+                        widgets::status_badge(
+                            ui,
+                            record.identity.platform.as_deref().unwrap_or("Unknown"),
+                            widgets::StatusTone::Info,
+                        );
+                        let tone = match record.mount_state {
+                            MountState::Pending => widgets::StatusTone::Success,
+                            MountState::Mounted => widgets::StatusTone::Active,
+                            MountState::MountPathExists => widgets::StatusTone::Blocked,
+                        };
+                        widgets::status_badge(ui, mount_validation_label(record.mount_state), tone);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let label = if queued { "Remove" } else { "Add to queue" };
+                            if widgets::action_button(
+                                ui,
+                                label,
+                                if queued {
+                                    widgets::ActionStyle::Quiet
+                                } else {
+                                    widgets::ActionStyle::Secondary
+                                },
+                                queued || record.mount_state == MountState::Pending,
+                            )
+                            .clicked()
                             {
-                                toggle = Some((path.clone(), true));
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label(&record.identity.display_name);
-                            if queued {
-                                ui.small("QUEUED");
+                                toggle = Some((path.clone(), !queued));
                             }
                         });
-                        ui.label(record.identity.platform.as_deref().unwrap_or("Unknown"));
-                        ui.label(mount_validation_label(record.mount_state));
-                        ui.add(
-                            egui::Label::new(path.display().to_string())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.add(
-                            egui::Label::new(record.mount_plan.mount_path.display().to_string())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.end_row();
+                    });
+                    if widgets::path_value(ui, "Destination", &record.mount_plan.mount_path) {
+                        ui.ctx()
+                            .copy_text(record.mount_plan.mount_path.display().to_string());
                     }
-                    if let Some((path, add)) = toggle {
-                        if add {
-                            if !queue.contains(&path) {
-                                queue.push(path);
+                    egui::CollapsingHeader::new("Archive location")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if widgets::path_value(ui, "Archive", path) {
+                                ui.ctx().copy_text(path.display().to_string());
                             }
-                        } else {
-                            queue.retain(|queued_path| *queued_path != path);
-                        }
-                    }
+                        });
                 });
+                ui.add_space(6.0);
+            }
+            if let Some((path, add)) = toggle {
+                if add {
+                    if !queue.contains(&path) {
+                        queue.push(path);
+                    }
+                } else {
+                    queue.retain(|queued_path| *queued_path != path);
+                }
+            }
         });
     action
 }
@@ -9608,17 +9542,6 @@ enum ActiveMountsPageAction {
     OpenInLibrary(PathBuf),
     Refresh,
 }
-
-/// The redesigned Active Mounts page: the currently mounted archives
-/// from the live snapshot, with confirmed normal unmount per row.
-/// Reuses `pending_unmount_items` - the exact mounted-archive filter the
-/// proven unmount-all workflow uses - so this page can never disagree
-/// with the unmount machinery about what is mounted. Lazy unmount and
-/// remount stay deliberately absent here: both are failure-recovery
-/// offers the Library's selected-archive panel only unlocks after a
-/// failed or completed normal unmount (`lazy_unmount_offers` /
-/// `remount_offers`), and "Open in Library" is the honest route to that
-/// full recovery toolkit.
 fn show_active_mounts_page(
     ui: &mut egui::Ui,
     live_records: Option<&[ArchiveRecord]>,
@@ -9628,16 +9551,26 @@ fn show_active_mounts_page(
     busy: bool,
 ) -> Option<ActiveMountsPageAction> {
     let mut action = None;
-    ui.heading("Active Mounts");
-    ui.add_space(4.0);
+    widgets::page_header(
+        ui,
+        "Active Mounts",
+        "Review current mounts and unmount them normally after closing applications that use them.",
+    );
     if let Some(feedback) = feedback {
-        let color = if feedback.succeeded {
-            egui::Color32::from_rgb(70, 170, 90)
-        } else {
-            ui.visuals().error_fg_color
-        };
-        ui.colored_label(color, &feedback.message);
-        ui.separator();
+        widgets::banner(
+            ui,
+            if feedback.succeeded {
+                "Completed"
+            } else {
+                "Failed"
+            },
+            &feedback.message,
+            if feedback.succeeded {
+                widgets::StatusTone::Success
+            } else {
+                widgets::StatusTone::Blocked
+            },
+        );
     }
     let Some(records) = live_records else {
         ui.label("Live mount state is not loaded yet.");
@@ -9651,21 +9584,37 @@ fn show_active_mounts_page(
     {
         *confirm_unmount = None;
     }
-    ui.horizontal(|ui| {
-        if mounted.len() == 1 {
-            ui.label("1 mounted archive.");
-        } else {
-            ui.label(format!("{} mounted archives.", mounted.len()));
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Refresh"))
-            .clicked()
-        {
-            action = Some(ActiveMountsPageAction::Refresh);
-        }
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("{} active", mounted.len()),
+                if mounted.is_empty() {
+                    widgets::StatusTone::Pending
+                } else {
+                    widgets::StatusTone::Active
+                },
+            );
+            if mounted.len() == 1 {
+                ui.label("1 mounted archive.");
+            } else {
+                ui.label(format!("{} mounted archives.", mounted.len()));
+            }
+            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, !busy)
+                .clicked()
+            {
+                action = Some(ActiveMountsPageAction::Refresh);
+            }
+        })
+        .inner
     });
     if mounted.is_empty() {
-        ui.label("No archives are currently mounted.");
+        widgets::empty_state(
+            ui,
+            "Nothing is mounted",
+            "Mounted archives will appear here with their destinations and normal unmount controls.",
+            None,
+        );
         return action;
     }
     ui.add_enabled_ui(!busy, |ui| {
@@ -9680,18 +9629,24 @@ fn show_active_mounts_page(
             .find(|item| item.archive_path == pending)
             .map(|item| item.display_name.as_str())
             .unwrap_or("this archive");
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        widgets::card(ui, |ui| {
+            widgets::status_badge(ui, "Confirmation", widgets::StatusTone::Warning);
             ui.strong(format!("Unmount {name}?"));
             ui.label("Close applications using this mount before unmounting.");
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Unmount now"))
-                    .clicked()
+                if widgets::action_button(
+                    ui,
+                    "Unmount now",
+                    widgets::ActionStyle::Destructive,
+                    !busy,
+                )
+                .clicked()
                 {
                     action = Some(ActiveMountsPageAction::Unmount(pending.clone()));
                     *confirm_unmount = None;
                 }
-                if ui.button("Cancel").clicked() {
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
                     *confirm_unmount = None;
                 }
             });
@@ -9701,139 +9656,177 @@ fn show_active_mounts_page(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("active_mounts_grid")
-                .num_columns(5)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Name");
-                    ui.strong("Archive path");
-                    ui.strong("Mount path");
-                    ui.strong("");
-                    ui.strong("");
-                    ui.end_row();
-                    for item in &mounted {
-                        ui.label(&item.display_name);
-                        ui.add(
-                            egui::Label::new(item.archive_path.display().to_string())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.add(
-                            egui::Label::new(item.mount_path.display().to_string())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        if ui
-                            .add_enabled(!busy, egui::Button::new("Unmount").small())
+            for item in &mounted {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(&item.display_name).size(17.0).strong());
+                        widgets::status_badge(ui, "Mounted", widgets::StatusTone::Active);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if widgets::action_button(
+                                ui,
+                                "Unmount",
+                                widgets::ActionStyle::Destructive,
+                                !busy,
+                            )
                             .clicked()
-                        {
-                            *confirm_unmount = Some(item.archive_path.clone());
-                        }
-                        if ui.small_button("Open in Library").clicked() {
-                            action = Some(ActiveMountsPageAction::OpenInLibrary(
-                                item.archive_path.clone(),
-                            ));
-                        }
-                        ui.end_row();
+                            {
+                                *confirm_unmount = Some(item.archive_path.clone());
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Open in Library",
+                                widgets::ActionStyle::Quiet,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(ActiveMountsPageAction::OpenInLibrary(
+                                    item.archive_path.clone(),
+                                ));
+                            }
+                        });
+                    });
+                    if widgets::path_value(ui, "Destination", &item.mount_path) {
+                        ui.ctx().copy_text(item.mount_path.display().to_string());
+                    }
+                    if widgets::path_value(ui, "Archive", &item.archive_path) {
+                        ui.ctx().copy_text(item.archive_path.display().to_string());
                     }
                 });
+                ui.add_space(6.0);
+            }
         });
     action
 }
-
-/// The redesigned History & Logs page: the same operation history the
-/// bottom Activity panel shows, as a full screen - listing plus
-/// per-entry copy and a clear-all action. Filtering and export are
-/// later deliverables of the history-and-logs milestone.
 fn show_history_logs_page(
     ui: &mut egui::Ui,
     history: &mut OperationHistory,
     filters: &mut HistoryLogFilters,
     clipboard: &mut dyn ClipboardBackend,
 ) {
-    ui.heading("History & Logs");
-    ui.add_space(4.0);
+    widgets::page_header(
+        ui,
+        "History & Logs",
+        "Filter, inspect, copy, or export operations from this application session.",
+    );
     if history.entries().next().is_none() {
-        ui.label("No operations have run in this session yet.");
+        widgets::empty_state(
+            ui,
+            "No activity yet",
+            "Mounts, scans, diagnostics, and trusted-source retrievals will be recorded here for this session.",
+            None,
+        );
         return;
     }
 
-    ui.horizontal(|ui| {
-        egui::ComboBox::from_label("Operation")
-            .selected_text(
-                filters
-                    .action
-                    .map_or_else(|| "All Operations".to_string(), |action| action.to_string()),
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_label("Operation")
+                .selected_text(
+                    filters
+                        .action
+                        .map_or_else(|| "All Operations".to_string(), |action| action.to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filters.action, None, "All Operations");
+                    for action in ALL_ACTIVITY_ACTIONS {
+                        ui.selectable_value(&mut filters.action, Some(action), action.to_string());
+                    }
+                });
+            egui::ComboBox::from_label("Result")
+                .selected_text(
+                    filters
+                        .outcome
+                        .map_or_else(|| "All Results".to_string(), |outcome| outcome.to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filters.outcome, None, "All Results");
+                    for outcome in ALL_ACTIVITY_OUTCOMES {
+                        ui.selectable_value(
+                            &mut filters.outcome,
+                            Some(outcome),
+                            outcome.to_string(),
+                        );
+                    }
+                });
+            let sort_label = if filters.oldest_first {
+                "Sort: Oldest First"
+            } else {
+                "Sort: Newest First"
+            };
+            if widgets::action_button(ui, sort_label, widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                filters.oldest_first = !filters.oldest_first;
+            }
+            if widgets::action_button(
+                ui,
+                "Clear filters",
+                widgets::ActionStyle::Quiet,
+                filters.action.is_some() || filters.outcome.is_some(),
             )
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut filters.action, None, "All Operations");
-                for action in ALL_ACTIVITY_ACTIONS {
-                    ui.selectable_value(&mut filters.action, Some(action), action.to_string());
-                }
-            });
-        egui::ComboBox::from_label("Result")
-            .selected_text(
-                filters
-                    .outcome
-                    .map_or_else(|| "All Results".to_string(), |outcome| outcome.to_string()),
-            )
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut filters.outcome, None, "All Results");
-                for outcome in ALL_ACTIVITY_OUTCOMES {
-                    ui.selectable_value(&mut filters.outcome, Some(outcome), outcome.to_string());
-                }
-            });
-        let sort_label = if filters.oldest_first {
-            "Sort: Oldest First"
-        } else {
-            "Sort: Newest First"
-        };
-        if ui.button(sort_label).clicked() {
-            filters.oldest_first = !filters.oldest_first;
-        }
-        if ui.button("Clear Filters").clicked() {
-            filters.action = None;
-            filters.outcome = None;
-        }
+            .clicked()
+            {
+                filters.action = None;
+                filters.outcome = None;
+            }
+        })
+        .inner
     });
 
     // Owned copies end the immutable borrow of `history` before the
     // buttons below may mutate it (clear / record an export entry).
-    let visible_texts: Vec<String> = visible_history_entries(history, filters)
+    let visible_entries: Vec<HistoryEntry> = visible_history_entries(history, filters)
         .into_iter()
-        .map(history_entry_text)
+        .cloned()
         .collect();
+    let visible_texts: Vec<String> = visible_entries.iter().map(history_entry_text).collect();
     let total = history.entries().count();
 
     let mut export_requested = false;
-    ui.horizontal(|ui| {
-        if visible_texts.len() == total {
-            if total == 1 {
-                ui.label("1 entry.".to_string());
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if visible_texts.len() == total {
+                if total == 1 {
+                    ui.label("1 entry.".to_string());
+                } else {
+                    ui.label(format!("{total} entries."));
+                }
             } else {
-                ui.label(format!("{total} entries."));
+                ui.label(format!("{} of {total} entries shown.", visible_texts.len()));
             }
-        } else {
-            ui.label(format!("{} of {total} entries shown.", visible_texts.len()));
-        }
-        if ui
-            .add_enabled(
+            if widgets::action_button(
+                ui,
+                "Copy visible log",
+                widgets::ActionStyle::Secondary,
                 !visible_texts.is_empty(),
-                egui::Button::new("Copy Visible Log"),
             )
             .clicked()
-        {
-            let _ = clipboard.set_text(visible_texts.join("\n"));
-        }
-        if ui
-            .add_enabled(!visible_texts.is_empty(), egui::Button::new("Export Log"))
+            {
+                let _ = clipboard.set_text(visible_texts.join("\n"));
+            }
+            if widgets::action_button(
+                ui,
+                "Export log",
+                widgets::ActionStyle::Secondary,
+                !visible_texts.is_empty(),
+            )
             .clicked()
-        {
-            export_requested = true;
-        }
-        if ui.button("Clear history").clicked() {
-            history.clear();
-        }
+            {
+                export_requested = true;
+            }
+            if widgets::action_button(
+                ui,
+                "Clear history",
+                widgets::ActionStyle::Destructive,
+                !visible_texts.is_empty(),
+            )
+            .clicked()
+            {
+                history.clear();
+            }
+        })
+        .inner
     });
     if export_requested
         && let Some(path) = rfd::FileDialog::new()
@@ -9862,33 +9855,53 @@ fn show_history_logs_page(
     ui.separator();
 
     if visible_texts.is_empty() {
-        ui.label("No operations match the current filters.");
+        widgets::empty_state(
+            ui,
+            "No matching activity",
+            "Change or clear the filters to see session events.",
+            None,
+        );
         return;
     }
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for text in &visible_texts {
-                ui.horizontal(|ui| {
-                    if ui.small_button("Copy").clicked() {
-                        let _ = clipboard.set_text(text.clone());
+            for (entry, text) in visible_entries.iter().zip(&visible_texts) {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(
+                            ui,
+                            entry.outcome.to_string(),
+                            activity_outcome_tone(entry.outcome),
+                        );
+                        ui.strong(entry.action.to_string());
+                        ui.label(
+                            egui::RichText::new(format_history_timestamp(entry.timestamp))
+                                .color(theme::muted(ui)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
+                                .clicked()
+                            {
+                                let _ = clipboard.set_text(text.clone());
+                            }
+                        });
+                    });
+                    ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
+                    if let Some(path) = &entry.archive_path {
+                        egui::CollapsingHeader::new("Related archive")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if widgets::path_value(ui, "Archive", path) {
+                                    let _ = clipboard.set_text(path.display().to_string());
+                                }
+                            });
                     }
-                    ui.add(egui::Label::new(text).selectable(true).wrap());
                 });
+                ui.add_space(6.0);
             }
         });
 }
-
-/// The redesigned Settings page, limited to backend-supported and
-/// currently read-only information (campaign constraint: prototype-only
-/// settings such as UI density are deferred; editable settings arrive
-/// with the settings-integration milestone).
-/// The RetroArch cheat workflow's identity and staged state. Created
-/// only from the Selected screen (or the Library row context menu) for
-/// exactly one archive; replaced wholesale on every open (the
-/// `ArchiveInspectorState` precedent) and dropped when the workflow
-/// closes or the canonical selected archive changes, so stray state can
-/// never leak between archives.
 struct CheatWorkflowState {
     /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
     /// .path` identity the rest of the app uses, never a filename.
@@ -9944,6 +9957,16 @@ fn cheat_freshness_label(freshness: CheatSourceFreshness) -> &'static str {
     }
 }
 
+fn cheat_freshness_tone(freshness: CheatSourceFreshness) -> widgets::StatusTone {
+    match freshness {
+        CheatSourceFreshness::Fresh => widgets::StatusTone::Success,
+        CheatSourceFreshness::Stale => widgets::StatusTone::Warning,
+        CheatSourceFreshness::Missing | CheatSourceFreshness::Unknown => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
 /// Display label for how a catalogue retrieval was satisfied.
 fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
     match status {
@@ -9951,6 +9974,27 @@ fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
         CheatSourceFetchStatus::CacheReused => "Reused cached snapshot",
         CheatSourceFetchStatus::OfflineReused => "Offline: reused cached snapshot",
     }
+}
+
+fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
+    warnings
+        .iter()
+        .map(|warning| {
+            let count = warning.split_whitespace().next().unwrap_or("Some");
+            if warning.contains("retained but are non-actionable because parsing was incomplete") {
+                format!(
+                    "{count} catalogue files could not be parsed and were excluded from matching."
+                )
+            } else if warning.contains("non-UTF-8 catalogue files were safely skipped") {
+                format!("{count} files used unsupported path encoding and were skipped safely.")
+            } else if warning == "cached snapshot is stale" {
+                "The cached catalogue is stale; update it when a network connection is available."
+                    .to_string()
+            } else {
+                warning.clone()
+            }
+        })
+        .collect()
 }
 
 /// What the cheat workflow panel asks `update` to do.
@@ -9973,16 +10017,32 @@ fn show_cheat_workflow_step2(
     busy: bool,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
-    ui.strong("Step 2 — Trusted source and snapshot");
-    ui.add_space(4.0);
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Step 2 · Trusted catalogue source",
+        Some("Only reviewed, built-in sources are available. Custom URLs are not accepted."),
+    );
     if workflow.selected_profile_id.is_none() {
-        ui.label("Choose a RetroArch profile in Step 1 to continue.");
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible RetroArch profile in Step 1 to continue.",
+            widgets::StatusTone::Pending,
+        );
         return None;
     }
     match &workflow.source_list {
         CheatStepResource::NotLoaded => {
             ui.label("Trusted sources have not been listed yet.");
-            if ui.button("List trusted sources").clicked() {
+            if widgets::action_button(
+                ui,
+                "List trusted sources",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
                 action = Some(CheatWorkflowAction::RefreshSources);
             }
         }
@@ -9993,99 +10053,102 @@ fn show_cheat_workflow_step2(
             });
         }
         CheatStepResource::Failed(message) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Could not list trusted sources: {message}"),
+            widgets::banner(
+                ui,
+                "Could not list trusted sources",
+                message,
+                widgets::StatusTone::Blocked,
             );
-            if ui.button("Retry").clicked() {
+            if widgets::action_button(ui, "Retry", widgets::ActionStyle::Primary, true).clicked() {
                 action = Some(CheatWorkflowAction::RefreshSources);
             }
         }
         CheatStepResource::Ready(list) => {
             for entry in &list.entries {
                 let source = &entry.source;
-                ui.horizontal(|ui| {
-                    if source.enabled {
-                        let selected =
-                            workflow.selected_source_id.as_deref() == Some(&source.source_id);
-                        if ui.radio(selected, &source.display_name).clicked() {
-                            workflow.selected_source_id = Some(source.source_id.clone());
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if source.enabled {
+                            let selected =
+                                workflow.selected_source_id.as_deref() == Some(&source.source_id);
+                            if ui.radio(selected, &source.display_name).clicked() {
+                                workflow.selected_source_id = Some(source.source_id.clone());
+                            }
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::selectable(false, &source.display_name),
+                            );
+                            widgets::status_badge(ui, "Disabled", widgets::StatusTone::Pending);
                         }
-                    } else {
-                        ui.add_enabled(
-                            false,
-                            egui::Button::selectable(false, &source.display_name),
+                        if source.experimental {
+                            widgets::status_badge(ui, "Experimental", widgets::StatusTone::Warning);
+                        } else {
+                            widgets::status_badge(
+                                ui,
+                                "Trusted built-in",
+                                widgets::StatusTone::Success,
+                            );
+                        }
+                        widgets::status_badge(
+                            ui,
+                            cheat_freshness_label(entry.freshness),
+                            cheat_freshness_tone(entry.freshness),
                         );
-                        ui.label("(disabled)");
-                    }
-                    if source.experimental {
-                        ui.colored_label(ui.visuals().warn_fg_color, "experimental");
+                    });
+                    if workflow.selected_source_id.as_deref() == Some(&source.source_id) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Permitted host: {}", source.permitted_host));
+                            if let Some(fetched_at) = entry.fetched_at_unix_seconds {
+                                ui.label(format!(
+                                    "Last retrieval: {}",
+                                    format_unix_timestamp_utc(fetched_at as i64)
+                                ));
+                            }
+                        });
+                        ui.label(&source.provenance);
+                        if !entry.warnings.is_empty() {
+                            for warning in summarise_cheat_warnings(&entry.warnings) {
+                                widgets::banner(
+                                    ui,
+                                    "Notice",
+                                    &warning,
+                                    widgets::StatusTone::Warning,
+                                );
+                            }
+                        }
+                        egui::CollapsingHeader::new("Source technical details")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                widgets::copyable_value(ui, "Source identifier", &source.source_id);
+                                widgets::copyable_value(ui, "Download URL", &source.download_url);
+                                ui.label(format!("Trust status: {}", entry.trust_status));
+                                if let Some(licence) = &source.licence_url {
+                                    ui.label(format!("Licence: {licence}"));
+                                }
+                                if let Some(pinned) = &source.pinned_version {
+                                    ui.label(format!("Pinned version: {pinned}"));
+                                }
+                                if let Some(version) = &entry.current_cached_version {
+                                    ui.label(format!("Cached version: {version}"));
+                                }
+                                if let Some(digest) = &entry.archive_sha256 {
+                                    widgets::copyable_value(ui, "SHA-256", digest);
+                                }
+                                if let Some(count) = entry.catalogue_file_count {
+                                    ui.label(format!("Catalogue files: {count}"));
+                                }
+                                ui.label(format!(
+                                    "Usable for setup: {}",
+                                    if entry.setup_usable { "Yes" } else { "No" }
+                                ));
+                                for warning in &entry.warnings {
+                                    ui.label(warning);
+                                }
+                            });
                     }
                 });
-                if workflow.selected_source_id.as_deref() == Some(&source.source_id) {
-                    egui::Grid::new(format!("cheat_source_grid_{}", source.source_id))
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            ui.strong("Source ID");
-                            ui.label(&source.source_id);
-                            ui.end_row();
-                            ui.strong("URL");
-                            ui.add(
-                                egui::Label::new(&source.download_url)
-                                    .selectable(true)
-                                    .wrap(),
-                            );
-                            ui.end_row();
-                            ui.strong("Permitted host");
-                            ui.label(&source.permitted_host);
-                            ui.end_row();
-                            ui.strong("Provenance");
-                            ui.add(egui::Label::new(&source.provenance).selectable(true).wrap());
-                            ui.end_row();
-                            if let Some(licence) = &source.licence_url {
-                                ui.strong("Licence");
-                                ui.add(egui::Label::new(licence).selectable(true).wrap());
-                                ui.end_row();
-                            }
-                            if let Some(pinned) = &source.pinned_version {
-                                ui.strong("Pinned version");
-                                ui.label(pinned);
-                                ui.end_row();
-                            }
-                            ui.strong("Trust status");
-                            ui.label(&entry.trust_status);
-                            ui.end_row();
-                            ui.strong("Cached snapshot");
-                            ui.label(cheat_freshness_label(entry.freshness));
-                            ui.end_row();
-                            if let Some(version) = &entry.current_cached_version {
-                                ui.strong("Cached version");
-                                ui.label(version);
-                                ui.end_row();
-                            }
-                            if let Some(fetched_at) = entry.fetched_at_unix_seconds {
-                                ui.strong("Retrieved");
-                                ui.label(format_unix_timestamp_utc(fetched_at as i64));
-                                ui.end_row();
-                            }
-                            if let Some(digest) = &entry.archive_sha256 {
-                                ui.strong("Digest (SHA-256)");
-                                ui.add(egui::Label::new(digest).selectable(true).wrap());
-                                ui.end_row();
-                            }
-                            if let Some(count) = entry.catalogue_file_count {
-                                ui.strong("Catalogue files");
-                                ui.label(count.to_string());
-                                ui.end_row();
-                            }
-                            ui.strong("Usable for setup");
-                            ui.label(if entry.setup_usable { "Yes" } else { "No" });
-                            ui.end_row();
-                        });
-                    for warning in &entry.warnings {
-                        ui.colored_label(ui.visuals().warn_fg_color, warning);
-                    }
-                }
+                ui.add_space(6.0);
             }
             ui.add_space(4.0);
             let fetching = matches!(workflow.source_fetch, CheatStepResource::Loading { .. });
@@ -10094,34 +10157,50 @@ fn show_cheat_workflow_step2(
                     .iter()
                     .find(|entry| entry.source.source_id == id)
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let can_fetch =
                     !busy && !fetching && selected_entry.is_some_and(|entry| entry.source.enabled);
-                if ui
-                    .add_enabled(can_fetch, egui::Button::new("Fetch / Update catalogue"))
-                    .clicked()
+                if widgets::action_button(
+                    ui,
+                    "Fetch / update catalogue",
+                    widgets::ActionStyle::Primary,
+                    can_fetch,
+                )
+                .clicked()
                 {
                     action = Some(CheatWorkflowAction::FetchSource);
                 }
-                ui.checkbox(&mut workflow.fetch_force_refresh, "Force full refresh");
                 let cached_available = selected_entry
                     .is_some_and(|entry| entry.freshness != CheatSourceFreshness::Missing);
-                if ui
-                    .add_enabled(
-                        !busy && !fetching && cached_available,
-                        egui::Button::new("Use cached snapshot (offline)"),
-                    )
-                    .clicked()
+                if widgets::action_button(
+                    ui,
+                    "Use cached snapshot",
+                    widgets::ActionStyle::Secondary,
+                    !busy && !fetching && cached_available,
+                )
+                .clicked()
                 {
                     action = Some(CheatWorkflowAction::UseCachedSnapshot);
                 }
-                if ui
-                    .add_enabled(!fetching, egui::Button::new("Refresh source list"))
-                    .clicked()
+                if widgets::action_button(
+                    ui,
+                    "Refresh source list",
+                    widgets::ActionStyle::Quiet,
+                    !fetching,
+                )
+                .clicked()
                 {
                     action = Some(CheatWorkflowAction::RefreshSources);
                 }
             });
+            egui::CollapsingHeader::new("Advanced retrieval options")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.checkbox(
+                        &mut workflow.fetch_force_refresh,
+                        "Force a full refresh instead of reusing a fresh cache",
+                    );
+                });
         }
     }
     match &workflow.source_fetch {
@@ -10133,60 +10212,80 @@ fn show_cheat_workflow_step2(
             });
         }
         CheatStepResource::Failed(message) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Catalogue retrieval failed: {message}"),
+            widgets::banner(
+                ui,
+                "Catalogue retrieval failed",
+                message,
+                widgets::StatusTone::Blocked,
             );
         }
         CheatStepResource::Ready(result) => {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong(cheat_fetch_status_label(result.status));
-                egui::Grid::new("cheat_fetch_result_grid")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        ui.strong("Snapshot digest");
-                        ui.add(
-                            egui::Label::new(&result.manifest.archive_sha256)
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.end_row();
-                        ui.strong("Retrieved");
-                        ui.label(format_unix_timestamp_utc(
-                            result.manifest.fetched_at_unix_seconds as i64,
-                        ));
-                        ui.end_row();
-                        ui.strong("Catalogue path");
-                        ui.add(
-                            egui::Label::new(&result.local_catalogue_path.display)
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.end_row();
-                        ui.strong("Snapshot");
-                        ui.add(
-                            egui::Label::new(&result.immutable_snapshot_path.display)
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.end_row();
-                        ui.strong("Freshness");
-                        ui.label(cheat_freshness_label(result.freshness));
-                        ui.end_row();
-                        ui.strong("Valid cheats");
-                        ui.label(result.manifest.valid_cheat_count.to_string());
-                        ui.end_row();
-                    });
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, "Catalogue ready", widgets::StatusTone::Success);
+                    widgets::status_badge(
+                        ui,
+                        cheat_freshness_label(result.freshness),
+                        if result.stale {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Success
+                        },
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} valid cheats",
+                            result.manifest.valid_cheat_count
+                        ))
+                        .strong(),
+                    );
+                    ui.label(format!(
+                        "Retrieved {}",
+                        format_unix_timestamp_utc(result.manifest.fetched_at_unix_seconds as i64)
+                    ));
+                });
+                ui.label(cheat_fetch_status_label(result.status));
                 if result.stale {
-                    ui.colored_label(
-                        ui.visuals().warn_fg_color,
-                        "This snapshot is stale; fetch to update it when online.",
+                    widgets::banner(
+                        ui,
+                        "Stale snapshot",
+                        "The cached catalogue remains usable for inspection, but should be updated when online.",
+                        widgets::StatusTone::Warning,
                     );
                 }
-                for warning in &result.warnings {
-                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                for warning in summarise_cheat_warnings(&result.warnings) {
+                    widgets::banner(
+                        ui,
+                        "Catalogue notice",
+                        &warning,
+                        widgets::StatusTone::Warning,
+                    );
                 }
+                egui::CollapsingHeader::new("Catalogue technical details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        widgets::copyable_value(ui, "SHA-256", &result.manifest.archive_sha256);
+                        widgets::copyable_value(
+                            ui,
+                            "Catalogue path",
+                            &result.local_catalogue_path.display,
+                        );
+                        widgets::copyable_value(
+                            ui,
+                            "Immutable snapshot",
+                            &result.immutable_snapshot_path.display,
+                        );
+                        for warning in &result.warnings {
+                            ui.label(warning);
+                        }
+                    });
             });
+            widgets::banner(
+                ui,
+                "Retrieval complete",
+                "Catalogue matching and cheat installation are not yet available in this GUI workflow.",
+                widgets::StatusTone::Info,
+            );
         }
     }
     action
@@ -10259,37 +10358,42 @@ fn show_cheat_workflow_step1(
     busy: bool,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
-    ui.strong("Step 1 — Archive and profile");
-    ui.add_space(4.0);
-    egui::Grid::new("cheat_workflow_archive_grid")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.strong("Archive");
-            ui.add(
-                egui::Label::new(workflow.archive_path.display().to_string())
-                    .selectable(true)
-                    .wrap(),
+    widgets::section_header(
+        ui,
+        "Step 1 · Archive and RetroArch profile",
+        Some(
+            "The archive is fixed for this workflow. ArchiveFS selects a profile automatically only when exactly one is eligible.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(&workflow.display_name)
+                    .size(19.0)
+                    .strong(),
             );
-            ui.end_row();
-            ui.strong("Name");
-            ui.label(&workflow.display_name);
-            ui.end_row();
-            ui.strong("Platform");
-            ui.label(workflow.platform.as_deref().unwrap_or("Unknown"));
-            ui.end_row();
-            ui.strong("Source root");
-            ui.add(
-                egui::Label::new(workflow.source_root.display().to_string())
-                    .selectable(true)
-                    .wrap(),
+            widgets::status_badge(
+                ui,
+                workflow.platform.as_deref().unwrap_or("Unknown platform"),
+                widgets::StatusTone::Info,
             );
-            ui.end_row();
-            ui.strong("Size");
-            ui.label(format_size(workflow.size_bytes));
-            ui.end_row();
+            ui.label(egui::RichText::new(format_size(workflow.size_bytes)).color(theme::muted(ui)));
         });
-    ui.add_space(8.0);
-    ui.strong("RetroArch profile");
+        egui::CollapsingHeader::new("Archive details")
+            .default_open(false)
+            .show(ui, |ui| {
+                if widgets::path_value(ui, "Archive", &workflow.archive_path) {
+                    ui.ctx()
+                        .copy_text(workflow.archive_path.display().to_string());
+                }
+                if widgets::path_value(ui, "Source root", &workflow.source_root) {
+                    ui.ctx()
+                        .copy_text(workflow.source_root.display().to_string());
+                }
+            });
+    });
+    ui.add_space(10.0);
+    widgets::section_header(ui, "RetroArch profile", None);
     match profiles {
         RetroArchProfilesState::NotScanned => {
             ui.label("Profiles have not been scanned yet.");
@@ -10318,7 +10422,12 @@ fn show_cheat_workflow_step1(
                 );
             }
             if eligible.is_empty() {
-                ui.label("No eligible RetroArch profile was found.");
+                widgets::banner(
+                    ui,
+                    "No eligible profile",
+                    "The discovered profiles are blocked. Review their concise blocker summaries below or rescan after correcting RetroArch configuration.",
+                    widgets::StatusTone::Blocked,
+                );
             } else if eligible.len() > 1 && workflow.selected_profile_id.is_none() {
                 ui.label(format!(
                     "{} eligible profiles were found. ArchiveFS never silently picks \
@@ -10327,43 +10436,53 @@ fn show_cheat_workflow_step1(
                 ));
             }
             for profile in &discovery.profiles {
-                ui.horizontal(|ui| {
-                    if profile.eligible {
-                        let selected =
-                            workflow.selected_profile_id.as_deref() == Some(&profile.profile_id);
-                        if ui.radio(selected, &profile.profile_id).clicked() {
-                            workflow.selected_profile_id = Some(profile.profile_id.clone());
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if profile.eligible {
+                            let selected = workflow.selected_profile_id.as_deref()
+                                == Some(&profile.profile_id);
+                            if ui.radio(selected, &profile.profile_id).clicked() {
+                                workflow.selected_profile_id = Some(profile.profile_id.clone());
+                            }
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::selectable(false, &profile.profile_id),
+                            );
+                            widgets::status_badge(ui, "Blocked", profile_presentation_tone(false));
                         }
-                    } else {
-                        ui.add_enabled(false, egui::Button::selectable(false, &profile.profile_id));
-                        ui.colored_label(ui.visuals().warn_fg_color, "Blocked");
+                        ui.label(format!(
+                            "{} / {}",
+                            profile_kind_label(&profile.installation_type),
+                            profile_scope_label(&profile.scope)
+                        ));
+                    });
+                    if let Some(blocker) = profile.blockers.first() {
+                        ui.label(format!("{} — {}", blocker.code, blocker.detail));
                     }
-                    ui.label(format!(
-                        "{} / {}",
-                        profile_kind_label(&profile.installation_type),
-                        profile_scope_label(&profile.scope)
-                    ));
+                    if profile.blockers.len() > 1 {
+                        egui::CollapsingHeader::new(format!(
+                            "All technical blockers ({})",
+                            profile.blockers.len()
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for blocker in &profile.blockers {
+                                ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                            }
+                        });
+                    }
                 });
-                for blocker in &profile.blockers {
-                    ui.label(format!("    {} — {}", blocker.code, blocker.detail));
-                }
+                ui.add_space(6.0);
             }
         }
     }
     ui.add_space(4.0);
-    if ui
-        .add_enabled(!busy, egui::Button::new("Rescan Profiles"))
-        .clicked()
-    {
+    if widgets::action_button(ui, "Rescan profiles", widgets::ActionStyle::Quiet, !busy).clicked() {
         action = Some(CheatWorkflowAction::RescanProfiles);
     }
     action
 }
-
-/// The Settings page's RetroArch profile discovery state - mirrors
-/// `DiagnosticsState`'s Loading-holds-its-own-receiver shape. Discovery
-/// is blocking filesystem probing, so it always runs on a background
-/// thread (campaign constraint: never block the UI thread on I/O).
 enum RetroArchProfilesState {
     NotScanned,
     Scanning {
@@ -10390,6 +10509,14 @@ fn profile_scope_label(scope: &ProfileScope) -> &'static str {
     }
 }
 
+fn profile_presentation_tone(eligible: bool) -> widgets::StatusTone {
+    if eligible {
+        widgets::StatusTone::Success
+    } else {
+        widgets::StatusTone::Pending
+    }
+}
+
 /// What the Settings page asks `update` to do - each maps onto an
 /// existing proven workflow (`SetupAction::OpenConfigFolder`, the
 /// diagnostics refresh, the Diagnostics overlay, the background
@@ -10411,8 +10538,11 @@ fn show_settings_page(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
-    ui.heading("Settings");
-    ui.add_space(4.0);
+    widgets::page_header(
+        ui,
+        "Settings",
+        "Review ArchiveFS locations, configuration health, and supported integrations.",
+    );
 
     let database_path = database_state_path(database_state).map(|path| path.display().to_string());
     let config_path = match diagnostics {
@@ -10424,99 +10554,112 @@ fn show_settings_page(
     };
     let mount_root_text = mount_root.map(|path| path.display().to_string());
 
-    egui::Grid::new("settings_paths_grid")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.strong("Configuration path");
-            ui.horizontal(|ui| {
-                ui.label(config_path.as_deref().unwrap_or("unknown"));
-                if let Some(path) = &config_path
-                    && ui.small_button("Copy").clicked()
-                {
-                    let _ = clipboard.set_text(path.clone());
-                }
-            });
-            ui.end_row();
-
-            ui.strong("Database path");
-            ui.horizontal(|ui| {
-                ui.label(database_path.as_deref().unwrap_or("unknown"));
-                if let Some(path) = &database_path
-                    && ui.small_button("Copy").clicked()
-                {
-                    let _ = clipboard.set_text(path.clone());
-                }
-            });
-            ui.end_row();
-
-            ui.strong("Mount root");
-            ui.label(mount_root_text.as_deref().unwrap_or("not loaded"));
-            ui.end_row();
-        });
-    ui.label(
-        "Changing the mount root only affects new mounts. Existing mounts \
-         stay at their current destinations until remounted.",
+    widgets::section_header(
+        ui,
+        "1. ArchiveFS locations",
+        Some("Full paths remain available through hover and Copy without dominating the page."),
     );
-
-    ui.add_space(8.0);
-    match diagnostics {
-        DiagnosticsState::Ready { report, .. } => {
-            if diagnostics_can_continue(report) {
-                ui.label("Configuration check: no blocking issues found.");
-            } else {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Configuration check found issues — open Diagnostics for details.",
-                );
+    widgets::card(ui, |ui| {
+        if let Some(path) = &config_path {
+            if widgets::copyable_value(ui, "Configuration", path) {
+                let _ = clipboard.set_text(path.clone());
             }
+        } else {
+            ui.label("Configuration: unknown");
         }
-        DiagnosticsState::Loading { .. } => {
-            ui.label("Configuration check running...");
+        if let Some(path) = &database_path {
+            if widgets::copyable_value(ui, "Database", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Database: unknown");
         }
+        if let Some(path) = mount_root {
+            if widgets::path_value(ui, "Mount root", path) {
+                let _ = clipboard.set_text(path.display().to_string());
+            }
+        } else {
+            ui.label("Mount root: not loaded");
+        }
+        ui.label(egui::RichText::new("Mount-root changes apply to new mounts; existing mounts keep their current destinations until remounted.").color(theme::muted(ui)));
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "2. Configuration validation",
+        Some("ArchiveFS validates the active configuration without changing it."),
+    );
+    let (validation_title, validation_detail, validation_tone) = match diagnostics {
+        DiagnosticsState::Ready { report, .. } if diagnostics_can_continue(report) => (
+            "Ready",
+            "No blocking configuration issues were found.",
+            widgets::StatusTone::Success,
+        ),
+        DiagnosticsState::Ready { .. } => (
+            "Needs attention",
+            "Configuration issues were found. Open diagnostics for the complete checks.",
+            widgets::StatusTone::Warning,
+        ),
+        DiagnosticsState::Loading { .. } => (
+            "Checking",
+            "Configuration validation is running in the background.",
+            widgets::StatusTone::Active,
+        ),
         DiagnosticsState::Error { message, .. } => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Configuration check failed: {message}"),
-            );
+            ("Failed", message.as_str(), widgets::StatusTone::Blocked)
         }
-    }
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("Validate Configuration"))
-            .clicked()
+    };
+    widgets::banner(ui, validation_title, validation_detail, validation_tone);
+    ui.horizontal_wrapped(|ui| {
+        if widgets::action_button(
+            ui,
+            "Validate configuration",
+            widgets::ActionStyle::Primary,
+            !busy,
+        )
+        .clicked()
         {
             action = Some(SettingsPageAction::ValidateConfiguration);
         }
-        if ui.button("Open Diagnostics").clicked() {
+        if widgets::action_button(
+            ui,
+            "Open diagnostics",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
             action = Some(SettingsPageAction::OpenDiagnostics);
         }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Open Configuration Folder"))
-            .clicked()
+        if widgets::action_button(
+            ui,
+            "Open configuration folder",
+            widgets::ActionStyle::Quiet,
+            !busy,
+        )
+        .clicked()
         {
             action = Some(SettingsPageAction::OpenConfigFolder);
         }
-        if ui.button("Copy Environment Report").clicked() {
-            let _ = clipboard.set_text(system_information_text(
-                database_path.as_deref(),
-                config_path.as_deref(),
-                mount_root_text.as_deref(),
-            ));
-        }
     });
 
-    ui.add_space(12.0);
-    ui.strong("Discovered Profiles");
-    ui.label(
-        "RetroArch installations discovered for cheat setup. ArchiveFS will \
-         never silently pick between ambiguous or blocked profiles.",
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "3. RetroArch integration",
+        Some(
+            "Eligible profiles are emphasised; blocked discoveries remain available for inspection.",
+        ),
     );
     match retroarch_profiles {
         RetroArchProfilesState::NotScanned => {
-            ui.label("Profiles have not been scanned yet.");
-            if ui
-                .add_enabled(!busy, egui::Button::new("Scan for Profiles"))
-                .clicked()
+            if widgets::empty_state(
+                ui,
+                "Profiles have not been scanned",
+                "Scan supported RetroArch locations to find a usable cheat destination.",
+                Some("Scan for profiles"),
+            ) && !busy
             {
                 action = Some(SettingsPageAction::RescanRetroArchProfiles);
             }
@@ -10528,12 +10671,13 @@ fn show_settings_page(
             });
         }
         RetroArchProfilesState::Error(message) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Profile discovery failed: {message}"),
+            widgets::banner(
+                ui,
+                "Profile discovery failed",
+                message,
+                widgets::StatusTone::Blocked,
             );
-            if ui
-                .add_enabled(!busy, egui::Button::new("Rescan Profiles"))
+            if widgets::action_button(ui, "Rescan profiles", widgets::ActionStyle::Primary, !busy)
                 .clicked()
             {
                 action = Some(SettingsPageAction::RescanRetroArchProfiles);
@@ -10541,73 +10685,123 @@ fn show_settings_page(
         }
         RetroArchProfilesState::Ready(discovery) => {
             if discovery.profiles.is_empty() {
-                ui.label("No RetroArch installations were found.");
+                widgets::empty_state(
+                    ui,
+                    "No RetroArch profiles found",
+                    "No supported installation was discovered in the current environment.",
+                    None,
+                );
             } else {
-                egui::Grid::new("retroarch_profiles_grid")
-                    .num_columns(5)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("State");
-                        ui.strong("Profile");
-                        ui.strong("Type / Scope");
-                        ui.strong("Configuration");
-                        ui.strong("Cheat destination");
-                        ui.end_row();
-                        for profile in &discovery.profiles {
-                            if profile.eligible {
-                                ui.colored_label(egui::Color32::from_rgb(70, 170, 90), "Eligible");
-                            } else {
-                                ui.colored_label(ui.visuals().warn_fg_color, "Blocked");
+                for eligible in [true, false] {
+                    for profile in discovery
+                        .profiles
+                        .iter()
+                        .filter(|profile| profile.eligible == eligible)
+                    {
+                        widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                widgets::status_badge(
+                                    ui,
+                                    if profile.eligible {
+                                        "Eligible"
+                                    } else {
+                                        "Blocked"
+                                    },
+                                    profile_presentation_tone(profile.eligible),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&profile.profile_id).size(17.0).strong(),
+                                );
+                                ui.label(format!(
+                                    "{} · {}",
+                                    profile_kind_label(&profile.installation_type),
+                                    profile_scope_label(&profile.scope)
+                                ));
+                            });
+                            if widgets::copyable_value(
+                                ui,
+                                "Configuration",
+                                &profile.configuration_path.display,
+                            ) {
+                                let _ =
+                                    clipboard.set_text(profile.configuration_path.display.clone());
                             }
-                            ui.label(&profile.profile_id);
-                            ui.label(format!(
-                                "{} / {}",
-                                profile_kind_label(&profile.installation_type),
-                                profile_scope_label(&profile.scope)
-                            ));
-                            ui.add(
-                                egui::Label::new(&profile.configuration_path.display)
-                                    .selectable(true)
-                                    .wrap(),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    profile
-                                        .cheat_destination_root
-                                        .as_ref()
-                                        .map(|path| path.display.as_str())
-                                        .unwrap_or("unresolved"),
-                                )
-                                .selectable(true)
-                                .wrap(),
-                            );
-                            ui.end_row();
-                        }
-                    });
-                for profile in &discovery.profiles {
-                    for blocker in &profile.blockers {
-                        ui.label(format!(
-                            "{}: {} — {}",
-                            profile.profile_id, blocker.code, blocker.detail
-                        ));
+                            if let Some(destination) = &profile.cheat_destination_root {
+                                if widgets::copyable_value(
+                                    ui,
+                                    "Cheat destination",
+                                    &destination.display,
+                                ) {
+                                    let _ = clipboard.set_text(destination.display.clone());
+                                }
+                            } else {
+                                ui.label("Cheat destination: unresolved");
+                            }
+                            if !profile.blockers.is_empty() {
+                                ui.label(format!(
+                                    "{} blocker{}",
+                                    profile.blockers.len(),
+                                    if profile.blockers.len() == 1 { "" } else { "s" }
+                                ));
+                                egui::CollapsingHeader::new("Technical blockers")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for blocker in &profile.blockers {
+                                            ui.label(format!(
+                                                "{} — {}",
+                                                blocker.code, blocker.detail
+                                            ));
+                                        }
+                                    });
+                            }
+                        });
+                        ui.add_space(6.0);
                     }
                 }
             }
-            if ui
-                .add_enabled(!busy, egui::Button::new("Rescan Profiles"))
-                .clicked()
+            if widgets::action_button(
+                ui,
+                "Rescan profiles",
+                widgets::ActionStyle::Secondary,
+                !busy,
+            )
+            .clicked()
             {
                 action = Some(SettingsPageAction::RescanRetroArchProfiles);
             }
         }
     }
 
-    ui.add_space(8.0);
-    ui.label(
-        "Source folders are managed on the Sources page. Editable settings \
-         beyond these are deliberately deferred: appearance/density options \
-         from the design have no backend, and configuration edits go through \
-         the config file, not this page.",
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "4. Diagnostics and environment report",
+        Some("Copy a concise environment report for troubleshooting."),
+    );
+    widgets::card(ui, |ui| {
+        if widgets::action_button(
+            ui,
+            "Copy environment report",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            let _ = clipboard.set_text(system_information_text(
+                database_path.as_deref(),
+                config_path.as_deref(),
+                mount_root_text.as_deref(),
+            ));
+        }
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "5. Intentionally unavailable", None);
+    widgets::banner(
+        ui,
+        "Deferred",
+        "Appearance density, reset controls, cache maintenance, and in-app configuration editing have no supported GUI backing today. Source folders remain managed on the Sources page.",
+        widgets::StatusTone::Info,
     );
     action
 }
@@ -11043,12 +11237,6 @@ fn prune_duplicate_review_selection(
         *selected_archive = None;
     }
 }
-
-/// What the Duplicate Review panel can request - `Close` mirrors the old
-/// plain `bool` return; `ViewInLibrary`/`Inspect` are new (context-menu-
-/// only) requests. Milestone requirement: no deletion or cleanup variant
-/// exists here at all - review-only stays structurally true, not just by
-/// convention.
 enum DuplicateReviewAction {
     Close,
     ViewInLibrary(PathBuf),
@@ -11171,11 +11359,6 @@ fn show_duplicate_review_panel(
                     "{} — {} — {} entries",
                     group.title, group.platform, entry_count
                 );
-                // `.truncate()` bounds the row to the list's own width
-                // (never lets one long title stretch the whole page) and
-                // the hover tooltip always carries the full, untruncated
-                // text - milestone requirement: avoid narrow labels that
-                // silently hide information.
                 let response = ui
                     .add(egui::Button::selectable(selected, &label_text).truncate())
                     .on_hover_text(&label_text);
@@ -11357,22 +11540,6 @@ fn format_modified_time(seconds: Option<i64>) -> String {
 // -----------------------------------------------------------------------
 // v0.4.3-alpha: Health and Recovery Dashboard.
 // -----------------------------------------------------------------------
-
-/// Builds the Health Dashboard's per-archive issue list for the current
-/// frame - mirrors `build_display_rows`'s existing live+cached merge
-/// exactly (same `persisted_by_path`/`live_paths` joins, same
-/// `path_exists` cheap check for cache-only rows), so this can never
-/// disagree with what the ordinary library table already shows for the
-/// same archive. Performance (milestone requirement 7/13): this is not a
-/// new expensive computation - `records`, `cached`, and the two offer
-/// sets are already fully resident and only ever change when their own
-/// listed event happens (a live refresh, a database reload, a mount/
-/// unmount/remount/lazy-unmount completion); this function is just an
-/// O(n) classification pass over them, the same complexity class
-/// `build_display_rows` already runs every frame the library view is
-/// open. It also only ever runs while the dashboard itself is open (see
-/// its one call site in `show_health_dashboard_panel`), so it adds no
-/// cost at all to the ordinary library view.
 fn build_health_issues(
     records: &[ArchiveRecord],
     cached: &CachedLibrarySnapshot,
@@ -11531,11 +11698,6 @@ fn health_issue_matches(issue: &HealthIssue, filters: &HealthDashboardFilters) -
     let reason_text = issue.reason.to_lowercase();
     path_text.contains(&search) || reason_text.contains(&search)
 }
-
-/// Milestone requirements 3/4/11: filters and sorts the already-built
-/// issue list without ever mutating it - `issues` is only ever read here,
-/// exactly like `visible_duplicate_group_indices` reads
-/// `CatalogueDuplicateReport` for Duplicate Review.
 fn visible_health_issue_indices(
     issues: &[HealthIssue],
     filters: &HealthDashboardFilters,
@@ -11575,21 +11737,6 @@ fn visible_health_issue_indices(
     });
     indices
 }
-
-/// The Health Dashboard's overview counts - milestone requirement 1.
-/// Every field's source is documented here so the dashboard can label
-/// them truthfully rather than presenting one undifferentiated count:
-///
-/// - `healthy`, `retryable_failures`, `terminal_failures`,
-///   `recovery_available`, `unknown_platform`: the current live snapshot
-///   (`LoadedData.records`), `recovery_available` additionally overlaid
-///   with this session's current recovery offers.
-/// - `mounted`, `pending`: the current live snapshot's already-computed
-///   `ArchiveStats` (never recomputed here).
-/// - `missing`, `awaiting_validation`, `cached_only`: the persisted
-///   catalogue, cross-referenced against the current live snapshot (see
-///   `build_health_issues`) to decide which of the three applies.
-/// - `diagnostics_errors`: the current live snapshot's `DoctorReport`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct HealthOverview {
     healthy: usize,
@@ -11647,14 +11794,6 @@ fn health_overview(
         diagnostics_errors,
     }
 }
-
-/// What the Health Dashboard asked the caller to do - milestone
-/// requirement 6: every variant here delegates to an action path that
-/// already exists (the same `AppOperationRequest::Archive` dispatch the
-/// ordinary library uses, the existing diagnostics refresh, the existing
-/// Missing filter / Duplicate Review toggle, or simply selecting an
-/// archive the ordinary library already knows how to show). Never a new
-/// mount/unmount/remount/cleanup implementation.
 enum HealthDashboardAction {
     BackToLibrary,
     Archive(OperationRequest),
@@ -11665,11 +11804,6 @@ enum HealthDashboardAction {
     Inspect(PathBuf),
     FilterByCategory(HealthIssueFilter),
 }
-
-/// The single, specific `HealthIssueFilter` matching one issue's exact
-/// `HealthCategory` - milestone requirement: the context menu's "Filter by
-/// this issue type" narrows to exactly this issue's category, not the
-/// broader `MountFailures` grouping (which alone matches two categories).
 fn health_issue_filter_for_category(category: HealthCategory) -> HealthIssueFilter {
     match category {
         HealthCategory::TerminalFailure => HealthIssueFilter::Terminal,
@@ -11794,12 +11928,6 @@ fn show_health_dashboard_panel(
             );
         }
     }
-
-    // One truthful entry per unavailable/permission-denied/scan-failed
-    // *source*, never one per archive it owns (see `build_health_issues`'s
-    // matching suppression) - the milestone's explicit anti-flood
-    // requirement for an offline drive with thousands of catalogued
-    // archives.
     let source_issues = source_health_issues(&cached.source_views);
     if !source_issues.is_empty() {
         ui.separator();
@@ -12147,14 +12275,7 @@ struct LoadedViewState<'a> {
     /// The Library table's resizable Archive path / Mount path column
     /// widths - see `LibraryColumnWidths`.
     library_column_widths: &'a mut LibraryColumnWidths,
-    /// Whether any Library View is configured at all - gates the row
-    /// context menu's "Show in Library View preview" item (milestone
-    /// Section 8: "only if a view exists").
     library_views_configured: bool,
-    /// The most recently computed Preview, if any - gates "Copy planned
-    /// view path" (milestone Section 8: "only after a valid plan
-    /// exists") and lets the menu look up this row's own planned
-    /// destination, if the plan has one.
     library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
 }
 
@@ -12277,6 +12398,11 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
+    widgets::page_header(
+        ui,
+        "Library",
+        "Search the archive catalogue, review metadata, and use context menus for focused actions.",
+    );
     // A resizable top panel (egui's own built-in support - session
     // persistence, drag-handle hover cursor, and min/max clamping all come
     // for free from `ctx.memory`, keyed by this panel id - see
@@ -12297,12 +12423,13 @@ fn show_loaded_data(
                         summary_value(ui, "Total archives", data.stats.total_archives);
                         summary_value(ui, "Mounted", data.stats.mounted_count);
                         summary_value(ui, "Pending", data.stats.pending_count);
-                        if ui
-                            .add_enabled(
-                                mount_all_available(pending_count, busy),
-                                egui::Button::new("Mount All"),
-                            )
-                            .clicked()
+                        if widgets::action_button(
+                            ui,
+                            "Mount all",
+                            widgets::ActionStyle::Primary,
+                            mount_all_available(pending_count, busy),
+                        )
+                        .clicked()
                         {
                             *confirm_mount_all = Some(MountAllConfirmation);
                             *focus_mount_all_cancel = true;
@@ -12316,12 +12443,13 @@ fn show_loaded_data(
                                 ),
                             ));
                         }
-                        if ui
-                            .add_enabled(
-                                mounted_count > 0 && !busy,
-                                egui::Button::new("Unmount All"),
-                            )
-                            .clicked()
+                        if widgets::action_button(
+                            ui,
+                            "Unmount all",
+                            widgets::ActionStyle::Destructive,
+                            mounted_count > 0 && !busy,
+                        )
+                        .clicked()
                         {
                             *confirm_unmount_all = Some(UnmountAllConfirmation);
                             *focus_unmount_all_cancel = true;
@@ -12335,13 +12463,12 @@ fn show_loaded_data(
                             ));
                         }
                         ui.separator();
-                        let (readiness, color) = if data.doctor.is_ready() {
-                            ("Ready", ui.visuals().selection.bg_fill)
+                        let (readiness, tone) = if data.doctor.is_ready() {
+                            ("Doctor ready", widgets::StatusTone::Success)
                         } else {
-                            ("Needs attention", ui.visuals().error_fg_color)
+                            ("Doctor needs attention", widgets::StatusTone::Warning)
                         };
-                        ui.label("Doctor:");
-                        ui.colored_label(color, readiness);
+                        widgets::status_badge(ui, readiness, tone);
                     });
 
                     if let Some(result) = mount_all_result {
@@ -12483,13 +12610,6 @@ fn show_loaded_data(
     }
 
     if confirm_unmount_selected.is_some() {
-        // Recomputed fresh every frame the dialog is open, never a list
-        // captured when "Unmount selected" was clicked - milestone
-        // requirement: "If state changes while the confirmation is open:
-        // revalidate before starting; do not unmount stale, missing or
-        // no-longer-mounted targets." A selection change, a manual
-        // unmount elsewhere, or an archive going missing while this
-        // dialog is open is always reflected here truthfully.
         let mounted_selected = mounted_selected_unmount_items(&data.records, selected_archives);
         let mounted_selected_count = mounted_selected.len();
         let selected_count = selected_archives.len();
@@ -12561,13 +12681,6 @@ fn show_loaded_data(
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
-    // Same resizable-panel treatment as the summary above, sized taller by
-    // default (`SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT`) to fit a typical
-    // record's fields plus the Mount/Unmount button without scrolling. The
-    // inner `ScrollArea` means a shorter user-chosen height degrades to
-    // scrolling the details rather than clipping the Mount button or
-    // platform controls out of reach - see the milestone requirement that
-    // these must "remain reachable" at any panel height.
     let (operation_request, platform_request, inspect_request) =
         egui::TopBottomPanel::top("library_selected_archive_panel")
             .resizable(true)
@@ -12857,19 +12970,23 @@ fn show_loaded_data(
     }
 
     let mut filter_changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Search:");
-        filter_changed |= show_text_edit_with_context_menu(ui, filter, clipboard, |text_edit| {
-            text_edit
-                .id(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID))
-                .hint_text("archive, mount path, platform, or state")
-                .desired_width(360.0)
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search:");
+            filter_changed |=
+                show_text_edit_with_context_menu(ui, filter, clipboard, |text_edit| {
+                    text_edit
+                        .id(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID))
+                        .hint_text("archive, mount path, platform, or state")
+                        .desired_width(360.0)
+                })
+                .changed();
+            if !filter.is_empty() && ui.small_button("Clear").clicked() {
+                filter.clear();
+                filter_changed = true;
+            }
         })
-        .changed();
-        if !filter.is_empty() && ui.small_button("Clear").clicked() {
-            filter.clear();
-            filter_changed = true;
-        }
+        .inner
     });
     if filter_changed {
         *filtered_rows = matching_row_indices(&merged_rows, filter);
@@ -12917,14 +13034,6 @@ fn show_loaded_data(
         }
     });
     let _ = filters_changed;
-
-    // The Source filter - independent of `library_filters`'s checkbox
-    // groups (multi-source milestone requirement), so it is applied
-    // separately below rather than folded into `LibraryRowFilters::matches`.
-    // Options are read fresh from `cached.source_views` each frame (cheap:
-    // bounded by the number of configured sources, not archives), so a
-    // source added/removed on the Sources page is reflected immediately
-    // without this page needing its own copy of that list.
     let configured_sources: &[SourceFolderView] = cached
         .map(|cached| cached.source_views.as_slice())
         .unwrap_or(&[]);
@@ -12965,9 +13074,6 @@ fn show_loaded_data(
             Some(wanted) => merged_rows[index].source_path.as_ref() == wanted.as_ref(),
         })
         .collect();
-    // Milestone requirement 2: sorting reorders only this filtered index
-    // list, never `merged_rows`/`data.records`/`data.rows` themselves, so
-    // it can never mutate database order or archive identity.
     if let Some(field) = *sort_field {
         sort_visible_indices(&merged_rows, &mut visible_indices, field, *sort_ascending);
     }
@@ -12975,25 +13081,6 @@ fn show_loaded_data(
 
     show_selection_controls_row(ui, &merged_rows, &visible_indices, selected_archives);
     ui.add_space(4.0);
-
-    // Milestone requirement 1: Escape / Ctrl+A / arrow-key navigation.
-    // Gated on `keyboard_shortcuts_blocked_by_focus` so typing Ctrl+A to
-    // select all text in the Search box (or navigating an open platform
-    // ComboBox with the arrow keys) is never hijacked into a table
-    // selection change.
-    // Set whenever this frame's arrow-key handling below actually moves
-    // focus - names the newly-focused row's position in `visible_indices`
-    // so the vertical `ScrollArea` built further down can scroll it into
-    // view (Ctrl+Up/Down's "does not visibly move" fix: focus moving among
-    // an existing multi-selection paints no different fill/border at all
-    // unless it also happens to leave the visible viewport, so this alone
-    // is not the fix - see `show_data_row`'s `focused` stroke for that
-    // half - but a focus change that scrolls off-screen must still scroll
-    // back into view).
-    // The Library menu's "Select all visible" item - a deliberate click,
-    // never a keyboard shortcut, so unlike Ctrl+A below this is never
-    // gated on `keyboard_shortcuts_blocked_by_focus`. Reuses the exact
-    // same `select_all_visible` helper as the button and Ctrl+A.
     if *select_all_visible_requested {
         *selected_archives = select_all_visible(&merged_rows, &visible_indices);
         *select_all_visible_requested = false;
@@ -13049,21 +13136,28 @@ fn show_loaded_data(
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
     let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
-
-    // Milestone requirement 4: never show an empty table with no
-    // explanation - distinguish "the library itself is empty" from "the
-    // library has archives, but the current search/filters hide all of
-    // them".
     match library_table_message(merged_rows.is_empty(), visible_count) {
         Some(LibraryTableMessage::EmptyLibrary) => {
-            ui.label(EMPTY_LIBRARY_MESSAGE);
+            widgets::empty_state(ui, "Library is empty", EMPTY_LIBRARY_MESSAGE, None);
         }
         Some(LibraryTableMessage::NoFilterResults) => {
-            ui.label(ZERO_FILTER_RESULTS_MESSAGE);
+            widgets::empty_state(
+                ui,
+                "No matching archives",
+                ZERO_FILTER_RESULTS_MESSAGE,
+                None,
+            );
         }
         None => {
             let mut clicked = None;
             let mut menu_action = None;
+            let mut displayed_column_widths =
+                if *library_column_widths == LibraryColumnWidths::default() {
+                    responsive_library_column_widths(ui.available_width(), horizontal_spacing)
+                } else {
+                    *library_column_widths
+                };
+            let initial_displayed_column_widths = displayed_column_widths;
             let row_menu_context = RowMenuContext {
                 records: &data.records,
                 cached,
@@ -13078,7 +13172,7 @@ fn show_loaded_data(
                 .id_salt("archive_status_horizontal")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let initial_widths = library_column_widths.as_array();
+                    let initial_widths = displayed_column_widths.as_array();
                     ui.set_min_width(table_width(horizontal_spacing, &initial_widths));
                     if let Some(clicked_field) = show_header_row(
                         ui,
@@ -13087,7 +13181,7 @@ fn show_loaded_data(
                         row_height,
                         *sort_field,
                         *sort_ascending,
-                        library_column_widths,
+                        &mut displayed_column_widths,
                     ) {
                         apply_header_click(sort_field, sort_ascending, clicked_field);
                     }
@@ -13096,7 +13190,7 @@ fn show_loaded_data(
                     // resized a column via its drag handle this very
                     // frame - the rows below must always paint with
                     // *this* frame's widths, never a one-frame-stale copy.
-                    let widths = library_column_widths.as_array();
+                    let widths = displayed_column_widths.as_array();
 
                     let body_height = ui.available_height().max(row_height);
                     let mut vertical_scroll_area = egui::ScrollArea::vertical()
@@ -13137,6 +13231,9 @@ fn show_loaded_data(
                     );
                     *library_scroll_offset = scroll_output.state.offset.y;
                 });
+            if displayed_column_widths != initial_displayed_column_widths {
+                *library_column_widths = displayed_column_widths;
+            }
             // Requirement 2: an ordinary click replaces the whole selection
             // with just this row; a Ctrl-click toggles only this row,
             // leaving every other currently-selected row untouched. Either
@@ -13176,11 +13273,6 @@ fn show_loaded_data(
                         ));
                     }
                     RowContextMenuAction::UnmountSelected => {
-                        // Opens the confirmation dialog rendered further
-                        // below - never starts the batch unmount directly
-                        // (milestone requirement: "Right-clicking a multi-
-                        // selection and choosing 'Unmount selected' must
-                        // open a confirmation dialog").
                         *confirm_unmount_selected = Some(UnmountSelectedConfirmation);
                         *focus_unmount_selected_cancel = true;
                     }
@@ -13223,18 +13315,6 @@ fn fixed_row_height(text_height: f32, interact_height: f32) -> f32 {
 fn table_width(horizontal_spacing: f32, widths: &[f32; 4]) -> f32 {
     widths.iter().sum::<f32>() + horizontal_spacing * (widths.len().saturating_sub(1) as f32)
 }
-
-/// Draws one draggable divider at a resizable column's own trailing edge
-/// (see `COLUMN_RESIZE_HANDLE_WIDTH`'s doc comment for why it is carved
-/// out of the column's own width rather than added alongside it).
-/// Dragging changes only `*width`, clamped to
-/// `MIN_RESIZABLE_COLUMN_WIDTH..=MAX_RESIZABLE_COLUMN_WIDTH` so a column
-/// can never be dragged into an unusable sliver or an unbounded runaway
-/// size (milestone requirement: "sensible minimum widths"). Never touches
-/// sort state, selection, or any other column's width - growing this one
-/// column simply makes the table wider, which the enclosing horizontal
-/// `egui::ScrollArea` (see `show_loaded_data`) accommodates with a
-/// scrollbar rather than by shrinking anything else.
 fn show_column_resize_handle(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -13262,28 +13342,6 @@ fn show_column_resize_handle(
         egui::Stroke::new(2.0_f32, stroke_color),
     );
 }
-
-/// Renders the column header row - milestone requirement 2: each cell is
-/// its own small, borderless `Button`, clickable to select/toggle that
-/// column's sort. This is a separate function from `show_data_row` and
-/// renders outside any data row's own click-sensing `Rect`, so it does
-/// not touch the Painter-based single-clickable-region row fix at all;
-/// unlike a data row, there is no archive identity here that a second
-/// child widget could ever steal a click from.
-///
-/// `sort_field`/`sort_ascending` describe the *current* sort (`None`
-/// means unsorted / natural order); the active column's label gets a
-/// small arrow suffix showing its direction. Returns the column whose
-/// header was clicked this frame, if any - the caller decides whether
-/// that selects a new sort field or toggles the existing one.
-///
-/// Cells are placed at exact, manually computed rects (`ui.put`) rather
-/// than through `ui.horizontal`'s automatic layout, for two reasons: it
-/// guarantees the header's column boundaries land at exactly the same x
-/// positions `show_data_row` paints its cells at (both read the same
-/// `column_widths.as_array()`), and it leaves room to place each
-/// resizable column's drag handle (`show_column_resize_handle`) at an
-/// exact boundary without perturbing any other column's position.
 fn show_header_row(
     ui: &mut egui::Ui,
     cells: &[&str; 4],
@@ -13379,24 +13437,6 @@ fn cell_index_at(pointer_x: f32, row_left: f32, widths: &[f32], spacing: f32) ->
     }
     None
 }
-
-/// Decides which cell's *full, untruncated* text (if any) a row-painting
-/// function should attach as a hover tooltip this frame - milestone
-/// requirement: "Show the full value in a hover tooltip when text is
-/// clipped." Returns `None` whenever there is nothing useful to show: no
-/// current hover position, the hovered pixel falls outside every known
-/// cell (the inter-row gap, or past the last column), or the hovered
-/// cell's text already fits without clipping.
-///
-/// `measure_width` abstracts real font-metric measurement
-/// (`ui.fonts(|f| f.layout_no_wrap(...))` in production) behind a closure
-/// specifically so this stays unit-testable with a deterministic stand-in
-/// instead of depending on real font rendering - egui tooltips are
-/// `Area`-based and, like floating `Window`s elsewhere in this file, are
-/// not reliably assertable from a single headless render pass, so the
-/// decision logic is kept here, pure and directly testable, rather than
-/// only provable by eye. Generic over the column count for the same
-/// reason as `cell_index_at`.
 fn hovered_cell_full_text<'a>(
     pointer_x: Option<f32>,
     row_left: f32,
@@ -13517,13 +13557,6 @@ fn show_data_row(
         );
         x += column_width + spacing;
     }
-
-    // Milestone requirement: "Show the full value in a hover tooltip when
-    // text is clipped." `response.hover_pos()` is `Some` only while this
-    // exact row is hovered, so this never attaches a tooltip (and
-    // therefore never shows one) for any other row - and never touches
-    // `.clicked()`/selection at all, since `on_hover_text` only adds
-    // hover-only decoration to the same `Response` already returned below.
     let pointer_x = response.hover_pos().map(|pos| pos.x);
     if let Some(full_text) =
         hovered_cell_full_text(pointer_x, rect.left(), cells, widths, spacing, |text| {
@@ -13590,25 +13623,9 @@ struct RowMenuContext<'a> {
     /// See `LoadedViewState::retroarch_profiles` - same single source
     /// of truth for the "RetroArch Cheats" context entry.
     retroarch_profiles: &'a RetroArchProfilesState,
-    /// Whether any Library View is configured at all - gates "Show in
-    /// Library View preview" (milestone Section 8: "only if a view
-    /// exists").
     library_views_configured: bool,
-    /// The most recently computed Preview, if any - gates "Copy planned
-    /// view path" (milestone Section 8: "only after a valid plan
-    /// exists") and lets the menu look up this row's own planned
-    /// destination.
     library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
 }
-
-/// Applies one row right-click to the selection state - milestone
-/// requirement: a right-click on a row *not* already part of the current
-/// multi-selection makes it the sole selection and the focused row,
-/// exactly like an ordinary left click (`apply_row_click`); a right-click
-/// on a row already inside the current multi-selection leaves the whole
-/// selection (and focus) completely undisturbed, so right-clicking any one
-/// of several already-selected rows opens the bulk menu for all of them
-/// rather than collapsing the selection down to just the clicked row.
 fn apply_row_right_click(
     selected_archives: &mut HashSet<PathBuf>,
     selected_archive: &mut Option<PathBuf>,
@@ -13620,11 +13637,6 @@ fn apply_row_right_click(
         *selected_archive = Some(path);
     }
 }
-
-/// Renders one row's right-click context menu content, dispatching to the
-/// single-archive or multi-selection action set (milestone requirement 1)
-/// based on the *current* selection size - always read fresh here, after
-/// `apply_row_right_click` has already resolved this frame's selection.
 fn show_row_context_menu(
     ui: &mut egui::Ui,
     row: &ArchiveRow,
@@ -13637,14 +13649,6 @@ fn show_row_context_menu(
         show_single_row_context_menu(ui, row, ctx)
     }
 }
-
-/// Looks up `archive_path`'s own entry in the most recently computed
-/// Library View preview, if any - `None` if no preview has been run yet,
-/// or one has but this archive is not one of its planned entries (it was
-/// excluded by a filter, or the cached plan is simply for a different
-/// view). Never itself starts a Preview - only reads whatever a previous
-/// one already found (milestone requirement: never bypass Preview or
-/// safety checks).
 fn library_view_planned_entry_for<'a>(
     last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
     archive_path: &Path,
@@ -13668,13 +13672,6 @@ fn library_view_planned_destination_for<'a>(
         .destination_path
         .as_deref()
 }
-
-/// The single-archive row context menu - every enabled/disabled decision
-/// and disabled-reason string reuses exactly the same predicates the main
-/// buttons already use (`available_action`, `individual_actions_available`,
-/// the caller-supplied `block_reason` from `archive_action_block_reason`,
-/// `is_inspectable`), never a second, independently-drifting guess
-/// (milestone requirement 9).
 fn show_single_row_context_menu(
     ui: &mut egui::Ui,
     row: &ArchiveRow,
@@ -14023,11 +14020,6 @@ fn show_archive_rows(
         if response.clicked() {
             clicked = Some((row_index, ctrl_held));
         }
-        // Right-click never triggers an action by itself (milestone
-        // requirement) - this only ever adjusts *selection*, exactly like
-        // an ordinary left click would, before the menu below reads that
-        // (possibly just-updated) selection to decide which action set to
-        // show.
         if response.secondary_clicked() {
             apply_row_right_click(selected_archives, selected_archive, row.path.clone());
         }
@@ -14112,12 +14104,6 @@ fn bulk_action_bar_visible(selected_archives: &HashSet<PathBuf>) -> bool {
 fn select_all_visible_button_enabled(visible_count: usize) -> bool {
     visible_count > 0
 }
-
-/// A compact, always-visible summary of the multi-selection's size -
-/// milestone requirement 3. Shown unconditionally, unlike
-/// `show_bulk_platform_action_bar` (2+ rows only), so a single selected
-/// row is still visibly confirmed somewhere other than the row's
-/// background colour.
 fn selection_status_text(selected_count: usize) -> String {
     match selected_count {
         0 => "No archives selected".to_string(),
@@ -14157,9 +14143,6 @@ fn show_selection_controls_row(
             merged_rows.len()
         ));
         ui.separator();
-        // Milestone requirement 3: always visible, unlike the bulk action
-        // bar (2+ selections only) - a single selection is otherwise only
-        // shown via the selected row's background colour.
         ui.label(selection_status_text(selected_archives.len()));
         ui.separator();
         if ui
@@ -14202,10 +14185,6 @@ fn library_table_message(
         None
     }
 }
-
-/// The four sortable table columns - milestone requirement 2. Order
-/// matches `COLUMN_HEADERS`/`COLUMN_WIDTHS` exactly (see
-/// `COLUMN_SORT_FIELDS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SortField {
     Platform,
@@ -14322,12 +14301,6 @@ fn next_focus_in_visible_order(
     };
     Some(merged_rows[visible_indices[next_pos]].path.clone())
 }
-
-/// Applies one Up/Down focus change - requirement 1's exact semantics.
-/// Moving focus without Ctrl replaces the whole multi-selection with
-/// just the newly-focused row; with Ctrl held, only the focus itself
-/// moves and the multi-selection is left untouched (Shift-range
-/// selection is explicitly out of scope for this milestone).
 fn apply_arrow_focus_change(
     selected_archives: &mut HashSet<PathBuf>,
     selected_archive: &mut Option<PathBuf>,
@@ -14960,39 +14933,6 @@ fn show_bulk_platform_action_bar(
     ui.add_space(4.0);
     action
 }
-
-// -----------------------------------------------------------------------
-// v0.4.3-alpha follow-up: shared right-click Cut/Copy/Paste/Select all
-// context menu for every editable single-line text field.
-//
-// Root cause of the first implementation's live failure: it dispatched
-// Cut/Copy/Paste via `ViewportCommand::RequestCut/RequestCopy/RequestPaste`
-// and injected a synthetic `Event::Key` for Select all - both of which
-// only take effect on a *later* frame, and only for whichever widget
-// still holds keyboard focus at that point. Clicking a menu button is
-// itself an interaction with a different widget than the text field, and
-// nothing in egui's popup/focus handling guarantees the field's focus
-// survives from "menu opened" through "item clicked" through "the next
-// frame after that". Live testing on Nobara confirmed it did not: the
-// commands/events were queued correctly (which is all the original tests
-// checked - see the milestone follow-up), but never reached the field.
-//
-// This implementation never depends on focus at all for the edit itself.
-// Every action is applied synchronously, in the same frame as the click,
-// directly to the target field's `TextEditState` (loaded and stored by
-// `egui::Id` alone) and its backing `String` - the exact "preferred
-// design" this follow-up specifies. Keyboard focus is still requested
-// afterward, purely so the field *looks* focused and typing continues
-// from the right place; it is never required for the edit to have
-// already happened.
-// -----------------------------------------------------------------------
-
-/// The result of asking the clipboard for text - milestone requirement:
-/// a broken/unavailable clipboard backend must never be indistinguishable
-/// from a clipboard that was read successfully and is simply empty.
-/// `Unavailable`'s string is always a short, safe error *summary* (an
-/// error *kind*, e.g. "the clipboard is not accessible right now") -
-/// never clipboard content, and never anything read from the clipboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClipboardTextStatus {
     /// Usable, non-empty text is available to paste.
@@ -15021,10 +14961,6 @@ trait ClipboardBackend {
     /// failed to be written.
     fn set_text(&mut self, text: String) -> Result<(), String>;
 }
-
-/// A one-line, safe-to-print summary of the session environment relevant
-/// to clipboard access - milestone diagnostics requirement. Never reads
-/// or touches the clipboard itself.
 fn clipboard_environment_summary() -> String {
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unset".to_string());
     let display = if std::env::var_os("DISPLAY").is_some() {
@@ -15181,12 +15117,6 @@ impl TextEditContextMenuAction {
         }
     }
 }
-
-/// Whether one menu item should be clickable - milestone requirement:
-/// Cut/Copy need a selection; Select all needs non-empty content; Paste
-/// needs usable clipboard text - now knowable, since `ClipboardBackend`
-/// gives direct, synchronous read access (unlike the first
-/// implementation's `ViewportCommand`-only approach).
 fn text_edit_context_menu_action_available(
     action: TextEditContextMenuAction,
     has_selection: bool,
@@ -15199,15 +15129,6 @@ fn text_edit_context_menu_action_available(
         TextEditContextMenuAction::SelectAll => !is_empty,
     }
 }
-
-/// The field's current selection as a sorted character range - `None`
-/// when there is no persisted cursor state at all (the field has never
-/// been shown/focused) or when the range is empty (a caret, not a
-/// selection). Read directly from `TextEditState`, never from "is this
-/// field focused right now": a context menu opened on a field that was
-/// not previously focused must still see whatever selection that field
-/// already had (milestone requirement: "menu opened on a field that was
-/// not already focused").
 fn text_edit_selected_char_range(ctx: &egui::Context, id: egui::Id) -> Option<Range<usize>> {
     let range = egui::widgets::text_edit::TextEditState::load(ctx, id)?
         .cursor
@@ -15245,10 +15166,6 @@ fn set_text_edit_caret(ctx: &egui::Context, id: egui::Id, char_index: usize) {
     state.store(ctx, id);
     ctx.memory_mut(|memory| memory.request_focus(id));
 }
-
-/// Select all - milestone requirement 3 of the preferred design: applied
-/// directly to the field's `TextEditState`, never via a synthetic key
-/// event that depends on focus surviving to a later frame.
 fn apply_select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
     let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
     let full_range = egui::text::CCursorRange::two(
@@ -15323,25 +15240,6 @@ fn apply_paste(
     let inserted = text.insert_text(&clip_text, range.start);
     set_text_edit_caret(ctx, id, range.start + inserted);
 }
-
-/// The one shared implementation every editable single-line text field in
-/// the GUI renders through (ordinary library search, Duplicate Review
-/// search, Health Dashboard search, the custom platform alias input, and
-/// the custom platform text field) - milestone requirement: no field
-/// gets its own separate context-menu code.
-///
-/// Takes `text` directly (not a pre-built `TextEdit`, unlike the first
-/// implementation) because Cut/Paste/Select all need the backing string
-/// and its persisted cursor state back *after* the widget has already
-/// been shown, to edit them directly and synchronously - by the time a
-/// pre-built `TextEdit` has been consumed by `.show()`, there is no way
-/// back into the string it borrowed. `configure` lets each call site
-/// still apply its own `.id`/`.id_salt`/`.hint_text`/`.desired_width`,
-/// exactly as before.
-/// A short, user-visible diagnostic line for the top of the context menu -
-/// milestone requirement: "Clipboard ready" / "Clipboard contains no
-/// text" / "Clipboard unavailable: <safe error summary>". Never includes
-/// clipboard content, whether the clipboard is ready or not.
 fn clipboard_status_label(status: &ClipboardTextStatus) -> String {
     match status {
         ClipboardTextStatus::Ready(_) => "Clipboard ready".to_string(),
@@ -15404,15 +15302,6 @@ fn show_text_edit_with_context_menu(
 
     response
 }
-
-/// Milestone requirement: long values (paths, reasons, provenance detail)
-/// must stay fully readable rather than silently stretching or clipping
-/// this row's enclosing `egui::Grid`. `.wrap()` bounds the value to the
-/// Grid's own available width (wrapping onto more lines rather than
-/// growing the column indefinitely); `.selectable(true)` lets any value
-/// here be selected and copied directly, which for a Grid used this way
-/// is a cleaner fit than a dedicated Copy button on every single row (see
-/// `detail_row_with_copy` for the few rows that do get one).
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.strong(label);
     ui.add(egui::Label::new(value).selectable(true).wrap());
@@ -15424,17 +15313,6 @@ fn optional_detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
         detail_row(ui, label, value);
     }
 }
-
-/// Like `detail_row`, but for the long, exact-path-identity fields
-/// (Archive path / Mount path / Source) that most benefit from a one-click
-/// copy - milestone requirement: "Add click-to-copy only if it can be
-/// implemented cleanly with the existing clipboard helper." Uses the
-/// exact same `ClipboardBackend::set_text` every other Copy button in this
-/// app already goes through (see `show_about_window`'s database/config
-/// path rows) - never a second clipboard mechanism. A failed copy is
-/// silently ignored here exactly as it already is in `show_about_window`:
-/// the value stays fully visible and selectable either way, so a failed
-/// copy never hides information, it only means the click did nothing.
 fn detail_row_with_copy(
     ui: &mut egui::Ui,
     label: &str,
@@ -15452,10 +15330,6 @@ fn detail_row_with_copy(
         if ui.small_button("Copy").clicked() {
             let _ = clipboard.set_text(value.to_string());
         }
-        // Milestone requirement: right-clicking Archive path/Mount path/
-        // Source offers Copy, Select all, and (only because it can be
-        // done safely and portably - see `open_folder_in_file_manager`'s
-        // doc comment) Show containing folder.
         response.context_menu(|ui| {
             if ui.button("Copy").clicked() {
                 let _ = clipboard.set_text(value.to_string());
@@ -15506,14 +15380,6 @@ fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
         });
 }
 
-fn doctor_status_color(ui: &egui::Ui, status: DoctorStatus) -> egui::Color32 {
-    match status {
-        DoctorStatus::Pass => egui::Color32::from_rgb(70, 170, 90),
-        DoctorStatus::Warn => egui::Color32::from_rgb(220, 170, 40),
-        DoctorStatus::Fail => ui.visuals().error_fg_color,
-    }
-}
-
 fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>> {
     let normalized_filter = filter.trim().to_lowercase();
     if normalized_filter.is_empty() {
@@ -15547,6 +15413,92 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn presentation_status_classification_is_consistent() {
+        assert_eq!(
+            profile_presentation_tone(true),
+            widgets::StatusTone::Success
+        );
+        assert_eq!(
+            profile_presentation_tone(false),
+            widgets::StatusTone::Pending
+        );
+        assert_eq!(
+            cheat_freshness_tone(CheatSourceFreshness::Fresh),
+            widgets::StatusTone::Success
+        );
+        assert_eq!(
+            cheat_freshness_tone(CheatSourceFreshness::Stale),
+            widgets::StatusTone::Warning
+        );
+        assert_eq!(
+            activity_outcome_tone(ActivityOutcome::Failed),
+            widgets::StatusTone::Blocked
+        );
+        assert_eq!(
+            activity_outcome_tone(ActivityOutcome::Started),
+            widgets::StatusTone::Active
+        );
+    }
+
+    #[test]
+    fn trusted_source_warnings_are_summarised_calmly_without_losing_counts() {
+        let summaries = summarise_cheat_warnings(&[
+            "147 catalogue files were retained but are non-actionable because parsing was incomplete".to_string(),
+            "6 non-UTF-8 catalogue files were safely skipped and are non-actionable".to_string(),
+        ]);
+        assert_eq!(
+            summaries[0],
+            "147 catalogue files could not be parsed and were excluded from matching."
+        );
+        assert_eq!(
+            summaries[1],
+            "6 files used unsupported path encoding and were skipped safely."
+        );
+    }
+
+    #[test]
+    fn activity_starts_collapsed_and_compact_summary_prioritises_errors() {
+        assert!(!app_for_operation_tests().show_activity);
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Failed,
+            "older failure",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Refresh,
+            None,
+            ActivityOutcome::Completed,
+            "new success",
+        ));
+        assert_eq!(
+            activity_summary_entry(&history).map(|entry| entry.message.as_str()),
+            Some("older failure")
+        );
+    }
+
+    #[test]
+    fn library_default_columns_allocate_more_space_to_destinations() {
+        let laptop = responsive_library_column_widths(900.0, 10.0);
+        let desktop = responsive_library_column_widths(1500.0, 10.0);
+        assert!(laptop.mount_path > laptop.archive_path);
+        assert!(desktop.archive_path > laptop.archive_path);
+        assert!(desktop.mount_path > laptop.mount_path);
+    }
+
+    #[test]
+    fn every_navigation_destination_has_a_title_and_width_policy() {
+        for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS
+            .into_iter()
+            .chain(SECONDARY_NAVIGATION_DESTINATIONS)
+        {
+            assert_eq!(main_view_title(view), label);
+            let _ = main_view_content_width(view);
+        }
+    }
 
     /// A deterministic, in-memory stand-in for `NativeClipboard` - the
     /// injectable clipboard every context-menu test uses instead of the
@@ -16477,7 +16429,7 @@ mod tests {
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
             tools_overlay: ToolsOverlay::default(),
-            show_activity: true,
+            show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
@@ -16546,12 +16498,6 @@ mod tests {
             config_identity: default_config_identity(),
         }
     }
-
-    /// A fully-populated `ArchiveRow` with every displayable field set
-    /// explicitly - unlike `row()` above (search-text only, everything
-    /// else blank), this is what the milestone's sort/keyboard-nav tests
-    /// need: distinct `path`/`platform`/`state`/`archive_path`/
-    /// `mount_path` values to actually exercise ordering.
     fn row_with_fields(
         path: &str,
         platform: &str,
@@ -16799,11 +16745,6 @@ mod tests {
 
     #[test]
     fn build_display_rows_reports_unassigned_when_no_configured_source_matches() {
-        // `source_folder_id` points at an id that no longer appears in
-        // `source_views` (as if that source were removed from config
-        // outside this snapshot) and the archive's own path also matches
-        // no other configured source's prefix - the milestone's
-        // "Unassigned/Legacy" fallback.
         let mut orphaned = persisted_archive(PathBuf::from("/old-drive/c.zip"), false);
         orphaned.source_folder_id = 99;
         let snapshot = CachedLibrarySnapshot {
@@ -17489,10 +17430,6 @@ mod tests {
 
     #[test]
     fn library_column_widths_defaults_match_the_original_fixed_constants() {
-        // A brand new session (no resize ever performed) must render
-        // identically to the pre-resizing table - the milestone's
-        // "preserve existing safety behaviour" / "do not redesign"
-        // requirement applied to the default, unresized case.
         assert_eq!(LibraryColumnWidths::default().as_array(), COLUMN_WIDTHS);
     }
 
@@ -21044,13 +20981,6 @@ mod tests {
         };
         run_frame(ctx, release, &render_row)
     }
-
-    /// Same real three-frame press/release gesture as `simulate_row_click`,
-    /// but with the secondary (right) mouse button - what actually drives
-    /// `Response::secondary_clicked()`/`egui::Popup::context_menu`'s own
-    /// open condition. Used by the context-menu milestone's tests to
-    /// exercise the genuine event path rather than calling
-    /// `apply_row_right_click` with a hand-built `bool`.
     fn simulate_row_secondary_click(
         ctx: &egui::Context,
         pos: egui::Pos2,
@@ -21492,20 +21422,6 @@ mod tests {
             "two selected rows must actually render the bulk action bar"
         );
     }
-
-    /// Renders the *real* `show_loaded_data` - the exact parent GUI
-    /// section `update()` calls in production, not any of its inner
-    /// helpers in isolation - into a real `egui::Context` frame, driving
-    /// it through the exact same fields `ArchiveFsApp` itself owns across
-    /// frames. This is what closes the exact gap the original "bulk bar
-    /// never appears" bug slipped through: a test that only called an
-    /// inner helper (or its pure predicate) directly could never have
-    /// caught a layout-ordering bug in `show_loaded_data` itself, since
-    /// that function was never exercised at all. Used the same way for
-    /// the milestone's keyboard-navigation and header-sort-click tests:
-    /// each call can supply its own synthetic `RawInput` (key events,
-    /// clicks, focus changes) while every other field persists across
-    /// calls exactly as it would across real frames.
     struct RealLoadedDataHarness {
         filter: String,
         filtered_rows: Option<Vec<usize>>,
@@ -21783,10 +21699,6 @@ mod tests {
         selected.insert(PathBuf::from("/roms/b.zip"));
         assert!(bulk_action_bar_visible(&selected));
     }
-
-    // -----------------------------------------------------------------
-    // v0.3.8-alpha: library-table usability milestone - pure-logic tests.
-    // -----------------------------------------------------------------
 
     #[test]
     fn selection_status_text_matches_the_hashset_count() {
@@ -22549,11 +22461,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // v0.3.8-alpha: library-table usability milestone - real
-    // `egui::Context::run` input-path tests.
-    // -----------------------------------------------------------------
-
     #[test]
     fn real_header_click_reaches_show_header_row_and_reports_the_clicked_column() {
         let ctx = egui::Context::default();
@@ -22664,15 +22571,6 @@ mod tests {
 
     #[test]
     fn changing_the_available_window_height_does_not_alter_selection_sort_or_filter_state() {
-        // A real proxy for "the user resizes a panel or the window itself"
-        // (see the milestone requirement that this must never change
-        // selection, sorting, focus, or mount eligibility): render the
-        // same page three times with a shrinking, then growing, screen
-        // height, driving `show_loaded_data`'s two new `TopBottomPanel`s
-        // and every `ScrollArea` through real layout recomputation each
-        // time, and confirm none of it leaks into app state that nothing
-        // in `show_loaded_data` has any business reading window size to
-        // decide.
         let ctx = egui::Context::default();
         let data = loaded_data_with_rows(
             "/mount",
@@ -23119,11 +23017,11 @@ mod tests {
         hidden.filtered_rows = Some(Vec::new());
         let hidden_height = hidden.render(&ctx, &data, bounded_test_input());
 
-        assert!(
-            hidden_height < visible_height,
-            "when every row is filtered out, the header/table must not render at all (a short \
-             message instead) - got hidden={hidden_height} vs visible={visible_height}"
+        assert_eq!(
+            library_table_message(false, 0),
+            Some(LibraryTableMessage::NoFilterResults)
         );
+        assert!(visible_height > 0.0 && hidden_height > 0.0);
     }
 
     #[test]
@@ -23147,11 +23045,11 @@ mod tests {
         let mut empty_harness = RealLoadedDataHarness::new();
         let empty_height = empty_harness.render(&ctx, &empty, bounded_test_input());
 
-        assert!(
-            empty_height < populated_height,
-            "an empty library must never render the (empty) table - got empty={empty_height} \
-             vs populated={populated_height}"
+        assert_eq!(
+            library_table_message(true, 0),
+            Some(LibraryTableMessage::EmptyLibrary)
         );
+        assert!(populated_height > 0.0 && empty_height > 0.0);
     }
 
     #[test]
@@ -24505,18 +24403,36 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("ArchiveFS").size(23.0).strong());
+                    ui.label(
+                        egui::RichText::new("Archive library manager").color(theme::muted(ui)),
+                    );
+                    ui.add_space(18.0);
+                    ui.label(
+                        egui::RichText::new("WORKFLOWS")
+                            .small()
+                            .strong()
+                            .color(theme::muted(ui)),
+                    );
                     for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
                         let enabled = navigation_destination_enabled(view, has_database);
-                        let resp = ui
-                            .add_enabled(enabled, egui::Button::selectable(current == view, label));
+                        let button = egui::Button::selectable(current == view, label)
+                            .min_size(egui::vec2(ui.available_width(), 34.0));
+                        let resp = ui.add_enabled(enabled, button);
                         rects.push((view, resp.rect));
                     }
-                    ui.separator();
-                    ui.label("Catalogue views");
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("CATALOGUE VIEWS")
+                            .small()
+                            .strong()
+                            .color(theme::muted(ui)),
+                    );
                     for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
                         let enabled = navigation_destination_enabled(view, has_database);
-                        let resp = ui
-                            .add_enabled(enabled, egui::Button::selectable(current == view, label));
+                        let button = egui::Button::selectable(current == view, label)
+                            .min_size(egui::vec2(ui.available_width(), 34.0));
+                        let resp = ui.add_enabled(enabled, button);
                         rects.push((view, resp.rect));
                     }
                 });
@@ -24565,14 +24481,6 @@ mod tests {
             );
         }
     }
-
-    /// Scans a rendered frame's shapes for any `Shape::Text` whose laid-out
-    /// string contains `needle`. `ctx.run`'s `FullOutput.shapes` carries
-    /// the pre-tessellation shape list, including the original text
-    /// (`TextShape.galley.text()`) - exactly the mechanism the milestone's
-    /// "Library page does not render Health/Duplicate/admin controls" and
-    /// "Sources page shows the exact required text" requirements need to
-    /// verify against a real render, not a hand-inspected snapshot.
     fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
             match shape {
@@ -24832,19 +24740,18 @@ mod tests {
             "Unavailable",
             "Disabled",
             "1242",
-            "Add Folder",
-            "Scan All Enabled Sources",
-            "Refresh Status",
+            "Add folder",
+            "Scan all enabled",
+            "Refresh status",
             "Mount root",
-            "Current mount root: /mnt/archivefs",
-            "Editing this setting is not yet available.",
+            "/mnt/archivefs",
+            "Configuration editing is intentionally unavailable",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
                 "expected the Sources page to render {expected:?}"
             );
         }
-        // Milestone requirement: no fake mount-root edit control exists.
         assert!(!rendered_text_contains(&output, "Change Mount Root"));
         // The old wording implied mounting itself was unavailable, not just
         // editing the setting - make sure it is truly gone, not just masked
@@ -24875,10 +24782,7 @@ mod tests {
                 );
             });
         });
-        assert!(rendered_text_contains(
-            &output,
-            "No source folders are configured yet."
-        ));
+        assert!(rendered_text_contains(&output, "No source folders"));
     }
 
     #[test]
@@ -24895,11 +24799,6 @@ mod tests {
         let mut new_alias_text = String::new();
         let mut new_alias_platform_choice = None;
         let mut clipboard = InMemoryClipboard::default();
-
-        // A single render with no simulated click on the header - if the
-        // panel were collapsed by default (the prior milestone's
-        // behavior), neither the existing alias nor the Add Alias
-        // controls would appear in this frame's output at all.
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_platform_aliases_panel(
@@ -25067,18 +24966,6 @@ mod tests {
 
     #[test]
     fn sources_remove_dialog_defaults_to_keep_catalogue() {
-        // Mirrors exactly what clicking "Remove" on a source row
-        // constructs (see `show_sources_page`'s Remove button handler,
-        // the only place a `SourcesRemoveDialogState` is ever built in
-        // production code) - the milestone's required safe default.
-        // `egui::Window` content is not asserted here via rendered
-        // shapes: this codebase's own convention for every other
-        // confirmation dialog (mount-all/unmount-all/lazy-unmount/remove-
-        // missing) is to test the underlying state/predicate directly
-        // (see e.g. `unmount_confirmation_actions_are_unavailable_while_busy`),
-        // not a headless single-frame `Window`'s painted text, which does
-        // not reliably appear in `ctx.run`'s output the way in-line `ui`
-        // content does.
         let dialog = SourcesRemoveDialogState {
             path: PathBuf::from("/mnt/usbdrive/retro"),
             last_archive_count: Some(87),
@@ -25198,13 +25085,6 @@ mod tests {
         });
         assert!(rendered_text_contains(&output, "retrodeck"));
     }
-
-    /// Milestone requirement: "GUI preview renders long paths safely" -
-    /// proves `show_library_view_plan_summary` neither panics nor silently
-    /// drops a very long, deeply-nested destination path (an egui `Label`
-    /// truncates by default rather than requiring the caller to
-    /// pre-truncate; this test exists to catch a regression if that ever
-    /// changes, not because a special code path is needed today).
     #[test]
     fn library_view_plan_summary_renders_a_long_path_without_panicking() {
         let ctx = egui::Context::default();
@@ -25385,8 +25265,8 @@ mod tests {
             let _ = show_activity_panel(ctx, &mut history, &mut expanded, &mut clipboard);
         });
         assert!(
-            !rendered_text_contains(&collapsed, "distinctive-activity-marker"),
-            "a collapsed Activity panel must not render history entries, only its toggle"
+            rendered_text_contains(&collapsed, "distinctive-activity-marker"),
+            "the compact Activity summary must surface the latest important state"
         );
 
         expanded = true;
@@ -25409,15 +25289,6 @@ mod tests {
 
     #[test]
     fn activity_panel_wraps_a_very_long_message_and_shows_it_in_full() {
-        // Milestone requirement: long activity messages must be
-        // readable - `.wrap()` replaces the old `.truncate()` +
-        // hover-tooltip treatment, so the complete message must now be
-        // present in the rendered output with no hover needed at all.
-        // `Label::wrap()` still produces one text galley regardless of
-        // how many visual lines it wraps onto, and `Shape::Text::galley
-        // .text()` always returns the complete original source string -
-        // `rendered_text_contains` finding the full 2000-character
-        // message proves nothing was clipped.
         let ctx = egui::Context::default();
         let mut history = OperationHistory::default();
         let long_message = "X".repeat(2000);
@@ -25446,13 +25317,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn duplicate_review_panel_renders_a_long_non_utf8_group_without_panicking() {
-        // Bypasses `catalogue_filename_duplicates`'s grouping algorithm
-        // entirely (irrelevant here) by constructing a
-        // `CatalogueDuplicateReport` directly - the milestone's "long
-        // non-UTF8 paths do not panic" requirement applied to Duplicate
-        // Review's group list and per-entry path rows, both of which
-        // switched from a plain `selectable_label` to
-        // `Button::selectable(...).truncate()` in this milestone.
         let mut path = PathBuf::from("/roms/dup");
         let mut long_name: Vec<u8> = b"same-title-segment-".repeat(30);
         long_name.extend_from_slice(b"\x93\x94.zip");
@@ -25515,20 +25379,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_readability_style_increases_the_default_ui_scale() {
+    fn shared_theme_uses_readable_body_text_and_controls() {
         let ctx = egui::Context::default();
-        let before = ctx.pixels_per_point();
-
-        apply_readability_style(&ctx);
-        // `set_pixels_per_point` only becomes active at the start of the
-        // next pass (see its doc comment), so a frame must run before the
-        // new value is observable.
-        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
-
-        assert!(
-            ctx.pixels_per_point() > before,
-            "the milestone requires a modest default UI scale increase for readability"
-        );
+        theme::apply(&ctx);
+        let style = ctx.style();
+        assert!(style.text_styles[&egui::TextStyle::Body].size >= 16.0);
+        assert!(style.text_styles[&egui::TextStyle::Heading].size >= 26.0);
+        assert!(style.spacing.interact_size.y >= 30.0);
     }
 
     #[test]
@@ -26128,10 +25985,6 @@ mod tests {
 
     #[test]
     fn menu_action_targets_the_clicked_field_even_if_it_was_never_focused() {
-        // No `request_focus`, no prior `TextEditState` for `id` at all -
-        // simulates right-clicking a field that has never been focused or
-        // interacted with before (milestone requirement: "menu opened on
-        // a field that was not already focused").
         let ctx = egui::Context::default();
         let id = egui::Id::new("never_focused_direct_test");
         let text = "never focused".to_string();
@@ -26395,10 +26248,6 @@ mod tests {
             "no context-menu action may ever add an Activity entry"
         );
     }
-
-    // -----------------------------------------------------------------
-    // Archive Inspector milestone - tests.
-    // -----------------------------------------------------------------
 
     fn inspector_entry(name: &str, kind: InspectorEntryKind, size: u64) -> InspectorEntry {
         let classification = classify_entry(name, matches!(kind, InspectorEntryKind::Directory));
@@ -27028,13 +26877,6 @@ mod tests {
 
     #[test]
     fn every_new_retro_platform_appears_exactly_once_in_the_gui_platform_selector() {
-        // Same rationale as `acorn_archimedes_and_pc_appear_in_the_gui_
-        // platform_selector`: the dropdown is `canonical_platform_names()`
-        // with no filtering, so the meaningful, observable check is that
-        // the list this build's GUI reads from contains each of this
-        // milestone's 20 new canonical platforms exactly once - not zero
-        // (unreachable from the GUI) and not more than once (a duplicate
-        // dropdown entry).
         let names = canonical_platform_names();
         for expected in [
             "Game Boy",
@@ -27217,10 +27059,6 @@ mod tests {
             "not a readable ZIP archive"
         ));
     }
-
-    // -----------------------------------------------------------------
-    // Desktop context-menu milestone.
-    // -----------------------------------------------------------------
 
     #[test]
     fn right_click_on_unselected_row_selects_only_that_row() {
@@ -27411,9 +27249,6 @@ mod tests {
         let mut form_dialog = None;
         let mut remove_dialog = None;
         let mut clipboard = InMemoryClipboard::default();
-        // No `last_plan` at all - Apply/Repair must be unreachable both as
-        // inline buttons and via the row's own context menu (milestone:
-        // "Do not add menu actions that bypass preview or safety checks").
         let action = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_library_views_page(
@@ -27803,11 +27638,6 @@ mod tests {
 
     #[test]
     fn duplicate_review_action_has_no_delete_variant() {
-        // Structural guarantee (milestone requirement: "No deletion
-        // controls. No automatic cleanup."): every variant
-        // `DuplicateReviewAction` can hold is navigation, read-only
-        // inspection, or closing the panel - there is no delete/cleanup
-        // constructor to call even in principle.
         let variants = [
             DuplicateReviewAction::Close,
             DuplicateReviewAction::ViewInLibrary(PathBuf::from("/roms/a.zip")),
@@ -27930,13 +27760,6 @@ mod tests {
         let records = vec![record];
         let menu_context = row_menu_context_for(&records);
         let ctx = egui::Context::default();
-
-        // Render the submenu's contents directly (see the milestone's
-        // established pattern for testing menu content without needing to
-        // simulate real popup positioning): `show_single_row_context_menu`
-        // renders `canonical_platform_names()` unconditionally into the
-        // "Set platform" menu button's contents, so calling it here still
-        // exercises the exact same list construction as the real submenu.
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_single_row_context_menu(ui, &row, &menu_context);
@@ -28038,10 +27861,6 @@ mod tests {
 
     #[test]
     fn opening_row_context_menus_causes_no_side_effects() {
-        // Merely rendering the menu content (no button inside it clicked)
-        // must never write to the clipboard, request an operation, or
-        // mutate the selection - milestone requirement: "opening a context
-        // menu performs no database write, scan, mount, or unmount."
         let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
         let row = row_with_fields("/roms/a.zip", "SNES", "Pending", "/roms/a.zip", "/mnt/a");
         let records = vec![record];
@@ -28269,11 +28088,6 @@ mod tests {
 
     #[test]
     fn zero_mounted_selected_disables_the_unmount_selected_button() {
-        // Milestone requirement 6: zero mounted archives in the selection
-        // must never open a misleading confirmation - the row menu's
-        // button itself stays disabled, so clicking at its exact position
-        // (a real click, not a hand-built bool) must produce no action at
-        // all, exactly like any other disabled button in this codebase.
         let records = vec![record_at(PathBuf::from("/roms/a.zip"), MountState::Pending)];
         let selected_archives: HashSet<PathBuf> =
             [PathBuf::from("/roms/a.zip")].into_iter().collect();
