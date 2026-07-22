@@ -503,10 +503,10 @@
    "required_tests": [
     "existing DoctorChecks overlay tests adapted, not deleted"
    ],
-   "status": "in_progress",
-   "evidence": "Redesigned shell adds MainView::Doctor rendering show_doctor_checks_panel as a primary destination; ToolsOverlay::DoctorChecks retained. Full design parity (severity layout, suggested actions) still open.",
+   "status": "complete",
+   "evidence": "MainView::Doctor page: doctor_summary_text (check counts by status + catalogue totals), Copy Report (doctor_report_text, plain text one check per line), Run All Checks (full refresh, gated while loading/busy), existing show_doctor_checks_panel grid. Overlay retained. Test: doctor_summary_and_report_text_reflect_exact_check_counts.",
    "implementation_commit": null,
-   "notes": ""
+   "notes": "Deliberate deviations: no per-check \"Suggested fix\" (DoctorCheck has no suggestion field - inventing fixes in the GUI would be untruthful) and no Export JSON (serde_json is not a GUI dependency; Copy Report covers the need). DoctorReport-vs-SetupDiagnostics reconciliation remains DOCTOR-001."
   },
   {
    "id": "DOCTOR-003",

@@ -5597,11 +5597,32 @@ impl eframe::App for ArchiveFsApp {
             if self.view == MainView::Doctor {
                 ui.heading("Doctor");
                 ui.add_space(4.0);
-                let doctor = match &self.state {
-                    LoadState::Ready(data) => Some(&data.doctor),
-                    _ => None,
-                };
-                show_doctor_checks_panel(ui, doctor);
+                let mut run_requested = false;
+                {
+                    let doctor = match &self.state {
+                        LoadState::Ready(data) => Some(&data.doctor),
+                        _ => None,
+                    };
+                    if let Some(report) = doctor {
+                        ui.horizontal(|ui| {
+                            ui.label(doctor_summary_text(report));
+                            if ui
+                                .add_enabled(!loading && !busy, egui::Button::new("Run All Checks"))
+                                .clicked()
+                            {
+                                run_requested = true;
+                            }
+                            if ui.button("Copy Report").clicked() {
+                                let _ = self.clipboard.set_text(doctor_report_text(report));
+                            }
+                        });
+                        ui.separator();
+                    }
+                    show_doctor_checks_panel(ui, doctor);
+                }
+                if run_requested {
+                    self.refresh(context);
+                }
                 return;
             }
 
@@ -6855,6 +6876,66 @@ fn show_activity_panel(
 /// on Library) into its own Tools destination. The Library page keeps
 /// only a compact Ready/Needs attention indicator (see `show_loaded_data`);
 /// this is the detailed Status/Check/Detail breakdown behind it.
+/// The Doctor page's one-line summary - check counts by status plus the
+/// catalogue totals the report already carries. Pure, so it is testable
+/// and can never disagree with the grid below it.
+fn doctor_summary_text(report: &DoctorReport) -> String {
+    let passed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Pass)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Warn)
+        .count();
+    let failed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Fail)
+        .count();
+    format!(
+        "{} checks: {passed} passed, {warnings} warnings, {failed} failed · \
+         {} archives ({} mounted, {} pending, {} unknown platform)",
+        report.checks.len(),
+        report.archives_found,
+        report.mounted_archives,
+        report.pending_archives,
+        report.archives_unknown_platform
+    )
+}
+
+/// The full-report text behind the Doctor page's "Copy Report" - the
+/// design's copy-full-details affordance. Plain text, one check per
+/// line, so it pastes cleanly into an issue or support request. The
+/// design's per-check "Suggested fix" is deliberately absent:
+/// `DoctorCheck` carries no suggestion field today, and inventing fixes
+/// in the GUI would be untruthful (see the capability matrix's Doctor
+/// "Suggested action" row).
+fn doctor_report_text(report: &DoctorReport) -> String {
+    let mut lines = vec![
+        format!("ArchiveFS doctor report"),
+        format!("Config: {}", report.config_path.display()),
+        doctor_summary_text(report),
+        String::new(),
+    ];
+    for check in &report.checks {
+        lines.push(format!(
+            "[{}] {} — {}",
+            check.status, check.name, check.detail
+        ));
+    }
+    if !report.platform_counts.is_empty() {
+        lines.push(String::new());
+        lines.push("Platform counts:".to_string());
+        for (platform, count) in &report.platform_counts {
+            lines.push(format!("  {platform}: {count}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn show_doctor_checks_panel(ui: &mut egui::Ui, doctor: Option<&DoctorReport>) {
     let Some(doctor) = doctor else {
         ui.label("Doctor checks are unavailable until the library has been scanned.");
@@ -14199,8 +14280,8 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
 mod tests {
     use super::*;
     use archivefs_core::{
-        Archive, ArchiveHealth, ArchiveMetadata, LibraryViewPlanCounts, MountPlan, SetupDiagnostic,
-        SourceScanStatus, classify_entry,
+        Archive, ArchiveHealth, ArchiveMetadata, DoctorCheck, LibraryViewPlanCounts, MountPlan,
+        SetupDiagnostic, SourceScanStatus, classify_entry,
     };
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -14367,6 +14448,49 @@ mod tests {
             mount_validation_label(MountState::MountPathExists),
             "Destination already exists — will be skipped"
         );
+    }
+
+    #[test]
+    fn doctor_summary_and_report_text_reflect_exact_check_counts() {
+        let report = DoctorReport {
+            config_path: PathBuf::from("/config/archivefs.toml"),
+            checks: vec![
+                DoctorCheck {
+                    name: "ratarmount".to_string(),
+                    status: DoctorStatus::Pass,
+                    detail: "ratarmount is available".to_string(),
+                },
+                DoctorCheck {
+                    name: "mount root".to_string(),
+                    status: DoctorStatus::Warn,
+                    detail: "mount root missing".to_string(),
+                },
+                DoctorCheck {
+                    name: "database".to_string(),
+                    status: DoctorStatus::Fail,
+                    detail: "database unreadable".to_string(),
+                },
+            ],
+            archives_found: 5,
+            archives_with_platform: 4,
+            archives_unknown_platform: 1,
+            unknown_platform_examples: Vec::new(),
+            platform_counts: vec![("PS2".to_string(), 4)],
+            pending_archives: 3,
+            mounted_archives: 2,
+        };
+        let summary = doctor_summary_text(&report);
+        assert_eq!(
+            summary,
+            "3 checks: 1 passed, 1 warnings, 1 failed · 5 archives (2 mounted, 3 pending, 1 unknown platform)"
+        );
+        let text = doctor_report_text(&report);
+        assert!(text.contains("Config: /config/archivefs.toml"));
+        assert!(text.contains(&summary));
+        assert!(text.contains("[PASS] ratarmount — ratarmount is available"));
+        assert!(text.contains("mount root missing"));
+        assert!(text.contains("database unreadable"));
+        assert!(text.contains("PS2: 4"));
     }
 
     #[test]

@@ -310,12 +310,35 @@ Landed in commit "Add filtering and export to History & Logs":
 - Tests: filter-list completeness and filter/sort behaviour
   (355 passed, 0 failed).
 
+## Doctor screen parity (2026-07-22)
+
+Landed in commit "Add summary, copy, and re-run to the Doctor screen":
+
+- `doctor_summary_text`: pure one-line summary (check counts by
+  status + archive/mounted/pending/unknown-platform totals from
+  `DoctorReport`).
+- "Copy Report": `doctor_report_text` — plain-text full report (config
+  path, summary, one check per line, platform counts) via the shared
+  clipboard backend.
+- "Run All Checks": full snapshot refresh, disabled while loading or
+  busy. The Doctor grid itself (`show_doctor_checks_panel`) is
+  unchanged and still shared with the Tools overlay.
+- Deliberate deviations (recorded in FABLE_FEATURES.json DOCTOR-002):
+  no per-check "Suggested fix" (`DoctorCheck` has no suggestion
+  field — inventing fixes in the GUI would be untruthful) and no
+  Export JSON (serde_json is not a GUI dependency; Copy Report covers
+  the need). `DoctorReport` vs `SetupDiagnostics` reconciliation
+  remains open as DOCTOR-001.
+- Test: doctor_summary_and_report_text_reflect_exact_check_counts
+  (356 passed, 0 failed).
+
 ## Next deliverable
 
-Doctor screen parity: copy-full-details affordance and suggested
-actions on the Doctor page, plus surfacing the RetroArch environment
-diagnostics (backend `emulator_environment::retroarch`, CLI
-`retroarch-environment`) if scoping allows.
+Settings parity within backend support (mount root / config visibility;
+prototype-only settings stay deferred) and About environment info, then
+assess the RetroArch surfaces (design has no RetroArch screen — decide
+where trusted-source/cheat workflows belong in the redesigned shell
+before building them).
 
 ## Latest clean commit
 
