@@ -4494,8 +4494,10 @@ impl ArchiveFsApp {
         workflow.source_list = CheatStepResource::Loading { receiver };
         thread::spawn(move || {
             let result = default_cheat_source_cache_root()
-                .map(|cache_root| list_retroarch_cheat_sources(&cache_root))
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())
+                .and_then(|cache_root| {
+                    list_retroarch_cheat_sources(&cache_root).map_err(|error| error.to_string())
+                });
             let _ = sender.send(result);
             context.request_repaint();
         });
