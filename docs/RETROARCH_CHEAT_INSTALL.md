@@ -6,6 +6,12 @@ the explicit journal path and destination root.
 Installation journals can be listed and assessed without changing anything
 with [`retroarch-cheat-history` and `retroarch-cheat-inspect`](RETROARCH_CHEAT_HISTORY.md).
 
+For ordinary end users, prefer
+[`retroarch-cheat-setup <local-path>`](RETROARCH_CHEAT_SETUP.md). Setup safely
+discovers destination and journal/backup defaults, previews and confirms, then
+delegates to this same installer. This lower-level command retains its explicit
+destination contract for scripting and isolated workflows.
+
 `archivefs retroarch-cheat-install <local-path>` is the first
 write-capable command in the RetroArch cheat pipeline: it can actually
 create a cheat file, replace one with a verified backup, and write a

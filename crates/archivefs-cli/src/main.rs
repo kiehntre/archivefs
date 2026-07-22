@@ -46,6 +46,8 @@ use archivefs_core::{
 };
 use serde::Serialize;
 
+mod retroarch_cheat_setup;
+
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 
@@ -410,6 +412,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("retroarch-cheat-install: one or more eligible entries did not complete successfully"
                     .into());
             }
+        }
+        "retroarch-cheat-setup" => {
+            retroarch_cheat_setup::run(args.collect())?;
         }
         "retroarch-cheat-history" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -4044,6 +4049,9 @@ fn print_help() {
         "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
     );
     println!(
+        "  retroarch-cheat-setup <local-path>  Guided profile discovery, preview, confirmation, and safe RetroArch cheat installation (--profile/--dry-run/--yes/--replace-different/--json/--database/--config accepted)"
+    );
+    println!(
         "  retroarch-cheat-history  Inspect cheat-install journals (read-only; --journal-root <path>/--json accepted)"
     );
     println!(
@@ -4131,6 +4139,10 @@ fn print_help() {
     );
     println!(
         "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json"
+    );
+    println!("  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --dry-run");
+    println!(
+        "  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --profile <profile-id> --yes"
     );
     println!("  archivefs retroarch-cheat-history");
     println!("  archivefs retroarch-cheat-history --json");

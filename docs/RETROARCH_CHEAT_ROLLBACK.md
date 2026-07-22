@@ -9,6 +9,11 @@ Rollback reverts one successful `retroarch-cheat-install` run identified by
 its journal. It never guesses a "latest" run and never overwrites files that
 changed after installation.
 
+The same command consumes journals produced by guided
+[`retroarch-cheat-setup`](RETROARCH_CHEAT_SETUP.md). Setup completion prints the
+actual journal and resolved destination root in a ready-to-preview rollback
+example.
+
 ```console
 archivefs retroarch-cheat-rollback ~/.local/share/archivefs/cheat-install-runs/<run>.json \
   --cheat-destination-root ~/.config/retroarch/cheats --yes
