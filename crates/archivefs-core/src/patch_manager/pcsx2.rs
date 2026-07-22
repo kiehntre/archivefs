@@ -326,7 +326,7 @@ fn normalize_serial(value: &str) -> Option<String> {
 
 /// Normalizes an 8-hex-digit PCSX2 executable CRC, uppercased. `None` if
 /// `value` is not exactly 8 hex digits.
-fn normalize_crc(value: &str) -> Option<String> {
+pub(super) fn normalize_crc(value: &str) -> Option<String> {
     let value = value.trim();
     (value.len() == 8 && value.chars().all(|character| character.is_ascii_hexdigit()))
         .then(|| value.to_ascii_uppercase())
