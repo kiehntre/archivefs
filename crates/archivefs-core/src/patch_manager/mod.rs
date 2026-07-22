@@ -30,6 +30,7 @@ mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
 mod destination_safety;
+mod import_safety;
 mod matching;
 mod pcsx2;
 mod retrieval;
@@ -110,6 +111,11 @@ pub use destination_safety::{
     DestinationSafetyFailureReason, DestinationState, InspectedParent, InspectedParentState,
     SafeDestination, ValidatedDestinationRoot, assess_destination, construct_safe_destination,
     inspect_safe_destination, validate_destination_root,
+};
+pub use import_safety::{
+    ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
+    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, UNKNOWN_CODE_POLICY,
+    automatic_execution_allowed, classify_active_content, trust_after_inspection,
 };
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,

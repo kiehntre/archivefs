@@ -13,6 +13,14 @@ installer network access:
 Fetching never installs cheats. Listing and inspection never access the
 network or mutate the cache.
 
+The built-in adapter is **Trusted** in ArchiveFS's three-state source model:
+its provenance, format, host and limits were reviewed. That status does not
+claim that structural inspection proves content malware-free. Local and
+community sources are **Unverified**, not malicious by definition, and a
+general import scanner for them is not implemented. Concrete unsafe structure
+is **Blocked**. See [`CHEATS_MODS_SAFETY.md`](CHEATS_MODS_SAFETY.md) for the
+trust, local-only inspection, unknown-code, consent and original-file policy.
+
 ## Registry and commands
 
 The compiled registry initially enables `libretro-buildbot-cheats`, the
@@ -49,6 +57,11 @@ Setup shows source name/ID/URL, fetch time, archive SHA-256, validation state,
 network/cache outcome, staleness, warnings, and immutable path. It preserves
 all existing match, confirmation, backup, journal, history, inspection, and
 rollback rules.
+
+Fetching or inspecting a source never modifies RetroArch, installs catalogue
+entries, or duplicates files in RetroArch's cheat directory. Installation is a
+separate explicit workflow with destination conflict, backup and journal
+rules. ArchiveFS does not execute catalogue content.
 
 ## Network and extraction protections
 
