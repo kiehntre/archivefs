@@ -47,6 +47,7 @@ use archivefs_core::{
 use serde::Serialize;
 
 mod retroarch_cheat_setup;
+mod retroarch_cheat_sources;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -415,6 +416,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "retroarch-cheat-setup" => {
             retroarch_cheat_setup::run(args.collect())?;
+        }
+        "retroarch-cheat-source-list" => {
+            retroarch_cheat_sources::run_list(args.collect())?;
+        }
+        "retroarch-cheat-source-fetch" => {
+            retroarch_cheat_sources::run_fetch(args.collect())?;
+        }
+        "retroarch-cheat-source-inspect" => {
+            retroarch_cheat_sources::run_inspect(args.collect())?;
         }
         "retroarch-cheat-history" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -4049,7 +4059,16 @@ fn print_help() {
         "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
     );
     println!(
-        "  retroarch-cheat-setup <local-path>  Guided profile discovery, preview, confirmation, and safe RetroArch cheat installation (--profile/--dry-run/--yes/--replace-different/--json/--database/--config accepted)"
+        "  retroarch-cheat-setup <local-path>|--source <source-id>  Guided profile discovery, trusted retrieval when selected, preview, confirmation, and safe installation"
+    );
+    println!(
+        "  retroarch-cheat-source-list  List trusted sources and local cache state without networking (--cache-root/--json accepted)"
+    );
+    println!(
+        "  retroarch-cheat-source-fetch <source-id>  Fetch or reuse a validated immutable catalogue snapshot (--offline/--force-refresh/--expected-sha256/--cache-root/--max-download-bytes/--json accepted)"
+    );
+    println!(
+        "  retroarch-cheat-source-inspect <source-id|snapshot-path>  Inspect registry, provenance, cache integrity, and setup usability (read-only; --cache-root/--json accepted)"
     );
     println!(
         "  retroarch-cheat-history  Inspect cheat-install journals (read-only; --journal-root <path>/--json accepted)"
@@ -4141,6 +4160,10 @@ fn print_help() {
         "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json"
     );
     println!("  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --dry-run");
+    println!("  archivefs retroarch-cheat-setup --source libretro-buildbot-cheats --dry-run");
+    println!("  archivefs retroarch-cheat-source-list --json");
+    println!("  archivefs retroarch-cheat-source-fetch libretro-buildbot-cheats");
+    println!("  archivefs retroarch-cheat-source-inspect libretro-buildbot-cheats");
     println!(
         "  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --profile <profile-id> --yes"
     );

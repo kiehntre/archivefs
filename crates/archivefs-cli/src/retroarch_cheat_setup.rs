@@ -17,9 +17,14 @@ use archivefs_core::patch_manager::{
     resolve_retroarch_cheat_setup_profile,
 };
 
+use crate::retroarch_cheat_sources::{SourceOptions, fetch_source};
+
 #[derive(Debug)]
 struct SetupCliOptions {
     catalogue_path: PathBuf,
+    source_id: Option<String>,
+    source_result: Option<archivefs_core::patch_manager::CheatSourceFetchResult>,
+    source_options: Option<SourceOptions>,
     profile_id: Option<String>,
     dry_run: bool,
     yes: bool,
@@ -30,7 +35,35 @@ struct SetupCliOptions {
 }
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_options(args)?;
+    let mut options = parse_options(args)?;
+    if let (Some(source_id), Some(source_options)) = (&options.source_id, &options.source_options) {
+        match fetch_source(source_id, source_options) {
+            Ok(result) => {
+                options.catalogue_path = source_options
+                    .cache_root
+                    .join(&result.source.source_id)
+                    .join("snapshots")
+                    .join(&result.manifest.archive_sha256)
+                    .join(&result.manifest.catalogue_relative_path);
+                options.source_result = Some(result);
+            }
+            Err(error) => {
+                if options.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "status": "failed",
+                            "operation": "source_retrieval",
+                            "source_id": source_id,
+                            "error": error,
+                        }))?
+                    );
+                }
+                return Err(Box::new(error));
+            }
+        }
+    }
     let filesystem = HostReadOnlyFilesystem;
     let environment = DiscoveryEnvironment::from_process_environment();
     let discovery = match discover_retroarch_cheat_setup_profiles(
@@ -162,7 +195,10 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         backup_directory: data_directory.join(CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME),
         run_id,
         started_at_unix_seconds: unix_seconds_now(),
-        catalogue_source: "local-catalogue".to_string(),
+        catalogue_source: options
+            .source_id
+            .clone()
+            .unwrap_or_else(|| "local-catalogue".to_string()),
     };
     let outcome = execute_cheat_install_run(&plan.installer_entries, &installer_options);
     let failed = matches!(
@@ -249,11 +285,45 @@ fn parse_options(mut args: Vec<String>) -> Result<SetupCliOptions, Box<dyn std::
         .map(Ok)
         .unwrap_or_else(default_database_path)?;
     let configuration_path = extract_value(&mut args, "--config")?.map(PathBuf::from);
-    if args.len() != 1 {
-        return Err("retroarch-cheat-setup requires one local catalogue path and accepts --profile <profile-id>, --dry-run, --yes, --replace-different, --json, --database <path>, and --config <path>".into());
+    let source_id = extract_value(&mut args, "--source")?;
+    let force_refresh = extract_flag(&mut args, "--force-refresh");
+    let offline = extract_flag(&mut args, "--offline");
+    let expected_sha256 = extract_value(&mut args, "--expected-sha256")?;
+    let cache_root = extract_value(&mut args, "--cache-root")?
+        .map(PathBuf::from)
+        .unwrap_or(archivefs_core::patch_manager::default_cheat_source_cache_root()?);
+    let max_download_bytes = extract_value(&mut args, "--max-download-bytes")?
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| "--max-download-bytes requires a positive integer")?;
+    if max_download_bytes == Some(0) {
+        return Err("--max-download-bytes must be greater than zero".into());
     }
+    if source_id.is_some() == (args.len() == 1) {
+        return Err("retroarch-cheat-setup requires exactly one local catalogue path or --source <source-id>, never both".into());
+    }
+    if source_id.is_none()
+        && (force_refresh || offline || expected_sha256.is_some() || max_download_bytes.is_some())
+    {
+        return Err("retrieval options require --source <source-id>".into());
+    }
+    if source_id.is_some() && !args.is_empty() {
+        return Err("a local catalogue path cannot be combined with --source".into());
+    }
+    let catalogue_path = args.first().map(PathBuf::from).unwrap_or_default();
+    let source_options = source_id.as_ref().map(|_| SourceOptions {
+        json,
+        force_refresh,
+        offline,
+        expected_sha256,
+        cache_root,
+        max_download_bytes,
+    });
     Ok(SetupCliOptions {
-        catalogue_path: PathBuf::from(args.remove(0)),
+        catalogue_path,
+        source_id,
+        source_result: None,
+        source_options,
         profile_id,
         dry_run,
         yes,
@@ -410,6 +480,24 @@ fn print_preview(plan: &RetroArchCheatSetupPlan, options: &SetupCliOptions) {
         profile.configuration_path.display,
         plan.destination_root.display()
     );
+    if let Some(source) = &options.source_result {
+        println!(
+            "Trusted source provenance\n  source: {} ({})\n  URL: {}\n  fetched: {}\n  archive SHA-256: {}\n  validation complete: {}\n  retrieval: {:?} (cache: {}, stale: {})\n  immutable snapshot: {}\n",
+            source.source.display_name,
+            source.source.source_id,
+            source.source.download_url,
+            source.manifest.fetched_at_unix_seconds,
+            source.manifest.archive_sha256,
+            source.manifest.validation_complete,
+            source.status,
+            source.from_cache,
+            source.stale,
+            source.immutable_snapshot_path.display,
+        );
+        for warning in &source.warnings {
+            println!("  retrieval warning: {warning}");
+        }
+    }
     println!(
         "Cheat catalogue\n  path: {}\n  ArchiveFS database: {}\n  game records examined: {}\n  cheat records discovered: {}\n",
         options.catalogue_path.display(),
@@ -436,7 +524,16 @@ fn print_preview(plan: &RetroArchCheatSetupPlan, options: &SetupCliOptions) {
     if plan.preview.planned_entries.is_empty() {
         println!("  No catalogue cheat records were found.");
     }
-    for entry in &plan.preview.planned_entries {
+    let visible_entries = plan
+        .preview
+        .planned_entries
+        .iter()
+        .filter(|entry| {
+            entry.planned_action
+                != archivefs_core::patch_manager::RetroArchCheatSetupPlannedAction::Skipped
+        })
+        .collect::<Vec<_>>();
+    for entry in &visible_entries {
         println!(
             "  {} [{}]\n    source: {}\n    destination: {}\n    action: {}\n    confidence/reason: {:?} / {}",
             entry.display_title,
@@ -450,6 +547,16 @@ fn print_preview(plan: &RetroArchCheatSetupPlan, options: &SetupCliOptions) {
             planned_action_label(entry.planned_action),
             entry.match_confidence,
             entry.reason
+        );
+    }
+    let omitted = plan
+        .preview
+        .planned_entries
+        .len()
+        .saturating_sub(visible_entries.len());
+    if omitted > 0 {
+        println!(
+            "  {omitted} non-actionable catalogue entries omitted; summary counts still include them."
         );
     }
     if !plan.warnings.is_empty() {
@@ -576,6 +683,10 @@ fn result_from_plan(
         configuration_path: Some(plan.selected_profile.configuration_path.clone()),
         cheat_destination_root: Some(EncodedPath::from_path(&plan.destination_root)),
         catalogue_path: EncodedPath::from_path(&options.catalogue_path),
+        retrieved_source: options
+            .source_result
+            .as_ref()
+            .map(archivefs_core::patch_manager::CheatSourceSetupContext::from),
         database_path: EncodedPath::from_path(&options.database_path),
         preview: Some(plan.preview.clone()),
         planned_entries: plan.preview.planned_entries.clone(),
@@ -588,15 +699,26 @@ fn result_from_plan(
 }
 
 fn preview_apply_command(options: &SetupCliOptions, plan: &RetroArchCheatSetupPlan) -> Vec<String> {
-    let mut command = vec![
-        "archivefs".into(),
-        "retroarch-cheat-setup".into(),
-        options.catalogue_path.display().to_string(),
+    let mut command = vec!["archivefs".into(), "retroarch-cheat-setup".into()];
+    if let Some(source_id) = &options.source_id {
+        command.push("--source".into());
+        command.push(source_id.clone());
+        if let Some(source_options) = &options.source_options {
+            if source_options.offline {
+                command.push("--offline".into());
+            }
+            command.push("--cache-root".into());
+            command.push(source_options.cache_root.display().to_string());
+        }
+    } else {
+        command.push(options.catalogue_path.display().to_string());
+    }
+    command.extend([
         "--profile".into(),
         plan.selected_profile.profile_id.clone(),
         "--database".into(),
         options.database_path.display().to_string(),
-    ];
+    ]);
     if let Some(configuration_path) = &options.configuration_path {
         command.push("--config".into());
         command.push(configuration_path.display().to_string());
@@ -803,5 +925,26 @@ mod tests {
             options.database_path,
             PathBuf::from("/data/library.sqlite3")
         );
+    }
+
+    #[test]
+    fn parser_keeps_local_and_trusted_source_forms_unambiguous() {
+        let source = parse_options(vec![
+            "--source".into(),
+            "libretro-buildbot-cheats".into(),
+            "--offline".into(),
+            "--cache-root".into(),
+            "/cache".into(),
+            "--dry-run".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            source.source_id.as_deref(),
+            Some("libretro-buildbot-cheats")
+        );
+        assert!(source.source_options.unwrap().offline);
+        assert!(parse_options(vec!["/catalogue".into(), "--source".into(), "id".into()]).is_err());
+        assert!(parse_options(vec!["/catalogue".into(), "--offline".into()]).is_err());
+        assert!(parse_options(vec![]).is_err());
     }
 }

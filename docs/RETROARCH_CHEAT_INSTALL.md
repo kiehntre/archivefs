@@ -12,6 +12,10 @@ discovers destination and journal/backup defaults, previews and confirms, then
 delegates to this same installer. This lower-level command retains its explicit
 destination contract for scripting and isolated workflows.
 
+Guided setup may also receive a validated local snapshot from the separate
+[trusted source retrieval layer](RETROARCH_CHEAT_SOURCES.md). The installer
+still receives a local path and never downloads a URL itself.
+
 `archivefs retroarch-cheat-install <local-path>` is the first
 write-capable command in the RetroArch cheat pipeline: it can actually
 create a cheat file, replace one with a verified backup, and write a

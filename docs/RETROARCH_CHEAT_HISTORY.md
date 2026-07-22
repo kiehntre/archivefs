@@ -6,6 +6,9 @@ without opening their JSON files manually:
 Journals produced by guided
 [`retroarch-cheat-setup`](RETROARCH_CHEAT_SETUP.md) use this same schema and
 default history root; there is no separate setup history implementation.
+Installs originating from a validated
+[trusted-source snapshot](RETROARCH_CHEAT_SOURCES.md) record its stable source
+ID and are discovered normally without network access.
 
 ```console
 archivefs retroarch-cheat-history

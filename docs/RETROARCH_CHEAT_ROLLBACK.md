@@ -13,6 +13,9 @@ The same command consumes journals produced by guided
 [`retroarch-cheat-setup`](RETROARCH_CHEAT_SETUP.md). Setup completion prints the
 actual journal and resolved destination root in a ready-to-preview rollback
 example.
+Trusted-source installs retain the same local hash, backup, destination,
+journal-binding, and confirmation checks; retrieval provenance does not weaken
+rollback safety.
 
 ```console
 archivefs retroarch-cheat-rollback ~/.local/share/archivefs/cheat-install-runs/<run>.json \

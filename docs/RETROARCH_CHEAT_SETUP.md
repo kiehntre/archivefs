@@ -1,18 +1,21 @@
 # Guided RetroArch Cheat Setup
 
-`archivefs retroarch-cheat-setup <catalogue-path>` is the end-user entry point
-for installing cheats from a local RetroArch catalogue. It discovers local
+`archivefs retroarch-cheat-setup <catalogue-path>` is the local entry point;
+`archivefs retroarch-cheat-setup --source <source-id>` uses a validated trusted
+snapshot. Both discover local
 RetroArch profiles, resolves their configured cheat directories, matches the
 catalogue against the existing ArchiveFS library database, previews every
 decision, and delegates approved writes to the existing safe installer.
 
-It does not download a catalogue, modify `retroarch.cfg`, enable cheats,
+The installer does not download a catalogue. The separate trusted-source layer
+may retrieve and validate one before setup. Setup never modifies `retroarch.cfg`, enables cheats,
 change playlists or cores, or touch game archives.
 
 ## Syntax and options
 
 ```console
 archivefs retroarch-cheat-setup <catalogue-path> [options]
+archivefs retroarch-cheat-setup --source <source-id> [options]
 ```
 
 | Option | Meaning |
@@ -24,6 +27,16 @@ archivefs retroarch-cheat-setup <catalogue-path> [options]
 | `--json` | Emit only the versioned setup result on stdout. Without `--yes`, this is a successful no-write preview. |
 | `--database <path>` | Read an explicit current-schema ArchiveFS library database. |
 | `--config <path>` | Restrict eligibility to a discovered profile using this exact RetroArch config path. It does not invent an installation around an arbitrary config. |
+| `--source <source-id>` | Retrieve or reuse one compiled-in trusted source; mutually exclusive with the local path. |
+| `--offline` | With `--source`, make no network request and require a valid cached snapshot. |
+| `--force-refresh` | With `--source`, validate a new snapshot before replacing the current pointer. |
+| `--expected-sha256 <hash>` | With `--source`, require this archive digest. |
+| `--cache-root <path>` | Override the ArchiveFS-owned source cache root. |
+| `--max-download-bytes <bytes>` | Lower the built-in source download ceiling. |
+
+Trusted-source preview provenance and cache behavior are documented in
+[`RETROARCH_CHEAT_SOURCES.md`](RETROARCH_CHEAT_SOURCES.md). Local catalogue
+behavior is unchanged.
 
 No destination, journal, backup, installation-type, or RetroArch config path
 is needed normally. The destination comes from the selected profile's parsed
