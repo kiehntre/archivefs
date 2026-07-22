@@ -16,7 +16,8 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::patch_manager::{
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, HttpsCheatSourceTransport, RetroArchCheatSetupDiscovery,
+    CheatSourceList, CheatSourceListEntry, HttpsCheatSourceTransport, ImportSourceKind,
+    ImportTrustState, LocalSafetyScanningState, RetroArchCheatSetupDiscovery, UNKNOWN_CODE_POLICY,
     default_cheat_source_cache_root, discover_retroarch_cheat_setup_profiles,
     fetch_retroarch_cheat_source, list_retroarch_cheat_sources,
 };
@@ -10243,6 +10244,178 @@ enum CheatWorkflowAction {
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
 const CHEAT_STAGE3_BODY: &str = "Catalogue retrieval is available. Archive matching and cheat installation are not yet implemented in this GUI workflow.";
+const LOCAL_INSPECTION_PRIVACY_COPY: &str = "Trusted catalogue archives are validated locally on this device for unsafe paths, special entries, resource-limit violations, and unexpected structure. Scan results, filenames, file contents, hashes, and metadata are not sent to the ArchiveFS developers or any third party. General local or community-source inspection is planned and is not active yet.";
+const IMPORT_CONSENT_COPY: &str = "Only import cheats or mods from sources you trust. ArchiveFS performs local structural and format checks where an implemented adapter provides them, but it is not an antivirus scanner.";
+const ETHICAL_USE_COPY: &str = "ArchiveFS is intended for preservation, accessibility, personal customization, and legitimate interoperability. It must not be used to bypass copy protection, licensing systems, access controls, or other technical protections. Game developers, artists, musicians, writers, testers, and publishers invest substantial effort in creating games; supporting legitimate releases helps future games, updates, and preservation efforts.";
+const USER_RESPONSIBILITY_COPY: &str = "You are responsible for ensuring that you have the right to use, modify, import, and distribute cheats, patches, mods, textures, or related files. ArchiveFS does not verify ownership or licensing.";
+const SCANNING_DISABLED_WARNING: &str =
+    "Turning this off does not make unsafe files safe. It only stops ArchiveFS checking them.";
+
+fn import_trust_label(state: ImportTrustState) -> &'static str {
+    match state {
+        ImportTrustState::Trusted => "Trusted",
+        ImportTrustState::Unverified => "Unverified",
+        ImportTrustState::Blocked => "Blocked",
+    }
+}
+
+fn import_trust_tone(state: ImportTrustState) -> widgets::StatusTone {
+    match state {
+        ImportTrustState::Trusted => widgets::StatusTone::Success,
+        ImportTrustState::Unverified => widgets::StatusTone::Warning,
+        ImportTrustState::Blocked => widgets::StatusTone::Blocked,
+    }
+}
+
+fn import_source_presentation(kind: ImportSourceKind) -> (&'static str, &'static str) {
+    match kind {
+        ImportSourceKind::EmulatorManagedLibrary => {
+            ("Existing emulator-managed library", "Existing content")
+        }
+        ImportSourceKind::ArchiveFsTrustedCatalogue => ("ArchiveFS trusted catalogue", "Available"),
+        ImportSourceKind::LocalUnverifiedSource => ("Local unverified source", "Planned"),
+        ImportSourceKind::RemoteUnverifiedSource => ("Future remote unverified source", "Planned"),
+    }
+}
+
+fn local_scanning_presentation(
+    state: LocalSafetyScanningState,
+) -> (&'static str, widgets::StatusTone) {
+    match state {
+        LocalSafetyScanningState::PlannedUnavailable => (
+            "Local safety scanning · Planned",
+            widgets::StatusTone::Pending,
+        ),
+        LocalSafetyScanningState::Enabled => {
+            ("Local safety scanning · On", widgets::StatusTone::Success)
+        }
+        LocalSafetyScanningState::DisabledPendingConfirmation => (
+            "Local safety scanning · Confirmation required",
+            widgets::StatusTone::Warning,
+        ),
+        LocalSafetyScanningState::Disabled => {
+            ("Local safety scanning · Off", widgets::StatusTone::Warning)
+        }
+    }
+}
+
+fn show_cheats_mods_workflow_states(
+    ui: &mut egui::Ui,
+    workflow: Option<&CheatWorkflowState>,
+    profiles: &RetroArchProfilesState,
+) {
+    let (profile_label, profile_tone) = retroarch_integration_presentation(profiles);
+    widgets::section_header(
+        ui,
+        "Workflow state",
+        Some(
+            "Profile, source, inspection, destination, and installation remain separate decisions.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        for (label, value, tone) in [
+            ("Emulator profile", profile_label.as_str(), profile_tone),
+            (
+                "Cheat or mod source",
+                "ArchiveFS trusted catalogue available",
+                widgets::StatusTone::Success,
+            ),
+            (
+                "Trust state",
+                import_trust_label(ImportTrustState::Trusted),
+                import_trust_tone(ImportTrustState::Trusted),
+            ),
+            (
+                "Inspection state",
+                "Trusted retrieval validation available",
+                widgets::StatusTone::Success,
+            ),
+            (
+                "Destination",
+                if workflow.is_some() {
+                    "Not selected — matching is unavailable"
+                } else {
+                    "No archive context"
+                },
+                widgets::StatusTone::Pending,
+            ),
+            (
+                "Installation state",
+                "Unavailable",
+                widgets::StatusTone::Pending,
+            ),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(label).strong()),
+                );
+                widgets::status_badge(ui, value, tone);
+            });
+        }
+    });
+}
+
+fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
+    egui::CollapsingHeader::new("Safety, privacy, and responsible use")
+        .default_open(false)
+        .show(ui, |ui| {
+            widgets::card(ui, |ui| {
+                ui.label(UNKNOWN_CODE_POLICY);
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let (label, tone) =
+                        local_scanning_presentation(LocalSafetyScanningState::current());
+                    widgets::status_badge(ui, label, tone);
+                    ui.label("No general local or community-source scanner or setting is active yet.");
+                });
+                ui.label(LOCAL_INSPECTION_PRIVACY_COPY);
+                ui.label("ArchiveFS never silently rewrites, deletes, or sanitizes an original import source. A future sanitized import would be a separate copy with an exclusion report.");
+                ui.label(IMPORT_CONSENT_COPY);
+                ui.label(format!("Future scanning control: {SCANNING_DISABLED_WARNING}"));
+                ui.add_space(6.0);
+                ui.strong("Source model");
+                for kind in [
+                    ImportSourceKind::EmulatorManagedLibrary,
+                    ImportSourceKind::ArchiveFsTrustedCatalogue,
+                    ImportSourceKind::LocalUnverifiedSource,
+                    ImportSourceKind::RemoteUnverifiedSource,
+                ] {
+                    let (label, state) = import_source_presentation(kind);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(label);
+                        widgets::status_badge(
+                            ui,
+                            state,
+                            if kind == ImportSourceKind::ArchiveFsTrustedCatalogue {
+                                widgets::StatusTone::Success
+                            } else {
+                                widgets::StatusTone::Pending
+                            },
+                        );
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for state in [
+                        ImportTrustState::Trusted,
+                        ImportTrustState::Unverified,
+                        ImportTrustState::Blocked,
+                    ] {
+                        widgets::status_badge(
+                            ui,
+                            import_trust_label(state),
+                            import_trust_tone(state),
+                        );
+                    }
+                });
+                ui.label("Trusted means a reviewed adapter and known provenance. Unverified means not reviewed by ArchiveFS; it does not mean malicious. Blocked is reserved for a concrete technical danger or adapter incompatibility.");
+                ui.add_space(6.0);
+                ui.label(ETHICAL_USE_COPY);
+                ui.label(USER_RESPONSIBILITY_COPY);
+            });
+        });
+}
 
 fn retroarch_integration_presentation(
     profiles: &RetroArchProfilesState,
@@ -10465,6 +10638,11 @@ fn show_cheats_mods_page(
             widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
         });
     });
+    ui.add_space(theme::SECTION_GAP);
+
+    show_cheats_mods_workflow_states(ui, workflow.as_deref(), profiles);
+    ui.add_space(theme::SECTION_GAP);
+    show_cheats_mods_safety_information(ui);
     ui.add_space(theme::SECTION_GAP);
 
     widgets::section_header(
@@ -16771,6 +16949,78 @@ mod tests {
                 "Cheats & Mods page did not render {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn cheats_mods_workspace_keeps_lifecycle_states_visibly_separate() {
+        let app = app_with_cheats_mods_context();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheats_mods_workflow_states(
+                    ui,
+                    app.cheat_workflow.as_ref(),
+                    &app.retroarch_profiles,
+                );
+            });
+        });
+
+        for expected in [
+            "Emulator profile",
+            "Cheat or mod source",
+            "Trust state",
+            "Inspection state",
+            "Destination",
+            "Installation state",
+            "Trusted",
+            "Not selected — matching is unavailable",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "workflow model did not render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheats_mods_safety_copy_is_truthful_and_has_no_fake_scanning_setting() {
+        assert_eq!(
+            LocalSafetyScanningState::current(),
+            LocalSafetyScanningState::PlannedUnavailable
+        );
+        assert!(LOCAL_INSPECTION_PRIVACY_COPY.contains("not sent"));
+        assert!(LOCAL_INSPECTION_PRIVACY_COPY.contains("planned and is not active yet"));
+        assert!(UNKNOWN_CODE_POLICY.contains("never executes unknown code automatically"));
+        assert!(IMPORT_CONSENT_COPY.contains("not an antivirus scanner"));
+        assert!(SCANNING_DISABLED_WARNING.contains("does not make unsafe files safe"));
+        assert!(ETHICAL_USE_COPY.contains("must not be used to bypass copy protection"));
+        assert!(USER_RESPONSIBILITY_COPY.contains("ArchiveFS does not verify ownership"));
+        assert_eq!(
+            local_scanning_presentation(LocalSafetyScanningState::current()).0,
+            "Local safety scanning · Planned"
+        );
+    }
+
+    #[test]
+    fn cheats_mods_trust_labels_do_not_conflate_unverified_with_blocked() {
+        assert_eq!(import_trust_label(ImportTrustState::Trusted), "Trusted");
+        assert_eq!(
+            import_trust_label(ImportTrustState::Unverified),
+            "Unverified"
+        );
+        assert_eq!(import_trust_label(ImportTrustState::Blocked), "Blocked");
+        assert_ne!(
+            import_trust_tone(ImportTrustState::Unverified),
+            import_trust_tone(ImportTrustState::Blocked)
+        );
+        assert_eq!(
+            import_source_presentation(ImportSourceKind::ArchiveFsTrustedCatalogue),
+            ("ArchiveFS trusted catalogue", "Available")
+        );
+        assert_eq!(
+            import_source_presentation(ImportSourceKind::LocalUnverifiedSource).1,
+            "Planned"
+        );
     }
 
     #[test]

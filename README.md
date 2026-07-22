@@ -31,6 +31,9 @@ explicit list of what it deliberately does not do.
 
 See [`docs/security.md`](docs/security.md) and [`SECURITY.md`](SECURITY.md)
 for the detailed safety model behind these principles.
+Cheat and mod trust, local inspection, unknown-code, privacy, original-file,
+and responsible-use boundaries are documented separately in
+[`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md).
 
 ## What ArchiveFS does today
 
@@ -62,6 +65,11 @@ for the detailed safety model behind these principles.
   `retroarch-cheat-source-inspect`. Fetching produces a bounded, validated,
   immutable local snapshot and never installs cheats. See
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- Presents Cheats & Mods as a first-class GUI workspace while keeping profile,
+  source trust, inspection, destination, and installation state distinct. The
+  current GUI retrieves trusted catalogues but does not yet match archives,
+  install cheats, inspect arbitrary local imports, or provide mod adapters; see
+  [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
   pinned snapshots remain protected, and retrieval and maintenance coordinate
