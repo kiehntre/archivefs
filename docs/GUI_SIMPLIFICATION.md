@@ -452,6 +452,28 @@ checklist below for how to re-verify this by hand.
 17. Confirm PCSX2 and Dolphin remain preview-only (no install/enable/
     disable/rollback controls) after the workflow-state row migration.
 
+### Cheats & Mods structure milestone additions to manual QA
+
+18. Open **Cheats & Mods** for a PS2 archive. Confirm the page now shows
+    "Overview", "Choose a system", and "Selected system workflow" as
+    distinct headings, and the Overview card lists both "RetroArch · ..."
+    and "PCSX2 · ..." availability lines (no "Dolphin · ..." line).
+19. In "Choose a system", click the PCSX2 tab. Confirm the adapter
+    switches (the tab row highlights PCSX2, its "PS2 only"/"Read-only"
+    badges appear below the tabs), and the "Selected system workflow"
+    section below now shows PCSX2's stages instead of RetroArch's.
+20. Set a RetroArch profile and cheat source, switch to PCSX2, then
+    switch back to RetroArch. Confirm the previously chosen profile and
+    source are still selected - nothing was reset by the round trip.
+21. Confirm "Database and sources" still appears on the page (below
+    Recent activity) with Download/Update/Verify fully functional, exactly
+    as in the Phase 1/2 checks above.
+22. Navigate "Choose a system"'s tabs with the keyboard (Tab to focus,
+    Enter/Space to activate). Confirm this works identically to any other
+    button in the app - no new or missing keyboard behaviour.
+23. Resize the window narrower/wider. Confirm the tab row wraps instead
+    of overflowing, and the Overview card's cross-system strip wraps too.
+
 ## Test coverage added in Phase 1
 
 - `ui/components.rs`: `technical_details` collapses its body by default;
@@ -482,3 +504,189 @@ Phase 1 total: 424 tests (414 pre-existing + 10 new) pass; 0 failures.
   card (only the RetroArch path had a pre-existing test).
 
 Phase 2 total: 429 tests (424 from Phase 1 + 5 new) pass; 0 failures.
+
+---
+
+## Cheats & Mods structure milestone (`sonnet-cheats-mods-structure` branch)
+
+A focused structural redesign of the Cheats & Mods page - not the full
+Library-tab IA migration, and not a further round of generic-component
+extraction. Same constraints as Phases 1-2: `MainView`, render-function
+names (`show_cheats_mods_page`, `show_cheat_emulator_adapter_selector`,
+etc.), and test-asserted labels/click-targets all unchanged; no
+mount/rollback/journal/cleanup/recovery/detection/execution code touched.
+
+### Old structure
+
+`show_cheats_mods_page` used to render, in order: a summary card (current
+archive + readiness badges); the selected adapter's six-row "Workflow
+state" card; a collapsed safety/privacy section; a static "Cheats and
+emulator patches" heading; then, only with an archive selected: archive
+context, shared game identity, shared preview, the adapter picker (three
+stacked cards, one per RetroArch/PCSX2/Dolphin option, each with its own
+radio button, badges, and description paragraph), and the selected
+adapter's own multi-stage body; then an unconditional mods placeholder and
+a recent-activity mini card. The RetroArch cheat-database card (added in
+Phase 1) rendered after all of that, at the app level, unlabelled as its
+own area.
+
+### New structure
+
+Five labelled areas, in this order:
+
+1. **Overview** - the same current-archive summary card, plus a new
+   cross-system availability status_strip (`"RetroArch · 2 eligible
+   profiles"`, `"PCSX2 · No eligible PCSX2 profile"`, etc.), gated by the
+   same `platform_is_ps2`/`platform_is_dolphin` checks the selector below
+   uses. Composed entirely from the pre-existing `*_integration_presentation`
+   functions - no new detection logic.
+2. **Choose a system** - the RetroArch/PCSX2/Dolphin picker, now one card
+   containing a `tab_row` of selectable buttons instead of three stacked
+   cards; the selected option's badges and description render once,
+   below the tabs, instead of every option's description always being
+   visible.
+3. **Selected system workflow** - the six-row workflow-state card (moved
+   here from Overview, since it details the one selected adapter, not a
+   cross-system summary), archive context, shared identity, shared
+   preview, and the adapter-specific body - all pre-existing calls,
+   unchanged, now grouped under one heading instead of the previous
+   static "Cheats and emulator patches" label.
+4. **Database and sources** - the RetroArch cheat-database card (Phase 1),
+   now under its own heading instead of rendering unlabelled.
+5. **Recent activity** - unchanged; already reused `activity_row_header`
+   from Phase 2.
+
+The mods placeholder card is unchanged and still renders between areas 3
+and 5.
+
+### Cards combined or removed
+
+- **Adapter picker: 3 cards → 1.** The RetroArch/PCSX2/Dolphin chooser's
+  three one-per-option cards became one card with a `tab_row`. Each
+  option's badges/description (e.g. PCSX2's "PS2 only" / "Read-only")
+  now show only for the currently selected option rather than for every
+  option simultaneously - a real interaction-model change (tabs, not a
+  visible-all radio list), which is exactly what "clear selector or
+  tab-like control" asked for. Nothing was deleted: every badge and every
+  description string still exists, just shown conditionally.
+- **Empty-state workflow card removed.** When no archive is selected, the
+  six-row "Workflow state" card no longer renders alongside the "Choose
+  one archive" card. It previously showed mostly "Not selected"/"No
+  archive context" placeholders in every row - now redundant with the
+  empty-state card's own five status badges, which already say the same
+  thing more clearly. No test depended on the placeholder card's
+  presence.
+
+### Which adapter-specific areas deliberately remain separate
+
+- `show_pcsx2_profile_card`, `show_dolphin_profile_card`, and RetroArch's
+  Stage 1 profile cards each mix a radio button, a path field, and a
+  status badge in the same row - not a pure badge row (`status_strip`) or
+  a pure label+badge list (`status_rows`), and forcing them through
+  either would mean a parameter-heavy wrapper standing in for genuinely
+  different per-adapter fields. This is the same conclusion Phase 2
+  reached about these same three functions; this milestone re-examined
+  and re-confirmed it, not skipped it.
+- `show_pcsx2_workflow` and `show_dolphin_workflow`'s multi-stage bodies
+  (profile → inventory → blockers) are structurally similar to each
+  other but meaningfully different from RetroArch's (source-mode choice,
+  existing-library vs. trusted-catalogue branching) - left as separate
+  functions, per the explicit instruction to retain adapter-specific
+  rendering helpers where workflows genuinely differ.
+
+### Compatibility decisions
+
+- `show_cheats_mods_page`'s signature is unchanged; both of its direct
+  test call sites needed no changes.
+- `show_cheat_emulator_adapter_selector`'s name, parameter list, and
+  return type (`Option<CheatWorkflowAction>`) are unchanged - only its
+  internal rendering (tab_row instead of three cards) changed. Its
+  section header text changed from "Emulator adapter" to "Choose a
+  system" (no test asserted the old string).
+- The "Database and sources" heading was added at the card's existing
+  app-level render site rather than by changing `show_cheats_mods_page`'s
+  signature to accept the catalogue-manager state it would need to render
+  that card itself. This is a deliberate compatibility tradeoff - see
+  "known ordering compromise" below.
+- `select_cheat_adapter` (the function that actually mutates
+  `workflow.adapter` and drops stale per-adapter async state) was not
+  touched at all. The new tests in this milestone
+  (`per_adapter_profile_selections_survive_a_real_adapter_switch`) add
+  coverage of a property it already had - that
+  `selected_profile_id`/`selected_pcsx2_profile_id`/`source_mode`/
+  `selected_source_id` all survive a switch - rather than changing its
+  behaviour.
+
+### Known ordering compromise
+
+"Database and sources" renders after "Recent activity" on the page, not
+before, as the target hierarchy lists them. The database card is composed
+at the app level because it needs `self.catalogue_manager`,
+`self.catalogue_review`, `self.catalogue_retrieval`, and
+`self.catalogue_last_result` - state `show_cheats_mods_page`'s pure-render
+signature does not carry - while Recent activity is the last thing
+`show_cheats_mods_page` itself renders. Fixing the order properly would
+mean either passing that catalogue state into `show_cheats_mods_page`
+(a signature change) or extracting `show_recent_cheat_activity`'s call
+out of it (also a signature change, since `history` would become an
+unused parameter) - both trade a two-test, low-risk compatibility
+guarantee for a purely cosmetic ordering fix. Left as a documented
+limitation rather than forced.
+
+### Remaining duplicated rendering
+
+- The three adapter-specific workflow bodies still each render their own
+  "Stage N · ..." progression independently; no cross-adapter "stage"
+  abstraction was introduced, consistent with keeping their genuinely
+  different state machines separate.
+- `ActionFeedback`'s own banner rendering (page-inline feedback messages)
+  remains hand-rolled, as noted in the Phase 2 section above - untouched
+  by this milestone.
+
+### Remaining blockers before the full Library-tab IA migration
+
+Unchanged from Phase 1/2 - still the same three items (deciding whether
+`Health`/`Duplicates`/`LibraryViews` become Library sub-tabs or are
+removed as separate `MainView` variants; rewriting the tests that assert
+on `SECONDARY_NAVIGATION_DESTINATIONS`'s exact contents; deciding what
+happens to `main_view_content_width`/`main_view_uses_page_scroll`). This
+milestone did not touch navigation code and did not add to or reduce
+this list.
+
+One new, relevant fact for that future work: `tab_row` (introduced here)
+is now available and already proven in production use, so the IA
+migration's tab bar (if it goes that route for Health/Duplicates/Library
+Views) has a ready-made, tested component rather than needing to invent
+one from scratch.
+
+### Recommended next milestone
+
+**The Library-tab IA migration is now the recommended next milestone.**
+The two safe-incremental component/structure passes this branch and its
+predecessors set out to do (shared components in Phase 1-2, Cheats & Mods
+structure here) are essentially complete for the areas identified in the
+original audit; further passes in the same style would mostly be
+diminishing-returns polish. The IA migration is the one remaining
+substantial piece of the original request that was explicitly deferred
+pending its own dedicated review, and `tab_row` existing now removes one
+of its previous open questions (what the tab control would look like).
+
+## Test coverage added in the Cheats & Mods structure milestone
+
+- `ui/components.rs`: `tab_row` renders every option's label.
+- `main.rs`: `choose_a_system_tabs_are_reachable_via_a_real_click` -
+  a real pointer-event click (not just a function call) on the PCSX2 tab
+  returns the correct `SelectAdapter` action, mirroring the existing
+  primary-navigation real-click test's approach;
+  `per_adapter_profile_selections_survive_a_real_adapter_switch` - each
+  adapter's own profile/source selections remain intact after switching
+  away and back; `overview_lists_availability_only_for_applicable_systems` -
+  the new cross-system strip shows RetroArch alone for a PS3 archive and
+  RetroArch+PCSX2 for a PS2 archive, never fabricating Dolphin
+  availability; `cheats_mods_page_renders_the_new_hierarchy_headings` -
+  "Overview", "Choose a system", and "Selected system workflow" all
+  render, alongside pre-existing content ("Emulator profile", "Recent
+  related activity"), proving the reorganisation didn't drop anything.
+
+Cheats & Mods structure milestone total: 434 tests (429 from Phase 2 +
+5 new) pass; 0 failures.

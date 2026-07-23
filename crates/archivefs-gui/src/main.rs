@@ -22240,6 +22240,174 @@ mod tests {
     }
 
     #[test]
+    fn choose_a_system_tabs_are_reachable_via_a_real_click() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let ctx = egui::Context::default();
+
+        let discovery_output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        let pcsx2_pos = find_exact_text_center(&discovery_output, "PCSX2")
+            .expect("the PCSX2 tab label must be rendered for a PS2 archive");
+
+        let clicked_action: std::rc::Rc<std::cell::RefCell<Option<CheatWorkflowAction>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured = std::rc::Rc::clone(&clicked_action);
+        let render = move |ui: &mut egui::Ui| -> egui::Response {
+            let inner = ui.scope(|ui| show_cheat_emulator_adapter_selector(ui, workflow));
+            if let Some(action) = inner.inner {
+                *captured.borrow_mut() = Some(action);
+            }
+            inner.response
+        };
+        simulate_row_click(&ctx, pcsx2_pos, egui::Modifiers::default(), render);
+
+        assert!(
+            matches!(
+                *clicked_action.borrow(),
+                Some(CheatWorkflowAction::SelectAdapter(
+                    CheatEmulatorAdapter::Pcsx2
+                ))
+            ),
+            "clicking the PCSX2 tab must select it as the emulator adapter"
+        );
+    }
+
+    #[test]
+    fn per_adapter_profile_selections_survive_a_real_adapter_switch() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.selected_profile_id = Some("native-user".to_string());
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.source_mode = CheatSourceMode::ArchiveFsTrustedCatalogue;
+        workflow.selected_source_id = Some("source-a".to_string());
+
+        select_cheat_adapter(workflow, CheatEmulatorAdapter::Pcsx2);
+        assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
+        assert_eq!(
+            workflow.selected_profile_id.as_deref(),
+            Some("native-user"),
+            "switching to PCSX2 must not discard the RetroArch profile choice"
+        );
+        assert_eq!(
+            workflow.selected_pcsx2_profile_id.as_deref(),
+            Some("pcsx2-native-test")
+        );
+        assert_eq!(
+            workflow.source_mode,
+            CheatSourceMode::ArchiveFsTrustedCatalogue
+        );
+        assert_eq!(workflow.selected_source_id.as_deref(), Some("source-a"));
+
+        select_cheat_adapter(workflow, CheatEmulatorAdapter::RetroArch);
+        assert_eq!(workflow.adapter, CheatEmulatorAdapter::RetroArch);
+        assert_eq!(
+            workflow.selected_profile_id.as_deref(),
+            Some("native-user"),
+            "switching back to RetroArch must still remember its own profile choice"
+        );
+        assert_eq!(
+            workflow.selected_pcsx2_profile_id.as_deref(),
+            Some("pcsx2-native-test"),
+            "the PCSX2 profile choice must remain remembered even while RetroArch is active"
+        );
+    }
+
+    #[test]
+    fn overview_lists_availability_only_for_applicable_systems() {
+        let mut app = app_with_cheats_mods_context();
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+
+        // A PS3 archive: only RetroArch applies.
+        app.cheat_workflow.as_mut().unwrap().platform = Some("PS3".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "RetroArch ·"));
+        assert!(!rendered_text_contains(&output, "PCSX2 ·"));
+        assert!(!rendered_text_contains(&output, "Dolphin ·"));
+
+        // A PS2 archive: RetroArch and PCSX2 both apply.
+        app.cheat_workflow.as_mut().unwrap().platform = Some("PS2".to_string());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "RetroArch ·"));
+        assert!(rendered_text_contains(&output, "PCSX2 ·"));
+        assert!(!rendered_text_contains(&output, "Dolphin ·"));
+    }
+
+    #[test]
+    fn cheats_mods_page_renders_the_new_hierarchy_headings() {
+        let mut app = app_with_cheats_mods_context();
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        for expected in [
+            "Overview",
+            "Choose a system",
+            "Selected system workflow",
+            "Emulator profile",
+            "Recent related activity",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "Cheats & Mods page did not render {expected:?} under the new hierarchy"
+            );
+        }
+    }
+
+    #[test]
     fn dolphin_workflow_presents_read_only_inventory_without_fake_actions() {
         let mut app = app_with_cheats_mods_context();
         let workflow = app.cheat_workflow.as_mut().unwrap();

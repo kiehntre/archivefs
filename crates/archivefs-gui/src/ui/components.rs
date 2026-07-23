@@ -317,6 +317,22 @@ mod tests {
     }
 
     #[test]
+    fn tab_row_renders_every_option_label() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = tab_row(ui, &[(1, "RetroArch"), (2, "PCSX2"), (3, "Dolphin")], 1);
+            });
+        });
+        for expected in ["RetroArch", "PCSX2", "Dolphin"] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "tab_row did not render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn status_rows_renders_every_label_and_value() {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
