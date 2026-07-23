@@ -171,7 +171,12 @@ pub(crate) fn failure_summary(
     retained_note: Option<&str>,
     detail: &str,
 ) {
-    banner(ui, headline, retained_note.unwrap_or(""), StatusTone::Warning);
+    banner(
+        ui,
+        headline,
+        retained_note.unwrap_or(""),
+        StatusTone::Warning,
+    );
     if !detail.is_empty() {
         technical_details(ui, id_salt, |ui| {
             ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
@@ -192,4 +197,100 @@ pub(crate) fn copyable_value(ui: &mut egui::Ui, label: &str, full: &str) -> bool
         copy = action_button(ui, "Copy", ActionStyle::Quiet, true).clicked();
     });
     copy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => nested.iter().any(|s| shape_contains(s, needle)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn status_strip_renders_every_item_with_its_own_label() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                status_strip(
+                    ui,
+                    &[
+                        ("Ready with warnings", StatusTone::Warning),
+                        ("Official repository", StatusTone::Info),
+                    ],
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Ready with warnings"));
+        assert!(rendered_text_contains(&output, "Official repository"));
+    }
+
+    #[test]
+    fn technical_details_hides_its_body_until_expanded() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                technical_details(ui, "collapsed_by_default_test", |ui| {
+                    ui.label("provider-id-9f31");
+                });
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "Technical details"),
+            "the disclosure's own label must always be visible"
+        );
+        assert!(
+            !rendered_text_contains(&output, "provider-id-9f31"),
+            "the body must stay collapsed until the user expands it"
+        );
+    }
+
+    #[test]
+    fn failure_summary_shows_the_headline_and_retained_note_directly_but_hides_detail() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                failure_summary(
+                    ui,
+                    "failure_summary_test",
+                    "Cheat database update failed",
+                    Some("Your existing cheat database is still active."),
+                    "download_too_large: received 268435457 bytes",
+                );
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Cheat database update failed"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "Your existing cheat database is still active."
+        ));
+        assert!(
+            !rendered_text_contains(&output, "download_too_large"),
+            "the full error text is preserved, but only behind Technical details"
+        );
+    }
+
+    #[test]
+    fn failure_summary_omits_the_disclosure_entirely_when_there_is_no_detail() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                failure_summary(ui, "no_detail_test", "Operation failed", None, "");
+            });
+        });
+        assert!(!rendered_text_contains(&output, "Technical details"));
+    }
 }

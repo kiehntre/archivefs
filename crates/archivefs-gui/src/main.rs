@@ -2491,6 +2491,16 @@ fn navigation_destination_selected(current: MainView, candidate: MainView) -> bo
     current == candidate
 }
 
+/// Whether the RetroArch cheat-database status should be (re)loaded for the
+/// currently active view - lazily, at most once per `NotLoaded` state, on
+/// both Sources (its original home) and Cheats & Mods (its new shortcut -
+/// see `show_retroarch_catalogue_manager`'s call site there), so opening
+/// either page shows current status without a manual refresh.
+fn catalogue_status_load_needed(view: MainView, catalogue_manager: &CatalogueManagerState) -> bool {
+    matches!(view, MainView::Sources | MainView::CheatsMods)
+        && matches!(catalogue_manager, CatalogueManagerState::NotLoaded)
+}
+
 fn main_view_title(view: MainView) -> &'static str {
     match view {
         MainView::Library => "Library",
@@ -6791,9 +6801,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_cheat_workflow();
-        if matches!(self.view, MainView::Sources | MainView::CheatsMods)
-            && matches!(self.catalogue_manager, CatalogueManagerState::NotLoaded)
-        {
+        if catalogue_status_load_needed(self.view, &self.catalogue_manager) {
             self.start_catalogue_status_load(context.clone());
         }
         if self.view == MainView::CheatsMods
@@ -8277,6 +8285,14 @@ const UNKNOWN_PLATFORM_EXPLANATION: &str = "ArchiveFS checks the filename, title
 fn unknown_platform_aggregate_headline(count: usize) -> String {
     let noun = if count == 1 { "entry" } else { "entries" };
     format!("{count} {noun} with unknown platform")
+}
+
+/// Gates the Library page's aggregate Unknown-platform banner: only worth
+/// showing once the user has actually asked to see Unknown-platform rows
+/// (the filter checkbox), and only when there is at least one such row to
+/// explain.
+fn unknown_platform_banner_visible(filters: &LibraryRowFilters, unknown_count: usize) -> bool {
+    filters.unknown_platform && unknown_count > 0
 }
 
 fn platform_source_label(source: Option<&str>) -> &'static str {
@@ -18974,7 +18990,7 @@ fn show_loaded_data(
         });
         let _ = filters_changed;
 
-        if library_filters.unknown_platform && unknown_count > 0 {
+        if unknown_platform_banner_visible(library_filters, unknown_count) {
             widgets::banner(
                 ui,
                 &unknown_platform_aggregate_headline(unknown_count),
@@ -27558,6 +27574,169 @@ mod tests {
         assert_eq!(
             unknown_count, 2,
             "unknown-live.zip and unknown-cached.zip - the manual and known-automatic rows must not count"
+        );
+    }
+
+    #[test]
+    fn unknown_platform_aggregate_headline_uses_singular_and_plural_correctly() {
+        assert_eq!(
+            unknown_platform_aggregate_headline(1),
+            "1 entry with unknown platform"
+        );
+        assert_eq!(
+            unknown_platform_aggregate_headline(0),
+            "0 entries with unknown platform"
+        );
+        assert_eq!(
+            unknown_platform_aggregate_headline(8_257),
+            "8257 entries with unknown platform"
+        );
+    }
+
+    #[test]
+    fn unknown_platform_banner_is_visible_only_when_the_filter_is_active_and_there_is_something_to_explain()
+     {
+        let mut filters = LibraryRowFilters::default();
+        assert!(
+            !unknown_platform_banner_visible(&filters, 5),
+            "must not show before the user asks to see Unknown-platform rows"
+        );
+
+        filters.unknown_platform = true;
+        assert!(
+            !unknown_platform_banner_visible(&filters, 0),
+            "must not show an explanation for zero entries"
+        );
+        assert!(unknown_platform_banner_visible(&filters, 5));
+    }
+
+    #[test]
+    fn catalogue_status_load_needed_covers_sources_and_cheats_mods_only() {
+        for view in [MainView::Sources, MainView::CheatsMods] {
+            assert!(
+                catalogue_status_load_needed(view, &CatalogueManagerState::NotLoaded),
+                "{view:?} must lazily load catalogue status when not yet loaded"
+            );
+        }
+        for view in [MainView::Library, MainView::Selected, MainView::Mount] {
+            assert!(
+                !catalogue_status_load_needed(view, &CatalogueManagerState::NotLoaded),
+                "{view:?} has no catalogue UI and must not trigger a load"
+            );
+        }
+        let (_, _, list) = cheat_source_list_fixture();
+        assert!(!catalogue_status_load_needed(
+            MainView::Sources,
+            &CatalogueManagerState::Ready(list)
+        ));
+    }
+
+    #[test]
+    fn handle_catalogue_manager_action_review_then_confirm_requires_both_steps() {
+        let mut app = app_for_operation_tests();
+        assert!(app.catalogue_review.is_none());
+        assert!(app.catalogue_retrieval.is_none());
+        let context = egui::Context::default();
+
+        app.handle_catalogue_manager_action(
+            &context,
+            CatalogueManagerAction::Review {
+                source_id: "libretro-buildbot-cheats".into(),
+                kind: CatalogueRetrievalKind::Update,
+            },
+        );
+        assert!(
+            app.catalogue_retrieval.is_none(),
+            "reviewing an update must never itself start network access"
+        );
+        assert_eq!(
+            app.catalogue_review
+                .as_ref()
+                .map(|review| &review.source_id),
+            Some(&"libretro-buildbot-cheats".to_string())
+        );
+
+        app.handle_catalogue_manager_action(&context, CatalogueManagerAction::Confirm);
+        assert!(
+            app.catalogue_retrieval.is_some(),
+            "confirming the reviewed action starts the retrieval"
+        );
+        assert!(
+            app.catalogue_review.is_none(),
+            "the review is consumed once confirmed"
+        );
+    }
+
+    #[test]
+    fn handle_catalogue_manager_action_cancel_review_clears_it_without_starting_retrieval() {
+        let mut app = app_for_operation_tests();
+        let context = egui::Context::default();
+        app.handle_catalogue_manager_action(
+            &context,
+            CatalogueManagerAction::Review {
+                source_id: "libretro-buildbot-cheats".into(),
+                kind: CatalogueRetrievalKind::Download,
+            },
+        );
+        app.handle_catalogue_manager_action(&context, CatalogueManagerAction::CancelReview);
+        assert!(app.catalogue_review.is_none());
+        assert!(app.catalogue_retrieval.is_none());
+    }
+
+    #[test]
+    fn platform_section_explains_unknown_platform_only_when_it_is_actually_unknown() {
+        let persisted = persisted_archive(PathBuf::from("/roms/mystery.zip"), false);
+        let unknown_details = PlatformProvenanceDetails {
+            platform: None,
+            source: None,
+            matched_component: None,
+            automatic_fallback: None,
+        };
+        let mut clipboard = InMemoryClipboard::default();
+        let mut choice = None;
+        let mut custom = String::new();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_platform_section(
+                    ui,
+                    Some(&persisted),
+                    Some(&unknown_details),
+                    &mut choice,
+                    &mut custom,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Why is this Unknown?"));
+        assert!(rendered_text_contains(
+            &output,
+            "Assign a platform manually below"
+        ));
+
+        let known_details = PlatformProvenanceDetails {
+            platform: Some("SNES".to_string()),
+            source: Some("heuristic-path-detector".to_string()),
+            matched_component: None,
+            automatic_fallback: None,
+        };
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_platform_section(
+                    ui,
+                    Some(&persisted),
+                    Some(&known_details),
+                    &mut choice,
+                    &mut custom,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(
+            !rendered_text_contains(&output, "Why is this Unknown?"),
+            "a recognised platform must not show the Unknown explanation"
         );
     }
 
