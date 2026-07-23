@@ -42,13 +42,13 @@ pub const CHEAT_SOURCE_REDIRECT_LIMIT: usize = 3;
 const HEADER_BYTES_LIMIT: usize = 32 * 1024;
 pub const CHEAT_SOURCE_ENTRY_LIMIT: usize = 60_000;
 pub const CHEAT_SOURCE_FILE_SIZE_LIMIT: u64 = 8 * 1024 * 1024;
-pub const CHEAT_SOURCE_EXPANDED_SIZE_LIMIT: u64 = 512 * 1024 * 1024;
+pub const CHEAT_SOURCE_EXPANDED_SIZE_LIMIT: u64 = 1024 * 1024 * 1024;
 const COMPRESSION_RATIO_LIMIT: u64 = 250;
 pub const CHEAT_SOURCE_PATH_BYTES_LIMIT: usize = 1024;
 const PATH_COMPONENT_LIMIT: usize = 24;
-pub const CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT: u64 = 128 * 1024 * 1024;
+pub const CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT: u64 = 256 * 1024 * 1024;
 pub const CHEAT_SOURCE_MANIFEST_BYTES_LIMIT: usize = 16 * 1024 * 1024;
-pub const CHEAT_SOURCE_TIMEOUT_SECONDS: u64 = 90;
+pub const CHEAT_SOURCE_TIMEOUT_SECONDS: u64 = 180;
 pub const CHEAT_SOURCE_RETAINED_SNAPSHOTS_MINIMUM: usize = 2;
 const REVISION_RESPONSE_LIMIT: u64 = 64 * 1024;
 
@@ -2470,8 +2470,8 @@ mod tests {
 
     #[test]
     fn revised_download_bound_accepts_realistic_size_and_still_fails_closed() {
-        let realistic = 96 * 1024 * 1024;
-        assert!(realistic > 64 * 1024 * 1024);
+        let realistic = 129 * 1024 * 1024;
+        assert!(realistic > 128 * 1024 * 1024);
         validate_downloaded_size(realistic, CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT).unwrap();
         let error = validate_downloaded_size(
             CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT + 1,
@@ -2479,8 +2479,9 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "download_too_large");
-        assert!(error.message.contains("134217729"));
-        assert!(error.message.contains("134217728"));
+        assert!(error.message.contains("268435457"));
+        assert!(error.message.contains("268435456"));
+        assert_eq!(CHEAT_SOURCE_TIMEOUT_SECONDS, 180);
     }
 
     #[test]
