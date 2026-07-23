@@ -2365,6 +2365,84 @@ enum MainView {
     Settings,
     About,
 }
+
+/// The four lenses onto Library data, unified in spirit even though today
+/// each still has its own `MainView` destination, sidebar entry, and
+/// render function - this is the Phase 1 foundation for the eventual
+/// single tabbed Library page (see docs/GUI_SIMPLIFICATION.md's "Library
+/// IA migration" section). `Archives` corresponds to `MainView::Library`
+/// (the archive table); `Views` corresponds to `MainView::LibraryViews`
+/// (saved library views) - named differently from its `MainView` variant
+/// because "Library Views" read twice as "Library" once tabs exist.
+///
+/// # Synchronization rule
+///
+/// `ArchiveFsApp::view` (`MainView`) remains the single source of truth
+/// for what actually renders in this phase - unchanged. `ArchiveFsApp::
+/// library_tab` (`LibraryTab`) is a *derived, read-only-from-the-rest-of-
+/// the-app* projection of it: once per frame, before anything renders,
+/// `library_tab_for_main_view(self.view)` is consulted, and if `self.view`
+/// is one of the four Library-related destinations, `self.library_tab` is
+/// set to match. If `self.view` is anything else (Mount, Settings, ...),
+/// `self.library_tab` is left untouched, so it keeps remembering the last
+/// Library tab visited.
+///
+/// This makes every existing way of navigating to a Library destination -
+/// the sidebar click, or any of the ~11 scattered `self.view =
+/// MainView::X` assignments elsewhere in the app - a correct "legacy
+/// route" into the right `LibraryTab` automatically, with no call site
+/// needing to know `LibraryTab` exists. The only sanctioned way to write
+/// `library_tab` going the other direction (choosing a tab and having
+/// `view` follow) is `ArchiveFsApp::navigate_to_library_tab`, the
+/// compatibility wrapper Phase 2's tab UI will call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum LibraryTab {
+    #[default]
+    Archives,
+    Health,
+    Duplicates,
+    Views,
+}
+
+/// The `MainView` destination that currently renders `tab`'s content -
+/// the inverse of `library_tab_for_main_view`. Used by
+/// `ArchiveFsApp::navigate_to_library_tab`.
+fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
+    match tab {
+        LibraryTab::Archives => MainView::Library,
+        LibraryTab::Health => MainView::Health,
+        LibraryTab::Duplicates => MainView::Duplicates,
+        LibraryTab::Views => MainView::LibraryViews,
+    }
+}
+
+/// Which `LibraryTab` (if any) `view` corresponds to - `None` for every
+/// non-Library destination (Mount, Settings, ...) and, deliberately, for
+/// `MainView::RecentlyFound` too: Recently Found is its own primary
+/// destination with its own place in the sidebar, not one of the four
+/// tabs this milestone is unifying.
+fn library_tab_for_main_view(view: MainView) -> Option<LibraryTab> {
+    match view {
+        MainView::Library => Some(LibraryTab::Archives),
+        MainView::Health => Some(LibraryTab::Health),
+        MainView::Duplicates => Some(LibraryTab::Duplicates),
+        MainView::LibraryViews => Some(LibraryTab::Views),
+        _ => None,
+    }
+}
+
+/// The label Phase 2's tab UI should show for `tab` - kept as one shared
+/// source of truth now so that UI, rather than being invented ad hoc
+/// later, only has to be wired up to it.
+fn library_tab_label(tab: LibraryTab) -> &'static str {
+    match tab {
+        LibraryTab::Archives => "Archives",
+        LibraryTab::Health => "Health",
+        LibraryTab::Duplicates => "Duplicates",
+        LibraryTab::Views => "Views",
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ToolsOverlay {
     #[default]
@@ -2719,6 +2797,13 @@ struct ArchiveFsApp {
     /// navigation click; every page's own state (filters/sort/selection)
     /// lives in its own fields below, independent of this one.
     view: MainView,
+    /// The last Library-area tab the user was on - see `LibraryTab`'s doc
+    /// comment for the synchronization rule with `view`. Foundation-only
+    /// state for the Phase 2 unified Library page: nothing currently reads
+    /// this to decide what renders (`view` alone still drives that,
+    /// unchanged), but it is kept correctly up to date every frame so
+    /// Phase 2 can start consuming it without a state-migration step.
+    library_tab: LibraryTab,
     /// Which "Tools" screen (if any) is showing in front of `view` - see
     /// `ToolsOverlay`'s doc comment.
     tools_overlay: ToolsOverlay,
@@ -2897,6 +2982,7 @@ impl ArchiveFsApp {
             health_report_cache: None,
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
+            library_tab: LibraryTab::default(),
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
@@ -24284,6 +24370,7 @@ mod tests {
             health_report_cache: None,
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
+            library_tab: LibraryTab::default(),
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
