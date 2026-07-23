@@ -23406,6 +23406,89 @@ mod tests {
     }
 
     #[test]
+    fn pcsx2_workflow_states_render_every_row_through_the_shared_status_rows_component() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        app.pcsx2_profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![pcsx2_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheats_mods_workflow_states(
+                    ui,
+                    app.cheat_workflow.as_ref(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                );
+            });
+        });
+        for expected in [
+            "Emulator profile",
+            "Cheat or mod source",
+            "Existing PCSX2-managed files",
+            "Trust state",
+            "Unverified local content",
+            "Inspection state",
+            "Destination",
+            "/isolated/PCSX2",
+            "Installation state",
+            "Unavailable · read-only adapter",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "PCSX2 workflow-state row did not render {expected:?} through status_rows"
+            );
+        }
+    }
+
+    #[test]
+    fn dolphin_workflow_states_render_every_row_through_the_shared_status_rows_component() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.adapter = CheatEmulatorAdapter::Dolphin;
+        workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
+        app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![dolphin_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheats_mods_workflow_states(
+                    ui,
+                    app.cheat_workflow.as_ref(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                );
+            });
+        });
+        for expected in [
+            "Emulator profile",
+            "Cheat or mod source",
+            "Existing Dolphin-managed files",
+            "Trust state",
+            "Unverified local content",
+            "Inspection state",
+            "Destination",
+            "Installation state",
+            "Unavailable · read-only adapter",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "Dolphin workflow-state row did not render {expected:?} through status_rows"
+            );
+        }
+    }
+
+    #[test]
     fn cheats_mods_safety_copy_is_truthful_and_has_no_fake_scanning_setting() {
         assert_eq!(
             LocalSafetyScanningState::current(),

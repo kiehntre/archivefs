@@ -287,6 +287,93 @@ mod tests {
     }
 
     #[test]
+    fn status_rows_renders_every_label_and_value() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                status_rows(
+                    ui,
+                    &[
+                        (
+                            "Emulator profile",
+                            "2 eligible profiles",
+                            StatusTone::Success,
+                        ),
+                        ("Trust state", "Trusted", StatusTone::Success),
+                        ("Destination", "/isolated/cheats", StatusTone::Pending),
+                    ],
+                );
+            });
+        });
+        for expected in [
+            "Emulator profile",
+            "2 eligible profiles",
+            "Trust state",
+            "Trusted",
+            "Destination",
+            "/isolated/cheats",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "status_rows did not render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_row_header_shows_timestamp_only_when_provided() {
+        let ctx = egui::Context::default();
+        let with_timestamp = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                activity_row_header(
+                    ui,
+                    "Completed",
+                    StatusTone::Success,
+                    "Mount",
+                    Some("2026-07-23 20:00 UTC"),
+                    |_ui| {},
+                );
+            });
+        });
+        assert!(rendered_text_contains(&with_timestamp, "Completed"));
+        assert!(rendered_text_contains(&with_timestamp, "Mount"));
+        assert!(rendered_text_contains(
+            &with_timestamp,
+            "2026-07-23 20:00 UTC"
+        ));
+
+        let without_timestamp = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                activity_row_header(
+                    ui,
+                    "Completed",
+                    StatusTone::Success,
+                    "Mount",
+                    None,
+                    |_ui| {},
+                );
+            });
+        });
+        assert!(rendered_text_contains(&without_timestamp, "Completed"));
+        assert!(rendered_text_contains(&without_timestamp, "Mount"));
+    }
+
+    #[test]
+    fn activity_row_header_renders_its_trailing_content() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                activity_row_header(ui, "Failed", StatusTone::Blocked, "Unmount", None, |ui| {
+                    ui.label("Copy");
+                });
+            });
+        });
+        assert!(rendered_text_contains(&output, "Failed"));
+        assert!(rendered_text_contains(&output, "Unmount"));
+        assert!(rendered_text_contains(&output, "Copy"));
+    }
+
+    #[test]
     fn technical_details_hides_its_body_until_expanded() {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
