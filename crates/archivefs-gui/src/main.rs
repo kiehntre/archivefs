@@ -23,11 +23,15 @@ use archivefs_core::patch_manager::{
     ImportSourceKind, ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType,
     Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory,
     Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
-    UNKNOWN_CODE_POLICY, default_cheat_source_cache_root, discover_dolphin_profiles,
-    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source,
-    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library,
-    list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
+    PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewIdentity,
+    PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem,
+    PreviewState, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchCheatSetupDiscovery, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
+    UNKNOWN_CODE_POLICY, build_shared_preview, default_cheat_source_cache_root,
+    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    fetch_retroarch_cheat_source, inspect_dolphin_profile, inspect_pcsx2_profile,
+    inspect_retroarch_cheat_library, list_retroarch_cheat_sources, match_dolphin_inventory,
+    match_pcsx2_inventory,
 };
 mod ui;
 
@@ -244,12 +248,14 @@ enum ActivityAction {
     DolphinProfileScan,
     /// Bounded read-only inventory of Dolphin GameSettings INI files.
     DolphinGameIniInspection,
+    /// Shared bounded source-to-destination preview and conflict detection.
+    CheatPreview,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 35] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 36] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -285,6 +291,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 35] = [
     ActivityAction::Pcsx2PnachInspection,
     ActivityAction::DolphinProfileScan,
     ActivityAction::DolphinGameIniInspection,
+    ActivityAction::CheatPreview,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -373,6 +380,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Pcsx2PnachInspection => "PCSX2 PNACH inspection",
             Self::DolphinProfileScan => "Dolphin profile scan",
             Self::DolphinGameIniInspection => "Dolphin Game INI inspection",
+            Self::CheatPreview => "Cheats & Mods preview",
         })
     }
 }
@@ -4444,6 +4452,8 @@ impl ArchiveFsApp {
             adapter,
             identity_request: None,
             identity: CheatStepResource::NotLoaded,
+            preview_request: None,
+            preview: CheatStepResource::NotLoaded,
             selected_profile_id,
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,
@@ -4511,9 +4521,55 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         workflow.identity_request = Some(request);
         workflow.identity = CheatStepResource::Loading { receiver };
+        workflow.preview_request = None;
+        workflow.preview = CheatStepResource::NotLoaded;
         thread::spawn(move || {
             let report = inspect_game_identity(&path, platform.as_deref());
             let _ = sender.send(Ok((worker_request, report)));
+            context.request_repaint();
+        });
+    }
+
+    fn start_cheat_preview(&mut self, context: egui::Context) {
+        let Some((key, request)) = self.cheat_workflow.as_ref().and_then(|workflow| {
+            build_cheat_preview_request(
+                workflow,
+                &self.retroarch_profiles,
+                &self.pcsx2_profiles,
+                &self.dolphin_profiles,
+            )
+        }) else {
+            return;
+        };
+        if self.cheat_workflow.as_ref().is_some_and(|workflow| {
+            workflow.preview_request.as_ref() == Some(&key)
+                && !matches!(workflow.preview, CheatStepResource::NotLoaded)
+        }) {
+            return;
+        }
+        let archive_path = key.archive_path.clone();
+        let worker_key = key.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Read-only Cheats & Mods preview started.",
+        ));
+        thread::spawn(move || {
+            let outcome = match build_shared_preview(&request) {
+                Ok(report) => CheatPreviewOutcome::Ready(report),
+                Err(error) => CheatPreviewOutcome::Failed(error),
+            };
+            let _ = sender.send(Ok(CheatPreviewResponse {
+                key: worker_key,
+                outcome,
+            }));
             context.request_repaint();
         });
     }
@@ -4623,6 +4679,8 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         workflow.pcsx2_inventory_profile_id = Some(profile_id.clone());
         workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
+        workflow.preview_request = None;
+        workflow.preview = CheatStepResource::NotLoaded;
         self.history.record(HistoryEntry::new(
             ActivityAction::Pcsx2PnachInspection,
             Some(archive_path),
@@ -4665,6 +4723,8 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         workflow.dolphin_inventory_profile_id = Some(profile_id.clone());
         workflow.dolphin_inventory = CheatStepResource::Loading { receiver };
+        workflow.preview_request = None;
+        workflow.preview = CheatStepResource::NotLoaded;
         self.history.record(HistoryEntry::new(
             ActivityAction::DolphinGameIniInspection,
             Some(archive_path),
@@ -4694,6 +4754,8 @@ impl ArchiveFsApp {
         let force_refresh = workflow.fetch_force_refresh && !offline;
         let (sender, receiver) = mpsc::channel();
         workflow.source_fetch = CheatStepResource::Loading { receiver };
+        workflow.preview_request = None;
+        workflow.preview = CheatStepResource::NotLoaded;
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
             Some(archive_path),
@@ -4737,6 +4799,8 @@ impl ArchiveFsApp {
         if !identity_page_is_current {
             workflow.identity_request = None;
             workflow.identity = CheatStepResource::NotLoaded;
+            workflow.preview_request = None;
+            workflow.preview = CheatStepResource::NotLoaded;
         } else if let CheatStepResource::Loading { receiver } = &workflow.identity {
             match receiver.try_recv() {
                 Ok(Ok((request, report))) => {
@@ -4761,6 +4825,83 @@ impl ArchiveFsApp {
                     workflow.identity = CheatStepResource::Failed(
                         "Game identity inspection stopped unexpectedly.".to_string(),
                     );
+                }
+            }
+        }
+        let mut preview_history_entry = None;
+        if identity_page_is_current {
+            let current_key = cheat_preview_key(workflow);
+            if workflow
+                .preview_request
+                .as_ref()
+                .is_some_and(|key| key != &current_key)
+            {
+                workflow.preview_request = None;
+                workflow.preview = CheatStepResource::NotLoaded;
+            } else if let CheatStepResource::Loading { receiver } = &workflow.preview {
+                match receiver.try_recv() {
+                    Ok(Ok(response)) if response.key == current_key => {
+                        let (outcome, message) = match &response.outcome {
+                            CheatPreviewOutcome::Ready(report) if !report.conflicts.is_empty() => (
+                                ActivityOutcome::Rejected,
+                                format!(
+                                    "Read-only preview found {} conflicts across {} entries.",
+                                    report.conflicts.len(),
+                                    report.entries.len()
+                                ),
+                            ),
+                            CheatPreviewOutcome::Ready(report) if report.summary.blocked > 0 => (
+                                ActivityOutcome::Rejected,
+                                format!(
+                                    "Read-only preview was blocked for {} of {} entries.",
+                                    report.summary.blocked,
+                                    report.entries.len()
+                                ),
+                            ),
+                            CheatPreviewOutcome::Ready(report) => (
+                                ActivityOutcome::Completed,
+                                format!(
+                                    "Read-only preview completed for {} entries; no files changed.",
+                                    report.entries.len()
+                                ),
+                            ),
+                            CheatPreviewOutcome::Failed(error) => (
+                                ActivityOutcome::Failed,
+                                format!("Read-only preview failed: {error}"),
+                            ),
+                        };
+                        preview_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::CheatPreview,
+                            Some(workflow.archive_path.clone()),
+                            outcome,
+                            message,
+                        ));
+                        workflow.preview = CheatStepResource::Ready(response);
+                    }
+                    Ok(Ok(_)) => {
+                        workflow.preview_request = None;
+                        workflow.preview = CheatStepResource::NotLoaded;
+                    }
+                    Ok(Err(message)) => {
+                        preview_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::CheatPreview,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Failed,
+                            format!("Read-only preview worker failed: {message}"),
+                        ));
+                        workflow.preview = CheatStepResource::Failed(message);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        let message = "Read-only preview stopped unexpectedly.".to_string();
+                        preview_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::CheatPreview,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Failed,
+                            &message,
+                        ));
+                        workflow.preview = CheatStepResource::Failed(message);
+                    }
                 }
             }
         }
@@ -4941,6 +5082,9 @@ impl ArchiveFsApp {
         if let Some(entry) = dolphin_history_entry {
             self.history.record(entry);
         }
+        if let Some(entry) = preview_history_entry {
+            self.history.record(entry);
+        }
     }
 
     /// Revalidates the independent workspace context against the live
@@ -4987,6 +5131,8 @@ impl ArchiveFsApp {
             workflow.platform = live_platform;
             workflow.identity_request = None;
             workflow.identity = CheatStepResource::NotLoaded;
+            workflow.preview_request = None;
+            workflow.preview = CheatStepResource::NotLoaded;
         }
     }
 
@@ -5926,6 +6072,14 @@ impl eframe::App for ArchiveFsApp {
             })
         {
             self.start_game_identity_inspection(context.clone());
+        }
+        if self.view == MainView::CheatsMods
+            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                workflow.preview_request.is_none()
+                    && matches!(workflow.preview, CheatStepResource::NotLoaded)
+            })
+        {
+            self.start_cheat_preview(context.clone());
         }
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
@@ -10892,6 +11046,8 @@ struct CheatWorkflowState {
     adapter: CheatEmulatorAdapter,
     identity_request: Option<GameIdentityRequest>,
     identity: CheatStepResource<(GameIdentityRequest, GameIdentityReport)>,
+    preview_request: Option<CheatPreviewRequestKey>,
+    preview: CheatStepResource<CheatPreviewResponse>,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never
@@ -10936,6 +11092,28 @@ struct GameIdentityRequest {
     adapter: CheatEmulatorAdapter,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheatPreviewRequestKey {
+    archive_path: PathBuf,
+    platform: Option<String>,
+    adapter: CheatEmulatorAdapter,
+    profile_id: Option<String>,
+    source_mode: CheatSourceMode,
+    source_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum CheatPreviewOutcome {
+    Ready(SharedPreviewReport),
+    Failed(SharedPreviewError),
+}
+
+#[derive(Debug)]
+struct CheatPreviewResponse {
+    key: CheatPreviewRequestKey,
+    outcome: CheatPreviewOutcome,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheatEmulatorAdapter {
     RetroArch,
@@ -10975,6 +11153,8 @@ fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulato
     workflow.adapter = adapter;
     workflow.identity_request = None;
     workflow.identity = CheatStepResource::NotLoaded;
+    workflow.preview_request = None;
+    workflow.preview = CheatStepResource::NotLoaded;
     // Dropping a loading receiver is the stale-result boundary: the
     // superseded worker cannot apply its result to the new adapter.
     workflow.pcsx2_inventory_profile_id = None;
@@ -12879,6 +13059,194 @@ fn ready_game_identity(workflow: &CheatWorkflowState) -> Option<&GameIdentityRep
     }
 }
 
+fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
+    let profile_id = match workflow.adapter {
+        CheatEmulatorAdapter::RetroArch => workflow.selected_profile_id.clone(),
+        CheatEmulatorAdapter::Pcsx2 => workflow.selected_pcsx2_profile_id.clone(),
+        CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.clone(),
+    };
+    CheatPreviewRequestKey {
+        archive_path: workflow.archive_path.clone(),
+        platform: workflow.platform.clone(),
+        adapter: workflow.adapter,
+        profile_id,
+        source_mode: workflow.source_mode,
+        source_id: workflow.selected_source_id.clone(),
+    }
+}
+
+fn preview_identity(
+    workflow: &CheatWorkflowState,
+    kind: PreviewIdentityKind,
+    value: Option<&str>,
+    revision: Option<u16>,
+) -> PreviewIdentity {
+    PreviewIdentity {
+        kind,
+        state: if value.is_some() {
+            PreviewIdentityState::Verified
+        } else {
+            PreviewIdentityState::Missing
+        },
+        value: value.map(str::to_owned),
+        archive_path: workflow.archive_path.clone(),
+        revision,
+    }
+}
+
+fn build_cheat_preview_request(
+    workflow: &CheatWorkflowState,
+    retroarch_profiles: &RetroArchProfilesState,
+    pcsx2_profiles: &Pcsx2ProfilesState,
+    dolphin_profiles: &DolphinProfilesState,
+) -> Option<(CheatPreviewRequestKey, SharedPreviewRequest)> {
+    let key = cheat_preview_key(workflow);
+    let identity = ready_game_identity(workflow);
+    match workflow.adapter {
+        CheatEmulatorAdapter::Pcsx2 => {
+            let selected = workflow.selected_pcsx2_profile_id.as_deref()?;
+            let Pcsx2ProfilesState::Ready(discovery) = pcsx2_profiles else {
+                return None;
+            };
+            let profile = discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)?;
+            let CheatStepResource::Ready(inventory) = &workflow.pcsx2_inventory else {
+                return None;
+            };
+            let verified_crc = identity.and_then(GameIdentityReport::verified_pcsx2_crc);
+            let matched =
+                match_pcsx2_inventory(inventory, verified_crc, Some(&workflow.display_name));
+            let strength = match matched.state {
+                Pcsx2MatchState::ExactCrcMatch | Pcsx2MatchState::MultiplePnachFilesForSameCrc => {
+                    PreviewMatchStrength::VerifiedExact
+                }
+                Pcsx2MatchState::CandidateByFilenameOrTitleOnly => PreviewMatchStrength::Candidate,
+                Pcsx2MatchState::InvalidVerifiedGameCrc => PreviewMatchStrength::Ambiguous,
+                _ => PreviewMatchStrength::Unsupported,
+            };
+            let source_items = matched
+                .matching_files
+                .iter()
+                .filter_map(|path| {
+                    let file = inventory.files.iter().find(|file| file.path == *path)?;
+                    let relative = path.strip_prefix(&profile.configuration_path).ok()?;
+                    Some(PreviewSourceItem {
+                        adapter: PreviewAdapter::Pcsx2,
+                        source_path: path.clone(),
+                        expected_source_digest: Some(file.sha256.clone()),
+                        destination_relative_paths: vec![relative.to_path_buf()],
+                        match_strength: strength,
+                    })
+                })
+                .collect();
+            Some((
+                key,
+                SharedPreviewRequest {
+                    adapter: PreviewAdapter::Pcsx2,
+                    selected_archive: workflow.archive_path.clone(),
+                    platform: workflow.platform.clone(),
+                    identity: preview_identity(
+                        workflow,
+                        PreviewIdentityKind::Pcsx2ExecutableCrc,
+                        verified_crc,
+                        None,
+                    ),
+                    destination_root: profile.configuration_path.clone(),
+                    source_items,
+                },
+            ))
+        }
+        CheatEmulatorAdapter::Dolphin => {
+            let selected = workflow.selected_dolphin_profile_id.as_deref()?;
+            let DolphinProfilesState::Ready(discovery) = dolphin_profiles else {
+                return None;
+            };
+            let profile = discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)?;
+            let CheatStepResource::Ready(inventory) = &workflow.dolphin_inventory else {
+                return None;
+            };
+            let game_id = identity.and_then(GameIdentityReport::verified_dolphin_game_id);
+            let revision = identity.and_then(GameIdentityReport::verified_dolphin_revision);
+            let matched = match_dolphin_inventory(inventory, game_id, revision);
+            let strength = match matched.state {
+                DolphinMatchState::ExactGameIdMatch
+                | DolphinMatchState::ExactGameIdAndRevisionMatch
+                | DolphinMatchState::MultipleIniFilesForGame => PreviewMatchStrength::VerifiedExact,
+                DolphinMatchState::RevisionMismatch => PreviewMatchStrength::Ambiguous,
+                _ => PreviewMatchStrength::Unsupported,
+            };
+            let source_items = matched
+                .matching_files
+                .iter()
+                .filter_map(|path| {
+                    let file = inventory.files.iter().find(|file| file.path == *path)?;
+                    let relative = path.strip_prefix(&profile.configuration_path).ok()?;
+                    Some(PreviewSourceItem {
+                        adapter: PreviewAdapter::Dolphin,
+                        source_path: path.clone(),
+                        expected_source_digest: Some(file.sha256.clone()),
+                        destination_relative_paths: vec![relative.to_path_buf()],
+                        match_strength: strength,
+                    })
+                })
+                .collect();
+            Some((
+                key,
+                SharedPreviewRequest {
+                    adapter: PreviewAdapter::Dolphin,
+                    selected_archive: workflow.archive_path.clone(),
+                    platform: workflow.platform.clone(),
+                    identity: preview_identity(
+                        workflow,
+                        PreviewIdentityKind::DolphinGameId,
+                        game_id,
+                        revision,
+                    ),
+                    destination_root: profile.configuration_path.clone(),
+                    source_items,
+                },
+            ))
+        }
+        CheatEmulatorAdapter::RetroArch => {
+            let selected = workflow.selected_profile_id.as_deref()?;
+            let RetroArchProfilesState::Ready(discovery) = retroarch_profiles else {
+                return None;
+            };
+            let profile = discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)?;
+            let root = profile.cheat_destination_root.as_ref()?;
+            let destination_root = (!root.lossy).then(|| PathBuf::from(&root.display))?;
+            Some((
+                key,
+                SharedPreviewRequest {
+                    adapter: PreviewAdapter::RetroArch,
+                    selected_archive: workflow.archive_path.clone(),
+                    platform: workflow.platform.clone(),
+                    identity: PreviewIdentity {
+                        kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                        state: PreviewIdentityState::Missing,
+                        value: None,
+                        archive_path: workflow.archive_path.clone(),
+                        revision: None,
+                    },
+                    destination_root,
+                    // The GUI does not yet materialize the existing catalogue's
+                    // per-game staging records. The shared report must say so
+                    // instead of inventing an installable source item.
+                    source_items: Vec::new(),
+                },
+            ))
+        }
+    }
+}
+
 fn identity_status_tone(status: IdentityStatus) -> widgets::StatusTone {
     match status {
         IdentityStatus::Verified => widgets::StatusTone::Success,
@@ -13025,6 +13393,228 @@ fn show_shared_game_identity(
     }
 }
 
+fn preview_state_label(state: PreviewState) -> &'static str {
+    match state {
+        PreviewState::InstallNew => "Install new",
+        PreviewState::AlreadyInstalled => "Already installed",
+        PreviewState::ReplaceDifferent => "Replace different",
+        PreviewState::Conflict => "Conflict",
+        PreviewState::Ambiguous => "Ambiguous",
+        PreviewState::NotEligible => "Not eligible",
+        PreviewState::Unsupported => "Unsupported",
+        PreviewState::UnsafeDestination => "Unsafe destination",
+        PreviewState::DestinationUnavailable => "Destination unavailable",
+        PreviewState::SourceUnavailable => "Source unavailable",
+        PreviewState::IdentityUnavailable => "Identity unavailable",
+        PreviewState::ResourceLimitReached => "Resource limit reached",
+    }
+}
+
+fn preview_state_tone(state: PreviewState) -> widgets::StatusTone {
+    match state {
+        PreviewState::InstallNew | PreviewState::AlreadyInstalled => widgets::StatusTone::Success,
+        PreviewState::ReplaceDifferent | PreviewState::ResourceLimitReached => {
+            widgets::StatusTone::Warning
+        }
+        PreviewState::Conflict | PreviewState::Ambiguous | PreviewState::UnsafeDestination => {
+            widgets::StatusTone::Blocked
+        }
+        _ => widgets::StatusTone::Pending,
+    }
+}
+
+fn destination_state_label(state: PreviewDestinationState) -> &'static str {
+    match state {
+        PreviewDestinationState::Missing => "Missing",
+        PreviewDestinationState::RegularFileIdentical => "Regular file · identical",
+        PreviewDestinationState::RegularFileDifferent => "Regular file · different",
+        PreviewDestinationState::Directory => "Directory",
+        PreviewDestinationState::Symlink => "Symlink",
+        PreviewDestinationState::SpecialFile => "Special file",
+        PreviewDestinationState::Inaccessible => "Inaccessible",
+        PreviewDestinationState::ChangedDuringInspection => "Changed during inspection",
+        PreviewDestinationState::Unavailable => "Unavailable",
+    }
+}
+
+fn show_shared_cheat_preview(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::section_header(
+        ui,
+        "Shared preview",
+        Some("Preview only. No files were changed."),
+    );
+    widgets::banner(
+        ui,
+        "Preview only. No files were changed.",
+        "ArchiveFS performs bounded local reads. Apply, Install, Replace, Enable, Delete, Backup, and Rollback controls are intentionally absent.",
+        widgets::StatusTone::Info,
+    );
+    match &workflow.preview {
+        CheatStepResource::NotLoaded => widgets::banner(
+            ui,
+            "Preview waiting",
+            "A verified identity, selected profile, and inspected adapter source are required before a source-to-destination preview can run.",
+            widgets::StatusTone::Pending,
+        ),
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting preview sources and destinations off the UI thread...");
+            });
+        }
+        CheatStepResource::Failed(message) => widgets::banner(
+            ui,
+            "Preview worker failed",
+            message,
+            widgets::StatusTone::Blocked,
+        ),
+        CheatStepResource::Ready(response) => match &response.outcome {
+            CheatPreviewOutcome::Failed(error) => widgets::banner(
+                ui,
+                "Preview unavailable",
+                &error.to_string(),
+                widgets::StatusTone::Blocked,
+            ),
+            CheatPreviewOutcome::Ready(report) => {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(
+                            ui,
+                            format!("Adapter · {:?}", report.adapter),
+                            widgets::StatusTone::Info,
+                        );
+                        ui.strong(format!("{} entries", report.summary.entries));
+                        ui.label(format!("{} install new", report.summary.install_new));
+                        ui.label(format!(
+                            "{} already installed",
+                            report.summary.already_installed
+                        ));
+                        ui.label(format!(
+                            "{} replace different",
+                            report.summary.replace_different
+                        ));
+                        ui.label(format!("{} conflicts", report.summary.conflicts));
+                        ui.label(format!("{} blocked", report.summary.blocked));
+                    });
+                    ui.label(format!(
+                        "Hashed {} source and {} destination files · {} total bytes · {} paths inspected",
+                        report.summary.source_files_hashed,
+                        report.summary.destination_files_hashed,
+                        report.summary.bytes_hashed,
+                        report.summary.destination_paths_inspected
+                    ));
+                });
+                for (index, entry) in report.entries.iter().enumerate() {
+                    widgets::card(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            widgets::status_badge(
+                                ui,
+                                preview_state_label(entry.state),
+                                preview_state_tone(entry.state),
+                            );
+                            widgets::status_badge(
+                                ui,
+                                if entry.eligibility == PreviewEligibility::Eligible {
+                                    "Eligible"
+                                } else {
+                                    "Blocked"
+                                },
+                                if entry.eligibility == PreviewEligibility::Eligible {
+                                    widgets::StatusTone::Success
+                                } else {
+                                    widgets::StatusTone::Blocked
+                                },
+                            );
+                            ui.strong(format!("Preview entry {}", index + 1));
+                        });
+                        if let Some(identity) = &entry.verified_identity {
+                            widgets::copyable_value(ui, "Verified identity", identity);
+                        } else {
+                            ui.label("Verified identity: unavailable");
+                        }
+                        ui.label(format!("Match strength: {:?}", entry.match_strength));
+                        if let Some(source) = &entry.source_path
+                            && widgets::path_value(ui, "Source item", source)
+                        {
+                            let _ = clipboard.set_text(source.display().to_string());
+                        }
+                        if let Some(destination) = &entry.destination_path
+                            && widgets::path_value(ui, "Destination", destination)
+                        {
+                            let _ = clipboard.set_text(destination.display().to_string());
+                        }
+                        ui.label(format!(
+                            "Current destination state: {}",
+                            destination_state_label(entry.destination_state)
+                        ));
+                        ui.label(format!("Proposed action: {:?}", entry.proposed_action));
+                        ui.label(format!(
+                            "Backup required: {} · explicit replacement permission required: {}",
+                            if entry.backup_required { "Yes" } else { "No" },
+                            if entry.explicit_replacement_permission_required {
+                                "Yes"
+                            } else {
+                                "No"
+                            }
+                        ));
+                        if let Some(digest) = &entry.source_digest {
+                            widgets::copyable_value(ui, "Source SHA-256", digest);
+                        }
+                        if let Some(digest) = &entry.existing_destination_digest {
+                            widgets::copyable_value(ui, "Destination SHA-256", digest);
+                        }
+                        egui::CollapsingHeader::new("Technical detail")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if widgets::path_value(
+                                    ui,
+                                    "Destination root",
+                                    &entry.destination_root,
+                                ) {
+                                    let _ = clipboard
+                                        .set_text(entry.destination_root.display().to_string());
+                                }
+                                if let Some(relative) = &entry.destination_relative_path {
+                                    ui.label(format!("Relative path: {}", relative.display()));
+                                }
+                                for blocker in &entry.blockers {
+                                    ui.label(format!(
+                                        "Blocker: {:?}{}",
+                                        blocker.kind,
+                                        blocker
+                                            .path
+                                            .as_ref()
+                                            .map(|path| format!(" · {}", path.display()))
+                                            .unwrap_or_default()
+                                    ));
+                                }
+                                for warning in &entry.warnings {
+                                    ui.label(format!("Warning: {:?}", warning.kind));
+                                }
+                            });
+                    });
+                }
+                if !report.conflicts.is_empty() {
+                    egui::CollapsingHeader::new(format!(
+                        "Conflict records ({})",
+                        report.conflicts.len()
+                    ))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for conflict in &report.conflicts {
+                            ui.label(format!("{:?}", conflict.kind));
+                        }
+                    });
+                }
+            }
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_cheats_mods_page(
     ui: &mut egui::Ui,
@@ -13119,6 +13709,8 @@ fn show_cheats_mods_page(
         show_cheat_archive_context(ui, workflow, live, cached, clipboard);
         ui.add_space(theme::SECTION_GAP);
         show_shared_game_identity(ui, workflow, clipboard);
+        ui.add_space(theme::SECTION_GAP);
+        show_shared_cheat_preview(ui, workflow, clipboard);
         ui.add_space(theme::SECTION_GAP);
         action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
@@ -19321,6 +19913,8 @@ mod tests {
             adapter: CheatEmulatorAdapter::RetroArch,
             identity_request: None,
             identity: CheatStepResource::NotLoaded,
+            preview_request: None,
+            preview: CheatStepResource::NotLoaded,
             selected_profile_id: Some("native-user".to_string()),
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
@@ -19540,6 +20134,12 @@ mod tests {
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
         assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .and_then(|workflow| workflow.platform.as_deref()),
+            Some("PS2")
+        );
     }
 
     #[test]
@@ -19591,6 +20191,63 @@ mod tests {
             app.cheat_workflow.as_ref().unwrap().identity,
             CheatStepResource::NotLoaded
         ));
+    }
+
+    #[test]
+    fn preview_result_is_rejected_after_profile_source_or_page_changes() {
+        let mut app = app_with_cheats_mods_context();
+        app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let old_key = cheat_preview_key(workflow);
+        let (sender, receiver) = mpsc::channel();
+        workflow.preview_request = Some(old_key.clone());
+        workflow.preview = CheatStepResource::Loading { receiver };
+        workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+        sender
+            .send(Ok(CheatPreviewResponse {
+                key: old_key,
+                outcome: CheatPreviewOutcome::Failed(SharedPreviewError::InvalidRequest(
+                    archivefs_core::patch_manager::PreviewBlockerKind::SourceMissing,
+                )),
+            }))
+            .unwrap();
+        app.poll_cheat_workflow();
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().preview,
+            CheatStepResource::NotLoaded
+        ));
+
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let page_key = cheat_preview_key(workflow);
+        let (_sender, receiver) = mpsc::channel();
+        workflow.preview_request = Some(page_key);
+        workflow.preview = CheatStepResource::Loading { receiver };
+        app.view = MainView::Library;
+        app.poll_cheat_workflow();
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().preview,
+            CheatStepResource::NotLoaded
+        ));
+        app.view = MainView::CheatsMods;
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let profile_key = cheat_preview_key(workflow);
+        let (_sender, receiver) = mpsc::channel();
+        workflow.preview_request = Some(profile_key);
+        workflow.preview = CheatStepResource::Loading { receiver };
+        workflow.selected_profile_id = Some("different-profile".to_string());
+        app.poll_cheat_workflow();
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().preview,
+            CheatStepResource::NotLoaded
+        ));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .and_then(|workflow| workflow.platform.as_deref()),
+            None
+        );
     }
 
     #[test]
@@ -20471,6 +21128,8 @@ mod tests {
             adapter: CheatEmulatorAdapter::RetroArch,
             identity_request: None,
             identity: CheatStepResource::NotLoaded,
+            preview_request: None,
+            preview: CheatStepResource::NotLoaded,
             selected_profile_id: None,
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
