@@ -76,11 +76,11 @@ separately verified PCSX2 executable CRC. It distinguishes one exact match,
 multiple files for that CRC, and no match. Without a verified CRC, a
 conservative comment-title equality is only an unverified candidate.
 
-Current ArchiveFS archive records do not contain a verified PS2 executable CRC.
-The GUI therefore reports identity extraction as unavailable/deferred and does
-not derive a CRC from an archive filename. Future exact matching requires a
-separately reviewed, bounded disc-image identity reader for relevant
-ISO/CHD/CSO formats without mounting, extracting, or executing content.
+The shared identity reader can now verify a PS2 serial from `SYSTEM.CNF` and
+calculate PCSX2's executable word-XOR CRC from the complete, exactly resolved
+boot ELF in a supported ISO. Only that verified CRC enables exact PNACH
+matching. ZIP prefix limits or an unavailable image format leave CRC explicit
+as deferred or resource-limited. See [`SHARED_GAME_IDENTITY.md`](SHARED_GAME_IDENTITY.md).
 
 ## Privacy, safety, and future work
 

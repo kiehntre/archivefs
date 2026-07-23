@@ -90,14 +90,17 @@ user-facing version at
   profile's existing cheat directory with fixed read-only bounds or retrieve a
   trusted cached catalogue. For PS2 archives it also offers a read-only PCSX2
   adapter that discovers safe native/Flatpak profiles and inventories existing
-  `cheats`, `cheats_ws`, and present `patches` PNACH files. It does not yet
-  derive a verified game CRC or install cheats or patches. GameCube and Wii
+  `cheats`, `cheats_ws`, and present `patches` PNACH files. A shared bounded
+  ISO reader can derive a verified PS2 serial and, when the complete boot ELF
+  fits its limit, PCSX2's executable CRC. GameCube and Wii
   archives can use a similarly read-only Dolphin adapter to discover native or
   Flatpak user directories and inspect bounded `GameSettings/*.ini` metadata.
-  Neither adapter inspects arbitrary local imports; see
+  Verified Dolphin Game IDs can establish exact INI matches. Neither adapter
+  inspects arbitrary local imports or installs content; see
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
-  [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md), and
-  [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md).
+  [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md),
+  [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md), and
+  [`docs/SHARED_GAME_IDENTITY.md`](docs/SHARED_GAME_IDENTITY.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
   pinned snapshots remain protected, and retrieval and maintenance coordinate
@@ -483,6 +486,7 @@ Platforms:
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
 - [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
 - [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
+- [Shared verified game identity](docs/SHARED_GAME_IDENTITY.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)

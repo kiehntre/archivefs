@@ -622,10 +622,9 @@ still owed and this section is the place to record it.
   - Failure notes:
 - [ ] **Action (In ArchiveFS GUI):** Read the match-state wording shown for
       the fixture (exact / ambiguous / no-match / unavailable).
-  - Expected: the wording never claims an "exact match" unless a verified
-    Dolphin Game ID was supplied - in ArchiveFS's current state that
-    should not happen, so an exact-match claim here would itself be a
-    defect to report.
+  - Expected: the wording never claims an "exact match" unless the shared
+    identity section shows a verified Dolphin Game ID read from supported
+    disc metadata. A filename candidate alone must never produce that claim.
   - Failure notes:
 - [ ] **Action (In ArchiveFS GUI):** Look across the entire Dolphin section
       for any Install, Apply, Enable, Disable, Delete, Replace, Fix, or
@@ -652,6 +651,28 @@ still owed and this section is the place to record it.
   - Expected: the Dolphin profile/Game INI content reflows the same way
     the rest of Cheats & Mods does at each width, with no clipped or
     inaccessible control.
+  - Failure notes:
+
+### Shared verified game identity (synthetic fixtures only)
+
+- [ ] **Action (On Nobara desktop):** Add synthetic, non-game ISO and ZIP
+      fixtures representing PS2, GameCube, and Wii to an isolated test source,
+      select each in Cheats & Mods, and observe the shared identity section.
+  - Expected: inspection runs without freezing the UI; archive, platform,
+    evidence states, source method, diagnostics, read counts, and exact adapter
+    match state remain visible. No raw binary data is rendered.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** While a synthetic identity read is in
+      progress, change archive, adapter, page, and platform context in turn.
+  - Expected: every superseded result is rejected and never appears under the
+    new context.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Observe the synthetic fixtures and their
+      parent directory before and after inspection, and monitor running
+      processes and network activity.
+  - Expected: no file, timestamp, directory, mount, emulator process, helper
+    process, or network connection is created or changed by identity
+    inspection.
   - Failure notes:
 
 ## 21. No-archive state
