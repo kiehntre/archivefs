@@ -55,8 +55,8 @@ use archivefs_core::{
     LazyUnmountCleanupResult, LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate,
     LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
     MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, RecoveryAction, RecoveryOffer,
-    RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
+    PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction,
+    RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
     SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability, SourceFolderConfig,
     SourceFolderView, UnmountOneOutcome, add_library_view_default, add_source_folder_default,
     apply_library_view_default, build_source_folder_views, canonical_platform_names,
@@ -1640,6 +1640,7 @@ struct CachedLibrarySnapshot {
     platform_details: HashMap<i64, PlatformProvenanceDetails>,
     stats: CatalogueStats,
     last_completed_scan: Option<CompletedScanSummary>,
+    recently_found: Option<RecentScanAdditions>,
     platform_aliases: Vec<PlatformAlias>,
     /// Computed once on the database worker whenever this snapshot is
     /// loaded. Rendering only filters/sorts these cached groups; it never
@@ -1879,6 +1880,7 @@ fn load_snapshot_from(
         .map_err(to_failed)?;
     let stats = database.catalogue_stats().map_err(to_failed)?;
     let last_completed_scan = database.latest_completed_scan().map_err(to_failed)?;
+    let recently_found = database.latest_scan_additions().map_err(to_failed)?;
     let platform_aliases = database.list_platform_aliases().map_err(to_failed)?;
     let duplicate_report = catalogue_filename_duplicates(&archives);
     let source_views = load_source_folder_configs_from(config_path)
@@ -1895,6 +1897,7 @@ fn load_snapshot_from(
         platform_details,
         stats,
         last_completed_scan,
+        recently_found,
         platform_aliases,
         duplicate_report,
         source_views,
@@ -2337,10 +2340,11 @@ struct HealthReportCache {
     remount_offers: HashSet<PathBuf>,
     issues: Vec<HealthIssue>,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum MainView {
     #[default]
     Library,
+    RecentlyFound,
     Health,
     Duplicates,
     Sources,
@@ -2443,12 +2447,13 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 10] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 11] = [
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
+    (MainView::RecentlyFound, "Recently Found"),
     (MainView::Sources, "Sources"),
     (MainView::Doctor, "Doctor"),
     (MainView::HistoryLogs, "History & Logs"),
@@ -2461,7 +2466,10 @@ const SECONDARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 3] = [
     (MainView::LibraryViews, "Library Views"),
 ];
 fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
-    !matches!(view, MainView::Health | MainView::Duplicates) || has_database
+    !matches!(
+        view,
+        MainView::Health | MainView::Duplicates | MainView::RecentlyFound
+    ) || has_database
 }
 
 fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
@@ -2471,6 +2479,7 @@ fn navigation_destination_selected(current: MainView, candidate: MainView) -> bo
 fn main_view_title(view: MainView) -> &'static str {
     match view {
         MainView::Library => "Library",
+        MainView::RecentlyFound => "Recently Found",
         MainView::Health => "Health",
         MainView::Duplicates => "Duplicates",
         MainView::Sources => "Sources",
@@ -2493,6 +2502,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::CheatsMods
         | MainView::ActiveMounts
         | MainView::Library
+        | MainView::RecentlyFound
         | MainView::Health
         | MainView::Duplicates
         | MainView::Sources
@@ -2500,6 +2510,18 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
         MainView::Doctor | MainView::Settings | MainView::About => ui_layout::ContentWidth::Normal,
     }
+}
+
+fn main_view_uses_page_scroll(view: MainView) -> bool {
+    matches!(
+        view,
+        MainView::Sources
+            | MainView::LibraryViews
+            | MainView::Doctor
+            | MainView::HistoryLogs
+            | MainView::Settings
+            | MainView::About
+    )
 }
 fn show_primary_navigation(
     ui: &mut egui::Ui,
@@ -6706,7 +6728,7 @@ impl eframe::App for ArchiveFsApp {
             } else {
                 ui_layout::ContentWidth::Normal
             };
-            ui_layout::page(ui, width, |ui| {
+            ui_layout::page(ui, width, main_view_uses_page_scroll(self.view), self.view, |ui| {
                 self.reconcile_cheats_mods_context();
 
                 if self.tools_overlay != ToolsOverlay::None {
@@ -6749,6 +6771,10 @@ impl eframe::App for ArchiveFsApp {
                                 match action {
                                     DatabasePanelAction::ScanLibrary => {
                                         self.start_database_action(context.clone(), true);
+                                    }
+                                    DatabasePanelAction::ViewRecentlyFound => {
+                                        self.tools_overlay = ToolsOverlay::None;
+                                        self.view = MainView::RecentlyFound;
                                     }
                                     DatabasePanelAction::RefreshStatus
                                     | DatabasePanelAction::RetryLoad => {
@@ -7526,6 +7552,14 @@ impl eframe::App for ArchiveFsApp {
                                 library_column_widths: &mut self.library_column_widths,
                                 library_views_configured: !self.library_views.is_empty(),
                                 library_view_last_plan: self.library_view_last_plan.as_ref(),
+                                recent_scan: if self.view == MainView::RecentlyFound {
+                                    self.database_state
+                                        .snapshot()
+                                        .and_then(|snapshot| snapshot.recently_found.as_ref())
+                                } else {
+                                    None
+                                },
+                                recent_view: self.view == MainView::RecentlyFound,
                             },
                         );
                     }
@@ -7967,27 +8001,30 @@ fn platform_provenance_lines(details: &PlatformProvenanceDetails) -> Vec<(&'stat
 
 fn format_scan_completion(summary: &ScanPersistSummary) -> String {
     format!(
-        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {}\nRestored: {}\nNewly missing: {}\nUnchanged: {}\nErrors: {}",
+        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {} (including {} restored)\nNewly missing: {}\nUnchanged: {}\nSkipped unsupported: {}\nSkipped ambiguous: {}\nErrors: {}",
         summary.counts.archives_seen,
         summary.counts.archives_added,
-        summary.counts.archives_changed,
+        summary.counts.archives_updated,
         summary.counts.archives_restored,
         summary.counts.archives_missing,
         summary.counts.archives_unchanged,
-        summary.folder_errors.len(),
+        summary.counts.skipped_unsupported_extension,
+        summary.counts.skipped_ambiguous_platform,
+        summary.counts.errors_count,
     )
 }
 
 fn format_scan_activity(summary: &ScanPersistSummary) -> String {
     format!(
-        "Scan completed: seen {}, added {}, updated {}, restored {}, newly missing {}, unchanged {}, errors {}.",
+        "Scan completed: seen {}, added {}, updated {} (including {} restored), newly missing {}, unchanged {}, skipped {}, errors {}.",
         summary.counts.archives_seen,
         summary.counts.archives_added,
-        summary.counts.archives_changed,
+        summary.counts.archives_updated,
         summary.counts.archives_restored,
         summary.counts.archives_missing,
         summary.counts.archives_unchanged,
-        summary.folder_errors.len(),
+        summary.counts.skipped_unsupported_extension + summary.counts.skipped_ambiguous_platform,
+        summary.counts.errors_count,
     )
 }
 
@@ -11700,44 +11737,40 @@ fn show_history_logs_page(
         );
         return action;
     }
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (entry, text) in visible_entries.iter().zip(&visible_texts) {
-                widgets::card(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        widgets::status_badge(
-                            ui,
-                            entry.outcome.to_string(),
-                            activity_outcome_tone(entry.outcome),
-                        );
-                        ui.strong(entry.action.to_string());
-                        ui.label(
-                            egui::RichText::new(format_history_timestamp(entry.timestamp))
-                                .color(theme::muted(ui)),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
-                                .clicked()
-                            {
-                                let _ = clipboard.set_text(text.clone());
-                            }
-                        });
-                    });
-                    ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
-                    if let Some(path) = &entry.archive_path {
-                        egui::CollapsingHeader::new("Related archive")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                if widgets::path_value(ui, "Archive", path) {
-                                    let _ = clipboard.set_text(path.display().to_string());
-                                }
-                            });
+    for (entry, text) in visible_entries.iter().zip(&visible_texts) {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    entry.outcome.to_string(),
+                    activity_outcome_tone(entry.outcome),
+                );
+                ui.strong(entry.action.to_string());
+                ui.label(
+                    egui::RichText::new(format_history_timestamp(entry.timestamp))
+                        .color(theme::muted(ui)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        let _ = clipboard.set_text(text.clone());
                     }
                 });
-                ui.add_space(6.0);
+            });
+            ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
+            if let Some(path) = &entry.archive_path {
+                egui::CollapsingHeader::new("Related archive")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if widgets::path_value(ui, "Archive", path) {
+                            let _ = clipboard.set_text(path.display().to_string());
+                        }
+                    });
             }
         });
+        ui.add_space(6.0);
+    }
     action
 }
 struct CheatWorkflowState {
@@ -15842,6 +15875,7 @@ fn format_history_timestamp(timestamp: SystemTime) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DatabasePanelAction {
     ScanLibrary,
+    ViewRecentlyFound,
     RefreshStatus,
     RetryLoad,
 }
@@ -15969,6 +16003,14 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
                     .clicked()
                 {
                     action = Some(DatabasePanelAction::ScanLibrary);
+                }
+                if state
+                    .snapshot()
+                    .and_then(|snapshot| snapshot.recently_found.as_ref())
+                    .is_some()
+                    && ui.button("View recently found").clicked()
+                {
+                    action = Some(DatabasePanelAction::ViewRecentlyFound);
                 }
                 match state {
                     DatabaseState::Ready { .. } => {
@@ -17320,6 +17362,8 @@ struct LoadedViewState<'a> {
     library_column_widths: &'a mut LibraryColumnWidths,
     library_views_configured: bool,
     library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
+    recent_scan: Option<&'a RecentScanAdditions>,
+    recent_view: bool,
 }
 
 const REMOVE_MISSING_CANCEL_LABEL: &str = "Cancel";
@@ -17426,10 +17470,40 @@ fn show_loaded_data(
         library_column_widths,
         library_views_configured,
         library_view_last_plan,
+        recent_scan,
+        recent_view,
     } = view_state;
     let mut requested_action = None;
     let pending_count = data.stats.pending_count;
     let mounted_count = data.stats.mounted_count;
+    if recent_view {
+        widgets::page_header(
+            ui,
+            "Recently Found",
+            "Persistent additions from the most recent completed scan.",
+        );
+    }
+    if let Some(recent) = recent_scan {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Scan {}", recent.scan.scan_run_id));
+                ui.label(format!("Added {}", recent.scan.archives_added));
+                ui.label(format!("Updated {}", recent.scan.archives_updated));
+                ui.label(format!(
+                    "Skipped {}",
+                    recent.scan.skipped_unsupported_extension
+                        + recent.scan.skipped_ambiguous_platform
+                ));
+                ui.label(format!("Errors {}", recent.scan.errors_count));
+            });
+            if recent.truncated {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "Recently Found reached its 10,000-entry display bound.",
+                );
+            }
+        });
+    }
     // Merged rows are rebuilt fresh every frame (cheap for realistic
     // library sizes, and always exactly consistent with the current
     // self.state/self.database_state - see build_display_rows). Only the
@@ -17441,11 +17515,13 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
-    widgets::page_header(
-        ui,
-        "Library",
-        "Search the archive catalogue, review metadata, and use context menus for focused actions.",
-    );
+    if !recent_view {
+        widgets::page_header(
+            ui,
+            "Library",
+            "Search the archive catalogue, review metadata, and use context menus for focused actions.",
+        );
+    }
     // A resizable top panel (egui's own built-in support - session
     // persistence, drag-handle hover cursor, and min/max clamping all come
     // for free from `ctx.memory`, keyed by this panel id - see
@@ -18124,6 +18200,11 @@ fn show_loaded_data(
             None => true,
             Some(wanted) => merged_rows[index].source_path.as_ref() == wanted.as_ref(),
         })
+        .filter(|&index| {
+            !recent_view
+                || recent_scan
+                    .is_some_and(|recent| recent_scan_contains(recent, &merged_rows[index].path))
+        })
         .collect();
     if let Some(field) = *sort_field {
         sort_visible_indices(&merged_rows, &mut visible_indices, field, *sort_ascending);
@@ -18187,7 +18268,30 @@ fn show_loaded_data(
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
     let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
-    match library_table_message(merged_rows.is_empty(), visible_count) {
+    let table_message = if recent_view && recent_scan.is_none() {
+        Some(LibraryTableMessage::NoCompletedScan)
+    } else if recent_scan.is_some_and(|recent| recent.archives.is_empty()) {
+        Some(LibraryTableMessage::NoRecentAdditions)
+    } else {
+        library_table_message(merged_rows.is_empty(), visible_count)
+    };
+    match table_message {
+        Some(LibraryTableMessage::NoCompletedScan) => {
+            widgets::empty_state(
+                ui,
+                "No completed scan yet",
+                "Run a library scan to populate Recently Found.",
+                None,
+            );
+        }
+        Some(LibraryTableMessage::NoRecentAdditions) => {
+            widgets::empty_state(
+                ui,
+                "No newly added files",
+                "The most recent completed scan added no new library entries. Updated entries remain in the main Library.",
+                None,
+            );
+        }
         Some(LibraryTableMessage::EmptyLibrary) => {
             widgets::empty_state(ui, "Library is empty", EMPTY_LIBRARY_MESSAGE, None);
         }
@@ -18356,6 +18460,13 @@ fn show_loaded_data(
     }
 
     requested_action
+}
+
+fn recent_scan_contains(recent: &RecentScanAdditions, path: &Path) -> bool {
+    recent
+        .archives
+        .iter()
+        .any(|archive| archive.absolute_path == path)
 }
 
 fn fixed_row_height(text_height: f32, interact_height: f32) -> f32 {
@@ -19222,6 +19333,8 @@ const ZERO_FILTER_RESULTS_MESSAGE: &str = "No archives match the current search 
 enum LibraryTableMessage {
     EmptyLibrary,
     NoFilterResults,
+    NoCompletedScan,
+    NoRecentAdditions,
 }
 
 fn library_table_message(
@@ -20424,6 +20537,7 @@ fn archive_kind_name(kind: ArchiveKind) -> &'static str {
         ArchiveKind::Zip => "ZIP",
         ArchiveKind::SevenZip => "7z",
         ArchiveKind::Rar => "RAR",
+        ArchiveKind::MegaDriveRom => "Mega Drive ROM",
     }
 }
 
@@ -22819,6 +22933,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn long_content_pages_use_shared_scrolling_without_changing_table_pages() {
+        for view in [
+            MainView::Settings,
+            MainView::Doctor,
+            MainView::About,
+            MainView::Sources,
+            MainView::LibraryViews,
+            MainView::HistoryLogs,
+        ] {
+            assert!(main_view_uses_page_scroll(view));
+        }
+        for view in [MainView::Library, MainView::RecentlyFound, MainView::Mount] {
+            assert!(!main_view_uses_page_scroll(view));
+        }
+    }
+
+    #[test]
+    fn recently_found_uses_exact_latest_scan_paths() {
+        let mut alien = persisted_archive(PathBuf::from("/roms/megadrive/Alien 3.md"), false);
+        alien.display_name = "Alien 3".to_string();
+        alien.normalized_name = "alien 3".to_string();
+        let other = persisted_archive(PathBuf::from("/roms/megadrive/Other.md"), false);
+        let recent = RecentScanAdditions {
+            scan: CompletedScanSummary {
+                scan_run_id: 9,
+                started_at: "start".into(),
+                finished_at: Some("finish".into()),
+                triggered_by: "test".into(),
+                source_folders_scanned: 1,
+                archives_seen: 2,
+                archives_added: 1,
+                archives_updated: 1,
+                archives_missing: 0,
+                archives_unchanged: 0,
+                skipped_unsupported_extension: 0,
+                skipped_ambiguous_platform: 0,
+                errors_count: 0,
+                error_message: None,
+            },
+            archives: vec![alien.clone()],
+            truncated: false,
+        };
+        assert!(recent_scan_contains(&recent, &alien.absolute_path));
+        assert!(!recent_scan_contains(&recent, &other.absolute_path));
+        assert!(alien.display_name.to_ascii_lowercase().contains("alien 3"));
+    }
+
     fn empty_catalogue_stats() -> CatalogueStats {
         CatalogueStats {
             total_archives: 0,
@@ -22852,6 +23014,7 @@ mod tests {
             platform_details,
             stats: empty_catalogue_stats(),
             last_completed_scan: None,
+            recently_found: None,
             platform_aliases: Vec::new(),
             duplicate_report,
             source_views: Vec::new(),
@@ -23553,6 +23716,8 @@ mod tests {
                 archives_unchanged: 1_230,
                 archives_updated: 3,
                 archives_missing: 4,
+                skipped_unsupported_extension: 5,
+                skipped_ambiguous_platform: 2,
                 errors_count: 1,
                 source_folders_scanned: 2,
             },
@@ -23561,12 +23726,12 @@ mod tests {
 
         assert_eq!(
             format_scan_completion(&summary),
-            "Scan completed\nSeen: 1236\nAdded: 3\nUpdated: 2\nRestored: 1\nNewly missing: 4\nUnchanged: 1230\nErrors: 1"
+            "Scan completed\nSeen: 1236\nAdded: 3\nUpdated: 3 (including 1 restored)\nNewly missing: 4\nUnchanged: 1230\nSkipped unsupported: 5\nSkipped ambiguous: 2\nErrors: 1"
         );
         let activity = format_scan_activity(&summary);
         assert_eq!(
             activity,
-            "Scan completed: seen 1236, added 3, updated 2, restored 1, newly missing 4, unchanged 1230, errors 1."
+            "Scan completed: seen 1236, added 3, updated 3 (including 1 restored), newly missing 4, unchanged 1230, skipped 7, errors 1."
         );
         assert_eq!(
             activity.lines().count(),
@@ -27762,6 +27927,8 @@ mod tests {
                             library_column_widths: &mut self.library_column_widths,
                             library_views_configured: false,
                             library_view_last_plan: None,
+                            recent_scan: None,
+                            recent_view: false,
                         },
                     );
                     panel_height = ui.min_rect().height();
@@ -30824,6 +30991,8 @@ mod tests {
                         library_column_widths: &mut library_column_widths,
                         library_views_configured: false,
                         library_view_last_plan: None,
+                        recent_scan: None,
+                        recent_view: false,
                     },
                 );
             });
@@ -34605,6 +34774,8 @@ mod tests {
                         library_column_widths: &mut library_column_widths,
                         library_views_configured: false,
                         library_view_last_plan: None,
+                        recent_scan: None,
+                        recent_view: false,
                     },
                 );
             });
