@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::emulator_environment::EncodedPath;
 
+use super::cheat_cache_lock::LockedCheatCache;
 use super::cheat_sources::{
     CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceCacheMetadata, CheatSourceError,
     CheatSourceFreshness, CheatSourceManifest, MANIFESTS_DIRECTORY, METADATA_FILE,
@@ -29,6 +30,12 @@ pub const DEFAULT_ABANDONED_STAGING_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
 pub const MINIMUM_ABANDONED_STAGING_AGE_SECONDS: u64 = 60 * 60;
 const MAINTENANCE_TREE_ENTRY_LIMIT: usize = 60_000;
 const MAINTENANCE_TREE_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
+const MAINTENANCE_INVENTORY_ENTRY_LIMIT: usize = 60_000;
+// Retrieval permits up to 60,000 paths of up to 1,024 bytes. These limits
+// bound hostile JSON while remaining above the largest valid retrieval output.
+const MAINTENANCE_MANIFEST_BYTES_LIMIT: u64 = 128 * 1024 * 1024;
+const MAINTENANCE_SOURCE_METADATA_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
+const MAINTENANCE_PIN_METADATA_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +113,13 @@ struct SnapshotPins {
     format_version: u32,
     source_id: String,
     pinned_snapshots: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotPinsDocument {
+    format_version: u32,
+    source_id: String,
+    pinned_snapshots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -206,6 +220,8 @@ pub struct CachePrunePlan {
     pub candidate_count: usize,
     pub protected_count: usize,
     pub candidate_bytes: u64,
+    #[serde(skip)]
+    resolved_cache_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -249,8 +265,15 @@ pub struct CachePruneExecutionResult {
 pub fn inventory_retroarch_cheat_snapshots(
     cache_root: &Path,
 ) -> Result<SnapshotInventoryReport, CheatSourceError> {
-    validate_maintenance_cache_root(cache_root)?;
-    if !cache_root.exists() {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    inventory_retroarch_cheat_snapshots_locked(&locked)
+}
+
+fn inventory_retroarch_cheat_snapshots_locked(
+    locked: &LockedCheatCache,
+) -> Result<SnapshotInventoryReport, CheatSourceError> {
+    let cache_root = locked.root();
+    if !locked.present_at_acquisition() {
         return Ok(SnapshotInventoryReport {
             schema_version: CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
             cache_root: EncodedPath::from_path(cache_root),
@@ -261,9 +284,12 @@ pub fn inventory_retroarch_cheat_snapshots(
     safe_regular_or_directory(cache_root, true)?;
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
+    let mut examined_entries = 0usize;
     let source_entries = fs::read_dir(cache_root)
         .map_err(|error| cache_error("cache_inventory_read_failed", error))?;
     for source_entry in source_entries {
+        examined_entries = examined_entries.saturating_add(1);
+        enforce_inventory_entry_limit(examined_entries)?;
         let source_entry = match source_entry {
             Ok(value) => value,
             Err(error) => {
@@ -331,6 +357,8 @@ pub fn inventory_retroarch_cheat_snapshots(
         };
         let mut snapshot_paths = Vec::new();
         for snapshot_entry in snapshot_entries {
+            examined_entries = examined_entries.saturating_add(1);
+            enforce_inventory_entry_limit(examined_entries)?;
             match snapshot_entry {
                 Ok(value) => snapshot_paths.push(value.path()),
                 Err(error) => {
@@ -518,8 +546,14 @@ fn read_manifest(path: &Path) -> Result<CheatSourceManifest, (SnapshotVerificati
             "manifest is a symlink or non-file".into(),
         ));
     }
-    let bytes = fs::read(path)
-        .map_err(|error| (SnapshotVerificationState::UnreadablePath, error.to_string()))?;
+    let bytes = read_bounded_file(path, MAINTENANCE_MANIFEST_BYTES_LIMIT).map_err(|error| {
+        let state = if error.code == "maintenance_metadata_size_limit" {
+            SnapshotVerificationState::InvalidManifest
+        } else {
+            SnapshotVerificationState::UnreadablePath
+        };
+        (state, error.to_string())
+    })?;
     serde_json::from_slice(&bytes).map_err(|error| {
         (
             SnapshotVerificationState::InvalidManifest,
@@ -672,7 +706,7 @@ fn read_current_snapshot(
         warnings.push(format!("unsafe source metadata: {}", path.display()));
         return (None, false);
     }
-    let metadata = fs::read(&path)
+    let metadata = read_bounded_file(&path, MAINTENANCE_SOURCE_METADATA_BYTES_LIMIT)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<CheatSourceCacheMetadata>(&bytes).ok());
     match metadata {
@@ -719,21 +753,36 @@ fn load_pins(source_root: &Path, source_id: &str) -> Result<SnapshotPins, CheatS
         });
     }
     safe_regular_or_directory(&path, false)?;
-    let bytes = fs::read(&path).map_err(|error| cache_error("pin_metadata_read_failed", error))?;
-    let value: SnapshotPins = serde_json::from_slice(&bytes)
+    let bytes = read_bounded_file(&path, MAINTENANCE_PIN_METADATA_BYTES_LIMIT)?;
+    let document: SnapshotPinsDocument = serde_json::from_slice(&bytes)
         .map_err(|error| cache_error("pin_metadata_invalid", error))?;
-    if value.format_version != CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION
-        || value.source_id != source_id
+    if document.format_version != CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION
+        || document.source_id != source_id
     {
         return Err(cache_error(
             "pin_metadata_binding_invalid",
             "pin metadata schema or source binding is invalid",
         ));
     }
-    for snapshot in &value.pinned_snapshots {
+    let pin_count = document.pinned_snapshots.len();
+    let pinned_snapshots = document
+        .pinned_snapshots
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if pinned_snapshots.len() != pin_count {
+        return Err(cache_error(
+            "pin_metadata_duplicate",
+            "pin metadata contains duplicate snapshot identities",
+        ));
+    }
+    for snapshot in &pinned_snapshots {
         validate_snapshot_name(snapshot)?;
     }
-    Ok(value)
+    Ok(SnapshotPins {
+        format_version: document.format_version,
+        source_id: document.source_id,
+        pinned_snapshots,
+    })
 }
 
 pub fn verify_retroarch_cheat_snapshots(
@@ -741,7 +790,17 @@ pub fn verify_retroarch_cheat_snapshots(
     snapshot_id: Option<&str>,
     source_id: Option<&str>,
 ) -> Result<SnapshotVerificationReport, CheatSourceError> {
-    let inventory = inventory_retroarch_cheat_snapshots(cache_root)?;
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    verify_retroarch_cheat_snapshots_locked(&locked, snapshot_id, source_id)
+}
+
+fn verify_retroarch_cheat_snapshots_locked(
+    locked: &LockedCheatCache,
+    snapshot_id: Option<&str>,
+    source_id: Option<&str>,
+) -> Result<SnapshotVerificationReport, CheatSourceError> {
+    let cache_root = locked.root();
+    let inventory = inventory_retroarch_cheat_snapshots_locked(locked)?;
     let mut entries = if let Some(id) = snapshot_id {
         vec![resolve_snapshot(&inventory.entries, id)?.clone()]
     } else {
@@ -754,7 +813,9 @@ pub fn verify_retroarch_cheat_snapshots(
             .collect::<Vec<_>>()
     };
     if snapshot_id.is_none() {
-        entries.extend(staging_verification_entries(cache_root, source_id)?);
+        if locked.present_at_acquisition() {
+            entries.extend(staging_verification_entries(cache_root, source_id)?);
+        }
         entries.sort_by(|left, right| {
             left.source_id
                 .cmp(&right.source_id)
@@ -784,12 +845,15 @@ fn staging_verification_entries(
     source_filter: Option<&str>,
 ) -> Result<Vec<SnapshotInventoryEntry>, CheatSourceError> {
     let mut entries = Vec::new();
+    let mut examined_entries = 0usize;
     if !cache_root.exists() {
         return Ok(entries);
     }
     for source in fs::read_dir(cache_root)
         .map_err(|error| cache_error("cache_inventory_read_failed", error))?
     {
+        examined_entries = examined_entries.saturating_add(1);
+        enforce_inventory_entry_limit(examined_entries)?;
         let source = source.map_err(|error| cache_error("cache_inventory_read_failed", error))?;
         let source_id = source.file_name().to_str().map(str::to_string);
         if source_filter.is_some_and(|filter| source_id.as_deref() != Some(filter)) {
@@ -821,6 +885,8 @@ fn staging_verification_entries(
             }
         };
         for item in items {
+            examined_entries = examined_entries.saturating_add(1);
+            enforce_inventory_entry_limit(examined_entries)?;
             let item = match item {
                 Ok(item) => item,
                 Err(error) => {
@@ -936,7 +1002,17 @@ pub fn set_retroarch_cheat_snapshot_pin(
     snapshot_id: &str,
     pinned: bool,
 ) -> Result<SnapshotPinResult, CheatSourceError> {
-    let inventory = inventory_retroarch_cheat_snapshots(cache_root)?;
+    let locked = LockedCheatCache::acquire_required(cache_root)?;
+    set_retroarch_cheat_snapshot_pin_locked(&locked, snapshot_id, pinned)
+}
+
+fn set_retroarch_cheat_snapshot_pin_locked(
+    locked: &LockedCheatCache,
+    snapshot_id: &str,
+    pinned: bool,
+) -> Result<SnapshotPinResult, CheatSourceError> {
+    let cache_root = locked.root();
+    let inventory = inventory_retroarch_cheat_snapshots_locked(locked)?;
     let entry = resolve_snapshot(&inventory.entries, snapshot_id)?;
     if !entry.valid() {
         return Err(cache_error(
@@ -981,6 +1057,15 @@ pub fn plan_retroarch_cheat_cache_prune(
     cache_root: &Path,
     policy: &CachePrunePolicy,
 ) -> Result<CachePrunePlan, CheatSourceError> {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    plan_retroarch_cheat_cache_prune_locked(&locked, policy)
+}
+
+fn plan_retroarch_cheat_cache_prune_locked(
+    locked: &LockedCheatCache,
+    policy: &CachePrunePolicy,
+) -> Result<CachePrunePlan, CheatSourceError> {
+    let cache_root = locked.root();
     if policy.include_abandoned_staging
         && policy.abandoned_staging_min_age_seconds < MINIMUM_ABANDONED_STAGING_AGE_SECONDS
     {
@@ -992,7 +1077,7 @@ pub fn plan_retroarch_cheat_cache_prune(
             ),
         ));
     }
-    let inventory = inventory_retroarch_cheat_snapshots(cache_root)?;
+    let inventory = inventory_retroarch_cheat_snapshots_locked(locked)?;
     let now = now_seconds();
     let mut entries = Vec::new();
     let mut source_rank = BTreeMap::<String, usize>::new();
@@ -1110,7 +1195,7 @@ pub fn plan_retroarch_cheat_cache_prune(
         });
     }
     apply_budget(policy.max_cache_bytes, &mut entries);
-    if policy.include_abandoned_staging {
+    if policy.include_abandoned_staging && locked.present_at_acquisition() {
         entries.extend(plan_staging(cache_root, policy, now)?);
     }
     entries.sort_by(|left, right| {
@@ -1129,7 +1214,7 @@ pub fn plan_retroarch_cheat_cache_prune(
         .iter()
         .filter(|entry| entry.disposition == CachePruneDisposition::Candidate)
         .map(|entry| entry.bytes)
-        .sum();
+        .fold(0u64, u64::saturating_add);
     Ok(CachePrunePlan {
         schema_version: CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
         cache_root: EncodedPath::from_path(cache_root),
@@ -1138,6 +1223,7 @@ pub fn plan_retroarch_cheat_cache_prune(
         candidate_count,
         protected_count,
         candidate_bytes,
+        resolved_cache_root: cache_root.to_path_buf(),
     })
 }
 
@@ -1149,7 +1235,7 @@ fn apply_budget(maximum: Option<u64>, entries: &mut [CachePrunePlanEntry]) {
         .iter()
         .filter(|entry| entry.kind == CachePruneEntryKind::Snapshot)
         .map(|entry| entry.bytes)
-        .sum::<u64>();
+        .fold(0u64, u64::saturating_add);
     let already_planned = entries
         .iter()
         .filter(|entry| {
@@ -1157,7 +1243,7 @@ fn apply_budget(maximum: Option<u64>, entries: &mut [CachePrunePlanEntry]) {
                 && entry.disposition == CachePruneDisposition::Candidate
         })
         .map(|entry| entry.bytes)
-        .sum::<u64>();
+        .fold(0u64, u64::saturating_add);
     let retained = total.saturating_sub(already_planned);
     if retained <= maximum {
         return;
@@ -1217,12 +1303,15 @@ fn plan_staging(
     now: u64,
 ) -> Result<Vec<CachePrunePlanEntry>, CheatSourceError> {
     let mut planned = Vec::new();
+    let mut examined_entries = 0usize;
     if !cache_root.exists() {
         return Ok(planned);
     }
     for source in fs::read_dir(cache_root)
         .map_err(|error| cache_error("cache_inventory_read_failed", error))?
     {
+        examined_entries = examined_entries.saturating_add(1);
+        enforce_inventory_entry_limit(examined_entries)?;
         let source = source.map_err(|error| cache_error("cache_inventory_read_failed", error))?;
         let source_id = source.file_name().to_str().map(str::to_string);
         if policy
@@ -1270,6 +1359,8 @@ fn plan_staging(
             }
         };
         for item in items {
+            examined_entries = examined_entries.saturating_add(1);
+            enforce_inventory_entry_limit(examined_entries)?;
             let item = match item {
                 Ok(item) => item,
                 Err(_) => {
@@ -1361,8 +1452,17 @@ pub fn execute_retroarch_cheat_cache_prune(
     plan: &CachePrunePlan,
     confirmed: bool,
 ) -> Result<CachePruneExecutionResult, CheatSourceError> {
-    validate_maintenance_cache_root(cache_root)?;
-    if plan.cache_root != EncodedPath::from_path(cache_root) {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    execute_retroarch_cheat_cache_prune_locked(&locked, plan, confirmed)
+}
+
+fn execute_retroarch_cheat_cache_prune_locked(
+    locked: &LockedCheatCache,
+    plan: &CachePrunePlan,
+    confirmed: bool,
+) -> Result<CachePruneExecutionResult, CheatSourceError> {
+    let cache_root = locked.root();
+    if plan.resolved_cache_root != cache_root {
         return Err(cache_error(
             "prune_plan_root_mismatch",
             "prune plan is bound to a different cache root",
@@ -1386,7 +1486,7 @@ pub fn execute_retroarch_cheat_cache_prune(
         .filter(|entry| entry.disposition == CachePruneDisposition::Candidate)
     {
         results.push(match candidate.kind {
-            CachePruneEntryKind::Snapshot => execute_snapshot_candidate(cache_root, candidate),
+            CachePruneEntryKind::Snapshot => execute_snapshot_candidate(locked, candidate),
             CachePruneEntryKind::Staging => execute_staging_candidate(
                 cache_root,
                 candidate,
@@ -1394,7 +1494,10 @@ pub fn execute_retroarch_cheat_cache_prune(
             ),
         });
     }
-    let bytes_reclaimed = results.iter().map(|entry| entry.bytes_reclaimed).sum();
+    let bytes_reclaimed = results
+        .iter()
+        .map(|entry| entry.bytes_reclaimed)
+        .fold(0u64, u64::saturating_add);
     let snapshots_deleted = results
         .iter()
         .filter(|entry| {
@@ -1429,9 +1532,10 @@ pub fn execute_retroarch_cheat_cache_prune(
 }
 
 fn execute_snapshot_candidate(
-    cache_root: &Path,
+    locked: &LockedCheatCache,
     candidate: &CachePrunePlanEntry,
 ) -> CachePruneExecutionEntry {
+    let cache_root = locked.root();
     let outcome = (|| -> Result<u64, (CachePruneEntryStatus, String)> {
         let source = candidate.source_id.as_deref().ok_or((
             CachePruneEntryStatus::Unsafe,
@@ -1453,13 +1557,16 @@ fn execute_snapshot_candidate(
             .join(source)
             .join(SNAPSHOTS_DIRECTORY)
             .join(snapshot);
-        if candidate.path != EncodedPath::from_path(&expected_path) || expected_path == cache_root {
+        if candidate.resolved_path != expected_path
+            || candidate.path != EncodedPath::from_path(&expected_path)
+            || expected_path == cache_root
+        {
             return Err((
                 CachePruneEntryStatus::Unsafe,
                 "candidate path is not exactly bound beneath the cache root".into(),
             ));
         }
-        let inventory = inventory_retroarch_cheat_snapshots(cache_root)
+        let inventory = inventory_retroarch_cheat_snapshots_locked(locked)
             .map_err(|error| (CachePruneEntryStatus::Failed, error.to_string()))?;
         let current = inventory
             .entries
@@ -1657,7 +1764,11 @@ fn snapshot_bytes(
         .join(format!("{snapshot}.json"));
     let manifest = read_manifest(&manifest_path)
         .map_err(|(_, message)| cache_error("snapshot_manifest_invalid", message))?;
-    let file_bytes = manifest.files.iter().map(|file| file.size).sum::<u64>();
+    let file_bytes = manifest
+        .files
+        .iter()
+        .map(|file| file.size)
+        .fold(0u64, u64::saturating_add);
     let manifest_bytes = fs::metadata(&manifest_path)
         .map_err(|error| cache_error("snapshot_manifest_metadata_failed", error))?
         .len();
@@ -1755,15 +1866,50 @@ fn sha256_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn validate_maintenance_cache_root(path: &Path) -> Result<(), CheatSourceError> {
-    validate_cache_path_for_read(path)?;
-    if path.parent().is_none() {
+fn read_bounded_file(path: &Path, maximum: u64) -> Result<Vec<u8>, CheatSourceError> {
+    safe_regular_or_directory(path, false)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| cache_error("maintenance_metadata_read_failed", error))?;
+    if metadata.len() > maximum {
         return Err(cache_error(
-            "unsafe_cache_root",
-            "filesystem roots cannot be used as maintenance cache roots",
+            "maintenance_metadata_size_limit",
+            format!(
+                "maintenance metadata exceeds the {maximum}-byte safety limit: {}",
+                path.display()
+            ),
         ));
     }
-    Ok(())
+    let mut file = fs::File::open(path)
+        .map_err(|error| cache_error("maintenance_metadata_read_failed", error))?;
+    let mut bytes = Vec::with_capacity(metadata.len().min(maximum).min(64 * 1024) as usize);
+    file.by_ref()
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| cache_error("maintenance_metadata_read_failed", error))?;
+    if bytes.len() as u64 > maximum {
+        return Err(cache_error(
+            "maintenance_metadata_size_limit",
+            format!(
+                "maintenance metadata grew beyond the {maximum}-byte safety limit while being read: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn enforce_inventory_entry_limit(count: usize) -> Result<(), CheatSourceError> {
+    if count > MAINTENANCE_INVENTORY_ENTRY_LIMIT {
+        Err(cache_error(
+            "maintenance_inventory_entry_limit",
+            format!(
+                "cache inventory exceeds the {}-entry safety limit",
+                MAINTENANCE_INVENTORY_ENTRY_LIMIT
+            ),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1865,6 +2011,18 @@ mod tests {
         assert!(first.entries.is_empty());
         assert!(!missing.exists());
         assert!(inventory_retroarch_cheat_snapshots(Path::new("/")).is_err());
+        assert!(inventory_retroarch_cheat_snapshots(Path::new("relative-cache")).is_err());
+    }
+
+    #[test]
+    fn missing_root_state_does_not_begin_unlocked_reads_if_root_appears() {
+        let temp = Temp::new();
+        let missing = temp.0.join("appears-later");
+        let locked = LockedCheatCache::acquire_existing(&missing).unwrap();
+        fs::create_dir(&missing).unwrap();
+        fixture(&missing, "source", &"10".repeat(32), 1, false);
+        let report = inventory_retroarch_cheat_snapshots_locked(&locked).unwrap();
+        assert!(report.entries.is_empty());
     }
 
     #[test]
@@ -2026,6 +2184,96 @@ mod tests {
     }
 
     #[test]
+    fn oversized_pin_metadata_is_bounded_and_protects_snapshots() {
+        let temp = Temp::new();
+        let id = "67".repeat(32);
+        let snapshot = fixture(&temp.0, "source", &id, 1, false);
+        let pins = temp.0.join("source/pins.json");
+        let file = fs::File::create(&pins).unwrap();
+        file.set_len(MAINTENANCE_PIN_METADATA_BYTES_LIMIT + 1)
+            .unwrap();
+
+        let error = set_retroarch_cheat_snapshot_pin(&temp.0, &id, true).unwrap_err();
+        assert_eq!(error.code, "maintenance_metadata_size_limit");
+        let plan = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                keep_newest_per_source: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.candidate_count, 0);
+        assert!(snapshot.exists());
+    }
+
+    #[test]
+    fn duplicate_pin_entries_are_rejected_and_protect_snapshots() {
+        let temp = Temp::new();
+        let id = "69".repeat(32);
+        let snapshot = fixture(&temp.0, "source", &id, 1, false);
+        fs::write(
+            temp.0.join("source/pins.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION,
+                "source_id": "source",
+                "pinned_snapshots": [&id, &id],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = set_retroarch_cheat_snapshot_pin(&temp.0, &id, true).unwrap_err();
+        assert_eq!(error.code, "pin_metadata_duplicate");
+        let plan = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                keep_newest_per_source: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.candidate_count, 0);
+        assert!(snapshot.exists());
+    }
+
+    #[test]
+    fn forged_manifest_sizes_cannot_overflow_accounting() {
+        let temp = Temp::new();
+        let id = "68".repeat(32);
+        fixture(&temp.0, "source", &id, 1, false);
+        let manifest_path = temp.0.join("source/manifests").join(format!("{id}.json"));
+        let mut manifest: CheatSourceManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.files[0].size = u64::MAX;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let inventory = inventory_retroarch_cheat_snapshots(&temp.0).unwrap();
+        assert_eq!(
+            snapshot_bytes(&temp.0, &inventory.entries[0]).unwrap(),
+            u64::MAX
+        );
+        let plan = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                max_cache_bytes: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.candidate_bytes, 0);
+        assert_eq!(plan.entries[0].bytes, u64::MAX);
+        assert_eq!(
+            plan.entries[0].disposition,
+            CachePruneDisposition::Protected
+        );
+    }
+
+    #[test]
     fn planner_protects_current_pinned_keep_and_retention_deterministically() {
         let temp = Temp::new();
         let old = "77".repeat(32);
@@ -2140,6 +2388,68 @@ mod tests {
     }
 
     #[test]
+    fn current_pointer_change_after_planning_causes_a_safe_skip() {
+        let temp = Temp::new();
+        let old = "b3".repeat(32);
+        let current = "b4".repeat(32);
+        let old_path = fixture(&temp.0, "source", &old, 1, false);
+        fixture(&temp.0, "source", &current, 2, true);
+        let plan = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                keep_newest_per_source: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let manifest_path = temp.0.join("source/manifests").join(format!("{old}.json"));
+        let manifest: CheatSourceManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        let metadata = CheatSourceCacheMetadata {
+            format_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+            source_id: "source".into(),
+            current_snapshot: Some(old.clone()),
+            manifest: Some(manifest),
+            last_fetch_succeeded: true,
+            last_error: None,
+        };
+        fs::write(
+            temp.0.join("source").join(METADATA_FILE),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let result = execute_retroarch_cheat_cache_prune(&temp.0, &plan, true).unwrap();
+        assert_eq!(result.entries[0].status, CachePruneEntryStatus::Skipped);
+        assert!(old_path.exists());
+    }
+
+    #[test]
+    fn held_cache_lock_blocks_pin_and_prune_without_mutation() {
+        let temp = Temp::new();
+        let old = "b5".repeat(32);
+        let current = "b6".repeat(32);
+        let old_path = fixture(&temp.0, "source", &old, 1, false);
+        fixture(&temp.0, "source", &current, 2, true);
+        let _held =
+            super::super::cheat_cache_lock::LockedCheatCache::acquire_required(&temp.0).unwrap();
+
+        let pin_error = set_retroarch_cheat_snapshot_pin(&temp.0, &old, true).unwrap_err();
+        assert_eq!(pin_error.code, "cache_lock_timeout");
+        let prune_error = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                keep_newest_per_source: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(prune_error.code, "cache_lock_timeout");
+        assert!(old_path.exists());
+        assert!(!temp.0.join("source/pins.json").exists());
+    }
+
+    #[test]
     fn partial_failure_continues_and_outside_root_plan_path_is_rejected() {
         let temp = Temp::new();
         let first = "bc".repeat(32);
@@ -2245,6 +2555,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn future_dated_staging_is_never_considered_abandoned() {
+        let temp = Temp::new();
+        let staging = temp.0.join("source/.staging/future");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("part"), b"abc").unwrap();
+        let future = std::time::SystemTime::now()
+            .checked_add(std::time::Duration::from_secs(2 * 60 * 60))
+            .unwrap();
+        fs::File::open(&staging)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        let plan = plan_retroarch_cheat_cache_prune(
+            &temp.0,
+            &CachePrunePolicy {
+                include_abandoned_staging: true,
+                abandoned_staging_min_age_seconds: MINIMUM_ABANDONED_STAGING_AGE_SECONDS,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.candidate_count, 0);
+        assert!(
+            plan.entries[0]
+                .reasons
+                .contains(&CachePruneReason::RecentOrActiveStaging)
+        );
+        assert!(staging.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_snapshot_and_pin_metadata_are_refused() {
@@ -2314,5 +2655,38 @@ mod tests {
         .unwrap();
         assert_eq!(plan.candidate_count, 0);
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_plan_root_binding_uses_original_non_utf8_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = Temp::new();
+        let first_root = temp.0.join(OsString::from_vec(vec![b'c', 0xfe]));
+        let second_root = temp.0.join(OsString::from_vec(vec![b'c', 0xff]));
+        assert_eq!(
+            EncodedPath::from_path(&first_root),
+            EncodedPath::from_path(&second_root)
+        );
+        let old = "f1".repeat(32);
+        let current = "f2".repeat(32);
+        fixture(&first_root, "source", &old, 1, false);
+        fixture(&first_root, "source", &current, 2, true);
+        let second_old = fixture(&second_root, "source", &old, 1, false);
+        fixture(&second_root, "source", &current, 2, true);
+        let plan = plan_retroarch_cheat_cache_prune(
+            &first_root,
+            &CachePrunePolicy {
+                keep_newest_per_source: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let error = execute_retroarch_cheat_cache_prune(&second_root, &plan, true).unwrap_err();
+        assert_eq!(error.code, "prune_plan_root_mismatch");
+        assert!(second_old.exists());
     }
 }

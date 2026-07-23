@@ -103,11 +103,13 @@ each group does, not every flag.
 
 `mount-one <archive-path-or-name>` scans and plans mounts, selects one archive with shared selection logic, and mounts only that archive if needed.
 
-`unmount` reads mounted paths under the configured mount root and unmounts those paths.
+`unmount` scans the current archive plans and unmounts only exact active mount paths belonging to
+those plans. Unrelated and nested mounts under the same root are refused or preserved.
 
 `unmount-one <archive-path-or-name>` scans and plans mounts, selects one archive with shared selection logic, and unmounts only that archive's mount path.
 
-`clean` removes empty directories under the mount root while preserving mounted paths and non-empty directories.
+`clean` removes only empty directories derived from current ArchiveFS mount plans, while preserving
+the mount root, unrelated directories, mounted paths, and non-empty directories.
 
 `watch` observes configured source folders and rebuilds the JSON index after debounced archive-related changes. It does not mount or unmount.
 

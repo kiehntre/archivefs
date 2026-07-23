@@ -22,6 +22,7 @@ use zip::ZipArchive;
 use crate::default_database_path;
 use crate::emulator_environment::{EncodedPath, HostReadOnlyFilesystem};
 
+use super::cheat_cache_lock::LockedCheatCache;
 use super::load_cheat_catalogue_snapshot;
 
 pub const CHEAT_SOURCE_RESULT_SCHEMA_VERSION: u32 = 1;
@@ -475,11 +476,14 @@ pub struct CheatSourceList {
     pub entries: Vec<CheatSourceListEntry>,
 }
 
-pub fn list_retroarch_cheat_sources(cache_root: &Path) -> CheatSourceList {
+pub fn list_retroarch_cheat_sources(
+    cache_root: &Path,
+) -> Result<CheatSourceList, CheatSourceError> {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
     let entries = trusted_retroarch_cheat_sources()
         .into_iter()
         .map(
-            |source| match inspect_retroarch_cheat_source(&source.source_id, cache_root) {
+            |source| match inspect_retroarch_cheat_source_locked(&source.source_id, &locked) {
                 Ok(inspection) => CheatSourceListEntry {
                     current_cached_version: inspection
                         .manifest
@@ -517,17 +521,41 @@ pub fn list_retroarch_cheat_sources(cache_root: &Path) -> CheatSourceList {
             },
         )
         .collect();
-    CheatSourceList {
+    Ok(CheatSourceList {
         schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
         entries,
-    }
+    })
 }
 
 pub fn inspect_retroarch_cheat_source(
     source_id: &str,
     cache_root: &Path,
 ) -> Result<CheatSourceInspection, CheatSourceError> {
+    let locked = LockedCheatCache::acquire_existing(cache_root)?;
+    inspect_retroarch_cheat_source_locked(source_id, &locked)
+}
+
+fn inspect_retroarch_cheat_source_locked(
+    source_id: &str,
+    locked: &LockedCheatCache,
+) -> Result<CheatSourceInspection, CheatSourceError> {
+    let cache_root = locked.root();
     let source = resolve_source(source_id)?;
+    if !locked.present_at_acquisition() {
+        return Ok(CheatSourceInspection {
+            schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+            source,
+            cache_root: EncodedPath::from_path(cache_root),
+            current_snapshot_path: None,
+            current_catalogue_path: None,
+            manifest: None,
+            freshness: CheatSourceFreshness::Missing,
+            last_fetch_succeeded: None,
+            last_error: None,
+            setup_usable: false,
+            warnings: Vec::new(),
+        });
+    }
     validate_cache_path_for_read(cache_root)?;
     let source_root = cache_root.join(source_id);
     let metadata_path = source_root.join(METADATA_FILE);
@@ -642,6 +670,7 @@ pub fn inspect_retroarch_cheat_source_snapshot(
     let cache_root = source_root
         .parent()
         .ok_or_else(|| cache_error("snapshot_path_invalid", "snapshot path has no cache root"))?;
+    let _locked = LockedCheatCache::acquire_required(cache_root)?;
     safe_regular_or_directory(snapshot_path, true)?;
     let manifest_path = source_root
         .join(MANIFESTS_DIRECTORY)
@@ -697,7 +726,15 @@ pub fn fetch_retroarch_cheat_source(
             "--offline and --force-refresh cannot be used together",
         ));
     }
-    if let Ok(inspection) = inspect_retroarch_cheat_source(source_id, &options.cache_root) {
+    if !options.offline && !options.cache_root.exists() {
+        prepare_cache_root(&options.cache_root)?;
+    }
+    let locked = if options.cache_root.exists() {
+        LockedCheatCache::acquire_required(&options.cache_root)?
+    } else {
+        LockedCheatCache::acquire_existing(&options.cache_root)?
+    };
+    if let Ok(inspection) = inspect_retroarch_cheat_source_locked(source_id, &locked) {
         let expected_matches = options.expected_sha256.as_ref().is_none_or(|expected| {
             inspection
                 .manifest
@@ -1900,6 +1937,19 @@ mod tests {
             resolve_source("unknown-source").unwrap_err().code,
             "unknown_source"
         );
+    }
+
+    #[test]
+    fn cache_lock_blocks_retrieval_before_transport_or_publication() {
+        let temp = TempDirectory::new();
+        let _held = LockedCheatCache::acquire_required(&temp.0).unwrap();
+        let transport = FakeTransport::new(Vec::new());
+        let error =
+            fetch_retroarch_cheat_source("libretro-buildbot-cheats", &options(&temp.0), &transport)
+                .unwrap_err();
+        assert_eq!(error.code, "cache_lock_timeout");
+        assert!(transport.calls.borrow().is_empty());
+        assert!(!temp.0.join("libretro-buildbot-cheats").exists());
     }
 
     #[test]

@@ -15,6 +15,23 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
+**Release status:** `v0.5.0-alpha` is currently in preparation - a hardening
+release (mount lifecycle postcondition checks, transactional catalogue
+refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
+GUI and a first-class Cheats & Mods workspace that now spans **three
+read-only emulator adapters**: RetroArch and PCSX2, plus Dolphin, which
+has been implemented and validated but is **not yet merged into this
+branch** (see the release notes' "Dolphin read-only adapter" section
+before assuming it is present in any build from this branch today).
+Further emulator adapter expansion is paused after Dolphin for now - see
+[`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
+[`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+for what's actually new and what remains unavailable, and
+[`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
+manual acceptance checklist. Nothing here has been tagged yet - the
+workspace version in `Cargo.toml` still reads `0.4.3-alpha` until that
+release-checklist step happens.
+
 ## Principles
 
 - **Local-first.** No telemetry, no required cloud account, and it keeps
@@ -31,10 +48,15 @@ explicit list of what it deliberately does not do.
 
 See [`docs/security.md`](docs/security.md) and [`SECURITY.md`](SECURITY.md)
 for the detailed safety model behind these principles.
+Cheat and mod trust, local inspection, unknown-code, privacy, original-file,
+and responsible-use boundaries are documented separately in
+[`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md), with a shorter
+user-facing version at
+[`docs/CHEATS_MODS_USER_POLICY.md`](docs/CHEATS_MODS_USER_POLICY.md).
 
 ## What ArchiveFS does today
 
-- Scans configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping obvious split-archive continuation parts).
+- Safely scans absolute, non-symlinked configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping symlink/special-file entries and obvious split-archive continuation parts, with bounded traversal).
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
 - Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. Catalogue reports and previews use an explicit read-only open; `database-check` additionally distinguishes hot-header evidence, zeroed/truncated non-hot journals, malformed headers, and recovery-required read-only failures without creating, migrating, repairing, or checkpointing anything.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
@@ -62,9 +84,24 @@ for the detailed safety model behind these principles.
   `retroarch-cheat-source-inspect`. Fetching produces a bounded, validated,
   immutable local snapshot and never installs cheats. See
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- Presents Cheats & Mods as a first-class GUI workspace while keeping profile,
+  source trust, inspection, destination, and installation state distinct. Its
+  in-page picker changes only workspace context; it can inventory an eligible
+  profile's existing cheat directory with fixed read-only bounds or retrieve a
+  trusted cached catalogue. For PS2 archives it also offers a read-only PCSX2
+  adapter that discovers safe native/Flatpak profiles and inventories existing
+  `cheats`, `cheats_ws`, and present `patches` PNACH files. It does not yet
+  derive a verified game CRC or install cheats or patches. GameCube and Wii
+  archives can use a similarly read-only Dolphin adapter to discover native or
+  Flatpak user directories and inspect bounded `GameSettings/*.ini` metadata.
+  Neither adapter inspects arbitrary local imports; see
+  [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
+  [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md), and
+  [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
-  pinned snapshots remain protected; see
+  pinned snapshots remain protected, and retrieval and maintenance coordinate
+  through one bounded cross-process cache lock; see
   [`docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
@@ -77,9 +114,9 @@ for the detailed safety model behind these principles.
   `pcsx2-patch-preview` and `retroarch-patch-preview` are preview only.
   Guided cheat setup installs only after confirmation and never enables cheats;
   trusted retrieval remains separate from installation.
-- No broad multi-emulator support yet - PCSX2 and RetroArch are the only
-  two emulators with any patch/cheat preview today, and neither launches,
-  configures, or manages the emulator itself.
+- No broad multi-emulator support yet - PCSX2, RetroArch, and Dolphin are the
+  only emulators with any patch/cheat preview or inventory today, and none is
+  launched or configured by these read-only workflows.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
@@ -444,17 +481,27 @@ Platforms:
 - [Persistent database](docs/database.md) / [database design](docs/DATABASE_DESIGN.md) / [ADR 0001](docs/adr/0001-persistent-library-database.md)
 - [Managed library views](docs/library-views.md)
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
+- [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
+- [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)
 - [RetroArch playlist identity and content matching](docs/RETROARCH_PLAYLISTS.md)
 - [RetroArch AppImage detection](docs/RETROARCH_APPIMAGE.md)
 - [RetroArch cheat installation history and journal inspection](docs/RETROARCH_CHEAT_HISTORY.md)
+- [RetroArch guided cheat setup](docs/RETROARCH_CHEAT_SETUP.md)
+- [RetroArch cheat installer and install-result model](docs/RETROARCH_CHEAT_INSTALL.md) / [install result](docs/RETROARCH_CHEAT_INSTALL_RESULT.md)
+- [RetroArch cheat rollback](docs/RETROARCH_CHEAT_ROLLBACK.md)
+- [Trusted RetroArch cheat-source retrieval](docs/RETROARCH_CHEAT_SOURCES.md) / [cheat catalogue](docs/RETROARCH_CHEAT_CATALOGUE.md)
+- [RetroArch cheat-source cache maintenance](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md) / [cache locking](docs/RETROARCH_CHEAT_CACHE_LOCKING.md)
+- [Cheats & Mods trust, safety, and privacy model](docs/CHEATS_MODS_SAFETY.md) / [user-facing policy](docs/CHEATS_MODS_USER_POLICY.md)
 - [Watcher](docs/watcher.md)
 - [Provider pipeline](docs/provider-pipeline.md)
 - [Duplicate detector](docs/duplicate-detector.md)
 - [Security model](docs/security.md)
 - [JSON API](docs/json-api.md)
+- [v0.5.0-alpha release notes](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+- [v0.5.0-alpha manual QA plan](docs/MANUAL_QA_v0.5.0-alpha.md)
 - [Release checklist](docs/release-checklist.md)
 - [Paper cuts / small usability notes](docs/paper-cuts.md)
 - [Contributing](CONTRIBUTING.md)

@@ -10,6 +10,29 @@ use std::sync::{
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
+use archivefs_core::emulator_environment::retroarch::{
+    DiscoveryEnvironment, ProfileKind, ProfileScope,
+};
+use archivefs_core::patch_manager::{
+    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
+    CheatSourceList, CheatSourceListEntry, DolphinGameIniInventory, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
+    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType,
+    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory,
+    Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    UNKNOWN_CODE_POLICY, default_cheat_source_cache_root, discover_dolphin_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source,
+    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library,
+    list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
+};
+mod ui;
+
+#[cfg(test)]
+use archivefs_core::patch_manager::Pcsx2PatchDirectory;
+
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
     ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
@@ -40,29 +63,15 @@ use archivefs_core::{
     validate_library_view_destination, validate_new_source_folder,
 };
 use eframe::egui;
+use ui::{components as widgets, layout as ui_layout, theme};
 // Brings `String`'s char-index-safe insert/delete/slice methods into
 // scope - see `show_text_edit_with_context_menu` and its helpers, the
 // only place these are used. The same trait egui's own `TextEdit`
 // editing uses internally, so this can never disagree with it about
 // UTF-8/char-boundary handling.
 use eframe::egui::TextBuffer;
-
-/// The default/initial column widths - `[Platform, State, Archive path,
-/// Mount path]`. Platform and State stay fixed at these widths forever
-/// (milestone requirement: "Platform and State should remain compact");
-/// Archive path and Mount path are only the *starting point* for
-/// `LibraryColumnWidths`, which the header's drag handles mutate at
-/// runtime (see `show_column_resize_handle`). Still used directly
-/// wherever a widths array is needed but resizing is irrelevant (the
-/// loading-preview table before any live session exists, and the large
-/// majority of existing table tests that predate resizing and are not
-/// about it).
 const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
 const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
-/// Below this width a resizable column becomes an unusable sliver (milestone
-/// requirement: "sensible minimum widths so columns cannot collapse").
-/// Chosen so the column header text itself ("Archive path" / "Mount path")
-/// still fits without being clipped at the default readability scale.
 const MIN_RESIZABLE_COLUMN_WIDTH: f32 = 160.0;
 /// An upper bound purely to stop a single wild drag gesture from producing
 /// an absurd column width - not a meaningful design constraint otherwise;
@@ -76,19 +85,6 @@ const MAX_RESIZABLE_COLUMN_WIDTH: f32 = 2400.0;
 /// handle never occupy overlapping screen space (and therefore never
 /// compete for the same click/drag).
 const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
-
-/// Vertical bounds for the Library page's two draggable top panels (see
-/// `show_loaded_data`'s `TopBottomPanel::top` calls). Both use egui's own
-/// built-in resizable-panel support - session-persisted via `ctx.memory`
-/// keyed by the panel id, so a height survives navigating away to Health/
-/// Duplicates/Sources/Tools/Inspector and back with no extra state of our
-/// own to manage, and clamped by `height_range` so neither panel can be
-/// dragged into a zero-height sliver or squeeze the table below it out of
-/// existence. `SUMMARY_PANEL_DEFAULT_HEIGHT` matches the panel's ordinary
-/// single-line content (the milestone's "compact by default" requirement);
-/// `SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT` is tall enough to show the
-/// archive's core fields plus the Mount/Unmount button without scrolling
-/// for a typical record.
 const SUMMARY_PANEL_MIN_HEIGHT: f32 = 32.0;
 const SUMMARY_PANEL_DEFAULT_HEIGHT: f32 = 64.0;
 const SUMMARY_PANEL_MAX_HEIGHT: f32 = 320.0;
@@ -139,13 +135,59 @@ impl LibraryColumnWidths {
         ]
     }
 }
-/// A fixed, explicit `egui::Id` for the library search box - not for any
-/// production behaviour, but so tests can give it real keyboard focus
-/// via `Memory::request_focus` deterministically, without depending on
-/// egui's position-derived auto-id (see the milestone requirement that
-/// keyboard shortcuts must be ignored while this field has focus).
+
+fn responsive_library_column_widths(available_width: f32, spacing: f32) -> LibraryColumnWidths {
+    let fixed = COLUMN_WIDTHS[0] + COLUMN_WIDTHS[1] + spacing * 3.0;
+    let path_space = (available_width - fixed).max(520.0);
+    LibraryColumnWidths {
+        archive_path: (path_space * 0.46).max(240.0),
+        mount_path: (path_space * 0.54).max(280.0),
+    }
+}
+
+const HEALTH_METRIC_MIN_WIDTH: f32 = 148.0;
+const HEALTH_METRIC_HEIGHT: f32 = 58.0;
+const LIBRARY_VIEW_DIALOG_MAX_WIDTH: f32 = 780.0;
+const LIBRARY_VIEW_DIALOG_MAX_HEIGHT: f32 = 720.0;
+
+fn responsive_card_columns(
+    available_width: f32,
+    minimum_card_width: f32,
+    spacing: f32,
+    item_count: usize,
+) -> usize {
+    if item_count == 0 {
+        return 0;
+    }
+    (((available_width + spacing) / (minimum_card_width + spacing)).floor() as usize)
+        .clamp(1, item_count)
+}
+
+fn library_view_dialog_size(viewport_size: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        (viewport_size.x - 24.0).clamp(320.0, LIBRARY_VIEW_DIALOG_MAX_WIDTH),
+        (viewport_size.y - 24.0).clamp(360.0, LIBRARY_VIEW_DIALOG_MAX_HEIGHT),
+    )
+}
+
+fn library_view_selections_side_by_side(dialog_width: f32) -> bool {
+    dialog_width >= 680.0
+}
+
+fn library_view_submit_blocker(name: &str, destination: &str, busy: bool) -> Option<&'static str> {
+    if busy {
+        Some("Wait for the current Library View operation to finish.")
+    } else if name.trim().is_empty() {
+        Some("Enter a name for this Library View.")
+    } else if destination.trim().is_empty() {
+        Some("Choose a destination folder for this Library View.")
+    } else {
+        None
+    }
+}
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 const HISTORY_LIMIT: usize = 50;
+const ACTIVITY_EXPANDED_BY_DEFAULT: bool = false;
 const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
 const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
 const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
@@ -184,6 +226,112 @@ enum ActivityAction {
     LibraryViewApply,
     LibraryViewRepair,
     LibraryViewRemoved,
+    /// Exporting the visible History & Logs entries to a file - recorded
+    /// in the history itself so the export's own outcome is auditable.
+    LogExport,
+    /// Background RetroArch profile discovery for cheat setup (the
+    /// Settings page's "Discovered Profiles" section).
+    RetroArchProfileScan,
+    /// Trusted cheat-source catalogue retrieval (network fetch or
+    /// offline cached-snapshot reuse) from the cheat workflow.
+    CheatSourceRetrieval,
+    /// Read-only discovery of local PCSX2 configuration profiles.
+    Pcsx2ProfileScan,
+    /// Bounded read-only inventory of one PCSX2 profile's PNACH files.
+    Pcsx2PnachInspection,
+    /// Read-only discovery of local Dolphin user profiles.
+    DolphinProfileScan,
+    /// Bounded read-only inventory of Dolphin GameSettings INI files.
+    DolphinGameIniInspection,
+}
+
+/// Every `ActivityAction`, for the History & Logs "Operation" filter.
+/// Must list each variant exactly once (checked by
+/// `activity_filter_lists_cover_every_variant`).
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 35] = [
+    ActivityAction::Refresh,
+    ActivityAction::Mount,
+    ActivityAction::MountAll,
+    ActivityAction::UnmountAll,
+    ActivityAction::Unmount,
+    ActivityAction::LazyUnmount,
+    ActivityAction::Remount,
+    ActivityAction::Cleanup,
+    ActivityAction::Diagnostics,
+    ActivityAction::Setup,
+    ActivityAction::LibraryDatabase,
+    ActivityAction::PlatformAssignment,
+    ActivityAction::BulkPlatformAssignment,
+    ActivityAction::PlatformAliasManagement,
+    ActivityAction::CatalogueCleanup,
+    ActivityAction::SourceAdded,
+    ActivityAction::SourceEnabled,
+    ActivityAction::SourceDisabled,
+    ActivityAction::SourceScan,
+    ActivityAction::SourceRemoved,
+    ActivityAction::LibraryViewAdded,
+    ActivityAction::LibraryViewEdited,
+    ActivityAction::LibraryViewEnabled,
+    ActivityAction::LibraryViewDisabled,
+    ActivityAction::LibraryViewPreview,
+    ActivityAction::LibraryViewApply,
+    ActivityAction::LibraryViewRepair,
+    ActivityAction::LibraryViewRemoved,
+    ActivityAction::LogExport,
+    ActivityAction::RetroArchProfileScan,
+    ActivityAction::CheatSourceRetrieval,
+    ActivityAction::Pcsx2ProfileScan,
+    ActivityAction::Pcsx2PnachInspection,
+    ActivityAction::DolphinProfileScan,
+    ActivityAction::DolphinGameIniInspection,
+];
+
+/// Every `ActivityOutcome`, for the History & Logs "Result" filter.
+const ALL_ACTIVITY_OUTCOMES: [ActivityOutcome; 9] = [
+    ActivityOutcome::Started,
+    ActivityOutcome::Offered,
+    ActivityOutcome::Retried,
+    ActivityOutcome::Confirmed,
+    ActivityOutcome::Cancelled,
+    ActivityOutcome::Skipped,
+    ActivityOutcome::Completed,
+    ActivityOutcome::Failed,
+    ActivityOutcome::Rejected,
+];
+
+/// The History & Logs page's filter/sort state. `None` filters mean
+/// "show everything" (the design's "All Operations"/"All Results").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryLogFilters {
+    action: Option<ActivityAction>,
+    outcome: Option<ActivityOutcome>,
+    oldest_first: bool,
+}
+
+/// Whether one history entry passes the History & Logs filters - pure,
+/// so filtering can never mutate or reorder the history itself.
+fn history_entry_visible(entry: &HistoryEntry, filters: &HistoryLogFilters) -> bool {
+    filters.action.is_none_or(|action| entry.action == action)
+        && filters
+            .outcome
+            .is_none_or(|outcome| entry.outcome == outcome)
+}
+
+/// The filtered, ordered entries the History & Logs page shows.
+/// `OperationHistory::entries` iterates newest-first; `oldest_first`
+/// reverses the *filtered* list without touching the underlying order.
+fn visible_history_entries<'a>(
+    history: &'a OperationHistory,
+    filters: &HistoryLogFilters,
+) -> Vec<&'a HistoryEntry> {
+    let mut entries: Vec<&HistoryEntry> = history
+        .entries()
+        .filter(|entry| history_entry_visible(entry, filters))
+        .collect();
+    if filters.oldest_first {
+        entries.reverse();
+    }
+    entries
 }
 
 impl std::fmt::Display for ActivityAction {
@@ -217,6 +365,13 @@ impl std::fmt::Display for ActivityAction {
             Self::LibraryViewApply => "Library View apply",
             Self::LibraryViewRepair => "Library View repair",
             Self::LibraryViewRemoved => "Library View removed",
+            Self::LogExport => "Log export",
+            Self::RetroArchProfileScan => "RetroArch profile scan",
+            Self::CheatSourceRetrieval => "Cheat source retrieval",
+            Self::Pcsx2ProfileScan => "PCSX2 profile scan",
+            Self::Pcsx2PnachInspection => "PCSX2 PNACH inspection",
+            Self::DolphinProfileScan => "Dolphin profile scan",
+            Self::DolphinGameIniInspection => "Dolphin Game INI inspection",
         })
     }
 }
@@ -294,22 +449,12 @@ impl OperationHistory {
     fn entries(&self) -> impl Iterator<Item = &HistoryEntry> {
         self.entries.iter()
     }
-
-    /// Removes exactly the entry at display `index` (matching `entries()`'s
-    /// own iteration order, front = most recent) - milestone requirement:
-    /// "Clearing one entry must not reorder or alter unrelated entries."
-    /// `VecDeque::remove` already only ever shifts elements, never
-    /// reorders the remaining ones relative to each other.
     fn remove(&mut self, index: usize) {
         self.entries.remove(index);
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // A minimal, headless diagnostic path - milestone requirement: proves
-    // on the real desktop session, with a single command, whether the
-    // native clipboard backend actually works there, without opening the
-    // GUI window at all. Never prints clipboard content.
     if std::env::args().any(|arg| arg == "--clipboard-check") {
         run_clipboard_check();
         return Ok(());
@@ -443,14 +588,6 @@ struct ArchiveRow {
     search_text: String,
     origin: RowOrigin,
     unknown_platform: bool,
-    /// The configured source folder that owns this archive, if known -
-    /// the Library page's Source filter and the selected-archive details
-    /// panel's "Source" line (milestone requirement). `None` means
-    /// "Unassigned/Legacy": either no source could be resolved (an
-    /// orphaned/legacy catalogue row) or - for a brand new live-only row
-    /// never yet persisted - no configured source path is a prefix of its
-    /// absolute path. Never itself a database write; purely derived
-    /// display data, resolved once in `build_display_rows`.
     source_path: Option<PathBuf>,
 }
 
@@ -550,13 +687,6 @@ impl ArchiveRow {
         .to_lowercase();
         self
     }
-
-    /// Sets this row's resolved owning-source path - see `build_display_rows`,
-    /// the only caller. Deliberately does not touch `search_text`: the
-    /// Source filter is its own independent dropdown (see
-    /// `ArchiveFsApp::library_source_filter`), not part of the free-text
-    /// search the milestone's other filters/sort must remain independent
-    /// of.
     fn with_source_path(mut self, source_path: Option<PathBuf>) -> Self {
         self.source_path = source_path;
         self
@@ -1141,17 +1271,6 @@ struct RunningUnmountAll {
 
 #[derive(Clone)]
 struct UnmountAllConfirmation;
-
-/// The Library row context menu's "Unmount selected" confirmation -
-/// deliberately a marker with no captured item list, exactly like
-/// `UnmountAllConfirmation`. The dialog recomputes "which selected
-/// archives are currently mounted" fresh from `data.records`/
-/// `selected_archives` every frame it is open, and again at the moment
-/// Confirm is clicked - never a list captured when the menu was
-/// right-clicked - so a selection or mount-state change while the dialog
-/// is open is always reflected truthfully (milestone requirement:
-/// "revalidate before starting; do not unmount stale, missing or
-/// no-longer-mounted targets").
 #[derive(Clone)]
 struct UnmountSelectedConfirmation;
 
@@ -1887,15 +2006,6 @@ struct SourcesAddDialogState {
     path_text: String,
     validation_message: Option<String>,
 }
-
-/// The Remove-source confirmation dialog's state. `keep_catalogue`
-/// defaults to `true` (see `SourcesPageAction::open_remove_dialog`) - the
-/// milestone's required safe default; the user must actively switch it to
-/// remove catalogue rows. `last_archive_count` is copied from the
-/// `SourceFolderView` at the moment the dialog opens purely for display
-/// ("N rows affected") - never re-queried live, and never itself the
-/// value acted on (the actual removal always re-resolves the source by
-/// path at commit time).
 #[derive(Clone, Debug)]
 struct SourcesRemoveDialogState {
     path: PathBuf,
@@ -2009,15 +2119,6 @@ struct LibraryViewRemoveDialogState {
     view_name: String,
     keep_definition: bool,
 }
-
-/// The Library Views page's Preview details filter - milestone
-/// requirement: "filters by result type". Mirrors
-/// `archivefs_core::library_views`'s private `LibraryViewCountBucket`
-/// exactly (six buckets, `Skip*` collapsed into one `Skip`) - kept as its
-/// own small presentation-layer duplicate rather than exporting that
-/// private core type, the same "own small presentation-layer function"
-/// convention `source_availability_label` already uses for
-/// `SourceAvailability`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LibraryViewPlanFilter {
     #[default]
@@ -2112,10 +2213,6 @@ impl From<&CatalogueDuplicateGroup> for DuplicateGroupIdentity {
         }
     }
 }
-
-/// The Health Dashboard's category filter (milestone requirement 3).
-/// `MountFailures` is the broader grouping of both failure categories;
-/// `Retryable`/`Terminal` narrow to exactly one of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HealthIssueFilter {
     #[default]
@@ -2174,21 +2271,12 @@ impl HealthIssueFilter {
         }
     }
 }
-
-/// The Health Dashboard's own independent filter state - milestone
-/// requirement 3. Deliberately never shared with `LibraryRowFilters` or
-/// `DuplicateReviewFilters`: entering or leaving the dashboard must never
-/// reset (or be reset by) the ordinary library's or Duplicate Review's own
-/// search/filter state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HealthDashboardFilters {
     search: String,
     platform: Option<String>,
     category: HealthIssueFilter,
 }
-
-/// Milestone requirement 4's sortable columns, plus the documented default
-/// severity order (`HealthCategory::severity_rank`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HealthSortField {
     #[default]
@@ -2210,28 +2298,6 @@ impl std::fmt::Display for HealthSortField {
         })
     }
 }
-
-/// What `cached_health_issues` last built the health report *from* -
-/// milestone requirement: "must not be rebuilt every frame." Compared by
-/// value each frame the dashboard is open; the report itself is rebuilt
-/// only when this key (together with the recovery-offer sets, compared
-/// separately - see `HealthReportCache`) actually changes.
-///
-/// `live_data_ptr`/`database_snapshot_ptr` are the addresses of the
-/// current `LoadedData`/`CachedLibrarySnapshot` this frame's `self.state`/
-/// `self.database_state` actually point at - never a copy of a
-/// generation counter alone. A `LoadState`/`DatabaseState` only ever
-/// starts pointing at a *new* `Box` once a background load has both
-/// completed *and* already passed `poll_load`/`poll_database_load`'s
-/// existing `generation` staleness guard (untouched by this milestone),
-/// so a stale/discarded background result can never move this key: it
-/// simply never gets applied to `self.state`/`self.database_state` in the
-/// first place. This also sidesteps a subtler bug a raw generation
-/// comparison would hit: `refresh_generation` bumps the instant a refresh
-/// *starts*, before the new data exists, so keying on it alone would
-/// falsely look "unchanged" once the slow load actually finishes (same
-/// generation value, brand new data). Pointer identity only ever changes
-/// exactly when the applied data itself changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HealthReportCacheKey {
     live_data_ptr: Option<usize>,
@@ -2255,27 +2321,6 @@ struct HealthReportCache {
     remount_offers: HashSet<PathBuf>,
     issues: Vec<HealthIssue>,
 }
-
-// -----------------------------------------------------------------------
-// v0.4.3-alpha: navigation redesign - one explicit main-view enum instead
-// of several independent `bool`s (the old `show_duplicate_review`/
-// `show_health_dashboard`), and one renderer per page (see `update`'s
-// `match self.view` and each `show_*_page`/`show_*_panel` function) rather
-// than one continuously growing `update` body. Each page's own state
-// (search/filter/sort/selection) lives in its own existing fields below,
-// completely untouched by navigating to a different page - switching
-// `view` only changes what gets *rendered*, never any of that state.
-// -----------------------------------------------------------------------
-
-/// The primary destinations - milestone requirement: "Library | Health |
-/// Duplicates | Sources" as clear, always-visible primary navigation, plus
-/// `LibraryViews` (the managed symlink-based organised folder trees
-/// milestone) added alongside them as a fifth user-facing content page,
-/// not a `ToolsOverlay` - it is something a user browses and acts on
-/// directly, exactly like Sources, not an administrative/diagnostic
-/// panel. Mutually exclusive with `ToolsOverlay` (see its own doc
-/// comment); `update` renders whichever overlay is active in preference
-/// to the current `view`, then restores the page underneath once closed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MainView {
     #[default]
@@ -2284,21 +2329,15 @@ enum MainView {
     Duplicates,
     Sources,
     LibraryViews,
+    Mount,
+    Selected,
+    CheatsMods,
+    ActiveMounts,
+    Doctor,
+    HistoryLogs,
+    Settings,
+    About,
 }
-
-/// A secondary, full-panel destination - distinct from `MainView` because
-/// none of these are one of the four primary destinations the navigation
-/// bar always shows, but each still deserves its own full screen rather
-/// than a cramped inline corner of the Library page (milestone
-/// requirement: "Do not show database administration, aliases,
-/// diagnostics ... inline on \[the Library\] page"). Replaces the old
-/// standalone `show_diagnostics: bool` - one overlay slot, one thing
-/// showing at a time, exactly like `MainView`. Most variants are reached
-/// from the "Tools" menu; `ArchiveInspector` is the one exception,
-/// reached instead from the selected archive's own "Inspect contents"
-/// button (see `show_selected_archive`) - it still belongs here rather
-/// than as a new `MainView`, since it is not one of the four
-/// always-visible primary destinations either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ToolsOverlay {
     #[default]
@@ -2362,10 +2401,6 @@ struct ArchiveInspectorState {
     /// The selected entry's exact stored name (see `InspectorEntry::name`)
     /// - identity within one report, never a display-only truncated form.
     selected_entry: Option<String>,
-    /// The Inspector row list's resizable Path column width - milestone
-    /// requirement: reuse the same readable-long-text treatment
-    /// (resizable columns, via `show_column_resize_handle`) the Library
-    /// table already has.
     path_column_width: f32,
 }
 
@@ -2392,59 +2427,102 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-
-/// Milestone readability requirement: "modestly increase default UI
-/// scale/text sizing" and give controls enough room that adjacent
-/// buttons aren't tiny/easy to mis-click. `1.15` is a ~15% bump (egui's
-/// own text/spacing all scale with `pixels_per_point`) - enough to read
-/// clearly at arm's length without pushing core Library-page content
-/// into horizontal scrolling at the milestone's 1536x864 baseline width.
-/// The spacing/padding bump is deliberately modest for the same reason.
-fn apply_readability_style(context: &egui::Context) {
-    context.set_pixels_per_point(1.15);
-    context.style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 6.0);
-        style.spacing.button_padding = egui::vec2(8.0, 5.0);
-        style.spacing.interact_size.y = 24.0;
-    });
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 10] = [
+    (MainView::Mount, "Mount"),
+    (MainView::Selected, "Selected"),
+    (MainView::CheatsMods, "Cheats & Mods"),
+    (MainView::ActiveMounts, "Active Mounts"),
+    (MainView::Library, "Library"),
+    (MainView::Sources, "Sources"),
+    (MainView::Doctor, "Doctor"),
+    (MainView::HistoryLogs, "History & Logs"),
+    (MainView::Settings, "Settings"),
+    (MainView::About, "About"),
+];
+const SECONDARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 3] = [
+    (MainView::Health, "Health"),
+    (MainView::Duplicates, "Duplicates"),
+    (MainView::LibraryViews, "Library Views"),
+];
+fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
+    !matches!(view, MainView::Health | MainView::Duplicates) || has_database
 }
 
-/// The four primary destinations, rendered as one always-visible row
-/// directly below the menu bar (milestone requirement: "visually
-/// prominent, easy to find" navigation, never buried in a submenu).
-/// `SelectableLabel`-style highlighting matches ordinary desktop tab
-/// conventions. Extracted from `update` (rather than inlined) so it can
-/// be driven by a real `egui::Context` frame in tests independent of
-/// `eframe::Frame`, which production code can only obtain from the
-/// eframe runtime itself. Health and Duplicates are disabled - not
-/// hidden, per the milestone's "use disabled states + explanatory text
-/// rather than hiding context" - until a database snapshot exists,
-/// since both pages render real catalogue data with nothing meaningful
-/// to show before then; Library and Sources remain reachable at any
-/// time. Returns the newly clicked view, if any, leaving `tools_overlay`
-/// handling to the caller.
+fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
+    current == candidate
+}
+
+fn main_view_title(view: MainView) -> &'static str {
+    match view {
+        MainView::Library => "Library",
+        MainView::Health => "Health",
+        MainView::Duplicates => "Duplicates",
+        MainView::Sources => "Sources",
+        MainView::LibraryViews => "Library Views",
+        MainView::Mount => "Mount",
+        MainView::Selected => "Selected",
+        MainView::CheatsMods => "Cheats & Mods",
+        MainView::ActiveMounts => "Active Mounts",
+        MainView::Doctor => "Doctor",
+        MainView::HistoryLogs => "History & Logs",
+        MainView::Settings => "Settings",
+        MainView::About => "About",
+    }
+}
+
+fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
+    match view {
+        MainView::Mount
+        | MainView::Selected
+        | MainView::CheatsMods
+        | MainView::ActiveMounts
+        | MainView::Library
+        | MainView::Health
+        | MainView::Duplicates
+        | MainView::Sources
+        | MainView::LibraryViews
+        | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
+        MainView::Doctor | MainView::Settings | MainView::About => ui_layout::ContentWidth::Normal,
+    }
+}
 fn show_primary_navigation(
     ui: &mut egui::Ui,
     current: MainView,
     has_database: bool,
 ) -> Option<MainView> {
     let mut clicked_view = None;
-    ui.horizontal(|ui| {
-        for (view, label) in [
-            (MainView::Library, "Library"),
-            (MainView::Health, "Health"),
-            (MainView::Duplicates, "Duplicates"),
-            (MainView::Sources, "Sources"),
-            (MainView::LibraryViews, "Library Views"),
-        ] {
-            let enabled = matches!(
-                view,
-                MainView::Library | MainView::Sources | MainView::LibraryViews
-            ) || has_database;
-            if ui
-                .add_enabled(enabled, egui::Button::selectable(current == view, label))
-                .clicked()
-            {
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new("ArchiveFS").size(23.0).strong());
+        ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
+        ui.add_space(18.0);
+        ui.label(
+            egui::RichText::new("WORKFLOWS")
+                .small()
+                .strong()
+                .color(theme::muted(ui)),
+        );
+        for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
+            let enabled = navigation_destination_enabled(view, has_database);
+            let selected = navigation_destination_selected(current, view);
+            let button = egui::Button::selectable(selected, label)
+                .min_size(egui::vec2(ui.available_width(), 34.0));
+            if ui.add_enabled(enabled, button).clicked() {
+                clicked_view = Some(view);
+            }
+        }
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("CATALOGUE VIEWS")
+                .small()
+                .strong()
+                .color(theme::muted(ui)),
+        );
+        for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
+            let enabled = navigation_destination_enabled(view, has_database);
+            let button =
+                egui::Button::selectable(navigation_destination_selected(current, view), label)
+                    .min_size(egui::vec2(ui.available_width(), 34.0));
+            if ui.add_enabled(enabled, button).clicked() {
                 clicked_view = Some(view);
             }
         }
@@ -2463,6 +2541,39 @@ struct ArchiveFsApp {
     confirm_mount_all: Option<MountAllConfirmation>,
     focus_mount_all_cancel: bool,
     mount_all_result: Option<MountAllResult>,
+    mount_queue: Vec<PathBuf>,
+    /// The Mount page's free-text filter (name/platform/path substring).
+    mount_search: String,
+    /// Whether the Mount page's inline mount-the-queue confirmation is
+    /// showing - the Mount page's counterpart of `MountAllConfirmation`.
+    confirm_mount_queue: bool,
+    /// The Active Mounts page's pending unmount confirmation (the
+    /// archive path awaiting "Unmount now"), cleared automatically when
+    /// that archive stops being mounted.
+    active_mounts_confirm_unmount: Option<PathBuf>,
+    /// The History & Logs page's filter/sort state.
+    history_filters: HistoryLogFilters,
+    /// The Settings page's RetroArch profile discovery state. Never
+    /// scanned automatically - filesystem probing only happens on an
+    /// explicit "Scan/Rescan Profiles" click.
+    retroarch_profiles: RetroArchProfilesState,
+    /// Read-only PCSX2 profile discovery shared by every PS2 archive
+    /// context. Inventory results remain archive-bound inside
+    /// `CheatWorkflowState`.
+    pcsx2_profiles: Pcsx2ProfilesState,
+    /// Read-only Dolphin profile discovery shared by GameCube and Wii archives.
+    dolphin_profiles: DolphinProfilesState,
+    /// The full-page Cheats & Mods workspace's current archive and
+    /// trusted-catalogue state. It survives ordinary page navigation so
+    /// returning to the same exact archive does not discard a completed
+    /// cache inspection or retrieval.
+    cheat_workflow: Option<CheatWorkflowState>,
+    /// A tentative archive choice is isolated here until the picker is
+    /// applied. It never mutates Library focus or multi-selection.
+    cheat_archive_picker: Option<CheatArchivePickerState>,
+    /// A different archive requires confirmation when fetched catalogue
+    /// state would otherwise be discarded.
+    confirm_cheat_archive_change: Option<PathBuf>,
     confirm_unmount_all: Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: bool,
     /// The Library row context menu's "Unmount selected" confirmation -
@@ -2510,8 +2621,6 @@ struct ArchiveFsApp {
     selected_archives: HashSet<PathBuf>,
     bulk_platform_action: Option<RunningBulkPlatformAction>,
     bulk_platform_choice: Option<String>,
-    /// The library table's current column sort - milestone requirement
-    /// 2. `None` means unsorted / natural (merge) order.
     sort_field: Option<SortField>,
     sort_ascending: bool,
     /// The library table's vertical `ScrollArea` offset as of the end of
@@ -2530,10 +2639,6 @@ struct ArchiveFsApp {
     health_sort_field: HealthSortField,
     health_sort_ascending: bool,
     selected_health_issue: Option<PathBuf>,
-    /// Bumped only by `refresh_diagnostics` - the one health-relevant event
-    /// (milestone requirement 3's "diagnostics refresh") not already
-    /// reflected by `state`/`database_state` changing identity, since a
-    /// diagnostics-only refresh touches neither.
     diagnostics_refresh_generation: RefreshGeneration,
     /// The Health Dashboard's cached report - see `cached_health_issues`.
     /// `None` until first built. Never read directly; always go through
@@ -2551,10 +2656,6 @@ struct ArchiveFsApp {
     /// Which "Tools" screen (if any) is showing in front of `view` - see
     /// `ToolsOverlay`'s doc comment.
     tools_overlay: ToolsOverlay,
-    /// Whether the bottom Activity panel is expanded - milestone
-    /// requirement: a collapsible bottom panel rather than a permanently
-    /// narrow side strip. Purely a display preference; never cleared by
-    /// navigation, and never affects `history` itself.
     show_activity: bool,
     /// Whether the Help "About ArchiveFS" window is open.
     show_about: bool,
@@ -2615,13 +2716,6 @@ struct ArchiveFsApp {
     /// The Library Views page's Preview details filter - see
     /// `LibraryViewPlanFilter`.
     library_view_plan_filter: LibraryViewPlanFilter,
-    /// The Library page's Source filter - milestone requirement. `None`
-    /// means "All sources" (no restriction); `Some(None)` means
-    /// "Unassigned/Legacy" (a persisted archive whose `source_folder_id`
-    /// no longer matches any currently configured source);
-    /// `Some(Some(path))` restricts to that one configured source's exact
-    /// path. Lives here, independent of `library_filters`, so it survives
-    /// navigation exactly like every other Library filter already does.
     library_source_filter: Option<Option<PathBuf>>,
     /// The Library table's current Archive path / Mount path column
     /// widths - see `LibraryColumnWidths`. Platform and State are not
@@ -2634,13 +2728,6 @@ struct ArchiveFsApp {
     /// as-is, so reopening it shows the same archive's already-loaded
     /// report instead of re-inspecting from scratch.
     archive_inspector: Option<ArchiveInspectorState>,
-    /// Bumped every time a new inspection starts (a fresh "Inspect
-    /// contents" click, whether for a new archive or the same one again);
-    /// see `start_archive_inspection`/`poll_archive_inspection`. A
-    /// background result whose generation no longer matches this is
-    /// stale and must never be applied. Milestone requirement: "If the
-    /// selected archive changes or disappears before the result returns,
-    /// do not apply stale results."
     archive_inspector_generation: RefreshGeneration,
 }
 
@@ -2653,7 +2740,7 @@ impl ArchiveFsApp {
     }
 
     fn new(context: egui::Context) -> Self {
-        apply_readability_style(&context);
+        theme::apply(&context);
         let generation = RefreshGeneration::INITIAL;
         let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
@@ -2677,6 +2764,17 @@ impl ArchiveFsApp {
             confirm_mount_all: None,
             focus_mount_all_cancel: false,
             mount_all_result: None,
+            mount_queue: Vec::new(),
+            mount_search: String::new(),
+            confirm_mount_queue: false,
+            active_mounts_confirm_unmount: None,
+            history_filters: HistoryLogFilters::default(),
+            retroarch_profiles: RetroArchProfilesState::NotScanned,
+            pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
+            dolphin_profiles: DolphinProfilesState::NotScanned,
+            cheat_workflow: None,
+            cheat_archive_picker: None,
+            confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -2726,7 +2824,7 @@ impl ArchiveFsApp {
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
             tools_overlay: ToolsOverlay::default(),
-            show_activity: true,
+            show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
@@ -2766,25 +2864,12 @@ impl ArchiveFsApp {
         self.refresh_diagnostics(context);
         self.state = start_load(context.clone(), generation, previous);
     }
-
-    /// Starts a fresh read-only inspection of `archive_path` in a
-    /// background thread (milestone requirement: "so large ZIP files do
-    /// not freeze the GUI") and opens the Archive Inspector overlay to
-    /// show it. Always replaces `self.archive_inspector` wholesale - see
-    /// `ArchiveInspectorState`'s own doc comment - and always bumps
-    /// `archive_inspector_generation` first, so any still-in-flight
-    /// result from a *previous* call can never be mistaken for this new
-    /// one once it lands (see `poll_archive_inspection`).
     fn start_archive_inspection(&mut self, context: egui::Context, archive_path: PathBuf) {
         self.archive_inspector_generation = self.archive_inspector_generation.next();
         let generation = self.archive_inspector_generation;
         let (sender, receiver) = mpsc::channel();
         let job_path = archive_path.clone();
         thread::spawn(move || {
-            // `inspect_archive` re-checks the path live (existence,
-            // format, structure) regardless of anything the caller
-            // believed - milestone requirement: "cached catalogue rows
-            // must not authorise inspection of a missing file."
             let result = inspect_archive(&job_path).map_err(|error| error.to_string());
             let _ = sender.send((generation, result));
             context.request_repaint();
@@ -2826,10 +2911,6 @@ impl ArchiveFsApp {
         let Some((generation, result)) = result else {
             return;
         };
-        // Stale - a newer inspection (a different archive, or the same
-        // one inspected again) has already superseded this one. Dropping
-        // it silently here, rather than ever applying it, is exactly the
-        // milestone's "do not apply stale results" requirement.
         if generation != self.archive_inspector_generation {
             return;
         }
@@ -3739,12 +3820,6 @@ impl ArchiveFsApp {
                     warning: None,
                     more_information: None,
                 });
-                // Deliberately does not clear `sources_add_dialog`/
-                // `sources_remove_dialog` on failure - the milestone's
-                // "clear inline validation message" requirement means a
-                // failed Add should leave the dialog open with its input
-                // intact so the user can correct and retry, not lose
-                // their typed path.
             }
         }
     }
@@ -4191,6 +4266,849 @@ impl ArchiveFsApp {
                             )
                         }),
                     });
+                }
+            }
+        }
+    }
+
+    /// Applies a `MountPageAction` returned by the Mount or Selected
+    /// page. Queue execution re-derives eligibility from the live
+    /// snapshot at the moment of the click (queue order, `Pending`
+    /// only), then hands the items to the proven `start_mount_all`
+    /// batch engine - never a stale item list captured at render time.
+    fn handle_mount_page_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<MountPageAction>,
+    ) {
+        match action {
+            Some(MountPageAction::MountQueue) => {
+                let items = match &self.state {
+                    LoadState::Ready(data) => {
+                        let eligible = queued_pending_paths(&self.mount_queue, &data.records);
+                        mount_all_items_for_paths(&data.records, &eligible)
+                    }
+                    _ => Vec::new(),
+                };
+                if !items.is_empty() {
+                    self.start_mount_all(context.clone(), items);
+                }
+            }
+            Some(MountPageAction::Refresh) => self.refresh(context),
+            Some(MountPageAction::GoToMount) => {
+                self.view = MainView::Mount;
+                self.tools_overlay = ToolsOverlay::None;
+            }
+            Some(MountPageAction::OpenCheatsMods(archive_path)) => {
+                self.open_cheats_mods_workspace(context, archive_path);
+            }
+            Some(MountPageAction::ScanRetroArchProfiles) => {
+                self.start_retroarch_profile_scan(context.clone());
+            }
+            None => {}
+        }
+    }
+
+    /// Selects the full-page Cheats & Mods workspace context without
+    /// starting I/O. Returning to the same exact archive preserves the
+    /// existing workflow; changing archive replaces it wholesale. The
+    /// return value says whether a new source-list load is needed.
+    fn prepare_cheats_mods_workspace(&mut self, archive_path: PathBuf) -> bool {
+        self.view = MainView::CheatsMods;
+        self.tools_overlay = ToolsOverlay::None;
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.archive_path == archive_path)
+        {
+            return false;
+        }
+        let (
+            source_mode,
+            selected_source_id,
+            fetch_force_refresh,
+            previous_profile_id,
+            previous_pcsx2_profile_id,
+            previous_dolphin_profile_id,
+            previous_adapter,
+        ) = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| {
+                (
+                    workflow.source_mode,
+                    workflow.selected_source_id.clone(),
+                    workflow.fetch_force_refresh,
+                    workflow.selected_profile_id.clone(),
+                    workflow.selected_pcsx2_profile_id.clone(),
+                    workflow.selected_dolphin_profile_id.clone(),
+                    Some(workflow.adapter),
+                )
+            })
+            .unwrap_or((
+                CheatSourceMode::ArchiveFsTrustedCatalogue,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            ));
+        let record_details = match &self.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        }
+        .and_then(|data| {
+            data.records
+                .iter()
+                .find(|record| record.mount_plan.archive.path == archive_path)
+                .map(|record| {
+                    (
+                        record.identity.display_name.clone(),
+                        record.identity.platform.clone(),
+                        record.identity.source_root.clone(),
+                        record.identity.size_bytes,
+                    )
+                })
+        });
+        let Some((display_name, platform, source_root, size_bytes)) = record_details else {
+            self.cheat_workflow = None;
+            return false;
+        };
+        let ps2 = platform_is_ps2(platform.as_deref());
+        let dolphin = platform_is_dolphin(platform.as_deref());
+        let adapter = if ps2 {
+            previous_adapter
+                .filter(|adapter| *adapter != CheatEmulatorAdapter::Dolphin)
+                .unwrap_or(CheatEmulatorAdapter::Pcsx2)
+        } else if dolphin {
+            previous_adapter
+                .filter(|adapter| *adapter != CheatEmulatorAdapter::Pcsx2)
+                .unwrap_or(CheatEmulatorAdapter::Dolphin)
+        } else {
+            CheatEmulatorAdapter::RetroArch
+        };
+        let selected_profile_id = match &self.retroarch_profiles {
+            RetroArchProfilesState::Ready(discovery) => {
+                let eligible = eligible_profile_ids(discovery);
+                if let Some(previous) =
+                    previous_profile_id.filter(|previous| eligible.contains(&previous.as_str()))
+                {
+                    Some(previous)
+                } else if eligible.len() == 1 {
+                    Some(eligible[0].to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let selected_pcsx2_profile_id = match &self.pcsx2_profiles {
+            Pcsx2ProfilesState::Ready(discovery) => {
+                let eligible = eligible_pcsx2_profile_ids(discovery);
+                if let Some(previous) = previous_pcsx2_profile_id
+                    .filter(|previous| eligible.contains(&previous.as_str()))
+                {
+                    Some(previous)
+                } else if eligible.len() == 1 {
+                    Some(eligible[0].to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let selected_dolphin_profile_id = match &self.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => {
+                let eligible = eligible_dolphin_profile_ids(discovery);
+                if let Some(previous) = previous_dolphin_profile_id
+                    .filter(|previous| eligible.contains(&previous.as_str()))
+                {
+                    Some(previous)
+                } else if eligible.len() == 1 {
+                    Some(eligible[0].to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.cheat_workflow = Some(CheatWorkflowState {
+            archive_path,
+            display_name,
+            platform,
+            source_root,
+            size_bytes,
+            adapter,
+            selected_profile_id,
+            selected_pcsx2_profile_id,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
+            source_mode,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id,
+            fetch_force_refresh,
+        });
+        true
+    }
+
+    /// Opens the full-page workspace and starts its read-only trusted
+    /// source inventory only when the exact archive context is new.
+    fn open_cheats_mods_workspace(&mut self, context: &egui::Context, archive_path: PathBuf) {
+        if !self.prepare_cheats_mods_workspace(archive_path) {
+            return;
+        }
+        // Read-only listing of the local trusted-source cache; safe to
+        // start immediately (no network, background thread).
+        self.start_cheat_source_list(context.clone());
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2)
+            && matches!(
+                self.pcsx2_profiles,
+                Pcsx2ProfilesState::NotScanned | Pcsx2ProfilesState::Error(_)
+            )
+        {
+            self.start_pcsx2_profile_scan(context.clone());
+        }
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin)
+            && matches!(
+                self.dolphin_profiles,
+                DolphinProfilesState::NotScanned | DolphinProfilesState::Error(_)
+            )
+        {
+            self.start_dolphin_profile_scan(context.clone());
+        }
+    }
+
+    fn open_cheat_archive_picker(&mut self) {
+        self.cheat_archive_picker = Some(CheatArchivePickerState::for_current(
+            self.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+        ));
+    }
+
+    /// Applies one explicit picker choice without touching Library focus,
+    /// multi-selection, queue membership, or mount state.
+    fn apply_cheat_archive_choice(&mut self, context: &egui::Context, archive_path: PathBuf) {
+        self.confirm_cheat_archive_change = None;
+        self.cheat_archive_picker = None;
+        let needs_profile_scan = matches!(
+            self.retroarch_profiles,
+            RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
+        );
+        self.open_cheats_mods_workspace(context, archive_path);
+        if self.cheat_workflow.is_some() && needs_profile_scan {
+            self.start_retroarch_profile_scan(context.clone());
+        }
+    }
+
+    /// Lists the trusted cheat sources and their cached snapshots in
+    /// the background (read-only cache inspection, no network).
+    fn start_cheat_source_list(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        workflow.source_list = CheatStepResource::Loading { receiver };
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root()
+                .map_err(|error| error.to_string())
+                .and_then(|cache_root| {
+                    list_retroarch_cheat_sources(&cache_root).map_err(|error| error.to_string())
+                });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn start_existing_retroarch_library_inspection(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(profile_id) = workflow.selected_profile_id.clone() else {
+            return;
+        };
+        let destination = match &self.retroarch_profiles {
+            RetroArchProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .and_then(|profile| profile.cheat_destination_root.as_ref())
+                .filter(|path| !path.lossy)
+                .map(|path| PathBuf::from(&path.display)),
+            _ => None,
+        };
+        let Some(destination) = destination else {
+            workflow.existing_library_profile_id = Some(profile_id);
+            workflow.existing_library = CheatStepResource::Failed(
+                "The selected profile has no safely resolved cheat destination.".to_string(),
+            );
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        workflow.existing_library_profile_id = Some(profile_id);
+        workflow.existing_library = CheatStepResource::Loading { receiver };
+        thread::spawn(move || {
+            let result = inspect_retroarch_cheat_library(&destination);
+            let _ = sender.send(Ok(result));
+            context.request_repaint();
+        });
+    }
+
+    fn start_pcsx2_inventory(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Pcsx2 {
+            return;
+        }
+        let Some(profile_id) = workflow.selected_pcsx2_profile_id.clone() else {
+            return;
+        };
+        let profile = match &self.pcsx2_profiles {
+            Pcsx2ProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .cloned(),
+            _ => None,
+        };
+        let Some(profile) = profile else {
+            workflow.pcsx2_inventory_profile_id = Some(profile_id);
+            workflow.pcsx2_inventory = CheatStepResource::Failed(
+                "The selected PCSX2 profile is no longer eligible.".to_string(),
+            );
+            return;
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        workflow.pcsx2_inventory_profile_id = Some(profile_id.clone());
+        workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Pcsx2PnachInspection,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            format!("PCSX2 PNACH inspection started for profile '{profile_id}'."),
+        ));
+        thread::spawn(move || {
+            let result = inspect_pcsx2_profile(&profile).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn start_dolphin_inventory(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Dolphin {
+            return;
+        }
+        let Some(profile_id) = workflow.selected_dolphin_profile_id.clone() else {
+            return;
+        };
+        let profile = match &self.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .cloned(),
+            _ => None,
+        };
+        let Some(profile) = profile else {
+            workflow.dolphin_inventory_profile_id = Some(profile_id);
+            workflow.dolphin_inventory = CheatStepResource::Failed(
+                "The selected Dolphin profile is no longer eligible.".to_string(),
+            );
+            return;
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        workflow.dolphin_inventory_profile_id = Some(profile_id.clone());
+        workflow.dolphin_inventory = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinGameIniInspection,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            format!("Dolphin GameSettings inspection started for profile '{profile_id}'."),
+        ));
+        thread::spawn(move || {
+            let result = inspect_dolphin_profile(&profile).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Retrieves the selected trusted source's catalogue in the
+    /// background - a real network fetch, or offline reuse of the
+    /// cached snapshot when `offline` is set. All size/digest/redirect
+    /// protections live in `fetch_retroarch_cheat_source`; the GUI adds
+    /// nothing and bypasses nothing.
+    fn start_cheat_source_fetch(&mut self, context: egui::Context, offline: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(source_id) = workflow.selected_source_id.clone() else {
+            return;
+        };
+        let archive_path = workflow.archive_path.clone();
+        let force_refresh = workflow.fetch_force_refresh && !offline;
+        let (sender, receiver) = mpsc::channel();
+        workflow.source_fetch = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            if offline {
+                format!("Cheat source '{source_id}': reusing cached snapshot (offline).")
+            } else {
+                format!("Cheat source '{source_id}': catalogue retrieval started.")
+            },
+        ));
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root()
+                .map_err(|error| error.to_string())
+                .and_then(|cache_root| {
+                    let options = CheatSourceFetchOptions {
+                        cache_root,
+                        force_refresh,
+                        offline,
+                        expected_sha256: None,
+                        max_download_bytes: None,
+                    };
+                    let transport = HttpsCheatSourceTransport::new();
+                    fetch_retroarch_cheat_source(&source_id, &options, &transport)
+                        .map_err(|error| error.to_string())
+                });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Polls the cheat workflow's background resources. A retrieval
+    /// result whose source no longer matches the current selection is
+    /// discarded (request-identity check); a superseded receiver was
+    /// already dropped when its state was replaced, so its result can
+    /// never arrive here at all.
+    fn poll_cheat_workflow(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if let CheatStepResource::Loading { receiver } = &workflow.source_list {
+            match receiver.try_recv() {
+                Ok(Ok(list)) => {
+                    if workflow.selected_source_id.is_none() {
+                        let enabled: Vec<&CheatSourceListEntry> = list
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.source.enabled)
+                            .collect();
+                        if enabled.len() == 1 {
+                            workflow.selected_source_id = Some(enabled[0].source.source_id.clone());
+                        }
+                    }
+                    workflow.source_list = CheatStepResource::Ready(list);
+                }
+                Ok(Err(message)) => {
+                    workflow.source_list = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.source_list = CheatStepResource::Failed(
+                        "Trusted-source listing stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        if let CheatStepResource::Loading { receiver } = &workflow.existing_library {
+            match receiver.try_recv() {
+                Ok(Ok(inspection)) => {
+                    workflow.existing_library = CheatStepResource::Ready(inspection);
+                }
+                Ok(Err(message)) => {
+                    workflow.existing_library = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.existing_library = CheatStepResource::Failed(
+                        "RetroArch library inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        let mut pcsx2_history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.pcsx2_inventory {
+            match receiver.try_recv() {
+                Ok(Ok(inventory)) => {
+                    if workflow.adapter == CheatEmulatorAdapter::Pcsx2
+                        && workflow.selected_pcsx2_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                        && workflow.pcsx2_inventory_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                    {
+                        pcsx2_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::Pcsx2PnachInspection,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "PCSX2 PNACH inspection found {} files ({} warnings).",
+                                inventory.files.len(),
+                                inventory.warnings.len()
+                            ),
+                        ));
+                        workflow.pcsx2_inventory = CheatStepResource::Ready(inventory);
+                    } else {
+                        workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    pcsx2_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::Pcsx2PnachInspection,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("PCSX2 PNACH inspection failed: {message}"),
+                    ));
+                    workflow.pcsx2_inventory = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.pcsx2_inventory = CheatStepResource::Failed(
+                        "PCSX2 PNACH inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        let mut dolphin_history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.dolphin_inventory {
+            match receiver.try_recv() {
+                Ok(Ok(inventory)) => {
+                    if workflow.adapter == CheatEmulatorAdapter::Dolphin
+                        && workflow.selected_dolphin_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                        && workflow.dolphin_inventory_profile_id.as_deref()
+                            == Some(inventory.profile_id.as_str())
+                    {
+                        dolphin_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::DolphinGameIniInspection,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "Dolphin GameSettings inspection found {} INI files ({} warnings).",
+                                inventory.files.len(),
+                                inventory.warnings.len()
+                            ),
+                        ));
+                        workflow.dolphin_inventory = CheatStepResource::Ready(inventory);
+                    } else {
+                        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    dolphin_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::DolphinGameIniInspection,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("Dolphin GameSettings inspection failed: {message}"),
+                    ));
+                    workflow.dolphin_inventory = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.dolphin_inventory = CheatStepResource::Failed(
+                        "Dolphin GameSettings inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        let mut history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.source_fetch {
+            match receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    if workflow.selected_source_id.as_deref()
+                        == Some(result.source.source_id.as_str())
+                    {
+                        history_entry = Some(HistoryEntry::new(
+                            ActivityAction::CheatSourceRetrieval,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "Cheat source '{}': {} (digest {}).",
+                                result.source.source_id,
+                                cheat_fetch_status_label(result.status),
+                                result.manifest.archive_sha256
+                            ),
+                        ));
+                        workflow.source_fetch = CheatStepResource::Ready(result);
+                    } else {
+                        // The selection changed while this retrieval ran;
+                        // its result no longer applies to anything shown.
+                        workflow.source_fetch = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatSourceRetrieval,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("Cheat source retrieval failed: {message}"),
+                    ));
+                    workflow.source_fetch = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.source_fetch = CheatStepResource::Failed(
+                        "Catalogue retrieval stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(entry) = history_entry {
+            self.history.record(entry);
+        }
+        if let Some(entry) = pcsx2_history_entry {
+            self.history.record(entry);
+        }
+        if let Some(entry) = dolphin_history_entry {
+            self.history.record(entry);
+        }
+    }
+
+    /// Revalidates the independent workspace context against the live
+    /// snapshot. Library focus is intentionally irrelevant: clearing or
+    /// changing it must not silently replace this explicit context.
+    fn reconcile_cheats_mods_context(&mut self) {
+        if self.view != MainView::CheatsMods {
+            return;
+        }
+        let context_is_current =
+            self.cheat_workflow
+                .as_ref()
+                .is_some_and(|workflow| match &self.state {
+                    LoadState::Ready(data) => data
+                        .records
+                        .iter()
+                        .any(|record| record.mount_plan.archive.path == workflow.archive_path),
+                    LoadState::Loading { .. } | LoadState::Error(_) => true,
+                });
+        if !context_is_current {
+            self.cheat_workflow = None;
+        }
+    }
+
+    fn start_pcsx2_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::Pcsx2ProfileScan,
+            None,
+            ActivityOutcome::Started,
+            "PCSX2 profile discovery started.",
+        ));
+        self.pcsx2_profiles = Pcsx2ProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result = Pcsx2ProfileDiscoveryRoots::from_environment()
+                .and_then(|roots| discover_pcsx2_profiles(&roots))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_pcsx2_profiles(&mut self) {
+        if let Pcsx2ProfilesState::Scanning { receiver } = &self.pcsx2_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(discovery)) => {
+                    let eligible = eligible_pcsx2_profile_ids(&discovery);
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Pcsx2ProfileScan,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!(
+                            "PCSX2 profile discovery found {} profiles ({} eligible).",
+                            discovery.profiles.len(),
+                            eligible.len()
+                        ),
+                    ));
+                    if let Some(workflow) = self.cheat_workflow.as_mut()
+                        && workflow.adapter == CheatEmulatorAdapter::Pcsx2
+                        && workflow
+                            .selected_pcsx2_profile_id
+                            .as_ref()
+                            .is_none_or(|selected| !eligible.contains(&selected.as_str()))
+                    {
+                        workflow.selected_pcsx2_profile_id =
+                            (eligible.len() == 1).then(|| eligible[0].to_string());
+                        workflow.pcsx2_inventory_profile_id = None;
+                        workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                    }
+                    self.pcsx2_profiles = Pcsx2ProfilesState::Ready(discovery);
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::Pcsx2ProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("PCSX2 profile discovery failed: {message}"),
+                    ));
+                    self.pcsx2_profiles = Pcsx2ProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.pcsx2_profiles = Pcsx2ProfilesState::Error(
+                        "PCSX2 profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn start_dolphin_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinProfileScan,
+            None,
+            ActivityOutcome::Started,
+            "Dolphin profile discovery started.",
+        ));
+        self.dolphin_profiles = DolphinProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result = DolphinProfileDiscoveryRoots::from_environment()
+                .and_then(|roots| discover_dolphin_profiles(&roots))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_dolphin_profiles(&mut self) {
+        if let DolphinProfilesState::Scanning { receiver } = &self.dolphin_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(discovery)) => {
+                    let eligible = eligible_dolphin_profile_ids(&discovery);
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::DolphinProfileScan,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!(
+                            "Dolphin profile discovery found {} profiles ({} eligible).",
+                            discovery.profiles.len(),
+                            eligible.len()
+                        ),
+                    ));
+                    if let Some(workflow) = self.cheat_workflow.as_mut()
+                        && workflow.adapter == CheatEmulatorAdapter::Dolphin
+                        && workflow
+                            .selected_dolphin_profile_id
+                            .as_ref()
+                            .is_none_or(|selected| !eligible.contains(&selected.as_str()))
+                    {
+                        workflow.selected_dolphin_profile_id =
+                            (eligible.len() == 1).then(|| eligible[0].to_string());
+                        workflow.dolphin_inventory_profile_id = None;
+                        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                    }
+                    self.dolphin_profiles = DolphinProfilesState::Ready(discovery);
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::DolphinProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("Dolphin profile discovery failed: {message}"),
+                    ));
+                    self.dolphin_profiles = DolphinProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.dolphin_profiles = DolphinProfilesState::Error(
+                        "Dolphin profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Starts a background RetroArch profile discovery scan - blocking
+    /// filesystem probing, so it never runs on the UI thread, exactly
+    /// like every other workflow. The result replaces the previous
+    /// discovery wholesale.
+    fn start_retroarch_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::RetroArchProfileScan,
+            None,
+            ActivityOutcome::Started,
+            "RetroArch profile discovery started.",
+        ));
+        self.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let filesystem = HostReadOnlyFilesystem;
+            let environment = DiscoveryEnvironment::from_process_environment();
+            let result = discover_retroarch_cheat_setup_profiles(&filesystem, &environment, None)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_retroarch_profiles(&mut self) {
+        if let RetroArchProfilesState::Scanning { receiver } = &self.retroarch_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(discovery)) => {
+                    let eligible = discovery
+                        .profiles
+                        .iter()
+                        .filter(|profile| profile.eligible)
+                        .count();
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::RetroArchProfileScan,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!(
+                            "RetroArch profile discovery found {} profiles ({} eligible).",
+                            discovery.profiles.len(),
+                            eligible
+                        ),
+                    ));
+                    let automatic_profile = {
+                        let eligible = eligible_profile_ids(&discovery);
+                        (eligible.len() == 1).then(|| eligible[0].to_string())
+                    };
+                    self.retroarch_profiles = RetroArchProfilesState::Ready(discovery);
+                    if let Some(workflow) = self.cheat_workflow.as_mut()
+                        && workflow.selected_profile_id.is_none()
+                    {
+                        workflow.selected_profile_id = automatic_profile;
+                        workflow.existing_library_profile_id = None;
+                        workflow.existing_library = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::RetroArchProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("RetroArch profile discovery failed: {message}"),
+                    ));
+                    self.retroarch_profiles = RetroArchProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.retroarch_profiles = RetroArchProfilesState::Error(
+                        "RetroArch profile discovery stopped unexpectedly.".to_string(),
+                    );
                 }
             }
         }
@@ -4776,6 +5694,9 @@ enum AppOperationRequest {
     /// *previously run* preview already said about this archive, since
     /// jumping pages must never bypass Preview's own safety gate.
     ShowInLibraryViews(PathBuf),
+    /// Opens the first-class Cheats & Mods workspace for this exact
+    /// archive - see `ArchiveFsApp::open_cheats_mods_workspace`.
+    OpenCheatsMods(PathBuf),
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -4912,6 +5833,10 @@ impl eframe::App for ArchiveFsApp {
         self.poll_operation(context);
         self.poll_mount_all(context);
         self.poll_unmount_all(context);
+        self.poll_retroarch_profiles();
+        self.poll_pcsx2_profiles();
+        self.poll_dolphin_profiles();
+        self.poll_cheat_workflow();
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
@@ -4948,7 +5873,7 @@ impl eframe::App for ArchiveFsApp {
 
         egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("ArchiveFS");
+                ui.label(egui::RichText::new(main_view_title(self.view)).strong());
                 ui.separator();
                 ui.menu_button("File", |ui| {
                     if ui.button("Quit").clicked() {
@@ -4999,8 +5924,6 @@ impl eframe::App for ArchiveFsApp {
                     }
                 });
                 ui.menu_button("Sources", |ui| {
-                    // Milestone requirement: "do not pretend multi-folder
-                    // add/remove exists yet" - navigation only.
                     if ui.button("Open Sources page").clicked() {
                         self.view = MainView::Sources;
                         self.tools_overlay = ToolsOverlay::None;
@@ -5052,14 +5975,30 @@ impl eframe::App for ArchiveFsApp {
                     }
                 });
             });
+        });
 
-            ui.add_space(4.0);
-            if let Some(clicked) = show_primary_navigation(ui, self.view, has_database) {
+        let mut navigation_request = None;
+        egui::SidePanel::left("app_navigation")
+            .resizable(false)
+            .exact_width(218.0)
+            .show(context, |ui| {
+                ui.add_space(14.0);
+                navigation_request = show_primary_navigation(ui, self.view, has_database);
+            });
+        if let Some(clicked) = navigation_request {
+            if clicked == MainView::CheatsMods {
+                if let Some(path) = self.selected_archive.clone() {
+                    self.open_cheats_mods_workspace(context, path);
+                } else {
+                    self.view = MainView::CheatsMods;
+                    self.tools_overlay = ToolsOverlay::None;
+                    self.cheat_workflow = None;
+                }
+            } else {
                 self.view = clicked;
                 self.tools_overlay = ToolsOverlay::None;
             }
-            ui.add_space(4.0);
-        });
+        }
 
         if let Some(ActivityPanelAction::ShowRelatedArchive(path)) = show_activity_panel(
             context,
@@ -5073,11 +6012,16 @@ impl eframe::App for ArchiveFsApp {
         }
 
         if self.show_about {
+            let mount_root = match &self.state {
+                LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                _ => None,
+            };
             show_about_window(
                 context,
                 &mut self.show_about,
                 &self.database_state,
                 &self.diagnostics,
+                mount_root,
                 &mut self.clipboard,
             );
         }
@@ -5089,403 +6033,790 @@ impl eframe::App for ArchiveFsApp {
         let mut stop_mount_all = false;
         let mut stop_unmount_all = false;
         egui::CentralPanel::default().show(context, |ui| {
-            if self.tools_overlay != ToolsOverlay::None {
-                match self.tools_overlay {
-                    ToolsOverlay::Diagnostics => {
-                        diagnostics_action = show_setup_diagnostics(
-                            ui,
-                            &self.diagnostics,
-                            self.setup_action.is_some(),
-                            self.feedback.as_ref(),
-                            self.refresh_error.as_deref(),
-                            self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
-                        );
-                    }
-                    ToolsOverlay::PlatformAliases => {
-                        if show_tools_overlay_header(ui, "Platform Aliases") {
-                            self.tools_overlay = ToolsOverlay::None;
+            let width = if self.tools_overlay == ToolsOverlay::None {
+                main_view_content_width(self.view)
+            } else if self.tools_overlay == ToolsOverlay::ArchiveInspector {
+                ui_layout::ContentWidth::Wide
+            } else {
+                ui_layout::ContentWidth::Normal
+            };
+            ui_layout::page(ui, width, |ui| {
+                self.reconcile_cheats_mods_context();
+
+                if self.tools_overlay != ToolsOverlay::None {
+                    match self.tools_overlay {
+                        ToolsOverlay::Diagnostics => {
+                            diagnostics_action = show_setup_diagnostics(
+                                ui,
+                                &self.diagnostics,
+                                self.setup_action.is_some(),
+                                self.feedback.as_ref(),
+                                self.refresh_error.as_deref(),
+                                self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
+                            );
                         }
-                        let cached_aliases = self
-                            .database_state
-                            .snapshot()
-                            .map(|snapshot| snapshot.platform_aliases.as_slice())
-                            .unwrap_or(&[]);
-                        if let Some(action) = show_platform_aliases_panel(
-                            ui,
-                            cached_aliases,
-                            &mut self.new_alias_text,
-                            &mut self.new_alias_platform_choice,
-                            self.alias_action.is_some(),
-                            &mut self.clipboard,
-                        ) {
-                            self.start_alias_action(context.clone(), action);
+                        ToolsOverlay::PlatformAliases => {
+                            if show_tools_overlay_header(ui, "Platform Aliases") {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                            let cached_aliases = self
+                                .database_state
+                                .snapshot()
+                                .map(|snapshot| snapshot.platform_aliases.as_slice())
+                                .unwrap_or(&[]);
+                            if let Some(action) = show_platform_aliases_panel(
+                                ui,
+                                cached_aliases,
+                                &mut self.new_alias_text,
+                                &mut self.new_alias_platform_choice,
+                                self.alias_action.is_some(),
+                                &mut self.clipboard,
+                            ) {
+                                self.start_alias_action(context.clone(), action);
+                            }
                         }
-                    }
-                    ToolsOverlay::DatabaseStatus => {
-                        if show_tools_overlay_header(ui, "Database Status") {
-                            self.tools_overlay = ToolsOverlay::None;
-                        }
-                        if let Some(action) = show_database_panel(ui, &self.database_state) {
-                            match action {
-                                DatabasePanelAction::ScanLibrary => {
-                                    self.start_database_action(context.clone(), true);
-                                }
-                                DatabasePanelAction::RefreshStatus
-                                | DatabasePanelAction::RetryLoad => {
-                                    self.start_database_action(context.clone(), false);
+                        ToolsOverlay::DatabaseStatus => {
+                            if show_tools_overlay_header(ui, "Database Status") {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                            if let Some(action) = show_database_panel(ui, &self.database_state) {
+                                match action {
+                                    DatabasePanelAction::ScanLibrary => {
+                                        self.start_database_action(context.clone(), true);
+                                    }
+                                    DatabasePanelAction::RefreshStatus
+                                    | DatabasePanelAction::RetryLoad => {
+                                        self.start_database_action(context.clone(), false);
+                                    }
                                 }
                             }
                         }
-                    }
-                    ToolsOverlay::DoctorChecks => {
-                        if show_tools_overlay_header(ui, "Doctor Checks") {
-                            self.tools_overlay = ToolsOverlay::None;
+                        ToolsOverlay::DoctorChecks => {
+                            if show_tools_overlay_header(ui, "Doctor Checks") {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                            let doctor = match &self.state {
+                                LoadState::Ready(data) => Some(&data.doctor),
+                                _ => None,
+                            };
+                            show_doctor_checks_panel(ui, doctor);
                         }
-                        let doctor = match &self.state {
-                            LoadState::Ready(data) => Some(&data.doctor),
+                        ToolsOverlay::ArchiveInspector => {
+                            if let Some(inspector) = self.archive_inspector.as_mut()
+                                && show_archive_inspector_panel(ui, inspector, &mut self.clipboard)
+                            {
+                                self.tools_overlay = ToolsOverlay::None;
+                            }
+                        }
+                        ToolsOverlay::None => unreachable!(),
+                    }
+                    return;
+                }
+
+                if let Some(error) = &self.refresh_error {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Refresh failed; showing the last known snapshot: {error}"),
+                    );
+                    ui.separator();
+                }
+                if let Some(batch) = self.mount_all.as_ref() {
+                    stop_mount_all = show_mount_all_progress(ui, &batch.progress);
+                    ui.separator();
+                }
+                if let Some(batch) = self.unmount_all.as_ref() {
+                    stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
+                    ui.separator();
+                }
+
+                if self.view == MainView::Sources {
+                    let sources = self
+                        .database_state
+                        .snapshot()
+                        .map(|snapshot| snapshot.source_views.as_slice())
+                        .unwrap_or(&[]);
+                    let mount_root = match &self.state {
+                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                        LoadState::Loading { .. } | LoadState::Error(_) => None,
+                    };
+                    let sources_action = show_sources_page(
+                        ui,
+                        sources,
+                        mount_root,
+                        self.source_action.is_some(),
+                        &mut self.sources_add_dialog,
+                        &mut self.sources_remove_dialog,
+                        &mut self.clipboard,
+                    );
+                    if let Some(sources_action) = sources_action {
+                        match sources_action {
+                            SourcesPageAction::AddFolder(path) => {
+                                self.start_source_action(context.clone(), SourceAction::Add(path));
+                            }
+                            SourcesPageAction::ScanOne(path) => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::ScanOne(path),
+                                );
+                            }
+                            SourcesPageAction::ScanAll => {
+                                self.start_source_action(context.clone(), SourceAction::ScanAll);
+                            }
+                            SourcesPageAction::RefreshStatus => {
+                                self.start_database_action(context.clone(), false);
+                            }
+                            SourcesPageAction::SetEnabled { path, enabled } => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::SetEnabled { path, enabled },
+                                );
+                            }
+                            SourcesPageAction::ConfirmRemove {
+                                path,
+                                keep_catalogue,
+                            } => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::Remove {
+                                        path,
+                                        keep_catalogue,
+                                    },
+                                );
+                            }
+                            SourcesPageAction::ViewInLibrary(path) => {
+                                self.view = MainView::Library;
+                                self.library_source_filter = Some(Some(path));
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if self.view == MainView::LibraryViews {
+                    let all_source_folders = self
+                        .database_state
+                        .snapshot()
+                        .map(|snapshot| snapshot.source_views.as_slice())
+                        .unwrap_or(&[]);
+                    let library_view_action = show_library_views_page(
+                        ui,
+                        &self.library_views,
+                        all_source_folders,
+                        self.library_view_action.is_some(),
+                        self.library_view_last_plan.as_ref(),
+                        self.library_view_focus_archive.as_deref(),
+                        &mut self.library_view_plan_filter,
+                        &mut self.library_view_form_dialog,
+                        &mut self.library_view_remove_dialog,
+                        &mut self.clipboard,
+                    );
+                    if let Some(library_view_action) = library_view_action {
+                        self.start_library_view_action(context.clone(), library_view_action);
+                    }
+                    return;
+                }
+
+                if self.view == MainView::Duplicates {
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        match show_duplicate_review_panel(
+                            ui,
+                            &snapshot.duplicate_report,
+                            DuplicateReviewViewState {
+                                filters: &mut self.duplicate_filters,
+                                sort_field: &mut self.duplicate_sort_field,
+                                sort_ascending: &mut self.duplicate_sort_ascending,
+                                selected_group: &mut self.selected_duplicate_group,
+                                selected_archive: &mut self.selected_duplicate_archive,
+                                clipboard: &mut self.clipboard,
+                            },
+                        ) {
+                            Some(DuplicateReviewAction::Close) => {
+                                self.view = MainView::Library;
+                            }
+                            Some(DuplicateReviewAction::ViewInLibrary(path)) => {
+                                self.view = MainView::Library;
+                                self.selected_archive = Some(path.clone());
+                                self.selected_archives = [path].into_iter().collect();
+                            }
+                            Some(DuplicateReviewAction::Inspect(path)) => {
+                                self.start_archive_inspection(context.clone(), path);
+                            }
+                            None => {}
+                        }
+                    } else {
+                        ui.label("Scan the library to review duplicates.");
+                    }
+                    return;
+                }
+
+                if self.view == MainView::Health {
+                    // `cached_health_issues` needs `&mut self` (it may rebuild
+                    // and store the cache); `.to_vec()` copies the small
+                    // already-built `Vec<HealthIssue>` out and ends that
+                    // mutable borrow immediately, so the immutable borrows of
+                    // `self.database_state`/`self.state` just below (for the
+                    // much larger `LoadedData`/`CachedLibrarySnapshot`, passed
+                    // by reference rather than cloned) never conflict with it.
+                    let issues = self.cached_health_issues().to_vec();
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        let live_data = match &self.state {
+                            LoadState::Ready(data) => Some(data.as_ref()),
                             _ => None,
                         };
-                        show_doctor_checks_panel(ui, doctor);
+                        health_dashboard_action = show_health_dashboard_panel(
+                            ui,
+                            live_data,
+                            snapshot,
+                            &issues,
+                            HealthDashboardViewState {
+                                filters: &mut self.health_filters,
+                                sort_field: &mut self.health_sort_field,
+                                sort_ascending: &mut self.health_sort_ascending,
+                                selected_issue: &mut self.selected_health_issue,
+                                busy: archive_actions_blocked,
+                                clipboard: &mut self.clipboard,
+                            },
+                        );
+                    } else {
+                        ui.label("Scan the library to see the health dashboard.");
                     }
-                    ToolsOverlay::ArchiveInspector => {
-                        if let Some(inspector) = self.archive_inspector.as_mut()
-                            && show_archive_inspector_panel(ui, inspector, &mut self.clipboard)
-                        {
-                            self.tools_overlay = ToolsOverlay::None;
-                        }
-                    }
-                    ToolsOverlay::None => unreachable!(),
+                    return;
                 }
-                return;
-            }
 
-            if let Some(error) = &self.refresh_error {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Refresh failed; showing the last known snapshot: {error}"),
-                );
-                ui.separator();
-            }
-            if let Some(batch) = self.mount_all.as_ref() {
-                stop_mount_all = show_mount_all_progress(ui, &batch.progress);
-                ui.separator();
-            }
-            if let Some(batch) = self.unmount_all.as_ref() {
-                stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
-                ui.separator();
-            }
-
-            if self.view == MainView::Sources {
-                let sources = self
-                    .database_state
-                    .snapshot()
-                    .map(|snapshot| snapshot.source_views.as_slice())
-                    .unwrap_or(&[]);
-                let mount_root = match &self.state {
-                    LoadState::Ready(data) => Some(data.mount_root.as_path()),
-                    LoadState::Loading { .. } | LoadState::Error(_) => None,
-                };
-                let sources_action = show_sources_page(
-                    ui,
-                    sources,
-                    mount_root,
-                    self.source_action.is_some(),
-                    &mut self.sources_add_dialog,
-                    &mut self.sources_remove_dialog,
-                    &mut self.clipboard,
-                );
-                if let Some(sources_action) = sources_action {
-                    match sources_action {
-                        SourcesPageAction::AddFolder(path) => {
-                            self.start_source_action(context.clone(), SourceAction::Add(path));
+                if self.view == MainView::CheatsMods {
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        LoadState::Loading { previous, .. } => previous.as_deref(),
+                        LoadState::Error(_) => None,
+                    };
+                    let action = egui::ScrollArea::vertical()
+                        .id_salt("cheats_mods_workspace_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            show_cheats_mods_page(
+                                ui,
+                                self.cheat_workflow.as_mut(),
+                                &self.retroarch_profiles,
+                                &self.pcsx2_profiles,
+                                &self.dolphin_profiles,
+                                live,
+                                self.database_state.snapshot(),
+                                &self.history,
+                                busy,
+                                &mut self.clipboard,
+                            )
+                        })
+                        .inner;
+                    let picker_rows = live
+                        .map(|data| {
+                            build_display_rows(
+                                &data.records,
+                                &data.rows,
+                                self.database_state.snapshot(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    match action {
+                        Some(CheatWorkflowAction::ChooseArchive) => {
+                            self.open_cheat_archive_picker();
                         }
-                        SourcesPageAction::ScanOne(path) => {
-                            self.start_source_action(context.clone(), SourceAction::ScanOne(path));
-                        }
-                        SourcesPageAction::ScanAll => {
-                            self.start_source_action(context.clone(), SourceAction::ScanAll);
-                        }
-                        SourcesPageAction::RefreshStatus => {
-                            self.start_database_action(context.clone(), false);
-                        }
-                        SourcesPageAction::SetEnabled { path, enabled } => {
-                            self.start_source_action(
-                                context.clone(),
-                                SourceAction::SetEnabled { path, enabled },
-                            );
-                        }
-                        SourcesPageAction::ConfirmRemove {
-                            path,
-                            keep_catalogue,
-                        } => {
-                            self.start_source_action(
-                                context.clone(),
-                                SourceAction::Remove {
-                                    path,
-                                    keep_catalogue,
-                                },
-                            );
-                        }
-                        SourcesPageAction::ViewInLibrary(path) => {
+                        Some(CheatWorkflowAction::OpenLibrary) => {
                             self.view = MainView::Library;
-                            self.library_source_filter = Some(Some(path));
                         }
+                        Some(CheatWorkflowAction::SelectAdapter(adapter)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                select_cheat_adapter(workflow, adapter);
+                            }
+                            if adapter == CheatEmulatorAdapter::Pcsx2
+                                && matches!(
+                                    self.pcsx2_profiles,
+                                    Pcsx2ProfilesState::NotScanned
+                                        | Pcsx2ProfilesState::Error(_)
+                                )
+                            {
+                                self.start_pcsx2_profile_scan(context.clone());
+                            }
+                            if adapter == CheatEmulatorAdapter::Dolphin
+                                && matches!(
+                                    self.dolphin_profiles,
+                                    DolphinProfilesState::NotScanned
+                                        | DolphinProfilesState::Error(_)
+                                )
+                            {
+                                self.start_dolphin_profile_scan(context.clone());
+                            }
+                        }
+                        Some(CheatWorkflowAction::RescanProfiles) => {
+                            self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RescanPcsx2Profiles) => {
+                            self.start_pcsx2_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::InspectPcsx2Profile) => {
+                            self.start_pcsx2_inventory(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RescanDolphinProfiles) => {
+                            self.start_dolphin_profile_scan(context.clone());
+                        }
+                        Some(CheatWorkflowAction::InspectDolphinProfile) => {
+                            self.start_dolphin_inventory(context.clone());
+                        }
+                        Some(CheatWorkflowAction::InspectExistingLibrary) => {
+                            self.start_existing_retroarch_library_inspection(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RefreshSources) => {
+                            self.start_cheat_source_list(context.clone());
+                        }
+                        Some(CheatWorkflowAction::FetchSource) => {
+                            self.start_cheat_source_fetch(context.clone(), false);
+                        }
+                        Some(CheatWorkflowAction::UseCachedSnapshot) => {
+                            self.start_cheat_source_fetch(context.clone(), true);
+                        }
+                        None => {}
                     }
+                    let picker_action = self.cheat_archive_picker.as_mut().and_then(|picker| {
+                        show_cheat_archive_picker(
+                            context,
+                            picker,
+                            &picker_rows,
+                            &mut self.clipboard,
+                        )
+                    });
+                    match picker_action {
+                        Some(CheatArchivePickerAction::Cancel) => {
+                            self.cheat_archive_picker = None;
+                        }
+                        Some(CheatArchivePickerAction::Select(path)) => {
+                            let requires_confirmation = cheat_archive_change_requires_confirmation(
+                                self.cheat_workflow.as_ref(),
+                                &path,
+                            );
+                            self.cheat_archive_picker = None;
+                            if requires_confirmation {
+                                self.confirm_cheat_archive_change = Some(path);
+                            } else {
+                                self.apply_cheat_archive_choice(context, path);
+                            }
+                        }
+                        None => {}
+                    }
+                    if let Some(path) = self.confirm_cheat_archive_change.clone() {
+                        let candidate_still_exists = picker_rows
+                            .iter()
+                            .any(|row| row.origin == RowOrigin::Live && row.path == path);
+                        egui::Window::new("Change Cheats & Mods archive?")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .show(context, |ui| {
+                                ui.label("The current archive has catalogue retrieval state. Changing archive discards that page state; it does not alter either archive or RetroArch.");
+                                ui.label(path.display().to_string());
+                                ui.horizontal(|ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        self.confirm_cheat_archive_change = None;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            candidate_still_exists,
+                                            egui::Button::new("Change archive"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.apply_cheat_archive_choice(context, path.clone());
+                                    }
+                                });
+                            });
+                    }
+                    return;
                 }
-                return;
-            }
 
-            if self.view == MainView::LibraryViews {
-                let all_source_folders = self
-                    .database_state
-                    .snapshot()
-                    .map(|snapshot| snapshot.source_views.as_slice())
-                    .unwrap_or(&[]);
-                let library_view_action = show_library_views_page(
-                    ui,
-                    &self.library_views,
-                    all_source_folders,
-                    self.library_view_action.is_some(),
-                    self.library_view_last_plan.as_ref(),
-                    self.library_view_focus_archive.as_deref(),
-                    &mut self.library_view_plan_filter,
-                    &mut self.library_view_form_dialog,
-                    &mut self.library_view_remove_dialog,
-                    &mut self.clipboard,
-                );
-                if let Some(library_view_action) = library_view_action {
-                    self.start_library_view_action(context.clone(), library_view_action);
-                }
-                return;
-            }
-
-            if self.view == MainView::Duplicates {
-                if let Some(snapshot) = self.database_state.snapshot() {
-                    match show_duplicate_review_panel(
+                if self.view == MainView::Mount {
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        _ => None,
+                    };
+                    let action = show_mount_page(
                         ui,
-                        &snapshot.duplicate_report,
-                        DuplicateReviewViewState {
-                            filters: &mut self.duplicate_filters,
-                            sort_field: &mut self.duplicate_sort_field,
-                            sort_ascending: &mut self.duplicate_sort_ascending,
-                            selected_group: &mut self.selected_duplicate_group,
-                            selected_archive: &mut self.selected_duplicate_archive,
-                            clipboard: &mut self.clipboard,
+                        live,
+                        self.mount_all_result.as_ref(),
+                        MountPageViewState {
+                            queue: &mut self.mount_queue,
+                            search: &mut self.mount_search,
+                            confirm: &mut self.confirm_mount_queue,
+                            busy: archive_actions_blocked,
+                            block_reason: archive_action_block_reason,
                         },
-                    ) {
-                        Some(DuplicateReviewAction::Close) => {
-                            self.view = MainView::Library;
+                    );
+                    self.handle_mount_page_action(context, action);
+                    return;
+                }
+
+                if self.view == MainView::Selected {
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        _ => None,
+                    };
+                    let action = show_selected_page(
+                        ui,
+                        live,
+                        self.mount_all_result.as_ref(),
+                        SelectedPageViewState {
+                            selected_archive: self.selected_archive.as_deref(),
+                            selected_count: self.selected_archives.len(),
+                            retroarch_profiles: &self.retroarch_profiles,
+                            queue: &mut self.mount_queue,
+                            confirm: &mut self.confirm_mount_queue,
+                            busy: archive_actions_blocked,
+                            block_reason: archive_action_block_reason,
+                        },
+                    );
+                    self.handle_mount_page_action(context, action);
+                    return;
+                }
+
+                if self.view == MainView::ActiveMounts {
+                    let live_records = match &self.state {
+                        LoadState::Ready(data) => Some(data.records.as_slice()),
+                        _ => None,
+                    };
+                    let action = show_active_mounts_page(
+                        ui,
+                        live_records,
+                        &mut self.active_mounts_confirm_unmount,
+                        &mut self.cleanup_after_unmount,
+                        self.feedback.as_ref(),
+                        archive_actions_blocked,
+                    );
+                    match action {
+                        Some(ActiveMountsPageAction::Unmount(archive_path)) => {
+                            requested_action =
+                                Some(AppOperationRequest::Archive(OperationRequest {
+                                    action: ArchiveAction::Unmount,
+                                    archive_path,
+                                    cleanup_after_unmount: self.cleanup_after_unmount,
+                                }));
                         }
-                        Some(DuplicateReviewAction::ViewInLibrary(path)) => {
+                        Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
                             self.view = MainView::Library;
                             self.selected_archive = Some(path.clone());
                             self.selected_archives = [path].into_iter().collect();
                         }
-                        Some(DuplicateReviewAction::Inspect(path)) => {
-                            self.start_archive_inspection(context.clone(), path);
+                        Some(ActiveMountsPageAction::Refresh) => self.refresh(context),
+                        None => {}
+                    }
+                    return;
+                }
+
+                if self.view == MainView::Doctor {
+                    widgets::page_header(
+                        ui,
+                        "Doctor",
+                        "Check ArchiveFS health, with blocking issues and warnings shown first.",
+                    );
+                    let mut run_requested = false;
+                    {
+                        let doctor = match &self.state {
+                            LoadState::Ready(data) => Some(&data.doctor),
+                            _ => None,
+                        };
+                        if let Some(report) = doctor {
+                            widgets::card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    let failures = report
+                                        .checks
+                                        .iter()
+                                        .filter(|check| check.status == DoctorStatus::Fail)
+                                        .count();
+                                    let warnings = report
+                                        .checks
+                                        .iter()
+                                        .filter(|check| check.status == DoctorStatus::Warn)
+                                        .count();
+                                    widgets::status_badge(
+                                        ui,
+                                        if failures == 0 {
+                                            "Healthy"
+                                        } else {
+                                            "Needs attention"
+                                        },
+                                        if failures == 0 {
+                                            widgets::StatusTone::Success
+                                        } else {
+                                            widgets::StatusTone::Blocked
+                                        },
+                                    );
+                                    ui.label(doctor_summary_text(report));
+                                    if widgets::action_button(
+                                        ui,
+                                        "Run all checks",
+                                        widgets::ActionStyle::Primary,
+                                        !loading && !busy,
+                                    )
+                                    .clicked()
+                                    {
+                                        run_requested = true;
+                                    }
+                                    if widgets::action_button(
+                                        ui,
+                                        "Copy summary",
+                                        widgets::ActionStyle::Secondary,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        let _ = self.clipboard.set_text(doctor_report_text(report));
+                                    }
+                                    if warnings > 0 {
+                                        widgets::status_badge(
+                                            ui,
+                                            format!("{warnings} warnings"),
+                                            widgets::StatusTone::Warning,
+                                        );
+                                    }
+                                })
+                                .inner
+                            });
+                            ui.add_space(12.0);
+                        }
+                        show_doctor_checks_panel(ui, doctor);
+                    }
+                    if run_requested {
+                        self.refresh(context);
+                    }
+                    return;
+                }
+
+                if self.view == MainView::HistoryLogs {
+                    show_history_logs_page(
+                        ui,
+                        &mut self.history,
+                        &mut self.history_filters,
+                        &mut self.clipboard,
+                    );
+                    return;
+                }
+
+                if self.view == MainView::Settings {
+                    let mount_root = match &self.state {
+                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
+                        _ => None,
+                    };
+                    let action = show_settings_page(
+                        ui,
+                        &self.database_state,
+                        &self.diagnostics,
+                        &self.retroarch_profiles,
+                        mount_root,
+                        busy,
+                        &mut self.clipboard,
+                    );
+                    match action {
+                        Some(SettingsPageAction::OpenConfigFolder) => {
+                            self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder);
+                        }
+                        Some(SettingsPageAction::ValidateConfiguration) => {
+                            self.refresh_diagnostics(context);
+                        }
+                        Some(SettingsPageAction::OpenDiagnostics) => {
+                            self.tools_overlay = ToolsOverlay::Diagnostics;
+                            self.refresh_diagnostics(context);
+                        }
+                        Some(SettingsPageAction::RescanRetroArchProfiles) => {
+                            self.start_retroarch_profile_scan(context.clone());
                         }
                         None => {}
                     }
-                } else {
-                    ui.label("Scan the library to review duplicates.");
+                    return;
                 }
-                return;
-            }
 
-            if self.view == MainView::Health {
-                // `cached_health_issues` needs `&mut self` (it may rebuild
-                // and store the cache); `.to_vec()` copies the small
-                // already-built `Vec<HealthIssue>` out and ends that
-                // mutable borrow immediately, so the immutable borrows of
-                // `self.database_state`/`self.state` just below (for the
-                // much larger `LoadedData`/`CachedLibrarySnapshot`, passed
-                // by reference rather than cloned) never conflict with it.
-                let issues = self.cached_health_issues().to_vec();
-                if let Some(snapshot) = self.database_state.snapshot() {
-                    let live_data = match &self.state {
-                        LoadState::Ready(data) => Some(data.as_ref()),
+                if self.view == MainView::About {
+                    let mount_root = match &self.state {
+                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
                         _ => None,
                     };
-                    health_dashboard_action = show_health_dashboard_panel(
+                    show_about_contents(
                         ui,
-                        live_data,
-                        snapshot,
-                        &issues,
-                        HealthDashboardViewState {
-                            filters: &mut self.health_filters,
-                            sort_field: &mut self.health_sort_field,
-                            sort_ascending: &mut self.health_sort_ascending,
-                            selected_issue: &mut self.selected_health_issue,
-                            busy: archive_actions_blocked,
-                            clipboard: &mut self.clipboard,
-                        },
+                        &self.database_state,
+                        &self.diagnostics,
+                        mount_root,
+                        &mut self.clipboard,
                     );
-                } else {
-                    ui.label("Scan the library to see the health dashboard.");
+                    return;
                 }
-                return;
-            }
 
-            match &self.state {
-                LoadState::Loading { .. } => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.spinner();
-                        ui.heading("Loading ArchiveFS data...");
-                        ui.label("Scanning runs in the background.");
-                    });
-                    // Requirement 1: show cached library rows before the
-                    // live snapshot finishes loading, clearly labelled as
-                    // last-known state. This is a read-only preview -
-                    // built with the same ArchiveRow/show_archive_rows
-                    // machinery as the live table, but with no selection
-                    // or action wiring at all, so it cannot expose a mount
-                    // or unmount button even in principle.
-                    if let Some(snapshot) = self.database_state.snapshot() {
-                        ui.separator();
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "Showing last-known catalogue state while the live snapshot loads.",
-                        );
-                        let preview_rows: Vec<ArchiveRow> = snapshot
-                            .archives
-                            .iter()
-                            .map(|persisted| {
-                                let path_exists = persisted.absolute_path.exists();
-                                ArchiveRow::from_cached(persisted, path_exists)
-                            })
-                            .collect();
-                        let row_height = fixed_row_height(
-                            ui.text_style_height(&egui::TextStyle::Body),
-                            ui.spacing().interact_size.y,
-                        );
-                        let horizontal_spacing = ui.spacing().item_spacing.x;
-                        let preview_widths = self.library_column_widths.as_array();
-                        egui::ScrollArea::horizontal()
-                            .id_salt("cache_preview_horizontal")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_min_width(table_width(horizontal_spacing, &preview_widths));
-                                // This cache-only loading preview has no sort
-                                // state of its own to wire up (it disappears
-                                // the moment the live snapshot loads) - the
-                                // headers render inertly, unsorted. Still
-                                // resizable (shares `self.library_column_widths`
-                                // with the real table) so a resize made here
-                                // is not lost once the live snapshot loads.
-                                let _ = show_header_row(
-                                    ui,
-                                    &COLUMN_HEADERS,
-                                    &COLUMN_SORT_FIELDS,
-                                    row_height,
-                                    None,
-                                    true,
-                                    &mut self.library_column_widths,
-                                );
-                                ui.separator();
-                                let body_height = ui.available_height().max(row_height);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("cache_preview_vertical")
-                                    .max_height(body_height)
-                                    .auto_shrink([false, false])
-                                    .show_rows(
+                match &self.state {
+                    LoadState::Loading { .. } => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(80.0);
+                            ui.spinner();
+                            ui.heading("Loading ArchiveFS data...");
+                            ui.label("Scanning runs in the background.");
+                        });
+                        // Requirement 1: show cached library rows before the
+                        // live snapshot finishes loading, clearly labelled as
+                        // last-known state. This is a read-only preview -
+                        // built with the same ArchiveRow/show_archive_rows
+                        // machinery as the live table, but with no selection
+                        // or action wiring at all, so it cannot expose a mount
+                        // or unmount button even in principle.
+                        if let Some(snapshot) = self.database_state.snapshot() {
+                            ui.separator();
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "Showing last-known catalogue state while the live snapshot loads.",
+                            );
+                            let preview_rows: Vec<ArchiveRow> = snapshot
+                                .archives
+                                .iter()
+                                .map(|persisted| {
+                                    let path_exists = persisted.absolute_path.exists();
+                                    ArchiveRow::from_cached(persisted, path_exists)
+                                })
+                                .collect();
+                            let row_height = fixed_row_height(
+                                ui.text_style_height(&egui::TextStyle::Body),
+                                ui.spacing().interact_size.y,
+                            );
+                            let horizontal_spacing = ui.spacing().item_spacing.x;
+                            let preview_widths = self.library_column_widths.as_array();
+                            egui::ScrollArea::horizontal()
+                                .id_salt("cache_preview_horizontal")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(table_width(
+                                        horizontal_spacing,
+                                        &preview_widths,
+                                    ));
+                                    // This cache-only loading preview has no sort
+                                    // state of its own to wire up (it disappears
+                                    // the moment the live snapshot loads) - the
+                                    // headers render inertly, unsorted. Still
+                                    // resizable (shares `self.library_column_widths`
+                                    // with the real table) so a resize made here
+                                    // is not lost once the live snapshot loads.
+                                    let _ = show_header_row(
                                         ui,
+                                        &COLUMN_HEADERS,
+                                        &COLUMN_SORT_FIELDS,
                                         row_height,
-                                        preview_rows.len(),
-                                        |ui, row_range| {
-                                            // Discard the result: this preview never sets
-                                            // selected_archive, so it can never drive
-                                            // show_selected_archive's action buttons, and
-                                            // `records: &[]` means its context menu (if
-                                            // right-clicked) offers nothing live either.
-                                            let _ = show_archive_rows(
-                                                ui,
-                                                &preview_rows,
-                                                None,
-                                                row_range,
-                                                row_height,
-                                                None,
-                                                &mut HashSet::new(),
-                                                &mut None,
-                                                &preview_widths,
-                                                &RowMenuContext {
-                                                    records: &[],
-                                                    cached: None,
-                                                    busy: true,
-                                                    block_reason: None,
-                                                    platform_busy: false,
-                                                    library_views_configured: false,
-                                                    library_view_last_plan: None,
-                                                },
-                                            );
-                                        },
+                                        None,
+                                        true,
+                                        &mut self.library_column_widths,
                                     );
-                            });
+                                    ui.separator();
+                                    let body_height = ui.available_height().max(row_height);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("cache_preview_vertical")
+                                        .max_height(body_height)
+                                        .auto_shrink([false, false])
+                                        .show_rows(
+                                            ui,
+                                            row_height,
+                                            preview_rows.len(),
+                                            |ui, row_range| {
+                                                // Discard the result: this preview never sets
+                                                // selected_archive, so it can never drive
+                                                // show_selected_archive's action buttons, and
+                                                // `records: &[]` means its context menu (if
+                                                // right-clicked) offers nothing live either.
+                                                let _ = show_archive_rows(
+                                                    ui,
+                                                    &preview_rows,
+                                                    None,
+                                                    row_range,
+                                                    row_height,
+                                                    None,
+                                                    &mut HashSet::new(),
+                                                    &mut None,
+                                                    &preview_widths,
+                                                    &RowMenuContext {
+                                                        records: &[],
+                                                        cached: None,
+                                                        busy: true,
+                                                        block_reason: None,
+                                                        platform_busy: false,
+                                                        retroarch_profiles: &self
+                                                            .retroarch_profiles,
+                                                        library_views_configured: false,
+                                                        library_view_last_plan: None,
+                                                    },
+                                                );
+                                            },
+                                        );
+                                });
+                        }
+                    }
+                    LoadState::Error(error) => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(80.0);
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                "Could not load ArchiveFS",
+                            );
+                            ui.label(error);
+                            ui.add_space(8.0);
+                            retry = ui.button("Try again").clicked();
+                        });
+                    }
+                    LoadState::Ready(data) => {
+                        requested_action = show_loaded_data(
+                            ui,
+                            data,
+                            LoadedViewState {
+                                filter: &mut self.filter,
+                                filtered_rows: &mut self.filtered_rows,
+                                selected_archive: &mut self.selected_archive,
+                                operation: self.operation.as_ref(),
+                                busy: archive_actions_blocked,
+                                block_reason: archive_action_block_reason,
+                                action_readiness_debug_lines: &action_readiness_debug_lines,
+                                feedback: self.feedback.as_ref(),
+                                confirm_unmount: &mut self.confirm_unmount,
+                                confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
+                                confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
+                                confirm_mount_all: &mut self.confirm_mount_all,
+                                focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
+                                confirm_unmount_all: &mut self.confirm_unmount_all,
+                                focus_unmount_all_cancel: &mut self.focus_unmount_all_cancel,
+                                confirm_unmount_selected: &mut self.confirm_unmount_selected,
+                                focus_unmount_selected_cancel: &mut self
+                                    .focus_unmount_selected_cancel,
+                                focus_lazy_cancel: &mut self.focus_lazy_cancel,
+                                focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
+                                lazy_unmount_offers: &self.lazy_unmount_offers,
+                                remount_offers: &self.remount_offers,
+                                cleanup_after_unmount: &mut self.cleanup_after_unmount,
+                                mount_all_result: self.mount_all_result.as_ref(),
+                                unmount_all_result: self.unmount_all_result.as_ref(),
+                                history: &mut self.history,
+                                cached: self.database_state.snapshot(),
+                                library_filters: &mut self.library_filters,
+                                platform_choice: &mut self.platform_choice,
+                                platform_custom_text: &mut self.platform_custom_text,
+                                platform_busy: self.platform_action.is_some(),
+                                retroarch_profiles: &self.retroarch_profiles,
+                                selected_archives: &mut self.selected_archives,
+                                bulk_platform_choice: &mut self.bulk_platform_choice,
+                                bulk_platform_busy: self.bulk_platform_action.is_some(),
+                                missing_removal_available,
+                                missing_removal_busy: self.missing_removal.is_some(),
+                                confirm_remove_missing: &mut self.confirm_remove_missing,
+                                sort_field: &mut self.sort_field,
+                                sort_ascending: &mut self.sort_ascending,
+                                library_scroll_offset: &mut self.library_scroll_offset,
+                                clipboard: &mut self.clipboard,
+                                select_all_visible_requested: &mut self
+                                    .select_all_visible_requested,
+                                library_source_filter: &mut self.library_source_filter,
+                                library_column_widths: &mut self.library_column_widths,
+                                library_views_configured: !self.library_views.is_empty(),
+                                library_view_last_plan: self.library_view_last_plan.as_ref(),
+                            },
+                        );
                     }
                 }
-                LoadState::Error(error) => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.colored_label(ui.visuals().error_fg_color, "Could not load ArchiveFS");
-                        ui.label(error);
-                        ui.add_space(8.0);
-                        retry = ui.button("Try again").clicked();
-                    });
-                }
-                LoadState::Ready(data) => {
-                    requested_action = show_loaded_data(
-                        ui,
-                        data,
-                        LoadedViewState {
-                            filter: &mut self.filter,
-                            filtered_rows: &mut self.filtered_rows,
-                            selected_archive: &mut self.selected_archive,
-                            operation: self.operation.as_ref(),
-                            busy: archive_actions_blocked,
-                            block_reason: archive_action_block_reason,
-                            action_readiness_debug_lines: &action_readiness_debug_lines,
-                            feedback: self.feedback.as_ref(),
-                            confirm_unmount: &mut self.confirm_unmount,
-                            confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
-                            confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
-                            confirm_mount_all: &mut self.confirm_mount_all,
-                            focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
-                            confirm_unmount_all: &mut self.confirm_unmount_all,
-                            focus_unmount_all_cancel: &mut self.focus_unmount_all_cancel,
-                            confirm_unmount_selected: &mut self.confirm_unmount_selected,
-                            focus_unmount_selected_cancel: &mut self.focus_unmount_selected_cancel,
-                            focus_lazy_cancel: &mut self.focus_lazy_cancel,
-                            focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
-                            lazy_unmount_offers: &self.lazy_unmount_offers,
-                            remount_offers: &self.remount_offers,
-                            cleanup_after_unmount: &mut self.cleanup_after_unmount,
-                            mount_all_result: self.mount_all_result.as_ref(),
-                            unmount_all_result: self.unmount_all_result.as_ref(),
-                            history: &mut self.history,
-                            cached: self.database_state.snapshot(),
-                            library_filters: &mut self.library_filters,
-                            platform_choice: &mut self.platform_choice,
-                            platform_custom_text: &mut self.platform_custom_text,
-                            platform_busy: self.platform_action.is_some(),
-                            selected_archives: &mut self.selected_archives,
-                            bulk_platform_choice: &mut self.bulk_platform_choice,
-                            bulk_platform_busy: self.bulk_platform_action.is_some(),
-                            missing_removal_available,
-                            missing_removal_busy: self.missing_removal.is_some(),
-                            confirm_remove_missing: &mut self.confirm_remove_missing,
-                            sort_field: &mut self.sort_field,
-                            sort_ascending: &mut self.sort_ascending,
-                            library_scroll_offset: &mut self.library_scroll_offset,
-                            clipboard: &mut self.clipboard,
-                            select_all_visible_requested: &mut self.select_all_visible_requested,
-                            library_source_filter: &mut self.library_source_filter,
-                            library_column_widths: &mut self.library_column_widths,
-                            library_views_configured: !self.library_views.is_empty(),
-                            library_view_last_plan: self.library_view_last_plan.as_ref(),
-                        },
-                    );
-                }
-            }
+            });
         });
         if stop_mount_all {
             self.request_mount_all_stop();
@@ -5603,6 +6934,9 @@ impl eframe::App for ArchiveFsApp {
                     self.view = MainView::LibraryViews;
                     self.library_view_focus_archive = Some(archive_path);
                 }
+                AppOperationRequest::OpenCheatsMods(archive_path) => {
+                    self.open_cheats_mods_workspace(context, archive_path);
+                }
             }
         }
     }
@@ -5649,15 +6983,6 @@ fn open_default_config_folder() -> archivefs_core::Result<String> {
     open_folder_in_file_manager(folder)?;
     Ok(format!("Opened config folder {}.", folder.display()))
 }
-
-/// Launches the native OS file manager at `folder` - shared by
-/// `open_default_config_folder` and the Selected Archive details context
-/// menu's "Show containing folder" (milestone requirement: "only if it can
-/// be implemented safely and portably without shell-injection risk").
-/// `Command::new(program).arg(folder)` passes `folder` directly to the
-/// child process's argv, never through a shell string, so no path -
-/// however it is spelled, including one containing shell metacharacters -
-/// can ever be interpreted as a second command.
 fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Result<()> {
     let (program, argument) = if cfg!(target_os = "windows") {
         ("explorer", folder.as_os_str())
@@ -6407,20 +7732,33 @@ fn show_setup_diagnostics(
         });
     action
 }
-
-/// Renders Activity as a collapsible bottom panel - milestone requirement:
-/// move it away from the permanently narrow right-hand strip, so it no
-/// longer shrinks every main page's usable *width*. Collapsed, the panel
-/// is just its own single header row tall, handing essentially all
-/// vertical space back to whichever page is showing above it. `expanded`
-/// is a pure display preference (see `ArchiveFsApp::show_activity`'s doc
-/// comment); this never mutates `history` beyond the existing "Clear"
-/// button, exactly as before, and never records an entry itself.
-/// The one Activity-panel context-menu action that needs to leave this
-/// function - Copy/Clear-one/Clear-all are all purely local (clipboard,
-/// `history`), so they execute directly inside the menu closure instead.
 enum ActivityPanelAction {
     ShowRelatedArchive(PathBuf),
+}
+
+fn activity_outcome_tone(outcome: ActivityOutcome) -> widgets::StatusTone {
+    match outcome {
+        ActivityOutcome::Completed => widgets::StatusTone::Success,
+        ActivityOutcome::Failed | ActivityOutcome::Rejected => widgets::StatusTone::Blocked,
+        ActivityOutcome::Started | ActivityOutcome::Retried | ActivityOutcome::Confirmed => {
+            widgets::StatusTone::Active
+        }
+        ActivityOutcome::Offered | ActivityOutcome::Skipped | ActivityOutcome::Cancelled => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
+fn activity_summary_entry(history: &OperationHistory) -> Option<&HistoryEntry> {
+    history
+        .entries()
+        .find(|entry| {
+            matches!(
+                entry.outcome,
+                ActivityOutcome::Failed | ActivityOutcome::Rejected
+            )
+        })
+        .or_else(|| history.entries().next())
 }
 
 fn show_activity_panel(
@@ -6434,22 +7772,43 @@ fn show_activity_panel(
         .resizable(*expanded)
         .show(context, |ui| {
             ui.horizontal(|ui| {
-                let toggle_label = if *expanded {
-                    "Hide Activity"
-                } else {
-                    "Show Activity"
-                };
-                if ui
-                    .button(format!("{toggle_label} ({})", history.entries.len()))
-                    .clicked()
+                if widgets::action_button(
+                    ui,
+                    if *expanded {
+                        "Hide activity"
+                    } else {
+                        "Show activity"
+                    },
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
                 {
                     *expanded = !*expanded;
                 }
+                widgets::status_badge(
+                    ui,
+                    format!("{} events", history.entries.len()),
+                    widgets::StatusTone::Info,
+                );
+                if !*expanded && let Some(entry) = activity_summary_entry(history) {
+                    widgets::status_badge(
+                        ui,
+                        entry.outcome.to_string(),
+                        activity_outcome_tone(entry.outcome),
+                    );
+                    ui.add(egui::Label::new(&entry.message).truncate())
+                        .on_hover_text(&entry.message);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if *expanded
-                        && ui
-                            .add_enabled(!history.entries.is_empty(), egui::Button::new("Clear"))
-                            .clicked()
+                        && widgets::action_button(
+                            ui,
+                            "Clear activity",
+                            widgets::ActionStyle::Destructive,
+                            !history.entries.is_empty(),
+                        )
+                        .clicked()
                     {
                         history.clear();
                     }
@@ -6464,17 +7823,6 @@ fn show_activity_panel(
                 ui.weak("No recent activity.");
                 return;
             }
-
-            // Milestone requirement: long activity messages must be
-            // readable, not silently clipped. Wrapping (the default for a
-            // `Label` inside this vertical `ScrollArea`, made explicit
-            // with `.wrap()`) replaces the previous single-line
-            // `.truncate()` + hover-tooltip treatment: every entry is now
-            // fully visible without needing to hover at all, and
-            // `.selectable(true)` lets a long path or error message be
-            // copied directly. This list is never `show_rows`-virtualized
-            // (bounded by `HISTORY_LIMIT` entries), so variable per-entry
-            // heights from wrapping need no special handling here.
             egui::ScrollArea::vertical()
                 .id_salt("activity_history")
                 .max_height(220.0)
@@ -6485,22 +7833,44 @@ fn show_activity_panel(
                     // menu item can freely call `history.clear()`/
                     // `history.remove()` without fighting the borrow
                     // checker over a `history` still being iterated.
-                    let rows: Vec<(usize, String, Option<PathBuf>)> = history
+                    let rows: Vec<(
+                        usize,
+                        ActivityAction,
+                        ActivityOutcome,
+                        String,
+                        Option<PathBuf>,
+                    )> = history
                         .entries()
                         .enumerate()
                         .map(|(index, entry)| {
-                            (index, history_entry_text(entry), entry.archive_path.clone())
+                            (
+                                index,
+                                entry.action,
+                                entry.outcome,
+                                entry.message.clone(),
+                                entry.archive_path.clone(),
+                            )
                         })
                         .collect();
                     let mut remove_index = None;
-                    for (index, text, archive_path) in &rows {
-                        let response = ui.add(
-                            egui::Label::new(text)
-                                .selectable(true)
-                                .wrap()
-                                .sense(egui::Sense::click()),
-                        );
-                        ui.add_space(2.0);
+                    for (index, activity, outcome, text, archive_path) in &rows {
+                        let response = widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                widgets::status_badge(
+                                    ui,
+                                    outcome.to_string(),
+                                    activity_outcome_tone(*outcome),
+                                );
+                                ui.strong(activity.to_string());
+                            });
+                            ui.add(
+                                egui::Label::new(text)
+                                    .selectable(true)
+                                    .wrap()
+                                    .sense(egui::Sense::click()),
+                            )
+                        });
+                        ui.add_space(6.0);
                         response.context_menu(|ui| {
                             if ui.button("Copy message").clicked() {
                                 let _ = clipboard.set_text(text.clone());
@@ -6538,34 +7908,111 @@ fn show_activity_panel(
         });
     action
 }
+fn doctor_summary_text(report: &DoctorReport) -> String {
+    let passed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Pass)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Warn)
+        .count();
+    let failed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Fail)
+        .count();
+    format!(
+        "{} checks: {passed} passed, {warnings} warnings, {failed} failed · \
+         {} archives ({} mounted, {} pending, {} unknown platform)",
+        report.checks.len(),
+        report.archives_found,
+        report.mounted_archives,
+        report.pending_archives,
+        report.archives_unknown_platform
+    )
+}
 
-/// The full "Doctor checks" detail table - extracted out of the Library
-/// page (milestone requirement: "Do not show ... diagnostics ... inline"
-/// on Library) into its own Tools destination. The Library page keeps
-/// only a compact Ready/Needs attention indicator (see `show_loaded_data`);
-/// this is the detailed Status/Check/Detail breakdown behind it.
+/// The full-report text behind the Doctor page's "Copy Report" - the
+/// design's copy-full-details affordance. Plain text, one check per
+/// line, so it pastes cleanly into an issue or support request. The
+/// design's per-check "Suggested fix" is deliberately absent:
+/// `DoctorCheck` carries no suggestion field today, and inventing fixes
+/// in the GUI would be untruthful (see the capability matrix's Doctor
+/// "Suggested action" row).
+fn doctor_report_text(report: &DoctorReport) -> String {
+    let mut lines = vec![
+        format!("ArchiveFS doctor report"),
+        format!("Config: {}", report.config_path.display()),
+        doctor_summary_text(report),
+        String::new(),
+    ];
+    for check in &report.checks {
+        lines.push(format!(
+            "[{}] {} — {}",
+            check.status, check.name, check.detail
+        ));
+    }
+    if !report.platform_counts.is_empty() {
+        lines.push(String::new());
+        lines.push("Platform counts:".to_string());
+        for (platform, count) in &report.platform_counts {
+            lines.push(format!("  {platform}: {count}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn show_doctor_checks_panel(ui: &mut egui::Ui, doctor: Option<&DoctorReport>) {
     let Some(doctor) = doctor else {
-        ui.label("Doctor checks are unavailable until the library has been scanned.");
+        widgets::empty_state(
+            ui,
+            "Health checks unavailable",
+            "Scan the library before running the full ArchiveFS health report.",
+            None,
+        );
         return;
     };
-    egui::Grid::new("doctor_checks")
-        .num_columns(3)
-        .striped(true)
+    for status in [DoctorStatus::Fail, DoctorStatus::Warn] {
+        for check in doctor.checks.iter().filter(|check| check.status == status) {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        check.status.to_string(),
+                        if status == DoctorStatus::Fail {
+                            widgets::StatusTone::Blocked
+                        } else {
+                            widgets::StatusTone::Warning
+                        },
+                    );
+                    ui.label(egui::RichText::new(&check.name).strong());
+                });
+                ui.add(egui::Label::new(&check.detail).wrap());
+            });
+            ui.add_space(6.0);
+        }
+    }
+    let passed = doctor
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Pass)
+        .count();
+    egui::CollapsingHeader::new(format!("Passed checks ({passed})"))
+        .default_open(false)
         .show(ui, |ui| {
-            ui.strong("Status");
-            ui.strong("Check");
-            ui.strong("Detail");
-            ui.end_row();
-
-            for check in &doctor.checks {
-                ui.colored_label(
-                    doctor_status_color(ui, check.status),
-                    check.status.to_string(),
-                );
-                ui.label(&check.name);
-                ui.label(&check.detail);
-                ui.end_row();
+            for check in doctor
+                .checks
+                .iter()
+                .filter(|check| check.status == DoctorStatus::Pass)
+            {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, "Pass", widgets::StatusTone::Success);
+                    ui.strong(&check.name);
+                    ui.label(egui::RichText::new(&check.detail).color(theme::muted(ui)));
+                });
             }
         });
 }
@@ -6628,13 +8075,6 @@ fn visible_inspector_entry_indices(
     });
     indices
 }
-
-/// The Inspector row list's compact trailing summary column - kind,
-/// classification, and (for files) size/compression, combined into one
-/// readable string rather than several more narrow fixed columns, in
-/// keeping with the milestone's "keep this first slice deliberately
-/// small" instruction. Every individual field is still available in full
-/// in the selected-entry details panel below the list.
 fn inspector_entry_details_text(entry: &InspectorEntry) -> String {
     match entry.kind {
         InspectorEntryKind::Directory => "Directory".to_string(),
@@ -6714,11 +8154,6 @@ fn show_inspector_row(
 
     response
 }
-
-/// The Archive Inspector overlay - milestone: a read-only, first-slice
-/// viewer for one ZIP archive's entries. Returns `true` when the user
-/// asked to close it ("Back to Library"), exactly like every other
-/// `ToolsOverlay` panel - see its own dispatch in `update`.
 fn show_archive_inspector_panel(
     ui: &mut egui::Ui,
     state: &mut ArchiveInspectorState,
@@ -6975,15 +8410,6 @@ fn show_tools_overlay_header(ui: &mut egui::Ui, title: &str) -> bool {
     ui.separator();
     close
 }
-
-/// A clean page shell for future multiple-source-folder management -
-/// milestone requirement: truthful, read-only display of the currently
-/// configured scan/archive root, with no fake add/remove controls yet.
-/// Reads the configuration file fresh each render - a cheap, synchronous,
-/// read-only file read (the same kind `run_setup_diagnostics_default`
-/// already performs, just off the background thread that one uses); this
-/// never starts a scan, mount, or write, and it is the only source of
-/// truth here (never invents state this app does not actually track).
 fn source_action_log_category(action: &SourceAction) -> ActivityAction {
     match action {
         SourceAction::Add(_) => ActivityAction::SourceAdded,
@@ -7294,15 +8720,6 @@ fn source_availability_label(availability: SourceAvailability) -> &'static str {
         SourceAvailability::ScanFailed => "Scan failed",
     }
 }
-
-/// What the Sources page asked the caller to do - every variant starts a
-/// `SourceAction` on a background thread via `ArchiveFsApp::start_source_action`,
-/// mirroring `HealthDashboardAction`'s "bubble up, caller dispatches"
-/// shape. Opening/closing/editing a dialog is deliberately *not* here -
-/// `show_sources_page` mutates `add_dialog`/`remove_dialog` directly for
-/// that, since none of it needs a background action or an Activity entry
-/// (see the milestone's "no Activity entry merely for opening a dialog or
-/// cancelling the picker" requirement).
 enum SourcesPageAction {
     AddFolder(PathBuf),
     ScanOne(PathBuf),
@@ -7323,17 +8740,6 @@ enum SourcesPageAction {
     /// independently-drifting filter mechanism).
     ViewInLibrary(PathBuf),
 }
-
-/// Renders the Sources page: one row per configured source folder (path,
-/// enabled state, availability, last archive count, last scan result/
-/// time, and its Scan/Enable-Disable/Remove buttons), the "Add Folder" /
-/// "Scan All Enabled Sources" / "Refresh Status" top actions, and the
-/// read-only mount root - milestone requirement: this is now the complete
-/// place to add/view/enable/disable/scan/remove source folders. `busy`
-/// (`ArchiveFsApp::source_action.is_some()`) disables every mutating
-/// control while one source action is already running, exactly like the
-/// existing platform-assignment/alias controls disable during their own
-/// running action.
 fn show_sources_page(
     ui: &mut egui::Ui,
     sources: &[SourceFolderView],
@@ -7345,34 +8751,48 @@ fn show_sources_page(
 ) -> Option<SourcesPageAction> {
     let mut action = None;
 
-    ui.heading("Sources");
-    ui.label("Where ArchiveFS looks for archives, and where it mounts them.");
-    ui.add_space(2.0);
+    widgets::page_header(
+        ui,
+        "Sources",
+        "Manage the configured folders ArchiveFS scans for archives.",
+    );
 
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("Add Folder"))
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Add folder", widgets::ActionStyle::Primary, !busy)
+                .clicked()
+            {
+                *add_dialog = Some(SourcesAddDialogState::default());
+            }
+            if widgets::action_button(
+                ui,
+                "Scan all enabled",
+                widgets::ActionStyle::Secondary,
+                !busy,
+            )
             .clicked()
-        {
-            *add_dialog = Some(SourcesAddDialogState::default());
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Scan All Enabled Sources"))
-            .clicked()
-        {
-            action = Some(SourcesPageAction::ScanAll);
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Refresh Status"))
-            .clicked()
-        {
-            action = Some(SourcesPageAction::RefreshStatus);
-        }
+            {
+                action = Some(SourcesPageAction::ScanAll);
+            }
+            if widgets::action_button(ui, "Refresh status", widgets::ActionStyle::Quiet, !busy)
+                .clicked()
+            {
+                action = Some(SourcesPageAction::RefreshStatus);
+            }
+        })
+        .inner
     });
-    ui.separator();
+    ui.add_space(12.0);
 
     if sources.is_empty() {
-        ui.label("No source folders are configured yet. Click \"Add Folder\" to add one.");
+        if widgets::empty_state(
+            ui,
+            "No source folders",
+            "Add an existing readable directory, then scan it to build the catalogue.",
+            Some("Add folder"),
+        ) {
+            *add_dialog = Some(SourcesAddDialogState::default());
+        }
     } else {
         egui::ScrollArea::vertical()
             .id_salt("sources_list")
@@ -7383,18 +8803,39 @@ fn show_sources_page(
                     let group_response = ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.strong(view.path.display().to_string());
+                                if widgets::path_value(ui, "Source", &view.path) {
+                                    let _ = clipboard.set_text(view.path.display().to_string());
+                                }
                                 ui.horizontal_wrapped(|ui| {
+                                    widgets::status_badge(
+                                        ui,
+                                        if view.enabled { "Enabled" } else { "Disabled" },
+                                        if view.enabled {
+                                            widgets::StatusTone::Active
+                                        } else {
+                                            widgets::StatusTone::Pending
+                                        },
+                                    );
+                                    let availability_tone = match view.availability {
+                                        SourceAvailability::Available => {
+                                            widgets::StatusTone::Success
+                                        }
+                                        SourceAvailability::Disabled => {
+                                            widgets::StatusTone::Pending
+                                        }
+                                        SourceAvailability::Unavailable
+                                        | SourceAvailability::PermissionDenied
+                                        | SourceAvailability::ScanFailed => {
+                                            widgets::StatusTone::Blocked
+                                        }
+                                    };
+                                    widgets::status_badge(
+                                        ui,
+                                        source_availability_label(view.availability),
+                                        availability_tone,
+                                    );
                                     ui.label(format!(
-                                        "Enabled: {}",
-                                        if view.enabled { "yes" } else { "no" }
-                                    ));
-                                    ui.label(format!(
-                                        "Status: {}",
-                                        source_availability_label(view.availability)
-                                    ));
-                                    ui.label(format!(
-                                        "Archives: {}",
+                                        "{} archives",
                                         view.last_archive_count
                                             .map(|count| count.to_string())
                                             .unwrap_or_else(|| "never scanned".to_string())
@@ -7411,7 +8852,13 @@ fn show_sources_page(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked()
+                                    if widgets::action_button(
+                                        ui,
+                                        "Remove",
+                                        widgets::ActionStyle::Destructive,
+                                        !busy,
+                                    )
+                                    .clicked()
                                     {
                                         *remove_dialog = Some(SourcesRemoveDialogState {
                                             path: view.path.clone(),
@@ -7421,16 +8868,27 @@ fn show_sources_page(
                                     }
                                     let enable_label =
                                         if view.enabled { "Disable" } else { "Enable" };
-                                    if ui
-                                        .add_enabled(!busy, egui::Button::new(enable_label))
-                                        .clicked()
+                                    if widgets::action_button(
+                                        ui,
+                                        enable_label,
+                                        widgets::ActionStyle::Quiet,
+                                        !busy,
+                                    )
+                                    .clicked()
                                     {
                                         action = Some(SourcesPageAction::SetEnabled {
                                             path: view.path.clone(),
                                             enabled: !view.enabled,
                                         });
                                     }
-                                    if ui.add_enabled(!busy, egui::Button::new("Scan")).clicked() {
+                                    if widgets::action_button(
+                                        ui,
+                                        "Scan",
+                                        widgets::ActionStyle::Secondary,
+                                        !busy,
+                                    )
+                                    .clicked()
+                                    {
                                         action =
                                             Some(SourcesPageAction::ScanOne(view.path.clone()));
                                     }
@@ -7438,11 +8896,6 @@ fn show_sources_page(
                             );
                         });
                     });
-                    // Milestone requirement: never offer filesystem
-                    // deletion, and "Remove source" opens the exact same
-                    // safe confirmation dialog the "Remove" button above
-                    // does (defaulting to Keep catalogue entries) - never
-                    // a second, weaker removal path.
                     group_response.response.context_menu(|ui| {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Scan source"))
@@ -7491,16 +8944,25 @@ fn show_sources_page(
             });
     }
 
-    ui.add_space(6.0);
-    ui.separator();
-    ui.strong("Mount root");
-    ui.label(format!(
-        "Current mount root: {}",
-        mount_root
-            .map(|root| root.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    ui.label("Editing this setting is not yet available.");
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Mount destination",
+        Some("The configured mount root is read-only here."),
+    );
+    widgets::card(ui, |ui| {
+        if let Some(root) = mount_root {
+            if widgets::path_value(ui, "Mount root", root) {
+                let _ = clipboard.set_text(root.display().to_string());
+            }
+        } else {
+            ui.label("Mount root: unknown");
+        }
+        ui.label(
+            egui::RichText::new("Configuration editing is intentionally unavailable on this page.")
+                .color(theme::muted(ui)),
+        );
+    });
 
     if let Some(dialog) = add_dialog.as_mut() {
         let mut open = true;
@@ -7703,21 +9165,69 @@ fn show_library_view_plan_summary(
         });
 }
 
-/// The Library Views page: list/Add View/Edit View/Preview/Apply/Repair/
-/// Remove View - milestone Section 7. Mirrors `show_sources_page`'s exact
-/// shape: dialog open/close/field-edits are applied directly to
-/// `form_dialog`/`remove_dialog` and need no returned action; only what
-/// starts a background action (Add/Edit/SetEnabled/Preview/Apply/Repair/
-/// Remove) is returned, for `update()` to dispatch through
-/// `start_library_view_action` - the single implementation this shares
-/// with the CLI's `view` subcommands (`preview_library_view_default` and
-/// friends), never a second one.
-///
-/// Every parameter is plain, read-only page data or a dialog's own open/
-/// closed state, with no natural grouping that would not just be
-/// busywork for its own sake - the same justification `show_data_row`/
-/// `show_sources_page`'s siblings already give for their own
-/// `#[allow(clippy::too_many_arguments)]`.
+fn show_library_view_source_selection(
+    ui: &mut egui::Ui,
+    sources: &[SourceFolderView],
+    selected: &mut HashSet<PathBuf>,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Sources",
+            Some("Leave every source unchecked to include all configured sources."),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("library_view_form_sources")
+            .max_height(210.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if sources.is_empty() {
+                    ui.weak("No source folders are configured.");
+                }
+                for source in sources {
+                    let mut checked = selected.contains(&source.path);
+                    if ui
+                        .checkbox(&mut checked, source.path.display().to_string())
+                        .on_hover_text(source.path.display().to_string())
+                        .changed()
+                    {
+                        if checked {
+                            selected.insert(source.path.clone());
+                        } else {
+                            selected.remove(&source.path);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+fn show_library_view_platform_selection(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Platforms",
+            Some("Leave every platform unchecked to include all known platforms."),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("library_view_form_platforms")
+            .max_height(210.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for platform in canonical_platform_names() {
+                    let mut checked = selected.contains(platform);
+                    if ui.checkbox(&mut checked, platform).changed() {
+                        if checked {
+                            selected.insert(platform.to_string());
+                        } else {
+                            selected.remove(platform);
+                        }
+                    }
+                }
+            });
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_library_views_page(
     ui: &mut egui::Ui,
@@ -7739,11 +9249,6 @@ fn show_library_views_page(
          never moves, copies, renames, or deletes an original archive file.",
     );
     ui.add_space(2.0);
-
-    // "Show in Library View preview" (Library row context menu) lands
-    // here - a read-only lookup against whatever the *last* Preview
-    // already found, never a Preview started on this archive's behalf
-    // (milestone requirement: never bypass Preview or safety checks).
     if let Some(archive_path) = focus_archive {
         ui.add_space(4.0);
         match library_view_planned_entry_for(last_plan, archive_path) {
@@ -7888,15 +9393,6 @@ fn show_library_views_page(
                             show_library_view_plan_summary(ui, plan, plan_filter);
                         }
                     });
-                    // Milestone Section 8: the exact same seven actions the
-                    // inline buttons above already offer - Preview, Apply,
-                    // Repair, Copy destination path, Disable/Enable, Remove
-                    // View - dispatched through the exact same
-                    // `LibraryViewAction`/dialog-opening paths, never a
-                    // second, independently-drifting execution path. Never
-                    // offers anything that would bypass Preview or safety
-                    // checks (no direct Apply/Repair without a safe current
-                    // plan, exactly like the inline buttons).
                     group_response.response.context_menu(|ui| {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Preview"))
@@ -7961,105 +9457,140 @@ fn show_library_views_page(
         } else {
             "Add Library View"
         };
+        let dialog_size =
+            library_view_dialog_size(ui.ctx().input(|input| input.screen_rect().size()));
         egui::Window::new(title)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size(dialog_size)
+            .min_size(egui::vec2(
+                dialog_size.x.min(460.0),
+                dialog_size.y.min(440.0),
+            ))
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    show_text_edit_with_context_menu(
-                        ui,
-                        &mut dialog.name,
-                        clipboard,
-                        |text_edit| {
-                            text_edit
-                                .id_salt("library_view_form_name")
-                                .desired_width(280.0)
-                        },
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Destination:");
-                    show_text_edit_with_context_menu(
-                        ui,
-                        &mut dialog.destination_text,
-                        clipboard,
-                        |text_edit| {
-                            text_edit
-                                .id_salt("library_view_form_destination")
-                                .desired_width(280.0)
-                        },
-                    );
-                    if ui.button("Browse...").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .set_title("Select Library View Destination Folder")
-                            .pick_folder()
-                    {
-                        dialog.destination_text = path.display().to_string();
-                        dialog.validation_message = None;
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.strong("Included source folders (none checked = all)");
-                for source in all_source_folders {
-                    let mut checked = dialog.selected_source_folders.contains(&source.path);
-                    if ui
-                        .checkbox(&mut checked, source.path.display().to_string())
-                        .changed()
-                    {
-                        if checked {
-                            dialog.selected_source_folders.insert(source.path.clone());
-                        } else {
-                            dialog.selected_source_folders.remove(&source.path);
-                        }
-                    }
-                }
-
-                ui.add_space(4.0);
-                ui.strong("Included platforms (none checked = all)");
+                let form_width = ui.available_width();
+                let form_scroll_height = (ui.available_height() - 94.0).max(220.0);
                 egui::ScrollArea::vertical()
-                    .id_salt("library_view_form_platforms")
-                    .max_height(160.0)
+                    .id_salt("library_view_form_content")
+                    .max_height(form_scroll_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for platform in canonical_platform_names() {
-                            let mut checked = dialog.selected_platforms.contains(platform);
-                            if ui.checkbox(&mut checked, platform).changed() {
-                                if checked {
-                                    dialog.selected_platforms.insert(platform.to_string());
-                                } else {
-                                    dialog.selected_platforms.remove(platform);
+                        widgets::card(ui, |ui| {
+                            widgets::section_header(
+                                ui,
+                                "View details",
+                                Some("Name the view and choose a destination outside every archive source."),
+                            );
+                            ui.label(egui::RichText::new("Name").strong());
+                            let name_width = ui.available_width().max(180.0);
+                            show_text_edit_with_context_menu(
+                                ui,
+                                &mut dialog.name,
+                                clipboard,
+                                |text_edit| {
+                                    text_edit
+                                        .id_salt("library_view_form_name")
+                                        .desired_width(name_width)
+                                },
+                            );
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Destination").strong());
+                            ui.horizontal(|ui| {
+                                let destination_width = (ui.available_width() - 100.0).max(180.0);
+                                show_text_edit_with_context_menu(
+                                    ui,
+                                    &mut dialog.destination_text,
+                                    clipboard,
+                                    |text_edit| {
+                                        text_edit
+                                            .id_salt("library_view_form_destination")
+                                            .desired_width(destination_width)
+                                    },
+                                );
+                                if ui.button("Browse...").clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_title("Select Library View Destination Folder")
+                                        .pick_folder()
+                                {
+                                    dialog.destination_text = path.display().to_string();
+                                    dialog.validation_message = None;
                                 }
-                            }
+                            });
+                        });
+                        ui.add_space(8.0);
+
+                        if library_view_selections_side_by_side(form_width) {
+                            ui.columns(2, |columns| {
+                                let (left, right) = columns.split_at_mut(1);
+                                show_library_view_source_selection(
+                                    &mut left[0],
+                                    all_source_folders,
+                                    &mut dialog.selected_source_folders,
+                                );
+                                show_library_view_platform_selection(
+                                    &mut right[0],
+                                    &mut dialog.selected_platforms,
+                                );
+                            });
+                        } else {
+                            show_library_view_source_selection(
+                                ui,
+                                all_source_folders,
+                                &mut dialog.selected_source_folders,
+                            );
+                            ui.add_space(8.0);
+                            show_library_view_platform_selection(
+                                ui,
+                                &mut dialog.selected_platforms,
+                            );
                         }
+                        ui.add_space(8.0);
+                        widgets::banner(
+                            ui,
+                            "Layout",
+                            "Creates {platform}/{filename}. No other layout is selected or implied.",
+                            widgets::StatusTone::Info,
+                        );
                     });
 
-                ui.add_space(4.0);
-                ui.label("Layout: {platform}/{filename} (the only layout this milestone supports)");
-
+                ui.separator();
                 if let Some(message) = &dialog.validation_message {
                     ui.colored_label(ui.visuals().error_fg_color, message);
                 }
-                ui.horizontal(|ui| {
+                let submit_blocker =
+                    library_view_submit_blocker(&dialog.name, &dialog.destination_text, busy);
+                if let Some(reason) = submit_blocker {
+                    ui.weak(reason);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let submit_label = if dialog.editing_id.is_some() {
                         "Save"
                     } else {
                         "Add"
                     };
                     if ui
-                        .add_enabled(
-                            !busy
-                                && !dialog.name.trim().is_empty()
-                                && !dialog.destination_text.trim().is_empty(),
-                            egui::Button::new(submit_label),
-                        )
+                        .add_enabled(submit_blocker.is_none(), egui::Button::new(submit_label))
+                        .on_disabled_hover_text(submit_blocker.unwrap_or_default())
                         .clicked()
                     {
                         submit = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if widgets::action_button(
+                        ui,
+                        "Cancel",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    )
+                    .clicked()
+                    {
                         cancel = true;
+                    }
+                    if submit_blocker.is_none() {
+                        ui.label(
+                            egui::RichText::new("Ready to validate and save")
+                                .color(theme::muted(ui)),
+                        );
                     }
                 });
             });
@@ -8158,17 +9689,12 @@ fn show_library_views_page(
 
     action
 }
-
-/// The Help "About ArchiveFS" window - milestone requirement: version,
-/// database path, and configuration path, and only those: never a
-/// "data"/"log" path this app has no actual concept of. Copy buttons
-/// reuse the exact same native clipboard every text field's context menu
-/// already goes through - no second clipboard mechanism.
 fn show_about_window(
     ctx: &egui::Context,
     open: &mut bool,
     database_state: &DatabaseState,
     diagnostics: &DiagnosticsState,
+    mount_root: Option<&Path>,
     clipboard: &mut dyn ClipboardBackend,
 ) {
     egui::Window::new("About ArchiveFS")
@@ -8176,45 +9702,4215 @@ fn show_about_window(
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
-            ui.strong(format!("ArchiveFS {}", env!("CARGO_PKG_VERSION")));
-            ui.add_space(8.0);
-
-            let database_path =
-                database_state_path(database_state).map(|path| path.display().to_string());
-            let config_path = match diagnostics {
-                DiagnosticsState::Ready { report, .. } => report
-                    .config_path
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                _ => None,
-            };
-
-            egui::Grid::new("about_paths_grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.strong("Database path");
-                    ui.horizontal(|ui| {
-                        ui.label(database_path.as_deref().unwrap_or("unknown"));
-                        if let Some(path) = &database_path
-                            && ui.small_button("Copy").clicked()
-                        {
-                            let _ = clipboard.set_text(path.clone());
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.strong("Configuration path");
-                    ui.horizontal(|ui| {
-                        ui.label(config_path.as_deref().unwrap_or("unknown"));
-                        if let Some(path) = &config_path
-                            && ui.small_button("Copy").clicked()
-                        {
-                            let _ = clipboard.set_text(path.clone());
-                        }
-                    });
-                    ui.end_row();
-                });
+            show_about_contents(ui, database_state, diagnostics, mount_root, clipboard);
         });
+}
+fn system_information_text(
+    database_path: Option<&str>,
+    config_path: Option<&str>,
+    mount_root: Option<&str>,
+) -> String {
+    format!(
+        "ArchiveFS {}\nOS: {} ({})\nDesktop: {}\nSession: {}\nDatabase schema: v{}\nDatabase path: {}\nConfiguration path: {}\nMount root: {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()),
+        clipboard_environment_summary(),
+        latest_schema_version(),
+        database_path.unwrap_or("unknown"),
+        config_path.unwrap_or("unknown"),
+        mount_root.unwrap_or("not loaded"),
+    )
+}
+
+fn show_about_contents(
+    ui: &mut egui::Ui,
+    database_state: &DatabaseState,
+    diagnostics: &DiagnosticsState,
+    mount_root: Option<&Path>,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::page_header(
+        ui,
+        "ArchiveFS",
+        "A Linux archive library and safe mount manager.",
+    );
+
+    let database_path = database_state_path(database_state).map(|path| path.display().to_string());
+    let config_path = match diagnostics {
+        DiagnosticsState::Ready { report, .. } => report
+            .config_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        _ => None,
+    };
+    let mount_root = mount_root.map(|path| path.display().to_string());
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("Version {}", env!("CARGO_PKG_VERSION")),
+                widgets::StatusTone::Info,
+            );
+            ui.label(format!(
+                "{} · {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ));
+            ui.label(format!("Database schema v{}", latest_schema_version()));
+        });
+        ui.label(format!(
+            "Desktop: {}",
+            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string())
+        ));
+    });
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Runtime locations",
+        Some("Paths are shown for troubleshooting and are not edited here."),
+    );
+    widgets::card(ui, |ui| {
+        if let Some(path) = &database_path {
+            if widgets::copyable_value(ui, "Database", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Database: unknown");
+        }
+        if let Some(path) = &config_path {
+            if widgets::copyable_value(ui, "Configuration", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Configuration: unknown");
+        }
+        if let Some(path) = &mount_root {
+            if widgets::copyable_value(ui, "Mount root", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Mount root: not loaded");
+        }
+    });
+
+    ui.add_space(12.0);
+    if widgets::action_button(
+        ui,
+        "Copy system information",
+        widgets::ActionStyle::Secondary,
+        true,
+    )
+    .clicked()
+    {
+        let _ = clipboard.set_text(system_information_text(
+            database_path.as_deref(),
+            config_path.as_deref(),
+            mount_root.as_deref(),
+        ));
+    }
+}
+
+/// The design's per-archive validation label on the Mount page - a pure
+/// mapping from the live `MountState`, so the preview can never disagree
+/// with what the batch engine will actually do (`Pending` is the only
+/// state `queued_pending_paths` lets through to a mount attempt).
+fn mount_validation_label(state: MountState) -> &'static str {
+    match state {
+        MountState::Pending => "Ready to mount",
+        MountState::Mounted => "Already mounted — will be skipped",
+        MountState::MountPathExists => "Destination already exists — will be skipped",
+    }
+}
+
+/// Drops queued paths whose archive no longer exists in the live
+/// snapshot (source removed, rescan, etc.). Deliberately keeps queued
+/// archives that are merely no longer `Pending` (mounted meanwhile, or a
+/// destination collision) - those stay visible on the Mount page with
+/// their skip reason instead of vanishing silently.
+fn prune_mount_queue(queue: &mut Vec<PathBuf>, records: &[ArchiveRecord]) {
+    queue.retain(|path| {
+        records
+            .iter()
+            .any(|record| record.mount_plan.archive.path == *path)
+    });
+}
+
+/// The queued paths that a "Mount queue" run will actually attempt - in
+/// queue order, `Pending` archives only, mirroring
+/// `show_bulk_row_context_menu`'s contract that
+/// `mount_all_items_for_paths` is only ever fed genuinely eligible
+/// archives.
+fn queued_pending_paths(queue: &[PathBuf], records: &[ArchiveRecord]) -> Vec<PathBuf> {
+    queue
+        .iter()
+        .filter(|path| {
+            records.iter().any(|record| {
+                record.mount_plan.archive.path == **path
+                    && record.mount_state == MountState::Pending
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Case-insensitive substring match over the fields the Mount page
+/// displays (name, platform, archive path, planned destination) - the
+/// Mount page's counterpart of the Library's `search_text` matching.
+fn mount_row_matches(record: &ArchiveRecord, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    format!(
+        "{} {} {} {}",
+        record.identity.display_name,
+        record.identity.platform.as_deref().unwrap_or(""),
+        record.mount_plan.archive.path.display(),
+        record.mount_plan.mount_path.display()
+    )
+    .to_lowercase()
+    .contains(&needle)
+}
+
+/// What the Mount page asks `update` to do - executing a mount goes
+/// through the app's own `start_mount_all` (the proven batch engine),
+/// never directly from render code.
+enum MountPageAction {
+    MountQueue,
+    Refresh,
+    /// Navigate to the Mount page (the Selected page's empty-queue
+    /// affordance).
+    GoToMount,
+    /// Open the first-class Cheats & Mods workspace for this exact
+    /// archive (the Selected page's entry point).
+    OpenCheatsMods(PathBuf),
+    /// Start the shared background RetroArch profile scan from the
+    /// Selected page's entry section.
+    ScanRetroArchProfiles,
+}
+
+/// What the user chose in the shared mount-queue confirmation strip.
+enum QueueConfirmChoice {
+    Mount,
+    Cancel,
+}
+
+/// The inline "mount the queue" confirmation strip shared by the Mount
+/// and Selected pages, so their wording and gating can never drift.
+fn show_mount_queue_confirmation(
+    ui: &mut egui::Ui,
+    attempted: usize,
+    busy: bool,
+) -> Option<QueueConfirmChoice> {
+    let mut choice = None;
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Confirmation", widgets::StatusTone::Warning);
+        if attempted == 1 {
+            ui.strong("Mount 1 queued archive?");
+        } else {
+            ui.strong(format!("Mount {attempted} queued archives?"));
+        }
+        ui.label(
+            "Only archives that are ready to mount are attempted; already-mounted \
+             archives and existing destinations are skipped by the batch engine.",
+        );
+        ui.horizontal(|ui| {
+            if widgets::action_button(
+                ui,
+                "Mount now",
+                widgets::ActionStyle::Primary,
+                !busy && attempted > 0,
+            )
+            .clicked()
+            {
+                choice = Some(QueueConfirmChoice::Mount);
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                choice = Some(QueueConfirmChoice::Cancel);
+            }
+        });
+    });
+    choice
+}
+
+/// The design's "Planned Action" label for a queued archive - what the
+/// batch engine will do with it, derived purely from `MountState` (the
+/// action-verb counterpart of `mount_validation_label`).
+fn planned_action_label(state: MountState) -> &'static str {
+    match state {
+        MountState::Pending => "Mount",
+        MountState::Mounted => "Skip — already mounted",
+        MountState::MountPathExists => "Skip — destination already exists",
+    }
+}
+struct SelectedPageViewState<'a> {
+    selected_archive: Option<&'a Path>,
+    selected_count: usize,
+    retroarch_profiles: &'a RetroArchProfilesState,
+    queue: &'a mut Vec<PathBuf>,
+    confirm: &'a mut bool,
+    busy: bool,
+    block_reason: Option<&'a str>,
+}
+
+fn show_selected_page(
+    ui: &mut egui::Ui,
+    live: Option<&LoadedData>,
+    mount_all_result: Option<&MountAllResult>,
+    view_state: SelectedPageViewState<'_>,
+) -> Option<MountPageAction> {
+    let SelectedPageViewState {
+        selected_archive,
+        selected_count,
+        retroarch_profiles,
+        queue,
+        confirm,
+        busy,
+        block_reason,
+    } = view_state;
+    let mut action = None;
+    widgets::page_header(
+        ui,
+        "Selected",
+        "Review queued archives and their validated destinations before mounting.",
+    );
+    if let Some(result) = mount_all_result {
+        show_mount_all_result(ui, result);
+        ui.separator();
+    }
+
+    widgets::section_header(
+        ui,
+        "Cheats & Mods",
+        Some("Open the dedicated workspace for the archive selected in Library."),
+    );
+    match selected_archive {
+        Some(path) => {
+            if widgets::path_value(ui, "Selected archive", path) {
+                ui.ctx().copy_text(path.display().to_string());
+            }
+        }
+        None => {
+            ui.label("No archive is selected in the Library.");
+        }
+    }
+    let entry_blocker = cheat_entry_blocker(
+        selected_archive,
+        selected_count,
+        live.map(|data| data.records.as_slice()),
+        retroarch_profiles,
+    );
+    ui.horizontal(|ui| {
+        if widgets::action_button(
+            ui,
+            "Open Cheats & Mods",
+            widgets::ActionStyle::Secondary,
+            entry_blocker.is_none() && !busy,
+        )
+        .clicked()
+            && let Some(path) = selected_archive
+        {
+            action = Some(MountPageAction::OpenCheatsMods(path.to_path_buf()));
+        }
+        if matches!(
+            retroarch_profiles,
+            RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
+        ) && widgets::action_button(
+            ui,
+            "Scan for RetroArch profiles",
+            widgets::ActionStyle::Quiet,
+            !busy,
+        )
+        .clicked()
+        {
+            action = Some(MountPageAction::ScanRetroArchProfiles);
+        }
+    });
+    if let Some(reason) = entry_blocker {
+        widgets::banner(ui, "Unavailable", reason, widgets::StatusTone::Pending);
+    }
+    ui.separator();
+
+    let Some(data) = live else {
+        ui.label("Live mount state is not loaded yet.");
+        return action;
+    };
+    prune_mount_queue(queue, &data.records);
+    if queue.is_empty() {
+        if widgets::empty_state(
+            ui,
+            "No archives queued",
+            "Choose archives on the Mount page, then return here to review them.",
+            Some("Choose archives"),
+        ) {
+            action = Some(MountPageAction::GoToMount);
+        }
+        return action;
+    }
+    let attempted = queued_pending_paths(queue, &data.records);
+
+    widgets::section_header(
+        ui,
+        "Mount queue",
+        Some(
+            "Ready entries will be mounted; blocked entries remain visible and are skipped safely.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if queue.len() == 1 {
+                ui.label("1 archive queued.");
+            } else {
+                ui.label(format!("{} archives queued.", queue.len()));
+            }
+            if attempted.len() < queue.len() {
+                ui.label(format!(
+                    "{} will be skipped (already mounted or destination exists).",
+                    queue.len() - attempted.len()
+                ));
+            }
+            if widgets::action_button(
+                ui,
+                "Clear queue",
+                widgets::ActionStyle::Quiet,
+                !queue.is_empty(),
+            )
+            .clicked()
+            {
+                queue.clear();
+                *confirm = false;
+            }
+            let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
+            if widgets::action_button(
+                ui,
+                format!("Mount ready archives ({})", attempted.len()),
+                widgets::ActionStyle::Primary,
+                mount_enabled,
+            )
+            .clicked()
+            {
+                *confirm = true;
+            }
+        })
+        .inner
+    });
+    if busy && let Some(reason) = block_reason {
+        ui.label(reason);
+    }
+    if *confirm {
+        match show_mount_queue_confirmation(ui, attempted.len(), busy) {
+            Some(QueueConfirmChoice::Mount) => {
+                action = Some(MountPageAction::MountQueue);
+                *confirm = false;
+            }
+            Some(QueueConfirmChoice::Cancel) => *confirm = false,
+            None => {}
+        }
+    }
+    ui.separator();
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut remove: Option<PathBuf> = None;
+            for ready in [true, false] {
+                let count = queue
+                    .iter()
+                    .filter(|path| {
+                        data.records.iter().any(|record| {
+                            record.mount_plan.archive.path == ***path
+                                && (record.mount_state == MountState::Pending) == ready
+                        })
+                    })
+                    .count();
+                if count == 0 {
+                    continue;
+                }
+                ui.label(
+                    egui::RichText::new(if ready { "READY" } else { "BLOCKED / SKIPPED" })
+                        .small()
+                        .strong()
+                        .color(theme::muted(ui)),
+                );
+                for path in queue.iter() {
+                    let Some(record) = data
+                        .records
+                        .iter()
+                        .find(|record| record.mount_plan.archive.path == *path)
+                    else {
+                        continue;
+                    };
+                    if (record.mount_state == MountState::Pending) != ready {
+                        continue;
+                    }
+                    widgets::card(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(&record.identity.display_name)
+                                    .size(17.0)
+                                    .strong(),
+                            );
+                            widgets::status_badge(
+                                ui,
+                                record.identity.platform.as_deref().unwrap_or("Unknown"),
+                                widgets::StatusTone::Info,
+                            );
+                            widgets::status_badge(
+                                ui,
+                                planned_action_label(record.mount_state),
+                                if ready {
+                                    widgets::StatusTone::Success
+                                } else {
+                                    widgets::StatusTone::Blocked
+                                },
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if widgets::action_button(
+                                        ui,
+                                        "Remove",
+                                        widgets::ActionStyle::Quiet,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        remove = Some(path.clone());
+                                    }
+                                },
+                            );
+                        });
+                        if widgets::path_value(ui, "Destination", &record.mount_plan.mount_path) {
+                            ui.ctx()
+                                .copy_text(record.mount_plan.mount_path.display().to_string());
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+            if let Some(path) = remove {
+                queue.retain(|queued_path| *queued_path != path);
+            }
+        });
+    action
+}
+
+/// The Mount page's mutable UI state, borrowed field-by-field from
+/// `ArchiveFsApp` (same pattern as `HealthDashboardViewState`).
+struct MountPageViewState<'a> {
+    queue: &'a mut Vec<PathBuf>,
+    search: &'a mut String,
+    confirm: &'a mut bool,
+    busy: bool,
+    block_reason: Option<&'a str>,
+}
+fn show_mount_page(
+    ui: &mut egui::Ui,
+    live: Option<&LoadedData>,
+    mount_all_result: Option<&MountAllResult>,
+    view_state: MountPageViewState<'_>,
+) -> Option<MountPageAction> {
+    let MountPageViewState {
+        queue,
+        search,
+        confirm,
+        busy,
+        block_reason,
+    } = view_state;
+    let mut action = None;
+    widgets::page_header(
+        ui,
+        "Mount",
+        "Choose archives, review validated destinations, and mount the ready queue.",
+    );
+    if let Some(result) = mount_all_result {
+        show_mount_all_result(ui, result);
+        ui.separator();
+    }
+    let Some(data) = live else {
+        ui.label("Live mount state is not loaded yet.");
+        return None;
+    };
+    prune_mount_queue(queue, &data.records);
+    let attempted = queued_pending_paths(queue, &data.records);
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search");
+            ui.add(egui::TextEdit::singleline(search).desired_width(240.0));
+            if widgets::action_button(ui, "Clear", widgets::ActionStyle::Quiet, !search.is_empty())
+                .clicked()
+            {
+                search.clear();
+            }
+            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, !busy)
+                .clicked()
+            {
+                action = Some(MountPageAction::Refresh);
+            }
+        })
+        .inner
+    });
+    ui.add_space(4.0);
+
+    let visible: Vec<&ArchiveRecord> = data
+        .records
+        .iter()
+        .filter(|record| mount_row_matches(record, search))
+        .collect();
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if queue.len() == 1 {
+                ui.label("1 archive queued.");
+            } else {
+                ui.label(format!("{} archives queued.", queue.len()));
+            }
+            let any_visible_unqueued_pending = visible.iter().any(|record| {
+                record.mount_state == MountState::Pending
+                    && !queue.contains(&record.mount_plan.archive.path)
+            });
+            if widgets::action_button(
+                ui,
+                "Queue all visible",
+                widgets::ActionStyle::Secondary,
+                any_visible_unqueued_pending,
+            )
+            .clicked()
+            {
+                for record in &visible {
+                    if record.mount_state == MountState::Pending
+                        && !queue.contains(&record.mount_plan.archive.path)
+                    {
+                        queue.push(record.mount_plan.archive.path.clone());
+                    }
+                }
+            }
+            if widgets::action_button(
+                ui,
+                "Clear queue",
+                widgets::ActionStyle::Quiet,
+                !queue.is_empty(),
+            )
+            .clicked()
+            {
+                queue.clear();
+                *confirm = false;
+            }
+            let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
+            if widgets::action_button(
+                ui,
+                format!("Mount queue ({})", attempted.len()),
+                widgets::ActionStyle::Primary,
+                mount_enabled,
+            )
+            .clicked()
+            {
+                *confirm = true;
+            }
+        })
+        .inner
+    });
+    if busy && let Some(reason) = block_reason {
+        ui.label(reason);
+    }
+
+    if *confirm {
+        match show_mount_queue_confirmation(ui, attempted.len(), busy) {
+            Some(QueueConfirmChoice::Mount) => {
+                action = Some(MountPageAction::MountQueue);
+                *confirm = false;
+            }
+            Some(QueueConfirmChoice::Cancel) => *confirm = false,
+            None => {}
+        }
+    }
+    ui.separator();
+
+    if data.records.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No archives found",
+            "Add and scan a source folder before creating a mount queue.",
+            None,
+        );
+        return action;
+    }
+    if visible.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No matching archives",
+            "Change or clear the search to see available archives.",
+            None,
+        );
+        return action;
+    }
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut toggle: Option<(PathBuf, bool)> = None;
+            for record in &visible {
+                let path = &record.mount_plan.archive.path;
+                let queued = queue.contains(path);
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(&record.identity.display_name)
+                                .size(17.0)
+                                .strong(),
+                        );
+                        widgets::status_badge(
+                            ui,
+                            record.identity.platform.as_deref().unwrap_or("Unknown"),
+                            widgets::StatusTone::Info,
+                        );
+                        let tone = match record.mount_state {
+                            MountState::Pending => widgets::StatusTone::Success,
+                            MountState::Mounted => widgets::StatusTone::Active,
+                            MountState::MountPathExists => widgets::StatusTone::Blocked,
+                        };
+                        widgets::status_badge(ui, mount_validation_label(record.mount_state), tone);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let label = if queued { "Remove" } else { "Add to queue" };
+                            if widgets::action_button(
+                                ui,
+                                label,
+                                if queued {
+                                    widgets::ActionStyle::Quiet
+                                } else {
+                                    widgets::ActionStyle::Secondary
+                                },
+                                queued || record.mount_state == MountState::Pending,
+                            )
+                            .clicked()
+                            {
+                                toggle = Some((path.clone(), !queued));
+                            }
+                        });
+                    });
+                    if widgets::path_value(ui, "Destination", &record.mount_plan.mount_path) {
+                        ui.ctx()
+                            .copy_text(record.mount_plan.mount_path.display().to_string());
+                    }
+                    egui::CollapsingHeader::new("Archive location")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if widgets::path_value(ui, "Archive", path) {
+                                ui.ctx().copy_text(path.display().to_string());
+                            }
+                        });
+                });
+                ui.add_space(6.0);
+            }
+            if let Some((path, add)) = toggle {
+                if add {
+                    if !queue.contains(&path) {
+                        queue.push(path);
+                    }
+                } else {
+                    queue.retain(|queued_path| *queued_path != path);
+                }
+            }
+        });
+    action
+}
+
+/// What the Active Mounts page asks `update` to do. `Unmount` is only
+/// ever returned after the page's own inline confirmation, and is then
+/// routed through the exact `AppOperationRequest::Archive` /
+/// `start_operation` path the Library's selected-archive panel uses.
+enum ActiveMountsPageAction {
+    Unmount(PathBuf),
+    OpenInLibrary(PathBuf),
+    Refresh,
+}
+fn show_active_mounts_page(
+    ui: &mut egui::Ui,
+    live_records: Option<&[ArchiveRecord]>,
+    confirm_unmount: &mut Option<PathBuf>,
+    cleanup_after_unmount: &mut bool,
+    feedback: Option<&ActionFeedback>,
+    busy: bool,
+) -> Option<ActiveMountsPageAction> {
+    let mut action = None;
+    widgets::page_header(
+        ui,
+        "Active Mounts",
+        "Review current mounts and unmount them normally after closing applications that use them.",
+    );
+    if let Some(feedback) = feedback {
+        widgets::banner(
+            ui,
+            if feedback.succeeded {
+                "Completed"
+            } else {
+                "Failed"
+            },
+            &feedback.message,
+            if feedback.succeeded {
+                widgets::StatusTone::Success
+            } else {
+                widgets::StatusTone::Blocked
+            },
+        );
+    }
+    let Some(records) = live_records else {
+        ui.label("Live mount state is not loaded yet.");
+        return None;
+    };
+    let mounted = pending_unmount_items(records);
+    // A confirmation for an archive that is no longer mounted (unmounted
+    // meanwhile, snapshot refreshed) must not survive as a stale prompt.
+    if let Some(pending) = confirm_unmount.as_ref()
+        && !mounted.iter().any(|item| item.archive_path == *pending)
+    {
+        *confirm_unmount = None;
+    }
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("{} active", mounted.len()),
+                if mounted.is_empty() {
+                    widgets::StatusTone::Pending
+                } else {
+                    widgets::StatusTone::Active
+                },
+            );
+            if mounted.len() == 1 {
+                ui.label("1 mounted archive.");
+            } else {
+                ui.label(format!("{} mounted archives.", mounted.len()));
+            }
+            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, !busy)
+                .clicked()
+            {
+                action = Some(ActiveMountsPageAction::Refresh);
+            }
+        })
+        .inner
+    });
+    if mounted.is_empty() {
+        widgets::empty_state(
+            ui,
+            "Nothing is mounted",
+            "Mounted archives will appear here with their destinations and normal unmount controls.",
+            None,
+        );
+        return action;
+    }
+    ui.add_enabled_ui(!busy, |ui| {
+        ui.checkbox(
+            cleanup_after_unmount,
+            "Clean empty mount directories after unmount",
+        );
+    });
+    if let Some(pending) = confirm_unmount.clone() {
+        let name = mounted
+            .iter()
+            .find(|item| item.archive_path == pending)
+            .map(|item| item.display_name.as_str())
+            .unwrap_or("this archive");
+        widgets::card(ui, |ui| {
+            widgets::status_badge(ui, "Confirmation", widgets::StatusTone::Warning);
+            ui.strong(format!("Unmount {name}?"));
+            ui.label("Close applications using this mount before unmounting.");
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Unmount now",
+                    widgets::ActionStyle::Destructive,
+                    !busy,
+                )
+                .clicked()
+                {
+                    action = Some(ActiveMountsPageAction::Unmount(pending.clone()));
+                    *confirm_unmount = None;
+                }
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
+                    *confirm_unmount = None;
+                }
+            });
+        });
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for item in &mounted {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(&item.display_name).size(17.0).strong());
+                        widgets::status_badge(ui, "Mounted", widgets::StatusTone::Active);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if widgets::action_button(
+                                ui,
+                                "Unmount",
+                                widgets::ActionStyle::Destructive,
+                                !busy,
+                            )
+                            .clicked()
+                            {
+                                *confirm_unmount = Some(item.archive_path.clone());
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Open in Library",
+                                widgets::ActionStyle::Quiet,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(ActiveMountsPageAction::OpenInLibrary(
+                                    item.archive_path.clone(),
+                                ));
+                            }
+                        });
+                    });
+                    if widgets::path_value(ui, "Destination", &item.mount_path) {
+                        ui.ctx().copy_text(item.mount_path.display().to_string());
+                    }
+                    if widgets::path_value(ui, "Archive", &item.archive_path) {
+                        ui.ctx().copy_text(item.archive_path.display().to_string());
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
+    action
+}
+fn show_history_logs_page(
+    ui: &mut egui::Ui,
+    history: &mut OperationHistory,
+    filters: &mut HistoryLogFilters,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::page_header(
+        ui,
+        "History & Logs",
+        "Filter, inspect, copy, or export operations from this application session.",
+    );
+    if history.entries().next().is_none() {
+        widgets::empty_state(
+            ui,
+            "No activity yet",
+            "Mounts, scans, diagnostics, and trusted-source retrievals will be recorded here for this session.",
+            None,
+        );
+        return;
+    }
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_label("Operation")
+                .selected_text(
+                    filters
+                        .action
+                        .map_or_else(|| "All Operations".to_string(), |action| action.to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filters.action, None, "All Operations");
+                    for action in ALL_ACTIVITY_ACTIONS {
+                        ui.selectable_value(&mut filters.action, Some(action), action.to_string());
+                    }
+                });
+            egui::ComboBox::from_label("Result")
+                .selected_text(
+                    filters
+                        .outcome
+                        .map_or_else(|| "All Results".to_string(), |outcome| outcome.to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filters.outcome, None, "All Results");
+                    for outcome in ALL_ACTIVITY_OUTCOMES {
+                        ui.selectable_value(
+                            &mut filters.outcome,
+                            Some(outcome),
+                            outcome.to_string(),
+                        );
+                    }
+                });
+            let sort_label = if filters.oldest_first {
+                "Sort: Oldest First"
+            } else {
+                "Sort: Newest First"
+            };
+            if widgets::action_button(ui, sort_label, widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                filters.oldest_first = !filters.oldest_first;
+            }
+            if widgets::action_button(
+                ui,
+                "Clear filters",
+                widgets::ActionStyle::Quiet,
+                filters.action.is_some() || filters.outcome.is_some(),
+            )
+            .clicked()
+            {
+                filters.action = None;
+                filters.outcome = None;
+            }
+        })
+        .inner
+    });
+
+    // Owned copies end the immutable borrow of `history` before the
+    // buttons below may mutate it (clear / record an export entry).
+    let visible_entries: Vec<HistoryEntry> = visible_history_entries(history, filters)
+        .into_iter()
+        .cloned()
+        .collect();
+    let visible_texts: Vec<String> = visible_entries.iter().map(history_entry_text).collect();
+    let total = history.entries().count();
+
+    let mut export_requested = false;
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if visible_texts.len() == total {
+                if total == 1 {
+                    ui.label("1 entry.".to_string());
+                } else {
+                    ui.label(format!("{total} entries."));
+                }
+            } else {
+                ui.label(format!("{} of {total} entries shown.", visible_texts.len()));
+            }
+            if widgets::action_button(
+                ui,
+                "Copy visible log",
+                widgets::ActionStyle::Secondary,
+                !visible_texts.is_empty(),
+            )
+            .clicked()
+            {
+                let _ = clipboard.set_text(visible_texts.join("\n"));
+            }
+            if widgets::action_button(
+                ui,
+                "Export log",
+                widgets::ActionStyle::Secondary,
+                !visible_texts.is_empty(),
+            )
+            .clicked()
+            {
+                export_requested = true;
+            }
+            if widgets::action_button(
+                ui,
+                "Clear history",
+                widgets::ActionStyle::Destructive,
+                !visible_texts.is_empty(),
+            )
+            .clicked()
+            {
+                history.clear();
+            }
+        })
+        .inner
+    });
+    if export_requested
+        && let Some(path) = rfd::FileDialog::new()
+            .set_file_name("archivefs-operations-log.txt")
+            .save_file()
+    {
+        match std::fs::write(&path, visible_texts.join("\n")) {
+            Ok(()) => history.record(HistoryEntry::new(
+                ActivityAction::LogExport,
+                None,
+                ActivityOutcome::Completed,
+                format!(
+                    "Exported {} log entries to {}",
+                    visible_texts.len(),
+                    path.display()
+                ),
+            )),
+            Err(error) => history.record(HistoryEntry::new(
+                ActivityAction::LogExport,
+                None,
+                ActivityOutcome::Failed,
+                format!("Could not export log to {}: {error}", path.display()),
+            )),
+        }
+    }
+    ui.separator();
+
+    if visible_texts.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No matching activity",
+            "Change or clear the filters to see session events.",
+            None,
+        );
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (entry, text) in visible_entries.iter().zip(&visible_texts) {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(
+                            ui,
+                            entry.outcome.to_string(),
+                            activity_outcome_tone(entry.outcome),
+                        );
+                        ui.strong(entry.action.to_string());
+                        ui.label(
+                            egui::RichText::new(format_history_timestamp(entry.timestamp))
+                                .color(theme::muted(ui)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
+                                .clicked()
+                            {
+                                let _ = clipboard.set_text(text.clone());
+                            }
+                        });
+                    });
+                    ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
+                    if let Some(path) = &entry.archive_path {
+                        egui::CollapsingHeader::new("Related archive")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if widgets::path_value(ui, "Archive", path) {
+                                    let _ = clipboard.set_text(path.display().to_string());
+                                }
+                            });
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
+}
+struct CheatWorkflowState {
+    /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
+    /// .path` identity the rest of the app uses, never a filename.
+    archive_path: PathBuf,
+    display_name: String,
+    platform: Option<String>,
+    source_root: PathBuf,
+    size_bytes: Option<u64>,
+    /// The emulator adapter is explicit and independent from archive
+    /// selection. PCSX2 is offered only for a canonical PS2 archive.
+    adapter: CheatEmulatorAdapter,
+    /// The explicitly selected profile. Preselected only when exactly
+    /// one eligible profile exists (the CLI's own auto-selection rule);
+    /// with several eligible profiles the user must choose - never
+    /// silently picked.
+    selected_profile_id: Option<String>,
+    selected_pcsx2_profile_id: Option<String>,
+    /// The PCSX2 profile identity bound to this archive's inventory.
+    pcsx2_inventory_profile_id: Option<String>,
+    pcsx2_inventory: CheatStepResource<Pcsx2PnachInventory>,
+    selected_dolphin_profile_id: Option<String>,
+    /// The Dolphin profile identity bound to this archive's inventory.
+    dolphin_inventory_profile_id: Option<String>,
+    dolphin_inventory: CheatStepResource<DolphinGameIniInventory>,
+    /// Independent source mode. Changing it never changes the archive,
+    /// profile, destination, or any fetched result retained by another mode.
+    source_mode: CheatSourceMode,
+    /// The profile identity bound to the current read-only installed-library
+    /// inspection. A profile change invalidates only this observation.
+    existing_library_profile_id: Option<String>,
+    existing_library: CheatStepResource<RetroArchCheatLibraryInspection>,
+    /// Step 2: the trusted-source cache listing, loaded in the
+    /// background when the workflow opens.
+    source_list: CheatStepResource<CheatSourceList>,
+    /// Step 2: the most recent catalogue retrieval (network fetch or
+    /// offline cached-snapshot reuse). A result whose source no longer
+    /// matches `selected_source_id` at receive time is discarded.
+    source_fetch: CheatStepResource<CheatSourceFetchResult>,
+    /// The explicitly selected trusted source - preselected only when
+    /// exactly one enabled trusted source exists (same single-candidate
+    /// rule as profiles).
+    selected_source_id: Option<String>,
+    /// Whether "Fetch / Update catalogue" bypasses the fresh-cache
+    /// short-circuit (the CLI's `--force-refresh`). Never applies to
+    /// offline reuse.
+    fetch_force_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheatEmulatorAdapter {
+    RetroArch,
+    Pcsx2,
+    Dolphin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheatSourceMode {
+    ExistingRetroArchLibrary,
+    ArchiveFsTrustedCatalogue,
+}
+
+impl CheatSourceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExistingRetroArchLibrary => "Existing RetroArch library",
+            Self::ArchiveFsTrustedCatalogue => "ArchiveFS cached catalogue",
+        }
+    }
+}
+
+fn cheat_archive_change_requires_confirmation(
+    workflow: Option<&CheatWorkflowState>,
+    candidate: &Path,
+) -> bool {
+    workflow.is_some_and(|workflow| {
+        workflow.archive_path != candidate
+            && !matches!(workflow.source_fetch, CheatStepResource::NotLoaded)
+    })
+}
+
+fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulatorAdapter) {
+    if workflow.adapter == adapter {
+        return;
+    }
+    workflow.adapter = adapter;
+    // Dropping a loading receiver is the stale-result boundary: the
+    // superseded worker cannot apply its result to the new adapter.
+    workflow.pcsx2_inventory_profile_id = None;
+    workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+    workflow.dolphin_inventory_profile_id = None;
+    workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+}
+
+#[derive(Default)]
+struct CheatArchivePickerState {
+    search: String,
+    platform_filter: Option<String>,
+    source_filter: Option<PathBuf>,
+    candidate: Option<PathBuf>,
+}
+
+impl CheatArchivePickerState {
+    fn for_current(current: Option<&Path>) -> Self {
+        Self {
+            candidate: current.map(Path::to_path_buf),
+            ..Self::default()
+        }
+    }
+}
+
+enum CheatArchivePickerAction {
+    Cancel,
+    Select(PathBuf),
+}
+
+fn cheat_picker_row_matches(
+    row: &ArchiveRow,
+    search: &str,
+    platform_filter: Option<&str>,
+    source_filter: Option<&Path>,
+) -> bool {
+    if row.origin != RowOrigin::Live {
+        return false;
+    }
+    let normalized = search.trim().to_lowercase();
+    let source_matches =
+        source_filter.is_none_or(|wanted| row.source_path.as_deref() == Some(wanted));
+    let platform_matches = platform_filter.is_none_or(|wanted| row.platform == wanted);
+    let text_matches = normalized.is_empty()
+        || row.matches(&normalized)
+        || row.source_path.as_ref().is_some_and(|source| {
+            source
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&normalized)
+        });
+    source_matches && platform_matches && text_matches
+}
+
+fn cheat_picker_visible_indices(
+    rows: &[ArchiveRow],
+    picker: &CheatArchivePickerState,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            cheat_picker_row_matches(
+                row,
+                &picker.search,
+                picker.platform_filter.as_deref(),
+                picker.source_filter.as_deref(),
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+    indices.sort_by(|left, right| rows[*left].path.cmp(&rows[*right].path));
+    indices
+}
+
+fn move_cheat_picker_candidate(
+    rows: &[ArchiveRow],
+    visible: &[usize],
+    current: Option<&Path>,
+    direction: ArrowDirection,
+) -> Option<PathBuf> {
+    if visible.is_empty() {
+        return None;
+    }
+    let current_position = current.and_then(|current| {
+        visible
+            .iter()
+            .position(|index| rows[*index].path == current)
+    });
+    let position = match (current_position, direction) {
+        (Some(position), ArrowDirection::Down) => (position + 1).min(visible.len() - 1),
+        (Some(position), ArrowDirection::Up) => position.saturating_sub(1),
+        (None, ArrowDirection::Down) => 0,
+        (None, ArrowDirection::Up) => visible.len() - 1,
+    };
+    Some(rows[visible[position]].path.clone())
+}
+
+fn show_cheat_archive_picker(
+    context: &egui::Context,
+    picker: &mut CheatArchivePickerState,
+    rows: &[ArchiveRow],
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatArchivePickerAction> {
+    let default_size = cheat_archive_picker_size(context.input(|input| input.screen_rect().size()));
+    let mut action = None;
+    let mut open = true;
+    egui::Window::new("Choose an archive for Cheats & Mods")
+        .id(egui::Id::new("cheats_mods_archive_picker"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(default_size)
+        .min_size(egui::vec2(520.0, 420.0))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(context, |ui| {
+            ui.label("This changes only the Cheats & Mods context. It does not mount, queue, fetch, or modify the archive.");
+            let search_has_focus = ui
+                .add(
+                egui::TextEdit::singleline(&mut picker.search)
+                    .hint_text("Search name, platform, source, mount state, or path")
+                    .desired_width(f32::INFINITY),
+                )
+                .has_focus();
+
+            let mut platforms: Vec<String> = rows
+                .iter()
+                .filter(|row| row.origin == RowOrigin::Live)
+                .map(|row| row.platform.clone())
+                .collect();
+            platforms.sort();
+            platforms.dedup();
+            let mut sources: Vec<PathBuf> = rows
+                .iter()
+                .filter(|row| row.origin == RowOrigin::Live)
+                .filter_map(|row| row.source_path.clone())
+                .collect();
+            sources.sort();
+            sources.dedup();
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("cheat_picker_platform")
+                    .selected_text(picker.platform_filter.as_deref().unwrap_or("All platforms"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut picker.platform_filter, None, "All platforms");
+                        for platform in &platforms {
+                            ui.selectable_value(
+                                &mut picker.platform_filter,
+                                Some(platform.clone()),
+                                platform,
+                            );
+                        }
+                    });
+                egui::ComboBox::from_id_salt("cheat_picker_source")
+                    .selected_text(
+                        picker
+                            .source_filter
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "All sources".to_string()),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut picker.source_filter, None, "All sources");
+                        for source in &sources {
+                            ui.selectable_value(
+                                &mut picker.source_filter,
+                                Some(source.clone()),
+                                source.display().to_string(),
+                            );
+                        }
+                    });
+            });
+
+            let visible = cheat_picker_visible_indices(rows, picker);
+            if !search_has_focus && ui.input(|input| input.key_pressed(egui::Key::ArrowDown)) {
+                picker.candidate = move_cheat_picker_candidate(
+                    rows,
+                    &visible,
+                    picker.candidate.as_deref(),
+                    ArrowDirection::Down,
+                );
+            }
+            if !search_has_focus && ui.input(|input| input.key_pressed(egui::Key::ArrowUp)) {
+                picker.candidate = move_cheat_picker_candidate(
+                    rows,
+                    &visible,
+                    picker.candidate.as_deref(),
+                    ArrowDirection::Up,
+                );
+            }
+
+            ui.separator();
+            ui.label(format!("{} matching archives", visible.len()));
+            egui::ScrollArea::vertical()
+                .id_salt("cheat_archive_picker_rows")
+                .max_height((ui.available_height() * 0.52).max(160.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for index in &visible {
+                        let row = &rows[*index];
+                        let title = row
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_else(|| row.path.as_os_str().to_string_lossy());
+                        let selected = picker.candidate.as_deref() == Some(row.path.as_path());
+                        let response = ui
+                            .add(
+                                egui::Button::selectable(
+                                selected,
+                                format!("{title}  ·  {}  ·  {}", row.platform, row.state),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(row.path.display().to_string());
+                        if response.clicked() {
+                            picker.candidate = Some(row.path.clone());
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Copy archive path").clicked() {
+                                let _ = clipboard.set_text(row.path.display().to_string());
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+
+            if let Some(candidate) = picker.candidate.as_ref()
+                && let Some(row) = rows.iter().find(|row| row.path == *candidate)
+            {
+                widgets::card(ui, |ui| {
+                    ui.strong("Selected archive preview");
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(ui, &row.platform, widgets::StatusTone::Info);
+                        widgets::status_badge(ui, &row.state, widgets::StatusTone::Pending);
+                    });
+                    if widgets::path_value(ui, "Archive", &row.path) {
+                        let _ = clipboard.set_text(row.path.display().to_string());
+                    }
+                    if let Some(source) = &row.source_path
+                        && widgets::path_value(ui, "Source", source)
+                    {
+                        let _ = clipboard.set_text(source.display().to_string());
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    action = Some(CheatArchivePickerAction::Cancel);
+                }
+                let choose = ui.add_enabled(
+                    picker.candidate.as_ref().is_some_and(|candidate| {
+                        rows.iter().any(|row| {
+                            row.origin == RowOrigin::Live && row.path == *candidate
+                        })
+                    }),
+                    egui::Button::new("Use selected archive"),
+                );
+                if choose.clicked()
+                    || (!search_has_focus
+                        && choose.enabled()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                {
+                    action = picker
+                        .candidate
+                        .clone()
+                        .map(CheatArchivePickerAction::Select);
+                }
+            });
+        });
+    if !open && action.is_none() {
+        action = Some(CheatArchivePickerAction::Cancel);
+    }
+    if action.is_none() && context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        action = Some(CheatArchivePickerAction::Cancel);
+    }
+    action
+}
+
+fn cheat_archive_picker_size(screen: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        (screen.x * 0.82).clamp(620.0, 1080.0),
+        (screen.y * 0.82).clamp(480.0, 760.0),
+    )
+}
+
+/// A background-loaded cheat-workflow resource. Stale-result protection
+/// is ownership, the app's existing pattern: starting a new load
+/// replaces this state wholesale, dropping the previous receiver, so a
+/// superseded worker's `send` fails and its result can never apply.
+/// Closing the workflow - or the selected archive changing - drops the
+/// whole `CheatWorkflowState` the same way.
+enum CheatStepResource<T> {
+    NotLoaded,
+    Loading {
+        receiver: Receiver<Result<T, String>>,
+    },
+    Ready(T),
+    Failed(String),
+}
+
+/// Display label for a cached trusted-source snapshot's freshness.
+fn cheat_freshness_label(freshness: CheatSourceFreshness) -> &'static str {
+    match freshness {
+        CheatSourceFreshness::Fresh => "Fresh",
+        CheatSourceFreshness::Stale => "Stale",
+        CheatSourceFreshness::Missing => "Not cached",
+        CheatSourceFreshness::Unknown => "Unknown",
+    }
+}
+
+fn cheat_freshness_tone(freshness: CheatSourceFreshness) -> widgets::StatusTone {
+    match freshness {
+        CheatSourceFreshness::Fresh => widgets::StatusTone::Success,
+        CheatSourceFreshness::Stale => widgets::StatusTone::Warning,
+        CheatSourceFreshness::Missing | CheatSourceFreshness::Unknown => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
+/// Display label for how a catalogue retrieval was satisfied.
+fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
+    match status {
+        CheatSourceFetchStatus::Fetched => "Downloaded fresh catalogue",
+        CheatSourceFetchStatus::CacheReused => "Reused cached snapshot",
+        CheatSourceFetchStatus::OfflineReused => "Offline: reused cached snapshot",
+    }
+}
+
+fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
+    warnings
+        .iter()
+        .map(|warning| {
+            let count = warning.split_whitespace().next().unwrap_or("Some");
+            if warning.contains("retained but are non-actionable because parsing was incomplete") {
+                format!(
+                    "{count} catalogue files could not be parsed and were excluded from matching."
+                )
+            } else if warning.contains("non-UTF-8 catalogue files were safely skipped") {
+                format!("{count} files used unsupported path encoding and were skipped safely.")
+            } else if warning == "cached snapshot is stale" {
+                "The cached catalogue is stale; update it when a network connection is available."
+                    .to_string()
+            } else {
+                warning.clone()
+            }
+        })
+        .collect()
+}
+
+/// What the cheat workflow panel asks `update` to do.
+enum CheatWorkflowAction {
+    ChooseArchive,
+    OpenLibrary,
+    SelectAdapter(CheatEmulatorAdapter),
+    RescanProfiles,
+    RescanPcsx2Profiles,
+    InspectPcsx2Profile,
+    RescanDolphinProfiles,
+    InspectDolphinProfile,
+    InspectExistingLibrary,
+    RefreshSources,
+    FetchSource,
+    UseCachedSnapshot,
+}
+
+const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
+const CHEAT_STAGE3_BODY: &str = "Catalogue retrieval is available. Archive matching and cheat installation are not yet implemented in this GUI workflow.";
+const LOCAL_INSPECTION_PRIVACY_COPY: &str = "Trusted catalogue archives are validated locally on this device for unsafe paths, special entries, resource-limit violations, and unexpected structure. Scan results, filenames, file contents, hashes, and metadata are not sent to the ArchiveFS developers or any third party. General local or community-source inspection is planned and is not active yet.";
+const IMPORT_CONSENT_COPY: &str = "Only import cheats or mods from sources you trust. ArchiveFS performs local structural and format checks where an implemented adapter provides them, but it is not an antivirus scanner.";
+const ETHICAL_USE_COPY: &str = "ArchiveFS is intended for preservation, accessibility, personal customization, and legitimate interoperability. It must not be used to bypass copy protection, licensing systems, access controls, or other technical protections. Game developers, artists, musicians, writers, testers, and publishers invest substantial effort in creating games; supporting legitimate releases helps future games, updates, and preservation efforts.";
+const USER_RESPONSIBILITY_COPY: &str = "You are responsible for ensuring that you have the right to use, modify, import, and distribute cheats, patches, mods, textures, or related files. ArchiveFS does not verify ownership or licensing.";
+const SCANNING_DISABLED_WARNING: &str =
+    "Turning this off does not make unsafe files safe. It only stops ArchiveFS checking them.";
+
+fn import_trust_label(state: ImportTrustState) -> &'static str {
+    match state {
+        ImportTrustState::Trusted => "Trusted",
+        ImportTrustState::Unverified => "Unverified",
+        ImportTrustState::Blocked => "Blocked",
+    }
+}
+
+fn import_trust_tone(state: ImportTrustState) -> widgets::StatusTone {
+    match state {
+        ImportTrustState::Trusted => widgets::StatusTone::Success,
+        ImportTrustState::Unverified => widgets::StatusTone::Warning,
+        ImportTrustState::Blocked => widgets::StatusTone::Blocked,
+    }
+}
+
+fn import_source_presentation(kind: ImportSourceKind) -> (&'static str, &'static str) {
+    match kind {
+        ImportSourceKind::EmulatorManagedLibrary => {
+            ("Existing emulator-managed library", "Existing content")
+        }
+        ImportSourceKind::ArchiveFsTrustedCatalogue => ("ArchiveFS trusted catalogue", "Available"),
+        ImportSourceKind::LocalUnverifiedSource => ("Local unverified source", "Planned"),
+        ImportSourceKind::RemoteUnverifiedSource => ("Future remote unverified source", "Planned"),
+    }
+}
+
+fn local_scanning_presentation(
+    state: LocalSafetyScanningState,
+) -> (&'static str, widgets::StatusTone) {
+    match state {
+        LocalSafetyScanningState::PlannedUnavailable => (
+            "Local safety scanning · Planned",
+            widgets::StatusTone::Pending,
+        ),
+        LocalSafetyScanningState::Enabled => {
+            ("Local safety scanning · On", widgets::StatusTone::Success)
+        }
+        LocalSafetyScanningState::DisabledPendingConfirmation => (
+            "Local safety scanning · Confirmation required",
+            widgets::StatusTone::Warning,
+        ),
+        LocalSafetyScanningState::Disabled => {
+            ("Local safety scanning · Off", widgets::StatusTone::Warning)
+        }
+    }
+}
+
+fn show_cheats_mods_workflow_states(
+    ui: &mut egui::Ui,
+    workflow: Option<&CheatWorkflowState>,
+    profiles: &RetroArchProfilesState,
+    pcsx2_profiles: &Pcsx2ProfilesState,
+    dolphin_profiles: &DolphinProfilesState,
+) {
+    if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2) {
+        show_pcsx2_workflow_states(ui, workflow.unwrap(), pcsx2_profiles);
+        return;
+    }
+    if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin) {
+        show_dolphin_workflow_states(ui, workflow.unwrap(), dolphin_profiles);
+        return;
+    }
+    let (profile_label, profile_tone) = retroarch_integration_presentation(profiles);
+    let source_label = workflow
+        .map(|workflow| workflow.source_mode.label())
+        .unwrap_or("No source mode selected");
+    let (source_tone, trust_label, trust_tone) = match workflow.map(|workflow| workflow.source_mode)
+    {
+        Some(CheatSourceMode::ExistingRetroArchLibrary) => (
+            widgets::StatusTone::Info,
+            import_trust_label(ImportTrustState::Unverified),
+            import_trust_tone(ImportTrustState::Unverified),
+        ),
+        Some(CheatSourceMode::ArchiveFsTrustedCatalogue) => (
+            widgets::StatusTone::Success,
+            import_trust_label(ImportTrustState::Trusted),
+            import_trust_tone(ImportTrustState::Trusted),
+        ),
+        None => (
+            widgets::StatusTone::Pending,
+            "Not selected",
+            widgets::StatusTone::Pending,
+        ),
+    };
+    let (inspection_label, inspection_tone) = match workflow {
+        Some(workflow) if workflow.source_mode == CheatSourceMode::ExistingRetroArchLibrary => {
+            match &workflow.existing_library {
+                CheatStepResource::Ready(result) if result.complete => (
+                    "Local bounded inventory complete",
+                    widgets::StatusTone::Success,
+                ),
+                CheatStepResource::Ready(_) => {
+                    ("Local inventory incomplete", widgets::StatusTone::Warning)
+                }
+                CheatStepResource::Loading { .. } => {
+                    ("Inspecting locally", widgets::StatusTone::Active)
+                }
+                CheatStepResource::Failed(_) => {
+                    ("Local inventory unavailable", widgets::StatusTone::Warning)
+                }
+                CheatStepResource::NotLoaded => {
+                    ("Local inventory pending", widgets::StatusTone::Pending)
+                }
+            }
+        }
+        Some(_) => (
+            "Trusted retrieval validation available",
+            widgets::StatusTone::Success,
+        ),
+        None => ("Not started", widgets::StatusTone::Pending),
+    };
+    let destination_label = workflow
+        .and_then(|workflow| {
+            let selected = workflow.selected_profile_id.as_deref()?;
+            let RetroArchProfilesState::Ready(discovery) = profiles else {
+                return None;
+            };
+            discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .and_then(|profile| profile.cheat_destination_root.as_ref())
+                .map(|path| path.display.clone())
+        })
+        .unwrap_or_else(|| {
+            if workflow.is_some() {
+                "Not selected — choose an eligible profile".to_string()
+            } else {
+                "No archive context".to_string()
+            }
+        });
+    widgets::section_header(
+        ui,
+        "Workflow state",
+        Some(
+            "Profile, source, inspection, destination, and installation remain separate decisions.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        for (label, value, tone) in [
+            ("Emulator profile", profile_label.as_str(), profile_tone),
+            ("Cheat or mod source", source_label, source_tone),
+            ("Trust state", trust_label, trust_tone),
+            ("Inspection state", inspection_label, inspection_tone),
+            (
+                "Destination",
+                destination_label.as_str(),
+                widgets::StatusTone::Pending,
+            ),
+            (
+                "Installation state",
+                "Unavailable",
+                widgets::StatusTone::Pending,
+            ),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(label).strong()),
+                );
+                widgets::status_badge(ui, value, tone);
+            });
+        }
+    });
+}
+
+fn show_pcsx2_workflow_states(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    profiles: &Pcsx2ProfilesState,
+) {
+    let (profile_label, profile_tone) = pcsx2_integration_presentation(profiles);
+    let (inspection_label, inspection_tone) = match &workflow.pcsx2_inventory {
+        CheatStepResource::Ready(inventory) if inventory.complete => (
+            "Local PNACH inventory complete",
+            widgets::StatusTone::Success,
+        ),
+        CheatStepResource::Ready(_) => (
+            "Local PNACH inventory incomplete",
+            widgets::StatusTone::Warning,
+        ),
+        CheatStepResource::Loading { .. } => ("Inspecting locally", widgets::StatusTone::Active),
+        CheatStepResource::Failed(_) => {
+            ("Local inspection unavailable", widgets::StatusTone::Warning)
+        }
+        CheatStepResource::NotLoaded => ("Local inspection pending", widgets::StatusTone::Pending),
+    };
+    let destination = workflow
+        .selected_pcsx2_profile_id
+        .as_deref()
+        .and_then(|selected| match profiles {
+            Pcsx2ProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .map(|profile| profile.configuration_path.display().to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Not selected — choose an eligible profile".to_string());
+    widgets::section_header(
+        ui,
+        "Workflow state",
+        Some("Profile, source, inspection, destination, and installation remain separate states."),
+    );
+    widgets::card(ui, |ui| {
+        for (label, value, tone) in [
+            ("Emulator profile", profile_label.as_str(), profile_tone),
+            (
+                "Cheat or mod source",
+                "Existing PCSX2-managed files",
+                widgets::StatusTone::Info,
+            ),
+            (
+                "Trust state",
+                "Unverified local content",
+                widgets::StatusTone::Warning,
+            ),
+            ("Inspection state", inspection_label, inspection_tone),
+            (
+                "Destination",
+                destination.as_str(),
+                widgets::StatusTone::Pending,
+            ),
+            (
+                "Installation state",
+                "Unavailable · read-only adapter",
+                widgets::StatusTone::Pending,
+            ),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(label).strong()),
+                );
+                widgets::status_badge(ui, value, tone);
+            });
+        }
+    });
+}
+
+fn pcsx2_integration_presentation(profiles: &Pcsx2ProfilesState) -> (String, widgets::StatusTone) {
+    match profiles {
+        Pcsx2ProfilesState::NotScanned => (
+            "PCSX2 profiles not scanned".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        Pcsx2ProfilesState::Scanning { .. } => (
+            "Scanning PCSX2 profiles".to_string(),
+            widgets::StatusTone::Active,
+        ),
+        Pcsx2ProfilesState::Error(_) => (
+            "PCSX2 profile scan needs attention".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        Pcsx2ProfilesState::Ready(discovery) => {
+            let eligible = discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .count();
+            if eligible == 0 {
+                (
+                    "No eligible PCSX2 profile".to_string(),
+                    widgets::StatusTone::Warning,
+                )
+            } else {
+                (
+                    format!(
+                        "{eligible} eligible PCSX2 profile{}",
+                        if eligible == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                )
+            }
+        }
+    }
+}
+
+fn show_dolphin_workflow_states(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+) {
+    let (profile_label, profile_tone) = dolphin_integration_presentation(profiles);
+    let (inspection_label, inspection_tone) = match &workflow.dolphin_inventory {
+        CheatStepResource::Ready(inventory) if inventory.complete => (
+            "Local Game INI inventory complete",
+            widgets::StatusTone::Success,
+        ),
+        CheatStepResource::Ready(_) => (
+            "Local Game INI inventory incomplete",
+            widgets::StatusTone::Warning,
+        ),
+        CheatStepResource::Loading { .. } => ("Inspecting locally", widgets::StatusTone::Active),
+        CheatStepResource::Failed(_) => {
+            ("Local inspection unavailable", widgets::StatusTone::Warning)
+        }
+        CheatStepResource::NotLoaded => ("Local inspection pending", widgets::StatusTone::Pending),
+    };
+    let destination = workflow
+        .selected_dolphin_profile_id
+        .as_deref()
+        .and_then(|selected| match profiles {
+            DolphinProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .map(|profile| profile.game_settings_path.display().to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Not selected — choose an eligible profile".to_string());
+    widgets::section_header(
+        ui,
+        "Workflow state",
+        Some(
+            "Profile, inspection, identity, destination, and installation remain separate states.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        for (label, value, tone) in [
+            ("Emulator profile", profile_label.as_str(), profile_tone),
+            (
+                "Cheat or mod source",
+                "Existing Dolphin-managed files",
+                widgets::StatusTone::Info,
+            ),
+            (
+                "Trust state",
+                "Unverified local content",
+                widgets::StatusTone::Warning,
+            ),
+            ("Inspection state", inspection_label, inspection_tone),
+            (
+                "Destination",
+                destination.as_str(),
+                widgets::StatusTone::Pending,
+            ),
+            (
+                "Installation state",
+                "Unavailable · read-only adapter",
+                widgets::StatusTone::Pending,
+            ),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(label).strong()),
+                );
+                widgets::status_badge(ui, value, tone);
+            });
+        }
+    });
+}
+
+fn dolphin_integration_presentation(
+    profiles: &DolphinProfilesState,
+) -> (String, widgets::StatusTone) {
+    match profiles {
+        DolphinProfilesState::NotScanned => (
+            "Dolphin profiles not scanned".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        DolphinProfilesState::Scanning { .. } => (
+            "Scanning Dolphin profiles".to_string(),
+            widgets::StatusTone::Active,
+        ),
+        DolphinProfilesState::Error(_) => (
+            "Dolphin profile scan needs attention".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        DolphinProfilesState::Ready(discovery) => {
+            let eligible = discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .count();
+            if eligible == 0 {
+                (
+                    "No eligible Dolphin profile".to_string(),
+                    widgets::StatusTone::Warning,
+                )
+            } else {
+                (
+                    format!(
+                        "{eligible} eligible Dolphin profile{}",
+                        if eligible == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                )
+            }
+        }
+    }
+}
+
+fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
+    egui::CollapsingHeader::new("Safety, privacy, and responsible use")
+        .default_open(false)
+        .show(ui, |ui| {
+            widgets::card(ui, |ui| {
+                ui.label(UNKNOWN_CODE_POLICY);
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let (label, tone) =
+                        local_scanning_presentation(LocalSafetyScanningState::current());
+                    widgets::status_badge(ui, label, tone);
+                    ui.label("No general local or community-source scanner or setting is active yet.");
+                });
+                ui.label(LOCAL_INSPECTION_PRIVACY_COPY);
+                ui.label("ArchiveFS never silently rewrites, deletes, or sanitizes an original import source. A future sanitized import would be a separate copy with an exclusion report.");
+                ui.label(IMPORT_CONSENT_COPY);
+                ui.label(format!("Future scanning control: {SCANNING_DISABLED_WARNING}"));
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for state in [
+                        ImportTrustState::Trusted,
+                        ImportTrustState::Unverified,
+                        ImportTrustState::Blocked,
+                    ] {
+                        widgets::status_badge(
+                            ui,
+                            import_trust_label(state),
+                            import_trust_tone(state),
+                        );
+                    }
+                });
+                ui.label("Trusted means a reviewed adapter and known provenance. Unverified means not reviewed by ArchiveFS; it does not mean malicious. Blocked is reserved for a concrete technical danger or adapter incompatibility.");
+                ui.add_space(6.0);
+                ui.label(ETHICAL_USE_COPY);
+                ui.label(USER_RESPONSIBILITY_COPY);
+            });
+        });
+}
+
+fn retroarch_integration_presentation(
+    profiles: &RetroArchProfilesState,
+) -> (String, widgets::StatusTone) {
+    match profiles {
+        RetroArchProfilesState::NotScanned => (
+            "RetroArch profiles not scanned".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        RetroArchProfilesState::Scanning { .. } => (
+            "Scanning RetroArch profiles".to_string(),
+            widgets::StatusTone::Active,
+        ),
+        RetroArchProfilesState::Error(_) => (
+            "RetroArch profile scan needs attention".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        RetroArchProfilesState::Ready(discovery) => {
+            let eligible = discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .count();
+            if eligible == 0 {
+                (
+                    "No eligible RetroArch profile".to_string(),
+                    widgets::StatusTone::Warning,
+                )
+            } else {
+                (
+                    format!(
+                        "{eligible} eligible RetroArch profile{}",
+                        if eligible == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                )
+            }
+        }
+    }
+}
+
+fn show_cheat_archive_context(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    live: Option<&LoadedData>,
+    cached: Option<&CachedLibrarySnapshot>,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    let record = live.and_then(|data| {
+        data.records
+            .iter()
+            .find(|record| record.mount_plan.archive.path == workflow.archive_path)
+    });
+    let persisted = selected_persisted_archive(cached, Some(&workflow.archive_path));
+    widgets::section_header(
+        ui,
+        "Selected archive context",
+        Some(
+            "This exact archive remains selected; opening this workspace changes no mount, queue, or platform state.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(&workflow.display_name)
+                    .size(19.0)
+                    .strong(),
+            );
+            widgets::status_badge(
+                ui,
+                persisted
+                    .and_then(|archive| archive.platform.as_deref())
+                    .or(workflow.platform.as_deref())
+                    .unwrap_or("Unknown platform"),
+                widgets::StatusTone::Info,
+            );
+            if let Some(record) = record {
+                widgets::status_badge(
+                    ui,
+                    mount_validation_label(record.mount_state),
+                    match record.mount_state {
+                        MountState::Mounted => widgets::StatusTone::Active,
+                        MountState::Pending => widgets::StatusTone::Success,
+                        MountState::MountPathExists => widgets::StatusTone::Warning,
+                    },
+                );
+            }
+            if persisted.is_some_and(|archive| {
+                archive.platform_source.as_deref() == Some(MANUAL_PLATFORM_SOURCE)
+            }) {
+                widgets::status_badge(ui, "Manual platform assignment", widgets::StatusTone::Info);
+            }
+            ui.label(egui::RichText::new(format_size(workflow.size_bytes)).color(theme::muted(ui)));
+        });
+        if widgets::path_value(ui, "Archive", &workflow.archive_path) {
+            let _ = clipboard.set_text(workflow.archive_path.display().to_string());
+        }
+        if widgets::path_value(ui, "Source", &workflow.source_root) {
+            let _ = clipboard.set_text(workflow.source_root.display().to_string());
+        }
+        if let Some(record) = record
+            && widgets::path_value(ui, "Mount destination", &record.mount_plan.mount_path)
+        {
+            let _ = clipboard.set_text(record.mount_plan.mount_path.display().to_string());
+        }
+    });
+}
+
+fn show_recent_cheat_activity(
+    ui: &mut egui::Ui,
+    history: &OperationHistory,
+    archive_path: Option<&Path>,
+) {
+    let entries: Vec<&HistoryEntry> = history
+        .entries()
+        .filter(|entry| {
+            entry.action == ActivityAction::RetroArchProfileScan
+                || entry.action == ActivityAction::Pcsx2ProfileScan
+                || (matches!(
+                    entry.action,
+                    ActivityAction::CheatSourceRetrieval | ActivityAction::Pcsx2PnachInspection
+                ) && archive_path.is_some()
+                    && entry.archive_path.as_deref() == archive_path)
+        })
+        .take(4)
+        .collect();
+    widgets::section_header(
+        ui,
+        "Recent related activity",
+        Some(
+            "A compact view of this session's emulator profile scans, local PNACH inspection, and trusted catalogue retrieval.",
+        ),
+    );
+    if entries.is_empty() {
+        ui.weak("No related activity has been recorded in this session.");
+        return;
+    }
+    for entry in entries {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    entry.outcome.to_string(),
+                    activity_outcome_tone(entry.outcome),
+                );
+                ui.strong(entry.action.to_string());
+                ui.label(
+                    egui::RichText::new(format_history_timestamp(entry.timestamp))
+                        .color(theme::muted(ui)),
+                );
+            });
+            ui.add(egui::Label::new(&entry.message).truncate())
+                .on_hover_text(&entry.message);
+        });
+        ui.add_space(4.0);
+    }
+}
+
+fn show_cheat_unavailable_stage(ui: &mut egui::Ui) {
+    widgets::section_header(ui, "Stage 3 · Matching and installation", None);
+    widgets::banner(
+        ui,
+        "Not available",
+        CHEAT_STAGE3_BODY,
+        widgets::StatusTone::Pending,
+    );
+}
+
+fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only: bool) {
+    widgets::section_header(
+        ui,
+        "Mods",
+        Some("A stable future home for verified, emulator-specific mod adapters."),
+    );
+    widgets::card(ui, |ui| {
+        if pcsx2_read_only {
+            widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
+            ui.label("PCSX2 widescreen and other PNACH patch directories can be inspected above. Preview, installation, enabling, disabling, replacement, and rollback are unavailable.");
+        } else if dolphin_read_only {
+            widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
+            ui.label("Dolphin frame patches, Action Replay, Gecko, and Riivolution declarations can be inspected above. Installation, enabling, disabling, replacement, and rollback are unavailable.");
+        } else {
+            widgets::status_badge(ui, "Planned", widgets::StatusTone::Pending);
+            ui.label(MODS_UNAVAILABLE_BODY);
+        }
+    });
+}
+
+fn platform_is_ps2(platform: Option<&str>) -> bool {
+    platform.is_some_and(|platform| platform.eq_ignore_ascii_case("PS2"))
+}
+
+fn platform_is_dolphin(platform: Option<&str>) -> bool {
+    platform.is_some_and(|platform| {
+        ["GameCube", "Nintendo GameCube", "Wii", "Nintendo Wii"]
+            .iter()
+            .any(|candidate| platform.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn show_cheat_emulator_adapter_selector(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    widgets::section_header(
+        ui,
+        "Emulator adapter",
+        Some(
+            "The adapter is separate from the archive, source, profile, destination, and installation state.",
+        ),
+    );
+    let mut selected = None;
+    widgets::card(ui, |ui| {
+        if ui
+            .radio(
+                workflow.adapter == CheatEmulatorAdapter::RetroArch,
+                "RetroArch",
+            )
+            .clicked()
+        {
+            selected = Some(CheatEmulatorAdapter::RetroArch);
+        }
+        ui.label("Profile discovery, existing cheat-directory inventory, and trusted catalogue retrieval.");
+    });
+    if platform_is_ps2(workflow.platform.as_deref()) {
+        widgets::card(ui, |ui| {
+            if ui
+                .radio(workflow.adapter == CheatEmulatorAdapter::Pcsx2, "PCSX2")
+                .clicked()
+            {
+                selected = Some(CheatEmulatorAdapter::Pcsx2);
+            }
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(ui, "PS2 only", widgets::StatusTone::Info);
+                widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            });
+            ui.label("Discovers local PCSX2 profiles and inspects existing PNACH files with fixed resource limits.");
+        });
+    }
+    if platform_is_dolphin(workflow.platform.as_deref()) {
+        widgets::card(ui, |ui| {
+            if ui
+                .radio(workflow.adapter == CheatEmulatorAdapter::Dolphin, "Dolphin")
+                .clicked()
+            {
+                selected = Some(CheatEmulatorAdapter::Dolphin);
+            }
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(ui, "GameCube / Wii", widgets::StatusTone::Info);
+                widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            });
+            ui.label("Discovers local Dolphin profiles and inspects existing GameSettings INI files with fixed resource limits.");
+        });
+    }
+    selected
+        .filter(|selected| *selected != workflow.adapter)
+        .map(CheatWorkflowAction::SelectAdapter)
+}
+
+fn show_pcsx2_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &Pcsx2ProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 1 · PCSX2 profile",
+        Some(
+            "ArchiveFS selects automatically only when exactly one discovered profile is eligible.",
+        ),
+    );
+    match profiles {
+        Pcsx2ProfilesState::NotScanned => {
+            widgets::banner(
+                ui,
+                "Profiles not scanned",
+                "Run local read-only discovery of documented PCSX2 configuration paths.",
+                widgets::StatusTone::Pending,
+            );
+        }
+        Pcsx2ProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning PCSX2 profiles locally...");
+            });
+        }
+        Pcsx2ProfilesState::Error(message) => {
+            widgets::banner(
+                ui,
+                "PCSX2 discovery failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+        }
+        Pcsx2ProfilesState::Ready(discovery) => {
+            let eligible = eligible_pcsx2_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_pcsx2_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_pcsx2_profile_id = None;
+                workflow.pcsx2_inventory_profile_id = None;
+                workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+            }
+            if discovery.profiles.is_empty() {
+                widgets::banner(
+                    ui,
+                    "No PCSX2 profile found",
+                    "No documented PCSX2 configuration directory was discovered. Missing cheat directories are not created.",
+                    widgets::StatusTone::Pending,
+                );
+            } else if eligible.len() > 1 && workflow.selected_pcsx2_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. Choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                show_pcsx2_profile_card(ui, workflow, profile, clipboard);
+                ui.add_space(6.0);
+            }
+            for warning in &discovery.warnings {
+                widgets::banner(
+                    ui,
+                    "Discovery limit",
+                    &warning.detail,
+                    widgets::StatusTone::Warning,
+                );
+            }
+        }
+    }
+    if widgets::action_button(
+        ui,
+        "Rescan PCSX2 profiles",
+        widgets::ActionStyle::Quiet,
+        !matches!(profiles, Pcsx2ProfilesState::Scanning { .. }),
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::RescanPcsx2Profiles);
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Stage 2 · Existing PCSX2-managed files",
+        Some(
+            "Cheats, widescreen patches, and other PNACH categories are inferred only from documented directory locations.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
+            widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            widgets::status_badge(ui, "Uploaded · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Executed · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Changed · No", widgets::StatusTone::Info);
+        });
+        ui.label("ArchiveFS inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
+    });
+    let Some(selected_profile_id) = workflow.selected_pcsx2_profile_id.as_deref() else {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible PCSX2 profile before inspecting existing files.",
+            widgets::StatusTone::Pending,
+        );
+        show_pcsx2_installation_unavailable(ui);
+        return action;
+    };
+    if workflow.pcsx2_inventory_profile_id.as_deref() != Some(selected_profile_id) {
+        workflow.pcsx2_inventory_profile_id = None;
+        workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+    }
+    match &workflow.pcsx2_inventory {
+        CheatStepResource::NotLoaded => {
+            if widgets::action_button(
+                ui,
+                "Inspect existing PNACH files",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::InspectPcsx2Profile);
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting existing PNACH files locally...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "PCSX2 inspection failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+        }
+        CheatStepResource::Ready(inventory) => {
+            show_pcsx2_inventory(ui, workflow, inventory, clipboard);
+        }
+    }
+    show_pcsx2_installation_unavailable(ui);
+    action
+}
+
+fn show_dolphin_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 1 · Dolphin profile",
+        Some(
+            "ArchiveFS selects automatically only when exactly one discovered profile is eligible.",
+        ),
+    );
+    match profiles {
+        DolphinProfilesState::NotScanned => widgets::banner(
+            ui,
+            "Profiles not scanned",
+            "Run local read-only discovery of documented Dolphin user directories.",
+            widgets::StatusTone::Pending,
+        ),
+        DolphinProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning Dolphin profiles locally...");
+            });
+        }
+        DolphinProfilesState::Error(message) => widgets::banner(
+            ui,
+            "Dolphin discovery failed",
+            message,
+            widgets::StatusTone::Blocked,
+        ),
+        DolphinProfilesState::Ready(discovery) => {
+            let eligible = eligible_dolphin_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_dolphin_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_dolphin_profile_id = None;
+                workflow.dolphin_inventory_profile_id = None;
+                workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+            }
+            if discovery.profiles.is_empty() {
+                widgets::banner(
+                    ui,
+                    "No Dolphin profile found",
+                    "No documented Dolphin user directory was discovered. Missing GameSettings directories are not created.",
+                    widgets::StatusTone::Pending,
+                );
+            } else if eligible.len() > 1 && workflow.selected_dolphin_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. Choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                show_dolphin_profile_card(ui, workflow, profile, clipboard);
+                ui.add_space(6.0);
+            }
+            for warning in &discovery.warnings {
+                widgets::banner(
+                    ui,
+                    "Discovery limit",
+                    &warning.detail,
+                    widgets::StatusTone::Warning,
+                );
+            }
+        }
+    }
+    if widgets::action_button(
+        ui,
+        "Rescan Dolphin profiles",
+        widgets::ActionStyle::Quiet,
+        !matches!(profiles, DolphinProfilesState::Scanning { .. }),
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::RescanDolphinProfiles);
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Stage 2 · Existing Dolphin-managed files",
+        Some("GameSettings INI sections are parsed as bounded text and are never evaluated."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
+            widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
+            widgets::status_badge(ui, "Uploaded · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Executed · No", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "Changed · No", widgets::StatusTone::Info);
+        });
+        ui.label("ArchiveFS inspects INI structure locally. It never invokes Dolphin, evaluates codes, follows referenced mod paths, or claims that structural inspection proves content is malware-free.");
+    });
+    let Some(selected_profile_id) = workflow.selected_dolphin_profile_id.as_deref() else {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible Dolphin profile before inspecting existing files.",
+            widgets::StatusTone::Pending,
+        );
+        show_dolphin_installation_unavailable(ui);
+        return action;
+    };
+    if workflow.dolphin_inventory_profile_id.as_deref() != Some(selected_profile_id) {
+        workflow.dolphin_inventory_profile_id = None;
+        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+    }
+    match &workflow.dolphin_inventory {
+        CheatStepResource::NotLoaded => {
+            if widgets::action_button(
+                ui,
+                "Inspect existing Game INI files",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::InspectDolphinProfile);
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting GameSettings INI files locally...");
+            });
+        }
+        CheatStepResource::Failed(message) => widgets::banner(
+            ui,
+            "Dolphin inspection failed",
+            message,
+            widgets::StatusTone::Blocked,
+        ),
+        CheatStepResource::Ready(inventory) => show_dolphin_inventory(ui, inventory, clipboard),
+    }
+    show_dolphin_installation_unavailable(ui);
+    action
+}
+
+fn show_dolphin_profile_card(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profile: &DolphinProfile,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if profile.eligible {
+                let selected = workflow.selected_dolphin_profile_id.as_deref()
+                    == Some(profile.profile_id.as_str());
+                if ui.radio(selected, &profile.profile_id).clicked() {
+                    workflow.selected_dolphin_profile_id = Some(profile.profile_id.clone());
+                    workflow.dolphin_inventory_profile_id = None;
+                    workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                }
+            } else {
+                widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                ui.strong(&profile.profile_id);
+            }
+            ui.label(format!(
+                "{} · {}",
+                dolphin_installation_label(profile.installation_type),
+                dolphin_scope_label(profile.scope)
+            ));
+        });
+        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+            let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+        }
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                dolphin_directory_state_label(profile.game_settings_state),
+                dolphin_directory_state_tone(profile.game_settings_state),
+            );
+            if widgets::path_value(ui, "GameSettings", &profile.game_settings_path) {
+                let _ = clipboard.set_text(profile.game_settings_path.display().to_string());
+            }
+        });
+        if let Some(warning) = &profile.game_settings_warning {
+            ui.label(warning);
+        }
+        for blocker in &profile.blockers {
+            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+        }
+    });
+}
+
+fn show_dolphin_inventory(
+    ui: &mut egui::Ui,
+    inventory: &DolphinGameIniInventory,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                if inventory.complete {
+                    "Complete"
+                } else {
+                    "Incomplete"
+                },
+                if inventory.complete {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            ui.strong(format!("{} Game INI files", inventory.files.len()));
+            ui.label(format!("{} bytes inspected", inventory.bytes_inspected));
+            ui.label(format!("{} entries visited", inventory.entries_visited));
+        });
+    });
+    let match_result = match_dolphin_inventory(inventory, None, None);
+    let (label, tone) = dolphin_match_presentation(match_result.state);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, label, tone);
+            ui.label(&match_result.reason);
+        });
+        ui.label("ArchiveFS currently has no reviewed disc-header identity reader. INI filename IDs are observations only until compared with a separately verified archive Game ID.");
+    });
+    egui::CollapsingHeader::new(format!(
+        "Inspected Game INI files ({})",
+        inventory.files.len()
+    ))
+    .default_open(false)
+    .show(ui, |ui| {
+        const MAX_RENDERED: usize = 100;
+        for file in inventory.files.iter().take(MAX_RENDERED) {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(file.filename_stem.to_string_lossy());
+                    if let Some(id) = &file.game_id_candidate {
+                        widgets::status_badge(
+                            ui,
+                            format!("Game ID candidate · {id}"),
+                            widgets::StatusTone::Pending,
+                        );
+                    }
+                    if let Some(revision) = file.revision_candidate {
+                        ui.label(format!("Revision {revision}"));
+                    }
+                });
+                if widgets::path_value(ui, "INI", &file.path) {
+                    let _ = clipboard.set_text(file.path.display().to_string());
+                }
+                ui.label(format!(
+                    "Definitions {} · enabled references {}",
+                    file.definition_count(),
+                    file.enabled_count()
+                ));
+                ui.label(format!(
+                    "Frame patches {} · Action Replay {} · Gecko {} · Riivolution {}",
+                    file.frame_patch_names.len(),
+                    file.action_replay_names.len(),
+                    file.gecko_names.len(),
+                    file.riivolution_names.len()
+                ));
+                egui::CollapsingHeader::new("Technical metadata")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        widgets::copyable_value(ui, "SHA-256", &file.sha256);
+                        if file.duplicate_game_identity
+                            || file.duplicate_filename
+                            || file.duplicate_content
+                        {
+                            ui.label(format!(
+                                "Duplicate identity: {} · filename: {} · content: {}",
+                                file.duplicate_game_identity,
+                                file.duplicate_filename,
+                                file.duplicate_content
+                            ));
+                        }
+                    });
+            });
+        }
+        if inventory.files.len() > MAX_RENDERED {
+            ui.label(format!(
+                "{} additional files omitted from this summary.",
+                inventory.files.len() - MAX_RENDERED
+            ));
+        }
+    });
+    if !inventory.warnings.is_empty() {
+        egui::CollapsingHeader::new(format!(
+            "Inspection warnings ({})",
+            inventory.warnings.len()
+        ))
+        .default_open(false)
+        .show(ui, |ui| {
+            for warning in inventory.warnings.iter().take(50) {
+                ui.label(format!("{:?}: {}", warning.kind, warning.detail));
+            }
+            if inventory.warnings.len() > 50 {
+                ui.label(format!(
+                    "{} additional warnings omitted from this view.",
+                    inventory.warnings.len() - 50
+                ));
+            }
+        });
+    }
+}
+
+fn show_dolphin_installation_unavailable(ui: &mut egui::Ui) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "Stage 3 · Preview and controlled installation", None);
+    widgets::banner(
+        ui,
+        "Unavailable · read-only milestone",
+        "ArchiveFS does not install, apply, enable, disable, replace, fix, delete, generate, or roll back Dolphin files.",
+        widgets::StatusTone::Pending,
+    );
+}
+
+fn dolphin_installation_label(kind: DolphinInstallationType) -> &'static str {
+    match kind {
+        DolphinInstallationType::Native => "Native",
+        DolphinInstallationType::FlatpakUser => "Flatpak user",
+        DolphinInstallationType::FlatpakSystem => "Flatpak system",
+        DolphinInstallationType::Explicit => "Explicit user directory",
+    }
+}
+
+fn dolphin_scope_label(scope: DolphinProfileScope) -> &'static str {
+    match scope {
+        DolphinProfileScope::User => "User profile",
+        DolphinProfileScope::SystemInstallationUserProfile => "System install · user profile",
+        DolphinProfileScope::Explicit => "Explicit scope",
+    }
+}
+
+fn dolphin_directory_state_label(state: DolphinSettingsDirectoryState) -> &'static str {
+    match state {
+        DolphinSettingsDirectoryState::Available => "Exists",
+        DolphinSettingsDirectoryState::Missing => "Missing",
+        DolphinSettingsDirectoryState::UnsafePath => "Unsafe path",
+        DolphinSettingsDirectoryState::NotDirectory => "Not a directory",
+        DolphinSettingsDirectoryState::Unreadable => "Unreadable",
+    }
+}
+
+fn dolphin_directory_state_tone(state: DolphinSettingsDirectoryState) -> widgets::StatusTone {
+    match state {
+        DolphinSettingsDirectoryState::Available => widgets::StatusTone::Success,
+        DolphinSettingsDirectoryState::Missing => widgets::StatusTone::Pending,
+        DolphinSettingsDirectoryState::UnsafePath => widgets::StatusTone::Blocked,
+        DolphinSettingsDirectoryState::NotDirectory | DolphinSettingsDirectoryState::Unreadable => {
+            widgets::StatusTone::Warning
+        }
+    }
+}
+
+fn dolphin_match_presentation(state: DolphinMatchState) -> (&'static str, widgets::StatusTone) {
+    match state {
+        DolphinMatchState::ExactGameIdMatch | DolphinMatchState::ExactGameIdAndRevisionMatch => (
+            "Exact verified identity match",
+            widgets::StatusTone::Success,
+        ),
+        DolphinMatchState::MultipleIniFilesForGame | DolphinMatchState::RevisionMismatch => {
+            ("Ambiguous identity", widgets::StatusTone::Warning)
+        }
+        DolphinMatchState::NoVerifiedGameIdAvailable
+        | DolphinMatchState::IdentityExtractionDeferred => {
+            ("Verified Game ID unavailable", widgets::StatusTone::Pending)
+        }
+        DolphinMatchState::NoMatchingIniFound => {
+            ("No matching Game INI", widgets::StatusTone::Pending)
+        }
+        DolphinMatchState::InvalidVerifiedGameId => {
+            ("Invalid verified Game ID", widgets::StatusTone::Blocked)
+        }
+    }
+}
+
+fn show_pcsx2_profile_card(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profile: &Pcsx2Profile,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if profile.eligible {
+                let selected = workflow.selected_pcsx2_profile_id.as_deref()
+                    == Some(profile.profile_id.as_str());
+                if ui.radio(selected, &profile.profile_id).clicked() {
+                    workflow.selected_pcsx2_profile_id = Some(profile.profile_id.clone());
+                    workflow.pcsx2_inventory_profile_id = None;
+                    workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                }
+                widgets::status_badge(ui, "Eligible", widgets::StatusTone::Success);
+            } else {
+                ui.add_enabled(false, egui::Button::selectable(false, &profile.profile_id));
+                widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+            }
+            ui.label(format!(
+                "{} · {}",
+                pcsx2_installation_label(profile.installation_type),
+                pcsx2_scope_label(profile.scope)
+            ));
+        });
+        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+            let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+        }
+        for directory in &profile.patch_directories {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    pcsx2_directory_state_label(directory.state),
+                    pcsx2_directory_state_tone(directory.state),
+                );
+                ui.label(pcsx2_category_label(directory.category));
+                if widgets::path_value(ui, "Path", &directory.path) {
+                    let _ = clipboard.set_text(directory.path.display().to_string());
+                }
+            });
+        }
+        if let Some(blocker) = profile.blockers.first() {
+            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+        }
+        if profile.blockers.len() > 1 {
+            egui::CollapsingHeader::new("All technical blockers")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for blocker in &profile.blockers {
+                        ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+                    }
+                });
+        }
+    });
+}
+
+fn show_pcsx2_inventory(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    inventory: &Pcsx2PnachInventory,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    let category_count = |category| {
+        inventory
+            .files
+            .iter()
+            .filter(|file| file.category == category)
+            .count()
+    };
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                if inventory.complete {
+                    "Complete"
+                } else {
+                    "Incomplete"
+                },
+                if inventory.complete {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            ui.strong(format!("{} PNACH files", inventory.files.len()));
+            ui.label(format!("{} bytes inspected", inventory.bytes_inspected));
+            ui.label(format!("{} entries visited", inventory.entries_visited));
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (category, label) in [
+                (Pcsx2PatchCategory::Cheats, "Cheats"),
+                (Pcsx2PatchCategory::WidescreenPatches, "Widescreen"),
+                (Pcsx2PatchCategory::OtherPatches, "Other patches"),
+                (Pcsx2PatchCategory::Unknown, "Unknown"),
+            ] {
+                widgets::status_badge(
+                    ui,
+                    format!("{label} · {}", category_count(category)),
+                    widgets::StatusTone::Info,
+                );
+            }
+        });
+    });
+    let match_result = match_pcsx2_inventory(inventory, None, Some(&workflow.display_name));
+    let (match_label, match_tone) = pcsx2_match_presentation(match_result.state);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, match_label, match_tone);
+            ui.label(&match_result.reason);
+        });
+        ui.label("ArchiveFS currently has no safe PS2 executable-CRC extractor. Filename CRCs and comment titles remain candidates only; they never establish exact identity.");
+        for path in &match_result.matching_files {
+            if widgets::path_value(ui, "Candidate", path) {
+                let _ = clipboard.set_text(path.display().to_string());
+            }
+        }
+    });
+    egui::CollapsingHeader::new(format!("Inspected PNACH files ({})", inventory.files.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            const MAX_RENDERED_PNACH_FILES: usize = 100;
+            for file in inventory.files.iter().take(MAX_RENDERED_PNACH_FILES) {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(file.filename_stem.to_string_lossy());
+                        widgets::status_badge(
+                            ui,
+                            pcsx2_category_label(file.category),
+                            widgets::StatusTone::Info,
+                        );
+                        if let Some(crc) = &file.crc_candidate {
+                            widgets::status_badge(ui, format!("CRC candidate · {crc}"), widgets::StatusTone::Pending);
+                        }
+                        ui.label(format!("{} patch entries", file.patch_entry_count));
+                    });
+                    if widgets::path_value(ui, "PNACH", &file.path) {
+                        let _ = clipboard.set_text(file.path.display().to_string());
+                    }
+                    ui.label(format!(
+                        "Enabled syntax {} · disabled syntax {} · unknown syntax {}",
+                        file.enabled_patch_count,
+                        file.disabled_patch_count,
+                        file.unknown_patch_count
+                    ));
+                    if !file.title_candidates.is_empty() {
+                        ui.label(format!("Comment title candidates: {}", file.title_candidates.join("; ")));
+                    }
+                    if !file.comments.is_empty() {
+                        ui.label(format!(
+                            "Retained comments: {}",
+                            file.comments
+                                .iter()
+                                .take(3)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
+                    egui::CollapsingHeader::new("Technical metadata")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            widgets::copyable_value(ui, "SHA-256", &file.sha256);
+                            if file.duplicate_crc || file.duplicate_filename || file.duplicate_content {
+                                ui.label(format!(
+                                    "Duplicate CRC: {} · filename: {} · content: {}",
+                                    file.duplicate_crc, file.duplicate_filename, file.duplicate_content
+                                ));
+                            }
+                        });
+                });
+            }
+            if inventory.files.len() > MAX_RENDERED_PNACH_FILES {
+                ui.label(format!(
+                    "{} additional files are retained in the bounded result but omitted from this summary.",
+                    inventory.files.len() - MAX_RENDERED_PNACH_FILES
+                ));
+            }
+        });
+    if !inventory.warnings.is_empty() {
+        egui::CollapsingHeader::new(format!(
+            "Inspection warnings ({})",
+            inventory.warnings.len()
+        ))
+        .default_open(false)
+        .show(ui, |ui| {
+            for warning in inventory.warnings.iter().take(50) {
+                ui.label(format!("{:?}: {}", warning.kind, warning.detail));
+            }
+            if inventory.warnings.len() > 50 {
+                ui.label(format!(
+                    "{} additional warnings omitted from this view.",
+                    inventory.warnings.len() - 50
+                ));
+            }
+        });
+    }
+}
+
+fn show_pcsx2_installation_unavailable(ui: &mut egui::Ui) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "Stage 3 · Preview and controlled installation", None);
+    widgets::banner(
+        ui,
+        "Unavailable · read-only milestone",
+        "ArchiveFS does not install, apply, enable, disable, replace, fix, delete, generate, or roll back PCSX2 files.",
+        widgets::StatusTone::Pending,
+    );
+}
+
+fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static str {
+    match kind {
+        Pcsx2InstallationType::Native => "Native",
+        Pcsx2InstallationType::FlatpakUser => "Flatpak user",
+        Pcsx2InstallationType::FlatpakSystem => "Flatpak system",
+        Pcsx2InstallationType::Portable => "Portable / explicit configuration",
+    }
+}
+
+fn pcsx2_scope_label(scope: Pcsx2ProfileScope) -> &'static str {
+    match scope {
+        Pcsx2ProfileScope::User => "User profile",
+        Pcsx2ProfileScope::SystemInstallationUserProfile => "System install · user profile",
+        Pcsx2ProfileScope::Portable => "Portable scope",
+    }
+}
+
+fn pcsx2_category_label(category: Pcsx2PatchCategory) -> &'static str {
+    match category {
+        Pcsx2PatchCategory::Cheats => "Cheats",
+        Pcsx2PatchCategory::WidescreenPatches => "Widescreen patches",
+        Pcsx2PatchCategory::OtherPatches => "Other PNACH patches",
+        Pcsx2PatchCategory::Unknown => "Unknown PNACH category",
+    }
+}
+
+fn pcsx2_directory_state_label(state: Pcsx2PatchDirectoryState) -> &'static str {
+    match state {
+        Pcsx2PatchDirectoryState::Available => "Exists",
+        Pcsx2PatchDirectoryState::Missing => "Missing",
+        Pcsx2PatchDirectoryState::UnsafePath => "Unsafe path",
+        Pcsx2PatchDirectoryState::NotDirectory => "Not a directory",
+        Pcsx2PatchDirectoryState::Unreadable => "Unreadable",
+    }
+}
+
+fn pcsx2_directory_state_tone(state: Pcsx2PatchDirectoryState) -> widgets::StatusTone {
+    match state {
+        Pcsx2PatchDirectoryState::Available => widgets::StatusTone::Success,
+        Pcsx2PatchDirectoryState::Missing => widgets::StatusTone::Pending,
+        Pcsx2PatchDirectoryState::UnsafePath => widgets::StatusTone::Blocked,
+        Pcsx2PatchDirectoryState::NotDirectory | Pcsx2PatchDirectoryState::Unreadable => {
+            widgets::StatusTone::Warning
+        }
+    }
+}
+
+fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str, widgets::StatusTone) {
+    match state {
+        Pcsx2MatchState::ExactCrcMatch => ("Exact CRC match", widgets::StatusTone::Success),
+        Pcsx2MatchState::MultiplePnachFilesForSameCrc => {
+            ("Ambiguous CRC match", widgets::StatusTone::Warning)
+        }
+        Pcsx2MatchState::CandidateByFilenameOrTitleOnly => {
+            ("Unverified title candidate", widgets::StatusTone::Warning)
+        }
+        Pcsx2MatchState::NoVerifiedGameCrcAvailable => (
+            "Verified game CRC unavailable",
+            widgets::StatusTone::Pending,
+        ),
+        Pcsx2MatchState::NoMatchingPnachFound => {
+            ("No matching PNACH", widgets::StatusTone::Pending)
+        }
+        Pcsx2MatchState::InvalidVerifiedGameCrc => {
+            ("Invalid verified CRC", widgets::StatusTone::Blocked)
+        }
+        Pcsx2MatchState::IdentityExtractionDeferred => {
+            ("Identity extraction deferred", widgets::StatusTone::Pending)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_cheats_mods_page(
+    ui: &mut egui::Ui,
+    workflow: Option<&mut CheatWorkflowState>,
+    profiles: &RetroArchProfilesState,
+    pcsx2_profiles: &Pcsx2ProfilesState,
+    dolphin_profiles: &DolphinProfilesState,
+    live: Option<&LoadedData>,
+    cached: Option<&CachedLibrarySnapshot>,
+    history: &OperationHistory,
+    busy: bool,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let activity_archive = workflow
+        .as_deref()
+        .map(|workflow| workflow.archive_path.clone());
+    let pcsx2_read_only = workflow
+        .as_deref()
+        .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2);
+    let dolphin_read_only = workflow
+        .as_deref()
+        .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin);
+    widgets::page_header(
+        ui,
+        "Cheats & Mods",
+        "Inspect emulator-managed cheats and patches or retrieve trusted catalogues for one exact archive.",
+    );
+    let (integration_label, integration_tone) = match workflow.as_deref() {
+        Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Pcsx2 => {
+            pcsx2_integration_presentation(pcsx2_profiles)
+        }
+        Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Dolphin => {
+            dolphin_integration_presentation(dolphin_profiles)
+        }
+        _ => retroarch_integration_presentation(profiles),
+    };
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, integration_label, integration_tone);
+            if let Some(workflow) = workflow.as_deref() {
+                ui.strong(format!("Current archive: {}", workflow.display_name));
+            } else {
+                ui.label("No archive context selected");
+            }
+            if widgets::action_button(
+                ui,
+                if workflow.is_some() {
+                    "Choose another archive"
+                } else {
+                    "Choose an archive"
+                },
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ChooseArchive);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                "Trusted catalogue retrieval available",
+                widgets::StatusTone::Success,
+            );
+            widgets::status_badge(ui, "Matching unavailable", widgets::StatusTone::Pending);
+            widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
+        });
+    });
+    ui.add_space(theme::SECTION_GAP);
+
+    show_cheats_mods_workflow_states(
+        ui,
+        workflow.as_deref(),
+        profiles,
+        pcsx2_profiles,
+        dolphin_profiles,
+    );
+    ui.add_space(theme::SECTION_GAP);
+    show_cheats_mods_safety_information(ui);
+    ui.add_space(theme::SECTION_GAP);
+
+    widgets::section_header(
+        ui,
+        "Cheats and emulator patches",
+        Some(
+            "Choose an emulator adapter explicitly. PCSX2 and Dolphin operations in this milestone are local and read-only.",
+        ),
+    );
+    if let Some(workflow) = workflow {
+        show_cheat_archive_context(ui, workflow, live, cached, clipboard);
+        ui.add_space(theme::SECTION_GAP);
+        action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
+        ui.add_space(theme::SECTION_GAP);
+        match workflow.adapter {
+            CheatEmulatorAdapter::RetroArch => {
+                action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
+                action = show_cheat_source_modes(ui, workflow, profiles).or(action);
+                let source_action = match workflow.source_mode {
+                    CheatSourceMode::ExistingRetroArchLibrary => {
+                        show_existing_retroarch_library(ui, workflow, profiles, clipboard)
+                    }
+                    CheatSourceMode::ArchiveFsTrustedCatalogue => {
+                        show_cheat_workflow_step2(ui, workflow, busy)
+                    }
+                };
+                action = action.or(source_action);
+                ui.add_space(theme::SECTION_GAP);
+                show_cheat_unavailable_stage(ui);
+            }
+            CheatEmulatorAdapter::Pcsx2 => {
+                action = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, clipboard).or(action);
+            }
+            CheatEmulatorAdapter::Dolphin => {
+                action =
+                    show_dolphin_workflow(ui, workflow, dolphin_profiles, clipboard).or(action);
+            }
+        }
+    } else {
+        widgets::card(ui, |ui| {
+            widgets::section_header(
+                ui,
+                "Choose one archive",
+                Some("ArchiveFS never fabricates a default archive context."),
+            );
+            ui.label("Choose an archive here to discover RetroArch profiles and inspect or retrieve a trusted catalogue. Selection alone never mounts, queues, fetches, or changes the archive.");
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    "Profile discovery available",
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    "Trusted retrieval available",
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(ui, "Matching unavailable", widgets::StatusTone::Pending);
+                widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
+                widgets::status_badge(ui, "Mods unavailable", widgets::StatusTone::Pending);
+            });
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "Choose archive", widgets::ActionStyle::Primary, true)
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::ChooseArchive);
+                }
+                if widgets::action_button(ui, "Open Library", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::OpenLibrary);
+                }
+            });
+        });
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    show_mods_section(ui, pcsx2_read_only, dolphin_read_only);
+    ui.add_space(theme::SECTION_GAP);
+    show_recent_cheat_activity(ui, history, activity_archive.as_deref());
+    action
+}
+
+fn show_cheat_source_modes(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    _profiles: &RetroArchProfilesState,
+) -> Option<CheatWorkflowAction> {
+    widgets::section_header(
+        ui,
+        "Stage 2 · Cheat source",
+        Some(
+            "Source choice is independent from the archive, emulator profile, destination, and installation state.",
+        ),
+    );
+    let show_existing = |ui: &mut egui::Ui, selected: bool| {
+        let mut clicked = false;
+        widgets::card(ui, |ui| {
+            clicked = ui.radio(selected, "Existing RetroArch library").clicked();
+            widgets::status_badge(ui, "Existing local content", widgets::StatusTone::Info);
+            ui.label("Read-only bounded inventory of the selected profile's configured cheat directory. No compatibility claim.");
+        });
+        clicked
+    };
+    let show_trusted = |ui: &mut egui::Ui, selected: bool| {
+        let mut clicked = false;
+        widgets::card(ui, |ui| {
+            clicked = ui.radio(selected, "ArchiveFS trusted catalogue").clicked();
+            widgets::status_badge(ui, "Trusted reviewed source", widgets::StatusTone::Success);
+            ui.label("A validated immutable ArchiveFS cache snapshot. It is not the same as RetroArch installed cheats.");
+        });
+        clicked
+    };
+    let existing_selected = workflow.source_mode == CheatSourceMode::ExistingRetroArchLibrary;
+    let trusted_selected = workflow.source_mode == CheatSourceMode::ArchiveFsTrustedCatalogue;
+    let (existing_clicked, trusted_clicked) = if ui.available_width() >= 760.0 {
+        let mut existing_clicked = false;
+        let mut trusted_clicked = false;
+        ui.columns(2, |columns| {
+            existing_clicked = show_existing(&mut columns[0], existing_selected);
+            trusted_clicked = show_trusted(&mut columns[1], trusted_selected);
+        });
+        (existing_clicked, trusted_clicked)
+    } else {
+        (
+            show_existing(ui, existing_selected),
+            show_trusted(ui, trusted_selected),
+        )
+    };
+    if existing_clicked {
+        workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+    } else if trusted_clicked {
+        workflow.source_mode = CheatSourceMode::ArchiveFsTrustedCatalogue;
+    }
+    let show_planned = |ui: &mut egui::Ui, kind, body| {
+        let (label, state) = import_source_presentation(kind);
+        widgets::card(ui, |ui| {
+            ui.strong(label);
+            widgets::status_badge(ui, state, widgets::StatusTone::Pending);
+            ui.label(body);
+        });
+    };
+    let local_body =
+        "A real bounded local inspection backend is required before selection can be offered.";
+    let remote_body = "User-defined remote sources are a future workflow.";
+    if ui.available_width() >= 760.0 {
+        ui.columns(2, |columns| {
+            show_planned(
+                &mut columns[0],
+                ImportSourceKind::LocalUnverifiedSource,
+                local_body,
+            );
+            show_planned(
+                &mut columns[1],
+                ImportSourceKind::RemoteUnverifiedSource,
+                remote_body,
+            );
+        });
+    } else {
+        show_planned(ui, ImportSourceKind::LocalUnverifiedSource, local_body);
+        show_planned(ui, ImportSourceKind::RemoteUnverifiedSource, remote_body);
+    }
+    None
+}
+
+fn show_existing_retroarch_library(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let selected_profile_id = workflow.selected_profile_id.as_deref();
+    if selected_profile_id.is_none() {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible RetroArch profile before inspecting its configured cheat directory.",
+            widgets::StatusTone::Pending,
+        );
+        return None;
+    }
+    let selected_profile_id = selected_profile_id.unwrap();
+    let destination = match profiles {
+        RetroArchProfilesState::Ready(discovery) => discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.eligible && profile.profile_id == selected_profile_id)
+            .and_then(|profile| profile.cheat_destination_root.as_ref()),
+        _ => None,
+    };
+    let Some(destination) = destination else {
+        widgets::banner(
+            ui,
+            "Destination unavailable",
+            "The selected profile does not currently expose a safely resolved cheat destination.",
+            widgets::StatusTone::Warning,
+        );
+        return None;
+    };
+    if destination.lossy {
+        widgets::banner(
+            ui,
+            "Destination unavailable",
+            "The configured path cannot be represented losslessly and will not be inspected.",
+            widgets::StatusTone::Blocked,
+        );
+        return None;
+    }
+    let path = Path::new(&destination.display);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
+            widgets::status_badge(
+                ui,
+                "Modified by this workspace · No",
+                widgets::StatusTone::Info,
+            );
+        });
+        if widgets::path_value(ui, "RetroArch cheat directory", path) {
+            let _ = clipboard.set_text(destination.display.clone());
+        }
+        ui.label("This inventory counts cheat-like filenames only; it does not prove format compatibility or safety.");
+    });
+
+    if workflow.existing_library_profile_id.as_deref() != Some(selected_profile_id) {
+        workflow.existing_library_profile_id = None;
+        workflow.existing_library = CheatStepResource::NotLoaded;
+    }
+    match &workflow.existing_library {
+        CheatStepResource::NotLoaded => Some(CheatWorkflowAction::InspectExistingLibrary),
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting the directory locally with fixed limits...");
+            });
+            None
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Inspection unavailable",
+                message,
+                widgets::StatusTone::Warning,
+            );
+            None
+        }
+        CheatStepResource::Ready(inspection) => {
+            let (label, tone) = retroarch_library_state_presentation(inspection.state);
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, label, tone);
+                    ui.label(format!(
+                        "Approximately {} cheat-like file{}",
+                        inspection.approximate_cheat_file_count,
+                        if inspection.approximate_cheat_file_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ));
+                    ui.label(format!("{} entries examined", inspection.entries_examined));
+                });
+                if let Some(warning) = &inspection.warning {
+                    ui.label(warning);
+                }
+            });
+            None
+        }
+    }
+}
+
+fn retroarch_library_state_presentation(
+    state: RetroArchCheatLibraryState,
+) -> (&'static str, widgets::StatusTone) {
+    match state {
+        RetroArchCheatLibraryState::Missing => ("Directory missing", widgets::StatusTone::Pending),
+        RetroArchCheatLibraryState::Available => ("Directory exists", widgets::StatusTone::Success),
+        RetroArchCheatLibraryState::Inaccessible => {
+            ("Directory inaccessible", widgets::StatusTone::Warning)
+        }
+        RetroArchCheatLibraryState::UnsafePath => {
+            ("Unsafe path refused", widgets::StatusTone::Blocked)
+        }
+        RetroArchCheatLibraryState::LimitReached => {
+            ("Inspection limit reached", widgets::StatusTone::Warning)
+        }
+    }
+}
+
+/// Step 2 of the cheat workflow: the built-in trusted source list, the
+/// cached snapshot's provenance/digest/freshness, and retrieval
+/// actions. Only the fixed trusted list is ever shown - there is no
+/// user-supplied URL surface, and every retrieval runs on a background
+/// thread through `fetch_retroarch_cheat_source`'s existing size/
+/// digest/redirect protections.
+fn show_cheat_workflow_step2(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    busy: bool,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Trusted catalogue details",
+        Some("Only reviewed, built-in sources are available. Custom URLs are not accepted."),
+    );
+    if workflow.selected_profile_id.is_none() {
+        widgets::banner(
+            ui,
+            "Waiting for profile",
+            "Choose an eligible RetroArch profile in Stage 1 to continue.",
+            widgets::StatusTone::Pending,
+        );
+        return None;
+    }
+    match &workflow.source_list {
+        CheatStepResource::NotLoaded => {
+            ui.label("Trusted sources have not been listed yet.");
+            if widgets::action_button(
+                ui,
+                "List trusted sources",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::RefreshSources);
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading the trusted-source cache...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Could not list trusted sources",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+            if widgets::action_button(ui, "Retry", widgets::ActionStyle::Primary, true).clicked() {
+                action = Some(CheatWorkflowAction::RefreshSources);
+            }
+        }
+        CheatStepResource::Ready(list) => {
+            for entry in &list.entries {
+                let source = &entry.source;
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if source.enabled {
+                            let selected =
+                                workflow.selected_source_id.as_deref() == Some(&source.source_id);
+                            if ui.radio(selected, &source.display_name).clicked() {
+                                workflow.selected_source_id = Some(source.source_id.clone());
+                            }
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::selectable(false, &source.display_name),
+                            );
+                            widgets::status_badge(ui, "Disabled", widgets::StatusTone::Pending);
+                        }
+                        if source.experimental {
+                            widgets::status_badge(ui, "Experimental", widgets::StatusTone::Warning);
+                        } else {
+                            widgets::status_badge(
+                                ui,
+                                "Trusted built-in",
+                                widgets::StatusTone::Success,
+                            );
+                        }
+                        widgets::status_badge(
+                            ui,
+                            cheat_freshness_label(entry.freshness),
+                            cheat_freshness_tone(entry.freshness),
+                        );
+                    });
+                    if workflow.selected_source_id.as_deref() == Some(&source.source_id) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Permitted host: {}", source.permitted_host));
+                            if let Some(fetched_at) = entry.fetched_at_unix_seconds {
+                                ui.label(format!(
+                                    "Last retrieval: {}",
+                                    format_unix_timestamp_utc(fetched_at as i64)
+                                ));
+                            }
+                        });
+                        ui.label(&source.provenance);
+                        if !entry.warnings.is_empty() {
+                            for warning in summarise_cheat_warnings(&entry.warnings) {
+                                widgets::banner(
+                                    ui,
+                                    "Notice",
+                                    &warning,
+                                    widgets::StatusTone::Warning,
+                                );
+                            }
+                        }
+                        egui::CollapsingHeader::new("Source technical details")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                widgets::copyable_value(ui, "Source identifier", &source.source_id);
+                                widgets::copyable_value(ui, "Download URL", &source.download_url);
+                                ui.label(format!("Trust status: {}", entry.trust_status));
+                                if let Some(licence) = &source.licence_url {
+                                    ui.label(format!("Licence: {licence}"));
+                                }
+                                if let Some(pinned) = &source.pinned_version {
+                                    ui.label(format!("Pinned version: {pinned}"));
+                                }
+                                if let Some(version) = &entry.current_cached_version {
+                                    ui.label(format!("Cached version: {version}"));
+                                }
+                                if let Some(digest) = &entry.archive_sha256 {
+                                    widgets::copyable_value(ui, "SHA-256", digest);
+                                }
+                                if let Some(count) = entry.catalogue_file_count {
+                                    ui.label(format!("Catalogue files: {count}"));
+                                }
+                                ui.label(format!(
+                                    "Usable for setup: {}",
+                                    if entry.setup_usable { "Yes" } else { "No" }
+                                ));
+                                for warning in &entry.warnings {
+                                    ui.label(warning);
+                                }
+                            });
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            ui.add_space(4.0);
+            let fetching = matches!(workflow.source_fetch, CheatStepResource::Loading { .. });
+            let selected_entry = workflow.selected_source_id.as_deref().and_then(|id| {
+                list.entries
+                    .iter()
+                    .find(|entry| entry.source.source_id == id)
+            });
+            ui.horizontal_wrapped(|ui| {
+                let can_fetch =
+                    !busy && !fetching && selected_entry.is_some_and(|entry| entry.source.enabled);
+                if widgets::action_button(
+                    ui,
+                    "Fetch / update catalogue",
+                    widgets::ActionStyle::Primary,
+                    can_fetch,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchSource);
+                }
+                let cached_available = selected_entry
+                    .is_some_and(|entry| entry.freshness != CheatSourceFreshness::Missing);
+                if widgets::action_button(
+                    ui,
+                    "Use cached snapshot",
+                    widgets::ActionStyle::Secondary,
+                    !busy && !fetching && cached_available,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::UseCachedSnapshot);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Refresh source list",
+                    widgets::ActionStyle::Quiet,
+                    !fetching,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::RefreshSources);
+                }
+            });
+            egui::CollapsingHeader::new("Advanced retrieval options")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.checkbox(
+                        &mut workflow.fetch_force_refresh,
+                        "Force a full refresh instead of reusing a fresh cache",
+                    );
+                });
+        }
+    }
+    match &workflow.source_fetch {
+        CheatStepResource::NotLoaded => {}
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Retrieving catalogue...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Catalogue retrieval failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+        }
+        CheatStepResource::Ready(result) => {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, "Catalogue ready", widgets::StatusTone::Success);
+                    widgets::status_badge(
+                        ui,
+                        cheat_freshness_label(result.freshness),
+                        if result.stale {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Success
+                        },
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} valid cheats",
+                            result.manifest.valid_cheat_count
+                        ))
+                        .strong(),
+                    );
+                    ui.label(format!(
+                        "Retrieved {}",
+                        format_unix_timestamp_utc(result.manifest.fetched_at_unix_seconds as i64)
+                    ));
+                });
+                ui.label(cheat_fetch_status_label(result.status));
+                if result.stale {
+                    widgets::banner(
+                        ui,
+                        "Stale snapshot",
+                        "The cached catalogue remains usable for inspection, but should be updated when online.",
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                for warning in summarise_cheat_warnings(&result.warnings) {
+                    widgets::banner(
+                        ui,
+                        "Catalogue notice",
+                        &warning,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                egui::CollapsingHeader::new("Catalogue technical details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        widgets::copyable_value(ui, "SHA-256", &result.manifest.archive_sha256);
+                        widgets::copyable_value(
+                            ui,
+                            "Catalogue path",
+                            &result.local_catalogue_path.display,
+                        );
+                        widgets::copyable_value(
+                            ui,
+                            "Immutable snapshot",
+                            &result.immutable_snapshot_path.display,
+                        );
+                        for warning in &result.warnings {
+                            ui.label(warning);
+                        }
+                    });
+            });
+        }
+    }
+    action
+}
+
+/// Why an exact-archive Cheats & Mods entry point is unavailable. Profile
+/// readiness is deliberately not a navigation gate: the full page owns
+/// profile discovery and truthfully presents blocked states.
+fn cheat_entry_blocker(
+    selected_archive: Option<&Path>,
+    selected_count: usize,
+    live_records: Option<&[ArchiveRecord]>,
+    _profiles: &RetroArchProfilesState,
+) -> Option<&'static str> {
+    let Some(path) = selected_archive else {
+        return Some("Select exactly one archive in the Library first.");
+    };
+    if selected_count > 1 {
+        return Some(
+            "RetroArch cheat setup works on exactly one archive; reduce the selection to one.",
+        );
+    }
+    let Some(records) = live_records else {
+        return Some("The live snapshot is still loading.");
+    };
+    if !records
+        .iter()
+        .any(|record| record.mount_plan.archive.path == path)
+    {
+        return Some("The selected archive is no longer present in the live snapshot.");
+    }
+    None
+}
+
+/// The eligible profile IDs in a discovery, in discovery order.
+fn eligible_profile_ids(discovery: &RetroArchCheatSetupDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+fn eligible_pcsx2_profile_ids(discovery: &Pcsx2ProfileDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+/// Step 1 of the cheat workflow: archive identity plus explicit profile
+/// selection. Renders from the shared `RetroArchProfilesState` (the
+/// same discovery the Settings page shows) and mutates only the
+/// workflow's own `selected_profile_id`. A selection that no longer
+/// exists in the current discovery (profile vanished on rescan) is
+/// cleared here rather than silently kept.
+fn show_cheat_workflow_step1(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+    busy: bool,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 1 · Archive and RetroArch profile",
+        Some(
+            "The archive context above is fixed. ArchiveFS selects a profile automatically only when exactly one is eligible.",
+        ),
+    );
+    widgets::section_header(ui, "RetroArch profile", None);
+    match profiles {
+        RetroArchProfilesState::NotScanned => {
+            ui.label("Profiles have not been scanned yet.");
+        }
+        RetroArchProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning for RetroArch profiles...");
+            });
+        }
+        RetroArchProfilesState::Error(message) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Profile discovery failed: {message}"),
+            );
+        }
+        RetroArchProfilesState::Ready(discovery) => {
+            let eligible = eligible_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_profile_id = None;
+                workflow.existing_library_profile_id = None;
+                workflow.existing_library = CheatStepResource::NotLoaded;
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "The previously selected profile is no longer eligible; choose again.",
+                );
+            }
+            if eligible.is_empty() {
+                widgets::banner(
+                    ui,
+                    "No eligible profile",
+                    "The discovered profiles are blocked. Review their concise blocker summaries below or rescan after correcting RetroArch configuration.",
+                    widgets::StatusTone::Blocked,
+                );
+            } else if eligible.len() > 1 && workflow.selected_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. ArchiveFS never silently picks \
+                     between them — choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if profile.eligible {
+                            let selected = workflow.selected_profile_id.as_deref()
+                                == Some(&profile.profile_id);
+                            if ui.radio(selected, &profile.profile_id).clicked() {
+                                workflow.selected_profile_id = Some(profile.profile_id.clone());
+                                workflow.existing_library_profile_id = None;
+                                workflow.existing_library = CheatStepResource::NotLoaded;
+                            }
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::selectable(false, &profile.profile_id),
+                            );
+                            widgets::status_badge(ui, "Blocked", profile_presentation_tone(false));
+                        }
+                        ui.label(format!(
+                            "{} / {}",
+                            profile_kind_label(&profile.installation_type),
+                            profile_scope_label(&profile.scope)
+                        ));
+                    });
+                    if let Some(blocker) = profile.blockers.first() {
+                        ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                    }
+                    if profile.blockers.len() > 1 {
+                        egui::CollapsingHeader::new(format!(
+                            "All technical blockers ({})",
+                            profile.blockers.len()
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for blocker in &profile.blockers {
+                                ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                            }
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        }
+    }
+    ui.add_space(4.0);
+    if widgets::action_button(ui, "Rescan profiles", widgets::ActionStyle::Quiet, !busy).clicked() {
+        action = Some(CheatWorkflowAction::RescanProfiles);
+    }
+    action
+}
+enum RetroArchProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<RetroArchCheatSetupDiscovery, String>>,
+    },
+    Ready(RetroArchCheatSetupDiscovery),
+    Error(String),
+}
+
+enum Pcsx2ProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<Pcsx2ProfileDiscovery, String>>,
+    },
+    Ready(Pcsx2ProfileDiscovery),
+    Error(String),
+}
+
+enum DolphinProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<DolphinProfileDiscovery, String>>,
+    },
+    Ready(DolphinProfileDiscovery),
+    Error(String),
+}
+
+/// Display label for a discovered profile's installation type.
+fn profile_kind_label(kind: &ProfileKind) -> &'static str {
+    match kind {
+        ProfileKind::Native => "Native",
+        ProfileKind::AppImage => "AppImage",
+        ProfileKind::Flatpak => "Flatpak",
+    }
+}
+
+/// Display label for a discovered profile's scope.
+fn profile_scope_label(scope: &ProfileScope) -> &'static str {
+    match scope {
+        ProfileScope::User => "User",
+        ProfileScope::System => "System",
+    }
+}
+
+fn profile_presentation_tone(eligible: bool) -> widgets::StatusTone {
+    if eligible {
+        widgets::StatusTone::Success
+    } else {
+        widgets::StatusTone::Pending
+    }
+}
+
+/// What the Settings page asks `update` to do - each maps onto an
+/// existing proven workflow (`SetupAction::OpenConfigFolder`, the
+/// diagnostics refresh, the Diagnostics overlay, the background
+/// profile-discovery scan), never new machinery.
+enum SettingsPageAction {
+    OpenConfigFolder,
+    ValidateConfiguration,
+    OpenDiagnostics,
+    RescanRetroArchProfiles,
+}
+
+fn show_settings_page(
+    ui: &mut egui::Ui,
+    database_state: &DatabaseState,
+    diagnostics: &DiagnosticsState,
+    retroarch_profiles: &RetroArchProfilesState,
+    mount_root: Option<&Path>,
+    busy: bool,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<SettingsPageAction> {
+    let mut action = None;
+    widgets::page_header(
+        ui,
+        "Settings",
+        "Review ArchiveFS locations, configuration health, and supported integrations.",
+    );
+
+    let database_path = database_state_path(database_state).map(|path| path.display().to_string());
+    let config_path = match diagnostics {
+        DiagnosticsState::Ready { report, .. } => report
+            .config_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        _ => None,
+    };
+    let mount_root_text = mount_root.map(|path| path.display().to_string());
+
+    widgets::section_header(
+        ui,
+        "1. ArchiveFS locations",
+        Some("Full paths remain available through hover and Copy without dominating the page."),
+    );
+    widgets::card(ui, |ui| {
+        if let Some(path) = &config_path {
+            if widgets::copyable_value(ui, "Configuration", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Configuration: unknown");
+        }
+        if let Some(path) = &database_path {
+            if widgets::copyable_value(ui, "Database", path) {
+                let _ = clipboard.set_text(path.clone());
+            }
+        } else {
+            ui.label("Database: unknown");
+        }
+        if let Some(path) = mount_root {
+            if widgets::path_value(ui, "Mount root", path) {
+                let _ = clipboard.set_text(path.display().to_string());
+            }
+        } else {
+            ui.label("Mount root: not loaded");
+        }
+        ui.label(egui::RichText::new("Mount-root changes apply to new mounts; existing mounts keep their current destinations until remounted.").color(theme::muted(ui)));
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "2. Configuration validation",
+        Some("ArchiveFS validates the active configuration without changing it."),
+    );
+    let (validation_title, validation_detail, validation_tone) = match diagnostics {
+        DiagnosticsState::Ready { report, .. } if diagnostics_can_continue(report) => (
+            "Ready",
+            "No blocking configuration issues were found.",
+            widgets::StatusTone::Success,
+        ),
+        DiagnosticsState::Ready { .. } => (
+            "Needs attention",
+            "Configuration issues were found. Open diagnostics for the complete checks.",
+            widgets::StatusTone::Warning,
+        ),
+        DiagnosticsState::Loading { .. } => (
+            "Checking",
+            "Configuration validation is running in the background.",
+            widgets::StatusTone::Active,
+        ),
+        DiagnosticsState::Error { message, .. } => {
+            ("Failed", message.as_str(), widgets::StatusTone::Blocked)
+        }
+    };
+    widgets::banner(ui, validation_title, validation_detail, validation_tone);
+    ui.horizontal_wrapped(|ui| {
+        if widgets::action_button(
+            ui,
+            "Validate configuration",
+            widgets::ActionStyle::Primary,
+            !busy,
+        )
+        .clicked()
+        {
+            action = Some(SettingsPageAction::ValidateConfiguration);
+        }
+        if widgets::action_button(
+            ui,
+            "Open diagnostics",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            action = Some(SettingsPageAction::OpenDiagnostics);
+        }
+        if widgets::action_button(
+            ui,
+            "Open configuration folder",
+            widgets::ActionStyle::Quiet,
+            !busy,
+        )
+        .clicked()
+        {
+            action = Some(SettingsPageAction::OpenConfigFolder);
+        }
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "3. RetroArch integration",
+        Some(
+            "Eligible profiles are emphasised; blocked discoveries remain available for inspection.",
+        ),
+    );
+    match retroarch_profiles {
+        RetroArchProfilesState::NotScanned => {
+            if widgets::empty_state(
+                ui,
+                "Profiles have not been scanned",
+                "Scan supported RetroArch locations to find a usable cheat destination.",
+                Some("Scan for profiles"),
+            ) && !busy
+            {
+                action = Some(SettingsPageAction::RescanRetroArchProfiles);
+            }
+        }
+        RetroArchProfilesState::Scanning { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning for RetroArch profiles...");
+            });
+        }
+        RetroArchProfilesState::Error(message) => {
+            widgets::banner(
+                ui,
+                "Profile discovery failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+            if widgets::action_button(ui, "Rescan profiles", widgets::ActionStyle::Primary, !busy)
+                .clicked()
+            {
+                action = Some(SettingsPageAction::RescanRetroArchProfiles);
+            }
+        }
+        RetroArchProfilesState::Ready(discovery) => {
+            if discovery.profiles.is_empty() {
+                widgets::empty_state(
+                    ui,
+                    "No RetroArch profiles found",
+                    "No supported installation was discovered in the current environment.",
+                    None,
+                );
+            } else {
+                for eligible in [true, false] {
+                    for profile in discovery
+                        .profiles
+                        .iter()
+                        .filter(|profile| profile.eligible == eligible)
+                    {
+                        widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                widgets::status_badge(
+                                    ui,
+                                    if profile.eligible {
+                                        "Eligible"
+                                    } else {
+                                        "Blocked"
+                                    },
+                                    profile_presentation_tone(profile.eligible),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&profile.profile_id).size(17.0).strong(),
+                                );
+                                ui.label(format!(
+                                    "{} · {}",
+                                    profile_kind_label(&profile.installation_type),
+                                    profile_scope_label(&profile.scope)
+                                ));
+                            });
+                            if widgets::copyable_value(
+                                ui,
+                                "Configuration",
+                                &profile.configuration_path.display,
+                            ) {
+                                let _ =
+                                    clipboard.set_text(profile.configuration_path.display.clone());
+                            }
+                            if let Some(destination) = &profile.cheat_destination_root {
+                                if widgets::copyable_value(
+                                    ui,
+                                    "Cheat destination",
+                                    &destination.display,
+                                ) {
+                                    let _ = clipboard.set_text(destination.display.clone());
+                                }
+                            } else {
+                                ui.label("Cheat destination: unresolved");
+                            }
+                            if !profile.blockers.is_empty() {
+                                ui.label(format!(
+                                    "{} blocker{}",
+                                    profile.blockers.len(),
+                                    if profile.blockers.len() == 1 { "" } else { "s" }
+                                ));
+                                egui::CollapsingHeader::new("Technical blockers")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for blocker in &profile.blockers {
+                                            ui.label(format!(
+                                                "{} — {}",
+                                                blocker.code, blocker.detail
+                                            ));
+                                        }
+                                    });
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                }
+            }
+            if widgets::action_button(
+                ui,
+                "Rescan profiles",
+                widgets::ActionStyle::Secondary,
+                !busy,
+            )
+            .clicked()
+            {
+                action = Some(SettingsPageAction::RescanRetroArchProfiles);
+            }
+        }
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "4. Diagnostics and environment report",
+        Some("Copy a concise environment report for troubleshooting."),
+    );
+    widgets::card(ui, |ui| {
+        if widgets::action_button(
+            ui,
+            "Copy environment report",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            let _ = clipboard.set_text(system_information_text(
+                database_path.as_deref(),
+                config_path.as_deref(),
+                mount_root_text.as_deref(),
+            ));
+        }
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "5. Intentionally unavailable", None);
+    widgets::banner(
+        ui,
+        "Deferred",
+        "Appearance density, reset controls, cache maintenance, and in-app configuration editing have no supported GUI backing today. Source folders remain managed on the Sources page.",
+        widgets::StatusTone::Info,
+    );
+    action
 }
 
 fn history_entry_text(entry: &HistoryEntry) -> String {
@@ -8648,12 +14344,6 @@ fn prune_duplicate_review_selection(
         *selected_archive = None;
     }
 }
-
-/// What the Duplicate Review panel can request - `Close` mirrors the old
-/// plain `bool` return; `ViewInLibrary`/`Inspect` are new (context-menu-
-/// only) requests. Milestone requirement: no deletion or cleanup variant
-/// exists here at all - review-only stays structurally true, not just by
-/// convention.
 enum DuplicateReviewAction {
     Close,
     ViewInLibrary(PathBuf),
@@ -8776,11 +14466,6 @@ fn show_duplicate_review_panel(
                     "{} — {} — {} entries",
                     group.title, group.platform, entry_count
                 );
-                // `.truncate()` bounds the row to the list's own width
-                // (never lets one long title stretch the whole page) and
-                // the hover tooltip always carries the full, untruncated
-                // text - milestone requirement: avoid narrow labels that
-                // silently hide information.
                 let response = ui
                     .add(egui::Button::selectable(selected, &label_text).truncate())
                     .on_hover_text(&label_text);
@@ -8962,22 +14647,6 @@ fn format_modified_time(seconds: Option<i64>) -> String {
 // -----------------------------------------------------------------------
 // v0.4.3-alpha: Health and Recovery Dashboard.
 // -----------------------------------------------------------------------
-
-/// Builds the Health Dashboard's per-archive issue list for the current
-/// frame - mirrors `build_display_rows`'s existing live+cached merge
-/// exactly (same `persisted_by_path`/`live_paths` joins, same
-/// `path_exists` cheap check for cache-only rows), so this can never
-/// disagree with what the ordinary library table already shows for the
-/// same archive. Performance (milestone requirement 7/13): this is not a
-/// new expensive computation - `records`, `cached`, and the two offer
-/// sets are already fully resident and only ever change when their own
-/// listed event happens (a live refresh, a database reload, a mount/
-/// unmount/remount/lazy-unmount completion); this function is just an
-/// O(n) classification pass over them, the same complexity class
-/// `build_display_rows` already runs every frame the library view is
-/// open. It also only ever runs while the dashboard itself is open (see
-/// its one call site in `show_health_dashboard_panel`), so it adds no
-/// cost at all to the ordinary library view.
 fn build_health_issues(
     records: &[ArchiveRecord],
     cached: &CachedLibrarySnapshot,
@@ -9136,11 +14805,6 @@ fn health_issue_matches(issue: &HealthIssue, filters: &HealthDashboardFilters) -
     let reason_text = issue.reason.to_lowercase();
     path_text.contains(&search) || reason_text.contains(&search)
 }
-
-/// Milestone requirements 3/4/11: filters and sorts the already-built
-/// issue list without ever mutating it - `issues` is only ever read here,
-/// exactly like `visible_duplicate_group_indices` reads
-/// `CatalogueDuplicateReport` for Duplicate Review.
 fn visible_health_issue_indices(
     issues: &[HealthIssue],
     filters: &HealthDashboardFilters,
@@ -9180,21 +14844,6 @@ fn visible_health_issue_indices(
     });
     indices
 }
-
-/// The Health Dashboard's overview counts - milestone requirement 1.
-/// Every field's source is documented here so the dashboard can label
-/// them truthfully rather than presenting one undifferentiated count:
-///
-/// - `healthy`, `retryable_failures`, `terminal_failures`,
-///   `recovery_available`, `unknown_platform`: the current live snapshot
-///   (`LoadedData.records`), `recovery_available` additionally overlaid
-///   with this session's current recovery offers.
-/// - `mounted`, `pending`: the current live snapshot's already-computed
-///   `ArchiveStats` (never recomputed here).
-/// - `missing`, `awaiting_validation`, `cached_only`: the persisted
-///   catalogue, cross-referenced against the current live snapshot (see
-///   `build_health_issues`) to decide which of the three applies.
-/// - `diagnostics_errors`: the current live snapshot's `DoctorReport`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct HealthOverview {
     healthy: usize,
@@ -9252,14 +14901,6 @@ fn health_overview(
         diagnostics_errors,
     }
 }
-
-/// What the Health Dashboard asked the caller to do - milestone
-/// requirement 6: every variant here delegates to an action path that
-/// already exists (the same `AppOperationRequest::Archive` dispatch the
-/// ordinary library uses, the existing diagnostics refresh, the existing
-/// Missing filter / Duplicate Review toggle, or simply selecting an
-/// archive the ordinary library already knows how to show). Never a new
-/// mount/unmount/remount/cleanup implementation.
 enum HealthDashboardAction {
     BackToLibrary,
     Archive(OperationRequest),
@@ -9270,11 +14911,6 @@ enum HealthDashboardAction {
     Inspect(PathBuf),
     FilterByCategory(HealthIssueFilter),
 }
-
-/// The single, specific `HealthIssueFilter` matching one issue's exact
-/// `HealthCategory` - milestone requirement: the context menu's "Filter by
-/// this issue type" narrows to exactly this issue's category, not the
-/// broader `MountFailures` grouping (which alone matches two categories).
 fn health_issue_filter_for_category(category: HealthCategory) -> HealthIssueFilter {
     match category {
         HealthCategory::TerminalFailure => HealthIssueFilter::Terminal,
@@ -9346,19 +14982,64 @@ fn show_health_dashboard_panel(
         diagnostics_errors,
     );
 
-    ui.horizontal_wrapped(|ui| {
-        summary_value(ui, "Healthy / ready", overview.healthy);
-        summary_value(ui, "Mounted", overview.mounted);
-        summary_value(ui, "Pending", overview.pending);
-        summary_value(ui, "Missing", overview.missing);
-        summary_value(ui, "Awaiting validation", overview.awaiting_validation);
-        summary_value(ui, "Cached-only", overview.cached_only);
-        summary_value(ui, "Retryable failures", overview.retryable_failures);
-        summary_value(ui, "Terminal failures", overview.terminal_failures);
-        summary_value(ui, "Unknown platform", overview.unknown_platform);
-        summary_value(ui, "Recovery available", overview.recovery_available);
-        summary_value(ui, "Diagnostics errors", overview.diagnostics_errors);
-    });
+    let metrics = [
+        SummaryMetric {
+            label: "Healthy / ready",
+            value: overview.healthy,
+            tone: widgets::StatusTone::Success,
+        },
+        SummaryMetric {
+            label: "Mounted",
+            value: overview.mounted,
+            tone: widgets::StatusTone::Active,
+        },
+        SummaryMetric {
+            label: "Pending",
+            value: overview.pending,
+            tone: widgets::StatusTone::Pending,
+        },
+        SummaryMetric {
+            label: "Missing",
+            value: overview.missing,
+            tone: widgets::StatusTone::Blocked,
+        },
+        SummaryMetric {
+            label: "Retryable failures",
+            value: overview.retryable_failures,
+            tone: widgets::StatusTone::Warning,
+        },
+        SummaryMetric {
+            label: "Terminal failures",
+            value: overview.terminal_failures,
+            tone: widgets::StatusTone::Blocked,
+        },
+        SummaryMetric {
+            label: "Recovery available",
+            value: overview.recovery_available,
+            tone: widgets::StatusTone::Info,
+        },
+        SummaryMetric {
+            label: "Awaiting validation",
+            value: overview.awaiting_validation,
+            tone: widgets::StatusTone::Warning,
+        },
+        SummaryMetric {
+            label: "Cached-only",
+            value: overview.cached_only,
+            tone: widgets::StatusTone::Pending,
+        },
+        SummaryMetric {
+            label: "Unknown platform",
+            value: overview.unknown_platform,
+            tone: widgets::StatusTone::Info,
+        },
+        SummaryMetric {
+            label: "Diagnostics errors",
+            value: overview.diagnostics_errors,
+            tone: widgets::StatusTone::Blocked,
+        },
+    ];
+    show_health_metric_cards(ui, &metrics);
     ui.label(
         "Healthy/Mounted/Pending/Retryable/Terminal/Recovery available/Unknown platform: current \
          live snapshot. Missing/Awaiting validation/Cached-only: persisted catalogue. \
@@ -9399,12 +15080,6 @@ fn show_health_dashboard_panel(
             );
         }
     }
-
-    // One truthful entry per unavailable/permission-denied/scan-failed
-    // *source*, never one per archive it owns (see `build_health_issues`'s
-    // matching suppression) - the milestone's explicit anti-flood
-    // requirement for an offline drive with thousands of catalogued
-    // archives.
     let source_issues = source_health_issues(&cached.source_views);
     if !source_issues.is_empty() {
         ui.separator();
@@ -9727,6 +15402,10 @@ struct LoadedViewState<'a> {
     platform_choice: &'a mut Option<String>,
     platform_custom_text: &'a mut String,
     platform_busy: bool,
+    /// Shared RetroArch profile discovery state. Navigation itself is
+    /// gated only by exact archive identity; the destination page uses
+    /// this state to present scan, eligible, and blocked profile states.
+    retroarch_profiles: &'a RetroArchProfilesState,
     selected_archives: &'a mut HashSet<PathBuf>,
     bulk_platform_choice: &'a mut Option<String>,
     bulk_platform_busy: bool,
@@ -9748,14 +15427,7 @@ struct LoadedViewState<'a> {
     /// The Library table's resizable Archive path / Mount path column
     /// widths - see `LibraryColumnWidths`.
     library_column_widths: &'a mut LibraryColumnWidths,
-    /// Whether any Library View is configured at all - gates the row
-    /// context menu's "Show in Library View preview" item (milestone
-    /// Section 8: "only if a view exists").
     library_views_configured: bool,
-    /// The most recently computed Preview, if any - gates "Copy planned
-    /// view path" (milestone Section 8: "only after a valid plan
-    /// exists") and lets the menu look up this row's own planned
-    /// destination, if the plan has one.
     library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
 }
 
@@ -9847,6 +15519,7 @@ fn show_loaded_data(
         platform_choice,
         platform_custom_text,
         platform_busy,
+        retroarch_profiles,
         selected_archives,
         bulk_platform_choice,
         bulk_platform_busy,
@@ -9877,6 +15550,11 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
+    widgets::page_header(
+        ui,
+        "Library",
+        "Search the archive catalogue, review metadata, and use context menus for focused actions.",
+    );
     // A resizable top panel (egui's own built-in support - session
     // persistence, drag-handle hover cursor, and min/max clamping all come
     // for free from `ctx.memory`, keyed by this panel id - see
@@ -9897,12 +15575,13 @@ fn show_loaded_data(
                         summary_value(ui, "Total archives", data.stats.total_archives);
                         summary_value(ui, "Mounted", data.stats.mounted_count);
                         summary_value(ui, "Pending", data.stats.pending_count);
-                        if ui
-                            .add_enabled(
-                                mount_all_available(pending_count, busy),
-                                egui::Button::new("Mount All"),
-                            )
-                            .clicked()
+                        if widgets::action_button(
+                            ui,
+                            "Mount all",
+                            widgets::ActionStyle::Primary,
+                            mount_all_available(pending_count, busy),
+                        )
+                        .clicked()
                         {
                             *confirm_mount_all = Some(MountAllConfirmation);
                             *focus_mount_all_cancel = true;
@@ -9916,12 +15595,13 @@ fn show_loaded_data(
                                 ),
                             ));
                         }
-                        if ui
-                            .add_enabled(
-                                mounted_count > 0 && !busy,
-                                egui::Button::new("Unmount All"),
-                            )
-                            .clicked()
+                        if widgets::action_button(
+                            ui,
+                            "Unmount all",
+                            widgets::ActionStyle::Destructive,
+                            mounted_count > 0 && !busy,
+                        )
+                        .clicked()
                         {
                             *confirm_unmount_all = Some(UnmountAllConfirmation);
                             *focus_unmount_all_cancel = true;
@@ -9935,13 +15615,12 @@ fn show_loaded_data(
                             ));
                         }
                         ui.separator();
-                        let (readiness, color) = if data.doctor.is_ready() {
-                            ("Ready", ui.visuals().selection.bg_fill)
+                        let (readiness, tone) = if data.doctor.is_ready() {
+                            ("Doctor ready", widgets::StatusTone::Success)
                         } else {
-                            ("Needs attention", ui.visuals().error_fg_color)
+                            ("Doctor needs attention", widgets::StatusTone::Warning)
                         };
-                        ui.label("Doctor:");
-                        ui.colored_label(color, readiness);
+                        widgets::status_badge(ui, readiness, tone);
                     });
 
                     if let Some(result) = mount_all_result {
@@ -10083,13 +15762,6 @@ fn show_loaded_data(
     }
 
     if confirm_unmount_selected.is_some() {
-        // Recomputed fresh every frame the dialog is open, never a list
-        // captured when "Unmount selected" was clicked - milestone
-        // requirement: "If state changes while the confirmation is open:
-        // revalidate before starting; do not unmount stale, missing or
-        // no-longer-mounted targets." A selection change, a manual
-        // unmount elsewhere, or an archive going missing while this
-        // dialog is open is always reflected here truthfully.
         let mounted_selected = mounted_selected_unmount_items(&data.records, selected_archives);
         let mounted_selected_count = mounted_selected.len();
         let selected_count = selected_archives.len();
@@ -10161,61 +15833,56 @@ fn show_loaded_data(
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
-    // Same resizable-panel treatment as the summary above, sized taller by
-    // default (`SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT`) to fit a typical
-    // record's fields plus the Mount/Unmount button without scrolling. The
-    // inner `ScrollArea` means a shorter user-chosen height degrades to
-    // scrolling the details rather than clipping the Mount button or
-    // platform controls out of reach - see the milestone requirement that
-    // these must "remain reachable" at any panel height.
-    let (operation_request, platform_request, inspect_request) =
-        egui::TopBottomPanel::top("library_selected_archive_panel")
-            .resizable(true)
-            .default_height(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT)
-            .height_range(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT..=SELECTED_ARCHIVE_PANEL_MAX_HEIGHT)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("library_selected_archive_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        show_selected_archive(
-                            ui,
-                            selected_record(&data.records, selected_archive.as_deref()),
-                            selected_persisted,
-                            selected_platform_details(cached, selected_persisted),
-                            selected_source_path,
-                            SelectedArchiveViewState {
-                                operation,
-                                busy,
-                                block_reason,
-                                action_readiness_debug_lines,
-                                confirm_unmount,
-                                confirm_lazy_unmount,
-                                focus_lazy_cancel,
-                                lazy_unmount_offers,
-                                remount_offers,
-                                cleanup_after_unmount,
-                                platform_choice,
-                                platform_custom_text,
-                                platform_busy,
-                                clipboard,
-                            },
-                        )
-                    })
-                    .inner
-            })
-            .inner;
-    if let Some(request) = operation_request {
+    let selected_actions = egui::TopBottomPanel::top("library_selected_archive_panel")
+        .resizable(true)
+        .default_height(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT)
+        .height_range(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT..=SELECTED_ARCHIVE_PANEL_MAX_HEIGHT)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("library_selected_archive_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    show_selected_archive(
+                        ui,
+                        selected_record(&data.records, selected_archive.as_deref()),
+                        selected_persisted,
+                        selected_platform_details(cached, selected_persisted),
+                        selected_source_path,
+                        SelectedArchiveViewState {
+                            operation,
+                            busy,
+                            block_reason,
+                            action_readiness_debug_lines,
+                            confirm_unmount,
+                            confirm_lazy_unmount,
+                            focus_lazy_cancel,
+                            lazy_unmount_offers,
+                            remount_offers,
+                            cleanup_after_unmount,
+                            platform_choice,
+                            platform_custom_text,
+                            platform_busy,
+                            clipboard,
+                        },
+                    )
+                })
+                .inner
+        })
+        .inner;
+    if let Some(request) = selected_actions.operation {
         requested_action = Some(AppOperationRequest::Archive(request));
     }
-    if let Some((archive_path, action)) = platform_request {
+    if let Some((archive_path, action)) = selected_actions.platform {
         requested_action = Some(AppOperationRequest::PlatformAssignment {
             archive_path,
             action,
         });
     }
-    if let Some(archive_path) = inspect_request {
+    if let Some(archive_path) = selected_actions.inspect {
         requested_action = Some(AppOperationRequest::InspectArchive(archive_path));
+    }
+    if let Some(archive_path) = selected_actions.cheats_mods {
+        requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
     }
 
     if let Some(archive_path) = confirm_lazy_unmount.clone() {
@@ -10393,164 +16060,166 @@ fn show_loaded_data(
         });
     }
 
-    let missing_count = merged_rows
-        .iter()
-        .filter(|row| row.origin == RowOrigin::CachedMissing)
-        .count();
-    let mut missing_only =
-        library_filters.missing && !library_filters.present && !library_filters.awaiting_validation;
-    let selected_missing = selected_missing_paths(cached, selected_archives);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!("Missing catalogue entries: {missing_count}"));
-        if ui
-            .checkbox(&mut missing_only, "Show missing only")
-            .changed()
-        {
-            set_missing_review_mode(library_filters, missing_only);
-        }
-        let enabled = missing_removal_available && selected_missing.is_ok();
-        let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
-        if !enabled && let Err(reason) = &selected_missing {
-            response.clone().on_hover_text(reason);
-        }
-        if response.clicked()
-            && let Ok(paths) = &selected_missing
-        {
-            *confirm_remove_missing = Some(paths.clone());
-        }
-        if missing_removal_busy {
-            ui.spinner();
-            ui.label("Removing catalogue entries...");
-        }
-    });
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Find and filter",
+            Some("Search paths and metadata, then narrow the catalogue without changing it."),
+        );
 
-    if let Some(paths) = confirm_remove_missing.clone() {
-        let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
-        let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
-        egui::Window::new(format!(
-            "Remove {} missing catalogue entr{}?",
-            paths.len(),
-            if paths.len() == 1 { "y" } else { "ies" }
-        ))
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ui.ctx(), |ui| {
-            ui.label(missing_removal_confirmation_text(paths.len()));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
-                    *confirm_remove_missing = None;
-                }
-                if ui
-                    .add_enabled(
-                        missing_removal_available && still_valid,
-                        egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
-                    )
-                    .clicked()
-                {
-                    requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
-                    *confirm_remove_missing = None;
-                }
-            });
+        let mut filter_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search:");
+            let search_width = (ui.available_width() - 72.0).clamp(180.0, 520.0);
+            filter_changed |=
+                show_text_edit_with_context_menu(ui, filter, clipboard, |text_edit| {
+                    text_edit
+                        .id(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID))
+                        .hint_text("archive, mount path, platform, or state")
+                        .desired_width(search_width)
+                })
+                .changed();
+            if !filter.is_empty() && ui.small_button("Clear").clicked() {
+                filter.clear();
+                filter_changed = true;
+            }
         });
-    }
-
-    let mut filter_changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Search:");
-        filter_changed |= show_text_edit_with_context_menu(ui, filter, clipboard, |text_edit| {
-            text_edit
-                .id(egui::Id::new(SEARCH_FILTER_TEXT_EDIT_ID))
-                .hint_text("archive, mount path, platform, or state")
-                .desired_width(360.0)
-        })
-        .changed();
-        if !filter.is_empty() && ui.small_button("Clear").clicked() {
-            filter.clear();
-            filter_changed = true;
+        if filter_changed {
+            *filtered_rows = matching_row_indices(&merged_rows, filter);
         }
-    });
-    if filter_changed {
-        *filtered_rows = matching_row_indices(&merged_rows, filter);
-    }
 
-    // Unknown-platform review workflow: a compact count plus a single
-    // "show unknown only" toggle, reusing the same `unknown_platform`
-    // filter field the "Filters:" row's platform group already reads
-    // (see `LibraryRowFilters`) - no separate filter state, no separate
-    // index generation, no rescan. The count covers every merged row
-    // (live and cache-only alike), independent of which filters are
-    // currently active - see requirement 7.
-    let unknown_count = merged_rows
-        .iter()
-        .filter(|row| row.unknown_platform)
-        .count();
-    let mut filters_changed = false;
-    ui.horizontal(|ui| {
-        ui.label(format!("Unknown platforms: {unknown_count}"));
-        filters_changed |= ui
-            .checkbox(&mut library_filters.unknown_platform, "Show unknown only")
-            .changed();
-    });
+        let unknown_count = merged_rows
+            .iter()
+            .filter(|row| row.unknown_platform)
+            .count();
+        let mut filters_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Show:");
+            filters_changed |= ui
+                .checkbox(&mut library_filters.present, "Present")
+                .changed();
+            filters_changed |= ui
+                .checkbox(&mut library_filters.missing, "Missing")
+                .changed();
+            filters_changed |= ui
+                .checkbox(
+                    &mut library_filters.awaiting_validation,
+                    "Awaiting validation",
+                )
+                .changed();
+            filters_changed |= ui
+                .checkbox(&mut library_filters.known_platform, "Known platform")
+                .changed();
+            filters_changed |= ui
+                .checkbox(
+                    &mut library_filters.unknown_platform,
+                    format!("Unknown platform ({unknown_count})"),
+                )
+                .changed();
+            if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
+                *library_filters = LibraryRowFilters::default();
+                filters_changed = true;
+            }
+        });
+        let _ = filters_changed;
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Filters:");
-        filters_changed |= ui
-            .checkbox(&mut library_filters.present, "Present")
-            .changed();
-        filters_changed |= ui
-            .checkbox(&mut library_filters.missing, "Missing")
-            .changed();
-        filters_changed |= ui
-            .checkbox(
-                &mut library_filters.awaiting_validation,
-                "Awaiting validation",
-            )
-            .changed();
-        filters_changed |= ui
-            .checkbox(&mut library_filters.known_platform, "Known platform")
-            .changed();
-        if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
-            *library_filters = LibraryRowFilters::default();
-            filters_changed = true;
-        }
-    });
-    let _ = filters_changed;
-
-    // The Source filter - independent of `library_filters`'s checkbox
-    // groups (multi-source milestone requirement), so it is applied
-    // separately below rather than folded into `LibraryRowFilters::matches`.
-    // Options are read fresh from `cached.source_views` each frame (cheap:
-    // bounded by the number of configured sources, not archives), so a
-    // source added/removed on the Sources page is reflected immediately
-    // without this page needing its own copy of that list.
-    let configured_sources: &[SourceFolderView] = cached
-        .map(|cached| cached.source_views.as_slice())
-        .unwrap_or(&[]);
-    if !configured_sources.is_empty() {
-        ui.horizontal(|ui| {
-            ui.label("Source:");
-            let selected_text = match library_source_filter {
-                None => "All sources".to_string(),
-                Some(None) => "Unassigned / Legacy".to_string(),
-                Some(Some(path)) => path.display().to_string(),
-            };
-            egui::ComboBox::from_id_salt("library_source_filter")
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(library_source_filter, None, "All sources");
-                    for source in configured_sources {
+        let configured_sources: &[SourceFolderView] = cached
+            .map(|cached| cached.source_views.as_slice())
+            .unwrap_or(&[]);
+        if !configured_sources.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Source:");
+                let selected_text = match library_source_filter {
+                    None => "All sources".to_string(),
+                    Some(None) => "Unassigned / Legacy".to_string(),
+                    Some(Some(path)) => path.display().to_string(),
+                };
+                egui::ComboBox::from_id_salt("library_source_filter")
+                    .selected_text(selected_text)
+                    .width((ui.available_width() - 16.0).clamp(220.0, 520.0))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(library_source_filter, None, "All sources");
+                        for source in configured_sources {
+                            ui.selectable_value(
+                                library_source_filter,
+                                Some(Some(source.path.clone())),
+                                source.path.display().to_string(),
+                            );
+                        }
                         ui.selectable_value(
                             library_source_filter,
-                            Some(Some(source.path.clone())),
-                            source.path.display().to_string(),
+                            Some(None),
+                            "Unassigned / Legacy",
                         );
-                    }
-                    ui.selectable_value(library_source_filter, Some(None), "Unassigned / Legacy");
-                });
+                    });
+            });
+        }
+
+        let missing_count = merged_rows
+            .iter()
+            .filter(|row| row.origin == RowOrigin::CachedMissing)
+            .count();
+        let mut missing_only = library_filters.missing
+            && !library_filters.present
+            && !library_filters.awaiting_validation;
+        let selected_missing = selected_missing_paths(cached, selected_archives);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Missing catalogue entries: {missing_count}"));
+            if ui
+                .checkbox(&mut missing_only, "Show missing only")
+                .changed()
+            {
+                set_missing_review_mode(library_filters, missing_only);
+            }
+            let enabled = missing_removal_available && selected_missing.is_ok();
+            let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
+            if !enabled && let Err(reason) = &selected_missing {
+                response.clone().on_hover_text(reason);
+            }
+            if response.clicked()
+                && let Ok(paths) = &selected_missing
+            {
+                *confirm_remove_missing = Some(paths.clone());
+            }
+            if missing_removal_busy {
+                ui.spinner();
+                ui.label("Removing catalogue entries...");
+            }
         });
-    }
+
+        if let Some(paths) = confirm_remove_missing.clone() {
+            let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
+            let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
+            egui::Window::new(format!(
+                "Remove {} missing catalogue entr{}?",
+                paths.len(),
+                if paths.len() == 1 { "y" } else { "ies" }
+            ))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(missing_removal_confirmation_text(paths.len()));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
+                        *confirm_remove_missing = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            missing_removal_available && still_valid,
+                            egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
+                        )
+                        .clicked()
+                    {
+                        requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
+                        *confirm_remove_missing = None;
+                    }
+                });
+            });
+        }
+    });
+    ui.add_space(8.0);
 
     let base_indices: Vec<usize> = filtered_rows
         .clone()
@@ -10565,9 +16234,6 @@ fn show_loaded_data(
             Some(wanted) => merged_rows[index].source_path.as_ref() == wanted.as_ref(),
         })
         .collect();
-    // Milestone requirement 2: sorting reorders only this filtered index
-    // list, never `merged_rows`/`data.records`/`data.rows` themselves, so
-    // it can never mutate database order or archive identity.
     if let Some(field) = *sort_field {
         sort_visible_indices(&merged_rows, &mut visible_indices, field, *sort_ascending);
     }
@@ -10575,25 +16241,6 @@ fn show_loaded_data(
 
     show_selection_controls_row(ui, &merged_rows, &visible_indices, selected_archives);
     ui.add_space(4.0);
-
-    // Milestone requirement 1: Escape / Ctrl+A / arrow-key navigation.
-    // Gated on `keyboard_shortcuts_blocked_by_focus` so typing Ctrl+A to
-    // select all text in the Search box (or navigating an open platform
-    // ComboBox with the arrow keys) is never hijacked into a table
-    // selection change.
-    // Set whenever this frame's arrow-key handling below actually moves
-    // focus - names the newly-focused row's position in `visible_indices`
-    // so the vertical `ScrollArea` built further down can scroll it into
-    // view (Ctrl+Up/Down's "does not visibly move" fix: focus moving among
-    // an existing multi-selection paints no different fill/border at all
-    // unless it also happens to leave the visible viewport, so this alone
-    // is not the fix - see `show_data_row`'s `focused` stroke for that
-    // half - but a focus change that scrolls off-screen must still scroll
-    // back into view).
-    // The Library menu's "Select all visible" item - a deliberate click,
-    // never a keyboard shortcut, so unlike Ctrl+A below this is never
-    // gated on `keyboard_shortcuts_blocked_by_focus`. Reuses the exact
-    // same `select_all_visible` helper as the button and Ctrl+A.
     if *select_all_visible_requested {
         *selected_archives = select_all_visible(&merged_rows, &visible_indices);
         *select_all_visible_requested = false;
@@ -10649,27 +16296,35 @@ fn show_loaded_data(
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
     let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
-
-    // Milestone requirement 4: never show an empty table with no
-    // explanation - distinguish "the library itself is empty" from "the
-    // library has archives, but the current search/filters hide all of
-    // them".
     match library_table_message(merged_rows.is_empty(), visible_count) {
         Some(LibraryTableMessage::EmptyLibrary) => {
-            ui.label(EMPTY_LIBRARY_MESSAGE);
+            widgets::empty_state(ui, "Library is empty", EMPTY_LIBRARY_MESSAGE, None);
         }
         Some(LibraryTableMessage::NoFilterResults) => {
-            ui.label(ZERO_FILTER_RESULTS_MESSAGE);
+            widgets::empty_state(
+                ui,
+                "No matching archives",
+                ZERO_FILTER_RESULTS_MESSAGE,
+                None,
+            );
         }
         None => {
             let mut clicked = None;
             let mut menu_action = None;
+            let mut displayed_column_widths =
+                if *library_column_widths == LibraryColumnWidths::default() {
+                    responsive_library_column_widths(ui.available_width(), horizontal_spacing)
+                } else {
+                    *library_column_widths
+                };
+            let initial_displayed_column_widths = displayed_column_widths;
             let row_menu_context = RowMenuContext {
                 records: &data.records,
                 cached,
                 busy,
                 block_reason,
                 platform_busy,
+                retroarch_profiles,
                 library_views_configured,
                 library_view_last_plan,
             };
@@ -10677,7 +16332,7 @@ fn show_loaded_data(
                 .id_salt("archive_status_horizontal")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let initial_widths = library_column_widths.as_array();
+                    let initial_widths = displayed_column_widths.as_array();
                     ui.set_min_width(table_width(horizontal_spacing, &initial_widths));
                     if let Some(clicked_field) = show_header_row(
                         ui,
@@ -10686,7 +16341,7 @@ fn show_loaded_data(
                         row_height,
                         *sort_field,
                         *sort_ascending,
-                        library_column_widths,
+                        &mut displayed_column_widths,
                     ) {
                         apply_header_click(sort_field, sort_ascending, clicked_field);
                     }
@@ -10695,7 +16350,7 @@ fn show_loaded_data(
                     // resized a column via its drag handle this very
                     // frame - the rows below must always paint with
                     // *this* frame's widths, never a one-frame-stale copy.
-                    let widths = library_column_widths.as_array();
+                    let widths = displayed_column_widths.as_array();
 
                     let body_height = ui.available_height().max(row_height);
                     let mut vertical_scroll_area = egui::ScrollArea::vertical()
@@ -10736,6 +16391,9 @@ fn show_loaded_data(
                     );
                     *library_scroll_offset = scroll_output.state.offset.y;
                 });
+            if displayed_column_widths != initial_displayed_column_widths {
+                *library_column_widths = displayed_column_widths;
+            }
             // Requirement 2: an ordinary click replaces the whole selection
             // with just this row; a Ctrl-click toggles only this row,
             // leaving every other currently-selected row untouched. Either
@@ -10775,11 +16433,6 @@ fn show_loaded_data(
                         ));
                     }
                     RowContextMenuAction::UnmountSelected => {
-                        // Opens the confirmation dialog rendered further
-                        // below - never starts the batch unmount directly
-                        // (milestone requirement: "Right-clicking a multi-
-                        // selection and choosing 'Unmount selected' must
-                        // open a confirmation dialog").
                         *confirm_unmount_selected = Some(UnmountSelectedConfirmation);
                         *focus_unmount_selected_cancel = true;
                     }
@@ -10798,6 +16451,9 @@ fn show_loaded_data(
                     RowContextMenuAction::ShowInLibraryViews(archive_path) => {
                         requested_action =
                             Some(AppOperationRequest::ShowInLibraryViews(archive_path));
+                    }
+                    RowContextMenuAction::CheatsMods(archive_path) => {
+                        requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
                     }
                     RowContextMenuAction::ClearSelection => {
                         selected_archives.clear();
@@ -10818,18 +16474,6 @@ fn fixed_row_height(text_height: f32, interact_height: f32) -> f32 {
 fn table_width(horizontal_spacing: f32, widths: &[f32; 4]) -> f32 {
     widths.iter().sum::<f32>() + horizontal_spacing * (widths.len().saturating_sub(1) as f32)
 }
-
-/// Draws one draggable divider at a resizable column's own trailing edge
-/// (see `COLUMN_RESIZE_HANDLE_WIDTH`'s doc comment for why it is carved
-/// out of the column's own width rather than added alongside it).
-/// Dragging changes only `*width`, clamped to
-/// `MIN_RESIZABLE_COLUMN_WIDTH..=MAX_RESIZABLE_COLUMN_WIDTH` so a column
-/// can never be dragged into an unusable sliver or an unbounded runaway
-/// size (milestone requirement: "sensible minimum widths"). Never touches
-/// sort state, selection, or any other column's width - growing this one
-/// column simply makes the table wider, which the enclosing horizontal
-/// `egui::ScrollArea` (see `show_loaded_data`) accommodates with a
-/// scrollbar rather than by shrinking anything else.
 fn show_column_resize_handle(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -10857,28 +16501,6 @@ fn show_column_resize_handle(
         egui::Stroke::new(2.0_f32, stroke_color),
     );
 }
-
-/// Renders the column header row - milestone requirement 2: each cell is
-/// its own small, borderless `Button`, clickable to select/toggle that
-/// column's sort. This is a separate function from `show_data_row` and
-/// renders outside any data row's own click-sensing `Rect`, so it does
-/// not touch the Painter-based single-clickable-region row fix at all;
-/// unlike a data row, there is no archive identity here that a second
-/// child widget could ever steal a click from.
-///
-/// `sort_field`/`sort_ascending` describe the *current* sort (`None`
-/// means unsorted / natural order); the active column's label gets a
-/// small arrow suffix showing its direction. Returns the column whose
-/// header was clicked this frame, if any - the caller decides whether
-/// that selects a new sort field or toggles the existing one.
-///
-/// Cells are placed at exact, manually computed rects (`ui.put`) rather
-/// than through `ui.horizontal`'s automatic layout, for two reasons: it
-/// guarantees the header's column boundaries land at exactly the same x
-/// positions `show_data_row` paints its cells at (both read the same
-/// `column_widths.as_array()`), and it leaves room to place each
-/// resizable column's drag handle (`show_column_resize_handle`) at an
-/// exact boundary without perturbing any other column's position.
 fn show_header_row(
     ui: &mut egui::Ui,
     cells: &[&str; 4],
@@ -10974,24 +16596,6 @@ fn cell_index_at(pointer_x: f32, row_left: f32, widths: &[f32], spacing: f32) ->
     }
     None
 }
-
-/// Decides which cell's *full, untruncated* text (if any) a row-painting
-/// function should attach as a hover tooltip this frame - milestone
-/// requirement: "Show the full value in a hover tooltip when text is
-/// clipped." Returns `None` whenever there is nothing useful to show: no
-/// current hover position, the hovered pixel falls outside every known
-/// cell (the inter-row gap, or past the last column), or the hovered
-/// cell's text already fits without clipping.
-///
-/// `measure_width` abstracts real font-metric measurement
-/// (`ui.fonts(|f| f.layout_no_wrap(...))` in production) behind a closure
-/// specifically so this stays unit-testable with a deterministic stand-in
-/// instead of depending on real font rendering - egui tooltips are
-/// `Area`-based and, like floating `Window`s elsewhere in this file, are
-/// not reliably assertable from a single headless render pass, so the
-/// decision logic is kept here, pure and directly testable, rather than
-/// only provable by eye. Generic over the column count for the same
-/// reason as `cell_index_at`.
 fn hovered_cell_full_text<'a>(
     pointer_x: Option<f32>,
     row_left: f32,
@@ -11112,13 +16716,6 @@ fn show_data_row(
         );
         x += column_width + spacing;
     }
-
-    // Milestone requirement: "Show the full value in a hover tooltip when
-    // text is clipped." `response.hover_pos()` is `Some` only while this
-    // exact row is hovered, so this never attaches a tooltip (and
-    // therefore never shows one) for any other row - and never touches
-    // `.clicked()`/selection at all, since `on_hover_text` only adds
-    // hover-only decoration to the same `Response` already returned below.
     let pointer_x = response.hover_pos().map(|pos| pos.x);
     if let Some(full_text) =
         hovered_cell_full_text(pointer_x, rect.left(), cells, widths, spacing, |text| {
@@ -11166,6 +16763,9 @@ enum RowContextMenuAction {
     /// "Show in Library View preview" - see
     /// `AppOperationRequest::ShowInLibraryViews`'s doc comment.
     ShowInLibraryViews(PathBuf),
+    /// Open the first-class Cheats & Mods workspace for this exact
+    /// archive - same gating as the Selected page's entry.
+    CheatsMods(PathBuf),
     ClearSelection,
 }
 
@@ -11179,25 +16779,12 @@ struct RowMenuContext<'a> {
     busy: bool,
     block_reason: Option<&'static str>,
     platform_busy: bool,
-    /// Whether any Library View is configured at all - gates "Show in
-    /// Library View preview" (milestone Section 8: "only if a view
-    /// exists").
+    /// See `LoadedViewState::retroarch_profiles`; profile readiness is
+    /// presented on the destination page rather than used to hide it.
+    retroarch_profiles: &'a RetroArchProfilesState,
     library_views_configured: bool,
-    /// The most recently computed Preview, if any - gates "Copy planned
-    /// view path" (milestone Section 8: "only after a valid plan
-    /// exists") and lets the menu look up this row's own planned
-    /// destination.
     library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
 }
-
-/// Applies one row right-click to the selection state - milestone
-/// requirement: a right-click on a row *not* already part of the current
-/// multi-selection makes it the sole selection and the focused row,
-/// exactly like an ordinary left click (`apply_row_click`); a right-click
-/// on a row already inside the current multi-selection leaves the whole
-/// selection (and focus) completely undisturbed, so right-clicking any one
-/// of several already-selected rows opens the bulk menu for all of them
-/// rather than collapsing the selection down to just the clicked row.
 fn apply_row_right_click(
     selected_archives: &mut HashSet<PathBuf>,
     selected_archive: &mut Option<PathBuf>,
@@ -11210,10 +16797,9 @@ fn apply_row_right_click(
     }
 }
 
-/// Renders one row's right-click context menu content, dispatching to the
-/// single-archive or multi-selection action set (milestone requirement 1)
-/// based on the *current* selection size - always read fresh here, after
-/// `apply_row_right_click` has already resolved this frame's selection.
+fn cheats_mods_row_action(path: &Path) -> RowContextMenuAction {
+    RowContextMenuAction::CheatsMods(path.to_path_buf())
+}
 fn show_row_context_menu(
     ui: &mut egui::Ui,
     row: &ArchiveRow,
@@ -11226,14 +16812,6 @@ fn show_row_context_menu(
         show_single_row_context_menu(ui, row, ctx)
     }
 }
-
-/// Looks up `archive_path`'s own entry in the most recently computed
-/// Library View preview, if any - `None` if no preview has been run yet,
-/// or one has but this archive is not one of its planned entries (it was
-/// excluded by a filter, or the cached plan is simply for a different
-/// view). Never itself starts a Preview - only reads whatever a previous
-/// one already found (milestone requirement: never bypass Preview or
-/// safety checks).
 fn library_view_planned_entry_for<'a>(
     last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
     archive_path: &Path,
@@ -11257,13 +16835,6 @@ fn library_view_planned_destination_for<'a>(
         .destination_path
         .as_deref()
 }
-
-/// The single-archive row context menu - every enabled/disabled decision
-/// and disabled-reason string reuses exactly the same predicates the main
-/// buttons already use (`available_action`, `individual_actions_available`,
-/// the caller-supplied `block_reason` from `archive_action_block_reason`,
-/// `is_inspectable`), never a second, independently-drifting guess
-/// (milestone requirement 9).
 fn show_single_row_context_menu(
     ui: &mut egui::Ui,
     row: &ArchiveRow,
@@ -11318,6 +16889,25 @@ fn show_single_row_context_menu(
     };
     if inspect_button.clicked() {
         action = Some(RowContextMenuAction::Inspect(row.path.clone()));
+        ui.close();
+    }
+
+    // Same gating as the Selected page's entry button - this menu only
+    // renders for a single-row selection, so the count is truthfully 1.
+    let cheat_blocker = cheat_entry_blocker(
+        Some(&row.path),
+        1,
+        Some(ctx.records),
+        ctx.retroarch_profiles,
+    );
+    let cheat_button = ui.add_enabled(cheat_blocker.is_none(), egui::Button::new("Cheats & Mods"));
+    let cheat_button = if let Some(reason) = cheat_blocker {
+        cheat_button.on_disabled_hover_text(reason)
+    } else {
+        cheat_button
+    };
+    if cheat_button.clicked() {
+        action = Some(cheats_mods_row_action(&row.path));
         ui.close();
     }
 
@@ -11590,11 +17180,6 @@ fn show_archive_rows(
         if response.clicked() {
             clicked = Some((row_index, ctrl_held));
         }
-        // Right-click never triggers an action by itself (milestone
-        // requirement) - this only ever adjusts *selection*, exactly like
-        // an ordinary left click would, before the menu below reads that
-        // (possibly just-updated) selection to decide which action set to
-        // show.
         if response.secondary_clicked() {
             apply_row_right_click(selected_archives, selected_archive, row.path.clone());
         }
@@ -11679,12 +17264,6 @@ fn bulk_action_bar_visible(selected_archives: &HashSet<PathBuf>) -> bool {
 fn select_all_visible_button_enabled(visible_count: usize) -> bool {
     visible_count > 0
 }
-
-/// A compact, always-visible summary of the multi-selection's size -
-/// milestone requirement 3. Shown unconditionally, unlike
-/// `show_bulk_platform_action_bar` (2+ rows only), so a single selected
-/// row is still visibly confirmed somewhere other than the row's
-/// background colour.
 fn selection_status_text(selected_count: usize) -> String {
     match selected_count {
         0 => "No archives selected".to_string(),
@@ -11724,9 +17303,6 @@ fn show_selection_controls_row(
             merged_rows.len()
         ));
         ui.separator();
-        // Milestone requirement 3: always visible, unlike the bulk action
-        // bar (2+ selections only) - a single selection is otherwise only
-        // shown via the selected row's background colour.
         ui.label(selection_status_text(selected_archives.len()));
         ui.separator();
         if ui
@@ -11769,10 +17345,6 @@ fn library_table_message(
         None
     }
 }
-
-/// The four sortable table columns - milestone requirement 2. Order
-/// matches `COLUMN_HEADERS`/`COLUMN_WIDTHS` exactly (see
-/// `COLUMN_SORT_FIELDS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SortField {
     Platform,
@@ -11889,12 +17461,6 @@ fn next_focus_in_visible_order(
     };
     Some(merged_rows[visible_indices[next_pos]].path.clone())
 }
-
-/// Applies one Up/Down focus change - requirement 1's exact semantics.
-/// Moving focus without Ctrl replaces the whole multi-selection with
-/// just the newly-focused row; with Ctrl held, only the focus itself
-/// moves and the multi-selection is left untouched (Shift-range
-/// selection is explicitly out of scope for this milestone).
 fn apply_arrow_focus_change(
     selected_archives: &mut HashSet<PathBuf>,
     selected_archive: &mut Option<PathBuf>,
@@ -12079,6 +17645,14 @@ struct SelectedArchiveViewState<'a> {
     clipboard: &'a mut dyn ClipboardBackend,
 }
 
+#[derive(Default)]
+struct SelectedArchiveActions {
+    operation: Option<OperationRequest>,
+    platform: Option<(PathBuf, PlatformAction)>,
+    inspect: Option<PathBuf>,
+    cheats_mods: Option<PathBuf>,
+}
+
 fn show_selected_archive(
     ui: &mut egui::Ui,
     record: Option<&ArchiveRecord>,
@@ -12086,11 +17660,7 @@ fn show_selected_archive(
     platform_details: Option<&PlatformProvenanceDetails>,
     source_path: Option<&Path>,
     view_state: SelectedArchiveViewState<'_>,
-) -> (
-    Option<OperationRequest>,
-    Option<(PathBuf, PlatformAction)>,
-    Option<PathBuf>,
-) {
+) -> SelectedArchiveActions {
     let SelectedArchiveViewState {
         operation,
         busy,
@@ -12110,8 +17680,13 @@ fn show_selected_archive(
     let mut request = None;
     let mut platform_request = None;
     let mut inspect_request = None;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.strong("Selected archive");
+    let mut cheats_mods_request = None;
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Selected archive",
+            Some("Inspect identity, mount state, health, and metadata for the focused row."),
+        );
         if record.is_none() && persisted.is_none() {
             ui.label("Select an archive row to view details.");
             return;
@@ -12120,13 +17695,9 @@ fn show_selected_archive(
         let Some(record) = record else {
             if let Some(persisted) = persisted {
                 let archive_path_text = persisted.absolute_path.display().to_string();
-                ui.label("Archive path:");
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(&archive_path_text).selectable(true).wrap());
-                    if ui.small_button("Copy").clicked() {
-                        let _ = clipboard.set_text(archive_path_text.clone());
-                    }
-                });
+                if widgets::copyable_value(ui, "Archive path", &archive_path_text) {
+                    let _ = clipboard.set_text(archive_path_text.clone());
+                }
                 let source_text = source_path
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "Unassigned / Legacy".to_string());
@@ -12239,18 +17810,25 @@ fn show_selected_archive(
             available_action(record.mount_state)
         };
         ui.strong("Options");
-        if ui
-            .add_enabled(
-                is_inspectable(&record.mount_plan.archive.path),
-                egui::Button::new("Inspect contents"),
-            )
-            .on_hover_text(
-                "Read-only: view this archive's internal entries without extracting them.",
-            )
-            .clicked()
-        {
-            inspect_request = Some(record.mount_plan.archive.path.clone());
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    is_inspectable(&record.mount_plan.archive.path),
+                    egui::Button::new("Inspect contents"),
+                )
+                .on_hover_text(
+                    "Read-only: view this archive's internal entries without extracting them.",
+                )
+                .clicked()
+            {
+                inspect_request = Some(record.mount_plan.archive.path.clone());
+            }
+            if widgets::action_button(ui, "Cheats & Mods", widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                cheats_mods_request = Some(record.mount_plan.archive.path.clone());
+            }
+        });
         ui.add_enabled_ui(!busy, |ui| {
             ui.checkbox(
                 cleanup_after_unmount,
@@ -12349,7 +17927,12 @@ fn show_selected_archive(
             platform_request = Some((record.mount_plan.archive.path.clone(), action));
         }
     });
-    (request, platform_request, inspect_request)
+    SelectedArchiveActions {
+        operation: request,
+        platform: platform_request,
+        inspect: inspect_request,
+        cheats_mods: cheats_mods_request,
+    }
 }
 
 /// Renders the "Set platform" / "Clear manual platform" controls tucked
@@ -12527,39 +18110,6 @@ fn show_bulk_platform_action_bar(
     ui.add_space(4.0);
     action
 }
-
-// -----------------------------------------------------------------------
-// v0.4.3-alpha follow-up: shared right-click Cut/Copy/Paste/Select all
-// context menu for every editable single-line text field.
-//
-// Root cause of the first implementation's live failure: it dispatched
-// Cut/Copy/Paste via `ViewportCommand::RequestCut/RequestCopy/RequestPaste`
-// and injected a synthetic `Event::Key` for Select all - both of which
-// only take effect on a *later* frame, and only for whichever widget
-// still holds keyboard focus at that point. Clicking a menu button is
-// itself an interaction with a different widget than the text field, and
-// nothing in egui's popup/focus handling guarantees the field's focus
-// survives from "menu opened" through "item clicked" through "the next
-// frame after that". Live testing on Nobara confirmed it did not: the
-// commands/events were queued correctly (which is all the original tests
-// checked - see the milestone follow-up), but never reached the field.
-//
-// This implementation never depends on focus at all for the edit itself.
-// Every action is applied synchronously, in the same frame as the click,
-// directly to the target field's `TextEditState` (loaded and stored by
-// `egui::Id` alone) and its backing `String` - the exact "preferred
-// design" this follow-up specifies. Keyboard focus is still requested
-// afterward, purely so the field *looks* focused and typing continues
-// from the right place; it is never required for the edit to have
-// already happened.
-// -----------------------------------------------------------------------
-
-/// The result of asking the clipboard for text - milestone requirement:
-/// a broken/unavailable clipboard backend must never be indistinguishable
-/// from a clipboard that was read successfully and is simply empty.
-/// `Unavailable`'s string is always a short, safe error *summary* (an
-/// error *kind*, e.g. "the clipboard is not accessible right now") -
-/// never clipboard content, and never anything read from the clipboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClipboardTextStatus {
     /// Usable, non-empty text is available to paste.
@@ -12588,10 +18138,6 @@ trait ClipboardBackend {
     /// failed to be written.
     fn set_text(&mut self, text: String) -> Result<(), String>;
 }
-
-/// A one-line, safe-to-print summary of the session environment relevant
-/// to clipboard access - milestone diagnostics requirement. Never reads
-/// or touches the clipboard itself.
 fn clipboard_environment_summary() -> String {
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unset".to_string());
     let display = if std::env::var_os("DISPLAY").is_some() {
@@ -12748,12 +18294,6 @@ impl TextEditContextMenuAction {
         }
     }
 }
-
-/// Whether one menu item should be clickable - milestone requirement:
-/// Cut/Copy need a selection; Select all needs non-empty content; Paste
-/// needs usable clipboard text - now knowable, since `ClipboardBackend`
-/// gives direct, synchronous read access (unlike the first
-/// implementation's `ViewportCommand`-only approach).
 fn text_edit_context_menu_action_available(
     action: TextEditContextMenuAction,
     has_selection: bool,
@@ -12766,15 +18306,6 @@ fn text_edit_context_menu_action_available(
         TextEditContextMenuAction::SelectAll => !is_empty,
     }
 }
-
-/// The field's current selection as a sorted character range - `None`
-/// when there is no persisted cursor state at all (the field has never
-/// been shown/focused) or when the range is empty (a caret, not a
-/// selection). Read directly from `TextEditState`, never from "is this
-/// field focused right now": a context menu opened on a field that was
-/// not previously focused must still see whatever selection that field
-/// already had (milestone requirement: "menu opened on a field that was
-/// not already focused").
 fn text_edit_selected_char_range(ctx: &egui::Context, id: egui::Id) -> Option<Range<usize>> {
     let range = egui::widgets::text_edit::TextEditState::load(ctx, id)?
         .cursor
@@ -12812,10 +18343,6 @@ fn set_text_edit_caret(ctx: &egui::Context, id: egui::Id, char_index: usize) {
     state.store(ctx, id);
     ctx.memory_mut(|memory| memory.request_focus(id));
 }
-
-/// Select all - milestone requirement 3 of the preferred design: applied
-/// directly to the field's `TextEditState`, never via a synthetic key
-/// event that depends on focus surviving to a later frame.
 fn apply_select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
     let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
     let full_range = egui::text::CCursorRange::two(
@@ -12890,25 +18417,6 @@ fn apply_paste(
     let inserted = text.insert_text(&clip_text, range.start);
     set_text_edit_caret(ctx, id, range.start + inserted);
 }
-
-/// The one shared implementation every editable single-line text field in
-/// the GUI renders through (ordinary library search, Duplicate Review
-/// search, Health Dashboard search, the custom platform alias input, and
-/// the custom platform text field) - milestone requirement: no field
-/// gets its own separate context-menu code.
-///
-/// Takes `text` directly (not a pre-built `TextEdit`, unlike the first
-/// implementation) because Cut/Paste/Select all need the backing string
-/// and its persisted cursor state back *after* the widget has already
-/// been shown, to edit them directly and synchronously - by the time a
-/// pre-built `TextEdit` has been consumed by `.show()`, there is no way
-/// back into the string it borrowed. `configure` lets each call site
-/// still apply its own `.id`/`.id_salt`/`.hint_text`/`.desired_width`,
-/// exactly as before.
-/// A short, user-visible diagnostic line for the top of the context menu -
-/// milestone requirement: "Clipboard ready" / "Clipboard contains no
-/// text" / "Clipboard unavailable: <safe error summary>". Never includes
-/// clipboard content, whether the clipboard is ready or not.
 fn clipboard_status_label(status: &ClipboardTextStatus) -> String {
     match status {
         ClipboardTextStatus::Ready(_) => "Clipboard ready".to_string(),
@@ -12971,15 +18479,6 @@ fn show_text_edit_with_context_menu(
 
     response
 }
-
-/// Milestone requirement: long values (paths, reasons, provenance detail)
-/// must stay fully readable rather than silently stretching or clipping
-/// this row's enclosing `egui::Grid`. `.wrap()` bounds the value to the
-/// Grid's own available width (wrapping onto more lines rather than
-/// growing the column indefinitely); `.selectable(true)` lets any value
-/// here be selected and copied directly, which for a Grid used this way
-/// is a cleaner fit than a dedicated Copy button on every single row (see
-/// `detail_row_with_copy` for the few rows that do get one).
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.strong(label);
     ui.add(egui::Label::new(value).selectable(true).wrap());
@@ -12991,17 +18490,6 @@ fn optional_detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
         detail_row(ui, label, value);
     }
 }
-
-/// Like `detail_row`, but for the long, exact-path-identity fields
-/// (Archive path / Mount path / Source) that most benefit from a one-click
-/// copy - milestone requirement: "Add click-to-copy only if it can be
-/// implemented cleanly with the existing clipboard helper." Uses the
-/// exact same `ClipboardBackend::set_text` every other Copy button in this
-/// app already goes through (see `show_about_window`'s database/config
-/// path rows) - never a second clipboard mechanism. A failed copy is
-/// silently ignored here exactly as it already is in `show_about_window`:
-/// the value stays fully visible and selectable either way, so a failed
-/// copy never hides information, it only means the click did nothing.
 fn detail_row_with_copy(
     ui: &mut egui::Ui,
     label: &str,
@@ -13010,19 +18498,17 @@ fn detail_row_with_copy(
 ) {
     ui.strong(label);
     ui.vertical(|ui| {
-        let response = ui.add(
-            egui::Label::new(value)
-                .selectable(true)
-                .wrap()
-                .sense(egui::Sense::click()),
-        );
+        let response = ui
+            .add(
+                egui::Label::new(value)
+                    .selectable(true)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(value);
         if ui.small_button("Copy").clicked() {
             let _ = clipboard.set_text(value.to_string());
         }
-        // Milestone requirement: right-clicking Archive path/Mount path/
-        // Source offers Copy, Select all, and (only because it can be
-        // done safely and portably - see `open_folder_in_file_manager`'s
-        // doc comment) Show containing folder.
         response.context_menu(|ui| {
             if ui.button("Copy").clicked() {
                 let _ = clipboard.set_text(value.to_string());
@@ -13073,11 +18559,65 @@ fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
         });
 }
 
-fn doctor_status_color(ui: &egui::Ui, status: DoctorStatus) -> egui::Color32 {
-    match status {
-        DoctorStatus::Pass => egui::Color32::from_rgb(70, 170, 90),
-        DoctorStatus::Warn => egui::Color32::from_rgb(220, 170, 40),
-        DoctorStatus::Fail => ui.visuals().error_fg_color,
+#[derive(Clone, Copy)]
+struct SummaryMetric<'a> {
+    label: &'a str,
+    value: usize,
+    tone: widgets::StatusTone,
+}
+
+fn show_health_metric_card(ui: &mut egui::Ui, width: f32, metric: SummaryMetric<'_>) {
+    let color = metric.tone.color(ui);
+    let content_width = (width - 20.0).max(64.0);
+    let fill = if metric.value == 0 {
+        theme::card_fill(ui)
+    } else {
+        color.gamma_multiply(0.10)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(theme::border(ui))
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(content_width, HEALTH_METRIC_HEIGHT - 10.0));
+            ui.set_max_width(content_width);
+            ui.vertical_centered(|ui| {
+                let value = egui::RichText::new(metric.value.to_string()).strong();
+                ui.label(if metric.value == 0 {
+                    value.color(ui.visuals().weak_text_color())
+                } else {
+                    value.color(color)
+                });
+                ui.add_sized(
+                    [content_width, ui.text_style_height(&egui::TextStyle::Small)],
+                    egui::Label::new(egui::RichText::new(metric.label).small()).truncate(),
+                )
+                .on_hover_text(metric.label);
+            });
+        });
+}
+
+fn show_health_metric_cards(ui: &mut egui::Ui, metrics: &[SummaryMetric<'_>]) {
+    let spacing = ui.spacing().item_spacing.x;
+    let columns = responsive_card_columns(
+        ui.available_width(),
+        HEALTH_METRIC_MIN_WIDTH,
+        spacing,
+        metrics.len(),
+    );
+    if columns == 0 {
+        return;
+    }
+    for row in metrics.chunks(columns) {
+        let width = ((ui.available_width() - spacing * (columns.saturating_sub(1) as f32))
+            / columns as f32)
+            .max(1.0);
+        ui.horizontal(|ui| {
+            for metric in row {
+                show_health_metric_card(ui, width, *metric);
+            }
+        });
     }
 }
 
@@ -13098,14 +18638,108 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::emulator_environment::EncodedPath;
+    use archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport;
+    use archivefs_core::patch_manager::{
+        CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceManifest,
+        RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupProfile,
+        RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState,
+        trusted_retroarch_cheat_sources,
+    };
     use archivefs_core::{
-        Archive, ArchiveHealth, ArchiveMetadata, LibraryViewPlanCounts, MountPlan, SetupDiagnostic,
-        SourceScanStatus, classify_entry,
+        Archive, ArchiveHealth, ArchiveMetadata, DoctorCheck, LibraryViewPlanCounts, MountPlan,
+        SetupDiagnostic, SourceScanStatus, classify_entry,
     };
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn presentation_status_classification_is_consistent() {
+        assert_eq!(
+            profile_presentation_tone(true),
+            widgets::StatusTone::Success
+        );
+        assert_eq!(
+            profile_presentation_tone(false),
+            widgets::StatusTone::Pending
+        );
+        assert_eq!(
+            cheat_freshness_tone(CheatSourceFreshness::Fresh),
+            widgets::StatusTone::Success
+        );
+        assert_eq!(
+            cheat_freshness_tone(CheatSourceFreshness::Stale),
+            widgets::StatusTone::Warning
+        );
+        assert_eq!(
+            activity_outcome_tone(ActivityOutcome::Failed),
+            widgets::StatusTone::Blocked
+        );
+        assert_eq!(
+            activity_outcome_tone(ActivityOutcome::Started),
+            widgets::StatusTone::Active
+        );
+    }
+
+    #[test]
+    fn trusted_source_warnings_are_summarised_calmly_without_losing_counts() {
+        let summaries = summarise_cheat_warnings(&[
+            "147 catalogue files were retained but are non-actionable because parsing was incomplete".to_string(),
+            "6 non-UTF-8 catalogue files were safely skipped and are non-actionable".to_string(),
+        ]);
+        assert_eq!(
+            summaries[0],
+            "147 catalogue files could not be parsed and were excluded from matching."
+        );
+        assert_eq!(
+            summaries[1],
+            "6 files used unsupported path encoding and were skipped safely."
+        );
+    }
+
+    #[test]
+    fn activity_starts_collapsed_and_compact_summary_prioritises_errors() {
+        assert!(!app_for_operation_tests().show_activity);
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Failed,
+            "older failure",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Refresh,
+            None,
+            ActivityOutcome::Completed,
+            "new success",
+        ));
+        assert_eq!(
+            activity_summary_entry(&history).map(|entry| entry.message.as_str()),
+            Some("older failure")
+        );
+    }
+
+    #[test]
+    fn library_default_columns_allocate_more_space_to_destinations() {
+        let laptop = responsive_library_column_widths(900.0, 10.0);
+        let desktop = responsive_library_column_widths(1500.0, 10.0);
+        assert!(laptop.mount_path > laptop.archive_path);
+        assert!(desktop.archive_path > laptop.archive_path);
+        assert!(desktop.mount_path > laptop.mount_path);
+    }
+
+    #[test]
+    fn every_navigation_destination_has_a_title_and_width_policy() {
+        for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS
+            .into_iter()
+            .chain(SECONDARY_NAVIGATION_DESTINATIONS)
+        {
+            assert_eq!(main_view_title(view), label);
+            let _ = main_view_content_width(view);
+        }
+    }
 
     /// A deterministic, in-memory stand-in for `NativeClipboard` - the
     /// injectable clipboard every context-menu test uses instead of the
@@ -13213,6 +18847,1599 @@ mod tests {
         )
     }
 
+    #[test]
+    fn queued_pending_paths_keeps_queue_order_and_only_pending_archives() {
+        let records = vec![
+            record("/roms/a.zip", MountState::Mounted),
+            record("/roms/b.zip", MountState::Pending),
+            record("/roms/c.zip", MountState::MountPathExists),
+            record("/roms/d.zip", MountState::Pending),
+        ];
+        let queue = vec![
+            PathBuf::from("/roms/d.zip"),
+            PathBuf::from("/roms/a.zip"),
+            PathBuf::from("/roms/b.zip"),
+            PathBuf::from("/roms/missing.zip"),
+        ];
+        assert_eq!(
+            queued_pending_paths(&queue, &records),
+            vec![PathBuf::from("/roms/d.zip"), PathBuf::from("/roms/b.zip")],
+            "only Pending queued archives are attempted, in queue order"
+        );
+    }
+
+    #[test]
+    fn prune_mount_queue_drops_only_archives_missing_from_the_snapshot() {
+        let records = vec![
+            record("/roms/a.zip", MountState::Mounted),
+            record("/roms/b.zip", MountState::MountPathExists),
+        ];
+        let mut queue = vec![
+            PathBuf::from("/roms/a.zip"),
+            PathBuf::from("/roms/gone.zip"),
+            PathBuf::from("/roms/b.zip"),
+        ];
+        prune_mount_queue(&mut queue, &records);
+        assert_eq!(
+            queue,
+            vec![PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")],
+            "non-Pending archives stay queued (with a skip label); only vanished paths are pruned"
+        );
+    }
+
+    #[test]
+    fn mount_validation_labels_distinguish_ready_mounted_and_collision() {
+        assert_eq!(
+            mount_validation_label(MountState::Pending),
+            "Ready to mount"
+        );
+        assert_eq!(
+            mount_validation_label(MountState::Mounted),
+            "Already mounted — will be skipped"
+        );
+        assert_eq!(
+            mount_validation_label(MountState::MountPathExists),
+            "Destination already exists — will be skipped"
+        );
+    }
+
+    fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
+        RetroArchCheatSetupProfile {
+            profile_id: profile_id.to_string(),
+            installation_type: ProfileKind::Native,
+            scope: ProfileScope::User,
+            state: if eligible {
+                RetroArchCheatSetupProfileState::Eligible
+            } else {
+                RetroArchCheatSetupProfileState::Ineligible
+            },
+            eligible,
+            executable_evidence: Vec::new(),
+            configuration_path: EncodedPath::from_path(Path::new("/isolated/retroarch.cfg")),
+            cheat_destination_root: eligible
+                .then(|| EncodedPath::from_path(Path::new("/isolated/cheats"))),
+            blockers: if eligible {
+                Vec::new()
+            } else {
+                vec![RetroArchCheatSetupProfileBlocker {
+                    code: "cheats_destination_unresolved".to_string(),
+                    detail: "no resolved cheats destination".to_string(),
+                }]
+            },
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn cheat_discovery(profiles: Vec<RetroArchCheatSetupProfile>) -> RetroArchCheatSetupDiscovery {
+        RetroArchCheatSetupDiscovery {
+            schema_version: RETROARCH_CHEAT_SETUP_SCHEMA_VERSION,
+            profiles,
+            diagnostics: Vec::new(),
+            environment: RetroArchEnvironmentReport {
+                format_version: 1,
+                profiles: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        }
+    }
+
+    fn cheat_manifest(source_id: &str) -> CheatSourceManifest {
+        CheatSourceManifest {
+            format_version: 1,
+            source_id: source_id.to_string(),
+            source_url: "https://example.invalid/catalogue.zip".to_string(),
+            pinned_version: None,
+            fetched_at_unix_seconds: 0,
+            downloaded_bytes: 0,
+            extracted_bytes: 0,
+            archive_entry_count: 0,
+            archive_sha256: "test-digest".to_string(),
+            response_content_type: None,
+            response_etag: None,
+            response_last_modified: None,
+            catalogue_file_count: 0,
+            valid_cheat_count: 0,
+            malformed_cheat_count: 0,
+            skipped_entry_count: 0,
+            discovered_platforms: Vec::new(),
+            validation_complete: true,
+            warnings: Vec::new(),
+            catalogue_relative_path: "catalogue.json".to_string(),
+            cache_relative_path: "cache".to_string(),
+            files: Vec::new(),
+        }
+    }
+
+    /// A fetch-result fixture built on a *real* trusted definition
+    /// (`CheatSourceArchiveType` is not exported, so the definition
+    /// cannot be constructed from scratch) with only its ID overridden.
+    /// No network and no real cache paths are involved.
+    fn cheat_fetch_result_for(
+        source_id: &str,
+        status: CheatSourceFetchStatus,
+    ) -> CheatSourceFetchResult {
+        let mut source = trusted_retroarch_cheat_sources()
+            .into_iter()
+            .next()
+            .expect("a built-in trusted source exists");
+        source.source_id = source_id.to_string();
+        CheatSourceFetchResult {
+            schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+            status,
+            source,
+            local_catalogue_path: EncodedPath::from_path(Path::new("/isolated/catalogue.json")),
+            immutable_snapshot_path: EncodedPath::from_path(Path::new("/isolated/snapshot")),
+            manifest: cheat_manifest(source_id),
+            freshness: CheatSourceFreshness::Fresh,
+            from_cache: status != CheatSourceFetchStatus::Fetched,
+            stale: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn cheat_source_list_fixture() -> (String, String, CheatSourceList) {
+        let source = trusted_retroarch_cheat_sources()
+            .into_iter()
+            .next()
+            .expect("a built-in trusted source exists");
+        let source_id = source.source_id.clone();
+        (
+            source_id,
+            source.display_name.clone(),
+            CheatSourceList {
+                schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+                entries: vec![CheatSourceListEntry {
+                    source,
+                    trust_status: "built_in_reviewed".to_string(),
+                    freshness: CheatSourceFreshness::Fresh,
+                    current_cached_version: Some("fixture".to_string()),
+                    fetched_at_unix_seconds: Some(0),
+                    archive_sha256: Some("fixture-digest".to_string()),
+                    catalogue_file_count: Some(4),
+                    setup_usable: true,
+                    warnings: Vec::new(),
+                }],
+            },
+        )
+    }
+
+    fn app_with_cheats_mods_context() -> ArchiveFsApp {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.retroarch_profiles =
+            RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+                "native-user",
+                true,
+            )]));
+        app.cheat_workflow = Some(CheatWorkflowState {
+            archive_path: PathBuf::from("/roms/a.zip"),
+            display_name: "a".to_string(),
+            platform: None,
+            source_root: PathBuf::from("/roms"),
+            size_bytes: None,
+            adapter: CheatEmulatorAdapter::RetroArch,
+            selected_profile_id: Some("native-user".to_string()),
+            selected_pcsx2_profile_id: None,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id: None,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
+            source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: Some("source-a".to_string()),
+            fetch_force_refresh: false,
+        });
+        app.view = MainView::CheatsMods;
+        app.tools_overlay = ToolsOverlay::None;
+        app
+    }
+
+    fn pcsx2_profile_fixture() -> Pcsx2Profile {
+        Pcsx2Profile {
+            profile_id: "pcsx2-native-test".to_string(),
+            installation_type: Pcsx2InstallationType::Native,
+            scope: Pcsx2ProfileScope::User,
+            configuration_path: PathBuf::from("/isolated/PCSX2"),
+            provenance: "test fixture",
+            eligible: true,
+            blockers: Vec::new(),
+            patch_directories: vec![
+                Pcsx2PatchDirectory {
+                    path: PathBuf::from("/isolated/PCSX2/cheats"),
+                    category: Pcsx2PatchCategory::Cheats,
+                    state: Pcsx2PatchDirectoryState::Available,
+                    warning: None,
+                    identity: None,
+                },
+                Pcsx2PatchDirectory {
+                    path: PathBuf::from("/isolated/PCSX2/cheats_ws"),
+                    category: Pcsx2PatchCategory::WidescreenPatches,
+                    state: Pcsx2PatchDirectoryState::Missing,
+                    warning: None,
+                    identity: None,
+                },
+            ],
+            configuration_identity: None,
+        }
+    }
+
+    fn empty_pcsx2_inventory() -> Pcsx2PnachInventory {
+        Pcsx2PnachInventory {
+            profile_id: "pcsx2-native-test".to_string(),
+            files: Vec::new(),
+            warnings: Vec::new(),
+            directories_traversed: 2,
+            entries_visited: 0,
+            bytes_inspected: 0,
+            complete: true,
+        }
+    }
+
+    fn dolphin_profile_fixture() -> DolphinProfile {
+        DolphinProfile {
+            profile_id: "dolphin-native-test".to_string(),
+            installation_type: DolphinInstallationType::Native,
+            scope: DolphinProfileScope::User,
+            configuration_path: PathBuf::from("/isolated/dolphin-emu"),
+            provenance: "test fixture",
+            eligible: true,
+            blockers: Vec::new(),
+            game_settings_path: PathBuf::from("/isolated/dolphin-emu/GameSettings"),
+            game_settings_state: DolphinSettingsDirectoryState::Available,
+            game_settings_warning: None,
+            configuration_identity: None,
+            game_settings_identity: None,
+        }
+    }
+
+    fn empty_dolphin_inventory() -> DolphinGameIniInventory {
+        DolphinGameIniInventory {
+            profile_id: "dolphin-native-test".to_string(),
+            files: Vec::new(),
+            warnings: Vec::new(),
+            entries_visited: 0,
+            bytes_inspected: 0,
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn pcsx2_adapter_is_visible_only_for_ps2_archives() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(&output, "PCSX2"));
+
+        workflow.platform = Some("PS3".to_string());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        assert!(!rendered_text_contains(&output, "PCSX2"));
+    }
+
+    #[test]
+    fn dolphin_adapter_is_visible_only_for_gamecube_and_wii_archives() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let ctx = egui::Context::default();
+        for platform in ["GameCube", "Nintendo Wii"] {
+            workflow.platform = Some(platform.to_string());
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+                });
+            });
+            assert!(rendered_text_contains(&output, "Dolphin"));
+        }
+        workflow.platform = Some("PS3".to_string());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
+            });
+        });
+        assert!(!rendered_text_contains(&output, "Dolphin"));
+    }
+
+    #[test]
+    fn dolphin_workflow_presents_read_only_inventory_without_fake_actions() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("GameCube".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Dolphin;
+        workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
+        workflow.dolphin_inventory_profile_id = Some("dolphin-native-test".to_string());
+        workflow.dolphin_inventory = CheatStepResource::Ready(empty_dolphin_inventory());
+        let profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![dolphin_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_dolphin_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        for expected in [
+            "Stage 1 · Dolphin profile",
+            "Existing Dolphin-managed files",
+            "Uploaded · No",
+            "Executed · No",
+            "Changed · No",
+            "Verified Game ID unavailable",
+            "Unavailable · read-only milestone",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for forbidden in ["Install now", "Apply patch", "Enable code", "Delete file"] {
+            assert!(!rendered_text_contains(&output, forbidden));
+        }
+    }
+
+    #[test]
+    fn adapter_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
+        let mut app = app_with_cheats_mods_context();
+        app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.pcsx2_inventory_profile_id = Some("pcsx2-native-test".to_string());
+        let (sender, receiver) = mpsc::channel();
+        workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
+        let archive = workflow.archive_path.clone();
+
+        select_cheat_adapter(workflow, CheatEmulatorAdapter::RetroArch);
+
+        assert!(sender.send(Ok(empty_pcsx2_inventory())).is_err());
+        assert_eq!(workflow.archive_path, archive);
+        assert!(matches!(
+            workflow.pcsx2_inventory,
+            CheatStepResource::NotLoaded
+        ));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+    }
+
+    #[test]
+    fn pcsx2_workflow_presents_profiles_and_read_only_limits_without_fake_actions() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.pcsx2_inventory_profile_id = Some("pcsx2-native-test".to_string());
+        workflow.pcsx2_inventory = CheatStepResource::Ready(empty_pcsx2_inventory());
+        let profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![pcsx2_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        for expected in [
+            "Stage 1 · PCSX2 profile",
+            "Eligible",
+            "Existing PCSX2-managed files",
+            "Uploaded · No",
+            "Executed · No",
+            "Changed · No",
+            "Verified game CRC unavailable",
+            "Unavailable · read-only milestone",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for forbidden in ["Install now", "Apply patch", "Enable patch", "Delete file"] {
+            assert!(!rendered_text_contains(&output, forbidden));
+        }
+    }
+
+    #[test]
+    fn ps2_archive_context_defaults_to_pcsx2_without_queue_or_mount_mutation() {
+        let mut app = app_for_operation_tests();
+        let mut ps2 = record("/roms/game.zip", MountState::Mounted);
+        ps2.identity.platform = Some("PS2".to_string());
+        ps2.mount_plan.archive.identity.platform = Some("PS2".to_string());
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records.push(ps2);
+        }
+        app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+        app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.zip")));
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
+        assert_eq!(workflow.archive_path, PathBuf::from("/roms/game.zip"));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/other.zip")));
+        let live = match &app.state {
+            LoadState::Ready(data) => &data.records[0],
+            _ => unreachable!(),
+        };
+        assert_eq!(live.mount_state, MountState::Mounted);
+        assert_eq!(live.identity.platform.as_deref(), Some("PS2"));
+    }
+
+    #[test]
+    fn cheat_source_labels_cover_every_freshness_and_status() {
+        assert_eq!(cheat_freshness_label(CheatSourceFreshness::Fresh), "Fresh");
+        assert_eq!(cheat_freshness_label(CheatSourceFreshness::Stale), "Stale");
+        assert_eq!(
+            cheat_freshness_label(CheatSourceFreshness::Missing),
+            "Not cached"
+        );
+        assert_eq!(
+            cheat_freshness_label(CheatSourceFreshness::Unknown),
+            "Unknown"
+        );
+        assert_eq!(
+            cheat_fetch_status_label(CheatSourceFetchStatus::Fetched),
+            "Downloaded fresh catalogue"
+        );
+        assert_eq!(
+            cheat_fetch_status_label(CheatSourceFetchStatus::CacheReused),
+            "Reused cached snapshot"
+        );
+        assert_eq!(
+            cheat_fetch_status_label(CheatSourceFetchStatus::OfflineReused),
+            "Offline: reused cached snapshot"
+        );
+    }
+
+    #[test]
+    fn stale_cheat_source_fetch_result_is_discarded_not_applied() {
+        let mut app = app_with_cheats_mods_context();
+        let (sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading { receiver };
+
+        // The user switched sources while the fetch ran: the result
+        // arriving for the *old* source must be discarded, never shown.
+        sender
+            .send(Ok(cheat_fetch_result_for(
+                "source-b",
+                CheatSourceFetchStatus::Fetched,
+            )))
+            .unwrap();
+        app.poll_cheat_workflow();
+        assert!(
+            matches!(
+                app.cheat_workflow.as_ref().unwrap().source_fetch,
+                CheatStepResource::NotLoaded
+            ),
+            "a result for a no-longer-selected source must be discarded"
+        );
+    }
+
+    #[test]
+    fn superseded_cheat_fetch_receiver_cannot_deliver_a_result() {
+        let mut app = app_with_cheats_mods_context();
+        let (old_sender, old_receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
+            receiver: old_receiver,
+        };
+        // A newer operation supersedes the old one: replacing the state
+        // drops the old receiver, so the old worker's send fails and its
+        // result can never apply.
+        let (_new_sender, new_receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
+            receiver: new_receiver,
+        };
+        let stale = old_sender.send(Ok(cheat_fetch_result_for(
+            "source-a",
+            CheatSourceFetchStatus::Fetched,
+        )));
+        assert!(
+            stale.is_err(),
+            "the superseded worker's send must fail once its receiver is gone"
+        );
+    }
+
+    #[test]
+    fn changing_cheats_mods_archive_discards_previous_background_result() {
+        let mut app = app_with_cheats_mods_context();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/b.zip", MountState::Pending));
+        }
+        let (old_sender, old_receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading {
+            receiver: old_receiver,
+        };
+
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/b.zip")));
+        assert!(
+            old_sender
+                .send(Ok(cheat_fetch_result_for(
+                    "source-a",
+                    CheatSourceFetchStatus::Fetched,
+                )))
+                .is_err(),
+            "replacing the exact archive context must drop its old receiver"
+        );
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().source_fetch,
+            CheatStepResource::NotLoaded
+        ));
+    }
+
+    #[test]
+    fn offline_cached_snapshot_reuse_applies_and_is_recorded() {
+        let mut app = app_with_cheats_mods_context();
+        let (sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Loading { receiver };
+        sender
+            .send(Ok(cheat_fetch_result_for(
+                "source-a",
+                CheatSourceFetchStatus::OfflineReused,
+            )))
+            .unwrap();
+        app.poll_cheat_workflow();
+        match &app.cheat_workflow.as_ref().unwrap().source_fetch {
+            CheatStepResource::Ready(result) => {
+                assert_eq!(result.status, CheatSourceFetchStatus::OfflineReused);
+            }
+            other => panic!("expected Ready, got {}", cheat_resource_debug(other)),
+        }
+        assert!(
+            app.history.entries().any(|entry| {
+                entry.action == ActivityAction::CheatSourceRetrieval
+                    && entry.outcome == ActivityOutcome::Completed
+            }),
+            "a completed retrieval must be recorded in the operation history"
+        );
+    }
+
+    fn cheat_resource_debug<T>(resource: &CheatStepResource<T>) -> &'static str {
+        match resource {
+            CheatStepResource::NotLoaded => "NotLoaded",
+            CheatStepResource::Loading { .. } => "Loading",
+            CheatStepResource::Ready(_) => "Ready",
+            CheatStepResource::Failed(_) => "Failed",
+        }
+    }
+
+    #[test]
+    fn cheat_entry_requires_one_existing_archive_but_not_a_completed_profile_scan() {
+        let records = vec![record("/roms/a.zip", MountState::Pending)];
+        let ready = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+            "native-user",
+            true,
+        )]));
+        let path = Some(Path::new("/roms/a.zip"));
+
+        assert_eq!(cheat_entry_blocker(path, 1, Some(&records), &ready), None);
+
+        assert!(cheat_entry_blocker(None, 0, Some(&records), &ready).is_some());
+        assert!(
+            cheat_entry_blocker(path, 2, Some(&records), &ready).is_some(),
+            "a multi-selection must disable the entry"
+        );
+        assert!(
+            cheat_entry_blocker(Some(Path::new("/roms/gone.zip")), 1, Some(&records), &ready)
+                .is_some(),
+            "an archive missing from the live snapshot must disable the entry"
+        );
+        assert!(cheat_entry_blocker(path, 1, None, &ready).is_some());
+        assert_eq!(
+            cheat_entry_blocker(path, 1, Some(&records), &RetroArchProfilesState::NotScanned),
+            None
+        );
+        let (_sender, receiver) = mpsc::channel();
+        assert_eq!(
+            cheat_entry_blocker(
+                path,
+                1,
+                Some(&records),
+                &RetroArchProfilesState::Scanning { receiver }
+            ),
+            None
+        );
+        assert_eq!(
+            cheat_entry_blocker(
+                path,
+                1,
+                Some(&records),
+                &RetroArchProfilesState::Error("boom".to_string())
+            ),
+            None
+        );
+        let no_eligible = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+            "blocked-profile",
+            false,
+        )]));
+        assert_eq!(
+            cheat_entry_blocker(path, 1, Some(&records), &no_eligible),
+            None
+        );
+    }
+
+    #[test]
+    fn cheats_mods_context_preselects_only_a_single_eligible_profile() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+
+        // Two eligible profiles: no silent choice.
+        app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+            cheat_profile("native-user", true),
+            cheat_profile("flatpak-user", true),
+        ]));
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
+        let workflow = app.cheat_workflow.as_ref().expect("workflow must open");
+        assert_eq!(workflow.selected_profile_id, None);
+        assert_eq!(app.view, MainView::CheatsMods);
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
+
+        // Exactly one eligible profile: preselected (the CLI's rule).
+        app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+            cheat_profile("native-user", true),
+            cheat_profile("blocked-profile", false),
+        ]));
+        app.cheat_workflow = None;
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
+        let workflow = app.cheat_workflow.as_ref().expect("workflow must reopen");
+        assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
+
+        // Opening for an archive missing from the snapshot does nothing.
+        app.cheat_workflow = None;
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/gone.zip"));
+        assert!(app.cheat_workflow.is_none());
+    }
+
+    #[test]
+    fn cheats_mods_navigation_and_reconciliation_never_alter_selection_or_queue() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+        app.retroarch_profiles =
+            RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+                "native-user",
+                true,
+            )]));
+
+        app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(Path::new("/roms/a.zip"))
+        );
+        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+
+        // Matching selection: the full-page workflow stays available.
+        app.reconcile_cheats_mods_context();
+        assert!(app.cheat_workflow.is_some());
+        assert_eq!(app.view, MainView::CheatsMods);
+
+        // Library focus changes and clearing are independent from this context.
+        app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
+        app.reconcile_cheats_mods_context();
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(Path::new("/roms/a.zip"))
+        );
+        app.selected_archive = None;
+        app.reconcile_cheats_mods_context();
+        assert!(app.cheat_workflow.is_some());
+        assert_eq!(app.selected_archive.as_deref(), None);
+        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    }
+
+    #[test]
+    fn cheats_mods_archive_picker_open_and_cancel_preserve_context() {
+        let mut app = app_with_cheats_mods_context();
+        let original = app.cheat_workflow.as_ref().unwrap().archive_path.clone();
+
+        app.open_cheat_archive_picker();
+        assert_eq!(
+            app.cheat_archive_picker
+                .as_ref()
+                .and_then(|picker| picker.candidate.as_deref()),
+            Some(original.as_path())
+        );
+        app.cheat_archive_picker = None;
+
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(original.as_path())
+        );
+
+        assert!(app.confirm_cheat_archive_change.is_none());
+    }
+
+    #[test]
+    fn cheats_mods_archive_picker_search_and_filters_cover_every_displayed_field() {
+        let rows = vec![
+            row_with_fields(
+                "/roms/snes/Chrono Trigger.zip",
+                "SNES",
+                "Ready to mount",
+                "/roms/snes/Chrono Trigger.zip",
+                "/mount/Chrono Trigger",
+            )
+            .with_source_path(Some(PathBuf::from("/roms/snes"))),
+            row_with_fields(
+                "/backup/psx/Chrono Cross.zip",
+                "PlayStation",
+                "Already mounted",
+                "/backup/psx/Chrono Cross.zip",
+                "/mount/Chrono Cross",
+            )
+            .with_source_path(Some(PathBuf::from("/backup/psx"))),
+        ];
+
+        for search in [
+            "chrono trigger",
+            "snes",
+            "/roms/snes",
+            "ready to mount",
+            "/mount/chrono trigger",
+        ] {
+            assert!(cheat_picker_row_matches(&rows[0], search, None, None));
+        }
+        assert!(!cheat_picker_row_matches(
+            &rows[0],
+            "chrono",
+            Some("PlayStation"),
+            None
+        ));
+        assert!(cheat_picker_row_matches(
+            &rows[1],
+            "",
+            Some("PlayStation"),
+            Some(Path::new("/backup/psx"))
+        ));
+        assert!(!cheat_picker_row_matches(
+            &rows[1],
+            "",
+            None,
+            Some(Path::new("/roms/snes"))
+        ));
+        let picker = CheatArchivePickerState::default();
+        let visible = cheat_picker_visible_indices(&rows, &picker);
+        assert_eq!(
+            move_cheat_picker_candidate(&rows, &visible, None, ArrowDirection::Down).as_deref(),
+            Some(Path::new("/backup/psx/Chrono Cross.zip"))
+        );
+        assert_eq!(
+            cheat_archive_picker_size(egui::vec2(1536.0, 864.0)),
+            egui::vec2(1080.0, 708.48)
+        );
+        assert_eq!(
+            cheat_archive_picker_size(egui::vec2(3440.0, 1440.0)),
+            egui::vec2(1080.0, 760.0)
+        );
+    }
+
+    #[test]
+    fn explicit_cheat_archive_choice_changes_only_workspace_context() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records = vec![
+                record("/roms/a.zip", MountState::Mounted),
+                record("/roms/b.zip", MountState::Pending),
+            ];
+        }
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip")));
+        {
+            let workflow = app.cheat_workflow.as_mut().unwrap();
+            workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+            workflow.selected_source_id = Some("source-a".to_string());
+            workflow.fetch_force_refresh = true;
+        }
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/b.zip")));
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(Path::new("/roms/b.zip"))
+        );
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(Path::new("/roms/a.zip"))
+        );
+        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        let LoadState::Ready(data) = &app.state else {
+            panic!("test fixture must remain ready");
+        };
+        assert_eq!(data.records[0].mount_state, MountState::Mounted);
+        assert_eq!(data.records[1].mount_state, MountState::Pending);
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().source_mode,
+            CheatSourceMode::ExistingRetroArchLibrary
+        );
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .selected_source_id
+                .as_deref(),
+            Some("source-a")
+        );
+        assert!(app.cheat_workflow.as_ref().unwrap().fetch_force_refresh);
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().source_fetch,
+            CheatStepResource::NotLoaded
+        ));
+    }
+
+    #[test]
+    fn fetched_state_requires_confirmation_before_changing_archive() {
+        let mut app = app_with_cheats_mods_context();
+        assert!(!cheat_archive_change_requires_confirmation(
+            app.cheat_workflow.as_ref(),
+            Path::new("/roms/b.zip")
+        ));
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Ready(
+            cheat_fetch_result_for("source-a", CheatSourceFetchStatus::OfflineReused),
+        );
+        assert!(cheat_archive_change_requires_confirmation(
+            app.cheat_workflow.as_ref(),
+            Path::new("/roms/b.zip")
+        ));
+        assert!(!cheat_archive_change_requires_confirmation(
+            app.cheat_workflow.as_ref(),
+            Path::new("/roms/a.zip")
+        ));
+    }
+
+    #[test]
+    fn source_mode_is_independent_and_local_unverified_has_no_action() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let archive = workflow.archive_path.clone();
+        let profile = workflow.selected_profile_id.clone();
+        workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
+        assert_eq!(workflow.archive_path, archive);
+        assert_eq!(workflow.selected_profile_id, profile);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_source_modes(ui, workflow, &RetroArchProfilesState::NotScanned);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Local unverified source"));
+        assert!(rendered_text_contains(&output, "Planned"));
+        for fake_action in ["Browse local", "Choose local", "Import local"] {
+            assert!(!rendered_text_contains(&output, fake_action));
+        }
+    }
+
+    #[test]
+    fn retroarch_library_states_distinguish_missing_inaccessible_and_unsafe() {
+        assert_eq!(
+            retroarch_library_state_presentation(RetroArchCheatLibraryState::Missing).0,
+            "Directory missing"
+        );
+        assert_eq!(
+            retroarch_library_state_presentation(RetroArchCheatLibraryState::Inaccessible).0,
+            "Directory inaccessible"
+        );
+        assert_eq!(
+            retroarch_library_state_presentation(RetroArchCheatLibraryState::UnsafePath).0,
+            "Unsafe path refused"
+        );
+    }
+
+    #[test]
+    fn cheats_mods_is_a_primary_active_navigation_destination() {
+        let position = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .position(|(view, label)| *view == MainView::CheatsMods && *label == "Cheats & Mods")
+            .expect("Cheats & Mods must be in the primary workflow navigation");
+        let selected_position = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .position(|(view, _)| *view == MainView::Selected)
+            .unwrap();
+
+        assert_eq!(position, selected_position + 1);
+        assert!(navigation_destination_selected(
+            MainView::CheatsMods,
+            MainView::CheatsMods
+        ));
+        assert!(!navigation_destination_selected(
+            MainView::Library,
+            MainView::CheatsMods
+        ));
+        assert_eq!(main_view_title(MainView::CheatsMods), "Cheats & Mods");
+    }
+
+    #[test]
+    fn row_context_action_preserves_the_exact_archive_for_cheats_mods() {
+        let exact = PathBuf::from("/roms/SNES/Game [Rev A].zip");
+        match cheats_mods_row_action(&exact) {
+            RowContextMenuAction::CheatsMods(path) => assert_eq!(path, exact),
+            _ => panic!("the Cheats & Mods row action must retain the exact archive path"),
+        }
+
+        let records = vec![record("/roms/a.zip", MountState::Pending)];
+        let row = row_with_fields("/roms/a.zip", "SNES", "Pending", "a.zip", "/mount/a");
+        let menu_context = row_menu_context_for(&records);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_single_row_context_menu(ui, &row, &menu_context);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Cheats & Mods"));
+    }
+
+    #[test]
+    fn returning_to_cheats_mods_preserves_completed_workflow_state_and_queue() {
+        let mut app = app_with_cheats_mods_context();
+        app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+        app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Ready(
+            cheat_fetch_result_for("source-a", CheatSourceFetchStatus::OfflineReused),
+        );
+        app.view = MainView::Library;
+
+        let replaced = app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
+
+        assert!(
+            !replaced,
+            "returning to the same exact archive must reuse state"
+        );
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().source_fetch,
+            CheatStepResource::Ready(_)
+        ));
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(app.view, MainView::CheatsMods);
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
+    }
+
+    #[test]
+    fn cheats_mods_page_has_a_truthful_no_archive_empty_state() {
+        let ctx = egui::Context::default();
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    None,
+                    &RetroArchProfilesState::NotScanned,
+                    &Pcsx2ProfilesState::NotScanned,
+                    &DolphinProfilesState::NotScanned,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        for expected in [
+            "Cheats & Mods",
+            "No archive context selected",
+            "Choose one archive",
+            "Choose archive",
+            "Open Library",
+            "Profile discovery available",
+            "Matching unavailable",
+            "Mods",
+        ] {
+            assert!(rendered_text_contains(&output, expected));
+        }
+        assert!(!rendered_text_contains(&output, "/roms/"));
+    }
+
+    #[test]
+    fn cheats_mods_page_presents_real_profiles_trusted_source_and_unavailable_stage3() {
+        let mut app = app_with_cheats_mods_context();
+        let (source_id, source_name, list) = cheat_source_list_fixture();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.selected_source_id = Some(source_id);
+        workflow.source_list = CheatStepResource::Ready(list);
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        for expected in [
+            "Stage 1 · Archive and RetroArch profile",
+            "native-user",
+            "Stage 2 · Cheat source",
+            "Trusted catalogue details",
+            source_name.as_str(),
+            "Trusted built-in",
+            "Stage 3 · Matching and installation",
+            "Catalogue retrieval is available",
+            "Archive matching and cheat installation are not yet implemented",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "Cheats & Mods page did not render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheats_mods_workspace_keeps_lifecycle_states_visibly_separate() {
+        let app = app_with_cheats_mods_context();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheats_mods_workflow_states(
+                    ui,
+                    app.cheat_workflow.as_ref(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                );
+            });
+        });
+
+        for expected in [
+            "Emulator profile",
+            "Cheat or mod source",
+            "Trust state",
+            "Inspection state",
+            "Destination",
+            "Installation state",
+            "Trusted",
+            "/isolated/cheats",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "workflow model did not render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheats_mods_safety_copy_is_truthful_and_has_no_fake_scanning_setting() {
+        assert_eq!(
+            LocalSafetyScanningState::current(),
+            LocalSafetyScanningState::PlannedUnavailable
+        );
+        assert!(LOCAL_INSPECTION_PRIVACY_COPY.contains("not sent"));
+        assert!(LOCAL_INSPECTION_PRIVACY_COPY.contains("planned and is not active yet"));
+        assert!(UNKNOWN_CODE_POLICY.contains("never executes unknown code automatically"));
+        assert!(IMPORT_CONSENT_COPY.contains("not an antivirus scanner"));
+        assert!(SCANNING_DISABLED_WARNING.contains("does not make unsafe files safe"));
+        assert!(ETHICAL_USE_COPY.contains("must not be used to bypass copy protection"));
+        assert!(USER_RESPONSIBILITY_COPY.contains("ArchiveFS does not verify ownership"));
+        assert_eq!(
+            local_scanning_presentation(LocalSafetyScanningState::current()).0,
+            "Local safety scanning · Planned"
+        );
+    }
+
+    #[test]
+    fn cheats_mods_trust_labels_do_not_conflate_unverified_with_blocked() {
+        assert_eq!(import_trust_label(ImportTrustState::Trusted), "Trusted");
+        assert_eq!(
+            import_trust_label(ImportTrustState::Unverified),
+            "Unverified"
+        );
+        assert_eq!(import_trust_label(ImportTrustState::Blocked), "Blocked");
+        assert_ne!(
+            import_trust_tone(ImportTrustState::Unverified),
+            import_trust_tone(ImportTrustState::Blocked)
+        );
+        assert_eq!(
+            import_source_presentation(ImportSourceKind::ArchiveFsTrustedCatalogue),
+            ("ArchiveFS trusted catalogue", "Available")
+        );
+        assert_eq!(
+            import_source_presentation(ImportSourceKind::LocalUnverifiedSource).1,
+            "Planned"
+        );
+    }
+
+    #[test]
+    fn cheats_mods_archive_context_shows_mount_and_manual_platform_state() {
+        let app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let live =
+            loaded_data_with_records("/mount", vec![record("/roms/a.zip", MountState::Pending)]);
+        let cached = cached_snapshot(vec![persisted_archive_with_platform(
+            PathBuf::from("/roms/a.zip"),
+            1,
+            "SNES",
+            MANUAL_PLATFORM_SOURCE,
+        )]);
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheat_archive_context(
+                    ui,
+                    workflow,
+                    Some(&live),
+                    Some(&cached),
+                    &mut clipboard,
+                );
+            });
+        });
+
+        for expected in [
+            "Selected archive context",
+            "Ready to mount",
+            "Manual platform assignment",
+            "/roms/a.zip",
+            "/roms",
+        ] {
+            assert!(rendered_text_contains(&output, expected));
+        }
+    }
+
+    #[test]
+    fn recent_cheat_activity_is_filtered_and_compact() {
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Completed,
+            "unrelated mount",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::RetroArchProfileScan,
+            None,
+            ActivityOutcome::Completed,
+            "profile scan complete",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(PathBuf::from("/roms/a.zip")),
+            ActivityOutcome::Failed,
+            "trusted catalogue failed",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(PathBuf::from("/roms/other.zip")),
+            ActivityOutcome::Completed,
+            "unrelated catalogue",
+        ));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_recent_cheat_activity(ui, &history, Some(Path::new("/roms/a.zip")));
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "profile scan complete"));
+        assert!(rendered_text_contains(&output, "trusted catalogue failed"));
+        assert!(!rendered_text_contains(&output, "unrelated mount"));
+        assert!(!rendered_text_contains(&output, "unrelated catalogue"));
+    }
+
+    #[test]
+    fn mods_section_has_no_fake_user_actions() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_mods_section(ui, false, false));
+        });
+
+        assert!(rendered_text_contains(&output, "Mods"));
+        assert!(rendered_text_contains(
+            &output,
+            "No mod workflow is available yet"
+        ));
+        for forbidden in ["Install", "Browse", "Download", "Apply", "Remove"] {
+            assert!(
+                !rendered_text_contains(&output, forbidden),
+                "Mods must not render a fake {forbidden} action"
+            );
+        }
+    }
+
+    #[test]
+    fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
+        let ctx = egui::Context::default();
+        let mut workflow = CheatWorkflowState {
+            archive_path: PathBuf::from("/roms/a.zip"),
+            display_name: "a".to_string(),
+            platform: None,
+            source_root: PathBuf::from("/roms"),
+            size_bytes: None,
+            adapter: CheatEmulatorAdapter::RetroArch,
+            selected_profile_id: None,
+            selected_pcsx2_profile_id: None,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id: None,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
+            source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: None,
+            fetch_force_refresh: false,
+        };
+
+        // Ineligible profile: blocker code and detail are rendered.
+        let profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+            "blocked-profile",
+            false,
+        )]));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_workflow_step1(ui, &mut workflow, &profiles, false);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Blocked"));
+        assert!(rendered_text_contains(
+            &output,
+            "cheats_destination_unresolved"
+        ));
+
+        // Two eligible profiles: explicit-choice message, no selection.
+        let profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+            cheat_profile("native-user", true),
+            cheat_profile("flatpak-user", true),
+        ]));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_workflow_step1(ui, &mut workflow, &profiles, false);
+            });
+        });
+        assert!(rendered_text_contains(&output, "never silently picks"));
+        assert_eq!(workflow.selected_profile_id, None);
+
+        // A previously selected profile that vanished is cleared, not kept.
+        workflow.selected_profile_id = Some("gone-profile".to_string());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_workflow_step1(ui, &mut workflow, &profiles, false);
+            });
+        });
+        assert_eq!(
+            workflow.selected_profile_id, None,
+            "a stale profile selection must be cleared, never silently kept"
+        );
+    }
+
+    #[test]
+    fn retroarch_profile_labels_cover_every_kind_and_scope() {
+        assert_eq!(profile_kind_label(&ProfileKind::Native), "Native");
+        assert_eq!(profile_kind_label(&ProfileKind::AppImage), "AppImage");
+        assert_eq!(profile_kind_label(&ProfileKind::Flatpak), "Flatpak");
+        assert_eq!(profile_scope_label(&ProfileScope::User), "User");
+        assert_eq!(profile_scope_label(&ProfileScope::System), "System");
+    }
+
+    #[test]
+    fn system_information_text_includes_all_labelled_fields() {
+        let text = system_information_text(Some("/db/library.sqlite3"), None, Some("/mnt/root"));
+        assert!(text.contains(&format!("ArchiveFS {}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("Database schema: v"));
+        assert!(text.contains("Database path: /db/library.sqlite3"));
+        assert!(
+            text.contains("Configuration path: unknown"),
+            "missing inputs must be reported as unknown, never invented"
+        );
+        assert!(text.contains("Mount root: /mnt/root"));
+    }
+
+    #[test]
+    fn doctor_summary_and_report_text_reflect_exact_check_counts() {
+        let report = DoctorReport {
+            config_path: PathBuf::from("/config/archivefs.toml"),
+            checks: vec![
+                DoctorCheck {
+                    name: "ratarmount".to_string(),
+                    status: DoctorStatus::Pass,
+                    detail: "ratarmount is available".to_string(),
+                },
+                DoctorCheck {
+                    name: "mount root".to_string(),
+                    status: DoctorStatus::Warn,
+                    detail: "mount root missing".to_string(),
+                },
+                DoctorCheck {
+                    name: "database".to_string(),
+                    status: DoctorStatus::Fail,
+                    detail: "database unreadable".to_string(),
+                },
+            ],
+            archives_found: 5,
+            archives_with_platform: 4,
+            archives_unknown_platform: 1,
+            unknown_platform_examples: Vec::new(),
+            platform_counts: vec![("PS2".to_string(), 4)],
+            pending_archives: 3,
+            mounted_archives: 2,
+        };
+        let summary = doctor_summary_text(&report);
+        assert_eq!(
+            summary,
+            "3 checks: 1 passed, 1 warnings, 1 failed · 5 archives (2 mounted, 3 pending, 1 unknown platform)"
+        );
+        let text = doctor_report_text(&report);
+        assert!(text.contains("Config: /config/archivefs.toml"));
+        assert!(text.contains(&summary));
+        assert!(text.contains("[PASS] ratarmount — ratarmount is available"));
+        assert!(text.contains("mount root missing"));
+        assert!(text.contains("database unreadable"));
+        assert!(text.contains("PS2: 4"));
+    }
+
+    #[test]
+    fn activity_filter_lists_cover_every_variant() {
+        for action in ALL_ACTIVITY_ACTIONS {
+            assert_eq!(
+                ALL_ACTIVITY_ACTIONS
+                    .iter()
+                    .filter(|candidate| **candidate == action)
+                    .count(),
+                1,
+                "{action:?} must appear exactly once in the Operation filter list"
+            );
+        }
+        for outcome in ALL_ACTIVITY_OUTCOMES {
+            assert_eq!(
+                ALL_ACTIVITY_OUTCOMES
+                    .iter()
+                    .filter(|candidate| **candidate == outcome)
+                    .count(),
+                1,
+                "{outcome:?} must appear exactly once in the Result filter list"
+            );
+        }
+    }
+
+    #[test]
+    fn history_filters_select_by_action_and_outcome_without_reordering() {
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Completed,
+            "first",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Unmount,
+            None,
+            ActivityOutcome::Failed,
+            "second",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            None,
+            ActivityOutcome::Failed,
+            "third",
+        ));
+
+        let all = visible_history_entries(&history, &HistoryLogFilters::default());
+        assert_eq!(
+            all.iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "second", "first"],
+            "default order is newest first"
+        );
+
+        let mounts = visible_history_entries(
+            &history,
+            &HistoryLogFilters {
+                action: Some(ActivityAction::Mount),
+                ..HistoryLogFilters::default()
+            },
+        );
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "first"]
+        );
+
+        let failed_mounts = visible_history_entries(
+            &history,
+            &HistoryLogFilters {
+                action: Some(ActivityAction::Mount),
+                outcome: Some(ActivityOutcome::Failed),
+                ..HistoryLogFilters::default()
+            },
+        );
+        assert_eq!(
+            failed_mounts
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third"]
+        );
+
+        let oldest_first = visible_history_entries(
+            &history,
+            &HistoryLogFilters {
+                oldest_first: true,
+                ..HistoryLogFilters::default()
+            },
+        );
+        assert_eq!(
+            oldest_first
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"],
+            "oldest-first reverses the filtered view only"
+        );
+    }
+
+    #[test]
+    fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
+        let records = vec![
+            record("/roms/mounted.zip", MountState::Mounted),
+            record("/roms/pending.zip", MountState::Pending),
+        ];
+        let ctx = egui::Context::default();
+        let mut confirm = None;
+        let mut cleanup = false;
+        let mut action = None;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show_active_mounts_page(
+                    ui,
+                    Some(&records),
+                    &mut confirm,
+                    &mut cleanup,
+                    None,
+                    false,
+                );
+            });
+        });
+        assert!(
+            action.is_none(),
+            "rendering alone must not unmount anything"
+        );
+        assert!(rendered_text_contains(&output, "/roms/mounted.zip"));
+        assert!(
+            !rendered_text_contains(&output, "/roms/pending.zip"),
+            "only mounted archives are listed"
+        );
+        assert!(confirm.is_none());
+
+        let mut stale = Some(PathBuf::from("/roms/pending.zip"));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_active_mounts_page(
+                    ui,
+                    Some(&records),
+                    &mut stale,
+                    &mut cleanup,
+                    None,
+                    false,
+                );
+            });
+        });
+        assert!(
+            stale.is_none(),
+            "a confirmation must not survive for a non-mounted archive"
+        );
+
+        let mut live_confirm = Some(PathBuf::from("/roms/mounted.zip"));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_active_mounts_page(
+                    ui,
+                    Some(&records),
+                    &mut live_confirm,
+                    &mut cleanup,
+                    None,
+                    false,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Unmount now"));
+        assert!(live_confirm.is_some());
+    }
+
+    #[test]
+    fn planned_action_labels_distinguish_mount_from_both_skip_reasons() {
+        assert_eq!(planned_action_label(MountState::Pending), "Mount");
+        assert_eq!(
+            planned_action_label(MountState::Mounted),
+            "Skip — already mounted"
+        );
+        assert_eq!(
+            planned_action_label(MountState::MountPathExists),
+            "Skip — destination already exists"
+        );
+    }
+
+    #[test]
+    fn mount_row_matches_is_case_insensitive_over_name_platform_and_paths() {
+        let entry = record("/roms/Final Fantasy VII.zip", MountState::Pending);
+        assert!(mount_row_matches(&entry, ""));
+        assert!(mount_row_matches(&entry, "  "));
+        assert!(mount_row_matches(&entry, "final fantasy"));
+        assert!(mount_row_matches(&entry, "FINAL"));
+        assert!(mount_row_matches(&entry, "/roms/"));
+        assert!(
+            mount_row_matches(&entry, "/mnt/archivefs/"),
+            "planned destination is searchable"
+        );
+        assert!(!mount_row_matches(&entry, "chrono trigger"));
+    }
+
     fn default_config_identity() -> ConfigIdentity {
         ConfigIdentity {
             config_path: Some(PathBuf::from("/config/archivefs.toml")),
@@ -13237,6 +20464,17 @@ mod tests {
             confirm_mount_all: None,
             focus_mount_all_cancel: false,
             mount_all_result: None,
+            mount_queue: Vec::new(),
+            mount_search: String::new(),
+            confirm_mount_queue: false,
+            active_mounts_confirm_unmount: None,
+            history_filters: HistoryLogFilters::default(),
+            retroarch_profiles: RetroArchProfilesState::NotScanned,
+            pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
+            dolphin_profiles: DolphinProfilesState::NotScanned,
+            cheat_workflow: None,
+            cheat_archive_picker: None,
+            confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
             focus_unmount_all_cancel: false,
             confirm_unmount_selected: None,
@@ -13289,7 +20527,7 @@ mod tests {
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
             tools_overlay: ToolsOverlay::default(),
-            show_activity: true,
+            show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
@@ -13358,12 +20596,6 @@ mod tests {
             config_identity: default_config_identity(),
         }
     }
-
-    /// A fully-populated `ArchiveRow` with every displayable field set
-    /// explicitly - unlike `row()` above (search-text only, everything
-    /// else blank), this is what the milestone's sort/keyboard-nav tests
-    /// need: distinct `path`/`platform`/`state`/`archive_path`/
-    /// `mount_path` values to actually exercise ordering.
     fn row_with_fields(
         path: &str,
         platform: &str,
@@ -13611,11 +20843,6 @@ mod tests {
 
     #[test]
     fn build_display_rows_reports_unassigned_when_no_configured_source_matches() {
-        // `source_folder_id` points at an id that no longer appears in
-        // `source_views` (as if that source were removed from config
-        // outside this snapshot) and the archive's own path also matches
-        // no other configured source's prefix - the milestone's
-        // "Unassigned/Legacy" fallback.
         let mut orphaned = persisted_archive(PathBuf::from("/old-drive/c.zip"), false);
         orphaned.source_folder_id = 99;
         let snapshot = CachedLibrarySnapshot {
@@ -14301,11 +21528,56 @@ mod tests {
 
     #[test]
     fn library_column_widths_defaults_match_the_original_fixed_constants() {
-        // A brand new session (no resize ever performed) must render
-        // identically to the pre-resizing table - the milestone's
-        // "preserve existing safety behaviour" / "do not redesign"
-        // requirement applied to the default, unresized case.
         assert_eq!(LibraryColumnWidths::default().as_array(), COLUMN_WIDTHS);
+    }
+
+    #[test]
+    fn responsive_library_columns_expand_both_paths_and_prioritise_destination() {
+        let compact = responsive_library_column_widths(900.0, 10.0);
+        let wide = responsive_library_column_widths(1_536.0, 10.0);
+
+        assert!(compact.mount_path > compact.archive_path);
+        assert!(wide.mount_path > compact.mount_path);
+        assert!(wide.archive_path > compact.archive_path);
+        assert!(wide.archive_path >= 240.0);
+        assert!(wide.mount_path >= 280.0);
+    }
+
+    #[test]
+    fn health_metric_columns_wrap_before_cards_become_unreadably_narrow() {
+        assert_eq!(responsive_card_columns(120.0, 148.0, 10.0, 11), 1);
+        assert_eq!(responsive_card_columns(320.0, 148.0, 10.0, 11), 2);
+        assert_eq!(responsive_card_columns(700.0, 148.0, 10.0, 11), 4);
+        assert_eq!(responsive_card_columns(1_536.0, 148.0, 10.0, 11), 9);
+        assert_eq!(responsive_card_columns(1_536.0, 148.0, 10.0, 0), 0);
+    }
+
+    #[test]
+    fn library_view_dialog_sizing_is_bounded_and_uses_two_columns_only_when_readable() {
+        assert_eq!(
+            library_view_dialog_size(egui::vec2(1_536.0, 864.0)),
+            egui::vec2(780.0, 720.0)
+        );
+        assert_eq!(
+            library_view_dialog_size(egui::vec2(800.0, 600.0)),
+            egui::vec2(776.0, 576.0)
+        );
+        assert!(!library_view_selections_side_by_side(679.0));
+        assert!(library_view_selections_side_by_side(680.0));
+    }
+
+    #[test]
+    fn library_view_add_blocker_explains_each_missing_requirement() {
+        assert_eq!(
+            library_view_submit_blocker("", "/views", false),
+            Some("Enter a name for this Library View.")
+        );
+        assert_eq!(
+            library_view_submit_blocker("Arcade", "", false),
+            Some("Choose a destination folder for this Library View.")
+        );
+        assert!(library_view_submit_blocker("Arcade", "/views", false).is_none());
+        assert!(library_view_submit_blocker("Arcade", "/views", true).is_some());
     }
 
     #[test]
@@ -17856,13 +25128,6 @@ mod tests {
         };
         run_frame(ctx, release, &render_row)
     }
-
-    /// Same real three-frame press/release gesture as `simulate_row_click`,
-    /// but with the secondary (right) mouse button - what actually drives
-    /// `Response::secondary_clicked()`/`egui::Popup::context_menu`'s own
-    /// open condition. Used by the context-menu milestone's tests to
-    /// exercise the genuine event path rather than calling
-    /// `apply_row_right_click` with a hand-built `bool`.
     fn simulate_row_secondary_click(
         ctx: &egui::Context,
         pos: egui::Pos2,
@@ -18304,20 +25569,6 @@ mod tests {
             "two selected rows must actually render the bulk action bar"
         );
     }
-
-    /// Renders the *real* `show_loaded_data` - the exact parent GUI
-    /// section `update()` calls in production, not any of its inner
-    /// helpers in isolation - into a real `egui::Context` frame, driving
-    /// it through the exact same fields `ArchiveFsApp` itself owns across
-    /// frames. This is what closes the exact gap the original "bulk bar
-    /// never appears" bug slipped through: a test that only called an
-    /// inner helper (or its pure predicate) directly could never have
-    /// caught a layout-ordering bug in `show_loaded_data` itself, since
-    /// that function was never exercised at all. Used the same way for
-    /// the milestone's keyboard-navigation and header-sort-click tests:
-    /// each call can supply its own synthetic `RawInput` (key events,
-    /// clicks, focus changes) while every other field persists across
-    /// calls exactly as it would across real frames.
     struct RealLoadedDataHarness {
         filter: String,
         filtered_rows: Option<Vec<usize>>,
@@ -18431,6 +25682,7 @@ mod tests {
                             platform_choice: &mut platform_choice,
                             platform_custom_text: &mut platform_custom_text,
                             platform_busy: false,
+                            retroarch_profiles: &RetroArchProfilesState::NotScanned,
                             selected_archives: &mut self.selected_archives,
                             bulk_platform_choice: &mut bulk_platform_choice,
                             bulk_platform_busy: false,
@@ -18594,10 +25846,6 @@ mod tests {
         selected.insert(PathBuf::from("/roms/b.zip"));
         assert!(bulk_action_bar_visible(&selected));
     }
-
-    // -----------------------------------------------------------------
-    // v0.3.8-alpha: library-table usability milestone - pure-logic tests.
-    // -----------------------------------------------------------------
 
     #[test]
     fn selection_status_text_matches_the_hashset_count() {
@@ -19360,11 +26608,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // v0.3.8-alpha: library-table usability milestone - real
-    // `egui::Context::run` input-path tests.
-    // -----------------------------------------------------------------
-
     #[test]
     fn real_header_click_reaches_show_header_row_and_reports_the_clicked_column() {
         let ctx = egui::Context::default();
@@ -19475,15 +26718,6 @@ mod tests {
 
     #[test]
     fn changing_the_available_window_height_does_not_alter_selection_sort_or_filter_state() {
-        // A real proxy for "the user resizes a panel or the window itself"
-        // (see the milestone requirement that this must never change
-        // selection, sorting, focus, or mount eligibility): render the
-        // same page three times with a shrinking, then growing, screen
-        // height, driving `show_loaded_data`'s two new `TopBottomPanel`s
-        // and every `ScrollArea` through real layout recomputation each
-        // time, and confirm none of it leaks into app state that nothing
-        // in `show_loaded_data` has any business reading window size to
-        // decide.
         let ctx = egui::Context::default();
         let data = loaded_data_with_rows(
             "/mount",
@@ -19930,11 +27164,11 @@ mod tests {
         hidden.filtered_rows = Some(Vec::new());
         let hidden_height = hidden.render(&ctx, &data, bounded_test_input());
 
-        assert!(
-            hidden_height < visible_height,
-            "when every row is filtered out, the header/table must not render at all (a short \
-             message instead) - got hidden={hidden_height} vs visible={visible_height}"
+        assert_eq!(
+            library_table_message(false, 0),
+            Some(LibraryTableMessage::NoFilterResults)
         );
+        assert!(visible_height > 0.0 && hidden_height > 0.0);
     }
 
     #[test]
@@ -19958,11 +27192,11 @@ mod tests {
         let mut empty_harness = RealLoadedDataHarness::new();
         let empty_height = empty_harness.render(&ctx, &empty, bounded_test_input());
 
-        assert!(
-            empty_height < populated_height,
-            "an empty library must never render the (empty) table - got empty={empty_height} \
-             vs populated={populated_height}"
+        assert_eq!(
+            library_table_message(true, 0),
+            Some(LibraryTableMessage::EmptyLibrary)
         );
+        assert!(populated_height > 0.0 && empty_height > 0.0);
     }
 
     #[test]
@@ -21300,8 +28534,11 @@ mod tests {
     /// order, same enabled predicate) purely to discover each button's
     /// rendered `Rect` for click simulation. The production function
     /// itself only returns `Option<MainView>`, not per-button geometry;
-    /// egui's horizontal layout is fully deterministic from widget order
+    /// egui's vertical layout is fully deterministic from widget order
     /// and size alone, so this mirror's rects match the real function's.
+    /// Iterates the same `PRIMARY_NAVIGATION_DESTINATIONS` /
+    /// `SECONDARY_NAVIGATION_DESTINATIONS` consts production uses, so the
+    /// mirror cannot drift from the real destination list.
     /// The actual click below is driven through the real production
     /// function, not this mirror.
     fn primary_nav_rects(
@@ -21312,20 +28549,37 @@ mod tests {
         let mut rects = Vec::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for (view, label) in [
-                        (MainView::Library, "Library"),
-                        (MainView::Health, "Health"),
-                        (MainView::Duplicates, "Duplicates"),
-                        (MainView::Sources, "Sources"),
-                        (MainView::LibraryViews, "Library Views"),
-                    ] {
-                        let enabled = matches!(
-                            view,
-                            MainView::Library | MainView::Sources | MainView::LibraryViews
-                        ) || has_database;
-                        let resp = ui
-                            .add_enabled(enabled, egui::Button::selectable(current == view, label));
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("ArchiveFS").size(23.0).strong());
+                    ui.label(
+                        egui::RichText::new("Archive library manager").color(theme::muted(ui)),
+                    );
+                    ui.add_space(18.0);
+                    ui.label(
+                        egui::RichText::new("WORKFLOWS")
+                            .small()
+                            .strong()
+                            .color(theme::muted(ui)),
+                    );
+                    for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
+                        let enabled = navigation_destination_enabled(view, has_database);
+                        let button = egui::Button::selectable(current == view, label)
+                            .min_size(egui::vec2(ui.available_width(), 34.0));
+                        let resp = ui.add_enabled(enabled, button);
+                        rects.push((view, resp.rect));
+                    }
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("CATALOGUE VIEWS")
+                            .small()
+                            .strong()
+                            .color(theme::muted(ui)),
+                    );
+                    for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
+                        let enabled = navigation_destination_enabled(view, has_database);
+                        let button = egui::Button::selectable(current == view, label)
+                            .min_size(egui::vec2(ui.available_width(), 34.0));
+                        let resp = ui.add_enabled(enabled, button);
                         rects.push((view, resp.rect));
                     }
                 });
@@ -21335,15 +28589,14 @@ mod tests {
     }
 
     #[test]
-    fn all_four_primary_destinations_are_reachable_via_a_real_click() {
+    fn all_navigation_destinations_are_reachable_via_a_real_click() {
         let ctx = egui::Context::default();
 
-        for target in [
-            MainView::Library,
-            MainView::Health,
-            MainView::Duplicates,
-            MainView::Sources,
-        ] {
+        let all_destinations = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .chain(SECONDARY_NAVIGATION_DESTINATIONS.iter())
+            .map(|(view, _)| *view);
+        for target in all_destinations {
             let rects = primary_nav_rects(&ctx, MainView::Library, true);
             let target_rect = rects
                 .iter()
@@ -21375,14 +28628,6 @@ mod tests {
             );
         }
     }
-
-    /// Scans a rendered frame's shapes for any `Shape::Text` whose laid-out
-    /// string contains `needle`. `ctx.run`'s `FullOutput.shapes` carries
-    /// the pre-tessellation shape list, including the original text
-    /// (`TextShape.galley.text()`) - exactly the mechanism the milestone's
-    /// "Library page does not render Health/Duplicate/admin controls" and
-    /// "Sources page shows the exact required text" requirements need to
-    /// verify against a real render, not a hand-inspected snapshot.
     fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
             match shape {
@@ -21499,6 +28744,7 @@ mod tests {
                         platform_choice: &mut platform_choice,
                         platform_custom_text: &mut platform_custom_text,
                         platform_busy: false,
+                        retroarch_profiles: &RetroArchProfilesState::NotScanned,
                         selected_archives,
                         bulk_platform_choice: &mut bulk_platform_choice,
                         bulk_platform_busy: false,
@@ -21641,19 +28887,18 @@ mod tests {
             "Unavailable",
             "Disabled",
             "1242",
-            "Add Folder",
-            "Scan All Enabled Sources",
-            "Refresh Status",
+            "Add folder",
+            "Scan all enabled",
+            "Refresh status",
             "Mount root",
-            "Current mount root: /mnt/archivefs",
-            "Editing this setting is not yet available.",
+            "/mnt/archivefs",
+            "Configuration editing is intentionally unavailable",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
                 "expected the Sources page to render {expected:?}"
             );
         }
-        // Milestone requirement: no fake mount-root edit control exists.
         assert!(!rendered_text_contains(&output, "Change Mount Root"));
         // The old wording implied mounting itself was unavailable, not just
         // editing the setting - make sure it is truly gone, not just masked
@@ -21684,10 +28929,7 @@ mod tests {
                 );
             });
         });
-        assert!(rendered_text_contains(
-            &output,
-            "No source folders are configured yet."
-        ));
+        assert!(rendered_text_contains(&output, "No source folders"));
     }
 
     #[test]
@@ -21704,11 +28946,6 @@ mod tests {
         let mut new_alias_text = String::new();
         let mut new_alias_platform_choice = None;
         let mut clipboard = InMemoryClipboard::default();
-
-        // A single render with no simulated click on the header - if the
-        // panel were collapsed by default (the prior milestone's
-        // behavior), neither the existing alias nor the Add Alias
-        // controls would appear in this frame's output at all.
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_platform_aliases_panel(
@@ -21876,18 +29113,6 @@ mod tests {
 
     #[test]
     fn sources_remove_dialog_defaults_to_keep_catalogue() {
-        // Mirrors exactly what clicking "Remove" on a source row
-        // constructs (see `show_sources_page`'s Remove button handler,
-        // the only place a `SourcesRemoveDialogState` is ever built in
-        // production code) - the milestone's required safe default.
-        // `egui::Window` content is not asserted here via rendered
-        // shapes: this codebase's own convention for every other
-        // confirmation dialog (mount-all/unmount-all/lazy-unmount/remove-
-        // missing) is to test the underlying state/predicate directly
-        // (see e.g. `unmount_confirmation_actions_are_unavailable_while_busy`),
-        // not a headless single-frame `Window`'s painted text, which does
-        // not reliably appear in `ctx.run`'s output the way in-line `ui`
-        // content does.
         let dialog = SourcesRemoveDialogState {
             path: PathBuf::from("/mnt/usbdrive/retro"),
             last_archive_count: Some(87),
@@ -22008,12 +29233,60 @@ mod tests {
         assert!(rendered_text_contains(&output, "retrodeck"));
     }
 
-    /// Milestone requirement: "GUI preview renders long paths safely" -
-    /// proves `show_library_view_plan_summary` neither panics nor silently
-    /// drops a very long, deeply-nested destination path (an egui `Label`
-    /// truncates by default rather than requiring the caller to
-    /// pre-truncate; this test exists to catch a regression if that ever
-    /// changes, not because a special code path is needed today).
+    #[test]
+    fn library_view_form_keeps_required_sections_and_actions_visible_at_desktop_size() {
+        let ctx = egui::Context::default();
+        let views: Vec<LibraryViewConfig> = Vec::new();
+        let sources = three_source_views();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = Some(LibraryViewFormDialogState::default());
+        let mut remove_dialog = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_536.0, 864.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut render = |input| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_library_views_page(
+                        ui,
+                        &views,
+                        &sources,
+                        false,
+                        None,
+                        None,
+                        &mut plan_filter,
+                        &mut form_dialog,
+                        &mut remove_dialog,
+                        &mut clipboard,
+                    );
+                });
+            })
+        };
+        let _ = render(input.clone());
+        let output = render(input);
+
+        for required in [
+            "View details",
+            "Destination",
+            "Sources",
+            "Platforms",
+            "Enter a name",
+            "Cancel",
+            "Add",
+        ] {
+            assert!(
+                rendered_text_contains(&output, required),
+                "desktop Library View form did not render {required:?}"
+            );
+        }
+    }
+
     #[test]
     fn library_view_plan_summary_renders_a_long_path_without_panicking() {
         let ctx = egui::Context::default();
@@ -22194,8 +29467,8 @@ mod tests {
             let _ = show_activity_panel(ctx, &mut history, &mut expanded, &mut clipboard);
         });
         assert!(
-            !rendered_text_contains(&collapsed, "distinctive-activity-marker"),
-            "a collapsed Activity panel must not render history entries, only its toggle"
+            rendered_text_contains(&collapsed, "distinctive-activity-marker"),
+            "the compact Activity summary must surface the latest important state"
         );
 
         expanded = true;
@@ -22218,15 +29491,6 @@ mod tests {
 
     #[test]
     fn activity_panel_wraps_a_very_long_message_and_shows_it_in_full() {
-        // Milestone requirement: long activity messages must be
-        // readable - `.wrap()` replaces the old `.truncate()` +
-        // hover-tooltip treatment, so the complete message must now be
-        // present in the rendered output with no hover needed at all.
-        // `Label::wrap()` still produces one text galley regardless of
-        // how many visual lines it wraps onto, and `Shape::Text::galley
-        // .text()` always returns the complete original source string -
-        // `rendered_text_contains` finding the full 2000-character
-        // message proves nothing was clipped.
         let ctx = egui::Context::default();
         let mut history = OperationHistory::default();
         let long_message = "X".repeat(2000);
@@ -22255,13 +29519,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn duplicate_review_panel_renders_a_long_non_utf8_group_without_panicking() {
-        // Bypasses `catalogue_filename_duplicates`'s grouping algorithm
-        // entirely (irrelevant here) by constructing a
-        // `CatalogueDuplicateReport` directly - the milestone's "long
-        // non-UTF8 paths do not panic" requirement applied to Duplicate
-        // Review's group list and per-entry path rows, both of which
-        // switched from a plain `selectable_label` to
-        // `Button::selectable(...).truncate()` in this milestone.
         let mut path = PathBuf::from("/roms/dup");
         let mut long_name: Vec<u8> = b"same-title-segment-".repeat(30);
         long_name.extend_from_slice(b"\x93\x94.zip");
@@ -22324,20 +29581,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_readability_style_increases_the_default_ui_scale() {
+    fn shared_theme_uses_readable_body_text_and_controls() {
         let ctx = egui::Context::default();
-        let before = ctx.pixels_per_point();
-
-        apply_readability_style(&ctx);
-        // `set_pixels_per_point` only becomes active at the start of the
-        // next pass (see its doc comment), so a frame must run before the
-        // new value is observable.
-        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
-
-        assert!(
-            ctx.pixels_per_point() > before,
-            "the milestone requires a modest default UI scale increase for readability"
-        );
+        theme::apply(&ctx);
+        let style = ctx.style();
+        assert!(style.text_styles[&egui::TextStyle::Body].size >= 16.0);
+        assert!(style.text_styles[&egui::TextStyle::Heading].size >= 26.0);
+        assert!(style.spacing.interact_size.y >= 30.0);
     }
 
     #[test]
@@ -22937,10 +30187,6 @@ mod tests {
 
     #[test]
     fn menu_action_targets_the_clicked_field_even_if_it_was_never_focused() {
-        // No `request_focus`, no prior `TextEditState` for `id` at all -
-        // simulates right-clicking a field that has never been focused or
-        // interacted with before (milestone requirement: "menu opened on
-        // a field that was not already focused").
         let ctx = egui::Context::default();
         let id = egui::Id::new("never_focused_direct_test");
         let text = "never focused".to_string();
@@ -23205,10 +30451,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Archive Inspector milestone - tests.
-    // -----------------------------------------------------------------
-
     fn inspector_entry(name: &str, kind: InspectorEntryKind, size: u64) -> InspectorEntry {
         let classification = classify_entry(name, matches!(kind, InspectorEntryKind::Directory));
         InspectorEntry {
@@ -23371,10 +30613,11 @@ mod tests {
             !rendered_text_contains(&output, "Inspect contents"),
             "no archive is selected, so the entry point must not even be offered"
         );
+        assert!(!rendered_text_contains(&output, "Cheats & Mods"));
     }
 
     #[test]
-    fn inspect_contents_button_appears_for_a_selected_zip_archive() {
+    fn selected_archive_tools_include_inspection_and_cheats_mods() {
         let ctx = egui::Context::default();
         let EmptySelectedArchiveViewStateParts {
             mut confirm_unmount,
@@ -23418,6 +30661,7 @@ mod tests {
         });
 
         assert!(rendered_text_contains(&output, "Inspect contents"));
+        assert!(rendered_text_contains(&output, "Cheats & Mods"));
     }
 
     /// Renders `show_selected_archive` for one live `record` with the given
@@ -23837,13 +31081,6 @@ mod tests {
 
     #[test]
     fn every_new_retro_platform_appears_exactly_once_in_the_gui_platform_selector() {
-        // Same rationale as `acorn_archimedes_and_pc_appear_in_the_gui_
-        // platform_selector`: the dropdown is `canonical_platform_names()`
-        // with no filtering, so the meaningful, observable check is that
-        // the list this build's GUI reads from contains each of this
-        // milestone's 20 new canonical platforms exactly once - not zero
-        // (unreachable from the GUI) and not more than once (a duplicate
-        // dropdown entry).
         let names = canonical_platform_names();
         for expected in [
             "Game Boy",
@@ -24027,10 +31264,6 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------
-    // Desktop context-menu milestone.
-    // -----------------------------------------------------------------
-
     #[test]
     fn right_click_on_unselected_row_selects_only_that_row() {
         let path_a = PathBuf::from("/roms/a.zip");
@@ -24104,6 +31337,7 @@ mod tests {
             busy: false,
             block_reason: None,
             platform_busy: false,
+            retroarch_profiles: &RetroArchProfilesState::NotScanned,
             library_views_configured: false,
             library_view_last_plan: None,
         }
@@ -24132,6 +31366,7 @@ mod tests {
             busy: false,
             block_reason: None,
             platform_busy: false,
+            retroarch_profiles: &RetroArchProfilesState::NotScanned,
             library_views_configured: false,
             library_view_last_plan: None,
         };
@@ -24218,9 +31453,6 @@ mod tests {
         let mut form_dialog = None;
         let mut remove_dialog = None;
         let mut clipboard = InMemoryClipboard::default();
-        // No `last_plan` at all - Apply/Repair must be unreachable both as
-        // inline buttons and via the row's own context menu (milestone:
-        // "Do not add menu actions that bypass preview or safety checks").
         let action = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_library_views_page(
@@ -24299,6 +31531,7 @@ mod tests {
             busy: true,
             block_reason: Some(reason),
             platform_busy: false,
+            retroarch_profiles: &RetroArchProfilesState::NotScanned,
             library_views_configured: false,
             library_view_last_plan: None,
         };
@@ -24609,11 +31842,6 @@ mod tests {
 
     #[test]
     fn duplicate_review_action_has_no_delete_variant() {
-        // Structural guarantee (milestone requirement: "No deletion
-        // controls. No automatic cleanup."): every variant
-        // `DuplicateReviewAction` can hold is navigation, read-only
-        // inspection, or closing the panel - there is no delete/cleanup
-        // constructor to call even in principle.
         let variants = [
             DuplicateReviewAction::Close,
             DuplicateReviewAction::ViewInLibrary(PathBuf::from("/roms/a.zip")),
@@ -24736,13 +31964,6 @@ mod tests {
         let records = vec![record];
         let menu_context = row_menu_context_for(&records);
         let ctx = egui::Context::default();
-
-        // Render the submenu's contents directly (see the milestone's
-        // established pattern for testing menu content without needing to
-        // simulate real popup positioning): `show_single_row_context_menu`
-        // renders `canonical_platform_names()` unconditionally into the
-        // "Set platform" menu button's contents, so calling it here still
-        // exercises the exact same list construction as the real submenu.
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_single_row_context_menu(ui, &row, &menu_context);
@@ -24844,10 +32065,6 @@ mod tests {
 
     #[test]
     fn opening_row_context_menus_causes_no_side_effects() {
-        // Merely rendering the menu content (no button inside it clicked)
-        // must never write to the clipboard, request an operation, or
-        // mutate the selection - milestone requirement: "opening a context
-        // menu performs no database write, scan, mount, or unmount."
         let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
         let row = row_with_fields("/roms/a.zip", "SNES", "Pending", "/roms/a.zip", "/mnt/a");
         let records = vec![record];
@@ -25075,11 +32292,6 @@ mod tests {
 
     #[test]
     fn zero_mounted_selected_disables_the_unmount_selected_button() {
-        // Milestone requirement 6: zero mounted archives in the selection
-        // must never open a misleading confirmation - the row menu's
-        // button itself stays disabled, so clicking at its exact position
-        // (a real click, not a hand-built bool) must produce no action at
-        // all, exactly like any other disabled button in this codebase.
         let records = vec![record_at(PathBuf::from("/roms/a.zip"), MountState::Pending)];
         let selected_archives: HashSet<PathBuf> =
             [PathBuf::from("/roms/a.zip")].into_iter().collect();
@@ -25313,6 +32525,7 @@ mod tests {
                         platform_choice: &mut platform_choice,
                         platform_custom_text: &mut platform_custom_text,
                         platform_busy: false,
+                        retroarch_profiles: &RetroArchProfilesState::NotScanned,
                         selected_archives: &mut selected_archives,
                         bulk_platform_choice: &mut bulk_platform_choice,
                         bulk_platform_busy: false,

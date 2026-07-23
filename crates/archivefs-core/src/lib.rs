@@ -3,11 +3,12 @@ use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info};
@@ -1720,6 +1721,12 @@ pub fn save_source_folder_configs_to(
     mount_root: &Path,
     ratarmount_bin: &str,
 ) -> Result<()> {
+    if let Some(source) = sources.iter().find(|source| source.path.to_str().is_none()) {
+        return Err(ArchiveFsError::Config(format!(
+            "source path cannot be stored losslessly in the UTF-8 configuration file: {}",
+            source.path.display()
+        )));
+    }
     let contents = render_source_folder_configs(sources, mount_root, ratarmount_bin);
     atomic_write_text(path.as_ref(), &contents)
 }
@@ -1804,6 +1811,101 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FilesystemIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_identity(metadata: &fs::Metadata) -> FilesystemIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FilesystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn filesystem_identity(_metadata: &fs::Metadata) -> FilesystemIdentity {
+    FilesystemIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+fn validate_source_root_shape(path: &Path) -> Result<()> {
+    if !path.is_absolute() || path.parent().is_none() {
+        return Err(ArchiveFsError::Config(format!(
+            "source root must be an absolute non-root path: {}",
+            path.display()
+        )));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(ArchiveFsError::Config(format!(
+            "source root contains traversal components: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_source_root(path: &Path) -> Result<FilesystemIdentity> {
+    validate_source_root_shape(path)?;
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|source| ArchiveFsError::io(current.clone(), source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArchiveFsError::Scanner(format!(
+                "refusing symlinked source component {}",
+                current.display()
+            )));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    if !metadata.is_dir() {
+        return Err(ArchiveFsError::Scanner(format!(
+            "source root is not a directory: {}",
+            path.display()
+        )));
+    }
+    fs::read_dir(path).map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    Ok(filesystem_identity(&metadata))
+}
+
+pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> {
+    const MAX_CONFIGURED_SOURCE_ROOTS: usize = 4_096;
+    if paths.len() > MAX_CONFIGURED_SOURCE_ROOTS {
+        return Err(ArchiveFsError::Config(format!(
+            "configured source count exceeds the {MAX_CONFIGURED_SOURCE_ROOTS} source limit"
+        )));
+    }
+    let mut normalized: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        validate_source_root_shape(path)?;
+        let path: PathBuf = path.components().collect();
+        if let Some(existing) = normalized.iter().find(|existing| {
+            path == **existing || path.starts_with(existing) || existing.starts_with(&path)
+        }) {
+            return Err(ArchiveFsError::Config(format!(
+                "duplicate or overlapping source roots are not supported: {} and {}",
+                existing.display(),
+                path.display()
+            )));
+        }
+        normalized.push(path);
+    }
+    Ok(())
+}
+
 /// Validates a user-supplied path as a candidate new source folder,
 /// against the currently configured sources - the multi-source
 /// milestone's shared validation, used identically by the GUI's Add
@@ -1818,12 +1920,20 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
 /// milestone's stated preference, since nothing in this schema
 /// deduplicates a file discovered under two different source folders.
 ///
-/// Returns the path to store: the original input with only its path
-/// components re-collected (which drops a harmless trailing separator),
-/// never canonicalized - so a symlinked source folder is stored exactly
-/// as the user typed it, not silently resolved to wherever it points.
+/// Returns the exact absolute path to store with a harmless trailing
+/// separator removed. Symlink components, traversal, filesystem-root paths,
+/// and paths that cannot be represented losslessly in the UTF-8 config are
+/// rejected rather than stored as aliases or lossy text.
 pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Result<PathBuf> {
     let normalized: PathBuf = candidate.components().collect();
+
+    validate_source_root_shape(candidate)?;
+    if normalized.to_str().is_none() {
+        return Err(ArchiveFsError::Config(format!(
+            "source path cannot be stored losslessly in the UTF-8 configuration file: {}",
+            normalized.display()
+        )));
+    }
 
     match inspect_path(&normalized) {
         PathInspection::Missing => {
@@ -1853,6 +1963,8 @@ pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Res
         PathInspection::Directory => {}
     }
 
+    validate_source_root(&normalized)?;
+
     if let Err(error) = fs::read_dir(&normalized) {
         return Err(ArchiveFsError::Config(format!(
             "{} cannot be read: {error}",
@@ -1864,8 +1976,28 @@ pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Res
         .map_err(|source| ArchiveFsError::io(normalized.clone(), source))?;
 
     for existing_path in existing {
-        let existing_canonical =
-            fs::canonicalize(existing_path).unwrap_or_else(|_| existing_path.clone());
+        validate_source_root_shape(existing_path)?;
+        let existing_normalized: PathBuf = existing_path.components().collect();
+        let existing_canonical = match inspect_path(&existing_normalized) {
+            PathInspection::Missing => existing_normalized,
+            PathInspection::Directory => {
+                validate_source_root(&existing_normalized)?;
+                fs::canonicalize(&existing_normalized)
+                    .map_err(|source| ArchiveFsError::io(existing_normalized.clone(), source))?
+            }
+            PathInspection::Other => {
+                return Err(ArchiveFsError::Config(format!(
+                    "configured source root is not a directory: {}",
+                    existing_normalized.display()
+                )));
+            }
+            PathInspection::PermissionDenied(detail) | PathInspection::MetadataError(detail) => {
+                return Err(ArchiveFsError::Config(format!(
+                    "configured source root cannot be safely compared: {} ({detail})",
+                    existing_normalized.display()
+                )));
+            }
+        };
         if candidate_canonical == existing_canonical {
             return Err(ArchiveFsError::Config(format!(
                 "{} is already a configured source folder",
@@ -2284,6 +2416,11 @@ pub fn scan_source_folder_at(
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
     let sources = load_source_folder_configs_from(config_path)?;
+    let configured_paths = sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    validate_configured_source_roots(&configured_paths)?;
     if !sources.iter().any(|source| source.path == target) {
         return Err(ArchiveFsError::Config(format!(
             "{} is not a configured source folder",
@@ -2328,6 +2465,7 @@ pub fn scan_all_enabled_sources_at(
 ) -> Result<ScanPersistSummary> {
     let sources = load_source_folder_configs_from(config_path)?;
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    validate_configured_source_roots(&all_paths)?;
     let mut database = Database::open_or_create(database_path)?;
     let registered = database.register_source_folders(&all_paths)?;
 
@@ -2584,6 +2722,10 @@ pub struct ArchiveIdentity {
     pub content_hash: Option<String>,
     pub archive_hash: Option<String>,
     pub internal_listing_hash: Option<String>,
+    pub filesystem_device: Option<u64>,
+    pub filesystem_inode: Option<u64>,
+    pub source_filesystem_device: Option<u64>,
+    pub source_filesystem_inode: Option<u64>,
 }
 
 impl ArchiveIdentity {
@@ -2593,6 +2735,9 @@ impl ArchiveIdentity {
         metadata: Option<&fs::Metadata>,
     ) -> Self {
         let source_root = source_root.into();
+        let source_metadata = fs::symlink_metadata(&source_root).ok();
+        let file_identity = metadata.map(filesystem_identity);
+        let source_identity = source_metadata.as_ref().map(filesystem_identity);
         let detection = detect_platform_with_provenance(path, &source_root);
         let (platform, platform_provenance) = match detection {
             Some(detection) => (Some(detection.platform), Some(detection.provenance)),
@@ -2610,6 +2755,10 @@ impl ArchiveIdentity {
             content_hash: None,
             archive_hash: None,
             internal_listing_hash: None,
+            filesystem_device: file_identity.map(|identity| identity.device),
+            filesystem_inode: file_identity.map(|identity| identity.inode),
+            source_filesystem_device: source_identity.map(|identity| identity.device),
+            source_filesystem_inode: source_identity.map(|identity| identity.inode),
         }
     }
 
@@ -2704,7 +2853,9 @@ impl Archive {
     ) -> Option<Self> {
         let path = path.as_ref();
         let kind = archive_kind(path)?;
-        let metadata = fs::metadata(path).ok();
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
         Some(Self {
             path: path.to_path_buf(),
             kind,
@@ -3408,6 +3559,18 @@ impl DuplicateDetector for EmptyDuplicateDetector {
 pub trait MountBackend {
     fn mount(&self, plan: &MountPlan) -> Result<()>;
     fn unmount(&self, mount_path: &Path) -> Result<()>;
+
+    fn active_mount_paths(&self, root: &Path) -> Result<HashSet<PathBuf>> {
+        mounted_paths_under(root)
+    }
+
+    fn verify_mounted(&self, _mount_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn verify_unmounted(&self, _mount_path: &Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3691,6 +3854,21 @@ impl MountBackend for RatarmountBackend {
     fn unmount(&self, mount_path: &Path) -> Result<()> {
         unmount_path(mount_path)
     }
+
+    fn verify_mounted(&self, mount_path: &Path) -> Result<()> {
+        if current_mount_paths()?.contains(mount_path) {
+            Ok(())
+        } else {
+            Err(ArchiveFsError::Mount(format!(
+                "{} is not mounted after the mount command reported success",
+                mount_path.display()
+            )))
+        }
+    }
+
+    fn verify_unmounted(&self, mount_path: &Path) -> Result<()> {
+        ensure_mount_disappeared(mount_path, &current_mount_paths()?)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3714,6 +3892,7 @@ impl<'a> ArchiveScanner<'a> {
             "starting archive scan across {} source folder(s)",
             self.config.source_folders.len()
         );
+        validate_configured_source_roots(&self.config.source_folders)?;
         let mut archives = Vec::new();
         for source in &self.config.source_folders {
             debug!("scanning source folder {}", source.display());
@@ -3780,38 +3959,99 @@ impl<'a> ArchiveScanner<'a> {
         source: &Path,
         archives: &mut Vec<Archive>,
     ) -> Result<()> {
-        let entries = fs::read_dir(source)
-            .map_err(|source_error| ArchiveFsError::io(source.to_path_buf(), source_error))?;
+        const MAX_SCAN_ENTRIES: usize = 250_000;
+        const MAX_SCAN_DEPTH: usize = 128;
 
-        for entry in entries {
-            let entry = entry
-                .map_err(|source_error| ArchiveFsError::io(source.to_path_buf(), source_error))?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|source_error| ArchiveFsError::io(path.clone(), source_error))?;
+        let source_identity = validate_source_root(source_root)?;
+        let mut directories = vec![(source.to_path_buf(), 0_usize)];
+        let mut entries_seen = 0_usize;
+        while let Some((directory, depth)) = directories.pop() {
+            let before = fs::symlink_metadata(&directory)
+                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            if before.file_type().is_symlink() || !before.is_dir() {
+                return Err(ArchiveFsError::Scanner(format!(
+                    "source directory changed or became unsafe during scan: {}",
+                    directory.display()
+                )));
+            }
+            let read_dir = fs::read_dir(&directory)
+                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            let mut entries = Vec::new();
+            for entry in read_dir {
+                entries_seen = entries_seen.checked_add(1).ok_or_else(|| {
+                    ArchiveFsError::Scanner("source entry count overflow".to_string())
+                })?;
+                if entries_seen > MAX_SCAN_ENTRIES {
+                    return Err(ArchiveFsError::Scanner(format!(
+                        "source scan exceeded the {MAX_SCAN_ENTRIES} entry limit at {}",
+                        directory.display()
+                    )));
+                }
+                entries.push(entry.map_err(|error| ArchiveFsError::io(directory.clone(), error))?);
+            }
+            entries.sort_by_key(|entry| entry.path());
 
-            if file_type.is_dir() {
-                if path
-                    .file_name()
-                    .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
-                {
-                    debug!(
-                        "not descending into container directory {} - its contents are internal \
-                         payload, not separate library archives",
-                        path.display()
-                    );
+            let mut child_directories = Vec::new();
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+                if file_type.is_symlink() {
                     continue;
                 }
-                self.scan_source(source_root, &path, archives)?;
-            } else if file_type.is_file()
-                && let Some(archive) = Archive::from_path_in_root(&path, source_root)
-            {
-                debug!("discovered archive {}", archive.path.display());
-                archives.push(archive);
+                if file_type.is_dir() {
+                    if path
+                        .file_name()
+                        .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
+                    {
+                        debug!(
+                            "not descending into container directory {} - its contents are internal \
+                             payload, not separate library archives",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    if depth >= MAX_SCAN_DEPTH {
+                        return Err(ArchiveFsError::Scanner(format!(
+                            "source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}",
+                            path.display()
+                        )));
+                    }
+                    child_directories.push((path, depth + 1));
+                } else if file_type.is_file()
+                    && let Some(archive) = Archive::from_path_in_root(&path, source_root)
+                {
+                    if archive.identity.size_bytes.is_none() {
+                        return Err(ArchiveFsError::Scanner(format!(
+                            "archive changed or became unreadable during scan: {}",
+                            path.display()
+                        )));
+                    }
+                    debug!("discovered archive {}", archive.path.display());
+                    archives.push(archive);
+                }
             }
+            let after = fs::symlink_metadata(&directory)
+                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            if after.file_type().is_symlink()
+                || !after.is_dir()
+                || filesystem_identity(&before) != filesystem_identity(&after)
+            {
+                return Err(ArchiveFsError::Scanner(format!(
+                    "source directory changed during scan: {}",
+                    directory.display()
+                )));
+            }
+            child_directories.reverse();
+            directories.extend(child_directories);
         }
-
+        if validate_source_root(source_root)? != source_identity {
+            return Err(ArchiveFsError::Scanner(format!(
+                "source root changed during scan: {}",
+                source_root.display()
+            )));
+        }
         Ok(())
     }
 }
@@ -3846,6 +4086,55 @@ fn is_container_directory(name: &str) -> bool {
 
 pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     ArchiveScanner::new(config).scan_archives()
+}
+
+pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> {
+    let source_identity = validate_source_root(&archive.identity.source_root)?;
+    if archive.identity.source_filesystem_device != Some(source_identity.device)
+        || archive.identity.source_filesystem_inode != Some(source_identity.inode)
+    {
+        return Err(ArchiveFsError::Scanner(format!(
+            "source root changed after scan: {}",
+            archive.identity.source_root.display()
+        )));
+    }
+    if !archive.path.starts_with(&archive.identity.source_root) {
+        return Err(ArchiveFsError::Scanner(format!(
+            "archive escaped source root: {}",
+            archive.path.display()
+        )));
+    }
+    let relative = archive
+        .path
+        .strip_prefix(&archive.identity.source_root)
+        .map_err(|_| ArchiveFsError::Scanner("archive source binding changed".to_string()))?;
+    let mut current = archive.identity.source_root.clone();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArchiveFsError::Scanner(format!(
+                "archive path contains a symlink after scan: {}",
+                current.display()
+            )));
+        }
+    }
+    let metadata = fs::symlink_metadata(&archive.path)
+        .map_err(|error| ArchiveFsError::io(archive.path.clone(), error))?;
+    let identity = filesystem_identity(&metadata);
+    if !metadata.is_file()
+        || archive.identity.filesystem_device != Some(identity.device)
+        || archive.identity.filesystem_inode != Some(identity.inode)
+        || archive.identity.size_bytes != Some(metadata.len())
+        || archive.identity.modified_time != metadata.modified().ok()
+    {
+        return Err(ArchiveFsError::Scanner(format!(
+            "archive changed after scan: {}",
+            archive.path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn plan_mounts(archives: &[Archive], mount_root: impl AsRef<Path>) -> Vec<MountPlan> {
@@ -5395,17 +5684,37 @@ pub fn mount_archives_with_backend(
 ) -> Result<Vec<ArchiveStatus>> {
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
-    fs::create_dir_all(&config.mount_root)
-        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    prepare_mount_root(&config.mount_root)?;
 
-    let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    for plan in &plans {
-        if mounted_paths.contains(&plan.mount_path) {
-            continue;
+    let archive_paths = plans
+        .iter()
+        .map(|plan| plan.archive.path.clone())
+        .collect::<Vec<_>>();
+    let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
+    let validations =
+        validate_mount_batch_targets(config, &plans, &archive_paths, &active_mount_paths);
+    for validation in validations {
+        match validation {
+            MountBatchTargetValidation::Ready { archive_path, .. } => {
+                let plan = select_mount_plan_by_path(&plans, &archive_path)?;
+                let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
+                mount_one_plan_outcome_with_active_mounts(
+                    config,
+                    plan,
+                    backend,
+                    &active_mount_paths,
+                )?;
+            }
+            MountBatchTargetValidation::Skipped {
+                reason: MountBatchTargetSkipReason::AlreadyMountedResolvedTarget { .. },
+                ..
+            } => {}
+            MountBatchTargetValidation::Skipped { reason, .. } => {
+                return Err(ArchiveFsError::Mount(format!(
+                    "refusing unsafe batch target: {reason}"
+                )));
+            }
         }
-        fs::create_dir_all(&plan.mount_path)
-            .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
-        backend.mount(plan)?;
     }
 
     current_statuses(config)
@@ -5505,9 +5814,8 @@ fn mount_one_plan_outcome(
         plan.mount_path.display()
     );
 
-    fs::create_dir_all(&config.mount_root)
-        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
-    let active_mount_paths = current_mount_paths()?;
+    prepare_mount_root(&config.mount_root)?;
+    let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
     mount_one_plan_outcome_with_active_mounts(config, plan, backend, &active_mount_paths)
 }
 
@@ -5532,25 +5840,145 @@ fn mount_unmounted_plan(
     plan: MountPlan,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
-    fs::create_dir_all(&config.mount_root)
-        .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))?;
+    prepare_mount_root(&config.mount_root)?;
+    validate_archive_for_mount(&plan.archive)?;
     validate_mount_target_parent(config, &plan.mount_path)?;
+    refuse_unsafe_existing_mount_target(&plan.mount_path)?;
     info!("mounting {}", plan.archive.path.display());
     fs::create_dir_all(&plan.mount_path)
         .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
+    ensure_no_symlink_components(&plan.mount_path)?;
     if !path_resolves_below(&plan.mount_path, &config.mount_root)? {
         return Err(ArchiveFsError::Config(format!(
             "refusing to mount outside mount root: {}",
             plan.mount_path.display()
         )));
     }
+    let target_identity = fs::symlink_metadata(&plan.mount_path)
+        .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
+    validate_archive_for_mount(&plan.archive)?;
+    refuse_unsafe_existing_mount_target(&plan.mount_path)?;
+    let revalidated_target = fs::symlink_metadata(&plan.mount_path)
+        .map_err(|source| ArchiveFsError::io(plan.mount_path.clone(), source))?;
+    if !same_file_identity(&target_identity, &revalidated_target) {
+        return Err(ArchiveFsError::Mount(format!(
+            "mount target changed during validation: {}",
+            plan.mount_path.display()
+        )));
+    }
     backend.mount(&plan)?;
+    backend.verify_mounted(&plan.mount_path)?;
     info!(
         "mounted {} at {}",
         plan.archive.path.display(),
         plan.mount_path.display()
     );
     Ok(plan)
+}
+
+fn prepare_mount_root(mount_root: &Path) -> Result<()> {
+    if !mount_root.is_absolute() || mount_root.parent().is_none() {
+        return Err(ArchiveFsError::Config(format!(
+            "mount root must be an absolute non-root path: {}",
+            mount_root.display()
+        )));
+    }
+    ensure_no_symlink_components(mount_root)?;
+    fs::create_dir_all(mount_root)
+        .map_err(|source| ArchiveFsError::io(mount_root.to_path_buf(), source))?;
+    ensure_no_symlink_components(mount_root)
+}
+
+fn ensure_no_symlink_components(path: &Path) -> Result<()> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing path traversal component in {}",
+            path.display()
+        )));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ArchiveFsError::Config(format!(
+                    "refusing unsafe symlink component {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => break,
+            Err(source) => return Err(ArchiveFsError::io(current, source)),
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_for_mount(archive: &Archive) -> Result<()> {
+    ensure_no_symlink_components(&archive.path)?;
+    let metadata = fs::symlink_metadata(&archive.path)
+        .map_err(|source| ArchiveFsError::io(archive.path.clone(), source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ArchiveFsError::Mount(format!(
+            "refusing archive that is not a regular file: {}",
+            archive.path.display()
+        )));
+    }
+    if archive
+        .identity
+        .size_bytes
+        .is_some_and(|expected| expected != metadata.len())
+        || archive.identity.modified_time.is_some_and(|expected| {
+            metadata
+                .modified()
+                .map_or(true, |observed| observed != expected)
+        })
+    {
+        return Err(ArchiveFsError::Mount(format!(
+            "archive changed after planning: {}",
+            archive.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn refuse_unsafe_existing_mount_target(mount_path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(mount_path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(ArchiveFsError::io(mount_path.to_path_buf(), source)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ArchiveFsError::Mount(format!(
+            "refusing unsafe existing mount target: {}",
+            mount_path.display()
+        )));
+    }
+    if !directory_is_empty(mount_path)? {
+        return Err(ArchiveFsError::Mount(format!(
+            "refusing to mount over nonempty directory: {}",
+            mount_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
 }
 
 fn validate_mount_batch_targets(
@@ -5670,14 +6098,18 @@ pub fn unmount_archives_with_backend(
     config: &Config,
     backend: &impl MountBackend,
 ) -> Result<Vec<ArchiveStatus>> {
-    let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    let mut mounted_paths = mounted_paths.into_iter().collect::<Vec<_>>();
-    mounted_paths.sort();
-    mounted_paths.reverse();
-
-    for mount_path in mounted_paths {
-        if path_is_under(&mount_path, &config.mount_root) {
-            backend.unmount(&mount_path)?;
+    let mut plans = ArchiveScanner::new(config).mount_plans()?;
+    plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
+    for plan in plans {
+        let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
+        if active_mount_paths.contains(&plan.mount_path) {
+            refuse_nested_active_mounts(&plan.mount_path, &active_mount_paths)?;
+            unmount_one_plan_outcome_with_active_mounts(
+                config,
+                plan,
+                backend,
+                &active_mount_paths,
+            )?;
         }
     }
 
@@ -5736,6 +6168,16 @@ fn lazy_unmount_one_archive_path_with_backend(
 
     let mounted_paths = backend.mounted_paths_under(&config.mount_root)?;
     validate_lazy_unmount_path(config, &mount_path, &mounted_paths)?;
+    let parent_identity = validated_unmount_parent_identity(config, &mount_path, "lazy-unmount")?;
+    refuse_nested_active_mounts(&mount_path, &mounted_paths)?;
+    let revalidated_parent =
+        validated_unmount_parent_identity(config, &mount_path, "lazy-unmount")?;
+    if !same_file_identity(&parent_identity, &revalidated_parent) {
+        return Err(ArchiveFsError::Unmount(format!(
+            "refusing lazy-unmount because the mount parent changed: {}",
+            mount_path.display()
+        )));
+    }
 
     let tool = backend.lazy_unmount(&mount_path)?;
     if backend
@@ -5813,18 +6255,14 @@ fn unmount_one_plan(
         plan.mount_path.display()
     );
 
-    if !path_is_under(&plan.mount_path, &config.mount_root) {
-        return Err(ArchiveFsError::Config(format!(
-            "refusing to unmount {} outside mount root {}",
-            plan.mount_path.display(),
-            config.mount_root.display()
-        )));
+    let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
+    match unmount_one_plan_outcome_with_active_mounts(config, plan, backend, &active_mount_paths)? {
+        UnmountOneOutcome::Unmounted(plan) => Ok(plan),
+        UnmountOneOutcome::NotMounted(plan) => Err(ArchiveFsError::Unmount(format!(
+            "{} is not currently mounted",
+            plan.mount_path.display()
+        ))),
     }
-
-    info!("unmounting {}", plan.mount_path.display());
-    backend.unmount(&plan.mount_path)?;
-    info!("unmounted {}", plan.mount_path.display());
-    Ok(plan)
 }
 
 fn unmount_one_plan_outcome_with_active_mounts(
@@ -5837,7 +6275,38 @@ fn unmount_one_plan_outcome_with_active_mounts(
         return Ok(UnmountOneOutcome::NotMounted(plan));
     }
     validate_active_unmount_path(config, &plan.mount_path, active_mount_paths, "unmount")?;
-    unmount_one_plan(config, plan, backend).map(UnmountOneOutcome::Unmounted)
+    let parent_identity = validated_unmount_parent_identity(config, &plan.mount_path, "unmount")?;
+    refuse_nested_active_mounts(&plan.mount_path, active_mount_paths)?;
+    let revalidated_parent =
+        validated_unmount_parent_identity(config, &plan.mount_path, "unmount")?;
+    if !same_file_identity(&parent_identity, &revalidated_parent) {
+        return Err(ArchiveFsError::Unmount(format!(
+            "refusing unmount because the mount parent changed: {}",
+            plan.mount_path.display()
+        )));
+    }
+    info!("unmounting {}", plan.mount_path.display());
+    backend.unmount(&plan.mount_path)?;
+    backend.verify_unmounted(&plan.mount_path)?;
+    info!("unmounted {}", plan.mount_path.display());
+    Ok(UnmountOneOutcome::Unmounted(plan))
+}
+
+fn refuse_nested_active_mounts(
+    mount_path: &Path,
+    active_mount_paths: &HashSet<PathBuf>,
+) -> Result<()> {
+    if let Some(child) = active_mount_paths
+        .iter()
+        .find(|candidate| candidate.as_path() != mount_path && path_is_under(candidate, mount_path))
+    {
+        return Err(ArchiveFsError::Unmount(format!(
+            "refusing to unmount {} while nested mount {} is active",
+            mount_path.display(),
+            child.display()
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_mount_disappeared(
@@ -5872,6 +6341,14 @@ fn validate_active_unmount_path(
             mount_path.display()
         )));
     }
+    validated_unmount_parent_identity(config, mount_path, operation).map(|_| ())
+}
+
+fn validated_unmount_parent_identity(
+    config: &Config,
+    mount_path: &Path,
+    operation: &str,
+) -> Result<fs::Metadata> {
     let Some(parent) = mount_path.parent() else {
         return Err(ArchiveFsError::Config(format!(
             "refusing to {operation} {} without a parent below mount root {}",
@@ -5890,10 +6367,19 @@ fn validate_active_unmount_path(
             config.mount_root.display()
         )));
     }
-    Ok(())
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ArchiveFsError::Config(format!(
+            "refusing to {operation} through unsafe parent {}",
+            parent.display()
+        )));
+    }
+    Ok(metadata)
 }
 
 pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
+    ensure_no_symlink_components(&config.mount_root)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -5907,6 +6393,7 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
 
 /// Removes an empty selected mount directory and its empty ancestors below the mount root.
 pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
+    ensure_no_symlink_components(&config.mount_root)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -5932,7 +6419,24 @@ pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result
 }
 
 fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<bool> {
-    if !path.is_dir() || mounted_paths.contains(path) || !directory_is_empty(path)? {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(ArchiveFsError::io(path.to_path_buf(), source)),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || mounted_paths.contains(path)
+        || !directory_is_empty(path)?
+    {
+        return Ok(false);
+    }
+    let revalidated = fs::symlink_metadata(path)
+        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
+    if revalidated.file_type().is_symlink()
+        || !revalidated.is_dir()
+        || !same_file_identity(&metadata, &revalidated)
+    {
         return Ok(false);
     }
     fs::remove_dir(path).map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
@@ -5948,49 +6452,21 @@ fn path_resolves_below(path: &Path, root: &Path) -> Result<bool> {
 }
 
 pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
-    let mounted_paths = mounted_paths_under(&config.mount_root)?;
-    clean_empty_dirs_under(&config.mount_root, &mounted_paths)
-}
-
-fn clean_empty_dirs_under(root: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    if !config.mount_root.exists() {
+        return Ok(Vec::new());
+    }
+    ensure_no_symlink_components(&config.mount_root)?;
+    let mut plans = ArchiveScanner::new(config).mount_plans()?;
+    plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
     let mut removed = Vec::new();
-    if !root.exists() {
-        return Ok(removed);
-    }
-    clean_empty_dirs_recursive(root, root, mounted_paths, &mut removed)?;
-    Ok(removed)
-}
-
-fn clean_empty_dirs_recursive(
-    root: &Path,
-    dir: &Path,
-    mounted_paths: &HashSet<PathBuf>,
-    removed: &mut Vec<PathBuf>,
-) -> Result<()> {
-    if mounted_paths.contains(dir) {
-        return Ok(());
-    }
-
-    let entries =
-        fs::read_dir(dir).map_err(|source| ArchiveFsError::io(dir.to_path_buf(), source))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|source| ArchiveFsError::io(dir.to_path_buf(), source))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|source| ArchiveFsError::io(path.clone(), source))?;
-        if file_type.is_dir() {
-            clean_empty_dirs_recursive(root, &path, mounted_paths, removed)?;
+    for plan in plans {
+        for path in cleanup_selected_mount_tree(config, &plan.mount_path)? {
+            if !removed.contains(&path) {
+                removed.push(path);
+            }
         }
     }
-
-    if dir != root && !mounted_paths.contains(dir) && directory_is_empty(dir)? {
-        fs::remove_dir(dir).map_err(|source| ArchiveFsError::io(dir.to_path_buf(), source))?;
-        removed.push(dir.to_path_buf());
-    }
-
-    Ok(())
+    Ok(removed)
 }
 
 fn directory_is_empty(path: &Path) -> Result<bool> {
@@ -6042,10 +6518,10 @@ fn archive_index_entry_from_record(record: ArchiveRecord) -> ArchiveIndexEntry {
 }
 
 fn current_mount_paths() -> Result<HashSet<PathBuf>> {
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+    let mountinfo = fs::read("/proc/self/mountinfo")
         .map_err(|source| ArchiveFsError::io(PathBuf::from("/proc/self/mountinfo"), source))?;
     Ok(mountinfo
-        .lines()
+        .split(|byte| *byte == b'\n')
         .filter_map(mount_path_from_mountinfo_line)
         .collect())
 }
@@ -6057,19 +6533,46 @@ fn mounted_paths_under(root: &Path) -> Result<HashSet<PathBuf>> {
         .collect())
 }
 
-fn mount_path_from_mountinfo_line(line: &str) -> Option<PathBuf> {
-    let mut fields = line.split_whitespace();
-    fields
-        .nth(4)
-        .map(unescape_mountinfo_path)
-        .map(PathBuf::from)
+fn mount_path_from_mountinfo_line(line: &[u8]) -> Option<PathBuf> {
+    let field = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .nth(4)?;
+    mountinfo_path_from_bytes(&unescape_mountinfo_path(field))
 }
 
-fn unescape_mountinfo_path(path: &str) -> String {
-    path.replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
+fn unescape_mountinfo_path(path: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == b'\\'
+            && index + 3 < path.len()
+            && path[index + 1..=index + 3]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'7'))
+        {
+            let value = (path[index + 1] - b'0') * 64
+                + (path[index + 2] - b'0') * 8
+                + (path[index + 3] - b'0');
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(path[index]);
+            index += 1;
+        }
+    }
+    decoded
+}
+
+#[cfg(unix)]
+fn mountinfo_path_from_bytes(path: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn mountinfo_path_from_bytes(path: &[u8]) -> Option<PathBuf> {
+    String::from_utf8(path.to_vec()).ok().map(PathBuf::from)
 }
 
 fn path_is_under(path: &Path, root: &Path) -> bool {
@@ -6136,20 +6639,83 @@ fn run_command(program: &str, args: &[&Path]) -> Result<()> {
 }
 
 fn run_command_os(program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|source| ArchiveFsError::io(PathBuf::from(program), source))?;
+    run_command_os_with_timeout(program, args, Duration::from_secs(30))
+}
 
-    if output.status.success() {
+const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
+
+fn run_command_os_with_timeout(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| ArchiveFsError::io(PathBuf::from(program), source))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ArchiveFsError::Mount(format!("failed to capture stdout from {program}")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ArchiveFsError::Mount(format!("failed to capture stderr from {program}")))?;
+    let stdout_reader = thread::spawn(move || read_bounded_output(stdout));
+    let stderr_reader = thread::spawn(move || read_bounded_output(stderr));
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .map_err(|source| ArchiveFsError::io(PathBuf::from(program), source))?;
+                break (status, true);
+            }
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ArchiveFsError::io(PathBuf::from(program), source));
+            }
+        }
+    };
+    let _stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    if timed_out {
+        Err(ArchiveFsError::ExternalCommand {
+            program: program.to_string(),
+            status: status.code(),
+            stderr: format!("command timed out after {} ms", timeout.as_millis()),
+        })
+    } else if status.success() {
         Ok(())
     } else {
         Err(ArchiveFsError::ExternalCommand {
             program: program.to_string(),
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            status: status.code(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
         })
     }
+}
+
+fn read_bounded_output(mut reader: impl Read) -> Vec<u8> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let remaining = COMMAND_OUTPUT_LIMIT.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..count.min(remaining)]);
+    }
+    retained
 }
 
 #[cfg(test)]
@@ -6444,6 +7010,8 @@ mod tests {
         symlink(&real_parent, mount_root.join("Alias")).unwrap();
         let first_archive = root.join("First.zip");
         let second_archive = root.join("Second.zip");
+        fs::write(&first_archive, b"archive").unwrap();
+        fs::write(&second_archive, b"archive").unwrap();
         let plans = vec![
             MountPlan::new(
                 Archive::from_path(&first_archive).unwrap(),
@@ -6644,6 +7212,145 @@ mod tests {
     }
 
     #[test]
+    fn bulk_unmount_ignores_unrelated_and_similarly_named_active_mounts() {
+        let root = test_root("bulk_unmount_exact_plans");
+        let source_root = root.join("roms").join("xbox360");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("Game.zip"), b"archive").unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let plan = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0);
+        fs::create_dir_all(plan.mount_path.parent().unwrap()).unwrap();
+        let unrelated = config.mount_root.join("Xbox360/Game-old");
+        let backend = RecordingBackend::with_active(HashSet::from([
+            plan.mount_path.clone(),
+            unrelated.clone(),
+        ]));
+
+        unmount_archives_with_backend(&config, &backend).unwrap();
+
+        assert_eq!(backend.unmounted(), vec![plan.mount_path]);
+        assert!(backend.active.borrow().contains(&unrelated));
+    }
+
+    #[test]
+    fn normal_and_lazy_unmount_refuse_nested_active_mounts() {
+        let root = test_root("unmount_nested_active");
+        let mount_root = root.join("mounts");
+        let mount_path = mount_root.join("Platform/Game");
+        let nested = mount_path.join("child");
+        fs::create_dir_all(mount_path.parent().unwrap()).unwrap();
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root,
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let plan = MountPlan::new(
+            Archive::from_path(root.join("Game.zip")).unwrap(),
+            mount_path.clone(),
+        );
+        let active = HashSet::from([mount_path.clone(), nested]);
+        let backend = RecordingBackend::with_active(active.clone());
+
+        let error = unmount_one_plan_outcome_with_active_mounts(&config, plan, &backend, &active)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("nested mount"));
+        assert!(backend.unmounted().is_empty());
+        assert!(validate_lazy_unmount_path(&config, &mount_path, &active).is_ok());
+        assert!(refuse_nested_active_mounts(&mount_path, &active).is_err());
+    }
+
+    #[test]
+    fn mount_refuses_nonempty_existing_target_and_missing_archive() {
+        let root = test_root("mount_revalidate_inputs");
+        let archive_path = root.join("roms/Game.zip");
+        let mount_path = root.join("mounts/Unknown/Game");
+        fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        fs::write(&archive_path, b"archive").unwrap();
+        fs::create_dir_all(&mount_path).unwrap();
+        fs::write(mount_path.join("owner-file"), b"owner data").unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+        let plan = MountPlan::new(
+            Archive::from_path(&archive_path).unwrap(),
+            mount_path.clone(),
+        );
+
+        let error = mount_unmounted_plan(&config, plan.clone(), &backend).unwrap_err();
+        assert!(error.to_string().contains("nonempty"));
+        assert!(backend.mounted().is_empty());
+
+        fs::remove_file(mount_path.join("owner-file")).unwrap();
+        fs::write(&archive_path, b"archive changed size").unwrap();
+        let error = mount_unmounted_plan(&config, plan.clone(), &backend).unwrap_err();
+        assert!(error.to_string().contains("changed after planning"));
+        assert!(backend.mounted().is_empty());
+
+        fs::remove_file(&archive_path).unwrap();
+        let error = mount_unmounted_plan(&config, plan, &backend).unwrap_err();
+        assert!(error.to_string().contains("No such file"));
+        assert!(backend.mounted().is_empty());
+    }
+
+    #[test]
+    fn backend_success_is_not_reported_before_mount_postcondition_verification() {
+        struct FalseSuccessBackend;
+        impl MountBackend for FalseSuccessBackend {
+            fn mount(&self, _plan: &MountPlan) -> Result<()> {
+                Ok(())
+            }
+
+            fn unmount(&self, _mount_path: &Path) -> Result<()> {
+                Ok(())
+            }
+
+            fn verify_mounted(&self, mount_path: &Path) -> Result<()> {
+                Err(ArchiveFsError::Mount(format!(
+                    "{} did not become mounted",
+                    mount_path.display()
+                )))
+            }
+        }
+
+        let root = test_root("mount_false_success");
+        let archive_path = root.join("roms/Game.zip");
+        fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        fs::write(&archive_path, b"archive").unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let plan = MountPlan::new(
+            Archive::from_path(archive_path).unwrap(),
+            config.mount_root.join("Unknown/Game"),
+        );
+
+        let error = mount_unmounted_plan(&config, plan, &FalseSuccessBackend).unwrap_err();
+        assert!(error.to_string().contains("did not become mounted"));
+    }
+
+    #[test]
+    fn relative_and_filesystem_root_mount_roots_are_rejected() {
+        assert!(prepare_mount_root(Path::new("relative/mounts")).is_err());
+        assert!(prepare_mount_root(Path::new("/")).is_err());
+        let root = test_root("mount_root_traversal");
+        assert!(prepare_mount_root(&root.join("parent/../mounts")).is_err());
+        assert!(!root.join("mounts").exists());
+    }
+
+    #[test]
     fn batch_validation_allows_distinct_targets_and_rejects_outside_root() {
         let root = test_root("batch_target_distinct");
         let mount_root = root.join("mounts");
@@ -6740,7 +7447,13 @@ mod tests {
     #[test]
     fn unmount_one_path_targets_non_utf8_archive_exactly() {
         let (config, first, second) = non_utf8_archive_fixture("non_utf8_unmount");
-        let backend = RecordingBackend::default();
+        let expected = select_mount_plan_by_path(
+            &ArchiveScanner::new(&config).mount_plans().unwrap(),
+            &second,
+        )
+        .unwrap();
+        fs::create_dir_all(expected.mount_path.parent().unwrap()).unwrap();
+        let backend = RecordingBackend::with_active(HashSet::from([expected.mount_path]));
 
         let plan = unmount_one_archive_path_with_backend(&config, &second, &backend).unwrap();
 
@@ -6788,14 +7501,13 @@ mod tests {
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
         };
-        let backend = RecordingBackend::default();
+        let expected_mount_path = mount_root.join("Xbox360").join("007_Legends");
+        fs::create_dir_all(expected_mount_path.parent().unwrap()).unwrap();
+        let backend = RecordingBackend::with_active(HashSet::from([expected_mount_path.clone()]));
 
         let plan = unmount_one_archive_with_backend(&config, "007 Legends", &backend).unwrap();
 
-        assert_eq!(
-            plan.mount_path,
-            mount_root.join("Xbox360").join("007_Legends")
-        );
+        assert_eq!(plan.mount_path, expected_mount_path);
         assert_eq!(backend.unmounted(), vec![plan.mount_path]);
     }
 
@@ -6817,6 +7529,25 @@ mod tests {
             error,
             ArchiveFsError::Selection(SelectionError::NoMatch { input }) if input == "missing"
         ));
+        assert!(backend.unmounted().is_empty());
+    }
+
+    #[test]
+    fn unmount_one_does_not_report_success_when_target_is_not_mounted() {
+        let root = test_root("unmount_one_not_mounted");
+        let source_root = root.join("roms");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("Game.zip"), b"archive").unwrap();
+        let config = Config {
+            source_folders: vec![source_root],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let backend = RecordingBackend::default();
+
+        let error = unmount_one_archive_with_backend(&config, "Game", &backend).unwrap_err();
+
+        assert!(error.to_string().contains("not currently mounted"));
         assert!(backend.unmounted().is_empty());
     }
 
@@ -7934,39 +8665,75 @@ mod tests {
     }
 
     #[test]
-    fn clean_empty_dirs_removes_empty_dirs_but_not_root_or_nonempty_dirs() {
-        let root = test_root("clean_empty_dirs");
-        let empty_child = root.join("Unknown").join("Empty");
-        let nonempty_child = root.join("Xbox360").join("Keep");
-        fs::create_dir_all(&empty_child).unwrap();
-        fs::create_dir_all(&nonempty_child).unwrap();
-        fs::write(nonempty_child.join("file.txt"), b"keep").unwrap();
+    fn public_clean_preserves_unrelated_empty_owner_directories() {
+        let root = test_root("clean_only_planned_targets");
+        let source_root = root.join("roms/xbox360");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("Game.zip"), b"archive").unwrap();
+        let config = Config {
+            source_folders: vec![root.join("roms")],
+            mount_root: root.join("mounts"),
+            ratarmount_bin: "ratarmount".to_string(),
+        };
+        let plan = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0);
+        fs::create_dir_all(&plan.mount_path).unwrap();
+        let owner_directory = config.mount_root.join("Owner/Empty");
+        fs::create_dir_all(&owner_directory).unwrap();
 
-        let removed = clean_empty_dirs_under(&root, &HashSet::new()).unwrap();
+        let removed = clean_mount_root(&config).unwrap();
 
-        assert!(root.exists());
-        assert!(!empty_child.exists());
-        assert!(!root.join("Unknown").exists());
-        assert!(nonempty_child.exists());
-        assert!(removed.contains(&empty_child));
-        assert!(removed.contains(&root.join("Unknown")));
-        assert!(!removed.contains(&root));
+        assert!(removed.contains(&plan.mount_path));
+        assert!(owner_directory.exists());
     }
 
     #[test]
-    fn clean_empty_dirs_skips_mounted_dirs_and_their_children() {
-        let root = test_root("clean_mounted_dirs");
-        let mounted = root.join("Xbox360").join("Mounted");
-        let virtual_empty = mounted.join("Empty");
-        fs::create_dir_all(&virtual_empty).unwrap();
-        let mounted_paths = HashSet::from([mounted.clone()]);
+    fn mountinfo_parser_decodes_octal_escapes_and_uses_exact_paths() {
+        let line = b"36 25 0:32 / /mnt/archive\\040fs rw,nosuid - fuse.test test rw";
+        assert_eq!(
+            mount_path_from_mountinfo_line(line),
+            Some(PathBuf::from("/mnt/archive fs"))
+        );
+    }
 
-        let removed = clean_empty_dirs_under(&root, &mounted_paths).unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn mountinfo_parser_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
 
-        assert!(mounted.exists());
-        assert!(virtual_empty.exists());
-        assert!(!removed.contains(&mounted));
-        assert!(!removed.contains(&virtual_empty));
+        let line = b"36 25 0:32 / /mnt/game\\200 rw - fuse.test test rw";
+        let path = mount_path_from_mountinfo_line(line).unwrap();
+
+        assert_eq!(path.as_os_str().as_bytes(), b"/mnt/game\x80");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_runner_times_out_and_bounds_captured_error_output() {
+        if command_available("sleep") {
+            let error =
+                run_command_os_with_timeout("sleep", &["5".as_ref()], Duration::from_millis(75))
+                    .unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+        }
+
+        if command_available("sh") && command_available("head") {
+            let error = run_command_os_with_timeout(
+                "sh",
+                &[
+                    "-c".as_ref(),
+                    "head -c 70000 /dev/zero >&2; exit 7".as_ref(),
+                ],
+                Duration::from_secs(2),
+            )
+            .unwrap_err();
+            let ArchiveFsError::ExternalCommand { stderr, .. } = error else {
+                panic!("expected external-command failure");
+            };
+            assert_eq!(stderr.len(), COMMAND_OUTPUT_LIMIT);
+        }
     }
 
     #[test]
@@ -9220,6 +9987,121 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scanner_refuses_a_symlinked_source_root_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("scanner_symlink_source");
+        let real_source = root.join("real-source");
+        let linked_source = root.join("linked-source");
+        fs::create_dir_all(&real_source).unwrap();
+        fs::write(real_source.join("outside.zip"), b"contents").unwrap();
+        symlink(&real_source, &linked_source).unwrap();
+
+        let error = ArchiveScanner::new(&scanner_config(&linked_source))
+            .scan_archives()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("symlinked source component"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_skips_a_symlink_escape_beneath_a_valid_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("scanner_nested_symlink_escape");
+        let source = root.join("source");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(source.join("inside.zip"), b"inside").unwrap();
+        fs::write(outside.join("outside.zip"), b"outside").unwrap();
+        symlink(&outside, source.join("escape")).unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&source))
+            .scan_archives()
+            .unwrap();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].path, source.join("inside.zip"));
+    }
+
+    #[test]
+    fn scanner_rejects_duplicate_and_nested_roots_but_not_prefix_siblings() {
+        let root = test_root("scanner_source_overlap");
+        let source = root.join("cache");
+        let child = source.join("nested");
+        let prefix_sibling = root.join("cache-old");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&prefix_sibling).unwrap();
+
+        let duplicate = Config {
+            source_folders: vec![source.clone(), source.clone()],
+            ..scanner_config(&root)
+        };
+        assert!(
+            ArchiveScanner::new(&duplicate)
+                .scan_archives()
+                .unwrap_err()
+                .to_string()
+                .contains("overlapping")
+        );
+
+        let nested = Config {
+            source_folders: vec![source.clone(), child],
+            ..scanner_config(&root)
+        };
+        assert!(
+            ArchiveScanner::new(&nested)
+                .scan_archives()
+                .unwrap_err()
+                .to_string()
+                .contains("overlapping")
+        );
+
+        let prefix_collision = Config {
+            source_folders: vec![source, prefix_sibling],
+            ..scanner_config(&root)
+        };
+        assert!(
+            ArchiveScanner::new(&prefix_collision)
+                .scan_archives()
+                .is_ok(),
+            "lexical prefix siblings are distinct roots"
+        );
+    }
+
+    #[test]
+    fn scanner_rejects_relative_and_filesystem_root_sources() {
+        for source in [PathBuf::from("relative/source"), PathBuf::from("/")] {
+            let config = Config {
+                source_folders: vec![source],
+                mount_root: PathBuf::from("/tmp/archivefs-test-mounts"),
+                ratarmount_bin: "ratarmount".to_string(),
+            };
+            let error = ArchiveScanner::new(&config).scan_archives().unwrap_err();
+            assert!(error.to_string().contains("absolute non-root"));
+        }
+    }
+
+    #[test]
+    fn scanner_enforces_a_bounded_directory_depth() {
+        let root = test_root("scanner_depth_limit");
+        let mut directory = root.clone();
+        for _ in 0..=128 {
+            directory.push("d");
+            fs::create_dir(&directory).unwrap();
+        }
+
+        let error = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("directory depth limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn non_utf8_sibling_paths_do_not_panic_during_container_boundary_scan() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -9246,6 +10128,25 @@ mod tests {
 
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].path, invalid_dir.join("Game.zip"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_preserves_a_programmatic_non_utf8_source_root_losslessly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("scanner_non_utf8_source");
+        let source = root.join(std::ffi::OsString::from_vec(vec![b's', 0x80, b'c']));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Game.zip"), b"contents").unwrap();
+
+        let archives = ArchiveScanner::new(&scanner_config(&source))
+            .scan_archives()
+            .unwrap();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].identity.source_root, source);
+        assert_eq!(archives[0].path, source.join("Game.zip"));
     }
 
     #[test]
@@ -9938,6 +10839,33 @@ mod tests {
         let validated = validate_new_source_folder(&new_source, &[existing]).unwrap();
 
         assert_eq!(validated, new_source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_config_save_rejects_non_utf8_without_replacing_existing_config() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("source_config_non_utf8");
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, b"mount_root = \"/safe/existing\"\n").unwrap();
+        let before = fs::read(&config_path).unwrap();
+        let source = SourceFolderConfig {
+            path: root.join(std::ffi::OsString::from_vec(vec![b's', 0x80, b'c'])),
+            enabled: true,
+            created_at: None,
+        };
+
+        let error = save_source_folder_configs_to(
+            &config_path,
+            &[source],
+            &root.join("mounts"),
+            "ratarmount",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("losslessly"));
+        assert_eq!(fs::read(&config_path).unwrap(), before);
     }
 
     fn write_starter_config(config_path: &Path, mount_root: &Path) {
@@ -11125,9 +12053,17 @@ mod tests {
     struct RecordingBackend {
         mounted: std::cell::RefCell<Vec<PathBuf>>,
         unmounted: std::cell::RefCell<Vec<PathBuf>>,
+        active: std::cell::RefCell<HashSet<PathBuf>>,
     }
 
     impl RecordingBackend {
+        fn with_active(active: HashSet<PathBuf>) -> Self {
+            Self {
+                active: std::cell::RefCell::new(active),
+                ..Self::default()
+            }
+        }
+
         fn mounted(&self) -> Vec<PathBuf> {
             self.mounted.borrow().clone()
         }
@@ -11145,7 +12081,12 @@ mod tests {
 
         fn unmount(&self, mount_path: &Path) -> Result<()> {
             self.unmounted.borrow_mut().push(mount_path.to_path_buf());
+            self.active.borrow_mut().remove(mount_path);
             Ok(())
+        }
+
+        fn active_mount_paths(&self, _root: &Path) -> Result<HashSet<PathBuf>> {
+            Ok(self.active.borrow().clone())
         }
     }
 

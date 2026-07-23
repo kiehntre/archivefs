@@ -20,6 +20,7 @@
 //! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
+mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_catalogue;
 mod cheat_history;
@@ -29,10 +30,14 @@ mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
 mod destination_safety;
+mod dolphin_local;
+mod import_safety;
 mod matching;
 mod pcsx2;
+mod pcsx2_local;
 mod retrieval;
 mod retroarch;
+mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
 
@@ -110,9 +115,36 @@ pub use destination_safety::{
     SafeDestination, ValidatedDestinationRoot, assess_destination, construct_safe_destination,
     inspect_safe_destination, validate_destination_root,
 };
+pub use dolphin_local::{
+    DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
+    DOLPHIN_MAX_LINE_BYTES, DOLPHIN_MAX_LINES_PER_FILE, DOLPHIN_MAX_PROFILES,
+    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinDirectoryIdentity,
+    DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory, DolphinInspectionError,
+    DolphinInspectionWarning, DolphinInspectionWarningKind, DolphinInstallationType,
+    DolphinMatchResult, DolphinMatchState, DolphinProfile, DolphinProfileBlocker,
+    DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
+    inspect_dolphin_profile, match_dolphin_inventory,
+};
+pub use import_safety::{
+    ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
+    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, UNKNOWN_CODE_POLICY,
+    automatic_execution_allowed, classify_active_content, trust_after_inspection,
+};
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
+};
+pub use pcsx2_local::{
+    PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
+    PCSX2_MAX_LINE_BYTES, PCSX2_MAX_LINES_PER_FILE, PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE,
+    PCSX2_MAX_PNACH_FILE_BYTES, PCSX2_MAX_PNACH_FILES, PCSX2_MAX_PROFILES,
+    PCSX2_MAX_TOTAL_PNACH_BYTES, Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2InspectionError,
+    Pcsx2InspectionWarning, Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2MatchResult,
+    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
+    Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
+    Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
+    discover_pcsx2_profiles, inspect_pcsx2_profile, match_pcsx2_inventory,
 };
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
 pub use retroarch::{
@@ -120,6 +152,10 @@ pub use retroarch::{
     PlaylistMatchConfidence, ProposedDestination, RetroArchAdvisoryEntry, RetroArchAdvisoryPlan,
     RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
+};
+pub use retroarch_cheat_library::{
+    RETROARCH_CHEAT_LIBRARY_MAX_DEPTH, RETROARCH_CHEAT_LIBRARY_MAX_ENTRIES,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, inspect_retroarch_cheat_library,
 };
 pub use retroarch_cheat_setup::{
     RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupDiscovery, RetroArchCheatSetupError,
