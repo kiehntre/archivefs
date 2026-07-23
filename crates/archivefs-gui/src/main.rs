@@ -3966,6 +3966,38 @@ impl ArchiveFsApp {
         });
     }
 
+    /// The single dispatch point for `CatalogueManagerAction` - shared by
+    /// every page that renders `show_retroarch_catalogue_manager` (Sources,
+    /// and now Cheats & Mods) so the Review-then-Confirm two-step and the
+    /// "no automatic network access" guarantee it enforces cannot drift
+    /// between call sites.
+    fn handle_catalogue_manager_action(
+        &mut self,
+        context: &egui::Context,
+        action: CatalogueManagerAction,
+    ) {
+        match action {
+            CatalogueManagerAction::Refresh => {
+                self.start_catalogue_status_load(context.clone());
+            }
+            CatalogueManagerAction::Review { source_id, kind } => {
+                self.catalogue_review = Some(CatalogueReview { source_id, kind });
+            }
+            CatalogueManagerAction::Confirm => {
+                self.start_catalogue_retrieval(context.clone());
+            }
+            CatalogueManagerAction::CancelReview => {
+                self.catalogue_review = None;
+            }
+            CatalogueManagerAction::CancelRunning => {
+                if let Some(running) = self.catalogue_retrieval.as_mut() {
+                    running.cancellation.cancel();
+                    running.cancellation_requested = true;
+                }
+            }
+        }
+    }
+
     fn poll_catalogue_manager(&mut self, context: &egui::Context) {
         if let CatalogueManagerState::Loading(receiver) = &self.catalogue_manager {
             match receiver.try_recv() {
@@ -6759,7 +6791,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_cheat_workflow();
-        if self.view == MainView::Sources
+        if matches!(self.view, MainView::Sources | MainView::CheatsMods)
             && matches!(self.catalogue_manager, CatalogueManagerState::NotLoaded)
         {
             self.start_catalogue_status_load(context.clone());
@@ -7086,26 +7118,7 @@ impl eframe::App for ArchiveFsApp {
                         &mut self.clipboard,
                     );
                     if let Some(catalogue_action) = catalogue_action {
-                        match catalogue_action {
-                            CatalogueManagerAction::Refresh => {
-                                self.start_catalogue_status_load(context.clone());
-                            }
-                            CatalogueManagerAction::Review { source_id, kind } => {
-                                self.catalogue_review = Some(CatalogueReview { source_id, kind });
-                            }
-                            CatalogueManagerAction::Confirm => {
-                                self.start_catalogue_retrieval(context.clone());
-                            }
-                            CatalogueManagerAction::CancelReview => {
-                                self.catalogue_review = None;
-                            }
-                            CatalogueManagerAction::CancelRunning => {
-                                if let Some(running) = self.catalogue_retrieval.as_mut() {
-                                    running.cancellation.cancel();
-                                    running.cancellation_requested = true;
-                                }
-                            }
-                        }
+                        self.handle_catalogue_manager_action(context, catalogue_action);
                     }
                     ui.add_space(theme::SECTION_GAP);
                     let sources = self
@@ -7267,11 +7280,11 @@ impl eframe::App for ArchiveFsApp {
                         LoadState::Loading { previous, .. } => previous.as_deref(),
                         LoadState::Error(_) => None,
                     };
-                    let action = egui::ScrollArea::vertical()
+                    let (action, catalogue_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            show_cheats_mods_page(
+                            let action = show_cheats_mods_page(
                                 ui,
                                 self.cheat_workflow.as_mut(),
                                 &self.retroarch_profiles,
@@ -7282,7 +7295,29 @@ impl eframe::App for ArchiveFsApp {
                                 &self.history,
                                 busy || self.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
-                            )
+                            );
+                            ui.add_space(theme::SECTION_GAP);
+                            // The RetroArch cheat database, reachable without
+                            // leaving Cheats & Mods (previously only from
+                            // Sources, via "Manage catalogue in Sources").
+                            // Renders through the exact same component,
+                            // state, and Review-then-Confirm dispatch as the
+                            // Sources page - see
+                            // `handle_catalogue_manager_action` - so this
+                            // shortcut cannot diverge in behaviour or safety
+                            // from the full Sources management view. Left
+                            // directly visible (not collapsed): Download /
+                            // Update / Verify are primary actions here, not
+                            // technical detail.
+                            let catalogue_action = show_retroarch_catalogue_manager(
+                                ui,
+                                &self.catalogue_manager,
+                                self.catalogue_review.as_ref(),
+                                self.catalogue_retrieval.as_ref(),
+                                self.catalogue_last_result.as_ref(),
+                                &mut self.clipboard,
+                            );
+                            (action, catalogue_action)
                         })
                         .inner;
                     let picker_rows = live
@@ -7294,6 +7329,9 @@ impl eframe::App for ArchiveFsApp {
                             )
                         })
                         .unwrap_or_default();
+                    if let Some(catalogue_action) = catalogue_action {
+                        self.handle_catalogue_manager_action(context, catalogue_action);
+                    }
                     match action {
                         Some(CheatWorkflowAction::ChooseArchive) => {
                             self.open_cheat_archive_picker();
@@ -9897,27 +9935,26 @@ fn show_retroarch_catalogue_manager(
                 widgets::card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.strong(&entry.source.display_name);
-                        widgets::status_badge(
-                            ui,
-                            catalogue_status_label(entry.status),
-                            match entry.status {
-                                CheatCatalogueStatus::Ready => widgets::StatusTone::Success,
-                                CheatCatalogueStatus::ReadyWithWarnings => {
-                                    widgets::StatusTone::Warning
-                                }
-                                CheatCatalogueStatus::Missing => widgets::StatusTone::Pending,
-                                CheatCatalogueStatus::Stale | CheatCatalogueStatus::Cancelled => {
-                                    widgets::StatusTone::Warning
-                                }
-                                _ => widgets::StatusTone::Blocked,
-                            },
-                        );
-                        widgets::status_badge(
-                            ui,
-                            "Official repository · third-party content",
-                            widgets::StatusTone::Info,
-                        );
                     });
+                    let status_tone = match entry.status {
+                        CheatCatalogueStatus::Ready => widgets::StatusTone::Success,
+                        CheatCatalogueStatus::ReadyWithWarnings => widgets::StatusTone::Warning,
+                        CheatCatalogueStatus::Missing => widgets::StatusTone::Pending,
+                        CheatCatalogueStatus::Stale | CheatCatalogueStatus::Cancelled => {
+                            widgets::StatusTone::Warning
+                        }
+                        _ => widgets::StatusTone::Blocked,
+                    };
+                    widgets::status_strip(
+                        ui,
+                        &[
+                            (catalogue_status_label(entry.status), status_tone),
+                            (
+                                "Official repository · third-party content",
+                                widgets::StatusTone::Info,
+                            ),
+                        ],
+                    );
                     ui.label("Catalogue download does not install cheats. Apply remains a separate confirmed transaction.");
                     ui.label("Updating this snapshot does not modify RetroArch or emulator files, and a game may legitimately have no matching cheat.");
                     if let Some(revision) = &entry.current_cached_version {
@@ -10134,7 +10171,7 @@ fn show_retroarch_catalogue_manager(
         match result {
             Ok(fetch) => widgets::banner(
                 ui,
-                "Catalogue activated",
+                "Cheat database updated",
                 &format!(
                     "Revision {} is active; {} files were verified. No cheats were installed.",
                     fetch.manifest.resolved_revision,
@@ -10142,15 +10179,16 @@ fn show_retroarch_catalogue_manager(
                 ),
                 widgets::StatusTone::Success,
             ),
-            Err(error) => widgets::banner(
+            Err(error) => widgets::failure_summary(
                 ui,
+                "catalogue_result_error",
                 if error.code == "cancelled" {
-                    "Catalogue download cancelled"
+                    "Cheat database download cancelled"
                 } else {
-                    "Catalogue update failed"
+                    "Cheat database update failed"
                 },
-                &format!("{error}. Any previous valid snapshot was retained."),
-                widgets::StatusTone::Warning,
+                Some("Your existing cheat database, if any, remains active and usable."),
+                &error.to_string(),
             ),
         }
     }
