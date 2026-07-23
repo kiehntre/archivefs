@@ -95,11 +95,16 @@ Extraction refuses absolute, `.`/`..`, empty-component, Windows drive,
 UNC/backslash, NUL, oversized/deep, duplicate, case-fold-colliding, symlink,
 hard-link, device, FIFO, socket, and other special entries. Files use
 no-overwrite creation beneath symlink-checked staging. Limits are 60,000
-entries, 8 MiB per file (the shared local catalogue bound), 1 GiB total expanded, 1,024 path bytes, 24
-components, and 250:1 compression ratio. Nested archives remain inert files
-and are never recursively extracted.
+entries, 64 MiB per extracted file, 1 GiB total expanded, 1,024 path bytes, 24
+components, and 250:1 compression ratio. The per-file extraction limit was
+raised from 8 MiB because the complete official immutable repository contains
+larger non-cheat data files, including its J2ME DAT metadata. Those files remain
+part of the verified manifest even though only `.cht` files enter cheat
+matching. Any individual entry above 64 MiB still fails closed. Nested archives
+remain inert files and are never recursively extracted.
 
-The archive download limit is 256 MiB, the revision response limit is 64 KiB,
+The compressed archive download limit remains 256 MiB and the total expanded
+content limit remains 1 GiB. The revision response limit is 64 KiB,
 the serialized manifest limit is 16 MiB, and redirects are limited to three.
 Connection establishment (including DNS and TLS) is bounded at 30 seconds,
 each response-body read may be idle for at most 60 seconds, and the complete

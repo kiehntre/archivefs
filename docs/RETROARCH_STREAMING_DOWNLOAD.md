@@ -76,7 +76,7 @@ internal state and incremental SHA-256 state. The full ZIP is never held in
 memory. The small revision JSON remains separately bounded at 64 KiB.
 
 Existing limits remain 256 MiB compressed, 1 GiB expanded, 60,000 ZIP entries,
-50,000 indexed catalogue files, 8 MiB per extracted file, 16 MiB manifest,
+50,000 indexed catalogue files, 64 MiB per extracted file, 16 MiB manifest,
 1,024 path bytes, 24 path components, 250:1 compression ratio, and three
 redirects. One provider operation and one active staging file are allowed at a
 time.
