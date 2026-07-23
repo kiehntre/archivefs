@@ -424,9 +424,11 @@ mod tests {
         let bytes = b"cheats = 1\ncheat0_desc = \"Infinite lives\"\ncheat0_code = \"ABCD\"\ncheat0_enable = false\n";
         fs::write(&source, bytes).unwrap();
         let manifest = CheatSourceManifest {
-            format_version: 1,
+            format_version: super::super::cheat_sources::CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
             source_id: "libretro-buildbot-cheats".into(),
             source_url: "https://example.invalid/catalogue.zip".into(),
+            canonical_repository_url: "https://github.com/libretro/libretro-database".into(),
+            resolved_revision: "1".repeat(40),
             pinned_version: None,
             fetched_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -489,6 +491,46 @@ mod tests {
         assert_eq!(result.sources[0].source_path, fixture.source);
         assert_eq!(fs::metadata(&fixture.source).unwrap().len(), before);
         assert_eq!(result.preview.summary.blocked, 0);
+    }
+
+    #[test]
+    fn mega_drive_md_entry_matches_alien_3_and_absence_is_a_typed_no_match() {
+        let mut fixture = fixture("mega-drive-alien-3");
+        fs::remove_file(&fixture.source).unwrap();
+        let relative = Path::new("Sega - Mega Drive - Genesis").join("Alien 3 (USA, Europe).cht");
+        let source = fixture.snapshot.join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let bytes = b"cheats = 1\ncheat0_desc = \"Infinite lives\"\ncheat0_code = \"00FF\"\ncheat0_enable = false\n";
+        fs::write(&source, bytes).unwrap();
+        let mut manifest: CheatSourceManifest =
+            serde_json::from_slice(&fs::read(&fixture.manifest).unwrap()).unwrap();
+        manifest.files = vec![CheatSourceManifestFile {
+            relative_path: relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            size: bytes.len() as u64,
+            sha256: sha256(bytes),
+        }];
+        manifest.discovered_platforms = vec!["Sega - Mega Drive - Genesis".into()];
+        fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fixture.source = source;
+
+        let mut request = request(&fixture);
+        request.selected_archive = fixture.root.join("Alien 3 (USA, Europe).md");
+        request.archive_display_name = "Alien 3 (USA, Europe)".into();
+        request.archive_normalized_name = "alien 3 usa europe".into();
+        request.platform = "MegaDrive".into();
+        let matched = materialize_retroarch_shared_preview(&request).unwrap();
+        assert_eq!(matched.sources.len(), 1);
+        assert_eq!(matched.sources[0].source_path, fixture.source);
+
+        request.archive_display_name = "Game With No Cheat".into();
+        request.archive_normalized_name = "game with no cheat".into();
+        let no_match = materialize_retroarch_shared_preview(&request).unwrap_err();
+        assert_eq!(
+            no_match.kind,
+            RetroArchMaterializationErrorKind::NoEligibleMatch
+        );
     }
 
     #[test]

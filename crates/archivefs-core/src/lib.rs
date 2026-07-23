@@ -4572,6 +4572,7 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("genesis", "MegaDrive"),
     ("segamegadrive", "MegaDrive"),
     ("segagenesis", "MegaDrive"),
+    ("segamegadrivegenesis", "MegaDrive"),
     ("smd", "MegaDrive"),
     ("mastersystem", "MasterSystem"),
     ("segamastersystem", "MasterSystem"),

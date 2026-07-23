@@ -106,6 +106,7 @@ pub fn fetch_source(
         offline: options.offline,
         expected_sha256: options.expected_sha256.clone(),
         max_download_bytes: options.max_download_bytes,
+        cancellation: None,
     };
     fetch_retroarch_cheat_source(source_id, &core_options, &HttpsCheatSourceTransport::new())
 }
@@ -245,6 +246,8 @@ fn manifest_json(
         "format_version": manifest.format_version,
         "source_id": manifest.source_id,
         "source_url": manifest.source_url,
+        "canonical_repository_url": manifest.canonical_repository_url,
+        "resolved_revision": manifest.resolved_revision,
         "pinned_version": manifest.pinned_version,
         "fetched_at_unix_seconds": manifest.fetched_at_unix_seconds,
         "downloaded_bytes": manifest.downloaded_bytes,
@@ -338,7 +341,10 @@ mod tests {
             std::process::id()
         ));
         let value = serde_json::to_value(list_retroarch_cheat_sources(&root).unwrap()).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["schema_version"],
+            archivefs_core::patch_manager::CHEAT_SOURCE_RESULT_SCHEMA_VERSION
+        );
         assert!(value["entries"].is_array());
         assert_eq!(
             value["entries"][0]["source"]["source_id"],

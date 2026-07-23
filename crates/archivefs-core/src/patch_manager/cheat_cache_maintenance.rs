@@ -16,12 +16,14 @@ use sha2::{Digest, Sha256};
 use crate::emulator_environment::EncodedPath;
 
 use super::cheat_cache_lock::LockedCheatCache;
+#[cfg(test)]
+use super::cheat_sources::CHEAT_SOURCE_RESULT_SCHEMA_VERSION;
 use super::cheat_sources::{
-    CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceCacheMetadata, CheatSourceError,
-    CheatSourceFreshness, CheatSourceManifest, MANIFESTS_DIRECTORY, METADATA_FILE,
-    SNAPSHOTS_DIRECTORY, STAGING_DIRECTORY, atomic_write_json, cache_error,
-    collect_catalogue_manifest, manifest_freshness, now_seconds, safe_regular_or_directory,
-    validate_cache_path_for_read, validate_catalogue_prefix, validate_snapshot_name,
+    CheatSourceCacheMetadata, CheatSourceError, CheatSourceFreshness, CheatSourceManifest,
+    MANIFESTS_DIRECTORY, METADATA_FILE, SNAPSHOTS_DIRECTORY, STAGING_DIRECTORY, atomic_write_json,
+    cache_error, collect_catalogue_manifest, manifest_freshness, now_seconds,
+    safe_regular_or_directory, supported_cheat_source_schema, validate_cache_path_for_read,
+    validate_catalogue_prefix, validate_snapshot_name,
 };
 
 pub const CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION: u32 = 1;
@@ -465,7 +467,7 @@ fn inspect_inventory_entry(
             .join(format!("{id}.json"));
         match read_manifest(&manifest_path) {
             Ok(value) => {
-                if value.format_version != CHEAT_SOURCE_RESULT_SCHEMA_VERSION {
+                if !supported_cheat_source_schema(value.format_version) {
                     finding(
                         &mut findings,
                         SnapshotVerificationState::UnsupportedSchema,
@@ -711,7 +713,7 @@ fn read_current_snapshot(
         .and_then(|bytes| serde_json::from_slice::<CheatSourceCacheMetadata>(&bytes).ok());
     match metadata {
         Some(value)
-            if value.format_version == CHEAT_SOURCE_RESULT_SCHEMA_VERSION
+            if supported_cheat_source_schema(value.format_version)
                 && value.source_id == source_id
                 && metadata_current_binding_valid(&value, source_id) =>
         {
@@ -729,7 +731,7 @@ fn metadata_current_binding_valid(metadata: &CheatSourceCacheMetadata, source_id
         (None, None) => true,
         (Some(snapshot), Some(manifest)) => {
             validate_snapshot_name(snapshot).is_ok()
-                && manifest.format_version == CHEAT_SOURCE_RESULT_SCHEMA_VERSION
+                && supported_cheat_source_schema(manifest.format_version)
                 && manifest.source_id == source_id
                 && manifest.archive_sha256 == *snapshot
                 && manifest.cache_relative_path == format!("{SNAPSHOTS_DIRECTORY}/{snapshot}")
@@ -1951,9 +1953,11 @@ mod tests {
         let bytes = b"cheats = 0\n";
         fs::write(snapshot.join(relative), bytes).unwrap();
         let manifest = CheatSourceManifest {
-            format_version: 1,
+            format_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
             source_id: source.into(),
             source_url: "https://example.invalid/cheats.zip".into(),
+            canonical_repository_url: "https://github.com/libretro/libretro-database".into(),
+            resolved_revision: "1".repeat(40),
             pinned_version: None,
             fetched_at_unix_seconds: timestamp,
             downloaded_bytes: 20,
@@ -1985,12 +1989,13 @@ mod tests {
         .unwrap();
         if current {
             let metadata = CheatSourceCacheMetadata {
-                format_version: 1,
+                format_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
                 source_id: source.into(),
                 current_snapshot: Some(id.into()),
                 manifest: Some(manifest),
                 last_fetch_succeeded: true,
                 last_error: None,
+                last_error_at_unix_seconds: None,
             };
             fs::write(
                 source_root.join(METADATA_FILE),
@@ -2412,6 +2417,7 @@ mod tests {
             manifest: Some(manifest),
             last_fetch_succeeded: true,
             last_error: None,
+            last_error_at_unix_seconds: None,
         };
         fs::write(
             temp.0.join("source").join(METADATA_FILE),
