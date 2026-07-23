@@ -13914,13 +13914,16 @@ fn show_pcsx2_workflow(
         ),
     );
     widgets::card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
-            widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
-            widgets::status_badge(ui, "Uploaded · No", widgets::StatusTone::Info);
-            widgets::status_badge(ui, "Executed · No", widgets::StatusTone::Info);
-            widgets::status_badge(ui, "Changed · No", widgets::StatusTone::Info);
-        });
+        widgets::status_strip(
+            ui,
+            &[
+                ("Unverified local content", widgets::StatusTone::Warning),
+                ("Read-only", widgets::StatusTone::Success),
+                ("Uploaded · No", widgets::StatusTone::Info),
+                ("Executed · No", widgets::StatusTone::Info),
+                ("Changed · No", widgets::StatusTone::Info),
+            ],
+        );
         ui.label("ArchiveFS inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
     });
     let Some(selected_profile_id) = workflow.selected_pcsx2_profile_id.as_deref() else {
@@ -14059,13 +14062,16 @@ fn show_dolphin_workflow(
         Some("GameSettings INI sections are parsed as bounded text and are never evaluated."),
     );
     widgets::card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
-            widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
-            widgets::status_badge(ui, "Uploaded · No", widgets::StatusTone::Info);
-            widgets::status_badge(ui, "Executed · No", widgets::StatusTone::Info);
-            widgets::status_badge(ui, "Changed · No", widgets::StatusTone::Info);
-        });
+        widgets::status_strip(
+            ui,
+            &[
+                ("Unverified local content", widgets::StatusTone::Warning),
+                ("Read-only", widgets::StatusTone::Success),
+                ("Uploaded · No", widgets::StatusTone::Info),
+                ("Executed · No", widgets::StatusTone::Info),
+                ("Changed · No", widgets::StatusTone::Info),
+            ],
+        );
         ui.label("ArchiveFS inspects INI structure locally. It never invokes Dolphin, evaluates codes, follows referenced mod paths, or claims that structural inspection proves content is malware-free.");
     });
     let Some(selected_profile_id) = workflow.selected_dolphin_profile_id.as_deref() else {
@@ -15842,14 +15848,13 @@ fn show_existing_retroarch_library(
     }
     let path = Path::new(&destination.display);
     widgets::card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(ui, "Unverified local content", widgets::StatusTone::Warning);
-            widgets::status_badge(
-                ui,
-                "Modified by this workspace · No",
-                widgets::StatusTone::Info,
-            );
-        });
+        widgets::status_strip(
+            ui,
+            &[
+                ("Unverified local content", widgets::StatusTone::Warning),
+                ("Modified by this workspace · No", widgets::StatusTone::Info),
+            ],
+        );
         if widgets::path_value(ui, "RetroArch cheat directory", path) {
             let _ = clipboard.set_text(destination.display.clone());
         }
