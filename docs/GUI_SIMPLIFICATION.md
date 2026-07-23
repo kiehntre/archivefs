@@ -889,3 +889,218 @@ job, described next.
 
 Library IA migration Phase 1 total: 441 tests (434 from the Cheats & Mods
 structure milestone + 7 new) pass; 0 failures.
+
+---
+
+## Library IA migration - Phase 2 (`sonnet-library-tabs-visible-ui` branch)
+
+The visible half of the migration Phase 1 laid the foundation for: one
+Library page, four tabs, one sidebar destination. `MainView` keeps all 14
+variants; the four underlying render functions are completely unchanged.
+
+### Old navigation
+
+Sidebar: a "WORKFLOWS" section (11 destinations, including "Library") and
+a separate "LIBRARY TOOLS" section with three more buttons ("Health",
+"Duplicates", "Library Views") - four Library-related sidebar entries
+total, each opening its own bare page with its own heading and, on
+Health/Duplicates, a "Back to Library" button.
+
+### New navigation
+
+Sidebar: "WORKFLOWS" only, 11 destinations, same as before minus nothing
+- "Library" was already one of them. The "LIBRARY TOOLS" section and its
+three buttons are gone entirely. Clicking "Library" opens one page: a
+"Library" heading, a four-tab row (Archives/Health/Duplicates/Views), and
+the selected tab's content below. The Library button renders selected
+while on *any* of the four tabs, and clicking it restores whichever tab
+was last selected rather than always resetting to Archives.
+
+### Unified Library shell structure
+
+`ArchiveFsApp::update`'s central-panel dispatch now has one block, guarded
+by `library_tab_for_main_view(self.view).is_some()`, replacing what used
+to be three separate `if self.view == MainView::X { ...; return; }`
+blocks (Health, Duplicates, LibraryViews) plus an implicit fallthrough for
+Library. That block:
+
+1. Calls `show_library_shell_header(ui, self.library_tab)` - a new,
+   directly-testable function rendering the shared "Library" heading and
+   the `tab_row`-based tab selector, returning the clicked tab (if any).
+   A click calls `navigate_to_library_tab`.
+2. `match self.library_tab { ... }`: the `Archives` arm is empty (falls
+   through, unreturned, to the existing `match &self.state { Loading |
+   Error | Ready(data) => show_loaded_data(...) }` block below - shared
+   with `MainView::RecentlyFound`, completely unchanged); the `Health`,
+   `Duplicates`, and `Views` arms contain the exact bodies their old
+   standalone `if` blocks used to (same function calls, same arguments,
+   same action handling), each ending in `return`.
+
+`show_library_shell_header` was deliberately kept small - just the
+heading and tab row - rather than also taking on content dispatch: each
+tab's existing renderer needs direct `&mut self` field access
+(`self.health_filters`, `self.duplicate_filters`, `self.library_views`,
+`self.database_state`, ...) that a standalone function would have to take
+as a dozen-plus parameters, exactly the "giant parameter-heavy universal
+renderer" this milestone was told to avoid. The four existing render
+functions (`show_loaded_data`, `show_health_dashboard_panel`,
+`show_duplicate_review_panel`, `show_library_views_page`) were not
+touched at all - not renamed, not restructured, not given new
+parameters. They are the compatibility layer this phase preserves,
+exactly as Phase 1 anticipated ("They may become wrappers around shared
+tab-body renderers" - in practice, no wrapper functions were needed;
+their existing call sites just moved from four `if` blocks into one
+`match`'s arms, verbatim).
+
+**One acknowledged minor redundancy**: on the Archives tab, the shell's
+own "Library" heading is immediately followed by `show_loaded_data`'s own
+"Library" `page_header` (unchanged, since `show_loaded_data` is shared
+with `RecentlyFound` and its heading logic was not touched). The
+Health/Duplicates/Views tabs don't have this problem - their own
+headings ("Health Dashboard", "Duplicate Review", "Library Views") differ
+from the shell's. Fixing the Archives case would mean either giving
+`show_loaded_data` a way to suppress its own heading (a real behaviour
+change to a heavily-tested, `RecentlyFound`-shared function) or forking
+its call site - both bigger changes than this phase's "retain existing
+render functions" scope justified for a cosmetic duplicate heading.
+Recorded as a Phase 3 cleanup candidate below, not fixed here.
+
+### Compatibility strategy
+
+Kept exactly as-is: all 14 `MainView` variants (including `Health`,
+`Duplicates`, `LibraryViews`); `show_loaded_data`,
+`show_health_dashboard_panel`, `show_duplicate_review_panel`,
+`show_library_views_page` (names, signatures, and bodies all unchanged);
+`HealthDashboardAction`, `DuplicateReviewAction`, `LibraryViewAction` and
+their existing handling (except two incidental
+`DuplicateReviewAction::Close`/`ViewInLibrary` lines that stayed as plain
+`self.view = MainView::Library` assignments rather than being switched to
+`navigate_to_library_tab`, deliberately not migrated - see "Phase 3 work"
+below); every one of the ~11 legacy `self.view = MainView::X` assignments
+across the app (Sources, CheatsMods, ActiveMounts, AppOperationRequest,
+the activity panel) - none were touched, and all still correctly land on
+the right tab via the unchanged `reconcile_library_tab` from Phase 1.
+
+New: `show_library_shell_header` (the tab chrome); the sidebar click
+handler's one new special case for `MainView::Library` (restore the last
+tab instead of resetting); `navigation_destination_selected`'s new
+any-of-four-Library-views selected-state for the Library button.
+
+### Scrolling solution
+
+All four Library-related destinations now report `false` from
+`main_view_uses_page_scroll` - no outer page-level `ScrollArea`. Three
+(Library, Health, Duplicates) already managed their own internal,
+full-height `ScrollArea` and were already `false`; `LibraryViews` was the
+one exception, previously `true`. Auditing `show_library_views_page`
+found both of its variable-length lists (the view definitions themselves,
+and a selected view's plan-entry details) already sit in their own
+bounded `egui::ScrollArea` (`max_height` 320.0 and 240.0 respectively);
+everything else on the page - heading, "Add View" button, the Add/Edit/
+Remove dialogs (separate `egui::Window`s with their own scrolling) - is
+short, fixed-height content that was never actually at risk of
+overflowing. Flipping `LibraryViews` to `false` was therefore the
+smallest safe change: it makes all four tabs share one scrolling model
+(the tab row is always pinned above whichever scroll area, if any, a tab
+owns; there is never a second, outer scroll area fighting an inner one),
+and it does not clip or hide any content that used to be reachable via
+the outer page scroll, because nothing on that page actually depended on
+it. Documented on `main_view_uses_page_scroll`'s doc comment in the code,
+which is the authoritative source; this section summarizes it.
+
+### Tests converted from structural to behavioural checks
+
+- `every_navigation_destination_has_a_title_and_width_policy` no longer
+  chains the removed `SECONDARY_NAVIGATION_DESTINATIONS` const (deleted);
+  a new `legacy_library_destinations_still_have_a_title_and_width_policy`
+  test asserts the same property directly for `Health`/`Duplicates`/
+  `LibraryViews`, now that they aren't in any navigation const to iterate.
+- `primary_nav_rects` (the geometry-discovery test mirror) and
+  `all_navigation_destinations_are_reachable_via_a_real_click` both
+  dropped their `SECONDARY_NAVIGATION_DESTINATIONS` iteration - the
+  mirror now matches `show_primary_navigation`'s actual single-section
+  layout, and the click-reachability test now iterates exactly the
+  destinations that are still sidebar buttons.
+- `long_content_pages_use_shared_scrolling_without_changing_table_pages`
+  updated to assert the new scrolling rule (all four Library-related
+  destinations use internal scrolling) instead of the old one
+  (`LibraryViews` used page scroll).
+- New, not conversions: `library_is_the_only_sidebar_destination_for_the_library_area`
+  and `library_sidebar_button_is_selected_on_every_library_tab` directly
+  assert the consolidated sidebar's shape and selected-state behaviour -
+  the behavioural properties the old structural tests' literal 3-entry
+  iteration used to only incidentally cover.
+
+### Remaining risks / limitations
+
+- The Archives-tab duplicate "Library" heading (see above) - cosmetic,
+  not a functional bug, deferred.
+- `show_library_shell_header` is directly tested; the `match
+  self.library_tab { ... }` *content dispatch* inside `update` is not,
+  because nothing in this codebase unit-tests the real
+  `eframe::App::update` (it requires a full `eframe::Frame`, which
+  nothing here constructs even for unrelated views). Confidence in the
+  dispatch itself comes from: it calls the exact same functions with the
+  exact same arguments the old standalone blocks did (a mechanical,
+  reviewable move, not new logic); Phase 1's routing tests
+  (`legacy_routes_reconcile_to_the_correct_library_tab`, etc.) prove
+  `self.library_tab` ends up correct for every legacy route; and the
+  four underlying render functions retain their own full existing test
+  coverage, unchanged. This is a pre-existing gap in this codebase's
+  testing conventions (the whole `update` method has always been
+  untested this way), not one introduced by this milestone.
+- PCSX2/Dolphin, mount/unmount, rollback, journal, cleanup, detection,
+  and database code were not touched - out of scope, and not audited
+  further here since nothing in this phase's diff touches those files.
+
+### Phase 3 work still required
+
+1. **Fix the Archives-tab duplicate heading** - give `show_loaded_data`
+   a way to suppress its own "Library" `page_header` when called from
+   the unified shell (a small, real change to a function this phase
+   deliberately left untouched).
+2. **Migrate the ~11 legacy `self.view = MainView::X` call sites** to
+   `navigate_to_library_tab` where they target a Library destination,
+   including the two `DuplicateReviewAction` arms this phase touched
+   but deliberately left as plain `view` assignments. Not required for
+   correctness (reconciliation already makes them work), but would make
+   `library_tab` the single place Library navigation is expressed
+   instead of two equivalent-but-different call patterns coexisting.
+3. **Decide whether `MainView::Health`/`Duplicates`/`LibraryViews` should
+   be removed as enum variants** once every call site that used to set
+   them directly instead calls `navigate_to_library_tab` - only sensible
+   after (2).
+4. **Reconsider the per-tab "Back to Library" buttons** inside
+   `show_health_dashboard_panel`/`show_duplicate_review_panel` - they
+   still work (they set `view = MainView::Library`, which the shell
+   correctly opens on the Archives tab), but are partially redundant now
+   that a one-click tab switch does the same thing. Not broken, just a
+   candidate for simplification once the page bodies are next touched
+   for an unrelated reason.
+5. **Only then**, as Phase 1 already noted, consider whether genuinely
+   shared content-rendering code exists across the four tab bodies worth
+   extracting - still premature until (1)-(4) settle the page's final
+   shape.
+
+## Test coverage added in the Library IA migration Phase 2
+
+- `main.rs`: `views_configuration_survives_a_library_tab_switch` -
+  `library_views` and `library_view_plan_filter` survive cycling through
+  every tab, extending Phase 1's equivalent test (which covered
+  Archives/Health/Duplicates state) to Views;
+  `library_shell_header_shows_all_four_tab_labels`;
+  `library_shell_header_tabs_are_reachable_via_a_real_click` - a real
+  pointer-event click (not just a function call) on each of the four tab
+  labels returns that exact tab, mirroring the click-test pattern used
+  for primary navigation and the Cheats & Mods adapter selector;
+  `library_shell_header_marks_the_current_tab_selected`;
+  `library_is_the_only_sidebar_destination_for_the_library_area` -
+  `PRIMARY_NAVIGATION_DESTINATIONS` contains exactly one Library-related
+  entry and none of Health/Duplicates/LibraryViews;
+  `library_sidebar_button_is_selected_on_every_library_tab`;
+  `clicking_library_in_the_sidebar_restores_the_last_selected_tab`;
+  `legacy_library_destinations_still_have_a_title_and_width_policy`
+  (structural-test replacement, see above).
+
+Library IA migration Phase 2 total: 449 tests (441 from Phase 1 + 8 new)
+pass; 0 failures.
