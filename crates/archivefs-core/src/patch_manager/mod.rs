@@ -40,6 +40,7 @@ mod retroarch;
 mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
+mod shared_preview;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -171,6 +172,16 @@ pub use retroarch_inventory::{
     ArtifactConflictState, ArtifactDiagnostic, ArtifactDiagnosticSeverity, ArtifactKind,
     ArtifactPlaylistEvidence, CheatFileSummary, RetroArchArtifactDestination,
     RetroArchArtifactFinding, RetroArchArtifactInventory, RetroArchArtifactSummary,
+};
+pub use shared_preview::{
+    PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,
+    PREVIEW_MAX_DESTINATION_PATHS, PREVIEW_MAX_ENTRIES, PREVIEW_MAX_SOURCE_FILES_HASHED,
+    PREVIEW_MAX_TOTAL_BYTES_HASHED, PREVIEW_MAX_WARNINGS, PreviewAdapter, PreviewBlocker,
+    PreviewBlockerKind, PreviewConflict, PreviewConflictKind, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewProposedAction, PreviewSourceItem, PreviewState, PreviewSummary,
+    PreviewWarning, PreviewWarningKind, SharedPreviewEntry, SharedPreviewError,
+    SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
