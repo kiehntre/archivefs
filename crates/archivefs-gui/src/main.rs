@@ -2407,13 +2407,6 @@ enum LibraryTab {
 /// The `MainView` destination that currently renders `tab`'s content -
 /// the inverse of `library_tab_for_main_view`. Used by
 /// `ArchiveFsApp::navigate_to_library_tab`.
-///
-/// `#[allow(dead_code)]`: not yet called from any production UI (only
-/// from `navigate_to_library_tab`, itself not yet called from production
-/// UI, and from this milestone's tests) - deliberate Phase 1 foundation
-/// scaffolding for Phase 2's tab control, not an oversight. See
-/// docs/GUI_SIMPLIFICATION.md's "Library IA migration" section.
-#[allow(dead_code)]
 fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
     match tab {
         LibraryTab::Archives => MainView::Library,
@@ -2438,13 +2431,10 @@ fn library_tab_for_main_view(view: MainView) -> Option<LibraryTab> {
     }
 }
 
-/// The label Phase 2's tab UI should show for `tab` - kept as one shared
-/// source of truth now so that UI, rather than being invented ad hoc
-/// later, only has to be wired up to it.
-///
-/// `#[allow(dead_code)]`: see `main_view_for_library_tab` - same
-/// deliberate not-yet-wired-into-production-UI status.
-#[allow(dead_code)]
+/// The label the Library tab selector shows for `tab` - the one shared
+/// source of truth `show_primary_navigation`'s Library button and the
+/// unified Library shell's `tab_row` both read, so the two can never
+/// drift apart.
 fn library_tab_label(tab: LibraryTab) -> &'static str {
     match tab {
         LibraryTab::Archives => "Archives",
@@ -2809,11 +2799,8 @@ struct ArchiveFsApp {
     /// lives in its own fields below, independent of this one.
     view: MainView,
     /// The last Library-area tab the user was on - see `LibraryTab`'s doc
-    /// comment for the synchronization rule with `view`. Foundation-only
-    /// state for the Phase 2 unified Library page: nothing currently reads
-    /// this to decide what renders (`view` alone still drives that,
-    /// unchanged), but it is kept correctly up to date every frame so
-    /// Phase 2 can start consuming it without a state-migration step.
+    /// comment for the synchronization rule with `view`. Drives which tab
+    /// the unified Library shell shows.
     library_tab: LibraryTab,
     /// Which "Tools" screen (if any) is showing in front of `view` - see
     /// `ToolsOverlay`'s doc comment.
@@ -3026,10 +3013,8 @@ impl ArchiveFsApp {
     /// `view` directly, exactly as before). Sets both fields together so
     /// they can never briefly disagree; `tools_overlay` is cleared to
     /// match every other navigation call site's behaviour (see the
-    /// sidebar-click handler in `update`). Not yet called from any
-    /// production UI - it exists for Phase 2's tab control to call, and
-    /// is exercised directly by this milestone's tests.
-    #[allow(dead_code)]
+    /// sidebar-click handler in `update`). Called by the unified Library
+    /// shell's tab_row.
     fn navigate_to_library_tab(&mut self, tab: LibraryTab) {
         self.view = main_view_for_library_tab(tab);
         self.library_tab = tab;
@@ -7850,6 +7835,43 @@ impl eframe::App for ArchiveFsApp {
                         &mut self.clipboard,
                     );
                     return;
+                }
+
+                // The unified Library shell: one heading and one tab
+                // selector shared by all four Library-related
+                // destinations. Only the Archives tab (MainView::Library)
+                // is routed through it so far - Health, Duplicates, and
+                // Library Views still render via their own `if self.view
+                // == MainView::X { ...; return; }` blocks below, unchanged.
+                // Folding those into this same block (removing their
+                // separate `if`s, matching on `self.library_tab` instead)
+                // is the very next change, so the shell covers every tab.
+                //
+                // Deliberately does *not* `return` for the Archives case:
+                // falling through to the existing `match &self.state`
+                // block below (shared with MainView::RecentlyFound,
+                // unchanged) is exactly how MainView::Library already
+                // reached it before this shell existed.
+                if self.view == MainView::Library {
+                    widgets::page_header(
+                        ui,
+                        "Library",
+                        "Archives, health, duplicates, and saved views for your library.",
+                    );
+                    let tab_options: [(LibraryTab, &str); 4] = [
+                        (LibraryTab::Archives, library_tab_label(LibraryTab::Archives)),
+                        (LibraryTab::Health, library_tab_label(LibraryTab::Health)),
+                        (
+                            LibraryTab::Duplicates,
+                            library_tab_label(LibraryTab::Duplicates),
+                        ),
+                        (LibraryTab::Views, library_tab_label(LibraryTab::Views)),
+                    ];
+                    if let Some(clicked_tab) = widgets::tab_row(ui, &tab_options, self.library_tab)
+                    {
+                        self.navigate_to_library_tab(clicked_tab);
+                    }
+                    ui.add_space(theme::SECTION_GAP);
                 }
 
                 match &self.state {
