@@ -18654,11 +18654,21 @@ fn show_loaded_data(
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
     if !recent_view {
-        widgets::page_header(
-            ui,
-            "Library",
-            "Search the archive catalogue, review metadata, and use context menus for focused actions.",
+        // No `widgets::page_header`/heading here: the only production
+        // caller left with `recent_view == false` is the unified Library
+        // shell's Archives tab (see `show_library_shell_header`), which
+        // already renders the page's one "Library" heading above the tab
+        // row - a second "Library" heading here would just repeat it.
+        // The archive-table-specific description that used to accompany
+        // that heading is kept as a plain label, since it says something
+        // the shell's own (more general, four-tab) description doesn't.
+        ui.label(
+            egui::RichText::new(
+                "Search the archive catalogue, review metadata, and use context menus for focused actions.",
+            )
+            .color(theme::muted(ui)),
         );
+        ui.add_space(theme::SECTION_GAP);
     }
     // A resizable top panel (egui's own built-in support - session
     // persistence, drag-handle hover cursor, and min/max clamping all come
