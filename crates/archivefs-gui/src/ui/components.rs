@@ -156,6 +156,26 @@ pub(crate) fn status_strip(ui: &mut egui::Ui, items: &[(&str, StatusTone)]) {
     });
 }
 
+/// A card containing a vertical list of "label: status badge" rows - the
+/// "Workflow state" shape shared identically by every Cheats & Mods
+/// emulator adapter (RetroArch, PCSX2, Dolphin), each stating
+/// profile/source/trust/inspection/destination/installation status the
+/// same way. Introduced because those three call sites were byte-for-byte
+/// identical except for their row contents.
+pub(crate) fn status_rows(ui: &mut egui::Ui, rows: &[(&str, &str, StatusTone)]) {
+    card(ui, |ui| {
+        for (label, value, tone) in rows {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [132.0, 0.0],
+                    egui::Label::new(egui::RichText::new(*label).strong()),
+                );
+                status_badge(ui, *value, *tone);
+            });
+        }
+    });
+}
+
 /// One consistent presentation for "an operation failed, but the previous
 /// good result is still active" - the shape most retrieval/refresh
 /// failures in ArchiveFS take (the old cheat database, the old catalogue,

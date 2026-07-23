@@ -13273,8 +13273,9 @@ fn show_cheats_mods_workflow_states(
             "Profile, source, inspection, destination, and installation remain separate decisions.",
         ),
     );
-    widgets::card(ui, |ui| {
-        for (label, value, tone) in [
+    widgets::status_rows(
+        ui,
+        &[
             ("Emulator profile", profile_label.as_str(), profile_tone),
             ("Cheat or mod source", source_label, source_tone),
             ("Trust state", trust_label, trust_tone),
@@ -13301,16 +13302,8 @@ fn show_cheats_mods_workflow_states(
                     widgets::StatusTone::Pending
                 },
             ),
-        ] {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_sized(
-                    [132.0, 0.0],
-                    egui::Label::new(egui::RichText::new(label).strong()),
-                );
-                widgets::status_badge(ui, value, tone);
-            });
-        }
-    });
+        ],
+    );
 }
 
 fn show_pcsx2_workflow_states(
@@ -13351,8 +13344,9 @@ fn show_pcsx2_workflow_states(
         "Workflow state",
         Some("Profile, source, inspection, destination, and installation remain separate states."),
     );
-    widgets::card(ui, |ui| {
-        for (label, value, tone) in [
+    widgets::status_rows(
+        ui,
+        &[
             ("Emulator profile", profile_label.as_str(), profile_tone),
             (
                 "Cheat or mod source",
@@ -13375,16 +13369,8 @@ fn show_pcsx2_workflow_states(
                 "Unavailable · read-only adapter",
                 widgets::StatusTone::Pending,
             ),
-        ] {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_sized(
-                    [132.0, 0.0],
-                    egui::Label::new(egui::RichText::new(label).strong()),
-                );
-                widgets::status_badge(ui, value, tone);
-            });
-        }
-    });
+        ],
+    );
 }
 
 fn pcsx2_integration_presentation(profiles: &Pcsx2ProfilesState) -> (String, widgets::StatusTone) {
@@ -13465,8 +13451,9 @@ fn show_dolphin_workflow_states(
             "Profile, inspection, identity, destination, and installation remain separate states.",
         ),
     );
-    widgets::card(ui, |ui| {
-        for (label, value, tone) in [
+    widgets::status_rows(
+        ui,
+        &[
             ("Emulator profile", profile_label.as_str(), profile_tone),
             (
                 "Cheat or mod source",
@@ -13489,16 +13476,8 @@ fn show_dolphin_workflow_states(
                 "Unavailable · read-only adapter",
                 widgets::StatusTone::Pending,
             ),
-        ] {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_sized(
-                    [132.0, 0.0],
-                    egui::Label::new(egui::RichText::new(label).strong()),
-                );
-                widgets::status_badge(ui, value, tone);
-            });
-        }
-    });
+        ],
+    );
 }
 
 fn dolphin_integration_presentation(
@@ -15582,27 +15561,24 @@ fn show_cheats_mods_page(
                 action = Some(CheatWorkflowAction::ChooseArchive);
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(
-                ui,
-                "Trusted catalogue retrieval available",
-                widgets::StatusTone::Success,
-            );
-            if workflow.is_none() {
-                widgets::status_badge(ui, "Matching pending", widgets::StatusTone::Pending);
-                widgets::status_badge(ui, "Installation gated", widgets::StatusTone::Pending);
-            } else if pcsx2_read_only || dolphin_read_only {
-                widgets::status_badge(ui, "Read-only preview", widgets::StatusTone::Info);
-                widgets::status_badge(ui, "Preview only", widgets::StatusTone::Pending);
-            } else {
-                widgets::status_badge(ui, "Shared matching available", widgets::StatusTone::Info);
-                widgets::status_badge(
-                    ui,
-                    "Controlled apply after eligible preview",
-                    widgets::StatusTone::Info,
-                );
-            }
-        });
+        let mut readiness_items = vec![(
+            "Trusted catalogue retrieval available",
+            widgets::StatusTone::Success,
+        )];
+        if workflow.is_none() {
+            readiness_items.push(("Matching pending", widgets::StatusTone::Pending));
+            readiness_items.push(("Installation gated", widgets::StatusTone::Pending));
+        } else if pcsx2_read_only || dolphin_read_only {
+            readiness_items.push(("Read-only preview", widgets::StatusTone::Info));
+            readiness_items.push(("Preview only", widgets::StatusTone::Pending));
+        } else {
+            readiness_items.push(("Shared matching available", widgets::StatusTone::Info));
+            readiness_items.push((
+                "Controlled apply after eligible preview",
+                widgets::StatusTone::Info,
+            ));
+        }
+        widgets::status_strip(ui, &readiness_items);
     });
     ui.add_space(theme::SECTION_GAP);
 
