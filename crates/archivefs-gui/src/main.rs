@@ -4001,10 +4001,14 @@ impl ArchiveFsApp {
                     None,
                     ActivityOutcome::Completed,
                     format!(
-                        "RetroArch catalogue '{}' activated at revision {} ({} files verified).",
+                        "RetroArch catalogue '{}' activated at revision {} ({} files verified; {} indexed, {} excluded).",
                         source_id,
                         fetch.manifest.resolved_revision,
-                        fetch.manifest.files.len()
+                        fetch.manifest.files.len(),
+                        fetch.manifest.indexed_file_count,
+                        fetch.manifest.malformed_cheat_count
+                            + fetch.manifest.excluded_unsupported_count
+                            + fetch.manifest.excluded_path_encoding_count
                     ),
                 ));
                 if let Some(workflow) = self.cheat_workflow.as_mut() {
@@ -5410,6 +5414,20 @@ impl ArchiveFsApp {
                                     report.entries.len()
                                 ),
                             ),
+                            CheatPreviewOutcome::Ready(report)
+                                if response.materialized.is_some() =>
+                            {
+                                let materialized = response.materialized.as_ref().unwrap();
+                                (
+                                    ActivityOutcome::Completed,
+                                    format!(
+                                        "Matching ready: {} indexed catalogue entries, {} excluded; preview completed for {} entries.",
+                                        materialized.indexed_file_count,
+                                        materialized.excluded_file_count,
+                                        report.entries.len()
+                                    ),
+                                )
+                            }
                             CheatPreviewOutcome::Ready(report) => (
                                 ActivityOutcome::Completed,
                                 format!(
@@ -5417,6 +5435,16 @@ impl ArchiveFsApp {
                                     report.entries.len()
                                 ),
                             ),
+                            CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(
+                                error,
+                            )) if error.kind
+                                == RetroArchMaterializationErrorKind::MatchingEntryExcluded =>
+                            {
+                                (
+                                    ActivityOutcome::Rejected,
+                                    format!("Matching entry excluded: {}", error.detail),
+                                )
+                            }
                             CheatPreviewOutcome::Failed(error) => (
                                 ActivityOutcome::Failed,
                                 format!("Read-only preview failed: {error}"),
@@ -9740,6 +9768,7 @@ fn catalogue_status_label(status: CheatCatalogueStatus) -> &'static str {
     match status {
         CheatCatalogueStatus::Missing => "Missing",
         CheatCatalogueStatus::Ready => "Ready",
+        CheatCatalogueStatus::ReadyWithWarnings => "Verified with warnings",
         CheatCatalogueStatus::Stale => "Stale",
         CheatCatalogueStatus::InvalidManifest => "Invalid manifest",
         CheatCatalogueStatus::Incomplete => "Incomplete",
@@ -9796,6 +9825,9 @@ fn show_retroarch_catalogue_manager(
                             catalogue_status_label(entry.status),
                             match entry.status {
                                 CheatCatalogueStatus::Ready => widgets::StatusTone::Success,
+                                CheatCatalogueStatus::ReadyWithWarnings => {
+                                    widgets::StatusTone::Warning
+                                }
                                 CheatCatalogueStatus::Missing => widgets::StatusTone::Pending,
                                 CheatCatalogueStatus::Stale | CheatCatalogueStatus::Cancelled => {
                                     widgets::StatusTone::Warning
@@ -9816,7 +9848,13 @@ fn show_retroarch_catalogue_manager(
                     }
                     ui.horizontal_wrapped(|ui| {
                         if let Some(count) = entry.catalogue_file_count {
-                            ui.label(format!("Files: {count}"));
+                            ui.label(format!("Active files: {count}"));
+                        }
+                        if let Some(count) = entry.indexed_file_count {
+                            ui.label(format!("Indexed: {count}"));
+                        }
+                        if let Some(count) = entry.excluded_file_count {
+                            ui.label(format!("Excluded: {count}"));
                         }
                         if let Some(bytes) = entry.total_bytes {
                             ui.label(format!("Verified size: {}", format_size(Some(bytes))));
@@ -9828,10 +9866,22 @@ fn show_retroarch_catalogue_manager(
                             ));
                         }
                     });
+                    for warning in summarise_cheat_warnings(&entry.warnings) {
+                        widgets::banner(
+                            ui,
+                            "Verified catalogue exclusion",
+                            &warning,
+                            widgets::StatusTone::Warning,
+                        );
+                    }
                     if let Some(error) = &entry.last_error {
                         widgets::banner(
                             ui,
-                            "Last update failed; active snapshot retained",
+                            if entry.setup_usable {
+                                "Update failed · existing catalogue remains active and usable"
+                            } else {
+                                "Update failed · no usable active catalogue"
+                            },
                             &error.to_string(),
                             widgets::StatusTone::Warning,
                         );
@@ -9904,6 +9954,19 @@ fn show_retroarch_catalogue_manager(
                             );
                             if let Some(digest) = &entry.archive_sha256 {
                                 widgets::copyable_value(ui, "Snapshot SHA-256", digest);
+                            }
+                            if !entry.exclusion_examples.is_empty() {
+                                ui.separator();
+                                ui.strong("Bounded exclusion examples");
+                                for example in &entry.exclusion_examples {
+                                    ui.label(format!(
+                                        "{:?}: {}",
+                                        example.kind,
+                                        example.relative_path.as_deref().unwrap_or(
+                                            "path bytes are not representable safely as UTF-8"
+                                        )
+                                    ));
+                                }
                             }
                             ui.label(format!("Trust classification: {}", entry.trust_status));
                             if ui.button("Copy provider details").clicked() {
@@ -12817,8 +12880,10 @@ fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
                 format!(
                     "{count} catalogue files could not be parsed and were excluded from matching."
                 )
-            } else if warning.contains("non-UTF-8 catalogue files were safely skipped") {
-                format!("{count} files used unsupported path encoding and were skipped safely.")
+            } else if warning.contains("unsupported content or encoding") {
+                format!("{count} files used unsupported content encoding and were excluded.")
+            } else if warning.contains("paths used unsupported encoding") {
+                format!("{count} paths used unsupported encoding and were excluded safely.")
             } else if warning == "cached snapshot is stale" {
                 "The cached catalogue is stale; update it when a network connection is available."
                     .to_string()
@@ -12850,7 +12915,6 @@ enum CheatWorkflowAction {
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
-const CHEAT_STAGE3_BODY: &str = "Catalogue retrieval is available. Archive matching and cheat installation are not yet implemented in this GUI workflow.";
 const LOCAL_INSPECTION_PRIVACY_COPY: &str = "Trusted catalogue archives are validated locally on this device for unsafe paths, special entries, resource-limit violations, and unexpected structure. Scan results, filenames, file contents, hashes, and metadata are not sent to the ArchiveFS developers or any third party. General local or community-source inspection is planned and is not active yet.";
 const IMPORT_CONSENT_COPY: &str = "Only import cheats or mods from sources you trust. ArchiveFS performs local structural and format checks where an implemented adapter provides them, but it is not an antivirus scanner.";
 const ETHICAL_USE_COPY: &str = "ArchiveFS is intended for preservation, accessibility, personal customization, and legitimate interoperability. It must not be used to bypass copy protection, licensing systems, access controls, or other technical protections. Game developers, artists, musicians, writers, testers, and publishers invest substantial effort in creating games; supporting legitimate releases helps future games, updates, and preservation efforts.";
@@ -13010,8 +13074,20 @@ fn show_cheats_mods_workflow_states(
             ),
             (
                 "Installation state",
-                "Unavailable",
-                widgets::StatusTone::Pending,
+                if workflow.is_some_and(|workflow| {
+                    workflow.source_mode == CheatSourceMode::ArchiveFsTrustedCatalogue
+                }) {
+                    "Controlled apply available after eligible preview"
+                } else {
+                    "Unavailable for this source mode"
+                },
+                if workflow.is_some_and(|workflow| {
+                    workflow.source_mode == CheatSourceMode::ArchiveFsTrustedCatalogue
+                }) {
+                    widgets::StatusTone::Info
+                } else {
+                    widgets::StatusTone::Pending
+                },
             ),
         ] {
             ui.horizontal_wrapped(|ui| {
@@ -13447,16 +13523,6 @@ fn show_recent_cheat_activity(
         });
         ui.add_space(4.0);
     }
-}
-
-fn show_cheat_unavailable_stage(ui: &mut egui::Ui) {
-    widgets::section_header(ui, "Stage 3 · Matching and installation", None);
-    widgets::banner(
-        ui,
-        "Not available",
-        CHEAT_STAGE3_BODY,
-        widgets::StatusTone::Pending,
-    );
 }
 
 fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only: bool) {
@@ -14810,6 +14876,16 @@ fn show_shared_cheat_preview(
         ),
         CheatStepResource::Ready(response) => match &response.outcome {
             CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(error))
+                if error.kind == RetroArchMaterializationErrorKind::MatchingEntryExcluded =>
+            {
+                widgets::banner(
+                    ui,
+                    "Matching catalogue entry excluded",
+                    &format!("{}. Nothing can be applied.", error.detail),
+                    widgets::StatusTone::Warning,
+                )
+            }
+            CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(error))
                 if error.kind == RetroArchMaterializationErrorKind::NoEligibleMatch =>
             {
                 widgets::banner(
@@ -14857,6 +14933,12 @@ fn show_shared_cheat_preview(
                             } else {
                                 "s"
                             }
+                        ));
+                        ui.label(format!(
+                            "Catalogue index: {:?} · {} indexed · {} excluded",
+                            materialized.catalogue_index_state,
+                            materialized.indexed_file_count,
+                            materialized.excluded_file_count
                         ));
                     });
                 }
@@ -15259,8 +15341,20 @@ fn show_cheats_mods_page(
                 "Trusted catalogue retrieval available",
                 widgets::StatusTone::Success,
             );
-            widgets::status_badge(ui, "Matching unavailable", widgets::StatusTone::Pending);
-            widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
+            if workflow.is_none() {
+                widgets::status_badge(ui, "Matching pending", widgets::StatusTone::Pending);
+                widgets::status_badge(ui, "Installation gated", widgets::StatusTone::Pending);
+            } else if pcsx2_read_only || dolphin_read_only {
+                widgets::status_badge(ui, "Read-only preview", widgets::StatusTone::Info);
+                widgets::status_badge(ui, "Preview only", widgets::StatusTone::Pending);
+            } else {
+                widgets::status_badge(ui, "Shared matching available", widgets::StatusTone::Info);
+                widgets::status_badge(
+                    ui,
+                    "Controlled apply after eligible preview",
+                    widgets::StatusTone::Info,
+                );
+            }
         });
     });
     ui.add_space(theme::SECTION_GAP);
@@ -15305,8 +15399,6 @@ fn show_cheats_mods_page(
                     }
                 };
                 action = action.or(source_action);
-                ui.add_space(theme::SECTION_GAP);
-                show_cheat_unavailable_stage(ui);
             }
             CheatEmulatorAdapter::Pcsx2 => {
                 action = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, clipboard).or(action);
@@ -21214,7 +21306,8 @@ mod tests {
     fn trusted_source_warnings_are_summarised_calmly_without_losing_counts() {
         let summaries = summarise_cheat_warnings(&[
             "147 catalogue files were retained but are non-actionable because parsing was incomplete".to_string(),
-            "6 non-UTF-8 catalogue files were safely skipped and are non-actionable".to_string(),
+            "6 catalogue files used unsupported content or encoding and were excluded".to_string(),
+            "2 catalogue paths used unsupported encoding and were excluded".to_string(),
         ]);
         assert_eq!(
             summaries[0],
@@ -21222,7 +21315,11 @@ mod tests {
         );
         assert_eq!(
             summaries[1],
-            "6 files used unsupported path encoding and were skipped safely."
+            "6 files used unsupported content encoding and were excluded."
+        );
+        assert_eq!(
+            summaries[2],
+            "2 paths used unsupported encoding and were excluded safely."
         );
     }
 
@@ -21487,9 +21584,13 @@ mod tests {
             response_etag: None,
             response_last_modified: None,
             catalogue_file_count: 0,
+            indexed_file_count: 0,
             valid_cheat_count: 0,
             malformed_cheat_count: 0,
             skipped_entry_count: 0,
+            excluded_unsupported_count: 0,
+            excluded_path_encoding_count: 0,
+            exclusion_examples: vec![],
             discovered_platforms: Vec::new(),
             validation_complete: true,
             warnings: Vec::new(),
@@ -21545,6 +21646,9 @@ mod tests {
                     fetched_at_unix_seconds: Some(0),
                     archive_sha256: Some("fixture-digest".to_string()),
                     catalogue_file_count: Some(4),
+                    indexed_file_count: Some(4),
+                    excluded_file_count: Some(0),
+                    exclusion_examples: Vec::new(),
                     setup_usable: true,
                     status: archivefs_core::patch_manager::CheatCatalogueStatus::Ready,
                     total_bytes: Some(0),
@@ -22074,6 +22178,76 @@ mod tests {
         });
         assert!(rendered_text_contains(&output, "Update"));
         assert!(rendered_text_contains(&output, "Verify"));
+    }
+
+    #[test]
+    fn sources_retained_snapshot_stays_visibly_usable_after_update_failure() {
+        let (_, _, mut list) = cheat_source_list_fixture();
+        let entry = &mut list.entries[0];
+        entry.status = CheatCatalogueStatus::ReadyWithWarnings;
+        entry.indexed_file_count = Some(27_853);
+        entry.excluded_file_count = Some(147);
+        entry.last_error = Some(CheatSourceError {
+            schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+            stage: archivefs_core::patch_manager::CheatSourceErrorStage::Download,
+            code: "download_too_large".into(),
+            message: "received 134217729 bytes, exceeding configured limit 134217728 bytes".into(),
+        });
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_retroarch_catalogue_manager(
+                    ui,
+                    &CatalogueManagerState::Ready(list.clone()),
+                    None,
+                    None,
+                    None,
+                    &mut clipboard,
+                );
+            });
+        });
+        for expected in [
+            "Verified with warnings",
+            "Indexed: 27853",
+            "Excluded: 147",
+            "Update failed · existing catalogue remains active and usable",
+            "download_too_large",
+        ] {
+            assert!(rendered_text_contains(&output, expected));
+        }
+    }
+
+    #[test]
+    fn excluded_retroarch_match_has_precise_gui_state() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let key = cheat_preview_key(workflow);
+        workflow.preview = CheatStepResource::Ready(CheatPreviewResponse {
+            key,
+            outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(
+                RetroArchMaterializationError {
+                    kind: RetroArchMaterializationErrorKind::MatchingEntryExcluded,
+                    path: Some(PathBuf::from("/snapshot/Alien 3.cht")),
+                    detail: "matching catalogue file was excluded because it could not be parsed"
+                        .into(),
+                },
+            )),
+            materialized: None,
+        });
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_shared_cheat_preview(ui, workflow, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Matching catalogue entry excluded"
+        ));
+        assert!(rendered_text_contains(&output, "could not be parsed"));
+        assert!(!rendered_text_contains(&output, "No matching cheat found"));
     }
 
     #[test]
@@ -22665,7 +22839,7 @@ mod tests {
     }
 
     #[test]
-    fn cheats_mods_page_presents_real_profiles_trusted_source_and_unavailable_stage3() {
+    fn cheats_mods_page_routes_retroarch_to_shared_preview_without_stale_wording() {
         let mut app = app_with_cheats_mods_context();
         let (source_id, source_name, list) = cheat_source_list_fixture();
         let workflow = app.cheat_workflow.as_mut().unwrap();
@@ -22698,15 +22872,18 @@ mod tests {
             "Trusted catalogue details",
             source_name.as_str(),
             "Trusted built-in",
-            "Stage 3 · Matching and installation",
-            "Catalogue retrieval is available",
-            "Archive matching and cheat installation are not yet implemented",
+            "Shared preview",
+            "Controlled apply available after eligible preview",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
                 "Cheats & Mods page did not render {expected:?}"
             );
         }
+        assert!(!rendered_text_contains(
+            &output,
+            "Archive matching and cheat installation are not yet implemented"
+        ));
     }
 
     #[test]

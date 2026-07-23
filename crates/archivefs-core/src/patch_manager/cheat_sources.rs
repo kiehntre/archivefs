@@ -27,9 +27,10 @@ use crate::default_database_path;
 use crate::emulator_environment::{EncodedPath, HostReadOnlyFilesystem};
 
 use super::cheat_cache_lock::LockedCheatCache;
+use super::cheat_catalogue::{CatalogueEntryExclusionKind, MAX_CATALOGUE_EXCLUSION_EXAMPLES};
 use super::load_cheat_catalogue_snapshot;
 
-pub const CHEAT_SOURCE_RESULT_SCHEMA_VERSION: u32 = 2;
+pub const CHEAT_SOURCE_RESULT_SCHEMA_VERSION: u32 = 3;
 const CHEAT_SOURCE_LEGACY_SCHEMA_VERSION: u32 = 1;
 const CACHE_DIRECTORY: &str = "cheat-sources";
 pub(super) const METADATA_FILE: &str = "metadata.json";
@@ -41,13 +42,13 @@ pub const CHEAT_SOURCE_REDIRECT_LIMIT: usize = 3;
 const HEADER_BYTES_LIMIT: usize = 32 * 1024;
 pub const CHEAT_SOURCE_ENTRY_LIMIT: usize = 60_000;
 pub const CHEAT_SOURCE_FILE_SIZE_LIMIT: u64 = 8 * 1024 * 1024;
-pub const CHEAT_SOURCE_EXPANDED_SIZE_LIMIT: u64 = 256 * 1024 * 1024;
+pub const CHEAT_SOURCE_EXPANDED_SIZE_LIMIT: u64 = 512 * 1024 * 1024;
 const COMPRESSION_RATIO_LIMIT: u64 = 250;
 pub const CHEAT_SOURCE_PATH_BYTES_LIMIT: usize = 1024;
 const PATH_COMPONENT_LIMIT: usize = 24;
-pub const CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
+pub const CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT: u64 = 128 * 1024 * 1024;
 pub const CHEAT_SOURCE_MANIFEST_BYTES_LIMIT: usize = 16 * 1024 * 1024;
-pub const CHEAT_SOURCE_TIMEOUT_SECONDS: u64 = 45;
+pub const CHEAT_SOURCE_TIMEOUT_SECONDS: u64 = 90;
 pub const CHEAT_SOURCE_RETAINED_SNAPSHOTS_MINIMUM: usize = 2;
 const REVISION_RESPONSE_LIMIT: u64 = 64 * 1024;
 
@@ -307,10 +308,13 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
         }
         let content_length = header("content-length").and_then(|value| value.parse::<u64>().ok());
         if content_length.is_some_and(|size| size > maximum_bytes) {
+            let size = content_length.unwrap_or_default();
             return Err(CheatSourceError::new(
                 CheatSourceErrorStage::Download,
                 "download_too_large",
-                format!("declared response size exceeds {maximum_bytes} bytes"),
+                format!(
+                    "declared response size {size} bytes exceeds configured limit {maximum_bytes} bytes"
+                ),
             ));
         }
         let status = response.status().as_u16();
@@ -338,7 +342,9 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
                     return Err(CheatSourceError::new(
                         CheatSourceErrorStage::Download,
                         "download_too_large",
-                        format!("response exceeded {maximum_bytes} bytes"),
+                        format!(
+                            "received at least {downloaded_bytes} bytes, exceeding configured limit {maximum_bytes} bytes"
+                        ),
                     ));
                 }
                 destination
@@ -384,6 +390,21 @@ pub enum CheatSourceFetchStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheatSourceExclusionExample {
+    pub kind: CheatSourceExclusionKind,
+    pub relative_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheatSourceExclusionKind {
+    MalformedCht,
+    UnsupportedContentEncoding,
+    UnsupportedPathEncoding,
+    UnsupportedContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheatSourceManifest {
     pub format_version: u32,
     pub source_id: String,
@@ -402,9 +423,17 @@ pub struct CheatSourceManifest {
     pub response_etag: Option<String>,
     pub response_last_modified: Option<String>,
     pub catalogue_file_count: usize,
+    #[serde(default)]
+    pub indexed_file_count: usize,
     pub valid_cheat_count: usize,
     pub malformed_cheat_count: usize,
     pub skipped_entry_count: usize,
+    #[serde(default)]
+    pub excluded_unsupported_count: usize,
+    #[serde(default)]
+    pub excluded_path_encoding_count: usize,
+    #[serde(default)]
+    pub exclusion_examples: Vec<CheatSourceExclusionExample>,
     pub discovered_platforms: Vec<String>,
     pub validation_complete: bool,
     pub warnings: Vec<String>,
@@ -507,6 +536,9 @@ pub struct CheatSourceListEntry {
     pub fetched_at_unix_seconds: Option<u64>,
     pub archive_sha256: Option<String>,
     pub catalogue_file_count: Option<usize>,
+    pub indexed_file_count: Option<usize>,
+    pub excluded_file_count: Option<usize>,
+    pub exclusion_examples: Vec<CheatSourceExclusionExample>,
     pub setup_usable: bool,
     pub status: CheatCatalogueStatus,
     pub total_bytes: Option<u64>,
@@ -520,6 +552,7 @@ pub struct CheatSourceListEntry {
 pub enum CheatCatalogueStatus {
     Missing,
     Ready,
+    ReadyWithWarnings,
     Stale,
     InvalidManifest,
     Incomplete,
@@ -558,10 +591,31 @@ pub fn list_retroarch_cheat_sources(
                         .as_ref()
                         .map(|m| m.archive_sha256.clone()),
                     catalogue_file_count: inspection.manifest.as_ref().map(|m| m.files.len()),
+                    indexed_file_count: inspection
+                        .manifest
+                        .as_ref()
+                        .map(manifest_indexed_file_count),
+                    excluded_file_count: inspection
+                        .manifest
+                        .as_ref()
+                        .map(manifest_excluded_file_count),
+                    exclusion_examples: inspection
+                        .manifest
+                        .as_ref()
+                        .map(|manifest| manifest.exclusion_examples.clone())
+                        .unwrap_or_default(),
                     setup_usable: inspection.setup_usable,
                     status: match inspection.freshness {
                         CheatSourceFreshness::Missing => CheatCatalogueStatus::Missing,
                         CheatSourceFreshness::Stale => CheatCatalogueStatus::Stale,
+                        CheatSourceFreshness::Fresh | CheatSourceFreshness::Unknown
+                            if inspection.setup_usable
+                                && inspection.manifest.as_ref().is_some_and(|manifest| {
+                                    manifest_excluded_file_count(manifest) > 0
+                                }) =>
+                        {
+                            CheatCatalogueStatus::ReadyWithWarnings
+                        }
                         CheatSourceFreshness::Fresh | CheatSourceFreshness::Unknown
                             if inspection.setup_usable =>
                         {
@@ -587,6 +641,9 @@ pub fn list_retroarch_cheat_sources(
                     fetched_at_unix_seconds: None,
                     archive_sha256: None,
                     catalogue_file_count: None,
+                    indexed_file_count: None,
+                    excluded_file_count: None,
+                    exclusion_examples: Vec::new(),
                     setup_usable: false,
                     status: status_for_error(&error),
                     total_bytes: None,
@@ -601,6 +658,53 @@ pub fn list_retroarch_cheat_sources(
         schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
         entries,
     })
+}
+
+fn manifest_indexed_file_count(manifest: &CheatSourceManifest) -> usize {
+    if manifest.format_version >= 3 {
+        manifest.indexed_file_count
+    } else {
+        manifest
+            .catalogue_file_count
+            .saturating_sub(manifest.malformed_cheat_count)
+    }
+}
+
+fn manifest_excluded_file_count(manifest: &CheatSourceManifest) -> usize {
+    if manifest.format_version >= 3 {
+        manifest
+            .malformed_cheat_count
+            .saturating_add(manifest.excluded_unsupported_count)
+            .saturating_add(manifest.excluded_path_encoding_count)
+    } else {
+        let unsupported = manifest
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("non-UTF-8 catalogue files"))
+            .and_then(|warning| warning.split_whitespace().next())
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                manifest
+                    .skipped_entry_count
+                    .saturating_sub(manifest.malformed_cheat_count)
+            });
+        manifest.malformed_cheat_count.saturating_add(unsupported)
+    }
+}
+
+fn source_exclusion_kind(kind: CatalogueEntryExclusionKind) -> CheatSourceExclusionKind {
+    match kind {
+        CatalogueEntryExclusionKind::MalformedCht => CheatSourceExclusionKind::MalformedCht,
+        CatalogueEntryExclusionKind::UnsupportedContentEncoding => {
+            CheatSourceExclusionKind::UnsupportedContentEncoding
+        }
+        CatalogueEntryExclusionKind::UnsupportedPathEncoding => {
+            CheatSourceExclusionKind::UnsupportedPathEncoding
+        }
+        CatalogueEntryExclusionKind::UnsupportedContent => {
+            CheatSourceExclusionKind::UnsupportedContent
+        }
+    }
 }
 
 pub fn inspect_retroarch_cheat_source(
@@ -697,6 +801,11 @@ fn inspect_retroarch_cheat_source_locked(
         .manifest
         .as_ref()
         .map_or(CheatSourceFreshness::Missing, manifest_freshness);
+    let warnings = metadata
+        .manifest
+        .as_ref()
+        .map(|manifest| manifest.warnings.clone())
+        .unwrap_or_default();
     Ok(CheatSourceInspection {
         schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
         source,
@@ -709,15 +818,12 @@ fn inspect_retroarch_cheat_source_locked(
         last_error: metadata.last_error,
         last_error_at_unix_seconds: metadata.last_error_at_unix_seconds,
         setup_usable: usable,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
 pub(super) fn supported_cheat_source_schema(version: u32) -> bool {
-    matches!(
-        version,
-        CHEAT_SOURCE_LEGACY_SCHEMA_VERSION | CHEAT_SOURCE_RESULT_SCHEMA_VERSION
-    )
+    (CHEAT_SOURCE_LEGACY_SCHEMA_VERSION..=CHEAT_SOURCE_RESULT_SCHEMA_VERSION).contains(&version)
 }
 
 pub fn inspect_retroarch_cheat_source_snapshot(
@@ -765,6 +871,15 @@ pub fn inspect_retroarch_cheat_source_snapshot(
         .map_err(|error| cache_error("snapshot_manifest_read_failed", error))?;
     let manifest: CheatSourceManifest = serde_json::from_slice(&bytes)
         .map_err(|error| cache_error("snapshot_manifest_invalid", error))?;
+    if !supported_cheat_source_schema(manifest.format_version) {
+        return Err(cache_error(
+            "snapshot_manifest_unsupported_schema",
+            format!(
+                "unsupported snapshot manifest schema {}",
+                manifest.format_version
+            ),
+        ));
+    }
     if manifest.source_id != source_id
         || manifest.archive_sha256 != hash
         || manifest.cache_relative_path != format!("{SNAPSHOTS_DIRECTORY}/{hash}")
@@ -778,6 +893,7 @@ pub fn inspect_retroarch_cheat_source_snapshot(
     safe_regular_or_directory(&catalogue_path, true)?;
     verify_catalogue_manifest(&catalogue_path, &manifest.files)?;
     let freshness = manifest_freshness(&manifest);
+    let warnings = manifest.warnings.clone();
     Ok(CheatSourceInspection {
         schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
         source,
@@ -790,7 +906,7 @@ pub fn inspect_retroarch_cheat_source_snapshot(
         last_fetch_succeeded: None,
         last_error: None,
         last_error_at_unix_seconds: None,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -974,18 +1090,10 @@ fn fetch_and_publish(
     safe_regular_or_directory(&catalogue_path, true)?;
     let snapshot =
         load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, &source.source_id, &catalogue_path);
-    let malformed = snapshot
-        .games
-        .iter()
-        .filter(|game| !game.parsing_complete)
-        .count();
-    let safely_skippable = snapshot.diagnostics.iter().all(|diagnostic| {
-        matches!(
-            diagnostic.code,
-            "catalogue_cht_malformed_line" | "catalogue_file_invalid_utf8"
-        )
-    });
-    if snapshot.games.is_empty() || (!snapshot.complete && !safely_skippable) {
+    let malformed = snapshot.excluded_malformed_count();
+    let excluded_unsupported = snapshot.excluded_unsupported_count();
+    let excluded_path_encoding = snapshot.excluded_path_encoding_count();
+    if snapshot.games.is_empty() || !snapshot.complete {
         let diagnostic_codes = snapshot
             .diagnostics
             .iter()
@@ -1005,7 +1113,8 @@ fn fetch_and_publish(
             ),
         ));
     }
-    let catalogue_files = snapshot.games.len();
+    let catalogue_files = snapshot.total_candidate_files;
+    let indexed_files = snapshot.games.len();
     let valid_cheats = snapshot
         .games
         .iter()
@@ -1037,22 +1146,39 @@ fn fetch_and_publish(
             .map_err(|error| cache_error("snapshot_publish_failed", error))?;
         sync_directory(&snapshots_root)?;
     }
-    let invalid_utf8 = snapshot
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "catalogue_file_invalid_utf8")
-        .count();
     let mut warnings = Vec::new();
     if malformed != 0 {
         warnings.push(format!(
             "{malformed} catalogue files were retained but are non-actionable because parsing was incomplete"
         ));
     }
-    if invalid_utf8 != 0 {
+    if excluded_unsupported != 0 {
         warnings.push(format!(
-            "{invalid_utf8} non-UTF-8 catalogue files were safely skipped and are non-actionable"
+            "{excluded_unsupported} catalogue files used unsupported content or encoding and were excluded"
         ));
     }
+    if excluded_path_encoding != 0 {
+        warnings.push(format!(
+            "{excluded_path_encoding} catalogue paths used unsupported encoding and were excluded"
+        ));
+    }
+    let exclusion_examples = snapshot
+        .excluded_entries
+        .iter()
+        .take(MAX_CATALOGUE_EXCLUSION_EXAMPLES)
+        .map(|entry| CheatSourceExclusionExample {
+            kind: source_exclusion_kind(entry.kind),
+            relative_path: (!entry.path.lossy)
+                .then(|| {
+                    Path::new(&entry.path.display)
+                        .strip_prefix(&catalogue_path)
+                        .ok()
+                })
+                .flatten()
+                .and_then(Path::to_str)
+                .map(|value| value.replace(std::path::MAIN_SEPARATOR, "/")),
+        })
+        .collect();
     let mut manifest = CheatSourceManifest {
         format_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
         source_id: source.source_id.clone(),
@@ -1069,9 +1195,13 @@ fn fetch_and_publish(
         response_etag: response.etag,
         response_last_modified: response.last_modified,
         catalogue_file_count: catalogue_files,
+        indexed_file_count: indexed_files,
         valid_cheat_count: valid_cheats,
         malformed_cheat_count: malformed,
-        skipped_entry_count: snapshot.diagnostics.len(),
+        skipped_entry_count: snapshot.excluded_entries.len(),
+        excluded_unsupported_count: excluded_unsupported,
+        excluded_path_encoding_count: excluded_path_encoding,
+        exclusion_examples,
         discovered_platforms: platforms,
         validation_complete: true,
         warnings: warnings.clone(),
@@ -1235,16 +1365,22 @@ fn download_with_redirects(
                 format!("server returned HTTP {}", response.status),
             ));
         }
-        if response.downloaded_bytes > maximum {
-            return Err(CheatSourceError::new(
-                CheatSourceErrorStage::Download,
-                "download_too_large",
-                format!("response exceeded {maximum} bytes"),
-            ));
-        }
+        validate_downloaded_size(response.downloaded_bytes, maximum)?;
         return Ok(response);
     }
     unreachable!()
+}
+
+fn validate_downloaded_size(actual: u64, maximum: u64) -> Result<(), CheatSourceError> {
+    if actual > maximum {
+        Err(CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "download_too_large",
+            format!("received {actual} bytes, exceeding configured limit {maximum} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2096,7 +2232,10 @@ mod tests {
                 return Err(CheatSourceError::new(
                     CheatSourceErrorStage::Download,
                     "download_too_large",
-                    "fake body exceeds bound",
+                    format!(
+                        "response size {} bytes exceeds configured limit {maximum_bytes} bytes",
+                        response.body.len()
+                    ),
                 ));
             }
             if response
@@ -2264,6 +2403,45 @@ mod tests {
     }
 
     #[test]
+    fn verified_snapshot_with_bounded_entry_exclusions_remains_usable() {
+        let temp = TempDirectory::new();
+        let archive = zip(&[
+            (
+                "libretro-database-1/cht/Sega - Mega Drive - Genesis/Alien 3 (USA, Europe).cht",
+                b"cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"00FF\"\n",
+                None,
+            ),
+            (
+                "libretro-database-1/cht/Sega - Mega Drive - Genesis/Broken.cht",
+                b"not an assignment\n",
+                None,
+            ),
+            (
+                "libretro-database-1/cht/Nintendo - Super Nintendo Entertainment System/Unsupported.cht",
+                b"cheats = 1\n\xff",
+                None,
+            ),
+        ]);
+        let fetched = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &options(&temp.0),
+            &FakeTransport::new(vec![Ok(response(archive))]),
+        )
+        .unwrap();
+        assert!(fetched.manifest.validation_complete);
+        assert_eq!(fetched.manifest.catalogue_file_count, 3);
+        assert_eq!(fetched.manifest.indexed_file_count, 1);
+        assert_eq!(fetched.manifest.malformed_cheat_count, 1);
+        assert_eq!(fetched.manifest.excluded_unsupported_count, 1);
+        assert_eq!(fetched.manifest.exclusion_examples.len(), 2);
+        assert!(
+            inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0)
+                .unwrap()
+                .setup_usable
+        );
+    }
+
+    #[test]
     fn legacy_snapshot_manifest_remains_readable_after_schema_upgrade() {
         let temp = TempDirectory::new();
         let fetched = fetch_retroarch_cheat_source(
@@ -2283,6 +2461,26 @@ mod tests {
         assert!(supported_cheat_source_schema(legacy.format_version));
         assert!(legacy.canonical_repository_url.is_empty());
         assert!(legacy.resolved_revision.is_empty());
+
+        let mut schema_two = serde_json::to_value(legacy).unwrap();
+        schema_two["format_version"] = serde_json::json!(2);
+        let schema_two: CheatSourceManifest = serde_json::from_value(schema_two).unwrap();
+        assert!(supported_cheat_source_schema(schema_two.format_version));
+    }
+
+    #[test]
+    fn revised_download_bound_accepts_realistic_size_and_still_fails_closed() {
+        let realistic = 96 * 1024 * 1024;
+        assert!(realistic > 64 * 1024 * 1024);
+        validate_downloaded_size(realistic, CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT).unwrap();
+        let error = validate_downloaded_size(
+            CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT + 1,
+            CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "download_too_large");
+        assert!(error.message.contains("134217729"));
+        assert!(error.message.contains("134217728"));
     }
 
     #[test]
@@ -2564,6 +2762,35 @@ mod tests {
                 .code,
             "entry_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn oversized_update_retains_a_usable_active_snapshot() {
+        let temp = TempDirectory::new();
+        let initial = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &options(&temp.0),
+            &FakeTransport::new(vec![Ok(response(valid_zip()))]),
+        )
+        .unwrap();
+        let mut update = options(&temp.0);
+        update.force_refresh = true;
+        update.max_download_bytes = Some(3);
+        let failure = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &update,
+            &FakeTransport::new(vec![Ok(response(valid_zip()))]),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "download_too_large");
+        let inspection =
+            inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0).unwrap();
+        assert!(inspection.setup_usable);
+        assert_eq!(
+            inspection.manifest.unwrap().archive_sha256,
+            initial.manifest.archive_sha256
+        );
+        assert_eq!(inspection.last_error.unwrap().code, "download_too_large");
     }
 
     #[test]

@@ -82,7 +82,7 @@ rebinding; exact host binding and TLS hostname verification remain controls.
 
 No request carries credentials, uploads, telemetry, game metadata, filenames,
 or locally computed hashes. Headers are limited to 32 KiB. Content-Length is only an early check: actual
-bytes are counted and stopped at the lower of the registry's 64 MiB maximum and
+bytes are counted and stopped at the lower of the registry's 128 MiB maximum and
 `--max-download-bytes`. Compressed HTTP transfer encoding is rejected. Missing
 Content-Length is accepted; a mismatching declared length is rejected.
 Accepted bytes stream directly into a unique staging file; they are never
@@ -93,13 +93,13 @@ Extraction refuses absolute, `.`/`..`, empty-component, Windows drive,
 UNC/backslash, NUL, oversized/deep, duplicate, case-fold-colliding, symlink,
 hard-link, device, FIFO, socket, and other special entries. Files use
 no-overwrite creation beneath symlink-checked staging. Limits are 60,000
-entries, 8 MiB per file (the shared local catalogue bound), 256 MiB total expanded, 1,024 path bytes, 24
+entries, 8 MiB per file (the shared local catalogue bound), 512 MiB total expanded, 1,024 path bytes, 24
 components, and 250:1 compression ratio. Nested archives remain inert files
 and are never recursively extracted.
 
-The archive download limit is 64 MiB, the revision response limit is 64 KiB,
+The archive download limit is 128 MiB, the revision response limit is 64 KiB,
 the serialized manifest limit is 16 MiB, redirects are limited to three, and
-the global request timeout is 45 seconds. One exclusive cache-root lock permits
+the global request timeout is 90 seconds. One exclusive cache-root lock permits
 only one source operation at a time.
 
 ## Cache, provenance, offline mode
@@ -116,19 +116,21 @@ overrides it explicitly:
 ```
 
 Downloads are written and synced in unique staging. Extracted content must
-produce a non-empty, complete result from the existing RetroArch catalogue
+produce a non-empty, structurally complete result from the RetroArch catalogue
 parser. The content-addressed snapshot is published before `metadata.json` is
 atomically replaced, so failure cannot replace the last known-good snapshot.
-Malformed individual cheat files are retained only as reported,
-non-actionable entries rather than silently weakening validation.
+Malformed or unsupported individual cheat files are retained in the verified
+snapshot but excluded from its derived matching index.
 
 Per-snapshot manifests retain provenance even after a newer snapshot becomes
 current; inspection accepts either a source ID or an exact snapshot directory.
-Manifest schema 2 records provider ID, canonical repository, immutable archive
+Manifest schema 3 records provider ID, canonical repository, immutable archive
 URL, exact commit, retrieval timestamp, selected non-sensitive response
 metadata, actual size, SHA-256, catalogue/cheat counts, platforms,
 completeness, warnings, and a sorted per-file relative path, size, and SHA-256.
-Released schema-1 snapshots remain readable and verifiable; their unavailable
+It also records total candidate files, indexed files, typed exclusion counts,
+and at most 32 deterministic representative exclusions. Released schema-1 and
+schema-2 snapshots remain readable and verifiable; their unavailable
 repository and exact-revision fields remain empty rather than being invented.
 Atomic `metadata.json` records the current snapshot, last successful state,
 and timestamped typed refresh failure. Snapshots are
@@ -150,9 +152,38 @@ still be supplied through the CLI. Use source inspection for freshness,
 provenance, usability, last outcome, and stage-specific registry/network,
 download, validation, extraction, cache, cancellation, or offline errors.
 
+## Fatal failures and usable partial indexes
+
+`validation_complete` describes the immutable snapshot structure and integrity;
+it is not a claim that every third-party `.cht` file can be indexed. Fatal
+failures include a missing, invalid, or unsupported manifest; incomplete
+download or extraction; archive or file digest mismatch; unsafe, duplicate, or
+case-colliding paths; symlinks or special files; a missing catalogue root;
+snapshot/metadata binding failures; source identity changes; and any resource
+limit that prevents complete verification. These states never materialize a
+source.
+
+After structural verification, content indexing has three states: Complete,
+Usable partial, and Incomplete. A bounded individual malformed `.cht`, invalid
+content encoding, or unsupported path encoding becomes a typed exclusion. It
+does not make the structurally verified snapshot incomplete. At most 2,048
+excluded identities and 2,048 structural diagnostics are retained; exceeding
+either bound fails closed. Non-UTF-8 paths are counted and shown only through a
+lossy-marked safe display or count-only text, never reconstructed or invented.
+
+Excluded entries never enter the match candidate list and are never
+materialized. Valid entries retain their exact snapshot ID, path, and SHA-256
+binding. A diagnostic-only exact title/platform lookup can report `Matching
+catalogue entry excluded` for a selected file; otherwise a genuine absence is
+reported as `No matching cheat found`. Candidate, weak, and ambiguous matches
+remain blocked. Snapshot age is an update hint, not an integrity failure, so a
+stale but fully verified immutable snapshot remains usable while Update stays
+explicit.
+
 ## Sources GUI and Cheats & Mods
 
-The Sources page owns network retrieval. It shows Missing, Ready, Stale,
+The Sources page owns network retrieval. It shows Missing, Ready, Verified with
+warnings, Stale,
 Invalid manifest, Incomplete, Unsupported schema, Verification failed,
 Retrieval failed, Cancelled, and Resource limit reached states. Download is
 shown only without a snapshot; Update is shown when local state exists; Verify
@@ -166,20 +197,34 @@ manifest construction, and per-file verification all succeed. Updating does
 not modify RetroArch files. Catalogue retrieval activity is session source
 history, never an apply journal.
 
+If Update fails, Sources separately shows the latest typed update failure and
+the retained active revision, verification time, active file count, indexed
+count, and excluded count. Verify performs only local manifest and per-file
+digest checks and never opens a network transport.
+
 After activation, an existing Cheats & Mods workspace is refreshed against the
 new snapshot while archive selection, Library filters, Recently Found, queue,
 mounts, platform assignments, History, and unrelated emulator state remain
 unchanged. Source-dependent preview and confirmation state is invalidated.
 Cheats & Mods displays the exact upstream revision and differentiates `No
-matching cheat found` from catalogue or identity failures. Candidate, weak,
+matching cheat found`, `Matching catalogue entry excluded`, verified-with-
+warnings, and catalogue or identity failures. The obsolete claim that
+RetroArch matching and installation are not implemented has been removed; the
+page uses the existing shared preview, controlled apply, History, and rollback
+pipeline. Candidate, weak,
 ambiguous, PCSX2, and Dolphin entries do not become writable through this
 manager.
+
+The canonical Libretro `Sega - Mega Drive - Genesis` and `Nintendo - Super
+Nintendo Entertainment System` directories map to ArchiveFS's existing
+MegaDrive and SNES platform identities. Valid entries for both systems remain
+matchable when unrelated catalogue files are excluded.
 
 No automatic download occurs at startup, during library scan, during preview,
 or during Apply. The Cheats & Mods page links to Sources for Download/Update;
 its only direct catalogue action is read-only cached-snapshot reuse.
 
-## Retention and manual Nobara QA
+## Retention and manual Saltbox/Nobara QA
 
 Activation never deletes snapshots. The active snapshot and all previous valid
 content-addressed snapshots remain until an explicit cache-maintenance plan is
@@ -187,20 +232,23 @@ reviewed and applied; journal/pin protections remain authoritative. This is
 more conservative than the minimum retention of one previous valid snapshot.
 Failed staging is removed by its operation-scoped cleanup when proven inactive.
 
-Manual Nobara checks:
+Manual Saltbox/Nobara checks:
 
-1. Open Sources and confirm the official Libretro provider card appears without network activity.
-2. Confirm Missing shows Download, while Ready or Stale shows Update and Verify.
-3. Click Download/Update, review provider and managed destination, then cancel; confirm no network operation or active-snapshot change.
-4. Confirm retrieval and observe responsive progress; optionally cancel and verify the previous snapshot remains active.
-5. Complete retrieval and confirm an exact 40-character revision, file count, total size, verification state, and successful-update time.
-6. Open details and confirm the canonical repository, resolver, immutable archive template, and snapshot SHA-256.
-7. Return to an `Alien 3 (USA, Europe).md` Mega Drive selection in Cheats & Mods and confirm the active revision and matching cheat count.
-8. Select a synthetic game with no catalogue entry and confirm `No matching cheat found`, with no Apply action.
-9. Confirm weak or ambiguous matches remain blocked and PCSX2/Dolphin remain preview-only.
-10. Confirm queue, mounts, selected game, Library filters, Recently Found, platform assignment, activity, and transaction History remain intact.
-11. Disconnect networking, request Update, and confirm the failure is typed and the previous valid snapshot remains usable.
-12. Restart ArchiveFS and confirm the active snapshot status and revision persist without an automatic update check.
+1. Open Sources with an active retained snapshot.
+2. Confirm an Update failure still shows the snapshot as active and usable.
+3. Disconnect networking and use Verify; confirm local verification completes.
+4. Confirm active, indexed, and excluded counts are visible, with bounded technical examples.
+5. Select Mega Drive `Alien 3`.
+6. Open Cheats & Mods.
+7. Confirm the page no longer says RetroArch matching or installation is unimplemented.
+8. Confirm match, no-match, or excluded-entry state is precise.
+9. Repeat with an SNES game under the canonical Libretro platform directory.
+10. Confirm unrelated malformed catalogue files do not block either system.
+11. Confirm PCSX2 and Dolphin remain preview-only.
+12. Confirm no Apply occurs without exact preview, review, and confirmation.
+13. Confirm queue, mounts, filters, Recently Found, History, and selection remain intact.
+14. Request Update and confirm an archive below 128 MiB succeeds.
+15. Disconnect networking, request Update, and confirm the active snapshot remains usable.
 
 Current limitations are one reviewed source, ZIP only, no standalone
 update-availability probe (Update performs the explicit resolve/download), no

@@ -6,9 +6,10 @@ use serde::Serialize;
 
 use super::CatalogueGameEvidence;
 use super::cheat_catalogue::{
-    CheatMatchConfidence, build_cheat_availability_report, load_cheat_catalogue_snapshot,
+    CatalogueEntryExclusionKind, CatalogueIndexState, CheatMatchConfidence,
+    build_cheat_availability_report, load_cheat_catalogue_snapshot, matching_excluded_entry,
 };
-use super::cheat_sources::{CheatSourceFreshness, inspect_retroarch_cheat_source_snapshot};
+use super::cheat_sources::inspect_retroarch_cheat_source_snapshot;
 use super::shared_preview::{
     PreviewAdapter, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
     PreviewMatchStrength, PreviewSourceItem, SharedPreviewError, SharedPreviewReport,
@@ -48,6 +49,9 @@ pub struct RetroArchMaterializedPreview {
     pub snapshot_root: PathBuf,
     pub catalogue_root: PathBuf,
     pub sources: Vec<RetroArchMaterializedSource>,
+    pub catalogue_index_state: CatalogueIndexState,
+    pub indexed_file_count: usize,
+    pub excluded_file_count: usize,
     pub preview: SharedPreviewReport,
 }
 
@@ -63,6 +67,7 @@ pub enum RetroArchMaterializationErrorKind {
     SourceEscapesSnapshot,
     SourceNotInManifest,
     SourceDigestMismatch,
+    MatchingEntryExcluded,
     NoEligibleMatch,
     ResourceLimitReached,
     PreviewFailed,
@@ -118,13 +123,6 @@ pub fn materialize_retroarch_shared_preview(
             RetroArchMaterializationErrorKind::SnapshotIdentityMismatch,
             Some(&request.snapshot_root),
             "snapshot source identifier changed",
-        ));
-    }
-    if inspection.freshness != CheatSourceFreshness::Fresh {
-        return Err(error(
-            RetroArchMaterializationErrorKind::SnapshotStale,
-            Some(&request.snapshot_root),
-            "trusted catalogue snapshot is stale; apply is blocked without fetching automatically",
         ));
     }
     if !inspection.setup_usable {
@@ -313,6 +311,25 @@ pub fn materialize_retroarch_shared_preview(
         });
     }
     if sources.is_empty() {
+        if let Some(excluded) =
+            matching_excluded_entry(&snapshot, &request.archive_display_name, &request.platform)
+        {
+            let reason = match excluded.kind {
+                CatalogueEntryExclusionKind::MalformedCht => "could not be parsed",
+                CatalogueEntryExclusionKind::UnsupportedContentEncoding => {
+                    "uses unsupported content encoding"
+                }
+                CatalogueEntryExclusionKind::UnsupportedPathEncoding => {
+                    "uses unsupported path encoding"
+                }
+                CatalogueEntryExclusionKind::UnsupportedContent => "uses unsupported content",
+            };
+            return Err(error(
+                RetroArchMaterializationErrorKind::MatchingEntryExcluded,
+                Some(Path::new(&excluded.path.display)),
+                &format!("matching catalogue file was excluded because it {reason}"),
+            ));
+        }
         return Err(error(
             RetroArchMaterializationErrorKind::NoEligibleMatch,
             Some(&catalogue_root),
@@ -350,6 +367,9 @@ pub fn materialize_retroarch_shared_preview(
         snapshot_root: request.snapshot_root.clone(),
         catalogue_root,
         sources,
+        catalogue_index_state: snapshot.index_state,
+        indexed_file_count: snapshot.games.len(),
+        excluded_file_count: snapshot.excluded_entries.len(),
         preview,
     })
 }
@@ -442,9 +462,13 @@ mod tests {
             response_etag: None,
             response_last_modified: None,
             catalogue_file_count: 1,
+            indexed_file_count: 1,
             valid_cheat_count: 1,
             malformed_cheat_count: 0,
             skipped_entry_count: 0,
+            excluded_unsupported_count: 0,
+            excluded_path_encoding_count: 0,
+            exclusion_examples: vec![],
             discovered_platforms: vec!["Atari - 2600".into()],
             validation_complete: true,
             warnings: vec![],
@@ -502,15 +526,29 @@ mod tests {
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         let bytes = b"cheats = 1\ncheat0_desc = \"Infinite lives\"\ncheat0_code = \"00FF\"\ncheat0_enable = false\n";
         fs::write(&source, bytes).unwrap();
+        let malformed_relative =
+            Path::new("Sega - Mega Drive - Genesis").join("Unrelated Broken Game.cht");
+        let malformed_source = fixture.snapshot.join(&malformed_relative);
+        let malformed_bytes = b"not an assignment\n";
+        fs::write(&malformed_source, malformed_bytes).unwrap();
         let mut manifest: CheatSourceManifest =
             serde_json::from_slice(&fs::read(&fixture.manifest).unwrap()).unwrap();
-        manifest.files = vec![CheatSourceManifestFile {
-            relative_path: relative
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/"),
-            size: bytes.len() as u64,
-            sha256: sha256(bytes),
-        }];
+        manifest.files = vec![
+            CheatSourceManifestFile {
+                relative_path: relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                size: bytes.len() as u64,
+                sha256: sha256(bytes),
+            },
+            CheatSourceManifestFile {
+                relative_path: malformed_relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                size: malformed_bytes.len() as u64,
+                sha256: sha256(malformed_bytes),
+            },
+        ];
         manifest.discovered_platforms = vec!["Sega - Mega Drive - Genesis".into()];
         fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
         fixture.source = source;
@@ -523,6 +561,11 @@ mod tests {
         let matched = materialize_retroarch_shared_preview(&request).unwrap();
         assert_eq!(matched.sources.len(), 1);
         assert_eq!(matched.sources[0].source_path, fixture.source);
+        assert_eq!(
+            matched.catalogue_index_state,
+            CatalogueIndexState::UsablePartial
+        );
+        assert_eq!(matched.excluded_file_count, 1);
 
         request.archive_display_name = "Game With No Cheat".into();
         request.archive_normalized_name = "game with no cheat".into();
@@ -534,7 +577,95 @@ mod tests {
     }
 
     #[test]
-    fn digest_mismatch_and_stale_snapshot_fail_closed() {
+    fn malformed_matching_mega_drive_entry_is_reported_as_excluded() {
+        let fixture = fixture("mega-drive-excluded");
+        fs::remove_file(&fixture.source).unwrap();
+        let relative = Path::new("Sega - Mega Drive - Genesis").join("Alien 3 (USA, Europe).cht");
+        let source = fixture.snapshot.join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let bytes = b"not an assignment\n";
+        fs::write(&source, bytes).unwrap();
+        let mut manifest: CheatSourceManifest =
+            serde_json::from_slice(&fs::read(&fixture.manifest).unwrap()).unwrap();
+        manifest.files = vec![CheatSourceManifestFile {
+            relative_path: relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            size: bytes.len() as u64,
+            sha256: sha256(bytes),
+        }];
+        fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let mut request = request(&fixture);
+        request.selected_archive = fixture.root.join("Alien 3 (USA, Europe).md");
+        request.archive_display_name = "Alien 3 (USA, Europe)".into();
+        request.archive_normalized_name = "alien 3 usa europe".into();
+        request.platform = "MegaDrive".into();
+        let failure = materialize_retroarch_shared_preview(&request).unwrap_err();
+        assert_eq!(
+            failure.kind,
+            RetroArchMaterializationErrorKind::MatchingEntryExcluded
+        );
+        assert!(failure.detail.contains("could not be parsed"));
+    }
+
+    #[test]
+    fn snes_match_survives_an_unrelated_malformed_entry() {
+        let fixture = fixture("snes-partial-index");
+        fs::remove_file(&fixture.source).unwrap();
+        let directory = Path::new("Nintendo - Super Nintendo Entertainment System");
+        let relative = directory.join("Chrono Quest (USA).cht");
+        let source = fixture.snapshot.join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let bytes = b"cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"ABCD\"\n";
+        fs::write(&source, bytes).unwrap();
+        let broken_relative = directory.join("Unrelated Broken Game.cht");
+        let broken = b"not an assignment\n";
+        fs::write(fixture.snapshot.join(&broken_relative), broken).unwrap();
+        let mut manifest: CheatSourceManifest =
+            serde_json::from_slice(&fs::read(&fixture.manifest).unwrap()).unwrap();
+        manifest.files = vec![
+            CheatSourceManifestFile {
+                relative_path: relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                size: bytes.len() as u64,
+                sha256: sha256(bytes),
+            },
+            CheatSourceManifestFile {
+                relative_path: broken_relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                size: broken.len() as u64,
+                sha256: sha256(broken),
+            },
+        ];
+        fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let mut request = request(&fixture);
+        request.selected_archive = fixture.root.join("Chrono Quest (USA).sfc");
+        request.archive_display_name = "Chrono Quest (USA)".into();
+        request.archive_normalized_name = "chrono quest usa".into();
+        request.platform = "SNES".into();
+        let matched = materialize_retroarch_shared_preview(&request).unwrap();
+        assert_eq!(matched.sources[0].source_path, source);
+        assert_eq!(
+            matched.catalogue_index_state,
+            CatalogueIndexState::UsablePartial
+        );
+
+        request.archive_display_name = "Absent SNES Game".into();
+        request.archive_normalized_name = "absent snes game".into();
+        assert_eq!(
+            materialize_retroarch_shared_preview(&request)
+                .unwrap_err()
+                .kind,
+            RetroArchMaterializationErrorKind::NoEligibleMatch
+        );
+    }
+
+    #[test]
+    fn digest_mismatch_fails_closed_and_stale_verified_snapshot_remains_usable() {
         let changed_fixture = fixture("digest-stale");
         fs::write(&changed_fixture.source, b"changed").unwrap();
         let digest_error =
@@ -549,8 +680,8 @@ mod tests {
             serde_json::from_slice(&fs::read(&fixture.manifest).unwrap()).unwrap();
         manifest.fetched_at_unix_seconds = 0;
         fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let stale = materialize_retroarch_shared_preview(&request(&fixture)).unwrap_err();
-        assert_eq!(stale.kind, RetroArchMaterializationErrorKind::SnapshotStale);
+        let stale = materialize_retroarch_shared_preview(&request(&fixture)).unwrap();
+        assert_eq!(stale.sources.len(), 1);
     }
 
     #[cfg(unix)]

@@ -96,6 +96,8 @@ pub const MAX_ARTIFACTS_PER_DIRECTORY: usize = 8_192;
 pub const MAX_CHEATS_PER_GAME: usize = 16_384;
 pub const MAX_GAME_RECORDS: usize = 100_000;
 pub const MAX_CATALOGUE_DIAGNOSTICS: usize = 2_048;
+pub const MAX_CATALOGUE_EXCLUDED_ENTRIES: usize = 2_048;
+pub const MAX_CATALOGUE_EXCLUSION_EXAMPLES: usize = 32;
 pub const MAX_CATALOGUE_STRING_BYTES: usize = 4 * 1024;
 
 /// Which local format a [`CheatGameRecord`] was parsed from.
@@ -130,6 +132,31 @@ pub struct CatalogueDiagnostic {
     pub code: &'static str,
     pub severity: ArtifactDiagnosticSeverity,
     pub path: Option<EncodedPath>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueIndexState {
+    Complete,
+    UsablePartial,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueEntryExclusionKind {
+    MalformedCht,
+    UnsupportedContentEncoding,
+    UnsupportedPathEncoding,
+    UnsupportedContent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogueExcludedEntry {
+    pub kind: CatalogueEntryExclusionKind,
+    pub path: EncodedPath,
+    pub source_game_name: Option<String>,
+    pub source_platform: Option<String>,
 }
 
 /// One game's cheat availability as declared by one local catalogue file.
@@ -179,13 +206,44 @@ pub struct CheatCatalogueSnapshot {
     pub source_name: String,
     pub source_root: EncodedPath,
     pub read_only: bool,
-    /// `false` if any bound (file count, directory count, manifest size,
-    /// game count) was reached, or a top-level read failed. Partial
-    /// results are never presented as a complete catalogue - mirrors
-    /// `RetroArchArtifactInventory::complete`.
+    /// Structural completeness only. Individual malformed or unsupported
+    /// content entries are represented in `excluded_entries` and do not
+    /// change this flag while their count remains bounded.
     pub complete: bool,
+    pub index_state: CatalogueIndexState,
+    pub total_candidate_files: usize,
     pub games: Vec<CheatGameRecord>,
+    pub excluded_entries: Vec<CatalogueExcludedEntry>,
     pub diagnostics: Vec<CatalogueDiagnostic>,
+}
+
+impl CheatCatalogueSnapshot {
+    pub fn excluded_malformed_count(&self) -> usize {
+        self.excluded_entries
+            .iter()
+            .filter(|entry| entry.kind == CatalogueEntryExclusionKind::MalformedCht)
+            .count()
+    }
+
+    pub fn excluded_unsupported_count(&self) -> usize {
+        self.excluded_entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.kind,
+                    CatalogueEntryExclusionKind::UnsupportedContentEncoding
+                        | CatalogueEntryExclusionKind::UnsupportedContent
+                )
+            })
+            .count()
+    }
+
+    pub fn excluded_path_encoding_count(&self) -> usize {
+        self.excluded_entries
+            .iter()
+            .filter(|entry| entry.kind == CatalogueEntryExclusionKind::UnsupportedPathEncoding)
+            .count()
+    }
 }
 
 /// A read-only local cheat catalogue adapter boundary. Only two
@@ -239,7 +297,10 @@ fn empty_snapshot_for_unusable_root(
         source_root: EncodedPath::from_path(root),
         read_only: true,
         complete: false,
+        index_state: CatalogueIndexState::Incomplete,
+        total_candidate_files: 0,
         games: Vec::new(),
+        excluded_entries: Vec::new(),
         diagnostics: vec![CatalogueDiagnostic {
             code,
             severity: ArtifactDiagnosticSeverity::Error,
@@ -275,6 +336,7 @@ impl CheatCatalogueSource for RetroarchChtDirectorySource {
 
     fn load(&self, filesystem: &dyn ReadOnlyHostFilesystem, root: &Path) -> CheatCatalogueSnapshot {
         let mut games = Vec::new();
+        let mut excluded_entries = Vec::new();
         let mut diagnostics = Vec::new();
         let mut complete = true;
         let mut total_files = 0usize;
@@ -337,32 +399,51 @@ impl CheatCatalogueSource for RetroarchChtDirectorySource {
                             pending.push((path, hint));
                             continue;
                         }
+                        if !os_name_has_cht_extension(&entry.file_name) {
+                            continue;
+                        }
                         if total_files >= MAX_CATALOGUE_FILES {
                             complete = false;
-                            continue;
-                        }
-                        let Some(name) = entry.file_name.to_str() else {
-                            complete = false;
                             diagnostics.push(CatalogueDiagnostic {
-                                code: "catalogue_file_non_utf8_name_skipped",
-                                severity: ArtifactDiagnosticSeverity::Warning,
+                                code: "catalogue_file_limit_reached",
+                                severity: ArtifactDiagnosticSeverity::Error,
                                 path: Some(EncodedPath::from_path(&path)),
                             });
-                            continue;
-                        };
-                        if !name.to_ascii_lowercase().ends_with(".cht") {
-                            continue;
+                            break;
                         }
                         total_files += 1;
-                        if let Some(record) = load_cht_record(
-                            filesystem,
-                            &path,
-                            platform_hint.as_deref(),
-                            &mut diagnostics,
-                        ) {
-                            games.push(record);
-                        } else {
-                            complete = false;
+                        if entry.file_name.to_str().is_none() {
+                            if !push_excluded_entry(
+                                &mut excluded_entries,
+                                CatalogueExcludedEntry {
+                                    kind: CatalogueEntryExclusionKind::UnsupportedPathEncoding,
+                                    path: EncodedPath::from_path(&path),
+                                    source_game_name: None,
+                                    source_platform: platform_hint.clone(),
+                                },
+                                &path,
+                                &mut diagnostics,
+                            ) {
+                                complete = false;
+                            }
+                            continue;
+                        }
+                        match load_cht_record(filesystem, &path, platform_hint.as_deref()) {
+                            ChtLoadOutcome::Indexed(record) => games.push(*record),
+                            ChtLoadOutcome::Excluded(excluded) => {
+                                if !push_excluded_entry(
+                                    &mut excluded_entries,
+                                    excluded,
+                                    &path,
+                                    &mut diagnostics,
+                                ) {
+                                    complete = false;
+                                }
+                            }
+                            ChtLoadOutcome::Fatal(diagnostic) => {
+                                complete = false;
+                                diagnostics.push(diagnostic);
+                            }
                         }
                     }
                     pending.sort_by(|(left, _), (right, _)| {
@@ -385,7 +466,19 @@ impl CheatCatalogueSource for RetroarchChtDirectorySource {
                 .display
                 .cmp(&right.source_file_path.display)
         });
+        excluded_entries.sort_by(|left, right| {
+            left.path.display.cmp(&right.path.display).then_with(|| {
+                exclusion_kind_order(left.kind).cmp(&exclusion_kind_order(right.kind))
+            })
+        });
         truncate_diagnostics(&mut diagnostics, &mut complete);
+        let index_state = if !complete {
+            CatalogueIndexState::Incomplete
+        } else if excluded_entries.is_empty() {
+            CatalogueIndexState::Complete
+        } else {
+            CatalogueIndexState::UsablePartial
+        };
 
         CheatCatalogueSnapshot {
             format_version: CHEAT_CATALOGUE_FORMAT_VERSION,
@@ -393,7 +486,10 @@ impl CheatCatalogueSource for RetroarchChtDirectorySource {
             source_root: EncodedPath::from_path(root),
             read_only: true,
             complete,
+            index_state,
+            total_candidate_files: total_files,
             games,
+            excluded_entries,
             diagnostics,
         }
     }
@@ -416,20 +512,28 @@ fn list_diagnostic(path: &Path, result: BoundedListResult) -> CatalogueDiagnosti
     }
 }
 
+enum ChtLoadOutcome {
+    Indexed(Box<CheatGameRecord>),
+    Excluded(CatalogueExcludedEntry),
+    Fatal(CatalogueDiagnostic),
+}
+
 fn load_cht_record(
     filesystem: &dyn ReadOnlyHostFilesystem,
     path: &Path,
     platform_hint: Option<&str>,
-    diagnostics: &mut Vec<CatalogueDiagnostic>,
-) -> Option<CheatGameRecord> {
+) -> ChtLoadOutcome {
+    let source_game_name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string);
     let probe = filesystem.probe(path);
     if probe == FsProbe::Symlink {
-        diagnostics.push(CatalogueDiagnostic {
+        return ChtLoadOutcome::Fatal(CatalogueDiagnostic {
             code: "catalogue_file_symlink_not_followed",
-            severity: ArtifactDiagnosticSeverity::Warning,
+            severity: ArtifactDiagnosticSeverity::Error,
             path: Some(EncodedPath::from_path(path)),
         });
-        return None;
     }
     let bytes = match filesystem.read_bounded(path, MAX_CATALOGUE_FILE_BYTES) {
         BoundedReadResult::Ok(bytes) => bytes,
@@ -443,37 +547,40 @@ fn load_cht_record(
                 BoundedReadResult::IoError => "catalogue_file_io_error",
                 BoundedReadResult::Ok(_) => unreachable!(),
             };
-            diagnostics.push(CatalogueDiagnostic {
+            return ChtLoadOutcome::Fatal(CatalogueDiagnostic {
                 code,
-                severity: ArtifactDiagnosticSeverity::Warning,
+                severity: ArtifactDiagnosticSeverity::Error,
                 path: Some(EncodedPath::from_path(path)),
             });
-            return None;
         }
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
-        diagnostics.push(CatalogueDiagnostic {
-            code: "catalogue_file_invalid_utf8",
-            severity: ArtifactDiagnosticSeverity::Warning,
-            path: Some(EncodedPath::from_path(path)),
+        return ChtLoadOutcome::Excluded(CatalogueExcludedEntry {
+            kind: CatalogueEntryExclusionKind::UnsupportedContentEncoding,
+            path: EncodedPath::from_path(path),
+            source_game_name,
+            source_platform: platform_hint.map(str::to_string),
         });
-        return None;
     };
     let hash = hex_sha256(&bytes);
-    let (cheats, parsing_complete, mut file_diagnostics) = parse_cht_cheats(text, path);
-    diagnostics.append(&mut file_diagnostics);
+    let (cheats, parsing_complete, _file_diagnostics) = parse_cht_cheats(text, path);
 
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    if !parsing_complete {
+        return ChtLoadOutcome::Excluded(CatalogueExcludedEntry {
+            kind: CatalogueEntryExclusionKind::MalformedCht,
+            path: EncodedPath::from_path(path),
+            source_game_name,
+            source_platform: platform_hint.map(str::to_string),
+        });
+    }
+
+    let stem = source_game_name.unwrap_or_else(|| "unknown".to_string());
     let enabled_by_default_count = cheats
         .iter()
         .filter(|cheat| cheat.enabled_by_default)
         .count();
 
-    Some(CheatGameRecord {
+    ChtLoadOutcome::Indexed(Box::new(CheatGameRecord {
         source_game_name: stem,
         source_platform: platform_hint.map(str::to_string),
         source_region: None,
@@ -487,9 +594,46 @@ fn load_cht_record(
         source_file_path: EncodedPath::from_path(path),
         source_file_hash: Some(hash),
         format: CheatCatalogueFormat::RetroarchChtDirectory,
-        parsing_complete,
+        parsing_complete: true,
         parsing_diagnostics: Vec::new(),
-    })
+    }))
+}
+
+fn os_name_has_cht_extension(name: &std::ffi::OsStr) -> bool {
+    let bytes = os_str_bytes(name);
+    bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".cht")
+}
+
+fn push_excluded_entry(
+    excluded_entries: &mut Vec<CatalogueExcludedEntry>,
+    entry: CatalogueExcludedEntry,
+    path: &Path,
+    diagnostics: &mut Vec<CatalogueDiagnostic>,
+) -> bool {
+    if excluded_entries.len() >= MAX_CATALOGUE_EXCLUDED_ENTRIES {
+        if !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "catalogue_exclusion_limit_reached")
+        {
+            diagnostics.push(CatalogueDiagnostic {
+                code: "catalogue_exclusion_limit_reached",
+                severity: ArtifactDiagnosticSeverity::Error,
+                path: Some(EncodedPath::from_path(path)),
+            });
+        }
+        return false;
+    }
+    excluded_entries.push(entry);
+    true
+}
+
+fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
+    match kind {
+        CatalogueEntryExclusionKind::MalformedCht => 0,
+        CatalogueEntryExclusionKind::UnsupportedContentEncoding => 1,
+        CatalogueEntryExclusionKind::UnsupportedPathEncoding => 2,
+        CatalogueEntryExclusionKind::UnsupportedContent => 3,
+    }
 }
 
 /// Parses the same `cheatN_*`/`cheats = N` key-value text format as
@@ -653,7 +797,10 @@ impl CheatCatalogueSource for JsonManifestSource {
                     source_root: EncodedPath::from_path(root),
                     read_only: true,
                     complete: false,
+                    index_state: CatalogueIndexState::Incomplete,
+                    total_candidate_files: 0,
                     games: Vec::new(),
+                    excluded_entries: Vec::new(),
                     diagnostics: vec![CatalogueDiagnostic {
                         code,
                         severity: ArtifactDiagnosticSeverity::Error,
@@ -675,7 +822,10 @@ impl CheatCatalogueSource for JsonManifestSource {
                     source_root: EncodedPath::from_path(root),
                     read_only: true,
                     complete: false,
+                    index_state: CatalogueIndexState::Incomplete,
+                    total_candidate_files: 0,
                     games: Vec::new(),
+                    excluded_entries: Vec::new(),
                     diagnostics: vec![CatalogueDiagnostic {
                         code: "catalogue_manifest_malformed_json",
                         severity: ArtifactDiagnosticSeverity::Error,
@@ -718,7 +868,14 @@ impl CheatCatalogueSource for JsonManifestSource {
             source_root: EncodedPath::from_path(root),
             read_only: true,
             complete,
+            index_state: if complete {
+                CatalogueIndexState::Complete
+            } else {
+                CatalogueIndexState::Incomplete
+            },
+            total_candidate_files: games.len(),
             games,
+            excluded_entries: Vec::new(),
             diagnostics,
         }
     }
@@ -932,6 +1089,29 @@ fn normalize_for_matching(text: &str) -> String {
 
 fn normalize_identifier(text: &str) -> String {
     text.trim().to_ascii_uppercase()
+}
+
+/// Diagnostic-only lookup for an entry that was excluded before matching.
+/// Excluded content is never converted into a [`CheatGameRecord`] and can
+/// therefore never become an install candidate.
+pub fn matching_excluded_entry<'a>(
+    snapshot: &'a CheatCatalogueSnapshot,
+    selected_name: &str,
+    selected_platform: &str,
+) -> Option<&'a CatalogueExcludedEntry> {
+    let selected_title = title_for_matching(selected_name);
+    let selected_platform = canonical_platform_for_alias(selected_platform)?;
+    snapshot.excluded_entries.iter().find(|entry| {
+        entry
+            .source_game_name
+            .as_deref()
+            .is_some_and(|name| title_for_matching(name) == selected_title)
+            && entry
+                .source_platform
+                .as_deref()
+                .and_then(canonical_platform_for_alias)
+                .is_some_and(|platform| platform == selected_platform)
+    })
 }
 
 /// Strips a `(...)` segment that contains "rev" (case-insensitive) - e.g.

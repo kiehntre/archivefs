@@ -4555,6 +4555,7 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("snes", "SNES"),
     ("supernintendo", "SNES"),
     ("supernintendoentertainmentsystem", "SNES"),
+    ("nintendosupernintendoentertainmentsystem", "SNES"),
     ("superfamicom", "SNES"),
     ("n64", "N64"),
     ("nintendo64", "N64"),
