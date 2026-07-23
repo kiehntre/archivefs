@@ -6,11 +6,13 @@ are called out explicitly below rather than left implicit. Nothing in this
 document should be read as a promise of stability, and the interfaces it
 describes may still change before a 1.0 release.
 
-This document describes the state of the `sonnet-v0.5-release-prep` branch at
-the time it was written. The workspace version in `Cargo.toml` has not been
-bumped to `0.5.0-alpha` and no Git tag has been created - both remain separate
-steps in [`docs/release-checklist.md`](release-checklist.md), performed after
-this documentation is reviewed.
+**This release has shipped.** `Cargo.toml` was bumped to `0.5.0-alpha` and the
+`v0.5.0-alpha` Git tag was created per
+[`docs/release-checklist.md`](release-checklist.md) after this documentation
+was reviewed. This document is kept as the historical record of what that
+release actually contained; see
+[`docs/RELEASE_NOTES_v0.6.0-alpha.md`](RELEASE_NOTES_v0.6.0-alpha.md) for
+what has changed since.
 
 ## Overview
 
@@ -30,9 +32,9 @@ things:
    explicit that matching and installation are not implemented in that
    workspace yet either.
 4. Brings Cheats & Mods to its intended **three-adapter architecture**:
-   RetroArch and PCSX2 (merged) plus Dolphin (implemented and validated,
-   pending merge). Further emulator adapter expansion is paused after
-   Dolphin for now - see [`ROADMAP.md`](../ROADMAP.md#medium-term-plans).
+   RetroArch, PCSX2, and Dolphin, all merged. Further emulator adapter
+   expansion is paused after Dolphin for now - see
+   [`ROADMAP.md`](../ROADMAP.md#medium-term-plans).
 
 ## Major user-visible changes
 
@@ -83,12 +85,11 @@ A new **Cheats & Mods** page keeps profile discovery, trusted-catalogue
 retrieval, and the trust/safety model together for one selected archive,
 across three read-only emulator adapters: **RetroArch** (cheat catalogue
 retrieval and profile discovery), **PCSX2** (PNACH inspection, PS2-only),
-and **Dolphin** (Game INI inspection, GameCube/Wii-only, implemented and
-validated but pending merge - see below). Only one adapter applies to a
-given archive's platform at a time, and each is explicit about what it does
-and does not do:
+and **Dolphin** (Game INI inspection, GameCube/Wii-only). Only one adapter
+applies to a given archive's platform at a time, and each is explicit about
+what it does and does not do:
 
-- Available today (RetroArch and PCSX2): choosing an archive, discovering
+- Available today (all three adapters): choosing an archive, discovering
   eligible emulator profiles, and - for RetroArch - fetching or reusing a
   trusted, reviewed cheat catalogue snapshot; for PCSX2, inspecting
   existing on-disk `.pnach` files.
@@ -156,18 +157,12 @@ backup/journal/rollback/enable/disable workflow, and automatic discovery
 of AppImage/portable configuration roots (an exact root must be supplied
 by a trusted caller).
 
-### Dolphin read-only adapter (implemented, pending merge into this branch)
+### Dolphin read-only adapter
 
-A read-only Dolphin adapter for Cheats & Mods has been implemented and
-validated on the separate `codex-dolphin-readonly-adapter` branch. **It has
-not been merged into this branch and is not part of any build produced
-from `sonnet-v0.5-release-prep` today.** It is documented here so the
-release notes are accurate once the merge happens; nothing below should be
-read as available in the current branch.
-
-Once merged, it is a **read-only inspection foundation**, not a complete
-cheat manager - it does not install cheats, apply mods, inspect texture
-packs, or change any Dolphin file:
+A read-only Dolphin adapter for Cheats & Mods is merged into this release.
+It is a **read-only inspection foundation**, not a complete cheat manager -
+it does not install cheats, apply mods, inspect texture packs, or change
+any Dolphin file:
 
 - Discovers native (`$XDG_CONFIG_HOME/dolphin-emu`, falling back to
   `~/.config/dolphin-emu`) and Flatpak
@@ -312,7 +307,7 @@ across every process sharing that cache.
 | PCSX2 read-only profile/PNACH inspection | **Available** (GUI, merged) |
 | PCSX2 exact CRC matching | Deferred - requires a verified PS2 executable CRC, which ArchiveFS does not yet have |
 | PCSX2 installation, rollback, mutation of any kind | Not implemented anywhere |
-| Dolphin read-only profile/Game INI inspection | Implemented and validated on branch `codex-dolphin-readonly-adapter`; **not yet merged into this branch** |
+| Dolphin read-only profile/Game INI inspection | **Available** (GUI, merged) |
 | Dolphin exact Game ID matching | Deferred - requires a verified GameCube/Wii Game ID, which ArchiveFS does not yet have |
 | Dolphin texture-pack/graphics-mod inspection | Not implemented anywhere |
 | Dolphin installation, rollback, mutation of any kind | Not implemented anywhere |
@@ -351,7 +346,12 @@ across every process sharing that cache.
 ## Known limitations
 
 - Cheat matching, installation, and rollback are not reachable from the
-  GUI's Cheats & Mods workspace, only from the CLI.
+  GUI's Cheats & Mods workspace, only from the CLI. **(Historical note:**
+  this was accurate for v0.5.0-alpha. Since then, RetroArch has gained a
+  working GUI apply/history/rollback flow - see
+  [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](RETROARCH_GUI_APPLY_HISTORY.md)
+  and [`docs/RELEASE_NOTES_v0.6.0-alpha.md`](RELEASE_NOTES_v0.6.0-alpha.md).
+  PCSX2 and Dolphin remain CLI/preview-only as originally described here.)
 - Cache pin/unpin and prune have no GUI controls yet.
 - There is no general-purpose local or community cheat/mod import
   inspection pipeline. Local safety scanning is shown in the GUI as

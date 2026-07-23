@@ -11,19 +11,137 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.5.0-alpha (unreleased)
+## v0.6.0-alpha (unreleased)
 
-Work merged since the `v0.4.3-alpha` tag, prepared for release as
-`v0.5.0-alpha`. The workspace version in `Cargo.toml` has not been bumped and
-no tag has been created yet - both remain separate release-checklist steps.
-See [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
-for a narrative overview and
-[`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
+Work merged since the `v0.5.0-alpha` tag, in preparation for release as
+`v0.6.0-alpha`. The workspace version in `Cargo.toml` has not been bumped and
+no tag has been created yet. See
+[`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md) for
+a narrative overview and
+[`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the
 manual acceptance plan.
 
-Cheats & Mods now spans **three read-only emulator adapters**: RetroArch and
-PCSX2 (merged) plus Dolphin (implemented and validated, pending merge - see
-"Pending merge" below). Adapter expansion pauses here - see
+### Added
+
+- **Shared verified game identity**: bounded, read-only PS2/GameCube/Wii
+  disc-identity extraction (product code, Game ID, revision, and, for PS2,
+  PCSX2's executable CRC) from a local ISO or single-ISO ZIP, shown as an
+  explicit `Verified`/`Candidate`/`Missing`/etc. evidence state rather than a
+  guessed name. Feeds exact matching in the PCSX2 and Dolphin adapters. See
+  [`docs/SHARED_GAME_IDENTITY.md`](docs/SHARED_GAME_IDENTITY.md).
+- **Shared read-only Cheats & Mods preview and conflict detection** across
+  all three adapters: a typed `Install new` / `Already installed` /
+  `Replace different` / `Conflict` / `Ambiguous` / etc. report with no apply
+  path of its own. See
+  [`docs/SHARED_CHEAT_PREVIEW.md`](docs/SHARED_CHEAT_PREVIEW.md).
+- **Shared safe apply, backup, journal, history, and rollback foundation**: a
+  bounded transaction pipeline with atomic temp-file-then-rename writes,
+  verified never-overwritten backups before any replacement, schema-versioned
+  journals, truthful partial-success reporting, and rollback that blocks on
+  user-modified content or a missing/changed backup. See
+  [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
+- **RetroArch GUI apply, history, and rollback**: an eligible exact or
+  approved-strong RetroArch trusted-catalogue match can now be applied
+  through the shared transaction engine directly from Cheats & Mods -
+  preview, explicit confirmation (with a separate, non-preselected
+  replacement approval), background execution, and a result shown as
+  success, partial success, or failure. History & Logs can open the exact
+  operation and preview/confirm its rollback. PCSX2 and Dolphin remain
+  preview-only - see [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md).
+- **RetroArch trusted catalogue download and management**: the Sources page
+  now owns catalogue retrieval end-to-end - Download/Update/Verify with an
+  explicit review-then-confirm dialog before any network access, background
+  retrieval with cancellation, and an activated snapshot that Cheats & Mods
+  matches against immediately. See
+  [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- **Recently Found**: a new navigation page listing only the newest
+  completed scan's added archives, in exact path order, backed by a
+  persistent append-only observation log and bounded to 10,000 entries with
+  explicit truncation reporting. Reuses the existing Library table
+  (search/filter/sort/selection all remain available). See
+  [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
+- **Mega Drive/Genesis loose-ROM recognition**: `.gen`/`.smd` files are
+  recognized case-insensitively; ambiguous `.md`/`.bin` files are recognized
+  only when located under an exactly-named Mega Drive/Genesis folder
+  component (`megadrive`, `mega-drive`, `genesis`, `sega-genesis`, and
+  similar aliases), never from the filename alone - so an unrelated
+  `README.md` outside such a folder is never imported. See
+  [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
+
+### Changed
+
+- Settings, Doctor, About, Sources, Library Views, and History & Logs now
+  share one scrollable-page wrapper supporting mouse wheel, touchpad, Page
+  Up/Down, Home, and End, recalculated on resize or Activity-panel
+  expansion. Cheats & Mods retains its own scroll region and does not yet
+  use this wrapper - see Known limitations.
+- Library database schema version 4 adds persistent per-scan counters for
+  unchanged, skipped-unsupported, and skipped-ambiguous files, so scan
+  summaries can report them without generating one activity event per file.
+
+### Security
+
+- The shared apply pipeline reopens every source no-follow, rejects symlink
+  components and special files, and compares device/inode/size/mtime around
+  every read before trusting a digest.
+- Every shared-apply transaction acquires an exclusive advisory lock on its
+  one destination root (5-second timeout, released on drop), and one
+  transaction always has exactly one destination root, so lock ordering is
+  deadlock-free by construction.
+- A confirmed apply is bound to a SHA-256 plan ID covering the exact
+  adapter, archive, identity, profile, destination, and action set; any
+  context change between preview and confirmation fails closed rather than
+  silently re-planning.
+- A journal-write failure that happens *after* a destination write already
+  succeeded is reported as `partial_failure`, never as silent success or an
+  opaque hard failure.
+- Rollback re-derives a fresh preview immediately before acting and blocks
+  on user-modified destination content, a missing or changed backup, or an
+  already-completed rollback (enforced by a separate, non-overwritable
+  rollback marker).
+- RetroArch catalogue Download/Update never touches the network until the
+  user explicitly confirms a review dialog naming the provider and the
+  exact ArchiveFS-managed destination; cancelling at any point before that
+  confirmation writes nothing and leaves the previously active snapshot,
+  if any, unchanged.
+
+### Known limitations
+
+- PCSX2 and Dolphin remain **preview-only**: both have real verified
+  identity and real read-only inspection of emulator-managed files, but
+  neither has an approved, independently materialized source artifact to
+  apply from, so neither offers Install/Apply/Enable/Disable/Rollback
+  anywhere in the GUI.
+- Mods remain planned and are not implemented; the Mods section of Cheats &
+  Mods is a labelled placeholder, not a working feature.
+- **A currently open issue**: some individual malformed entries in a
+  downloaded RetroArch trusted catalogue can affect validation of the whole
+  snapshot rather than being cleanly isolated as non-actionable, and the
+  Cheats & Mods "Stage 3" copy in one place still reads "Archive matching
+  and cheat installation are not yet implemented in this GUI workflow" even
+  though RetroArch matching/apply now exist. Both are being actively fixed;
+  neither is resolved as of this entry. See `docs/V0.6_RELEASE_AUDIT.md` for
+  current status before relying on either behavior.
+- There is no cancellation once a shared-apply write has actually begun -
+  only before it starts.
+- Cheats & Mods does not yet use the shared scrollable-page keyboard
+  wrapper the other listed pages use.
+- Operation history in the GUI's History & Logs page remains in-memory for
+  the current session; it is not yet persisted to disk.
+- No general-purpose local or community cheat/mod import inspection
+  pipeline exists; only the fixed, reviewed RetroArch trusted-source list
+  can be fetched, never an arbitrary or user-supplied URL.
+
+## v0.5.0-alpha
+
+Released. `Cargo.toml` reads `0.5.0-alpha` and the `v0.5.0-alpha` tag exists.
+See [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+for the narrative overview and
+[`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
+manual acceptance plan used at the time.
+
+Cheats & Mods reached its intended **three read-only emulator adapters**:
+RetroArch, PCSX2, and Dolphin. Adapter expansion paused here - see
 [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 
 ### Added
@@ -31,10 +149,9 @@ PCSX2 (merged) plus Dolphin (implemented and validated, pending merge - see
 - **Three-adapter Cheats & Mods architecture.** Cheats & Mods now
   integrates three read-only emulator adapters - RetroArch, PCSX2, and
   Dolphin - each gated to its own platform(s) with explicit profile
-  selection and no install/apply/rollback control anywhere. RetroArch and
-  PCSX2 are merged; Dolphin is implemented and validated, pending merge
-  (see "Pending merge" below). This is the intended stopping point for
-  adapter expansion for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
+  selection and no install/apply/rollback control anywhere. This is the
+  intended stopping point for adapter expansion for now - see
+  [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 - Read-only PCSX2 profile and PNACH inspection in Cheats & Mods: discovers
   native, Flatpak, and explicitly supplied portable PCSX2 profiles, and
   inspects existing `cheats`/`cheats_ws`/`patches` directories and `.pnach`
@@ -42,6 +159,17 @@ PCSX2 (merged) plus Dolphin (implemented and validated, pending merge - see
   separately verified PCSX2 executable CRC, which ArchiveFS does not yet
   have, so no exact match is ever claimed. No Install, Apply, Enable,
   Disable, or rollback control exists. See "PCSX2 read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+  for full detail.
+- Read-only Dolphin profile and Game INI inspection in Cheats & Mods:
+  discovers native, Flatpak, and explicitly supplied Dolphin configuration
+  roots, and inspects existing `GameSettings/*.ini` files for GameCube/Wii
+  archives - read-only, nothing written or created, and no texture pack,
+  graphics mod, resource pack, or Riivolution asset is inspected. Exact
+  matching requires a separately verified Dolphin Game ID, which ArchiveFS
+  does not yet have, so no exact match is ever claimed. No Install, Apply,
+  Enable, Disable, or rollback control exists. See "Dolphin read-only
+  adapter" in
   [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
   for full detail.
 - Redesigned desktop GUI navigation: `Mount`, `Selected`, `Active Mounts`,
@@ -289,32 +417,14 @@ PCSX2 (merged) plus Dolphin (implemented and validated, pending merge - see
 - PCSX2's exact CRC matching remains deferred (requires a separately
   verified PCSX2 executable CRC, which ArchiveFS does not yet have), and
   there is no PCSX2 preview, installation, or rollback support.
-- A read-only Dolphin adapter has been implemented and validated (see
-  "Pending merge" below) but has not been merged into this branch. Further
-  emulator adapter expansion beyond Dolphin is paused for now - see
-  [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
-
-### Pending merge (not yet part of this branch)
-
-- **Read-only Dolphin profile and Game INI inspection**, implemented and
-  validated on branch `codex-dolphin-readonly-adapter` (not yet merged
-  here): discovers native, Flatpak, and explicitly supplied Dolphin
-  configuration roots, and inspects existing `GameSettings/*.ini` files
-  for GameCube/Wii archives - read-only, nothing written or created, and
-  no texture pack, graphics mod, resource pack, or Riivolution asset is
-  inspected. Exact matching requires a separately verified Dolphin Game
-  ID, which ArchiveFS does not yet have, so no exact match is ever
-  claimed. No Install, Apply, Enable, Disable, or rollback control exists.
-  Proven by 6 core tests and 2 GUI tests; full workspace validation on
-  that branch reported 1,356 tests passing (CLI 127, core 828, GUI 401).
-  A Nobara-specific manual run remains outstanding (the available
-  environment was Ubuntu 24.04.4 LTS). See "Dolphin read-only adapter" in
-  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
-  for full detail.
-
-With Dolphin, Cheats & Mods reaches its intended three-adapter shape
-(RetroArch, PCSX2, Dolphin); further emulator adapter expansion is paused
-for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
+- Dolphin's exact matching remains deferred (requires a separately verified
+  Dolphin Game ID, which ArchiveFS does not yet have), there is no
+  texture-pack, graphics-mod, resource-pack, or Riivolution-asset
+  inspection, and there is no Dolphin installation or rollback support. A
+  Nobara-specific manual QA run for the Dolphin adapter remains
+  outstanding (validated on Ubuntu 24.04.4 LTS at merge time).
+- Further emulator adapter expansion beyond RetroArch/PCSX2/Dolphin is
+  paused for now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans).
 
 ## v0.4.3-alpha
 

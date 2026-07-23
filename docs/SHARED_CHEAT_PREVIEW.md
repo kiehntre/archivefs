@@ -37,9 +37,13 @@ exact matches are conflicts.
 RetroArch preserves its existing exact/strong/candidate/ambiguous/unsupported
 strength vocabulary. The shared engine accepts exact or strong RetroArch input
 only alongside verified selected-archive identity; weak/candidate-only input is
-never eligible. The current GUI does not yet materialize a selected trusted
-catalogue's individual RetroArch staging records into this shared report, so it
-truthfully reports source unavailable instead of inventing a source item.
+never eligible. The GUI materializes a selected trusted catalogue's individual
+RetroArch staging records into this shared report through the
+`materialize_retroarch_shared_preview` bridge (see
+[`RETROARCH_GUI_APPLY_HISTORY.md`](RETROARCH_GUI_APPLY_HISTORY.md)); it
+truthfully reports source unavailable only when no eligible catalogue entry
+actually exists for the selected archive, never as a placeholder for
+unfinished wiring.
 
 PCSX2 destinations are accepted only when an inspected matched file maps back
 to exactly `<configuration>/<category>/<filename>`. Deeper recursive PNACH
@@ -104,9 +108,11 @@ data, renames and deletes nothing, executes and mounts nothing, and performs no
 network operation or metadata upload. Synthetic fixture writes exist only in
 unit tests.
 
-The shared transaction foundation now provides fresh immediately-before-write
+The shared transaction foundation provides fresh immediately-before-write
 checks, explicit replacement consent, verified backups, durable journaling,
 atomic installation, post-write verification, and rollback for adapters with a
-safe materialized source seam. PCSX2 and Dolphin remain preview-only, and the
-GUI RetroArch per-game materialization bridge remains deferred. See
+safe materialized source seam. The GUI RetroArch per-game materialization
+bridge is implemented and wired into Cheats & Mods. PCSX2 and Dolphin remain
+preview-only, since neither has an independent, approved local source
+artifact to materialize. See
 [`SHARED_SAFE_APPLY_ROLLBACK.md`](SHARED_SAFE_APPLY_ROLLBACK.md).

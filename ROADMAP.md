@@ -150,43 +150,111 @@ These are implemented, tested, and in current use today:
   PS2 archives only. Exact CRC matching remains deferred pending a
   verified PS2 executable CRC. See "PCSX2 read-only adapter" in
   [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md).
+- A read-only Dolphin profile and Game INI inspection adapter in the same
+  workspace (GameCube/Wii archives only; no texture-pack or graphics-mod
+  inspection; exact matching deferred pending a verified Dolphin Game ID).
+  It ships as its own module (`patch_manager::dolphin_local`), not a
+  change to the `EmulatorAdapter` trait or the shared orchestration layer
+  below. See "Dolphin read-only adapter" in
+  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md).
+- Shared verified game identity: bounded, read-only PS2/GameCube/Wii disc
+  identity extraction feeding exact matching in the PCSX2 and Dolphin
+  adapters; see
+  [`docs/SHARED_GAME_IDENTITY.md`](docs/SHARED_GAME_IDENTITY.md).
+- A shared read-only Cheats & Mods preview/conflict model across all three
+  adapters, and a shared safe apply/backup/journal/rollback transaction
+  foundation with atomic writes, locking, and truthful partial-success
+  reporting; see
+  [`docs/SHARED_CHEAT_PREVIEW.md`](docs/SHARED_CHEAT_PREVIEW.md) and
+  [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
+- A working RetroArch GUI apply/history/rollback flow connecting an
+  eligible trusted-catalogue match to the shared transaction engine; see
+  [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md).
+- RetroArch trusted-catalogue download and management from the Sources
+  page (Download/Update/Verify, explicit review-then-confirm, background
+  retrieval with cancellation); see
+  [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- Recently Found and Mega Drive/Genesis loose-ROM recognition; see
+  [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
 
 ## Current development
 
-Work in progress or the immediate next slice of work on top of the
-foundations above:
+Work in progress, being fixed on a parallel branch and **not yet merged
+into `main`** as of this writing - do not treat any of the following as
+resolved until it lands:
 
-- A read-only Dolphin profile and Game INI inspection adapter in the
-  Cheats & Mods GUI workspace has been implemented and validated
-  (GameCube/Wii archives only; no texture-pack or graphics-mod inspection;
-  exact matching deferred pending a verified Dolphin Game ID) but is not
-  yet merged into the release branch. It ships as its own module
-  (`patch_manager::dolphin_local`), not a change to the `EmulatorAdapter`
-  trait or the shared orchestration layer below. See "Dolphin read-only
-  adapter" in
-  [`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md).
-- The shared `patch_manager` orchestration layer (platform filtering,
-  ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
-  specific to the original PCSX2 patch-preview foundation and
-  adapter-parameterized only through `EmulatorAdapter`'s narrow read-only
-  surface; see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
-  RetroArch's preview and Dolphin's new adapter both deliberately did not
-  generalize or extend this layer - each shipped as its own independent
-  module instead, since neither shape fit `EmulatorAdapter`'s
-  PCSX2-patch-preview-specific design. Whether the newer PCSX2 Cheats &
-  Mods adapter itself extends `EmulatorAdapter` or is likewise
-  independent has not been separately confirmed here.
-- Ongoing library inspection and catalogue-health improvements building on
-  the archive inspector and `CatalogueHealthReport`.
-- Documentation maintenance to keep this roadmap, the architecture docs, and
-  the changelog aligned with the code as these areas change.
+- A currently open RetroArch catalogue-tolerance issue: some individual
+  malformed entries in a downloaded trusted catalogue can affect
+  validation of the whole snapshot rather than being cleanly isolated and
+  reported as non-actionable.
+- Stale "Archive matching and cheat installation are not yet implemented"
+  wording still shown in one place in the Cheats & Mods GUI, left over
+  from before the RetroArch GUI apply/history/rollback flow above shipped.
+- Libretro catalogue archive size-limit handling.
+- "Usable with warnings" catalogue behavior for a snapshot that parses
+  with some retained warnings but is otherwise safe to match against.
+
+The shared `patch_manager` orchestration layer (platform filtering,
+ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
+specific to the original PCSX2 patch-preview foundation and
+adapter-parameterized only through `EmulatorAdapter`'s narrow read-only
+surface; see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
+RetroArch's preview and the Dolphin adapter both deliberately did not
+generalize or extend this layer - each shipped as its own independent
+module instead, since neither shape fit `EmulatorAdapter`'s
+PCSX2-patch-preview-specific design. Whether the newer PCSX2 Cheats &
+Mods adapter itself extends `EmulatorAdapter` or is likewise independent
+has not been separately confirmed here.
+
+Ongoing library inspection and catalogue-health improvements build on the
+archive inspector and `CatalogueHealthReport`. Documentation maintenance
+keeps this roadmap, the architecture docs, and the changelog aligned with
+the code as these areas change.
 
 ## Next milestones
 
-Realistic, concrete next steps, not yet started:
+Realistic, concrete next steps, in the recommended order below:
 
-- Release process discipline: a documented, repeatable release checklist
-  tied to the pinned toolchain (see [`docs/release-checklist.md`](docs/release-checklist.md)).
+1. **RetroArch catalogue tolerance and live QA** - land the parse-tolerance
+   fix and stale-wording fix above, then run a real manual QA pass against
+   a live-fetched catalogue rather than synthetic fixtures alone.
+2. **PCSX2 official `pcsx2_patches` provider** - a reviewed provider
+   integration against the real upstream
+   [`PCSX2/pcsx2_patches`](https://github.com/PCSX2/pcsx2_patches)
+   repository, whose `patches/` directory currently holds several thousand
+   `.pnach` files named `<serial>_<CRC>.pnach` or bare `<CRC>.pnach`.
+3. **PCSX2 section selection and safe PNACH merge** - a single `.pnach`
+   file can contain multiple independently named sections (for example a
+   widescreen hack alongside unrelated cheat codes); safe apply needs
+   per-section selection and a conservative merge strategy, not
+   whole-file replacement.
+4. **Dolphin official `GameSettings` provider** - a reviewed provider
+   integration against the real upstream
+   [`dolphin-emu/dolphin` `Data/Sys/GameSettings`](https://github.com/dolphin-emu/dolphin/tree/master/Data/Sys/GameSettings)
+   tree, whose filenames vary between a base 3-character Game ID, a full
+   6-character Game ID plus region, and occasional non-standard
+   identifiers for special-case titles.
+5. **Dolphin Action Replay/Gecko/OnFrame section selection and safe INI
+   merge** - individual cheats inside a Dolphin `GameSettings/*.ini` file
+   are delimited by `$Name` entries within an `[ActionReplay]`/`[Gecko]`
+   section, a finer selection unit than the file or even the bracketed
+   section itself; safe apply needs to select and merge at that level.
+6. **Real Nobara/Saltbox QA** - a genuine manual pass on the actual target
+   hardware/distribution combination, not a substitute Linux environment.
+7. **`v0.6.0-alpha` release** - once the above are complete and the
+   go/no-go checklist in
+   [`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) is clear.
+8. **Mods work** - after v0.6.0-alpha, not before; no mod adapter or
+   installation path exists yet in any form.
+9. **Further adapters** - PPSSPP, RPCS3, Xenia, Switch, MAME, and
+   Amiga/WHDLoad remain research-only candidates, explicitly not
+   scheduled and not implemented in any form; see "Medium-term plans"
+   below for the standing pause on adapter expansion.
+
+Release process discipline (a documented, repeatable release checklist
+tied to the pinned toolchain) already exists at
+[`docs/release-checklist.md`](docs/release-checklist.md) and applies to
+step 7 above unchanged.
 
 ## Medium-term plans
 
@@ -195,9 +263,15 @@ scheduled:
 
 - **Emulator adapter expansion pauses after Dolphin.** With RetroArch,
   PCSX2, and Dolphin, Cheats & Mods reaches its intended three-adapter
-  shape for now. Further read-only emulator adapters - RPCS3, PPSSPP,
-  DuckStation, Cemu, Xenia, and similar candidates - are not scheduled and
-  should not be implied as forthcoming; each would still follow the same
+  shape for now, and the immediate priority is deepening those three
+  (official providers, section-selection, real QA - see "Next milestones"
+  above) and Mods, not adding a fourth emulator. Further read-only
+  emulator adapters - PPSSPP, RPCS3, Xenia, Switch, MAME, and
+  Amiga/WHDLoad, in roughly that priority order - are not scheduled and
+  should not be implied as forthcoming; none is implemented in any form.
+  Switch is additionally sensitive (keys, firmware) and would need its own
+  separate policy decision before any design work, not just an
+  architecture review. Each would still follow the same
   read-only-inspection-first pattern if and when real user demand and an
   architecture review justify revisiting this pause.
 - Library health reporting beyond today's `CatalogueHealthReport`: damaged

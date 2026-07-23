@@ -15,21 +15,23 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** `v0.5.0-alpha` is currently in preparation - a hardening
+**Release status:** `v0.5.0-alpha` is tagged and released - a hardening
 release (mount lifecycle postcondition checks, transactional catalogue
 refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
-GUI and a first-class Cheats & Mods workspace that now spans **three
-read-only emulator adapters**: RetroArch and PCSX2, plus Dolphin, which
-has been implemented and validated but is **not yet merged into this
-branch** (see the release notes' "Dolphin read-only adapter" section
-before assuming it is present in any build from this branch today).
-Further emulator adapter expansion is paused after Dolphin for now - see
-[`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
-[`docs/RELEASE_NOTES_v0.5.0-alpha.md`](docs/RELEASE_NOTES_v0.5.0-alpha.md)
+GUI and a first-class Cheats & Mods workspace spanning **three read-only
+emulator adapters**: RetroArch, PCSX2, and Dolphin. `v0.6.0-alpha` is
+currently in preparation on top of that, adding a shared verified game
+identity system, a shared read-only preview/conflict model, a shared safe
+apply/backup/journal/rollback foundation, a working RetroArch GUI
+apply/history/rollback flow, RetroArch trusted-catalogue download and
+management, Recently Found, and Mega Drive loose-ROM recognition. PCSX2 and
+Dolphin remain preview-only; adapter expansion is paused after Dolphin for
+now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
+[`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md)
 for what's actually new and what remains unavailable, and
-[`docs/MANUAL_QA_v0.5.0-alpha.md`](docs/MANUAL_QA_v0.5.0-alpha.md) for the
-manual acceptance checklist. Nothing here has been tagged yet - the
-workspace version in `Cargo.toml` still reads `0.4.3-alpha` until that
+[`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the
+manual acceptance checklist. `v0.6.0-alpha` has not been tagged yet - the
+workspace version in `Cargo.toml` still reads `0.5.0-alpha` until that
 release-checklist step happens.
 
 ## Principles
@@ -104,11 +106,42 @@ user-facing version at
   bounded source-to-destination preview reports missing, identical, different,
   unsafe, ambiguous, and conflicting states without changing files; see
   [`docs/SHARED_CHEAT_PREVIEW.md`](docs/SHARED_CHEAT_PREVIEW.md).
+- For RetroArch specifically, an eligible exact or approved-strong trusted-
+  catalogue match can go further: the GUI can apply it through a shared,
+  locked transaction engine after explicit confirmation (with a separate,
+  non-preselected approval before replacing different existing content),
+  verify the write, and record a journal entry. History & Logs can open that
+  exact operation and preview/confirm its rollback. ArchiveFS never
+  auto-applies, and PCSX2/Dolphin remain preview-only with no apply control
+  at all; see
+  [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md)
+  and
+  [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
+  ArchiveFS does not execute cheat files or any other retrieved content at
+  any stage of preview, apply, or rollback.
+- The Sources page owns RetroArch trusted-catalogue retrieval end-to-end:
+  Download when nothing is cached, Update when a snapshot exists, and an
+  always-available read-only Verify, each starting only after an explicit
+  review-then-confirm dialog naming the exact destination. Catalogue
+  download is a separate step from cheat installation - fetching a
+  catalogue never installs anything; see
+  [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
   pinned snapshots remain protected, and retrieval and maintenance coordinate
   through one bounded cross-process cache lock; see
   [`docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md`](docs/RETROARCH_CHEAT_CACHE_MAINTENANCE.md).
+- Shows **Recently Found**: a dedicated navigation page listing only the
+  newest completed scan's newly added archives, in exact path order,
+  persisted across restarts and bounded to 10,000 entries with explicit
+  truncation reporting; see
+  [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
+- Recognizes loose **Mega Drive/Genesis** ROMs: `.gen`/`.smd` files
+  case-insensitively, and ambiguous `.md`/`.bin` files only when they sit
+  under an exactly-named Mega Drive/Genesis folder component - never from
+  the filename alone - so an unrelated `README.md` elsewhere is never
+  imported; see
+  [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
 - Includes config validation and doctor-style diagnostics.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
@@ -116,10 +149,12 @@ user-facing version at
 
 ## Current limitations
 
-- No automatic patch installation or cheat enabling -
-  `pcsx2-patch-preview` and `retroarch-patch-preview` are preview only.
-  Guided cheat setup installs only after confirmation and never enables cheats;
-  trusted retrieval remains separate from installation.
+- No automatic patch or cheat installation anywhere - `pcsx2-patch-preview`
+  and `retroarch-patch-preview` are preview only; guided cheat setup and the
+  GUI's RetroArch apply flow both require explicit confirmation and never
+  install or enable anything on their own; trusted catalogue retrieval
+  remains a separate step from installation. PCSX2 and Dolphin remain
+  preview-only in the GUI with no apply control at all.
 - No broad multi-emulator support yet - PCSX2, RetroArch, and Dolphin are the
   only emulators with any patch/cheat preview or inventory today, and none is
   launched or configured by these read-only workflows.
@@ -134,13 +169,13 @@ user-facing version at
 
 ## Install from a Release
 
-Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.4.3-alpha`. This is the quickest way to get running without building from source.
+Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.5.0-alpha`. This is the quickest way to get running without building from source.
 
 1. Download the release tarball and its `SHA256SUMS` file, for example:
 
    ```sh
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.4.3-alpha/archivefs-v0.4.3-alpha-x86_64-linux.tar.gz
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.4.3-alpha/SHA256SUMS
+   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.5.0-alpha/archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
+   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.5.0-alpha/SHA256SUMS
    ```
 
 2. Verify the tarball against the checksum file before extracting it:
@@ -152,8 +187,8 @@ Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehn
 3. Extract it:
 
    ```sh
-   tar -xzf archivefs-v0.4.3-alpha-x86_64-linux.tar.gz
-   cd archivefs-v0.4.3-alpha-x86_64-linux
+   tar -xzf archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
+   cd archivefs-v0.5.0-alpha-x86_64-linux
    ```
 
 ### Quick install
@@ -509,8 +544,11 @@ Platforms:
 - [Duplicate detector](docs/duplicate-detector.md)
 - [Security model](docs/security.md)
 - [JSON API](docs/json-api.md)
+- [v0.6.0-alpha release notes (in preparation, not yet released)](docs/RELEASE_NOTES_v0.6.0-alpha.md)
+- [v0.6.0-alpha manual QA plan](docs/MANUAL_QA_v0.6.0-alpha.md)
 - [v0.5.0-alpha release notes](docs/RELEASE_NOTES_v0.5.0-alpha.md)
 - [v0.5.0-alpha manual QA plan](docs/MANUAL_QA_v0.5.0-alpha.md)
+- [Adapter support matrix](docs/ADAPTER_SUPPORT_MATRIX.md)
 - [Release checklist](docs/release-checklist.md)
 - [Paper cuts / small usability notes](docs/paper-cuts.md)
 - [Contributing](CONTRIBUTING.md)
