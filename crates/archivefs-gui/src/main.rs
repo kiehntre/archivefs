@@ -7153,7 +7153,7 @@ impl eframe::App for ArchiveFsApp {
             &mut self.show_activity,
             &mut self.clipboard,
         ) {
-            self.view = MainView::Library;
+            self.navigate_to_library_tab(LibraryTab::Archives);
             self.selected_archive = Some(path.clone());
             self.selected_archives = [path].into_iter().collect();
         }
@@ -7347,7 +7347,7 @@ impl eframe::App for ArchiveFsApp {
                                 );
                             }
                             SourcesPageAction::ViewInLibrary(path) => {
-                                self.view = MainView::Library;
+                                self.navigate_to_library_tab(LibraryTab::Archives);
                                 self.library_source_filter = Some(Some(path));
                             }
                         }
@@ -7425,7 +7425,7 @@ impl eframe::App for ArchiveFsApp {
                             self.open_cheat_archive_picker();
                         }
                         Some(CheatWorkflowAction::OpenLibrary) => {
-                            self.view = MainView::Library;
+                            self.navigate_to_library_tab(LibraryTab::Archives);
                         }
                         Some(CheatWorkflowAction::SelectAdapter(adapter)) => {
                             if let Some(workflow) = self.cheat_workflow.as_mut() {
@@ -7628,7 +7628,7 @@ impl eframe::App for ArchiveFsApp {
                                 }));
                         }
                         Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
-                            self.view = MainView::Library;
+                            self.navigate_to_library_tab(LibraryTab::Archives);
                             self.selected_archive = Some(path.clone());
                             self.selected_archives = [path].into_iter().collect();
                         }
@@ -7872,10 +7872,10 @@ impl eframe::App for ArchiveFsApp {
                                     },
                                 ) {
                                     Some(DuplicateReviewAction::Close) => {
-                                        self.view = MainView::Library;
+                                        self.navigate_to_library_tab(LibraryTab::Archives);
                                     }
                                     Some(DuplicateReviewAction::ViewInLibrary(path)) => {
-                                        self.view = MainView::Library;
+                                        self.navigate_to_library_tab(LibraryTab::Archives);
                                         self.selected_archive = Some(path.clone());
                                         self.selected_archives = [path].into_iter().collect();
                                     }
@@ -8140,7 +8140,7 @@ impl eframe::App for ArchiveFsApp {
         if let Some(action) = health_dashboard_action {
             match action {
                 HealthDashboardAction::BackToLibrary => {
-                    self.view = MainView::Library;
+                    self.navigate_to_library_tab(LibraryTab::Archives);
                 }
                 HealthDashboardAction::Archive(request) => {
                     requested_action = Some(AppOperationRequest::Archive(request));
@@ -8149,14 +8149,14 @@ impl eframe::App for ArchiveFsApp {
                     self.refresh_diagnostics(context);
                 }
                 HealthDashboardAction::OpenMissingReview => {
-                    self.view = MainView::Library;
+                    self.navigate_to_library_tab(LibraryTab::Archives);
                     self.library_filters.missing = true;
                 }
                 HealthDashboardAction::OpenDuplicateReview => {
-                    self.view = MainView::Duplicates;
+                    self.navigate_to_library_tab(LibraryTab::Duplicates);
                 }
                 HealthDashboardAction::ViewInLibrary(path) => {
-                    self.view = MainView::Library;
+                    self.navigate_to_library_tab(LibraryTab::Archives);
                     self.selected_archive = Some(path.clone());
                     self.selected_archives = [path].into_iter().collect();
                 }
@@ -8212,7 +8212,7 @@ impl eframe::App for ArchiveFsApp {
                     self.start_archive_inspection(context.clone(), archive_path);
                 }
                 AppOperationRequest::ShowInLibraryViews(archive_path) => {
-                    self.view = MainView::LibraryViews;
+                    self.navigate_to_library_tab(LibraryTab::Views);
                     self.library_view_focus_archive = Some(archive_path);
                 }
                 AppOperationRequest::OpenCheatsMods(archive_path) => {
@@ -36391,7 +36391,7 @@ mod tests {
         let action = HealthDashboardAction::ViewInLibrary(path.clone());
         match action {
             HealthDashboardAction::ViewInLibrary(resolved) => {
-                app.view = MainView::Library;
+                app.navigate_to_library_tab(LibraryTab::Archives);
                 app.selected_archive = Some(resolved.clone());
                 app.selected_archives = [resolved].into_iter().collect();
             }
@@ -36399,6 +36399,7 @@ mod tests {
         }
 
         assert_eq!(app.view, MainView::Library);
+        assert_eq!(app.library_tab, LibraryTab::Archives);
         assert_eq!(app.selected_archive, Some(path.clone()));
         assert_eq!(
             app.selected_archives,
