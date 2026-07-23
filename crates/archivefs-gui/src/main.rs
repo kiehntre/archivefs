@@ -3009,6 +3009,21 @@ impl ArchiveFsApp {
         }
     }
 
+    /// The compatibility wrapper for navigating *by tab* - the write
+    /// direction LibraryTab's synchronization rule reserves exclusively
+    /// for this method (every other call site still navigates by setting
+    /// `view` directly, exactly as before). Sets both fields together so
+    /// they can never briefly disagree; `tools_overlay` is cleared to
+    /// match every other navigation call site's behaviour (see the
+    /// sidebar-click handler in `update`). Not yet called from any
+    /// production UI - it exists for Phase 2's tab control to call, and
+    /// is exercised directly by this milestone's tests.
+    fn navigate_to_library_tab(&mut self, tab: LibraryTab) {
+        self.view = main_view_for_library_tab(tab);
+        self.library_tab = tab;
+        self.tools_overlay = ToolsOverlay::None;
+    }
+
     fn refresh(&mut self, context: &egui::Context) {
         self.refresh_generation = self.refresh_generation.next();
         let generation = self.refresh_generation;
@@ -6853,6 +6868,11 @@ impl Drop for ArchiveFsApp {
 
 impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        // LibraryTab synchronization rule - see LibraryTab's doc comment.
+        // `view` is untouched by this; `library_tab` only ever follows it.
+        if let Some(tab) = library_tab_for_main_view(self.view) {
+            self.library_tab = tab;
+        }
         self.poll_shared_history();
         if self.view != MainView::HistoryLogs
             && matches!(
