@@ -82,7 +82,7 @@ rebinding; exact host binding and TLS hostname verification remain controls.
 
 No request carries credentials, uploads, telemetry, game metadata, filenames,
 or locally computed hashes. Headers are limited to 32 KiB. Content-Length is only an early check: actual
-bytes are counted and stopped at the lower of the registry's 128 MiB maximum and
+bytes are counted and stopped at the lower of the registry's 256 MiB maximum and
 `--max-download-bytes`. Compressed HTTP transfer encoding is rejected. Missing
 Content-Length is accepted; a mismatching declared length is rejected.
 Accepted bytes stream directly into a unique staging file; they are never
@@ -93,13 +93,13 @@ Extraction refuses absolute, `.`/`..`, empty-component, Windows drive,
 UNC/backslash, NUL, oversized/deep, duplicate, case-fold-colliding, symlink,
 hard-link, device, FIFO, socket, and other special entries. Files use
 no-overwrite creation beneath symlink-checked staging. Limits are 60,000
-entries, 8 MiB per file (the shared local catalogue bound), 512 MiB total expanded, 1,024 path bytes, 24
+entries, 8 MiB per file (the shared local catalogue bound), 1 GiB total expanded, 1,024 path bytes, 24
 components, and 250:1 compression ratio. Nested archives remain inert files
 and are never recursively extracted.
 
-The archive download limit is 128 MiB, the revision response limit is 64 KiB,
+The archive download limit is 256 MiB, the revision response limit is 64 KiB,
 the serialized manifest limit is 16 MiB, redirects are limited to three, and
-the global request timeout is 90 seconds. One exclusive cache-root lock permits
+the global request timeout is 180 seconds. One exclusive cache-root lock permits
 only one source operation at a time.
 
 ## Cache, provenance, offline mode
@@ -220,6 +220,21 @@ Nintendo Entertainment System` directories map to ArchiveFS's existing
 MegaDrive and SNES platform identities. Valid entries for both systems remain
 matchable when unrelated catalogue files are excluded.
 
+For a catalogued loose Mega Drive ROM, shared identity hashes the complete
+on-disk file (up to 64 MiB) after validating an exact scanner/manual platform
+assignment, a supported extension, a regular no-follow file, and stable file
+metadata. That SHA-256 identifies the local bytes only; it is not a known-good
+dump or safety claim. The digest is bound into trusted-catalogue preview and is
+revalidated before apply. `.smd` bytes are hashed exactly as stored without
+header stripping or deinterleaving. See `LOOSE_ROM_CHEAT_SUPPORT.md`.
+
+Existing-local-cheat inspection is independent from the trusted snapshot. For
+one selected game it checks only reviewed exact platform-directory aliases and
+their immediate `.cht` files. It never recursively walks the full RetroArch
+tree. Local results remain unverified and are reported as Not found, filename
+Candidate, Exact local filename, Ambiguous, Unsafe, Unavailable, or Limit
+reached.
+
 No automatic download occurs at startup, during library scan, during preview,
 or during Apply. The Cheats & Mods page links to Sources for Download/Update;
 its only direct catalogue action is read-only cached-snapshot reuse.
@@ -247,7 +262,7 @@ Manual Saltbox/Nobara checks:
 11. Confirm PCSX2 and Dolphin remain preview-only.
 12. Confirm no Apply occurs without exact preview, review, and confirmation.
 13. Confirm queue, mounts, filters, Recently Found, History, and selection remain intact.
-14. Request Update and confirm an archive below 128 MiB succeeds.
+14. Request Update and confirm an archive below 256 MiB succeeds.
 15. Disconnect networking, request Update, and confirm the active snapshot remains usable.
 
 Current limitations are one reviewed source, ZIP only, no standalone
