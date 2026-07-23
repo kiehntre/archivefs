@@ -4666,6 +4666,12 @@ impl ArchiveFsApp {
         };
         let (sender, receiver) = mpsc::channel();
         self.shared_history = SharedHistoryState::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            "Refreshing bounded shared transaction history.",
+        ));
         thread::spawn(move || {
             let report = discover_shared_apply_history(&history_root);
             let _ = sender.send(Ok(report));
@@ -4678,8 +4684,28 @@ impl ArchiveFsApp {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(report)) => self.shared_history = SharedHistoryState::Ready(report),
-            Ok(Err(message)) => self.shared_history = SharedHistoryState::Failed(message),
+            Ok(Ok(report)) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "Shared transaction history refreshed: {} journal(s), {} warning(s).",
+                        report.journals.len(),
+                        report.warnings.len()
+                    ),
+                ));
+                self.shared_history = SharedHistoryState::Ready(report);
+            }
+            Ok(Err(message)) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("Shared transaction history refresh failed: {message}"),
+                ));
+                self.shared_history = SharedHistoryState::Failed(message);
+            }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.shared_history = SharedHistoryState::Failed(
@@ -4707,6 +4733,12 @@ impl ArchiveFsApp {
         };
         let (sender, receiver) = mpsc::channel();
         self.shared_rollback = SharedRollbackState::Previewing { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            "Rollback preview started; no files are being changed.",
+        ));
         thread::spawn(move || {
             let preview = preview_shared_rollback(&journal_path, &destination_root, &backup_root);
             let _ = sender.send(Ok((preview, history_root, backup_root)));
@@ -4748,6 +4780,15 @@ impl ArchiveFsApp {
         };
         let (sender, receiver) = mpsc::channel();
         self.shared_rollback = SharedRollbackState::Applying { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            format!(
+                "Rollback '{}' started after exact preview confirmation.",
+                options.rollback_operation_id
+            ),
+        ));
         thread::spawn(move || {
             let result = execute_shared_rollback(&preview, &options);
             let _ = sender.send(Ok(result));
@@ -4759,6 +4800,20 @@ impl ArchiveFsApp {
         match &self.shared_rollback {
             SharedRollbackState::Previewing { receiver } => match receiver.try_recv() {
                 Ok(Ok((preview, history_root, backup_root))) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        None,
+                        if preview.available {
+                            ActivityOutcome::Completed
+                        } else {
+                            ActivityOutcome::Rejected
+                        },
+                        if preview.available {
+                            "Rollback preview completed and is available."
+                        } else {
+                            "Rollback preview completed and is blocked."
+                        },
+                    ));
                     self.shared_rollback = SharedRollbackState::Review {
                         preview,
                         history_root,
@@ -4775,6 +4830,16 @@ impl ArchiveFsApp {
             },
             SharedRollbackState::Applying { receiver } => match receiver.try_recv() {
                 Ok(Ok(result)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        None,
+                        if result.status == SharedApplyStatus::Success {
+                            ActivityOutcome::Completed
+                        } else {
+                            ActivityOutcome::Failed
+                        },
+                        format!("Rollback finished with {:?}.", result.status),
+                    ));
                     self.shared_rollback = SharedRollbackState::Result(result);
                     self.shared_history = SharedHistoryState::NotLoaded;
                 }

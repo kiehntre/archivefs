@@ -85,4 +85,3 @@ Manual Nobara checks:
 7. Change archive/profile/source/page during preview or review and verify the
    stale result cannot be applied. Confirm queue, mounts, Library selection, and
    platform assignment are unchanged throughout.
-
