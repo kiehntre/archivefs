@@ -41,7 +41,7 @@ const FRESH_SECONDS: u64 = 24 * 60 * 60;
 pub const CHEAT_SOURCE_REDIRECT_LIMIT: usize = 3;
 const HEADER_BYTES_LIMIT: usize = 32 * 1024;
 pub const CHEAT_SOURCE_ENTRY_LIMIT: usize = 60_000;
-pub const CHEAT_SOURCE_FILE_SIZE_LIMIT: u64 = 8 * 1024 * 1024;
+pub const CHEAT_SOURCE_FILE_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 pub const CHEAT_SOURCE_EXPANDED_SIZE_LIMIT: u64 = 1024 * 1024 * 1024;
 const COMPRESSION_RATIO_LIMIT: u64 = 250;
 pub const CHEAT_SOURCE_PATH_BYTES_LIMIT: usize = 1024;
@@ -2138,7 +2138,9 @@ fn validate_extraction_sizes(
         return Err(CheatSourceError::new(
             CheatSourceErrorStage::Extraction,
             "file_size_limit_exceeded",
-            format!("entry exceeds {CHEAT_SOURCE_FILE_SIZE_LIMIT} bytes: {name}"),
+            format!(
+                "entry size {file_size} bytes exceeds maximum {CHEAT_SOURCE_FILE_SIZE_LIMIT} bytes: {name}"
+            ),
         ));
     }
     if expanded_total > CHEAT_SOURCE_EXPANDED_SIZE_LIMIT {
@@ -2259,7 +2261,8 @@ pub(super) fn collect_catalogue_manifest(
                 return Err(cache_error(
                     "catalogue_manifest_file_size_limit",
                     format!(
-                        "catalogue file exceeds {CHEAT_SOURCE_FILE_SIZE_LIMIT} bytes: {}",
+                        "catalogue file size {} bytes exceeds maximum {CHEAT_SOURCE_FILE_SIZE_LIMIT} bytes: {}",
+                        metadata.len(),
                         path.display()
                     ),
                 ));
@@ -3876,6 +3879,99 @@ mod tests {
                 .unwrap_err()
                 .code,
             "entry_limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn individual_entry_limit_accepts_files_above_eight_mib_through_exactly_sixty_four_mib() {
+        let former_limit = 8 * 1024 * 1024;
+        let just_above_former_limit = former_limit + 1;
+
+        assert_eq!(CHEAT_SOURCE_FILE_SIZE_LIMIT, 64 * 1024 * 1024);
+        validate_extraction_sizes(
+            just_above_former_limit,
+            just_above_former_limit,
+            just_above_former_limit,
+            "libretro-database/relevant.dat",
+        )
+        .unwrap();
+        validate_extraction_sizes(
+            CHEAT_SOURCE_FILE_SIZE_LIMIT,
+            CHEAT_SOURCE_FILE_SIZE_LIMIT,
+            CHEAT_SOURCE_FILE_SIZE_LIMIT,
+            "libretro-database/limit.dat",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn individual_entry_above_sixty_four_mib_reports_actual_limit_and_path() {
+        let actual = CHEAT_SOURCE_FILE_SIZE_LIMIT + 1;
+        let path = "libretro-database/revision/dat/Mobile - J2ME.dat";
+        let error = validate_extraction_sizes(actual, actual, actual, path).unwrap_err();
+
+        assert_eq!(error.code, "file_size_limit_exceeded");
+        assert!(error.message.contains(&actual.to_string()));
+        assert!(
+            error
+                .message
+                .contains(&CHEAT_SOURCE_FILE_SIZE_LIMIT.to_string())
+        );
+        assert!(error.message.contains(path));
+    }
+
+    #[test]
+    fn expanded_content_limit_remains_independent_of_the_larger_entry_limit() {
+        let error = validate_extraction_sizes(
+            1,
+            1,
+            CHEAT_SOURCE_EXPANDED_SIZE_LIMIT + 1,
+            "libretro-database/small.dat",
+        )
+        .unwrap_err();
+
+        assert_eq!(CHEAT_SOURCE_EXPANDED_SIZE_LIMIT, 1024 * 1024 * 1024);
+        assert_eq!(error.code, "expanded_size_limit_exceeded");
+    }
+
+    #[test]
+    fn oversized_extracted_entry_retains_the_previous_active_snapshot() {
+        let temp = TempDirectory::new();
+        let initial = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &options(&temp.0),
+            &FakeTransport::new(vec![Ok(response(valid_zip()))]),
+        )
+        .unwrap();
+        let oversized = vec![b'x'; CHEAT_SOURCE_FILE_SIZE_LIMIT as usize + 1];
+        let oversized_archive = zip(&[(
+            "libretro-database-new/dat/Mobile - J2ME.dat",
+            oversized.as_slice(),
+            None,
+        )]);
+        let mut update = options(&temp.0);
+        update.force_refresh = true;
+        let error = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &update,
+            &FakeTransport::new(vec![Ok(response(oversized_archive))]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "file_size_limit_exceeded");
+        assert!(error.message.contains("67108865"));
+        assert!(error.message.contains("67108864"));
+        assert!(error.message.contains("Mobile - J2ME.dat"));
+        let inspection =
+            inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0).unwrap();
+        assert!(inspection.setup_usable);
+        assert_eq!(
+            inspection.manifest.unwrap().archive_sha256,
+            initial.manifest.archive_sha256
+        );
+        assert_eq!(
+            inspection.last_error.unwrap().code,
+            "file_size_limit_exceeded"
         );
     }
 
