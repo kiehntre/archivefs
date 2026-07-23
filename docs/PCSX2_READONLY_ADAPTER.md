@@ -82,6 +82,13 @@ boot ELF in a supported ISO. Only that verified CRC enables exact PNACH
 matching. ZIP prefix limits or an unavailable image format leave CRC explicit
 as deferred or resource-limited. See [`SHARED_GAME_IDENTITY.md`](SHARED_GAME_IDENTITY.md).
 
+The shared read-only preview uses that verified CRC to select PNACH content and
+maps only a conservative `cheats`, `cheats_ws`, or `patches` child path beneath
+the approved PCSX2 root. Serial-only and filename/title evidence remain
+candidate-only and blocked. Existing different content is reported as a future
+replacement requiring both backup and explicit replacement permission; no
+replacement is performed. See [`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
+
 ## Privacy, safety, and future work
 
 All inspection is local. No filenames, contents, hashes, results, or metadata
@@ -89,6 +96,6 @@ are uploaded. The adapter has no network or process-execution path. Original
 PCSX2 files remain untouched. Structural inspection is not antivirus scanning
 and does not prove that a patch is benign or correct.
 
-Preview, installation, conflict handling, verified backup, journaling,
-rollback, enabling, and disabling are future work. The GUI exposes none of
-those actions in this read-only milestone.
+The preview and conflict report is implemented read-only. Installation,
+verified backup, journaling, rollback, enabling, and disabling remain future
+work, and the GUI exposes none of those actions.

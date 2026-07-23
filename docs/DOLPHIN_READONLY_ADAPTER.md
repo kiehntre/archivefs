@@ -78,6 +78,14 @@ outer-header revision remains candidate-only. An INI or archive filename Game
 ID remains an observation, not verified identity. See
 [`SHARED_GAME_IDENTITY.md`](SHARED_GAME_IDENTITY.md).
 
+The shared read-only preview uses the verified Game ID, preserving an optional
+verified revision as distinct evidence, and maps only a conservative
+`GameSettings/<matched file>.ini` destination beneath the approved Dolphin
+root. Candidate filename IDs are visible but blocked. Texture-pack preview is
+not supported. Existing different content is reported as a future replacement
+requiring both backup and explicit replacement permission; no replacement is
+performed. See [`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
+
 ## Privacy, safety, and future work
 
 All profile inspection is local. No filename, content, hash, result, or
@@ -85,6 +93,7 @@ metadata is uploaded. The adapter exposes no network or process-execution path,
 and original Dolphin files remain untouched. Structural inspection is not
 antivirus scanning and does not prove that a cheat or patch is benign.
 
-Preview, installation, conflict handling, verified backup, journaling,
-rollback, enabling, disabling, and referenced Riivolution asset inspection are
-future work. The GUI exposes none of those actions in this read-only milestone.
+The preview and conflict report is implemented read-only. Installation,
+verified backup, journaling, rollback, enabling, disabling, and referenced
+Riivolution asset inspection remain future work, and the GUI exposes none of
+those actions.

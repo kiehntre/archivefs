@@ -100,7 +100,10 @@ user-facing version at
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
   [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md),
   [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md), and
-  [`docs/SHARED_GAME_IDENTITY.md`](docs/SHARED_GAME_IDENTITY.md).
+  [`docs/SHARED_GAME_IDENTITY.md`](docs/SHARED_GAME_IDENTITY.md). A shared,
+  bounded source-to-destination preview reports missing, identical, different,
+  unsafe, ambiguous, and conflicting states without changing files; see
+  [`docs/SHARED_CHEAT_PREVIEW.md`](docs/SHARED_CHEAT_PREVIEW.md).
 - Inventories, verifies, pins and deliberately prunes immutable cheat-source
   snapshots with preview-first cache maintenance. Current, last-known-good and
   pinned snapshots remain protected, and retrieval and maintenance coordinate
@@ -487,6 +490,7 @@ Platforms:
 - [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
 - [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
 - [Shared verified game identity](docs/SHARED_GAME_IDENTITY.md)
+- [Shared read-only Cheats & Mods preview](docs/SHARED_CHEAT_PREVIEW.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)
