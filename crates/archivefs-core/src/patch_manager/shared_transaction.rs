@@ -20,6 +20,7 @@ use super::shared_preview::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewProposedAction,
     SharedPreviewReport,
 };
+use crate::default_database_path;
 
 pub const SHARED_APPLY_SCHEMA_VERSION: u32 = 1;
 pub const SHARED_MAX_ENTRIES: usize = 128;
@@ -35,6 +36,28 @@ pub const SHARED_MAX_CREATED_DIRECTORIES: usize = 32;
 pub const SHARED_MAX_TEMP_FILES: usize = 128;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY: Duration = Duration::from_millis(25);
+
+pub fn default_shared_history_root() -> Result<PathBuf, SharedApplyFailure> {
+    default_managed_root("shared-cheat-history")
+}
+
+pub fn default_shared_backup_root() -> Result<PathBuf, SharedApplyFailure> {
+    default_managed_root("shared-cheat-backups")
+}
+
+fn default_managed_root(name: &str) -> Result<PathBuf, SharedApplyFailure> {
+    let database = default_database_path().map_err(|error_value| {
+        failure(
+            SharedApplyFailureKind::ManagedRootUnsafe,
+            None,
+            &error_value.to_string(),
+        )
+    })?;
+    Ok(database
+        .parent()
+        .expect("default database path always has a parent")
+        .join(name))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaultPoint {

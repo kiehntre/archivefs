@@ -40,6 +40,7 @@ mod retroarch;
 mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
+mod retroarch_materialization;
 mod shared_preview;
 mod shared_transaction;
 
@@ -174,6 +175,12 @@ pub use retroarch_inventory::{
     ArtifactPlaylistEvidence, CheatFileSummary, RetroArchArtifactDestination,
     RetroArchArtifactFinding, RetroArchArtifactInventory, RetroArchArtifactSummary,
 };
+pub use retroarch_materialization::{
+    RETROARCH_MAX_MATERIALIZED_ENTRIES, RetroArchMaterializationError,
+    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
+    RetroArchMaterializedPreview, RetroArchMaterializedSource,
+    materialize_retroarch_shared_preview,
+};
 pub use shared_preview::{
     PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,
     PREVIEW_MAX_DESTINATION_PATHS, PREVIEW_MAX_ENTRIES, PREVIEW_MAX_SOURCE_FILES_HASHED,
@@ -195,8 +202,9 @@ pub use shared_transaction::{
     SharedPlanEntry, SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions,
     SharedRollbackOutcome, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPath,
     SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
-    build_shared_transaction_plan, discover_shared_apply_history, execute_shared_apply,
-    execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
+    build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
+    discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, preview_shared_rollback,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
