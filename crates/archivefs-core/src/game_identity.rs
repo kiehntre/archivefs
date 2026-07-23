@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
@@ -21,6 +22,10 @@ pub const MAX_EXECUTABLE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_DIRECTORY_BYTES: u64 = 1024 * 1024;
 pub const MAX_NESTED_CONTAINER_DEPTH: usize = 1;
 pub const MAX_RETAINED_WARNINGS: usize = 64;
+pub const MAX_LOOSE_ROM_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_LOOSE_ROM_FILES: usize = 1;
+pub const MAX_LOOSE_ROM_WARNINGS: usize = 16;
+pub const MAX_LOOSE_ROM_METADATA_TOKENS: usize = 16;
 
 const ISO_SECTOR_SIZE: u64 = 2_048;
 const DOLPHIN_HEADER_BYTES: usize = 0x20;
@@ -66,6 +71,9 @@ pub enum IdentityKind {
     DolphinRevision,
     DolphinDiscNumber,
     DolphinRegion,
+    LooseRomSha256,
+    LooseRomFormat,
+    LooseRomTitle,
 }
 
 impl fmt::Display for IdentityKind {
@@ -78,6 +86,9 @@ impl fmt::Display for IdentityKind {
             Self::DolphinRevision => "Dolphin revision",
             Self::DolphinDiscNumber => "Dolphin disc number",
             Self::DolphinRegion => "Dolphin region code",
+            Self::LooseRomSha256 => "Local ROM SHA-256",
+            Self::LooseRomFormat => "Loose ROM format",
+            Self::LooseRomTitle => "Normalized ROM title",
         };
         f.write_str(value)
     }
@@ -97,6 +108,8 @@ pub enum IdentityPlatform {
     PlayStation2,
     GameCube,
     Wii,
+    MegaDrive,
+    Snes,
     Other,
 }
 
@@ -107,6 +120,14 @@ impl IdentityPlatform {
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" => Self::GameCube,
             "wii" | "nintendo wii" => Self::Wii,
+            "megadrive" | "mega drive" | "genesis" | "sega mega drive" | "sega genesis" => {
+                Self::MegaDrive
+            }
+            "snes"
+            | "super nintendo"
+            | "super nintendo entertainment system"
+            | "nintendo super nintendo entertainment system"
+            | "super famicom" => Self::Snes,
             _ => Self::Other,
         }
     }
@@ -116,6 +137,8 @@ impl IdentityPlatform {
             Self::PlayStation2 => "PlayStation 2",
             Self::GameCube => "GameCube",
             Self::Wii => "Wii",
+            Self::MegaDrive => "Mega Drive / Genesis",
+            Self::Snes => "SNES",
             Self::Other => "Unsupported platform",
         }
     }
@@ -125,6 +148,7 @@ impl IdentityPlatform {
 pub enum IdentityImageFormat {
     Iso,
     ZipContainingIso,
+    LooseCartridgeRom,
     Deferred,
     Unsupported,
 }
@@ -183,9 +207,36 @@ impl GameIdentityReport {
     pub fn verified_pcsx2_crc(&self) -> Option<&str> {
         self.verified_value(IdentityKind::Pcsx2ExecutableCrc)
     }
+
+    pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::LooseRomSha256)
+    }
+
+    pub fn is_verified_loose_rom(&self) -> bool {
+        self.format == IdentityImageFormat::LooseCartridgeRom
+            && self.verified_loose_rom_sha256().is_some()
+    }
 }
 
 pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameIdentityReport {
+    inspect_game_identity_with_platform_trust(path, platform_hint, false)
+}
+
+/// Inspect identity using platform evidence already validated by the library
+/// scanner or an explicit manual assignment. The boolean is deliberately not
+/// inferred from a filename: callers must opt in at the catalogue boundary.
+pub fn inspect_catalogued_game_identity(
+    path: &Path,
+    platform_hint: Option<&str>,
+) -> GameIdentityReport {
+    inspect_game_identity_with_platform_trust(path, platform_hint, true)
+}
+
+fn inspect_game_identity_with_platform_trust(
+    path: &Path,
+    platform_hint: Option<&str>,
+    trusted_platform: bool,
+) -> GameIdentityReport {
     let platform = IdentityPlatform::from_catalogue(platform_hint);
     let mut report = GameIdentityReport {
         archive_path: path.to_path_buf(),
@@ -202,13 +253,33 @@ pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameId
     report.evidence.push(evidence(
         &report,
         IdentityKind::Platform,
-        IdentityStatus::Candidate,
+        if trusted_platform {
+            IdentityStatus::Verified
+        } else {
+            IdentityStatus::Candidate
+        },
         platform_hint.map(str::to_owned),
         IdentityConfidence::CatalogueContext,
-        "catalogue platform context; not derived from disc bytes",
-        "ArchiveFS catalogue context",
+        if trusted_platform {
+            "exact platform supplied by scanner or manual assignment; not derived from ROM bytes"
+        } else {
+            "catalogue platform context; not derived from disc bytes"
+        },
+        if trusted_platform {
+            "trusted ArchiveFS library platform context"
+        } else {
+            "ArchiveFS catalogue context"
+        },
     ));
     add_filename_candidate(&mut report);
+
+    if matches!(
+        platform,
+        IdentityPlatform::MegaDrive | IdentityPlatform::Snes
+    ) {
+        inspect_loose_rom(&mut report, trusted_platform);
+        return report;
+    }
 
     if platform == IdentityPlatform::Other {
         report.evidence.push(evidence(
@@ -246,6 +317,228 @@ pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameId
         ),
     }
     report
+}
+
+pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match (platform, extension.as_str()) {
+        (IdentityPlatform::MegaDrive, "md") => Some("md"),
+        (IdentityPlatform::MegaDrive, "gen") => Some("gen"),
+        (IdentityPlatform::MegaDrive, "smd") => Some("smd"),
+        (IdentityPlatform::MegaDrive, "bin") => Some("bin"),
+        (IdentityPlatform::Snes, "sfc") => Some("sfc"),
+        (IdentityPlatform::Snes, "smc") => Some("smc"),
+        _ => None,
+    }
+}
+
+fn inspect_loose_rom(report: &mut GameIdentityReport, trusted_platform: bool) {
+    report.format = IdentityImageFormat::LooseCartridgeRom;
+    let Some(format) = supported_loose_rom_format(&report.archive_path, report.platform) else {
+        add_loose_rom_unavailable(
+            report,
+            IdentityStatus::Unsupported,
+            "file extension is not supported for the exact cartridge platform",
+        );
+        return;
+    };
+    if !trusted_platform {
+        add_loose_rom_unavailable(
+            report,
+            IdentityStatus::Ambiguous,
+            "loose ROM identity requires exact scanner or manual platform evidence",
+        );
+        return;
+    }
+    let mut file = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_loose_rom_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let before = match StableFileMetadata::from_file(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            add_loose_rom_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    if before.len > MAX_LOOSE_ROM_BYTES {
+        add_loose_rom_unavailable(
+            report,
+            IdentityStatus::ResourceLimitReached,
+            &format!(
+                "loose ROM is {} bytes; maximum supported size is {} bytes",
+                before.len, MAX_LOOSE_ROM_BYTES
+            ),
+        );
+        return;
+    }
+    let digest = match hash_bounded_file(&mut file, MAX_LOOSE_ROM_BYTES) {
+        Ok((digest, bytes_read)) => {
+            report.bytes_read = bytes_read;
+            digest
+        }
+        Err(error) => {
+            add_loose_rom_unavailable(report, source_error_status(&error), &error.to_string());
+            return;
+        }
+    };
+    let after = match StableFileMetadata::from_file(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            add_loose_rom_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    if !loose_rom_read_was_stable(&before, &after, report.bytes_read) {
+        add_loose_rom_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "loose ROM changed while its identity was being read",
+        );
+        return;
+    }
+
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::LooseRomSha256,
+        IdentityStatus::Verified,
+        Some(digest),
+        IdentityConfidence::ExactBytes,
+        "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim",
+        "bounded full-file SHA-256",
+    ));
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::LooseRomFormat,
+        IdentityStatus::Verified,
+        Some(format.to_string()),
+        IdentityConfidence::StructuredMetadata,
+        if format == "smd" {
+            "format is recorded from the exact extension; bytes were not header-stripped or deinterleaved"
+        } else {
+            "format is recorded from the exact extension and trusted platform context"
+        },
+        "exact file extension",
+    ));
+    if let Some(title) = normalized_loose_rom_title(&report.archive_path) {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::LooseRomTitle,
+            IdentityStatus::Verified,
+            Some(title),
+            IdentityConfidence::CatalogueContext,
+            "deterministic display title derived from the exact filename; not content identity",
+            "filename stem normalization",
+        ));
+    } else {
+        retain_warning(
+            report,
+            "ROM title contains unsupported path encoding; exact path bytes remain preserved",
+        );
+    }
+    report.complete = true;
+}
+
+fn loose_rom_read_was_stable(
+    before: &StableFileMetadata,
+    after: &StableFileMetadata,
+    bytes_read: u64,
+) -> bool {
+    before == after && bytes_read == before.len
+}
+
+fn normalized_loose_rom_title(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let mut normalized = String::with_capacity(stem.len());
+    let mut separator = true;
+    for character in stem.chars() {
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
+            separator = false;
+        } else if !separator {
+            normalized.push(' ');
+            separator = true;
+        }
+    }
+    normalized.truncate(normalized.trim_end().len());
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn add_loose_rom_unavailable(
+    report: &mut GameIdentityReport,
+    status: IdentityStatus,
+    diagnostic: &str,
+) {
+    for kind in [IdentityKind::LooseRomSha256, IdentityKind::LooseRomFormat] {
+        report.evidence.push(evidence(
+            report,
+            kind,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            diagnostic,
+            "loose cartridge ROM safety eligibility",
+        ));
+    }
+}
+
+fn hash_bounded_file(file: &mut File, maximum: u64) -> io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("loose ROM byte count overflow"))?;
+        if total > maximum {
+            return Err(io::Error::other("loose ROM hash byte limit reached"));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok((
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        total,
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StableFileMetadata {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl StableFileMetadata {
+    fn from_file(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+fn retain_warning(report: &mut GameIdentityReport, warning: &str) {
+    if report.warnings.len() < MAX_LOOSE_ROM_WARNINGS.min(MAX_RETAINED_WARNINGS) {
+        report.warnings.push(warning.to_string());
+    }
 }
 
 fn inspect_direct_iso(report: &mut GameIdentityReport) {
@@ -361,7 +654,10 @@ fn inspect_zip_iso(report: &mut GameIdentityReport) {
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             member_size.min(DOLPHIN_HEADER_BYTES as u64)
         }
-        IdentityPlatform::PlayStation2 | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
+        IdentityPlatform::PlayStation2
+        | IdentityPlatform::MegaDrive
+        | IdentityPlatform::Snes
+        | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
     if let Err(error) = entry.by_ref().take(read_cap).read_to_end(&mut data) {
@@ -394,7 +690,7 @@ fn inspect_iso_source(
         IdentityPlatform::PlayStation2 => {
             inspect_ps2_iso(report, source, member_path, member_index)
         }
-        IdentityPlatform::Other => {}
+        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => {}
     }
 }
 
@@ -1161,7 +1457,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
-        IdentityPlatform::Other => &[],
+        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => &[],
     };
     for kind in kinds {
         report.evidence.push(evidence(
@@ -1222,7 +1518,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
                 }
             }
         }
-        IdentityPlatform::Other => {}
+        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => {}
     }
 }
 
@@ -1363,6 +1659,11 @@ mod tests {
         let path = directory.0.join(name);
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     #[test]
@@ -1590,5 +1891,133 @@ mod tests {
                 .iter()
                 .any(|item| item.diagnostic.contains("symlink refused"))
         );
+    }
+
+    #[test]
+    fn mega_drive_loose_formats_receive_verified_local_byte_identity() {
+        let directory = FixtureDir::new("loose-mega-drive");
+        for extension in ["md", "gen", "smd"] {
+            let bytes = format!("synthetic-{extension}-bytes").into_bytes();
+            let path = write_fixture(
+                &directory,
+                &format!("Alien 3 (USA, Europe).{extension}"),
+                &bytes,
+            );
+            let report = inspect_catalogued_game_identity(&path, Some("MegaDrive"));
+            assert_eq!(report.platform, IdentityPlatform::MegaDrive);
+            assert_eq!(report.format, IdentityImageFormat::LooseCartridgeRom);
+            assert_eq!(report.bytes_read, bytes.len() as u64);
+            let expected = sha256_hex(&bytes);
+            assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+            assert!(report.complete);
+            assert!(report.evidence.iter().any(|item| {
+                item.kind == IdentityKind::LooseRomSha256
+                    && item.diagnostic.contains("not a known-good dump claim")
+            }));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn contextual_bin_requires_trusted_exact_platform_evidence() {
+        let directory = FixtureDir::new("loose-bin-context");
+        let path = write_fixture(&directory, "Game.bin", b"bytes");
+        let candidate = inspect_game_identity(&path, Some("MegaDrive"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert!(candidate.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Ambiguous
+        }));
+
+        let verified = inspect_catalogued_game_identity(&path, Some("MegaDrive"));
+        let expected = sha256_hex(b"bytes");
+        assert_eq!(
+            verified.verified_loose_rom_sha256(),
+            Some(expected.as_str())
+        );
+        let unrelated = inspect_catalogued_game_identity(&path, Some("SNES"));
+        assert_eq!(unrelated.verified_loose_rom_sha256(), None);
+    }
+
+    #[test]
+    fn snes_loose_formats_receive_verified_local_byte_identity() {
+        let directory = FixtureDir::new("loose-snes");
+        for extension in ["sfc", "smc"] {
+            let bytes = format!("synthetic-{extension}-bytes").into_bytes();
+            let path = write_fixture(&directory, &format!("Chrono Quest.{extension}"), &bytes);
+            let report = inspect_catalogued_game_identity(&path, Some("SNES"));
+            assert_eq!(report.platform, IdentityPlatform::Snes);
+            let expected = sha256_hex(&bytes);
+            assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn oversized_loose_rom_fails_closed_without_hashing() {
+        let directory = FixtureDir::new("loose-oversized");
+        let path = directory.0.join("Too Large.md");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_LOOSE_ROM_BYTES + 1).unwrap();
+        let report = inspect_catalogued_game_identity(&path, Some("MegaDrive"));
+        assert_eq!(report.bytes_read, 0);
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256
+                && item.status == IdentityStatus::ResourceLimitReached
+        }));
+    }
+
+    #[test]
+    fn loose_rom_stability_check_rejects_file_mutation() {
+        let directory = FixtureDir::new("loose-mutated");
+        let path = write_fixture(&directory, "Changing.md", b"initial bytes");
+        let file = OpenOptions::new().read(true).open(&path).unwrap();
+        let before = StableFileMetadata::from_file(&file).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let after = StableFileMetadata::from_file(&file).unwrap();
+        assert!(!loose_rom_read_was_stable(&before, &after, before.len));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_rom_refuses_symlinked_parent_and_preserves_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("loose-paths");
+        let real_parent = directory.0.join("real");
+        fs::create_dir(&real_parent).unwrap();
+        let link_parent = directory.0.join("linked");
+        symlink(&real_parent, &link_parent).unwrap();
+        let real = real_parent.join("Game.md");
+        fs::write(&real, b"rom").unwrap();
+        let refused =
+            inspect_catalogued_game_identity(&link_parent.join("Game.md"), Some("MegaDrive"));
+        assert_eq!(refused.verified_loose_rom_sha256(), None);
+
+        let file_link = directory.0.join("linked-file.md");
+        symlink(&real, &file_link).unwrap();
+        let refused = inspect_catalogued_game_identity(&file_link, Some("MegaDrive"));
+        assert_eq!(refused.verified_loose_rom_sha256(), None);
+
+        let mut name = b"game-".to_vec();
+        name.push(0xff);
+        name.extend_from_slice(b".md");
+        let path = directory.0.join(std::ffi::OsString::from_vec(name));
+        fs::write(&path, b"non utf8 rom").unwrap();
+        let report = inspect_catalogued_game_identity(&path, Some("MegaDrive"));
+        assert_eq!(report.archive_path, path);
+        assert!(report.verified_loose_rom_sha256().is_some());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("path encoding"))
+        );
+        assert!(real.exists());
     }
 }
