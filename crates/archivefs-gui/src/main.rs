@@ -11925,13 +11925,11 @@ fn show_mount_page(
                         ui.ctx()
                             .copy_text(record.mount_plan.mount_path.display().to_string());
                     }
-                    egui::CollapsingHeader::new("Archive location")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            if widgets::path_value(ui, "Archive", path) {
-                                ui.ctx().copy_text(path.display().to_string());
-                            }
-                        });
+                    widgets::technical_details(ui, ("mount_queue_archive_location", path), |ui| {
+                        if widgets::path_value(ui, "Archive", path) {
+                            ui.ctx().copy_text(path.display().to_string());
+                        }
+                    });
                 });
                 ui.add_space(6.0);
             }
@@ -12314,26 +12312,30 @@ fn show_history_logs_page(
                         if widgets::path_value(ui, "Journal", &PathBuf::from(&path.display)) {
                             let _ = clipboard.set_text(path.display.clone());
                         }
-                        egui::CollapsingHeader::new("Technical detail").show(ui, |ui| {
-                            widgets::copyable_value(ui, "Plan ID", &journal.plan_id);
-                            for entry in &journal.entries {
-                                ui.label(format!(
-                                    "{:?} · {} · verification {} · backup {}",
-                                    entry.outcome,
-                                    entry.plan_entry.destination_relative_path.display,
-                                    if entry.verification_succeeded {
-                                        "passed"
-                                    } else {
-                                        "not complete"
-                                    },
-                                    if entry.backup_path.is_some() {
-                                        "retained"
-                                    } else {
-                                        "not required"
-                                    }
-                                ));
-                            }
-                        });
+                        widgets::technical_details(
+                            ui,
+                            ("journal_technical_detail", &journal.plan_id),
+                            |ui| {
+                                widgets::copyable_value(ui, "Plan ID", &journal.plan_id);
+                                for entry in &journal.entries {
+                                    ui.label(format!(
+                                        "{:?} · {} · verification {} · backup {}",
+                                        entry.outcome,
+                                        entry.plan_entry.destination_relative_path.display,
+                                        if entry.verification_succeeded {
+                                            "passed"
+                                        } else {
+                                            "not complete"
+                                        },
+                                        if entry.backup_path.is_some() {
+                                            "retained"
+                                        } else {
+                                            "not required"
+                                        }
+                                    ));
+                                }
+                            },
+                        );
                         let journal_path = path.to_path_buf().ok();
                         let destination_root = journal.destination_root.to_path_buf().ok();
                         let can_preview = journal.status == SharedApplyStatus::Success
@@ -14261,9 +14263,10 @@ fn show_dolphin_inventory(
                     file.gecko_names.len(),
                     file.riivolution_names.len()
                 ));
-                egui::CollapsingHeader::new("Technical metadata")
-                    .default_open(false)
-                    .show(ui, |ui| {
+                widgets::technical_details(
+                    ui,
+                    ("dolphin_ini_technical_metadata", &file.sha256),
+                    |ui| {
                         widgets::copyable_value(ui, "SHA-256", &file.sha256);
                         if file.duplicate_game_identity
                             || file.duplicate_filename
@@ -14276,7 +14279,8 @@ fn show_dolphin_inventory(
                                 file.duplicate_content
                             ));
                         }
-                    });
+                    },
+                );
             });
         }
         if inventory.files.len() > MAX_RENDERED {
@@ -14541,17 +14545,15 @@ fn show_pcsx2_inventory(
                                 .join("; ")
                         ));
                     }
-                    egui::CollapsingHeader::new("Technical metadata")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            widgets::copyable_value(ui, "SHA-256", &file.sha256);
-                            if file.duplicate_crc || file.duplicate_filename || file.duplicate_content {
-                                ui.label(format!(
-                                    "Duplicate CRC: {} · filename: {} · content: {}",
-                                    file.duplicate_crc, file.duplicate_filename, file.duplicate_content
-                                ));
-                            }
-                        });
+                    widgets::technical_details(ui, ("pcsx2_pnach_technical_metadata", &file.sha256), |ui| {
+                        widgets::copyable_value(ui, "SHA-256", &file.sha256);
+                        if file.duplicate_crc || file.duplicate_filename || file.duplicate_content {
+                            ui.label(format!(
+                                "Duplicate CRC: {} · filename: {} · content: {}",
+                                file.duplicate_crc, file.duplicate_filename, file.duplicate_content
+                            ));
+                        }
+                    });
                 });
             }
             if inventory.files.len() > MAX_RENDERED_PNACH_FILES {
@@ -14956,9 +14958,13 @@ fn show_shared_game_identity(
                             widgets::copyable_value(ui, "Value", value);
                         }
                     });
-                    egui::CollapsingHeader::new("Technical provenance")
-                        .default_open(false)
-                        .show(ui, |ui| {
+                    widgets::technical_details(
+                        ui,
+                        (
+                            "identity_evidence_technical_provenance",
+                            item.kind.to_string(),
+                        ),
+                        |ui| {
                             ui.label(format!("Method: {}", item.provenance.method));
                             ui.label(format!("Confidence: {:?}", item.confidence));
                             if let Some(index) = item.provenance.member_index {
@@ -14971,7 +14977,8 @@ fn show_shared_game_identity(
                                 ));
                             }
                             ui.label(&item.diagnostic);
-                        });
+                        },
+                    );
                 });
             }
             if !report.warnings.is_empty() {
@@ -15267,9 +15274,10 @@ fn show_shared_cheat_preview(
                         if let Some(digest) = &entry.existing_destination_digest {
                             widgets::copyable_value(ui, "Destination SHA-256", digest);
                         }
-                        egui::CollapsingHeader::new("Technical detail")
-                            .default_open(false)
-                            .show(ui, |ui| {
+                        widgets::technical_details(
+                            ui,
+                            ("preview_entry_technical_detail", index),
+                            |ui| {
                                 if widgets::path_value(
                                     ui,
                                     "Destination root",
@@ -15295,7 +15303,8 @@ fn show_shared_cheat_preview(
                                 for warning in &entry.warnings {
                                     ui.label(format!("Warning: {:?}", warning.kind));
                                 }
-                            });
+                            },
+                        );
                     });
                 }
                 if !report.conflicts.is_empty() {
@@ -16057,9 +16066,10 @@ fn show_cheat_workflow_step2(
                                 );
                             }
                         }
-                        egui::CollapsingHeader::new("Source technical details")
-                            .default_open(false)
-                            .show(ui, |ui| {
+                        widgets::technical_details(
+                            ui,
+                            ("cheat_source_technical_details", &source.source_id),
+                            |ui| {
                                 widgets::copyable_value(ui, "Source identifier", &source.source_id);
                                 widgets::copyable_value(ui, "Download URL", &source.download_url);
                                 ui.label(format!("Trust status: {}", entry.trust_status));
@@ -16085,7 +16095,8 @@ fn show_cheat_workflow_step2(
                                 for warning in &entry.warnings {
                                     ui.label(warning);
                                 }
-                            });
+                            },
+                        );
                     }
                 });
                 ui.add_space(6.0);
@@ -16201,9 +16212,13 @@ fn show_cheat_workflow_step2(
                         widgets::StatusTone::Warning,
                     );
                 }
-                egui::CollapsingHeader::new("Catalogue technical details")
-                    .default_open(false)
-                    .show(ui, |ui| {
+                widgets::technical_details(
+                    ui,
+                    (
+                        "cheat_catalogue_technical_details",
+                        &result.manifest.archive_sha256,
+                    ),
+                    |ui| {
                         widgets::copyable_value(ui, "SHA-256", &result.manifest.archive_sha256);
                         widgets::copyable_value(
                             ui,
@@ -16218,7 +16233,8 @@ fn show_cheat_workflow_step2(
                         for warning in &result.warnings {
                             ui.label(warning);
                         }
-                    });
+                    },
+                );
             });
         }
     }
@@ -16674,16 +16690,18 @@ fn show_settings_page(
                                     profile.blockers.len(),
                                     if profile.blockers.len() == 1 { "" } else { "s" }
                                 ));
-                                egui::CollapsingHeader::new("Technical blockers")
-                                    .default_open(false)
-                                    .show(ui, |ui| {
+                                widgets::technical_details(
+                                    ui,
+                                    ("retroarch_profile_technical_blockers", &profile.profile_id),
+                                    |ui| {
                                         for blocker in &profile.blockers {
                                             ui.label(format!(
                                                 "{} — {}",
                                                 blocker.code, blocker.detail
                                             ));
                                         }
-                                    });
+                                    },
+                                );
                             }
                         });
                         ui.add_space(6.0);
