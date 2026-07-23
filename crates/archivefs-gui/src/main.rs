@@ -7305,18 +7305,25 @@ impl eframe::App for ArchiveFsApp {
                                 &mut self.clipboard,
                             );
                             ui.add_space(theme::SECTION_GAP);
-                            // The RetroArch cheat database, reachable without
-                            // leaving Cheats & Mods (previously only from
-                            // Sources, via "Manage catalogue in Sources").
-                            // Renders through the exact same component,
-                            // state, and Review-then-Confirm dispatch as the
-                            // Sources page - see
-                            // `handle_catalogue_manager_action` - so this
-                            // shortcut cannot diverge in behaviour or safety
-                            // from the full Sources management view. Left
-                            // directly visible (not collapsed): Download /
-                            // Update / Verify are primary actions here, not
-                            // technical detail.
+                            // Database and sources: the RetroArch cheat
+                            // database, reachable without leaving Cheats &
+                            // Mods (previously only from Sources, via
+                            // "Manage catalogue in Sources"). Renders
+                            // through the exact same component, state, and
+                            // Review-then-Confirm dispatch as the Sources
+                            // page - see `handle_catalogue_manager_action` -
+                            // so this shortcut cannot diverge in behaviour
+                            // or safety from the full Sources management
+                            // view. Left directly visible (not collapsed):
+                            // Download / Update / Verify are primary actions
+                            // here, not technical detail.
+                            widgets::section_header(
+                                ui,
+                                "Database and sources",
+                                Some(
+                                    "Download, update, or verify the trusted cheat database without leaving this page.",
+                                ),
+                            );
                             let catalogue_action = show_retroarch_catalogue_manager(
                                 ui,
                                 &self.catalogue_manager,
