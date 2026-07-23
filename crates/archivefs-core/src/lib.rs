@@ -25,10 +25,11 @@ pub use database::{
     DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
     DatabaseHealthReport, DatabaseOpenOutcome, DatabaseSidecarFinding, DatabaseSidecarKind,
     MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, RegisteredSourceFolder,
-    ScanPersistSummary, ScanRunCounts, SourceFolderRecord, SourceScanStatus, check_database_health,
-    default_database_path, diagnose_database, format_unix_timestamp_utc, latest_schema_version,
-    persisted_archive_has_unknown_platform, scan_and_persist,
+    PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions,
+    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, SourceFolderRecord,
+    SourceScanStatus, check_database_health, default_database_path, diagnose_database,
+    format_unix_timestamp_utc, latest_schema_version, persisted_archive_has_unknown_platform,
+    scan_and_persist,
 };
 
 mod inspector;
@@ -2660,6 +2661,9 @@ pub enum ArchiveKind {
     Zip,
     SevenZip,
     Rar,
+    /// A loose Mega Drive/Genesis ROM. It is catalogued but deliberately
+    /// marked unsupported for ArchiveFS's archive-mount backend.
+    MegaDriveRom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2854,15 +2858,29 @@ impl Archive {
         source_root: impl Into<PathBuf>,
     ) -> Option<Self> {
         let path = path.as_ref();
-        let kind = archive_kind(path)?;
+        let source_root = source_root.into();
+        let kind = archive_kind_in_root(path, &source_root)?;
         let metadata = fs::symlink_metadata(path)
             .ok()
             .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
         Some(Self {
             path: path.to_path_buf(),
             kind,
-            identity: ArchiveIdentity::from_path(path, source_root, metadata.as_ref()),
-            health: ArchiveHealth::Pending,
+            identity: {
+                let mut identity = ArchiveIdentity::from_path(path, source_root, metadata.as_ref());
+                if kind == ArchiveKind::MegaDriveRom {
+                    identity.platform = Some("MegaDrive".to_string());
+                    identity
+                        .platform_provenance
+                        .get_or_insert(PlatformProvenance::Heuristic);
+                }
+                identity
+            },
+            health: if kind == ArchiveKind::MegaDriveRom {
+                ArchiveHealth::Unsupported
+            } else {
+                ArchiveHealth::Pending
+            },
         })
     }
 }
@@ -2885,9 +2903,29 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         Some(ArchiveKind::SevenZip)
     } else if filename.ends_with(".rar") {
         Some(ArchiveKind::Rar)
+    } else if filename.ends_with(".gen") || filename.ends_with(".smd") {
+        Some(ArchiveKind::MegaDriveRom)
     } else {
         None
     }
+}
+
+fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
+    if let Some(kind) = archive_kind(path) {
+        return Some(kind);
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "md" | "bin") {
+        return None;
+    }
+    let nested_match = detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| platform == "MegaDrive");
+    let source_root_match = source_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(folder_platform_alias)
+        == Some("MegaDrive");
+    (nested_match || source_root_match).then_some(ArchiveKind::MegaDriveRom)
 }
 
 pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
@@ -3884,26 +3922,44 @@ pub struct ArchiveScanner<'a> {
     config: &'a Config,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveScanDiscovery {
+    pub archives: Vec<Archive>,
+    pub skipped_unsupported_extension: usize,
+    pub skipped_ambiguous_platform: usize,
+}
+
 impl<'a> ArchiveScanner<'a> {
     pub fn new(config: &'a Config) -> Self {
         Self { config }
     }
 
     pub fn scan_archives(&self) -> Result<Vec<Archive>> {
+        Ok(self.scan_archives_with_summary()?.archives)
+    }
+
+    pub fn scan_archives_with_summary(&self) -> Result<ArchiveScanDiscovery> {
         info!(
             "starting archive scan across {} source folder(s)",
             self.config.source_folders.len()
         );
         validate_configured_source_roots(&self.config.source_folders)?;
-        let mut archives = Vec::new();
+        let mut discovery = ArchiveScanDiscovery::default();
         for source in &self.config.source_folders {
             debug!("scanning source folder {}", source.display());
-            self.scan_source(source, source, &mut archives)?;
+            self.scan_source(source, source, &mut discovery)?;
         }
-        archives.sort_by(|left, right| left.path.cmp(&right.path));
-        archives.dedup_by(|left, right| left.path == right.path);
-        info!("archive scan complete: {} archive(s) found", archives.len());
-        Ok(archives)
+        discovery
+            .archives
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        discovery
+            .archives
+            .dedup_by(|left, right| left.path == right.path);
+        info!(
+            "archive scan complete: {} archive(s) found",
+            discovery.archives.len()
+        );
+        Ok(discovery)
     }
 
     pub fn mount_plans(&self) -> Result<Vec<MountPlan>> {
@@ -3959,7 +4015,7 @@ impl<'a> ArchiveScanner<'a> {
         &self,
         source_root: &Path,
         source: &Path,
-        archives: &mut Vec<Archive>,
+        discovery: &mut ArchiveScanDiscovery,
     ) -> Result<()> {
         const MAX_SCAN_ENTRIES: usize = 250_000;
         const MAX_SCAN_DEPTH: usize = 128;
@@ -4031,7 +4087,20 @@ impl<'a> ArchiveScanner<'a> {
                         )));
                     }
                     debug!("discovered archive {}", archive.path.display());
-                    archives.push(archive);
+                    discovery.archives.push(archive);
+                } else if file_type.is_file() {
+                    let extension = path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_ascii_lowercase);
+                    if extension
+                        .as_deref()
+                        .is_some_and(|value| matches!(value, "md" | "bin"))
+                    {
+                        discovery.skipped_ambiguous_platform += 1;
+                    } else {
+                        discovery.skipped_unsupported_extension += 1;
+                    }
                 }
             }
             let after = fs::symlink_metadata(&directory)
@@ -5078,7 +5147,7 @@ fn watch_path_is_supported_archive(path: &Path) -> bool {
 
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "zip" | "rar" | "7z" | "iso"
+        "zip" | "rar" | "7z" | "iso" | "md" | "gen" | "smd" | "bin"
     )
 }
 
@@ -5922,6 +5991,12 @@ fn ensure_no_symlink_components(path: &Path) -> Result<()> {
 }
 
 fn validate_archive_for_mount(archive: &Archive) -> Result<()> {
+    if archive.kind == ArchiveKind::MegaDriveRom {
+        return Err(ArchiveFsError::Mount(format!(
+            "loose Mega Drive ROMs are catalogued for library discovery but are not archive mount inputs: {}",
+            archive.path.display()
+        )));
+    }
     ensure_no_symlink_components(&archive.path)?;
     let metadata = fs::symlink_metadata(&archive.path)
         .map_err(|source| ArchiveFsError::io(archive.path.clone(), source))?;
@@ -6740,6 +6815,81 @@ mod tests {
         assert!(message.contains("multiple archives matched '007':"));
         assert!(message.contains("Archive: /roms/007 Legends.zip"));
         assert!(message.contains("Mount:   /mnt/archivefs/Xbox360/007_Legends"));
+    }
+
+    #[test]
+    fn mega_drive_rom_extensions_use_conservative_folder_context() {
+        let root = test_root("megadrive-rom-context");
+        for folder in [
+            "megadrive",
+            "Mega-Drive",
+            "mega_drive",
+            "genesis",
+            "sega-megadrive",
+            "sega-genesis",
+        ] {
+            let directory = root.join(folder);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("Alien 3.MD"), b"rom").unwrap();
+            fs::write(directory.join("Game.BIN"), b"rom").unwrap();
+        }
+        fs::write(root.join("README.md"), b"markdown").unwrap();
+        let misleading = root.join("genesis-project");
+        fs::create_dir_all(&misleading).unwrap();
+        fs::write(misleading.join("notes.md"), b"markdown").unwrap();
+        fs::write(root.join("specific.GEN"), b"rom").unwrap();
+        fs::write(root.join("specific.sMd"), b"rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+        assert_eq!(discovery.archives.len(), 14);
+        assert!(discovery.archives.iter().all(|archive| {
+            archive.kind == ArchiveKind::MegaDriveRom
+                && archive.identity.platform.as_deref() == Some("MegaDrive")
+        }));
+        assert!(!discovery.archives.iter().any(|archive| {
+            archive.path.ends_with("README.md") || archive.path.ends_with("notes.md")
+        }));
+        assert_eq!(discovery.skipped_ambiguous_platform, 2);
+        assert_eq!(discovery.skipped_unsupported_extension, 0);
+        let mount_error = validate_archive_for_mount(&discovery.archives[0]).unwrap_err();
+        assert!(mount_error.to_string().contains("not archive mount inputs"));
+        assert_eq!(
+            archive_kind_in_root(
+                &root.join("megadrive").join("Alien 3.MD"),
+                &root.join("megadrive")
+            ),
+            Some(ArchiveKind::MegaDriveRom),
+            "an exact platform alias may itself be the configured source root"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mega_drive_scan_preserves_non_utf8_path_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = test_root("megadrive-non-utf8");
+        let directory = root.join("megadrive");
+        fs::create_dir_all(&directory).unwrap();
+        let name = std::ffi::OsString::from_vec(b"game-\xff.md".to_vec());
+        let path = directory.join(name);
+        fs::write(&path, b"rom").unwrap();
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+        };
+        let archives = ArchiveScanner::new(&config).scan_archives().unwrap();
+        assert_eq!(archives[0].path, path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
