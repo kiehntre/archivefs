@@ -14,6 +14,7 @@ use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
     DiscoveryEnvironment, ProfileKind, ProfileScope,
 };
+use archivefs_core::game_identity::{GameIdentityReport, IdentityStatus, inspect_game_identity};
 use archivefs_core::patch_manager::{
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, DolphinGameIniInventory, DolphinInstallationType,
@@ -4441,6 +4442,8 @@ impl ArchiveFsApp {
             source_root,
             size_bytes,
             adapter,
+            identity_request: None,
+            identity: CheatStepResource::NotLoaded,
             selected_profile_id,
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,
@@ -4468,6 +4471,7 @@ impl ArchiveFsApp {
         // Read-only listing of the local trusted-source cache; safe to
         // start immediately (no network, background thread).
         self.start_cheat_source_list(context.clone());
+        self.start_game_identity_inspection(context.clone());
         if self
             .cheat_workflow
             .as_ref()
@@ -4490,6 +4494,28 @@ impl ArchiveFsApp {
         {
             self.start_dolphin_profile_scan(context.clone());
         }
+    }
+
+    fn start_game_identity_inspection(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let request = GameIdentityRequest {
+            archive_path: workflow.archive_path.clone(),
+            platform: workflow.platform.clone(),
+            adapter: workflow.adapter,
+        };
+        let path = request.archive_path.clone();
+        let platform = request.platform.clone();
+        let worker_request = request.clone();
+        let (sender, receiver) = mpsc::channel();
+        workflow.identity_request = Some(request);
+        workflow.identity = CheatStepResource::Loading { receiver };
+        thread::spawn(move || {
+            let report = inspect_game_identity(&path, platform.as_deref());
+            let _ = sender.send(Ok((worker_request, report)));
+            context.request_repaint();
+        });
     }
 
     fn open_cheat_archive_picker(&mut self) {
@@ -4704,9 +4730,40 @@ impl ArchiveFsApp {
     /// already dropped when its state was replaced, so its result can
     /// never arrive here at all.
     fn poll_cheat_workflow(&mut self) {
+        let identity_page_is_current = self.view == MainView::CheatsMods;
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
+        if !identity_page_is_current {
+            workflow.identity_request = None;
+            workflow.identity = CheatStepResource::NotLoaded;
+        } else if let CheatStepResource::Loading { receiver } = &workflow.identity {
+            match receiver.try_recv() {
+                Ok(Ok((request, report))) => {
+                    let current = GameIdentityRequest {
+                        archive_path: workflow.archive_path.clone(),
+                        platform: workflow.platform.clone(),
+                        adapter: workflow.adapter,
+                    };
+                    if request == current
+                        && workflow.identity_request.as_ref() == Some(&request)
+                        && report.archive_path == workflow.archive_path
+                    {
+                        workflow.identity = CheatStepResource::Ready((request, report));
+                    } else {
+                        workflow.identity_request = None;
+                        workflow.identity = CheatStepResource::NotLoaded;
+                    }
+                }
+                Ok(Err(message)) => workflow.identity = CheatStepResource::Failed(message),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.identity = CheatStepResource::Failed(
+                        "Game identity inspection stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
         if let CheatStepResource::Loading { receiver } = &workflow.source_list {
             match receiver.try_recv() {
                 Ok(Ok(list)) => {
@@ -4905,6 +4962,31 @@ impl ArchiveFsApp {
                 });
         if !context_is_current {
             self.cheat_workflow = None;
+            return;
+        }
+        let live_platform = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| match &self.state {
+                LoadState::Ready(data) => data
+                    .records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == workflow.archive_path)
+                    .map(|record| record.identity.platform.clone()),
+                LoadState::Loading { previous, .. } => previous.as_deref().and_then(|data| {
+                    data.records
+                        .iter()
+                        .find(|record| record.mount_plan.archive.path == workflow.archive_path)
+                        .map(|record| record.identity.platform.clone())
+                }),
+                LoadState::Error(_) => None,
+            });
+        if let (Some(workflow), Some(live_platform)) = (self.cheat_workflow.as_mut(), live_platform)
+            && workflow.platform != live_platform
+        {
+            workflow.platform = live_platform;
+            workflow.identity_request = None;
+            workflow.identity = CheatStepResource::NotLoaded;
         }
     }
 
@@ -5837,6 +5919,14 @@ impl eframe::App for ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_cheat_workflow();
+        if self.view == MainView::CheatsMods
+            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                workflow.identity_request.is_none()
+                    && matches!(workflow.identity, CheatStepResource::NotLoaded)
+            })
+        {
+            self.start_game_identity_inspection(context.clone());
+        }
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
@@ -6327,6 +6417,7 @@ impl eframe::App for ArchiveFsApp {
                             if let Some(workflow) = self.cheat_workflow.as_mut() {
                                 select_cheat_adapter(workflow, adapter);
                             }
+                            self.start_game_identity_inspection(context.clone());
                             if adapter == CheatEmulatorAdapter::Pcsx2
                                 && matches!(
                                     self.pcsx2_profiles,
@@ -10799,6 +10890,8 @@ struct CheatWorkflowState {
     /// The emulator adapter is explicit and independent from archive
     /// selection. PCSX2 is offered only for a canonical PS2 archive.
     adapter: CheatEmulatorAdapter,
+    identity_request: Option<GameIdentityRequest>,
+    identity: CheatStepResource<(GameIdentityRequest, GameIdentityReport)>,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never
@@ -10834,6 +10927,13 @@ struct CheatWorkflowState {
     /// short-circuit (the CLI's `--force-refresh`). Never applies to
     /// offline reuse.
     fetch_force_refresh: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GameIdentityRequest {
+    archive_path: PathBuf,
+    platform: Option<String>,
+    adapter: CheatEmulatorAdapter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10873,6 +10973,8 @@ fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulato
         return;
     }
     workflow.adapter = adapter;
+    workflow.identity_request = None;
+    workflow.identity = CheatStepResource::NotLoaded;
     // Dropping a loading receiver is the stale-result boundary: the
     // superseded worker cannot apply its result to the new adapter.
     workflow.pcsx2_inventory_profile_id = None;
@@ -12227,7 +12329,9 @@ fn show_dolphin_workflow(
             message,
             widgets::StatusTone::Blocked,
         ),
-        CheatStepResource::Ready(inventory) => show_dolphin_inventory(ui, inventory, clipboard),
+        CheatStepResource::Ready(inventory) => {
+            show_dolphin_inventory(ui, workflow, inventory, clipboard)
+        }
     }
     show_dolphin_installation_unavailable(ui);
     action
@@ -12283,6 +12387,7 @@ fn show_dolphin_profile_card(
 
 fn show_dolphin_inventory(
     ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
     inventory: &DolphinGameIniInventory,
     clipboard: &mut dyn ClipboardBackend,
 ) {
@@ -12306,14 +12411,19 @@ fn show_dolphin_inventory(
             ui.label(format!("{} entries visited", inventory.entries_visited));
         });
     });
-    let match_result = match_dolphin_inventory(inventory, None, None);
+    let identity = ready_game_identity(workflow);
+    let match_result = match_dolphin_inventory(
+        inventory,
+        identity.and_then(GameIdentityReport::verified_dolphin_game_id),
+        identity.and_then(GameIdentityReport::verified_dolphin_revision),
+    );
     let (label, tone) = dolphin_match_presentation(match_result.state);
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, label, tone);
             ui.label(&match_result.reason);
         });
-        ui.label("ArchiveFS currently has no reviewed disc-header identity reader. INI filename IDs are observations only until compared with a separately verified archive Game ID.");
+        ui.label("Only a verified disc-header Game ID can establish an exact match. Wii outer-header revision remains candidate evidence and cannot establish a revision-aware match.");
     });
     egui::CollapsingHeader::new(format!(
         "Inspected Game INI files ({})",
@@ -12573,14 +12683,18 @@ fn show_pcsx2_inventory(
             }
         });
     });
-    let match_result = match_pcsx2_inventory(inventory, None, Some(&workflow.display_name));
+    let match_result = match_pcsx2_inventory(
+        inventory,
+        ready_game_identity(workflow).and_then(GameIdentityReport::verified_pcsx2_crc),
+        Some(&workflow.display_name),
+    );
     let (match_label, match_tone) = pcsx2_match_presentation(match_result.state);
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, match_label, match_tone);
             ui.label(&match_result.reason);
         });
-        ui.label("ArchiveFS currently has no safe PS2 executable-CRC extractor. Filename CRCs and comment titles remain candidates only; they never establish exact identity.");
+        ui.label("Exact matching requires a verified CRC calculated from the complete bounded boot ELF. Filename CRCs and comment titles remain candidates only.");
         for path in &match_result.matching_files {
             if widgets::path_value(ui, "Candidate", path) {
                 let _ = clipboard.set_text(path.display().to_string());
@@ -12751,6 +12865,166 @@ fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str, widgets::S
     }
 }
 
+fn ready_game_identity(workflow: &CheatWorkflowState) -> Option<&GameIdentityReport> {
+    match &workflow.identity {
+        CheatStepResource::Ready((request, report))
+            if request.archive_path == workflow.archive_path
+                && request.platform == workflow.platform
+                && request.adapter == workflow.adapter
+                && report.archive_path == workflow.archive_path =>
+        {
+            Some(report)
+        }
+        _ => None,
+    }
+}
+
+fn identity_status_tone(status: IdentityStatus) -> widgets::StatusTone {
+    match status {
+        IdentityStatus::Verified => widgets::StatusTone::Success,
+        IdentityStatus::Candidate | IdentityStatus::Deferred | IdentityStatus::Missing => {
+            widgets::StatusTone::Pending
+        }
+        IdentityStatus::ResourceLimitReached | IdentityStatus::Ambiguous => {
+            widgets::StatusTone::Warning
+        }
+        IdentityStatus::Invalid | IdentityStatus::Unsupported => widgets::StatusTone::Blocked,
+    }
+}
+
+fn show_shared_game_identity(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::section_header(
+        ui,
+        "Shared game identity",
+        Some("Bounded local disc metadata; candidates are never promoted to verified values."),
+    );
+    match &workflow.identity {
+        CheatStepResource::NotLoaded => widgets::banner(
+            ui,
+            "Identity unavailable",
+            "The current archive, adapter, page, or platform context changed. Reopen or reselect the adapter to inspect it.",
+            widgets::StatusTone::Pending,
+        ),
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading bounded disc metadata in the background...");
+            });
+        }
+        CheatStepResource::Failed(message) => widgets::banner(
+            ui,
+            "Identity inspection failed",
+            message,
+            widgets::StatusTone::Blocked,
+        ),
+        CheatStepResource::Ready((_, report)) => {
+            widgets::card(ui, |ui| {
+                if widgets::path_value(ui, "Selected archive", &report.archive_path) {
+                    let _ = clipboard.set_text(report.archive_path.display().to_string());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, report.platform.label(), widgets::StatusTone::Info);
+                    ui.label(format!("Format: {:?}", report.format));
+                    ui.label(format!("{} bytes read", report.bytes_read));
+                    ui.label(format!(
+                        "{} members · {} metadata paths",
+                        report.archive_members_inspected, report.metadata_paths_inspected
+                    ));
+                });
+            });
+            for item in &report.evidence {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(item.kind.to_string());
+                        widgets::status_badge(
+                            ui,
+                            item.status.to_string(),
+                            identity_status_tone(item.status),
+                        );
+                        if let Some(value) = &item.value {
+                            widgets::copyable_value(ui, "Value", value);
+                        }
+                    });
+                    egui::CollapsingHeader::new("Technical provenance")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(format!("Method: {}", item.provenance.method));
+                            ui.label(format!("Confidence: {:?}", item.confidence));
+                            if let Some(index) = item.provenance.member_index {
+                                ui.label(format!("ZIP member index: {index}"));
+                            }
+                            if let Some(member) = &item.provenance.member_path {
+                                ui.label(format!(
+                                    "ZIP member: {}",
+                                    String::from_utf8_lossy(member)
+                                ));
+                            }
+                            ui.label(&item.diagnostic);
+                        });
+                });
+            }
+            if !report.warnings.is_empty() {
+                egui::CollapsingHeader::new(format!(
+                    "Identity warnings ({})",
+                    report.warnings.len()
+                ))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for warning in &report.warnings {
+                        ui.label(warning);
+                    }
+                });
+            }
+            let adapter_match = match workflow.adapter {
+                CheatEmulatorAdapter::Pcsx2 => match &workflow.pcsx2_inventory {
+                    CheatStepResource::Ready(inventory) => {
+                        let result = match_pcsx2_inventory(
+                            inventory,
+                            report.verified_pcsx2_crc(),
+                            Some(&workflow.display_name),
+                        );
+                        let (label, tone) = pcsx2_match_presentation(result.state);
+                        Some((label, tone, result.reason))
+                    }
+                    _ => None,
+                },
+                CheatEmulatorAdapter::Dolphin => match &workflow.dolphin_inventory {
+                    CheatStepResource::Ready(inventory) => {
+                        let result = match_dolphin_inventory(
+                            inventory,
+                            report.verified_dolphin_game_id(),
+                            report.verified_dolphin_revision(),
+                        );
+                        let (label, tone) = dolphin_match_presentation(result.state);
+                        Some((label, tone, result.reason))
+                    }
+                    _ => None,
+                },
+                CheatEmulatorAdapter::RetroArch => None,
+            };
+            widgets::card(ui, |ui| {
+                ui.strong("Exact adapter match result");
+                if let Some((label, tone, reason)) = adapter_match {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(ui, label, tone);
+                        ui.label(reason);
+                    });
+                } else {
+                    widgets::status_badge(
+                        ui,
+                        "Adapter inventory not loaded",
+                        widgets::StatusTone::Pending,
+                    );
+                }
+            });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_cheats_mods_page(
     ui: &mut egui::Ui,
@@ -12843,6 +13117,8 @@ fn show_cheats_mods_page(
     );
     if let Some(workflow) = workflow {
         show_cheat_archive_context(ui, workflow, live, cached, clipboard);
+        ui.add_space(theme::SECTION_GAP);
+        show_shared_game_identity(ui, workflow, clipboard);
         ui.add_space(theme::SECTION_GAP);
         action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
@@ -19043,6 +19319,8 @@ mod tests {
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             adapter: CheatEmulatorAdapter::RetroArch,
+            identity_request: None,
+            identity: CheatStepResource::NotLoaded,
             selected_profile_id: Some("native-user".to_string()),
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
@@ -19230,9 +19508,31 @@ mod tests {
         workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
         let archive = workflow.archive_path.clone();
 
+        let (identity_sender, identity_receiver) = mpsc::channel();
+        workflow.identity_request = Some(GameIdentityRequest {
+            archive_path: archive.clone(),
+            platform: workflow.platform.clone(),
+            adapter: CheatEmulatorAdapter::Pcsx2,
+        });
+        workflow.identity = CheatStepResource::Loading {
+            receiver: identity_receiver,
+        };
+
         select_cheat_adapter(workflow, CheatEmulatorAdapter::RetroArch);
 
         assert!(sender.send(Ok(empty_pcsx2_inventory())).is_err());
+        assert!(
+            identity_sender
+                .send(Ok((
+                    GameIdentityRequest {
+                        archive_path: archive.clone(),
+                        platform: Some("PS2".to_string()),
+                        adapter: CheatEmulatorAdapter::Pcsx2,
+                    },
+                    inspect_game_identity(Path::new("/missing.chd"), Some("PS2")),
+                )))
+                .is_err()
+        );
         assert_eq!(workflow.archive_path, archive);
         assert!(matches!(
             workflow.pcsx2_inventory,
@@ -19240,6 +19540,57 @@ mod tests {
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
         assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+    }
+
+    #[test]
+    fn identity_result_is_rejected_after_page_or_platform_context_changes() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("GameCube".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Dolphin;
+        let request = GameIdentityRequest {
+            archive_path: workflow.archive_path.clone(),
+            platform: workflow.platform.clone(),
+            adapter: workflow.adapter,
+        };
+        let (sender, receiver) = mpsc::channel();
+        workflow.identity_request = Some(request.clone());
+        workflow.identity = CheatStepResource::Loading { receiver };
+        sender
+            .send(Ok((
+                request,
+                inspect_game_identity(Path::new("/missing.chd"), Some("GameCube")),
+            )))
+            .unwrap();
+        app.view = MainView::Library;
+        app.poll_cheat_workflow();
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().identity,
+            CheatStepResource::NotLoaded
+        ));
+
+        app.view = MainView::CheatsMods;
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let old_request = GameIdentityRequest {
+            archive_path: workflow.archive_path.clone(),
+            platform: Some("GameCube".to_string()),
+            adapter: CheatEmulatorAdapter::Dolphin,
+        };
+        let (sender, receiver) = mpsc::channel();
+        workflow.identity_request = Some(old_request.clone());
+        workflow.identity = CheatStepResource::Loading { receiver };
+        workflow.platform = Some("Wii".to_string());
+        sender
+            .send(Ok((
+                old_request,
+                inspect_game_identity(Path::new("/missing.chd"), Some("GameCube")),
+            )))
+            .unwrap();
+        app.poll_cheat_workflow();
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().identity,
+            CheatStepResource::NotLoaded
+        ));
     }
 
     #[test]
@@ -20118,6 +20469,8 @@ mod tests {
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             adapter: CheatEmulatorAdapter::RetroArch,
+            identity_request: None,
+            identity: CheatStepResource::NotLoaded,
             selected_profile_id: None,
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
