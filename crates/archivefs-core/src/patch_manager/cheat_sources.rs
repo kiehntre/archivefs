@@ -41,7 +41,7 @@ const FRESH_SECONDS: u64 = 24 * 60 * 60;
 pub const CHEAT_SOURCE_REDIRECT_LIMIT: usize = 3;
 const HEADER_BYTES_LIMIT: usize = 32 * 1024;
 pub const CHEAT_SOURCE_ENTRY_LIMIT: usize = 60_000;
-pub const CHEAT_SOURCE_FILE_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+pub const CHEAT_SOURCE_FILE_SIZE_LIMIT: u64 = 256 * 1024 * 1024;
 pub const CHEAT_SOURCE_EXPANDED_SIZE_LIMIT: u64 = 1024 * 1024 * 1024;
 const COMPRESSION_RATIO_LIMIT: u64 = 250;
 pub const CHEAT_SOURCE_PATH_BYTES_LIMIT: usize = 1024;
@@ -3883,16 +3883,15 @@ mod tests {
     }
 
     #[test]
-    fn individual_entry_limit_accepts_files_above_eight_mib_through_exactly_sixty_four_mib() {
-        let former_limit = 8 * 1024 * 1024;
-        let just_above_former_limit = former_limit + 1;
+    fn individual_entry_limit_accepts_real_j2me_size_through_exactly_two_fifty_six_mib() {
+        let observed_j2me_size = 82_656_891;
 
-        assert_eq!(CHEAT_SOURCE_FILE_SIZE_LIMIT, 64 * 1024 * 1024);
+        assert_eq!(CHEAT_SOURCE_FILE_SIZE_LIMIT, 256 * 1024 * 1024);
         validate_extraction_sizes(
-            just_above_former_limit,
-            just_above_former_limit,
-            just_above_former_limit,
-            "libretro-database/relevant.dat",
+            observed_j2me_size,
+            observed_j2me_size,
+            observed_j2me_size,
+            "libretro-database/revision/dat/Mobile - J2ME.dat",
         )
         .unwrap();
         validate_extraction_sizes(
@@ -3905,7 +3904,7 @@ mod tests {
     }
 
     #[test]
-    fn individual_entry_above_sixty_four_mib_reports_actual_limit_and_path() {
+    fn individual_entry_above_two_fifty_six_mib_reports_actual_limit_and_path() {
         let actual = CHEAT_SOURCE_FILE_SIZE_LIMIT + 1;
         let path = "libretro-database/revision/dat/Mobile - J2ME.dat";
         let error = validate_extraction_sizes(actual, actual, actual, path).unwrap_err();
@@ -3935,7 +3934,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_extracted_entry_retains_the_previous_active_snapshot() {
+    fn recorded_oversized_entry_failure_retains_the_previous_active_snapshot() {
         let temp = TempDirectory::new();
         let initial = fetch_retroarch_cheat_source(
             "libretro-buildbot-cheats",
@@ -3943,24 +3942,21 @@ mod tests {
             &FakeTransport::new(vec![Ok(response(valid_zip()))]),
         )
         .unwrap();
-        let oversized = vec![b'x'; CHEAT_SOURCE_FILE_SIZE_LIMIT as usize + 1];
-        let oversized_archive = zip(&[(
+        let oversized = CHEAT_SOURCE_FILE_SIZE_LIMIT + 1;
+        let error = validate_extraction_sizes(
+            oversized,
+            oversized,
+            oversized,
             "libretro-database-new/dat/Mobile - J2ME.dat",
-            oversized.as_slice(),
-            None,
-        )]);
-        let mut update = options(&temp.0);
-        update.force_refresh = true;
-        let error = fetch_retroarch_cheat_source(
-            "libretro-buildbot-cheats",
-            &update,
-            &FakeTransport::new(vec![Ok(response(oversized_archive))]),
         )
         .unwrap_err();
+        let source = resolve_source("libretro-buildbot-cheats").unwrap();
+        record_fetch_failure(&source, &temp.0, &error);
 
         assert_eq!(error.code, "file_size_limit_exceeded");
-        assert!(error.message.contains("67108865"));
-        assert!(error.message.contains("67108864"));
+        assert!(!retryable_download_error(&error));
+        assert!(error.message.contains("268435457"));
+        assert!(error.message.contains("268435456"));
         assert!(error.message.contains("Mobile - J2ME.dat"));
         let inspection =
             inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0).unwrap();
