@@ -16,7 +16,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,7 +48,18 @@ pub const CHEAT_SOURCE_PATH_BYTES_LIMIT: usize = 1024;
 const PATH_COMPONENT_LIMIT: usize = 24;
 pub const CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT: u64 = 256 * 1024 * 1024;
 pub const CHEAT_SOURCE_MANIFEST_BYTES_LIMIT: usize = 16 * 1024 * 1024;
-pub const CHEAT_SOURCE_TIMEOUT_SECONDS: u64 = 180;
+pub const CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+pub const CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS: u64 = 60;
+pub const CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS: u64 = 15 * 60;
+pub const CHEAT_SOURCE_RETRY_ATTEMPTS: usize = 3;
+pub const CHEAT_SOURCE_RETRY_DELAY_SECONDS: u64 = 5;
+pub const CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS: u64 = 30;
+pub const CHEAT_SOURCE_NETWORK_CHUNK_BYTES: usize = 64 * 1024;
+pub const CHEAT_SOURCE_PROGRESS_EVENT_LIMIT: usize = 512;
+pub const CHEAT_SOURCE_PROGRESS_BYTE_INTERVAL: u64 = 2 * 1024 * 1024;
+pub const CHEAT_SOURCE_STAGING_FILES_PER_PROVIDER: usize = 1;
+pub const CHEAT_SOURCE_CONCURRENT_OPERATIONS_PER_PROVIDER: usize = 1;
+pub const CHEAT_SOURCE_INACTIVE_STAGING_CLEANUP_LIMIT: usize = 16;
 pub const CHEAT_SOURCE_RETAINED_SNAPSHOTS_MINIMUM: usize = 2;
 const REVISION_RESPONSE_LIMIT: u64 = 64 * 1024;
 
@@ -122,6 +133,8 @@ pub struct CheatSourceError {
     pub stage: CheatSourceErrorStage,
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl CheatSourceError {
@@ -135,6 +148,66 @@ impl CheatSourceError {
             stage,
             code: code.to_string(),
             message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn with_retry_after(mut self, seconds: Option<u64>) -> Self {
+        self.retry_after_seconds = seconds;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheatSourceProgressPhase {
+    ResolvingRevision,
+    Connecting,
+    Downloading,
+    Retrying,
+    VerifyingArchive,
+    Extracting,
+    VerifyingFiles,
+    Activating,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheatSourceProgress {
+    pub phase: CheatSourceProgressPhase,
+    pub attempt: usize,
+    pub maximum_attempts: usize,
+    pub bytes_received: u64,
+    pub total_bytes: Option<u64>,
+    pub retry_delay_seconds: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct CheatSourceProgressReporter {
+    callback: Arc<dyn Fn(CheatSourceProgress) + Send + Sync>,
+    emitted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for CheatSourceProgressReporter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheatSourceProgressReporter")
+            .field("emitted", &self.emitted.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl CheatSourceProgressReporter {
+    pub fn new(callback: impl Fn(CheatSourceProgress) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+            emitted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn report(&self, progress: CheatSourceProgress) {
+        let index = self.emitted.fetch_add(1, Ordering::AcqRel);
+        if index < CHEAT_SOURCE_PROGRESS_EVENT_LIMIT {
+            (self.callback)(progress);
         }
     }
 }
@@ -155,6 +228,7 @@ pub struct CheatSourceFetchOptions {
     pub expected_sha256: Option<String>,
     pub max_download_bytes: Option<u64>,
     pub cancellation: Option<CheatSourceCancellation>,
+    pub progress: Option<CheatSourceProgressReporter>,
 }
 
 impl CheatSourceFetchOptions {
@@ -166,6 +240,7 @@ impl CheatSourceFetchOptions {
             expected_sha256: None,
             max_download_bytes: None,
             cancellation: None,
+            progress: None,
         })
     }
 }
@@ -207,6 +282,15 @@ pub struct CheatSourceHttpResponse {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub downloaded_bytes: u64,
+    pub retry_after_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub struct CheatSourceTransferContext<'a> {
+    pub cancellation: Option<&'a CheatSourceCancellation>,
+    pub progress: Option<&'a CheatSourceProgressReporter>,
+    pub attempt: usize,
+    pub overall_timeout: Duration,
 }
 
 pub trait CheatSourceTransport {
@@ -215,6 +299,7 @@ pub trait CheatSourceTransport {
         url: &str,
         maximum_bytes: u64,
         destination: &mut dyn Write,
+        context: CheatSourceTransferContext<'_>,
     ) -> Result<CheatSourceHttpResponse, CheatSourceError>;
 }
 
@@ -230,11 +315,21 @@ impl HttpsCheatSourceTransport {
             .proxy(None)
             .max_redirects(0)
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(CHEAT_SOURCE_TIMEOUT_SECONDS)))
-            .timeout_resolve(Some(Duration::from_secs(5)))
-            .timeout_connect(Some(Duration::from_secs(8)))
-            .timeout_recv_response(Some(Duration::from_secs(10)))
-            .timeout_recv_body(Some(Duration::from_secs(30)))
+            .timeout_global(Some(Duration::from_secs(
+                CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS,
+            )))
+            .timeout_resolve(Some(Duration::from_secs(
+                CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+            )))
+            .timeout_connect(Some(Duration::from_secs(
+                CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+            )))
+            // ureq 3.3 carries recv-response deadlines into body reads. Leaving
+            // this unset avoids turning a header timeout into a whole-body cap;
+            // the global bound still covers headers and the receive-body bound
+            // below is a true per-read idle timeout.
+            .timeout_recv_response(None)
+            .timeout_recv_body(Some(Duration::from_secs(CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS)))
             .build();
         Self {
             agent: config.new_agent(),
@@ -254,11 +349,22 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
         url: &str,
         maximum_bytes: u64,
         destination: &mut dyn Write,
+        context: CheatSourceTransferContext<'_>,
     ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
+        if context
+            .cancellation
+            .is_some_and(CheatSourceCancellation::is_cancelled)
+        {
+            return Err(cancelled_error());
+        }
         validate_public_resolution(url)?;
-        let mut response = self
+        let request = self
             .agent
             .get(url)
+            .config()
+            .timeout_global(Some(context.overall_timeout))
+            .build();
+        let mut response = request
             .header(
                 "Accept",
                 "application/vnd.github+json, application/zip, application/octet-stream",
@@ -269,13 +375,7 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
                 concat!("archivefs/", env!("CARGO_PKG_VERSION")),
             )
             .call()
-            .map_err(|error| {
-                CheatSourceError::new(
-                    CheatSourceErrorStage::Network,
-                    "request_failed",
-                    error.to_string(),
-                )
-            })?;
+            .map_err(classify_ureq_request_error)?;
         let header_bytes = response
             .headers()
             .iter()
@@ -306,34 +406,44 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
                 "only identity transfer encoding is accepted",
             ));
         }
-        let content_length = header("content-length").and_then(|value| value.parse::<u64>().ok());
-        if content_length.is_some_and(|size| size > maximum_bytes) {
-            let size = content_length.unwrap_or_default();
-            return Err(CheatSourceError::new(
-                CheatSourceErrorStage::Download,
-                "download_too_large",
-                format!(
-                    "declared response size {size} bytes exceeds configured limit {maximum_bytes} bytes"
-                ),
-            ));
-        }
+        let content_length = match header("content-length") {
+            Some(value) => Some(value.parse::<u64>().map_err(|_| {
+                CheatSourceError::new(
+                    CheatSourceErrorStage::Network,
+                    "content_length_invalid",
+                    "response Content-Length is not a valid unsigned byte count",
+                )
+            })?),
+            None => None,
+        };
+        let retry_after_seconds = header("retry-after")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| seconds.min(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS));
+        validate_declared_download_size(content_length, maximum_bytes)?;
         let status = response.status().as_u16();
         let content_type = header("content-type");
         let location = header("location");
         let etag = header("etag");
         let last_modified = header("last-modified");
         let mut downloaded_bytes = 0u64;
+        let mut next_progress_bytes = CHEAT_SOURCE_PROGRESS_BYTE_INTERVAL;
         if (200..300).contains(&status) {
+            if context
+                .cancellation
+                .is_some_and(CheatSourceCancellation::is_cancelled)
+            {
+                return Err(cancelled_error());
+            }
             let mut reader = response.body_mut().as_reader();
-            let mut buffer = [0u8; 64 * 1024];
+            let mut buffer = [0u8; CHEAT_SOURCE_NETWORK_CHUNK_BYTES];
             loop {
-                let count = reader.read(&mut buffer).map_err(|error| {
-                    CheatSourceError::new(
-                        CheatSourceErrorStage::Download,
-                        "response_interrupted",
-                        error.to_string(),
-                    )
-                })?;
+                if context
+                    .cancellation
+                    .is_some_and(CheatSourceCancellation::is_cancelled)
+                {
+                    return Err(cancelled_error());
+                }
+                let count = reader.read(&mut buffer).map_err(classify_body_read_error)?;
                 if count == 0 {
                     break;
                 }
@@ -349,14 +459,41 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
                 }
                 destination
                     .write_all(&buffer[..count])
-                    .map_err(|error| cache_error("staging_write_failed", error))?;
+                    .map_err(classify_destination_error)?;
+                if downloaded_bytes >= next_progress_bytes {
+                    if let Some(reporter) = context.progress {
+                        reporter.report(CheatSourceProgress {
+                            phase: CheatSourceProgressPhase::Downloading,
+                            attempt: context.attempt,
+                            maximum_attempts: CHEAT_SOURCE_RETRY_ATTEMPTS,
+                            bytes_received: downloaded_bytes,
+                            total_bytes: content_length,
+                            retry_delay_seconds: None,
+                        });
+                    }
+                    next_progress_bytes =
+                        downloaded_bytes.saturating_add(CHEAT_SOURCE_PROGRESS_BYTE_INTERVAL);
+                }
             }
-            if content_length.is_some_and(|declared| declared != downloaded_bytes) {
+            if let Some(declared) = content_length.filter(|declared| *declared != downloaded_bytes)
+            {
                 return Err(CheatSourceError::new(
                     CheatSourceErrorStage::Download,
                     "incomplete_response",
-                    "received byte count differs from Content-Length",
+                    format!(
+                        "declared Content-Length was {declared} bytes but received {downloaded_bytes} bytes"
+                    ),
                 ));
+            }
+            if let Some(reporter) = context.progress {
+                reporter.report(CheatSourceProgress {
+                    phase: CheatSourceProgressPhase::Downloading,
+                    attempt: context.attempt,
+                    maximum_attempts: CHEAT_SOURCE_RETRY_ATTEMPTS,
+                    bytes_received: downloaded_bytes,
+                    total_bytes: content_length,
+                    retry_delay_seconds: None,
+                });
             }
         }
         Ok(CheatSourceHttpResponse {
@@ -368,7 +505,128 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
             etag,
             last_modified,
             downloaded_bytes,
+            retry_after_seconds,
         })
+    }
+}
+
+fn classify_ureq_request_error(error: ureq::Error) -> CheatSourceError {
+    use ureq::Error;
+    match error {
+        Error::Timeout(ureq::Timeout::Global) | Error::Timeout(ureq::Timeout::PerCall) => {
+            CheatSourceError::new(
+                CheatSourceErrorStage::Network,
+                "overall_timeout",
+                "overall transfer timeout reached",
+            )
+        }
+        Error::Timeout(ureq::Timeout::Resolve) | Error::Timeout(ureq::Timeout::Connect) => {
+            CheatSourceError::new(
+                CheatSourceErrorStage::Network,
+                "connect_timeout",
+                error.to_string(),
+            )
+        }
+        Error::Timeout(ureq::Timeout::RecvBody) => CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "idle_timeout",
+            error.to_string(),
+        ),
+        Error::Timeout(ureq::Timeout::RecvResponse) => CheatSourceError::new(
+            CheatSourceErrorStage::Network,
+            "response_timeout",
+            error.to_string(),
+        ),
+        Error::HostNotFound => CheatSourceError::new(
+            CheatSourceErrorStage::Network,
+            "temporary_dns_failure",
+            error.to_string(),
+        ),
+        Error::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            CheatSourceError::new(
+                CheatSourceErrorStage::Network,
+                "connection_interrupted",
+                io_error.to_string(),
+            )
+        }
+        Error::Tls(_) => CheatSourceError::new(
+            CheatSourceErrorStage::Network,
+            "tls_verification_failed",
+            error.to_string(),
+        ),
+        Error::RequireHttpsOnly(_) | Error::TlsRequired => CheatSourceError::new(
+            CheatSourceErrorStage::Network,
+            "unsupported_scheme",
+            error.to_string(),
+        ),
+        other => CheatSourceError::new(
+            CheatSourceErrorStage::Network,
+            "request_failed",
+            other.to_string(),
+        ),
+    }
+}
+
+fn classify_body_read_error(error: std::io::Error) -> CheatSourceError {
+    if let Some(ureq_error) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+    {
+        return match ureq_error {
+            ureq::Error::Timeout(ureq::Timeout::Global)
+            | ureq::Error::Timeout(ureq::Timeout::PerCall) => CheatSourceError::new(
+                CheatSourceErrorStage::Download,
+                "overall_timeout",
+                ureq_error.to_string(),
+            ),
+            ureq::Error::Timeout(ureq::Timeout::RecvBody) => CheatSourceError::new(
+                CheatSourceErrorStage::Download,
+                "idle_timeout",
+                ureq_error.to_string(),
+            ),
+            ureq::Error::Timeout(ureq::Timeout::RecvResponse) => CheatSourceError::new(
+                CheatSourceErrorStage::Download,
+                "response_timeout",
+                ureq_error.to_string(),
+            ),
+            _ => CheatSourceError::new(
+                CheatSourceErrorStage::Download,
+                "response_interrupted",
+                ureq_error.to_string(),
+            ),
+        };
+    }
+    let code = if error.kind() == std::io::ErrorKind::TimedOut {
+        "idle_timeout"
+    } else {
+        "response_interrupted"
+    };
+    CheatSourceError::new(CheatSourceErrorStage::Download, code, error.to_string())
+}
+
+fn classify_destination_error(error: std::io::Error) -> CheatSourceError {
+    match error.kind() {
+        std::io::ErrorKind::Interrupted => cancelled_error(),
+        std::io::ErrorKind::TimedOut => CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "overall_timeout",
+            error.to_string(),
+        ),
+        std::io::ErrorKind::FileTooLarge => CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "download_too_large",
+            error.to_string(),
+        ),
+        _ => cache_error("staging_write_failed", error),
     }
 }
 
@@ -992,6 +1250,288 @@ pub fn fetch_retroarch_cheat_source(
     result
 }
 
+#[derive(Debug)]
+struct DownloadedArchive {
+    path: PathBuf,
+    response: CheatSourceHttpResponse,
+    sha256: String,
+    attempt: usize,
+}
+
+struct StreamingArchiveWriter<'a> {
+    file: File,
+    hasher: Sha256,
+    bytes_written: u64,
+    maximum_bytes: u64,
+    options: &'a CheatSourceFetchOptions,
+    transfer_started: Instant,
+}
+
+impl<'a> StreamingArchiveWriter<'a> {
+    fn new(
+        file: File,
+        maximum_bytes: u64,
+        _attempt: usize,
+        options: &'a CheatSourceFetchOptions,
+        transfer_started: Instant,
+    ) -> Self {
+        Self {
+            file,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+            maximum_bytes,
+            options,
+            transfer_started,
+        }
+    }
+
+    fn finish(mut self) -> Result<(String, u64), CheatSourceError> {
+        self.file
+            .flush()
+            .and_then(|_| self.file.sync_all())
+            .map_err(|error| cache_error("staging_sync_failed", error))?;
+        let digest = self.hasher.finalize();
+        Ok((
+            digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+            self.bytes_written,
+        ))
+    }
+}
+
+impl Write for StreamingArchiveWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self
+            .options
+            .cancellation
+            .as_ref()
+            .is_some_and(CheatSourceCancellation::is_cancelled)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "catalogue retrieval cancelled",
+            ));
+        }
+        if self.transfer_started.elapsed()
+            >= Duration::from_secs(CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "overall transfer timeout reached",
+            ));
+        }
+        let proposed = self
+            .bytes_written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("download byte count overflow"))?;
+        if proposed > self.maximum_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "received at least {proposed} bytes, exceeding configured limit {} bytes",
+                    self.maximum_bytes
+                ),
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn report_progress(
+    options: &CheatSourceFetchOptions,
+    phase: CheatSourceProgressPhase,
+    attempt: usize,
+    bytes_received: u64,
+    total_bytes: Option<u64>,
+    retry_delay_seconds: Option<u64>,
+) {
+    if let Some(reporter) = &options.progress {
+        reporter.report(CheatSourceProgress {
+            phase,
+            attempt,
+            maximum_attempts: CHEAT_SOURCE_RETRY_ATTEMPTS,
+            bytes_received,
+            total_bytes,
+            retry_delay_seconds,
+        });
+    }
+}
+
+fn download_archive_with_retries(
+    source: &CheatSourceDefinition,
+    archive_url: &str,
+    maximum: u64,
+    transport: &dyn CheatSourceTransport,
+    options: &CheatSourceFetchOptions,
+    work: &Path,
+    transfer_started: Instant,
+) -> Result<DownloadedArchive, CheatSourceError> {
+    for attempt in 1..=CHEAT_SOURCE_RETRY_ATTEMPTS {
+        check_transfer_deadline(options, transfer_started)?;
+        let attempt_path = work.join(format!("archive-attempt-{attempt}.zip.part"));
+        let file = secure_create(&attempt_path)?;
+        let mut writer =
+            StreamingArchiveWriter::new(file, maximum, attempt, options, transfer_started);
+        report_progress(
+            options,
+            CheatSourceProgressPhase::Connecting,
+            attempt,
+            0,
+            None,
+            None,
+        );
+        let redirect_context = RedirectDownloadContext {
+            source,
+            maximum,
+            transport,
+            options,
+            attempt,
+            transfer_started,
+        };
+        let result = download_with_redirects(archive_url, &mut writer, &redirect_context);
+        match result {
+            Ok(response) => {
+                let (sha256, bytes_written) = writer.finish()?;
+                if bytes_written != response.downloaded_bytes {
+                    let _ = fs::remove_file(&attempt_path);
+                    return Err(CheatSourceError::new(
+                        CheatSourceErrorStage::Download,
+                        "staging_length_mismatch",
+                        "staged byte count differs from the streamed response count",
+                    ));
+                }
+                return Ok(DownloadedArchive {
+                    path: attempt_path,
+                    response,
+                    sha256,
+                    attempt,
+                });
+            }
+            Err(error) => {
+                drop(writer);
+                let _ = fs::remove_file(&attempt_path);
+                if error.code == "cancelled" {
+                    report_progress(
+                        options,
+                        CheatSourceProgressPhase::Cancelled,
+                        attempt,
+                        0,
+                        None,
+                        None,
+                    );
+                    return Err(error);
+                }
+                if !retryable_download_error(&error) || attempt == CHEAT_SOURCE_RETRY_ATTEMPTS {
+                    return Err(with_attempt_context(error, attempt));
+                }
+                check_transfer_deadline(options, transfer_started)?;
+                let delay_seconds = retry_delay_seconds(&error);
+                report_progress(
+                    options,
+                    CheatSourceProgressPhase::Retrying,
+                    attempt + 1,
+                    0,
+                    None,
+                    Some(delay_seconds),
+                );
+                wait_for_retry(
+                    options,
+                    transfer_started,
+                    Duration::from_secs(delay_seconds),
+                )?;
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn retryable_download_error(error: &CheatSourceError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "response_interrupted"
+            | "idle_timeout"
+            | "response_timeout"
+            | "connect_timeout"
+            | "connection_interrupted"
+            | "temporary_dns_failure"
+            | "http_408"
+            | "http_429"
+            | "http_500"
+            | "http_502"
+            | "http_503"
+            | "http_504"
+    )
+}
+
+fn retry_delay_seconds(error: &CheatSourceError) -> u64 {
+    error
+        .retry_after_seconds
+        .unwrap_or(CHEAT_SOURCE_RETRY_DELAY_SECONDS)
+        .min(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS)
+}
+
+fn with_attempt_context(mut error: CheatSourceError, attempt: usize) -> CheatSourceError {
+    error.message = format!(
+        "{} (attempt {attempt} of {CHEAT_SOURCE_RETRY_ATTEMPTS})",
+        error.message
+    );
+    error
+}
+
+fn check_transfer_deadline(
+    options: &CheatSourceFetchOptions,
+    transfer_started: Instant,
+) -> Result<(), CheatSourceError> {
+    check_cancelled(options)?;
+    if transfer_started.elapsed() >= Duration::from_secs(CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS) {
+        return Err(CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "overall_timeout",
+            format!(
+                "overall transfer exceeded {} seconds",
+                CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn remaining_transfer_time(transfer_started: Instant) -> Result<Duration, CheatSourceError> {
+    Duration::from_secs(CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS)
+        .checked_sub(transfer_started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            CheatSourceError::new(
+                CheatSourceErrorStage::Download,
+                "overall_timeout",
+                format!(
+                    "overall transfer exceeded {} seconds",
+                    CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS
+                ),
+            )
+        })
+}
+
+fn wait_for_retry(
+    options: &CheatSourceFetchOptions,
+    transfer_started: Instant,
+    delay: Duration,
+) -> Result<(), CheatSourceError> {
+    let wait_started = Instant::now();
+    while wait_started.elapsed() < delay {
+        check_transfer_deadline(options, transfer_started)?;
+        let remaining = delay.saturating_sub(wait_started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    check_transfer_deadline(options, transfer_started)
+}
+
 fn fetch_and_publish(
     source: &CheatSourceDefinition,
     options: &CheatSourceFetchOptions,
@@ -1005,6 +1545,7 @@ fn fetch_and_publish(
     let manifests_root = source_root.join(MANIFESTS_DIRECTORY);
     create_safe_directory(&source_root)?;
     create_safe_directory(&staging_root)?;
+    cleanup_inactive_staging(&staging_root)?;
     create_safe_directory(&snapshots_root)?;
     create_safe_directory(&manifests_root)?;
     let unique = format!("{}-{}", std::process::id(), now_nanos());
@@ -1022,16 +1563,30 @@ fn fetch_and_publish(
             "download limit must be greater than zero",
         ));
     }
-    let archive_path = work.join("archive.zip");
-    let mut archive_file = secure_create(&archive_path)?;
-    let resolved = resolve_source_revision(source, transport, options)?;
+    let transfer_started = Instant::now();
+    report_progress(
+        options,
+        CheatSourceProgressPhase::ResolvingRevision,
+        0,
+        0,
+        None,
+        None,
+    );
+    let resolved = resolve_source_revision(source, transport, options, transfer_started)?;
     check_cancelled(options)?;
-    let response = download_with_redirects(
+    let DownloadedArchive {
+        path: archive_path,
+        response,
+        sha256: archive_sha256,
+        attempt,
+    } = download_archive_with_retries(
         source,
         &resolved.archive_url,
         maximum,
         transport,
-        &mut archive_file,
+        options,
+        &work,
+        transfer_started,
     )?;
     check_cancelled(options)?;
     if response
@@ -1054,12 +1609,14 @@ fn fetch_and_publish(
             ),
         ));
     }
-    archive_file
-        .flush()
-        .and_then(|_| archive_file.sync_all())
-        .map_err(|error| cache_error("staging_sync_failed", error))?;
-    drop(archive_file);
-    let archive_sha256 = sha256_file(&archive_path)?;
+    report_progress(
+        options,
+        CheatSourceProgressPhase::VerifyingArchive,
+        CHEAT_SOURCE_RETRY_ATTEMPTS.min(attempt),
+        response.downloaded_bytes,
+        response.content_length,
+        None,
+    );
     let expected = options
         .expected_sha256
         .as_ref()
@@ -1081,6 +1638,15 @@ fn fetch_and_publish(
             "download is not a ZIP archive by content",
         ));
     }
+    check_cancelled(options)?;
+    report_progress(
+        options,
+        CheatSourceProgressPhase::Extracting,
+        attempt,
+        response.downloaded_bytes,
+        response.content_length,
+        None,
+    );
     let extracted = work.join("extracted");
     create_safe_directory(&extracted)?;
     let extraction = extract_zip_safely(&archive_path, &extracted, options)?;
@@ -1088,6 +1654,14 @@ fn fetch_and_publish(
     validate_catalogue_prefix(&source.catalogue_prefix)?;
     let catalogue_path = extracted.join(&source.catalogue_prefix);
     safe_regular_or_directory(&catalogue_path, true)?;
+    report_progress(
+        options,
+        CheatSourceProgressPhase::VerifyingFiles,
+        attempt,
+        response.downloaded_bytes,
+        response.content_length,
+        None,
+    );
     let snapshot =
         load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, &source.source_id, &catalogue_path);
     let malformed = snapshot.excluded_malformed_count();
@@ -1236,6 +1810,14 @@ fn fetch_and_publish(
         last_error_at_unix_seconds: None,
     };
     check_cancelled(options)?;
+    report_progress(
+        options,
+        CheatSourceProgressPhase::Activating,
+        attempt,
+        response.downloaded_bytes,
+        response.content_length,
+        None,
+    );
     atomic_write_json(&source_root.join(METADATA_FILE), &metadata)?;
     let _ = fs::remove_dir_all(&work);
     let catalogue = snapshot_path.join(&source.catalogue_prefix);
@@ -1267,10 +1849,21 @@ fn resolve_source_revision(
     source: &CheatSourceDefinition,
     transport: &dyn CheatSourceTransport,
     options: &CheatSourceFetchOptions,
+    transfer_started: Instant,
 ) -> Result<ResolvedSourceRevision, CheatSourceError> {
     validate_url_host(&source.revision_url, &source.revision_host)?;
     let mut bytes = Vec::new();
-    let response = transport.get(&source.revision_url, REVISION_RESPONSE_LIMIT, &mut bytes)?;
+    let response = transport.get(
+        &source.revision_url,
+        REVISION_RESPONSE_LIMIT,
+        &mut bytes,
+        CheatSourceTransferContext {
+            cancellation: options.cancellation.as_ref(),
+            progress: None,
+            attempt: 0,
+            overall_timeout: remaining_transfer_time(transfer_started)?,
+        },
+    )?;
     check_cancelled(options)?;
     if !(200..300).contains(&response.status) || response.downloaded_bytes != bytes.len() as u64 {
         return Err(CheatSourceError::new(
@@ -1307,27 +1900,46 @@ fn check_cancelled(options: &CheatSourceFetchOptions) -> Result<(), CheatSourceE
         .as_ref()
         .is_some_and(CheatSourceCancellation::is_cancelled)
     {
-        Err(CheatSourceError::new(
-            CheatSourceErrorStage::Download,
-            "cancelled",
-            "catalogue retrieval was cancelled before activation",
-        ))
+        report_progress(
+            options,
+            CheatSourceProgressPhase::Cancelled,
+            0,
+            0,
+            None,
+            None,
+        );
+        Err(cancelled_error())
     } else {
         Ok(())
     }
 }
 
-fn download_with_redirects(
-    source: &CheatSourceDefinition,
-    initial_url: &str,
+fn cancelled_error() -> CheatSourceError {
+    CheatSourceError::new(
+        CheatSourceErrorStage::Download,
+        "cancelled",
+        "catalogue retrieval was cancelled before activation",
+    )
+}
+
+struct RedirectDownloadContext<'a> {
+    source: &'a CheatSourceDefinition,
     maximum: u64,
-    transport: &dyn CheatSourceTransport,
+    transport: &'a dyn CheatSourceTransport,
+    options: &'a CheatSourceFetchOptions,
+    attempt: usize,
+    transfer_started: Instant,
+}
+
+fn download_with_redirects(
+    initial_url: &str,
     destination: &mut dyn Write,
+    context: &RedirectDownloadContext<'_>,
 ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
     let mut url = initial_url.to_string();
     let mut visited = HashSet::new();
     for redirects in 0..=CHEAT_SOURCE_REDIRECT_LIMIT {
-        validate_url_for_source(&url, source)?;
+        validate_url_for_source(&url, context.source)?;
         if !visited.insert(url.clone()) {
             return Err(CheatSourceError::new(
                 CheatSourceErrorStage::Network,
@@ -1335,7 +1947,17 @@ fn download_with_redirects(
                 "redirect loop detected",
             ));
         }
-        let response = transport.get(&url, maximum, destination)?;
+        let response = context.transport.get(
+            &url,
+            context.maximum,
+            destination,
+            CheatSourceTransferContext {
+                cancellation: context.options.cancellation.as_ref(),
+                progress: context.options.progress.as_ref(),
+                attempt: context.attempt,
+                overall_timeout: remaining_transfer_time(context.transfer_started)?,
+            },
+        )?;
         if (300..400).contains(&response.status) {
             if redirects == CHEAT_SOURCE_REDIRECT_LIMIT {
                 return Err(CheatSourceError::new(
@@ -1359,13 +1981,15 @@ fn download_with_redirects(
             continue;
         }
         if !(200..300).contains(&response.status) {
+            let code = format!("http_{}", response.status);
             return Err(CheatSourceError::new(
                 CheatSourceErrorStage::Network,
-                "http_status",
+                &code,
                 format!("server returned HTTP {}", response.status),
-            ));
+            )
+            .with_retry_after(response.retry_after_seconds));
         }
-        validate_downloaded_size(response.downloaded_bytes, maximum)?;
+        validate_downloaded_size(response.downloaded_bytes, context.maximum)?;
         return Ok(response);
     }
     unreachable!()
@@ -1377,6 +2001,21 @@ fn validate_downloaded_size(actual: u64, maximum: u64) -> Result<(), CheatSource
             CheatSourceErrorStage::Download,
             "download_too_large",
             format!("received {actual} bytes, exceeding configured limit {maximum} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_declared_download_size(
+    declared: Option<u64>,
+    maximum: u64,
+) -> Result<(), CheatSourceError> {
+    if let Some(size) = declared.filter(|size| *size > maximum) {
+        Err(CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            "download_too_large",
+            format!("declared response size {size} bytes exceeds configured limit {maximum} bytes"),
         ))
     } else {
         Ok(())
@@ -1834,27 +2473,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn sha256_file(path: &Path) -> Result<String, CheatSourceError> {
-    let mut file =
-        File::open(path).map_err(|error| cache_error("staged_archive_open_failed", error))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| cache_error("staged_archive_read_failed", error))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
 fn zip_magic_valid(path: &Path) -> Result<bool, CheatSourceError> {
     let mut file =
         File::open(path).map_err(|error| cache_error("staged_archive_open_failed", error))?;
@@ -1925,6 +2543,50 @@ fn create_safe_directory(path: &Path) -> Result<(), CheatSourceError> {
     validate_cache_path_for_read(path)?;
     fs::create_dir_all(path).map_err(|error| cache_error("directory_create_failed", error))?;
     reject_symlink(path)
+}
+
+fn cleanup_inactive_staging(staging_root: &Path) -> Result<(), CheatSourceError> {
+    let mut entries = fs::read_dir(staging_root)
+        .map_err(|error| cache_error("staging_read_failed", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| cache_error("staging_read_failed", error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.len() > CHEAT_SOURCE_INACTIVE_STAGING_CLEANUP_LIMIT {
+        return Err(cache_error(
+            "inactive_staging_limit_reached",
+            format!(
+                "found {} inactive staging entries; cleanup limit is {}",
+                entries.len(),
+                CHEAT_SOURCE_INACTIVE_STAGING_CLEANUP_LIMIT
+            ),
+        ));
+    }
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(cache_error(
+                "inactive_staging_name_invalid",
+                "inactive staging entry has unsupported path encoding",
+            ));
+        };
+        let valid_name = name.split_once('-').is_some_and(|(process, nonce)| {
+            !process.is_empty()
+                && !nonce.is_empty()
+                && process.bytes().all(|byte| byte.is_ascii_digit())
+                && nonce.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| cache_error("inactive_staging_inspection_failed", error))?;
+        if !valid_name || !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(cache_error(
+                "inactive_staging_unsafe",
+                format!("refused unexpected staging entry: {name}"),
+            ));
+        }
+        fs::remove_dir_all(entry.path())
+            .map_err(|error| cache_error("inactive_staging_cleanup_failed", error))?;
+    }
+    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), CheatSourceError> {
@@ -2005,7 +2667,9 @@ fn secure_create(path: &Path) -> Result<File, CheatSourceError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     options
         .open(path)
         .map_err(|error| cache_error("file_create_failed", error))
@@ -2193,6 +2857,7 @@ mod tests {
         responses: RefCell<Vec<Result<FakeResponse, CheatSourceError>>>,
         calls: RefCell<Vec<String>>,
     }
+    #[derive(Clone)]
     struct FakeResponse {
         metadata: CheatSourceHttpResponse,
         body: Vec<u8>,
@@ -2211,7 +2876,14 @@ mod tests {
             url: &str,
             maximum_bytes: u64,
             destination: &mut dyn Write,
+            context: CheatSourceTransferContext<'_>,
         ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
+            if context
+                .cancellation
+                .is_some_and(CheatSourceCancellation::is_cancelled)
+            {
+                return Err(cancelled_error());
+            }
             self.calls.borrow_mut().push(url.to_string());
             if url.contains("api.github.com/repos/libretro/libretro-database/commits/") {
                 let body = format!(r#"{{"sha":"{}"}}"#, "1".repeat(40)).into_bytes();
@@ -2225,9 +2897,11 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     downloaded_bytes: body.len() as u64,
+                    retry_after_seconds: None,
                 });
             }
             let mut response = self.responses.borrow_mut().remove(0)?;
+            validate_declared_download_size(response.metadata.content_length, maximum_bytes)?;
             if response.body.len() as u64 > maximum_bytes {
                 return Err(CheatSourceError::new(
                     CheatSourceErrorStage::Download,
@@ -2252,6 +2926,16 @@ mod tests {
             if (200..300).contains(&response.metadata.status) {
                 destination.write_all(&response.body).unwrap();
                 response.metadata.downloaded_bytes = response.body.len() as u64;
+                if let Some(reporter) = context.progress {
+                    reporter.report(CheatSourceProgress {
+                        phase: CheatSourceProgressPhase::Downloading,
+                        attempt: context.attempt,
+                        maximum_attempts: CHEAT_SOURCE_RETRY_ATTEMPTS,
+                        bytes_received: response.metadata.downloaded_bytes,
+                        total_bytes: response.metadata.content_length,
+                        retry_delay_seconds: None,
+                    });
+                }
             }
             Ok(response.metadata)
         }
@@ -2267,6 +2951,7 @@ mod tests {
             etag: Some("fixture".into()),
             last_modified: None,
             downloaded_bytes: 0,
+            retry_after_seconds: None,
         };
         FakeResponse { metadata, body }
     }
@@ -2299,6 +2984,7 @@ mod tests {
             expected_sha256: None,
             max_download_bytes: Some(2 * 1024 * 1024),
             cancellation: None,
+            progress: None,
         }
     }
 
@@ -2481,7 +3167,420 @@ mod tests {
         assert_eq!(error.code, "download_too_large");
         assert!(error.message.contains("268435457"));
         assert!(error.message.contains("268435456"));
-        assert_eq!(CHEAT_SOURCE_TIMEOUT_SECONDS, 180);
+        assert_eq!(CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS, 30);
+        assert_eq!(CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS, 60);
+        assert_eq!(CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS, 15 * 60);
+        assert_eq!(CHEAT_SOURCE_RETRY_ATTEMPTS, 3);
+        assert_eq!(CHEAT_SOURCE_RETRY_DELAY_SECONDS, 5);
+    }
+
+    #[test]
+    fn streaming_writer_handles_178_mib_with_one_bounded_chunk_and_incremental_sha256() {
+        let temp = TempDirectory::new();
+        let path = temp.0.join("large.part");
+        let options = options(&temp.0);
+        let mut writer = StreamingArchiveWriter::new(
+            secure_create(&path).unwrap(),
+            CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT,
+            1,
+            &options,
+            Instant::now(),
+        );
+        let chunk = vec![0x5a; CHEAT_SOURCE_NETWORK_CHUNK_BYTES];
+        let mut expected = Sha256::new();
+        for _ in 0..(178 * 1024 * 1024 / CHEAT_SOURCE_NETWORK_CHUNK_BYTES) {
+            writer.write_all(&chunk).unwrap();
+            expected.update(&chunk);
+        }
+        let (digest, bytes) = writer.finish().unwrap();
+        assert_eq!(bytes, 178 * 1024 * 1024);
+        let expected: String = expected
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(digest, expected);
+        assert_eq!(fs::metadata(path).unwrap().len(), bytes);
+    }
+
+    #[test]
+    fn declared_length_is_rejected_before_any_body_write_and_unknown_length_streams() {
+        let mut oversized = response(vec![1, 2, 3]);
+        oversized.metadata.content_length = Some(4);
+        let transport = FakeTransport::new(vec![Ok(oversized)]);
+        let mut destination = Vec::new();
+        let error = transport
+            .get(
+                "https://codeload.github.com/archive.zip",
+                3,
+                &mut destination,
+                CheatSourceTransferContext {
+                    cancellation: None,
+                    progress: None,
+                    attempt: 1,
+                    overall_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "download_too_large");
+        assert!(destination.is_empty());
+
+        let known = response(vec![1, 2, 3]);
+        let transport = FakeTransport::new(vec![Ok(known)]);
+        transport
+            .get(
+                "https://codeload.github.com/archive.zip",
+                3,
+                &mut destination,
+                CheatSourceTransferContext {
+                    cancellation: None,
+                    progress: None,
+                    attempt: 1,
+                    overall_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(destination, vec![1, 2, 3]);
+        destination.clear();
+
+        let mut unknown = response(vec![4, 5, 6]);
+        unknown.metadata.content_length = None;
+        let transport = FakeTransport::new(vec![Ok(unknown)]);
+        transport
+            .get(
+                "https://codeload.github.com/archive.zip",
+                3,
+                &mut destination,
+                CheatSourceTransferContext {
+                    cancellation: None,
+                    progress: None,
+                    attempt: 1,
+                    overall_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(destination, vec![4, 5, 6]);
+    }
+
+    fn retryable_fixture_error(code: &str) -> CheatSourceError {
+        CheatSourceError::new(
+            CheatSourceErrorStage::Download,
+            code,
+            "fixture interruption",
+        )
+        .with_retry_after(Some(0))
+    }
+
+    #[test]
+    fn interrupted_attempt_uses_a_fresh_staging_file_and_incremental_digest() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let body = b"streamed archive bytes".to_vec();
+        let transport = FakeTransport::new(vec![
+            Err(retryable_fixture_error("response_interrupted")),
+            Ok(response(body.clone())),
+        ]);
+        let downloaded = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &transport,
+            &options(&temp.0),
+            &work,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(downloaded.attempt, 2);
+        assert!(!work.join("archive-attempt-1.zip.part").exists());
+        assert!(downloaded.path.ends_with("archive-attempt-2.zip.part"));
+        assert_eq!(downloaded.sha256, sha256_hex(&body));
+        assert_eq!(transport.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn all_transient_attempts_fail_once_and_permanent_http_status_does_not_retry() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let transient = FakeTransport::new(vec![
+            Err(retryable_fixture_error("idle_timeout")),
+            Err(retryable_fixture_error("response_interrupted")),
+            Err(retryable_fixture_error("connection_interrupted")),
+        ]);
+        let error = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &transient,
+            &options(&temp.0),
+            &work,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "connection_interrupted");
+        assert!(error.message.contains("attempt 3 of 3"));
+        assert_eq!(transient.calls.borrow().len(), 3);
+        assert_eq!(fs::read_dir(&work).unwrap().count(), 0);
+
+        let mut not_found = response(Vec::new());
+        not_found.metadata.status = 404;
+        let permanent = FakeTransport::new(vec![Ok(not_found)]);
+        let error = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &permanent,
+            &options(&temp.0),
+            &work,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "http_404");
+        assert_eq!(permanent.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn exhausted_transient_retries_retain_the_previous_active_snapshot() {
+        let temp = TempDirectory::new();
+        let first = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &options(&temp.0),
+            &FakeTransport::new(vec![Ok(response(valid_zip()))]),
+        )
+        .unwrap();
+        let original = first.manifest.archive_sha256;
+        let mut update = options(&temp.0);
+        update.force_refresh = true;
+        let error = fetch_retroarch_cheat_source(
+            "libretro-buildbot-cheats",
+            &update,
+            &FakeTransport::new(vec![
+                Err(retryable_fixture_error("response_interrupted")),
+                Err(retryable_fixture_error("idle_timeout")),
+                Err(retryable_fixture_error("connection_interrupted")),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "connection_interrupted");
+        let inspected =
+            inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0).unwrap();
+        assert!(inspected.setup_usable);
+        assert_eq!(inspected.manifest.unwrap().archive_sha256, original);
+    }
+
+    #[test]
+    fn retryable_http_statuses_honor_bounded_retry_after() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let mut limited = response(Vec::new());
+        limited.metadata.status = 429;
+        limited.metadata.retry_after_seconds = Some(0);
+        let mut unavailable = response(Vec::new());
+        unavailable.metadata.status = 503;
+        unavailable.metadata.retry_after_seconds = Some(0);
+        let transport = FakeTransport::new(vec![
+            Ok(limited),
+            Ok(unavailable),
+            Ok(response(b"ok".to_vec())),
+        ]);
+        let downloaded = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &transport,
+            &options(&temp.0),
+            &work,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(downloaded.attempt, 3);
+        assert_eq!(transport.calls.borrow().len(), 3);
+        assert_eq!(
+            retry_delay_seconds(
+                &CheatSourceError::new(CheatSourceErrorStage::Network, "http_429", "limited")
+                    .with_retry_after(Some(999))
+            ),
+            CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS
+        );
+        assert_eq!(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS, 30);
+    }
+
+    #[test]
+    fn cancellation_during_retry_delay_is_typed_and_leaves_no_partial_file() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let cancellation = CheatSourceCancellation::default();
+        let cancel_from_progress = cancellation.clone();
+        let reporter = CheatSourceProgressReporter::new(move |progress| {
+            if progress.phase == CheatSourceProgressPhase::Retrying {
+                cancel_from_progress.cancel();
+            }
+        });
+        let mut configured = options(&temp.0);
+        configured.cancellation = Some(cancellation);
+        configured.progress = Some(reporter);
+        let transport =
+            FakeTransport::new(vec![Err(retryable_fixture_error("response_interrupted"))]);
+        let error = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &transport,
+            &configured,
+            &work,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(fs::read_dir(work).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_between_streamed_chunks_removes_the_partial_attempt() {
+        struct CancellingTransport;
+        impl CheatSourceTransport for CancellingTransport {
+            fn get(
+                &self,
+                _url: &str,
+                _maximum_bytes: u64,
+                destination: &mut dyn Write,
+                context: CheatSourceTransferContext<'_>,
+            ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
+                destination.write_all(b"first chunk").unwrap();
+                context.cancellation.unwrap().cancel();
+                if context
+                    .cancellation
+                    .is_some_and(CheatSourceCancellation::is_cancelled)
+                {
+                    return Err(cancelled_error());
+                }
+                unreachable!()
+            }
+        }
+
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let mut configured = options(&temp.0);
+        configured.cancellation = Some(CheatSourceCancellation::default());
+        let error = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &CancellingTransport,
+            &configured,
+            &work,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(fs::read_dir(work).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn streamed_actual_size_limit_and_permanent_security_failures_fail_closed() {
+        let temp = TempDirectory::new();
+        let path = temp.0.join("limited.part");
+        let configured = options(&temp.0);
+        let mut writer = StreamingArchiveWriter::new(
+            secure_create(&path).unwrap(),
+            3,
+            1,
+            &configured,
+            Instant::now(),
+        );
+        let error = writer.write_all(b"four").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+
+        for code in [
+            "tls_verification_failed",
+            "redirect_limit_exceeded",
+            "unsupported_scheme",
+            "download_too_large",
+            "sha256_mismatch",
+        ] {
+            assert!(!retryable_download_error(&CheatSourceError::new(
+                CheatSourceErrorStage::Network,
+                code,
+                "permanent fixture"
+            )));
+        }
+    }
+
+    #[test]
+    fn overall_timeout_prevents_a_new_attempt() {
+        let temp = TempDirectory::new();
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(
+                CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS + 1,
+            ))
+            .unwrap();
+        let transport = FakeTransport::new(Vec::new());
+        let error = download_archive_with_retries(
+            &trusted_retroarch_cheat_sources().remove(0),
+            "https://codeload.github.com/libretro/libretro-database/zip/revision",
+            1024,
+            &transport,
+            &options(&temp.0),
+            &work,
+            started,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "overall_timeout");
+        assert!(transport.calls.borrow().is_empty());
+        assert_eq!(fs::read_dir(work).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn progress_is_monotonic_per_attempt_and_retention_is_bounded() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter = CheatSourceProgressReporter::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        for index in 0..(CHEAT_SOURCE_PROGRESS_EVENT_LIMIT + 20) {
+            reporter.report(CheatSourceProgress {
+                phase: CheatSourceProgressPhase::Downloading,
+                attempt: 1,
+                maximum_attempts: CHEAT_SOURCE_RETRY_ATTEMPTS,
+                bytes_received: index as u64,
+                total_bytes: None,
+                retry_delay_seconds: None,
+            });
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), CHEAT_SOURCE_PROGRESS_EVENT_LIMIT);
+        assert!(events.windows(2).all(|pair| {
+            pair[0].attempt == pair[1].attempt && pair[0].bytes_received <= pair[1].bytes_received
+        }));
+    }
+
+    #[test]
+    fn production_downloader_has_no_whole_body_or_external_process_path() {
+        let production = include_str!("cheat_sources.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "read_to_end",
+            "read_to_vec",
+            "Command::",
+            "std::process::Command",
+            "curl ",
+            "wget ",
+        ] {
+            assert!(!production.contains(forbidden));
+        }
+        assert!(production.contains("CHEAT_SOURCE_NETWORK_CHUNK_BYTES"));
+        assert!(production.contains(".timeout_recv_response(None)"));
+        assert!(production.contains("CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS"));
+        assert!(production.contains("CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS"));
     }
 
     #[test]
@@ -2616,20 +3715,35 @@ mod tests {
     #[test]
     fn network_failures_and_redirects_are_structured() {
         let temp = TempDirectory::new();
-        for status in [404, 500] {
-            let mut value = response(Vec::new());
-            value.metadata.status = status;
-            assert_eq!(
-                fetch_retroarch_cheat_source(
-                    "libretro-buildbot-cheats",
-                    &options(&temp.0),
-                    &FakeTransport::new(vec![Ok(value)])
-                )
-                .unwrap_err()
-                .code,
-                "http_status"
-            );
-        }
+        let mut not_found = response(Vec::new());
+        not_found.metadata.status = 404;
+        assert_eq!(
+            fetch_retroarch_cheat_source(
+                "libretro-buildbot-cheats",
+                &options(&temp.0),
+                &FakeTransport::new(vec![Ok(not_found)])
+            )
+            .unwrap_err()
+            .code,
+            "http_404"
+        );
+        let mut unavailable = response(Vec::new());
+        unavailable.metadata.status = 500;
+        unavailable.metadata.retry_after_seconds = Some(0);
+        assert_eq!(
+            fetch_retroarch_cheat_source(
+                "libretro-buildbot-cheats",
+                &options(&temp.0),
+                &FakeTransport::new(vec![
+                    Ok(unavailable.clone()),
+                    Ok(unavailable.clone()),
+                    Ok(unavailable),
+                ])
+            )
+            .unwrap_err()
+            .code,
+            "http_500"
+        );
         let mut redirect = response(Vec::new());
         redirect.metadata.status = 302;
         redirect.metadata.location = Some("https://localhost/archive.zip".into());
@@ -2837,6 +3951,24 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn only_proven_inactive_operation_staging_is_cleaned() {
+        let temp = TempDirectory::new();
+        let staging = temp.0.join(STAGING_DIRECTORY);
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(staging.join("123-456")).unwrap();
+        fs::write(staging.join("123-456/archive.part"), b"partial").unwrap();
+        cleanup_inactive_staging(&staging).unwrap();
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+
+        fs::create_dir(staging.join("unexpected-name")).unwrap();
+        assert_eq!(
+            cleanup_inactive_staging(&staging).unwrap_err().code,
+            "inactive_staging_unsafe"
+        );
+        assert!(staging.join("unexpected-name").exists());
     }
 
     #[cfg(unix)]
