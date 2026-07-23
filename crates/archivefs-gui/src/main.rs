@@ -16,17 +16,18 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::game_identity::{GameIdentityReport, IdentityStatus, inspect_game_identity};
 use archivefs_core::patch_manager::{
-    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, DolphinGameIniInventory, DolphinInstallationType,
-    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
-    DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
-    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType,
-    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory,
-    Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewIdentity,
-    PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem,
-    PreviewState, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchMaterializationError, RetroArchMaterializationRequest,
+    CheatCatalogueStatus, CheatSourceCancellation, CheatSourceError, CheatSourceFetchOptions,
+    CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList,
+    CheatSourceListEntry, DolphinGameIniInventory, DolphinInstallationType, DolphinMatchState,
+    DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    DolphinSettingsDirectoryState, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, RetroArchCheatLibraryInspection,
+    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchMaterializationError,
+    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
     SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
@@ -2712,6 +2713,11 @@ struct ArchiveFsApp {
     /// mirrors `alias_action` exactly, including the "one writer at a
     /// time" convention `source_action_available` enforces.
     source_action: Option<RunningSourceAction>,
+    catalogue_manager: CatalogueManagerState,
+    catalogue_review: Option<CatalogueReview>,
+    catalogue_retrieval: Option<RunningCatalogueRetrieval>,
+    catalogue_generation: u64,
+    catalogue_last_result: Option<Result<CheatSourceFetchResult, CheatSourceError>>,
     /// The "Add Folder" dialog's open/closed state and its own fields -
     /// see `SourcesAddDialogState`.
     sources_add_dialog: Option<SourcesAddDialogState>,
@@ -2872,6 +2878,11 @@ impl ArchiveFsApp {
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
+            catalogue_manager: CatalogueManagerState::NotLoaded,
+            catalogue_review: None,
+            catalogue_retrieval: None,
+            catalogue_generation: 0,
+            catalogue_last_result: None,
             sources_add_dialog: None,
             sources_remove_dialog: None,
             library_views: load_library_view_configs_default().unwrap_or_default(),
@@ -3866,6 +3877,162 @@ impl ArchiveFsApp {
                 });
             }
         }
+    }
+
+    fn start_catalogue_status_load(&mut self, context: egui::Context) {
+        if matches!(self.catalogue_manager, CatalogueManagerState::Loading(_)) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.catalogue_manager = CatalogueManagerState::Loading(receiver);
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root()
+                .and_then(|root| list_retroarch_cheat_sources(&root));
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn start_catalogue_retrieval(&mut self, context: egui::Context) {
+        if self.catalogue_retrieval.is_some() {
+            return;
+        }
+        let Some(review) = self.catalogue_review.take() else {
+            return;
+        };
+        self.catalogue_generation = self.catalogue_generation.wrapping_add(1);
+        let generation = self.catalogue_generation;
+        let source_id = review.source_id;
+        let force_refresh = review.kind == CatalogueRetrievalKind::Update;
+        let cancellation = CheatSourceCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            None,
+            ActivityOutcome::Started,
+            format!(
+                "RetroArch catalogue {review_kind} started for '{source_id}'.",
+                review_kind = if force_refresh { "update" } else { "download" }
+            ),
+        ));
+        self.catalogue_retrieval = Some(RunningCatalogueRetrieval {
+            generation,
+            source_id: source_id.clone(),
+            cancellation,
+            receiver,
+            cancellation_requested: false,
+        });
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root().and_then(|cache_root| {
+                fetch_retroarch_cheat_source(
+                    &source_id,
+                    &CheatSourceFetchOptions {
+                        cache_root,
+                        force_refresh,
+                        offline: false,
+                        expected_sha256: None,
+                        max_download_bytes: None,
+                        cancellation: Some(worker_cancellation),
+                    },
+                    &HttpsCheatSourceTransport::new(),
+                )
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_catalogue_manager(&mut self, context: &egui::Context) {
+        if let CatalogueManagerState::Loading(receiver) = &self.catalogue_manager {
+            match receiver.try_recv() {
+                Ok(Ok(list)) => self.catalogue_manager = CatalogueManagerState::Ready(list),
+                Ok(Err(error)) => self.catalogue_manager = CatalogueManagerState::Failed(error),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.catalogue_manager = CatalogueManagerState::Failed(CheatSourceError {
+                        schema_version:
+                            archivefs_core::patch_manager::CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+                        stage: archivefs_core::patch_manager::CheatSourceErrorStage::Cache,
+                        code: "status_worker_stopped".to_string(),
+                        message: "catalogue status worker stopped unexpectedly".to_string(),
+                    });
+                }
+            }
+        }
+        let result = self.catalogue_retrieval.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.generation, running.source_id.clone(), result))
+        });
+        let Some((generation, source_id, result)) = result else {
+            return;
+        };
+        self.catalogue_retrieval = None;
+        if generation != self.catalogue_generation {
+            return;
+        }
+        match &result {
+            Ok(fetch) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "RetroArch catalogue '{}': revision resolved to {}.",
+                        source_id, fetch.manifest.resolved_revision
+                    ),
+                ));
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "RetroArch catalogue '{}': download and verification completed ({} bytes, {} manifest files).",
+                        source_id,
+                        fetch.manifest.downloaded_bytes,
+                        fetch.manifest.files.len()
+                    ),
+                ));
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "RetroArch catalogue '{}' activated at revision {} ({} files verified).",
+                        source_id,
+                        fetch.manifest.resolved_revision,
+                        fetch.manifest.files.len()
+                    ),
+                ));
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.source_fetch = CheatStepResource::Ready(fetch.clone());
+                    workflow.source_list = CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.preview = CheatStepResource::NotLoaded;
+                    workflow.transaction = CheatTransactionState::Idle;
+                }
+            }
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    if error.code == "cancelled" {
+                        ActivityOutcome::Skipped
+                    } else {
+                        ActivityOutcome::Failed
+                    },
+                    format!(
+                        "RetroArch catalogue '{source_id}': {error}. Existing snapshot retained."
+                    ),
+                ));
+            }
+        }
+        self.catalogue_last_result = Some(result);
+        self.catalogue_manager = CatalogueManagerState::NotLoaded;
+        self.start_catalogue_status_load(context.clone());
     }
 
     /// Whether a new Library Views action may start - the same "one
@@ -5160,6 +5327,7 @@ impl ArchiveFsApp {
                         offline,
                         expected_sha256: None,
                         max_download_bytes: None,
+                        cancellation: None,
                     };
                     let transport = HttpsCheatSourceTransport::new();
                     fetch_retroarch_cheat_source(&source_id, &options, &transport)
@@ -6499,6 +6667,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
         self.poll_source_action(context);
+        self.poll_catalogue_manager(context);
         self.poll_library_view_action(context);
         self.poll_archive_inspection();
         self.poll_missing_removal(context);
@@ -6509,6 +6678,11 @@ impl eframe::App for ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_cheat_workflow();
+        if self.view == MainView::Sources
+            && matches!(self.catalogue_manager, CatalogueManagerState::NotLoaded)
+        {
+            self.start_catalogue_status_load(context.clone());
+        }
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
                 workflow.identity_request.is_none()
@@ -6822,6 +6996,37 @@ impl eframe::App for ArchiveFsApp {
                 }
 
                 if self.view == MainView::Sources {
+                    let catalogue_action = show_retroarch_catalogue_manager(
+                        ui,
+                        &self.catalogue_manager,
+                        self.catalogue_review.as_ref(),
+                        self.catalogue_retrieval.as_ref(),
+                        self.catalogue_last_result.as_ref(),
+                        &mut self.clipboard,
+                    );
+                    if let Some(catalogue_action) = catalogue_action {
+                        match catalogue_action {
+                            CatalogueManagerAction::Refresh => {
+                                self.start_catalogue_status_load(context.clone());
+                            }
+                            CatalogueManagerAction::Review { source_id, kind } => {
+                                self.catalogue_review = Some(CatalogueReview { source_id, kind });
+                            }
+                            CatalogueManagerAction::Confirm => {
+                                self.start_catalogue_retrieval(context.clone());
+                            }
+                            CatalogueManagerAction::CancelReview => {
+                                self.catalogue_review = None;
+                            }
+                            CatalogueManagerAction::CancelRunning => {
+                                if let Some(running) = self.catalogue_retrieval.as_mut() {
+                                    running.cancellation.cancel();
+                                    running.cancellation_requested = true;
+                                }
+                            }
+                        }
+                    }
+                    ui.add_space(theme::SECTION_GAP);
                     let sources = self
                         .database_state
                         .snapshot()
@@ -6994,7 +7199,7 @@ impl eframe::App for ArchiveFsApp {
                                 live,
                                 self.database_state.snapshot(),
                                 &self.history,
-                                busy,
+                                busy || self.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
                             )
                         })
@@ -7060,8 +7265,9 @@ impl eframe::App for ArchiveFsApp {
                         Some(CheatWorkflowAction::RefreshSources) => {
                             self.start_cheat_source_list(context.clone());
                         }
-                        Some(CheatWorkflowAction::FetchSource) => {
-                            self.start_cheat_source_fetch(context.clone(), false);
+                        Some(CheatWorkflowAction::ManageCatalogue) => {
+                            self.view = MainView::Sources;
+                            self.start_catalogue_status_load(context.clone());
                         }
                         Some(CheatWorkflowAction::UseCachedSnapshot) => {
                             self.start_cheat_source_fetch(context.clone(), true);
@@ -9471,6 +9677,44 @@ fn source_availability_label(availability: SourceAvailability) -> &'static str {
         SourceAvailability::ScanFailed => "Scan failed",
     }
 }
+
+enum CatalogueManagerState {
+    NotLoaded,
+    Loading(Receiver<Result<CheatSourceList, CheatSourceError>>),
+    Ready(CheatSourceList),
+    Failed(CheatSourceError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogueRetrievalKind {
+    Download,
+    Update,
+}
+
+struct CatalogueReview {
+    source_id: String,
+    kind: CatalogueRetrievalKind,
+}
+
+struct RunningCatalogueRetrieval {
+    generation: u64,
+    source_id: String,
+    cancellation: CheatSourceCancellation,
+    receiver: Receiver<Result<CheatSourceFetchResult, CheatSourceError>>,
+    cancellation_requested: bool,
+}
+
+enum CatalogueManagerAction {
+    Refresh,
+    Review {
+        source_id: String,
+        kind: CatalogueRetrievalKind,
+    },
+    Confirm,
+    CancelReview,
+    CancelRunning,
+}
+
 enum SourcesPageAction {
     AddFolder(PathBuf),
     ScanOne(PathBuf),
@@ -9491,6 +9735,267 @@ enum SourcesPageAction {
     /// independently-drifting filter mechanism).
     ViewInLibrary(PathBuf),
 }
+
+fn catalogue_status_label(status: CheatCatalogueStatus) -> &'static str {
+    match status {
+        CheatCatalogueStatus::Missing => "Missing",
+        CheatCatalogueStatus::Ready => "Ready",
+        CheatCatalogueStatus::Stale => "Stale",
+        CheatCatalogueStatus::InvalidManifest => "Invalid manifest",
+        CheatCatalogueStatus::Incomplete => "Incomplete",
+        CheatCatalogueStatus::UnsupportedSchema => "Unsupported schema",
+        CheatCatalogueStatus::VerificationFailed => "Verification failed",
+        CheatCatalogueStatus::RetrievalFailed => "Retrieval failed",
+        CheatCatalogueStatus::Cancelled => "Cancelled",
+        CheatCatalogueStatus::ResourceLimitReached => "Resource limit reached",
+    }
+}
+
+fn show_retroarch_catalogue_manager(
+    ui: &mut egui::Ui,
+    state: &CatalogueManagerState,
+    review: Option<&CatalogueReview>,
+    running: Option<&RunningCatalogueRetrieval>,
+    last_result: Option<&Result<CheatSourceFetchResult, CheatSourceError>>,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CatalogueManagerAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "RetroArch cheat catalogue",
+        Some(
+            "Explicitly acquire and verify third-party content from the official Libretro database.",
+        ),
+    );
+    match state {
+        CatalogueManagerState::NotLoaded | CatalogueManagerState::Loading(_) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Verifying local catalogue status…");
+            });
+        }
+        CatalogueManagerState::Failed(error) => {
+            widgets::banner(
+                ui,
+                "Catalogue status unavailable",
+                &error.to_string(),
+                widgets::StatusTone::Blocked,
+            );
+            if widgets::action_button(ui, "Retry", widgets::ActionStyle::Secondary, true).clicked()
+            {
+                action = Some(CatalogueManagerAction::Refresh);
+            }
+        }
+        CatalogueManagerState::Ready(list) => {
+            for entry in &list.entries {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&entry.source.display_name);
+                        widgets::status_badge(
+                            ui,
+                            catalogue_status_label(entry.status),
+                            match entry.status {
+                                CheatCatalogueStatus::Ready => widgets::StatusTone::Success,
+                                CheatCatalogueStatus::Missing => widgets::StatusTone::Pending,
+                                CheatCatalogueStatus::Stale | CheatCatalogueStatus::Cancelled => {
+                                    widgets::StatusTone::Warning
+                                }
+                                _ => widgets::StatusTone::Blocked,
+                            },
+                        );
+                        widgets::status_badge(
+                            ui,
+                            "Official repository · third-party content",
+                            widgets::StatusTone::Info,
+                        );
+                    });
+                    ui.label("Catalogue download does not install cheats. Apply remains a separate confirmed transaction.");
+                    ui.label("Updating this snapshot does not modify RetroArch or emulator files, and a game may legitimately have no matching cheat.");
+                    if let Some(revision) = &entry.current_cached_version {
+                        ui.label(format!("Active revision: {revision}"));
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(count) = entry.catalogue_file_count {
+                            ui.label(format!("Files: {count}"));
+                        }
+                        if let Some(bytes) = entry.total_bytes {
+                            ui.label(format!("Verified size: {}", format_size(Some(bytes))));
+                        }
+                        if let Some(timestamp) = entry.fetched_at_unix_seconds {
+                            ui.label(format!(
+                                "Last successful update: {}",
+                                format_unix_timestamp_utc(timestamp as i64)
+                            ));
+                        }
+                    });
+                    if let Some(error) = &entry.last_error {
+                        widgets::banner(
+                            ui,
+                            "Last update failed; active snapshot retained",
+                            &error.to_string(),
+                            widgets::StatusTone::Warning,
+                        );
+                        if let Some(timestamp) = entry.last_error_at_unix_seconds {
+                            ui.label(format!(
+                                "Last failed update: {}",
+                                format_unix_timestamp_utc(timestamp as i64)
+                            ));
+                        }
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let idle = running.is_none() && review.is_none();
+                        if entry.status == CheatCatalogueStatus::Missing
+                            && widgets::action_button(
+                                ui,
+                                "Download",
+                                widgets::ActionStyle::Primary,
+                                idle,
+                            )
+                            .clicked()
+                        {
+                            action = Some(CatalogueManagerAction::Review {
+                                source_id: entry.source.source_id.clone(),
+                                kind: CatalogueRetrievalKind::Download,
+                            });
+                        }
+                        if entry.status != CheatCatalogueStatus::Missing
+                            && widgets::action_button(
+                                ui,
+                                "Update",
+                                widgets::ActionStyle::Primary,
+                                idle,
+                            )
+                            .clicked()
+                        {
+                            action = Some(CatalogueManagerAction::Review {
+                                source_id: entry.source.source_id.clone(),
+                                kind: CatalogueRetrievalKind::Update,
+                            });
+                        }
+                        if widgets::action_button(
+                            ui,
+                            "Verify",
+                            widgets::ActionStyle::Secondary,
+                            running.is_none(),
+                        )
+                        .clicked()
+                        {
+                            action = Some(CatalogueManagerAction::Refresh);
+                        }
+                    });
+                    egui::CollapsingHeader::new("Open details")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            widgets::copyable_value(ui, "Provider ID", &entry.source.source_id);
+                            widgets::copyable_value(
+                                ui,
+                                "Canonical repository",
+                                &entry.source.canonical_repository_url,
+                            );
+                            widgets::copyable_value(
+                                ui,
+                                "Revision resolver",
+                                &entry.source.revision_url,
+                            );
+                            widgets::copyable_value(
+                                ui,
+                                "Immutable archive template",
+                                &entry.source.download_url,
+                            );
+                            if let Some(digest) = &entry.archive_sha256 {
+                                widgets::copyable_value(ui, "Snapshot SHA-256", digest);
+                            }
+                            ui.label(format!("Trust classification: {}", entry.trust_status));
+                            if ui.button("Copy provider details").clicked() {
+                                let _ = clipboard.set_text(format!(
+                                    "{}\n{}",
+                                    entry.source.canonical_repository_url,
+                                    entry.source.revision_url
+                                ));
+                            }
+                        });
+                });
+            }
+        }
+    }
+    if let Some(running) = running {
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if running.cancellation_requested {
+                    "Cancellation requested; the active snapshot will remain unchanged."
+                } else {
+                    "Resolving, downloading, verifying, and staging the catalogue…"
+                });
+            });
+            if widgets::action_button(
+                ui,
+                "Cancel",
+                widgets::ActionStyle::Secondary,
+                !running.cancellation_requested,
+            )
+            .clicked()
+            {
+                action = Some(CatalogueManagerAction::CancelRunning);
+            }
+        });
+    }
+    if let Some(result) = last_result {
+        match result {
+            Ok(fetch) => widgets::banner(
+                ui,
+                "Catalogue activated",
+                &format!(
+                    "Revision {} is active; {} files were verified. No cheats were installed.",
+                    fetch.manifest.resolved_revision,
+                    fetch.manifest.files.len()
+                ),
+                widgets::StatusTone::Success,
+            ),
+            Err(error) => widgets::banner(
+                ui,
+                if error.code == "cancelled" {
+                    "Catalogue download cancelled"
+                } else {
+                    "Catalogue update failed"
+                },
+                &format!("{error}. Any previous valid snapshot was retained."),
+                widgets::StatusTone::Warning,
+            ),
+        }
+    }
+    if let Some(review) = review {
+        let mut open = true;
+        egui::Window::new(match review.kind {
+            CatalogueRetrievalKind::Download => "Review catalogue download",
+            CatalogueRetrievalKind::Update => "Review catalogue update",
+        })
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            ui.label("Network access begins only after you confirm this exact request.");
+            ui.label(format!("Provider: {}", review.source_id));
+            if let Ok(root) = default_cheat_source_cache_root() {
+                ui.label(format!("Managed destination: {}", root.display()));
+            }
+            ui.label("The master reference will be resolved to an exact commit, then an immutable HTTPS archive will be downloaded and verified.");
+            ui.horizontal(|ui| {
+                if ui.button("Confirm retrieval").clicked() {
+                    action = Some(CatalogueManagerAction::Confirm);
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(CatalogueManagerAction::CancelReview);
+                }
+            });
+        });
+        if !open {
+            action = Some(CatalogueManagerAction::CancelReview);
+        }
+    }
+    action
+}
+
 fn show_sources_page(
     ui: &mut egui::Ui,
     sources: &[SourceFolderView],
@@ -12336,7 +12841,7 @@ enum CheatWorkflowAction {
     InspectDolphinProfile,
     InspectExistingLibrary,
     RefreshSources,
-    FetchSource,
+    ManageCatalogue,
     UseCachedSnapshot,
     ReviewApply,
     ConfirmApply,
@@ -14304,6 +14809,16 @@ fn show_shared_cheat_preview(
             widgets::StatusTone::Blocked,
         ),
         CheatStepResource::Ready(response) => match &response.outcome {
+            CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(error))
+                if error.kind == RetroArchMaterializationErrorKind::NoEligibleMatch =>
+            {
+                widgets::banner(
+                    ui,
+                    "No matching cheat found",
+                    "The active verified catalogue contains no exact or approved strong match for this game. Nothing can be applied.",
+                    widgets::StatusTone::Pending,
+                )
+            }
             CheatPreviewOutcome::Failed(error) => widgets::banner(
                 ui,
                 "Preview unavailable",
@@ -14319,6 +14834,13 @@ fn show_shared_cheat_preview(
                             widgets::StatusTone::Success,
                         );
                         widgets::copyable_value(ui, "Snapshot ID", &materialized.snapshot_id);
+                        if let CheatStepResource::Ready(fetch) = &workflow.source_fetch {
+                            widgets::copyable_value(
+                                ui,
+                                "Upstream revision",
+                                &fetch.manifest.resolved_revision,
+                            );
+                        }
                         if widgets::path_value(
                             ui,
                             "Immutable snapshot",
@@ -15202,13 +15724,13 @@ fn show_cheat_workflow_step2(
                     !busy && !fetching && selected_entry.is_some_and(|entry| entry.source.enabled);
                 if widgets::action_button(
                     ui,
-                    "Fetch / update catalogue",
+                    "Manage catalogue in Sources",
                     widgets::ActionStyle::Primary,
                     can_fetch,
                 )
                 .clicked()
                 {
-                    action = Some(CheatWorkflowAction::FetchSource);
+                    action = Some(CheatWorkflowAction::ManageCatalogue);
                 }
                 let cached_available = selected_entry
                     .is_some_and(|entry| entry.freshness != CheatSourceFreshness::Missing);
@@ -20950,9 +21472,11 @@ mod tests {
 
     fn cheat_manifest(source_id: &str) -> CheatSourceManifest {
         CheatSourceManifest {
-            format_version: 1,
+            format_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
             source_id: source_id.to_string(),
             source_url: "https://example.invalid/catalogue.zip".to_string(),
+            canonical_repository_url: "https://github.com/libretro/libretro-database".to_string(),
+            resolved_revision: "1".repeat(40),
             pinned_version: None,
             fetched_at_unix_seconds: 0,
             downloaded_bytes: 0,
@@ -21022,6 +21546,10 @@ mod tests {
                     archive_sha256: Some("fixture-digest".to_string()),
                     catalogue_file_count: Some(4),
                     setup_usable: true,
+                    status: archivefs_core::patch_manager::CheatCatalogueStatus::Ready,
+                    total_bytes: Some(0),
+                    last_error: None,
+                    last_error_at_unix_seconds: None,
                     warnings: Vec::new(),
                 }],
             },
@@ -21499,6 +22027,82 @@ mod tests {
         assert_eq!(
             cheat_fetch_status_label(CheatSourceFetchStatus::OfflineReused),
             "Offline: reused cached snapshot"
+        );
+    }
+
+    #[test]
+    fn sources_catalogue_card_separates_download_update_and_never_offers_apply() {
+        let (_, _, mut list) = cheat_source_list_fixture();
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        list.entries[0].status = CheatCatalogueStatus::Missing;
+        list.entries[0].freshness = CheatSourceFreshness::Missing;
+        list.entries[0].setup_usable = false;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_retroarch_catalogue_manager(
+                    ui,
+                    &CatalogueManagerState::Ready(list.clone()),
+                    None,
+                    None,
+                    None,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Download"));
+        assert!(!rendered_text_contains(&output, "Update"));
+        assert!(rendered_text_contains(
+            &output,
+            "Apply remains a separate confirmed transaction"
+        ));
+
+        list.entries[0].status = CheatCatalogueStatus::Ready;
+        list.entries[0].freshness = CheatSourceFreshness::Fresh;
+        list.entries[0].setup_usable = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_retroarch_catalogue_manager(
+                    ui,
+                    &CatalogueManagerState::Ready(list.clone()),
+                    None,
+                    None,
+                    None,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Update"));
+        assert!(rendered_text_contains(&output, "Verify"));
+    }
+
+    #[test]
+    fn stale_catalogue_result_is_rejected_without_touching_library_state() {
+        let mut app = app_for_operation_tests();
+        app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+        app.selected_archive = Some(PathBuf::from("/roms/Alien 3.md"));
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(cheat_fetch_result_for(
+                "libretro-buildbot-cheats",
+                CheatSourceFetchStatus::Fetched,
+            )))
+            .unwrap();
+        app.catalogue_generation = 2;
+        app.catalogue_retrieval = Some(RunningCatalogueRetrieval {
+            generation: 1,
+            source_id: "libretro-buildbot-cheats".into(),
+            cancellation: CheatSourceCancellation::default(),
+            receiver,
+            cancellation_requested: false,
+        });
+        app.poll_catalogue_manager(&egui::Context::default());
+        assert!(app.catalogue_retrieval.is_none());
+        assert!(app.catalogue_last_result.is_none());
+        assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+        assert_eq!(
+            app.selected_archive,
+            Some(PathBuf::from("/roms/Alien 3.md"))
         );
     }
 
@@ -22709,6 +23313,11 @@ mod tests {
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
+            catalogue_manager: CatalogueManagerState::NotLoaded,
+            catalogue_review: None,
+            catalogue_retrieval: None,
+            catalogue_generation: 0,
+            catalogue_last_result: None,
             sources_add_dialog: None,
             sources_remove_dialog: None,
             // Deliberately `Vec::new()`, never `load_library_view_configs_default()`,
