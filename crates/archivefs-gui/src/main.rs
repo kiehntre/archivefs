@@ -26,12 +26,19 @@ use archivefs_core::patch_manager::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewIdentity,
     PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem,
     PreviewState, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, SharedAdapterWriteSupport, SharedPreviewError,
-    SharedPreviewReport, SharedPreviewRequest, UNKNOWN_CODE_POLICY, adapter_write_support,
-    build_shared_preview, default_cheat_source_cache_root, discover_dolphin_profiles,
-    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source,
+    RetroArchCheatSetupDiscovery, RetroArchMaterializationError, RetroArchMaterializationRequest,
+    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
+    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    UNKNOWN_CODE_POLICY, adapter_write_support, build_shared_preview,
+    build_shared_transaction_plan, default_cheat_source_cache_root, default_shared_backup_root,
+    default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
+    discover_retroarch_cheat_setup_profiles, discover_shared_apply_history, execute_shared_apply,
+    execute_shared_rollback, fetch_retroarch_cheat_source, generate_shared_operation_id,
     inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library,
     list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
+    materialize_retroarch_shared_preview, preview_shared_rollback,
 };
 mod ui;
 
@@ -2562,6 +2569,9 @@ struct ArchiveFsApp {
     active_mounts_confirm_unmount: Option<PathBuf>,
     /// The History & Logs page's filter/sort state.
     history_filters: HistoryLogFilters,
+    shared_history: SharedHistoryState,
+    shared_history_operation: Option<String>,
+    shared_rollback: SharedRollbackState,
     /// The Settings page's RetroArch profile discovery state. Never
     /// scanned automatically - filesystem probing only happens on an
     /// explicit "Scan/Rescan Profiles" click.
@@ -2778,6 +2788,9 @@ impl ArchiveFsApp {
             confirm_mount_queue: false,
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
+            shared_history: SharedHistoryState::NotLoaded,
+            shared_history_operation: None,
+            shared_rollback: SharedRollbackState::Idle,
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
@@ -4375,13 +4388,17 @@ impl ArchiveFsApp {
                 .map(|record| {
                     (
                         record.identity.display_name.clone(),
+                        record.identity.normalized_name.clone(),
                         record.identity.platform.clone(),
+                        record.identity.region.clone(),
                         record.identity.source_root.clone(),
                         record.identity.size_bytes,
                     )
                 })
         });
-        let Some((display_name, platform, source_root, size_bytes)) = record_details else {
+        let Some((display_name, normalized_name, platform, region, source_root, size_bytes)) =
+            record_details
+        else {
             self.cheat_workflow = None;
             return false;
         };
@@ -4446,7 +4463,9 @@ impl ArchiveFsApp {
         self.cheat_workflow = Some(CheatWorkflowState {
             archive_path,
             display_name,
+            normalized_name,
             platform,
+            region,
             source_root,
             size_bytes,
             adapter,
@@ -4454,6 +4473,7 @@ impl ArchiveFsApp {
             identity: CheatStepResource::NotLoaded,
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
+            transaction: CheatTransactionState::Idle,
             selected_profile_id,
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,
@@ -4531,7 +4551,7 @@ impl ArchiveFsApp {
     }
 
     fn start_cheat_preview(&mut self, context: egui::Context) {
-        let Some((key, request)) = self.cheat_workflow.as_ref().and_then(|workflow| {
+        let Some((key, work)) = self.cheat_workflow.as_ref().and_then(|workflow| {
             build_cheat_preview_request(
                 workflow,
                 &self.retroarch_profiles,
@@ -4562,14 +4582,356 @@ impl ArchiveFsApp {
             "Read-only Cheats & Mods preview started.",
         ));
         thread::spawn(move || {
-            let outcome = match build_shared_preview(&request) {
-                Ok(report) => CheatPreviewOutcome::Ready(report),
-                Err(error) => CheatPreviewOutcome::Failed(error),
+            let (outcome, materialized) = match work {
+                CheatPreviewWork::Shared(request) => (
+                    match build_shared_preview(&request) {
+                        Ok(report) => CheatPreviewOutcome::Ready(report),
+                        Err(error) => {
+                            CheatPreviewOutcome::Failed(CheatPreviewFailure::Shared(error))
+                        }
+                    },
+                    None,
+                ),
+                CheatPreviewWork::RetroArch(request) => {
+                    match materialize_retroarch_shared_preview(&request) {
+                        Ok(materialized) => (
+                            CheatPreviewOutcome::Ready(materialized.preview.clone()),
+                            Some(materialized),
+                        ),
+                        Err(error) => (
+                            CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(
+                                error,
+                            )),
+                            None,
+                        ),
+                    }
+                }
             };
             let _ = sender.send(Ok(CheatPreviewResponse {
                 key: worker_key,
                 outcome,
+                materialized,
             }));
+            context.request_repaint();
+        });
+    }
+
+    fn review_cheat_apply(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::RetroArch {
+            return;
+        }
+        let CheatStepResource::Ready(response) = &workflow.preview else {
+            return;
+        };
+        let (CheatPreviewOutcome::Ready(report), Some(materialized)) =
+            (&response.outcome, response.materialized.as_ref())
+        else {
+            return;
+        };
+        let Some(profile_id) = workflow.selected_profile_id.as_deref() else {
+            return;
+        };
+        match build_shared_transaction_plan(
+            report,
+            profile_id,
+            workflow.source_mode.label(),
+            &materialized.snapshot_root,
+        ) {
+            Ok(plan) => {
+                workflow.transaction = CheatTransactionState::Review {
+                    key: response.key.clone(),
+                    plan,
+                    replacement_approved: false,
+                };
+            }
+            Err(error) => self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                format!("Shared apply review blocked: {}", error.detail),
+            )),
+        }
+    }
+
+    fn refresh_shared_history(&mut self, context: egui::Context) {
+        let history_root = match default_shared_history_root() {
+            Ok(path) => path,
+            Err(error) => {
+                self.shared_history = SharedHistoryState::Failed(error.detail);
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.shared_history = SharedHistoryState::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            "Refreshing bounded shared transaction history.",
+        ));
+        thread::spawn(move || {
+            let report = discover_shared_apply_history(&history_root);
+            let _ = sender.send(Ok(report));
+            context.request_repaint();
+        });
+    }
+
+    fn poll_shared_history(&mut self) {
+        let SharedHistoryState::Loading { receiver } = &self.shared_history else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "Shared transaction history refreshed: {} journal(s), {} warning(s).",
+                        report.journals.len(),
+                        report.warnings.len()
+                    ),
+                ));
+                self.shared_history = SharedHistoryState::Ready(report);
+            }
+            Ok(Err(message)) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("Shared transaction history refresh failed: {message}"),
+                ));
+                self.shared_history = SharedHistoryState::Failed(message);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.shared_history = SharedHistoryState::Failed(
+                    "Transaction history worker stopped unexpectedly.".to_string(),
+                );
+            }
+        }
+    }
+
+    fn start_shared_rollback_preview(
+        &mut self,
+        context: egui::Context,
+        journal_path: PathBuf,
+        destination_root: PathBuf,
+    ) {
+        let Ok(history_root) = default_shared_history_root() else {
+            self.shared_rollback =
+                SharedRollbackState::Failed("Managed history root is unavailable.".to_string());
+            return;
+        };
+        let Ok(backup_root) = default_shared_backup_root() else {
+            self.shared_rollback =
+                SharedRollbackState::Failed("Managed backup root is unavailable.".to_string());
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.shared_rollback = SharedRollbackState::Previewing { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            "Rollback preview started; no files are being changed.",
+        ));
+        thread::spawn(move || {
+            let preview = preview_shared_rollback(&journal_path, &destination_root, &backup_root);
+            let _ = sender.send(Ok((preview, history_root, backup_root)));
+            context.request_repaint();
+        });
+    }
+
+    fn start_shared_rollback(&mut self, context: egui::Context) {
+        let state = std::mem::replace(&mut self.shared_rollback, SharedRollbackState::Idle);
+        let SharedRollbackState::Review {
+            preview,
+            history_root,
+            backup_root,
+        } = state
+        else {
+            self.shared_rollback = state;
+            return;
+        };
+        if !preview.available {
+            self.shared_rollback = SharedRollbackState::Review {
+                preview,
+                history_root,
+                backup_root,
+            };
+            return;
+        }
+        let options = SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: generate_shared_operation_id(),
+            timestamp_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+            history_root,
+            backup_root,
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.shared_rollback = SharedRollbackState::Applying { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            format!(
+                "Rollback '{}' started after exact preview confirmation.",
+                options.rollback_operation_id
+            ),
+        ));
+        thread::spawn(move || {
+            let result = execute_shared_rollback(&preview, &options);
+            let _ = sender.send(Ok(result));
+            context.request_repaint();
+        });
+    }
+
+    fn poll_shared_rollback(&mut self) {
+        match &self.shared_rollback {
+            SharedRollbackState::Previewing { receiver } => match receiver.try_recv() {
+                Ok(Ok((preview, history_root, backup_root))) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        None,
+                        if preview.available {
+                            ActivityOutcome::Completed
+                        } else {
+                            ActivityOutcome::Rejected
+                        },
+                        if preview.available {
+                            "Rollback preview completed and is available."
+                        } else {
+                            "Rollback preview completed and is blocked."
+                        },
+                    ));
+                    self.shared_rollback = SharedRollbackState::Review {
+                        preview,
+                        history_root,
+                        backup_root,
+                    };
+                }
+                Ok(Err(message)) => self.shared_rollback = SharedRollbackState::Failed(message),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.shared_rollback = SharedRollbackState::Failed(
+                        "Rollback preview worker stopped unexpectedly.".to_string(),
+                    );
+                }
+            },
+            SharedRollbackState::Applying { receiver } => match receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        None,
+                        if result.status == SharedApplyStatus::Success {
+                            ActivityOutcome::Completed
+                        } else {
+                            ActivityOutcome::Failed
+                        },
+                        format!("Rollback finished with {:?}.", result.status),
+                    ));
+                    self.shared_rollback = SharedRollbackState::Result(result);
+                    self.shared_history = SharedHistoryState::NotLoaded;
+                }
+                Ok(Err(message)) => self.shared_rollback = SharedRollbackState::Failed(message),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.shared_rollback = SharedRollbackState::Failed(
+                        "Rollback worker stopped unexpectedly.".to_string(),
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn start_cheat_apply(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let state = std::mem::replace(&mut workflow.transaction, CheatTransactionState::Idle);
+        let CheatTransactionState::Review {
+            key,
+            plan,
+            replacement_approved,
+        } = state
+        else {
+            workflow.transaction = state;
+            return;
+        };
+        if key != cheat_preview_key(workflow)
+            || plan.context.selected_archive.to_path_buf().ok().as_ref()
+                != Some(&workflow.archive_path)
+        {
+            return;
+        }
+        let history_root = match default_shared_history_root() {
+            Ok(path) => path,
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(workflow.archive_path.clone()),
+                    ActivityOutcome::Failed,
+                    format!("Apply root unavailable: {}", error.detail),
+                ));
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(path) => path,
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(workflow.archive_path.clone()),
+                    ActivityOutcome::Failed,
+                    format!("Backup root unavailable: {}", error.detail),
+                ));
+                return;
+            }
+        };
+        let operation_id = generate_shared_operation_id();
+        let timestamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let options = SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved,
+            }),
+            operation_id: operation_id.clone(),
+            timestamp_unix_seconds: timestamp,
+            current_context: plan.context.clone(),
+            history_root,
+            backup_root,
+        };
+        let archive = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        workflow.transaction = CheatTransactionState::Applying {
+            key: key.clone(),
+            receiver,
+        };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            Some(archive),
+            ActivityOutcome::Started,
+            format!("Shared apply '{operation_id}' started."),
+        ));
+        thread::spawn(move || {
+            let result = execute_shared_apply(&plan, &options);
+            let _ = sender.send(Ok(result));
             context.request_repaint();
         });
     }
@@ -4902,6 +5264,51 @@ impl ArchiveFsApp {
                         ));
                         workflow.preview = CheatStepResource::Failed(message);
                     }
+                }
+            }
+        }
+        let current_transaction_key = cheat_preview_key(workflow);
+        let transaction_is_stale = match &workflow.transaction {
+            CheatTransactionState::Review { key, .. }
+            | CheatTransactionState::Applying { key, .. }
+            | CheatTransactionState::Result { key, .. } => key != &current_transaction_key,
+            CheatTransactionState::Idle => false,
+        };
+        if !identity_page_is_current || transaction_is_stale {
+            workflow.transaction = CheatTransactionState::Idle;
+        } else if let CheatTransactionState::Applying { key, receiver } = &workflow.transaction {
+            let key = key.clone();
+            match receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    let outcome = match result.journal.status {
+                        SharedApplyStatus::Success => ActivityOutcome::Completed,
+                        SharedApplyStatus::PartialFailure => ActivityOutcome::Failed,
+                        SharedApplyStatus::Failed => ActivityOutcome::Failed,
+                        SharedApplyStatus::DryRun => ActivityOutcome::Skipped,
+                    };
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        Some(workflow.archive_path.clone()),
+                        outcome,
+                        format!(
+                            "Shared apply '{}' finished with {:?}.",
+                            result.journal.operation_id, result.journal.status
+                        ),
+                    ));
+                    workflow.transaction = CheatTransactionState::Result { key, result };
+                }
+                Ok(Err(message)) => {
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("Shared apply worker failed: {message}"),
+                    ));
+                    workflow.transaction = CheatTransactionState::Idle;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.transaction = CheatTransactionState::Idle;
                 }
             }
         }
@@ -6047,6 +6454,21 @@ impl Drop for ArchiveFsApp {
 
 impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_shared_history();
+        if self.view != MainView::HistoryLogs
+            && matches!(
+                self.shared_rollback,
+                SharedRollbackState::Previewing { .. } | SharedRollbackState::Review { .. }
+            )
+        {
+            self.shared_rollback = SharedRollbackState::Idle;
+        }
+        self.poll_shared_rollback();
+        if self.view == MainView::HistoryLogs
+            && matches!(self.shared_history, SharedHistoryState::NotLoaded)
+        {
+            self.refresh_shared_history(context.clone());
+        }
         self.poll_load(context);
         self.poll_database_load(context);
         self.poll_diagnostics();
@@ -6618,6 +7040,30 @@ impl eframe::App for ArchiveFsApp {
                         Some(CheatWorkflowAction::UseCachedSnapshot) => {
                             self.start_cheat_source_fetch(context.clone(), true);
                         }
+                        Some(CheatWorkflowAction::ReviewApply) => {
+                            self.review_cheat_apply();
+                        }
+                        Some(CheatWorkflowAction::ConfirmApply) => {
+                            self.start_cheat_apply(context.clone());
+                        }
+                        Some(CheatWorkflowAction::CancelApply) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.transaction = CheatTransactionState::Idle;
+                            }
+                        }
+                        Some(CheatWorkflowAction::OpenApplyHistory) => {
+                            self.shared_history_operation = self
+                                .cheat_workflow
+                                .as_ref()
+                                .and_then(|workflow| match &workflow.transaction {
+                                    CheatTransactionState::Result { result, .. } => {
+                                        Some(result.journal.operation_id.clone())
+                                    }
+                                    _ => None,
+                                });
+                            self.shared_history = SharedHistoryState::NotLoaded;
+                            self.view = MainView::HistoryLogs;
+                        }
                         None => {}
                     }
                     let picker_action = self.cheat_archive_picker.as_mut().and_then(|picker| {
@@ -6833,12 +7279,35 @@ impl eframe::App for ArchiveFsApp {
                 }
 
                 if self.view == MainView::HistoryLogs {
-                    show_history_logs_page(
+                    let history_action = show_history_logs_page(
                         ui,
+                        &self.shared_history,
+                        &mut self.shared_rollback,
+                        self.shared_history_operation.as_deref(),
                         &mut self.history,
                         &mut self.history_filters,
                         &mut self.clipboard,
                     );
+                    match history_action {
+                        Some(HistoryPageAction::PreviewRollback {
+                            journal_path,
+                            destination_root,
+                        }) => self.start_shared_rollback_preview(
+                            context.clone(),
+                            journal_path,
+                            destination_root,
+                        ),
+                        Some(HistoryPageAction::ConfirmRollback) => {
+                            self.start_shared_rollback(context.clone());
+                        }
+                        Some(HistoryPageAction::CancelRollback) => {
+                            self.shared_rollback = SharedRollbackState::Idle;
+                        }
+                        Some(HistoryPageAction::Refresh) => {
+                            self.shared_history = SharedHistoryState::NotLoaded;
+                        }
+                        None => {}
+                    }
                     return;
                 }
 
@@ -10831,23 +11300,260 @@ fn show_active_mounts_page(
 }
 fn show_history_logs_page(
     ui: &mut egui::Ui,
+    shared_history: &SharedHistoryState,
+    rollback: &mut SharedRollbackState,
+    selected_operation: Option<&str>,
     history: &mut OperationHistory,
     filters: &mut HistoryLogFilters,
     clipboard: &mut dyn ClipboardBackend,
-) {
+) -> Option<HistoryPageAction> {
+    let mut action = None;
     widgets::page_header(
         ui,
         "History & Logs",
         "Filter, inspect, copy, or export operations from this application session.",
     );
+    widgets::card(ui, |ui| match rollback {
+        SharedRollbackState::Idle => {
+            ui.label("Rollback always begins with a fresh read-only preview and a separate confirmation.");
+        }
+        SharedRollbackState::Previewing { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting rollback state off the UI thread…");
+            });
+        }
+        SharedRollbackState::Review { preview, .. } => {
+            widgets::status_badge(
+                ui,
+                if preview.available {
+                    "Rollback available"
+                } else {
+                    "Rollback blocked"
+                },
+                if preview.available {
+                    widgets::StatusTone::Warning
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+            widgets::copyable_value(ui, "Rollback preview ID", &preview.preview_id);
+            for entry in &preview.entries {
+                ui.label(format!("Current state: {:?}", entry.outcome));
+                if let Some(destination) = &entry.destination {
+                    ui.label(format!("Destination: {}", destination.display));
+                }
+                if let Some(backup) = &entry.backup {
+                    ui.label(format!("Backup: {}", backup.display));
+                }
+                if let Some(failure) = &entry.failure {
+                    ui.label(format!("Blocker: {:?} · {}", failure.kind, failure.detail));
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Confirm exact rollback",
+                    widgets::ActionStyle::Primary,
+                    preview.available,
+                )
+                .clicked()
+                {
+                    action = Some(HistoryPageAction::ConfirmRollback);
+                }
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
+                    action = Some(HistoryPageAction::CancelRollback);
+                }
+            });
+        }
+        SharedRollbackState::Applying { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Restoring journal-owned content and verifying the result…");
+            });
+        }
+        SharedRollbackState::Result(result) => {
+            widgets::status_badge(
+                ui,
+                format!("Rollback {:?}", result.status),
+                if result.status == SharedApplyStatus::Success {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            for entry in &result.preview.entries {
+                ui.label(format!("Rollback result: {:?}", entry.outcome));
+            }
+            if widgets::action_button(ui, "Close result", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                action = Some(HistoryPageAction::CancelRollback);
+            }
+        }
+        SharedRollbackState::Failed(message) => {
+            widgets::banner(ui, "Rollback failed", message, widgets::StatusTone::Blocked);
+            if widgets::action_button(ui, "Close", widgets::ActionStyle::Quiet, true).clicked() {
+                action = Some(HistoryPageAction::CancelRollback);
+            }
+        }
+    });
+    widgets::section_header(
+        ui,
+        "Verified transaction journals",
+        Some("Bounded, read-only projection of shared apply and rollback evidence."),
+    );
+    if widgets::action_button(
+        ui,
+        "Refresh transaction history",
+        widgets::ActionStyle::Secondary,
+        !matches!(shared_history, SharedHistoryState::Loading { .. }),
+    )
+    .clicked()
+    {
+        action = Some(HistoryPageAction::Refresh);
+    }
+    match shared_history {
+        SharedHistoryState::NotLoaded | SharedHistoryState::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading transaction journals off the UI thread…");
+            });
+        }
+        SharedHistoryState::Failed(message) => widgets::banner(
+            ui,
+            "Transaction history unavailable",
+            message,
+            widgets::StatusTone::Warning,
+        ),
+        SharedHistoryState::Ready(report) => {
+            if !report.warnings.is_empty() {
+                widgets::banner(
+                    ui,
+                    "Some journals could not be read",
+                    &format!(
+                        "{} malformed or unsupported journal warning(s) were retained; valid operations remain visible.",
+                        report.warnings.len()
+                    ),
+                    widgets::StatusTone::Warning,
+                );
+            }
+            if report.journals.is_empty() {
+                ui.label("No shared transaction journals found.");
+            } else {
+                let mut journals: Vec<_> = report.journals.iter().collect();
+                journals.sort_by(|left, right| {
+                    right
+                        .1
+                        .timestamp_unix_seconds
+                        .cmp(&left.1.timestamp_unix_seconds)
+                        .then_with(|| right.1.operation_id.cmp(&left.1.operation_id))
+                });
+                for (path, journal) in journals.into_iter().take(200) {
+                    widgets::card(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            widgets::status_badge(
+                                ui,
+                                format!("{:?}", journal.status),
+                                match journal.status {
+                                    SharedApplyStatus::Success => widgets::StatusTone::Success,
+                                    SharedApplyStatus::PartialFailure => {
+                                        widgets::StatusTone::Warning
+                                    }
+                                    SharedApplyStatus::Failed => widgets::StatusTone::Blocked,
+                                    SharedApplyStatus::DryRun => widgets::StatusTone::Info,
+                                },
+                            );
+                            ui.strong(&journal.operation_id);
+                            if selected_operation == Some(journal.operation_id.as_str()) {
+                                widgets::status_badge(
+                                    ui,
+                                    "Opened from apply result",
+                                    widgets::StatusTone::Info,
+                                );
+                            }
+                            ui.label(format!("{:?}", journal.context.adapter));
+                        });
+                        ui.label(format!("Timestamp: {}", journal.timestamp_unix_seconds));
+                        ui.label(format!(
+                            "Selected archive: {}",
+                            journal.context.selected_archive.display
+                        ));
+                        ui.label(format!("Source mode: {}", journal.context.source_mode));
+                        ui.label(format!(
+                            "Destination root: {}",
+                            journal.destination_root.display
+                        ));
+                        ui.label(format!("Entries: {}", journal.entries.len()));
+                        ui.label(format!(
+                            "Rollback: {}",
+                            if journal.rollback_operation_id.is_some() {
+                                "already completed"
+                            } else if journal.status == SharedApplyStatus::Success {
+                                "preview may be available"
+                            } else {
+                                "unavailable"
+                            }
+                        ));
+                        if widgets::path_value(ui, "Journal", &PathBuf::from(&path.display)) {
+                            let _ = clipboard.set_text(path.display.clone());
+                        }
+                        egui::CollapsingHeader::new("Technical detail").show(ui, |ui| {
+                            widgets::copyable_value(ui, "Plan ID", &journal.plan_id);
+                            for entry in &journal.entries {
+                                ui.label(format!(
+                                    "{:?} · {} · verification {} · backup {}",
+                                    entry.outcome,
+                                    entry.plan_entry.destination_relative_path.display,
+                                    if entry.verification_succeeded {
+                                        "passed"
+                                    } else {
+                                        "not complete"
+                                    },
+                                    if entry.backup_path.is_some() {
+                                        "retained"
+                                    } else {
+                                        "not required"
+                                    }
+                                ));
+                            }
+                        });
+                        let journal_path = path.to_path_buf().ok();
+                        let destination_root = journal.destination_root.to_path_buf().ok();
+                        let can_preview = journal.status == SharedApplyStatus::Success
+                            && journal.rollback_operation_id.is_none()
+                            && journal_path.is_some()
+                            && destination_root.is_some()
+                            && matches!(rollback, SharedRollbackState::Idle);
+                        if widgets::action_button(
+                            ui,
+                            "Preview rollback",
+                            widgets::ActionStyle::Secondary,
+                            can_preview,
+                        )
+                        .clicked()
+                        {
+                            action = Some(HistoryPageAction::PreviewRollback {
+                                journal_path: journal_path.expect("enabled path"),
+                                destination_root: destination_root.expect("enabled root"),
+                            });
+                        }
+                    });
+                }
+            }
+        }
+    }
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "Session activity", None);
     if history.entries().next().is_none() {
         widgets::empty_state(
             ui,
-            "No activity yet",
+            "No session activity yet",
             "Mounts, scans, diagnostics, and trusted-source retrievals will be recorded here for this session.",
             None,
         );
-        return;
+        return action;
     }
 
     widgets::card(ui, |ui| {
@@ -10992,7 +11698,7 @@ fn show_history_logs_page(
             "Change or clear the filters to see session events.",
             None,
         );
-        return;
+        return action;
     }
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -11032,13 +11738,16 @@ fn show_history_logs_page(
                 ui.add_space(6.0);
             }
         });
+    action
 }
 struct CheatWorkflowState {
     /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
     /// .path` identity the rest of the app uses, never a filename.
     archive_path: PathBuf,
     display_name: String,
+    normalized_name: String,
     platform: Option<String>,
+    region: Option<String>,
     source_root: PathBuf,
     size_bytes: Option<u64>,
     /// The emulator adapter is explicit and independent from archive
@@ -11048,6 +11757,7 @@ struct CheatWorkflowState {
     identity: CheatStepResource<(GameIdentityRequest, GameIdentityReport)>,
     preview_request: Option<CheatPreviewRequestKey>,
     preview: CheatStepResource<CheatPreviewResponse>,
+    transaction: CheatTransactionState,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never
@@ -11100,18 +11810,57 @@ struct CheatPreviewRequestKey {
     profile_id: Option<String>,
     source_mode: CheatSourceMode,
     source_id: Option<String>,
+    snapshot_id: Option<String>,
 }
 
 #[derive(Debug)]
 enum CheatPreviewOutcome {
     Ready(SharedPreviewReport),
-    Failed(SharedPreviewError),
+    Failed(CheatPreviewFailure),
+}
+
+#[derive(Debug)]
+enum CheatPreviewFailure {
+    Shared(SharedPreviewError),
+    Materialization(RetroArchMaterializationError),
+}
+
+impl std::fmt::Display for CheatPreviewFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shared(error) => error.fmt(formatter),
+            Self::Materialization(error) => error.fmt(formatter),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CheatPreviewResponse {
     key: CheatPreviewRequestKey,
     outcome: CheatPreviewOutcome,
+    materialized: Option<RetroArchMaterializedPreview>,
+}
+
+enum CheatPreviewWork {
+    Shared(SharedPreviewRequest),
+    RetroArch(RetroArchMaterializationRequest),
+}
+
+enum CheatTransactionState {
+    Idle,
+    Review {
+        key: CheatPreviewRequestKey,
+        plan: SharedTransactionPlan,
+        replacement_approved: bool,
+    },
+    Applying {
+        key: CheatPreviewRequestKey,
+        receiver: Receiver<Result<SharedApplyResult, String>>,
+    },
+    Result {
+        key: CheatPreviewRequestKey,
+        result: SharedApplyResult,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11456,6 +12205,42 @@ enum CheatStepResource<T> {
     Failed(String),
 }
 
+enum SharedHistoryState {
+    NotLoaded,
+    Loading {
+        receiver: Receiver<Result<SharedHistoryReport, String>>,
+    },
+    Ready(SharedHistoryReport),
+    Failed(String),
+}
+
+enum SharedRollbackState {
+    Idle,
+    Previewing {
+        receiver: Receiver<Result<(SharedRollbackPreview, PathBuf, PathBuf), String>>,
+    },
+    Review {
+        preview: SharedRollbackPreview,
+        history_root: PathBuf,
+        backup_root: PathBuf,
+    },
+    Applying {
+        receiver: Receiver<Result<SharedRollbackResult, String>>,
+    },
+    Result(SharedRollbackResult),
+    Failed(String),
+}
+
+enum HistoryPageAction {
+    PreviewRollback {
+        journal_path: PathBuf,
+        destination_root: PathBuf,
+    },
+    ConfirmRollback,
+    CancelRollback,
+    Refresh,
+}
+
 /// Display label for a cached trusted-source snapshot's freshness.
 fn cheat_freshness_label(freshness: CheatSourceFreshness) -> &'static str {
     match freshness {
@@ -11520,6 +12305,10 @@ enum CheatWorkflowAction {
     RefreshSources,
     FetchSource,
     UseCachedSnapshot,
+    ReviewApply,
+    ConfirmApply,
+    CancelApply,
+    OpenApplyHistory,
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -13072,6 +13861,10 @@ fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
         profile_id,
         source_mode: workflow.source_mode,
         source_id: workflow.selected_source_id.clone(),
+        snapshot_id: match &workflow.source_fetch {
+            CheatStepResource::Ready(result) => Some(result.manifest.archive_sha256.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -13099,7 +13892,7 @@ fn build_cheat_preview_request(
     retroarch_profiles: &RetroArchProfilesState,
     pcsx2_profiles: &Pcsx2ProfilesState,
     dolphin_profiles: &DolphinProfilesState,
-) -> Option<(CheatPreviewRequestKey, SharedPreviewRequest)> {
+) -> Option<(CheatPreviewRequestKey, CheatPreviewWork)> {
     let key = cheat_preview_key(workflow);
     let identity = ready_game_identity(workflow);
     match workflow.adapter {
@@ -13143,7 +13936,7 @@ fn build_cheat_preview_request(
                 .collect();
             Some((
                 key,
-                SharedPreviewRequest {
+                CheatPreviewWork::Shared(SharedPreviewRequest {
                     adapter: PreviewAdapter::Pcsx2,
                     selected_archive: workflow.archive_path.clone(),
                     platform: workflow.platform.clone(),
@@ -13155,7 +13948,7 @@ fn build_cheat_preview_request(
                     ),
                     destination_root: profile.configuration_path.clone(),
                     source_items,
-                },
+                }),
             ))
         }
         CheatEmulatorAdapter::Dolphin => {
@@ -13197,7 +13990,7 @@ fn build_cheat_preview_request(
                 .collect();
             Some((
                 key,
-                SharedPreviewRequest {
+                CheatPreviewWork::Shared(SharedPreviewRequest {
                     adapter: PreviewAdapter::Dolphin,
                     selected_archive: workflow.archive_path.clone(),
                     platform: workflow.platform.clone(),
@@ -13209,10 +14002,13 @@ fn build_cheat_preview_request(
                     ),
                     destination_root: profile.configuration_path.clone(),
                     source_items,
-                },
+                }),
             ))
         }
         CheatEmulatorAdapter::RetroArch => {
+            if workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue {
+                return None;
+            }
             let selected = workflow.selected_profile_id.as_deref()?;
             let RetroArchProfilesState::Ready(discovery) = retroarch_profiles else {
                 return None;
@@ -13223,25 +14019,26 @@ fn build_cheat_preview_request(
                 .find(|profile| profile.eligible && profile.profile_id == selected)?;
             let root = profile.cheat_destination_root.as_ref()?;
             let destination_root = (!root.lossy).then(|| PathBuf::from(&root.display))?;
+            let CheatStepResource::Ready(fetch) = &workflow.source_fetch else {
+                return None;
+            };
+            if fetch.local_catalogue_path.lossy || fetch.immutable_snapshot_path.lossy {
+                return None;
+            }
+            let platform = workflow.platform.clone()?;
             Some((
                 key,
-                SharedPreviewRequest {
-                    adapter: PreviewAdapter::RetroArch,
+                CheatPreviewWork::RetroArch(RetroArchMaterializationRequest {
+                    snapshot_root: PathBuf::from(&fetch.immutable_snapshot_path.display),
+                    expected_snapshot_id: fetch.manifest.archive_sha256.clone(),
+                    source_id: fetch.source.source_id.clone(),
                     selected_archive: workflow.archive_path.clone(),
-                    platform: workflow.platform.clone(),
-                    identity: PreviewIdentity {
-                        kind: PreviewIdentityKind::RetroArchCatalogueMatch,
-                        state: PreviewIdentityState::Missing,
-                        value: None,
-                        archive_path: workflow.archive_path.clone(),
-                        revision: None,
-                    },
+                    archive_display_name: workflow.display_name.clone(),
+                    archive_normalized_name: workflow.normalized_name.clone(),
+                    platform,
+                    region: workflow.region.clone(),
                     destination_root,
-                    // The GUI does not yet materialize the existing catalogue's
-                    // per-game staging records. The shared report must say so
-                    // instead of inventing an installable source item.
-                    source_items: Vec::new(),
-                },
+                }),
             ))
         }
     }
@@ -13439,9 +14236,10 @@ fn destination_state_label(state: PreviewDestinationState) -> &'static str {
 
 fn show_shared_cheat_preview(
     ui: &mut egui::Ui,
-    workflow: &CheatWorkflowState,
+    workflow: &mut CheatWorkflowState,
     clipboard: &mut dyn ClipboardBackend,
-) {
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
     widgets::section_header(
         ui,
         "Shared preview",
@@ -13480,6 +14278,33 @@ fn show_shared_cheat_preview(
                 widgets::StatusTone::Blocked,
             ),
             CheatPreviewOutcome::Ready(report) => {
+                if let Some(materialized) = &response.materialized {
+                    widgets::card(ui, |ui| {
+                        widgets::status_badge(
+                            ui,
+                            "Trusted source materialized",
+                            widgets::StatusTone::Success,
+                        );
+                        widgets::copyable_value(ui, "Snapshot ID", &materialized.snapshot_id);
+                        if widgets::path_value(
+                            ui,
+                            "Immutable snapshot",
+                            &materialized.snapshot_root,
+                        ) {
+                            let _ = clipboard
+                                .set_text(materialized.snapshot_root.display().to_string());
+                        }
+                        ui.label(format!(
+                            "{} exact local source item{}",
+                            materialized.sources.len(),
+                            if materialized.sources.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ));
+                    });
+                }
                 widgets::card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         widgets::status_badge(
@@ -13610,13 +14435,27 @@ fn show_shared_cheat_preview(
                         }
                     });
                 }
-                show_shared_transaction_readiness(ui, report);
+                action = show_shared_transaction_readiness(
+                    ui,
+                    report,
+                    response.materialized.is_some(),
+                    &mut workflow.transaction,
+                    clipboard,
+                );
             }
         },
     }
+    action
 }
 
-fn show_shared_transaction_readiness(ui: &mut egui::Ui, report: &SharedPreviewReport) {
+fn show_shared_transaction_readiness(
+    ui: &mut egui::Ui,
+    report: &SharedPreviewReport,
+    source_materialized: bool,
+    transaction: &mut CheatTransactionState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
@@ -13675,7 +14514,128 @@ fn show_shared_transaction_readiness(ui: &mut egui::Ui, report: &SharedPreviewRe
                 widgets::StatusTone::Pending,
             );
         }
+        match transaction {
+            CheatTransactionState::Idle if actionable > 0 && source_materialized => {
+                if widgets::action_button(
+                    ui,
+                    "Review exact apply plan",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::ReviewApply);
+                }
+            }
+            CheatTransactionState::Review {
+                plan,
+                replacement_approved,
+                ..
+            } => {
+                widgets::status_badge(ui, "Review required", widgets::StatusTone::Warning);
+                widgets::copyable_value(ui, "Plan ID", &plan.plan_id);
+                let replacement_required = plan.entries.iter().any(|entry| {
+                    entry.proposed_action
+                        == archivefs_core::patch_manager::PreviewProposedAction::Replace
+                });
+                for entry in &plan.entries {
+                    ui.separator();
+                    ui.label(format!("Action: {:?}", entry.proposed_action));
+                    ui.label(format!("Source: {}", entry.source_path.display));
+                    ui.label(format!(
+                        "Destination: {}/{}",
+                        entry.destination_root.display, entry.destination_relative_path.display
+                    ));
+                    widgets::copyable_value(ui, "Approved source SHA-256", &entry.source_digest);
+                }
+                if replacement_required {
+                    ui.checkbox(
+                        replacement_approved,
+                        "I separately approve replacement of the exact different file shown above",
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Confirm and apply exact plan",
+                        widgets::ActionStyle::Primary,
+                        !replacement_required || *replacement_approved,
+                    )
+                    .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::ConfirmApply);
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::CancelApply);
+                    }
+                });
+            }
+            CheatTransactionState::Applying { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Applying and verifying the exact approved plan off the UI thread…");
+                });
+            }
+            CheatTransactionState::Result { result, .. } => {
+                let (label, tone) = match result.journal.status {
+                    SharedApplyStatus::Success => ("Apply succeeded", widgets::StatusTone::Success),
+                    SharedApplyStatus::PartialFailure => {
+                        ("Apply partially succeeded", widgets::StatusTone::Warning)
+                    }
+                    SharedApplyStatus::Failed => ("Apply failed", widgets::StatusTone::Blocked),
+                    SharedApplyStatus::DryRun => ("Dry run", widgets::StatusTone::Info),
+                };
+                widgets::status_badge(ui, label, tone);
+                widgets::copyable_value(ui, "Operation ID", &result.journal.operation_id);
+                for entry in &result.journal.entries {
+                    ui.label(format!(
+                        "{:?} · verification {} · backup {}",
+                        entry.outcome,
+                        if entry.verification_succeeded {
+                            "passed"
+                        } else {
+                            "not complete"
+                        },
+                        if entry.backup_path.is_some() {
+                            "retained"
+                        } else {
+                            "not required"
+                        }
+                    ));
+                    for failure in &entry.failures {
+                        ui.label(format!("Failure: {:?} · {}", failure.kind, failure.detail));
+                    }
+                }
+                if let Some(failure) = &result.journal_failure {
+                    widgets::banner(
+                        ui,
+                        "Journal failed after transaction work",
+                        &failure.detail,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                if let Some(path) = &result.journal_path
+                    && widgets::path_value(ui, "Journal", path)
+                {
+                    let _ = clipboard.set_text(path.display().to_string());
+                }
+                if widgets::action_button(
+                    ui,
+                    "Open exact operation in History & Logs",
+                    widgets::ActionStyle::Secondary,
+                    result.journal_path.is_some(),
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::OpenApplyHistory);
+                }
+            }
+            CheatTransactionState::Idle => {}
+        }
     });
+    action
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13773,7 +14733,7 @@ fn show_cheats_mods_page(
         ui.add_space(theme::SECTION_GAP);
         show_shared_game_identity(ui, workflow, clipboard);
         ui.add_space(theme::SECTION_GAP);
-        show_shared_cheat_preview(ui, workflow, clipboard);
+        action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
         ui.add_space(theme::SECTION_GAP);
         action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
@@ -19970,7 +20930,9 @@ mod tests {
         app.cheat_workflow = Some(CheatWorkflowState {
             archive_path: PathBuf::from("/roms/a.zip"),
             display_name: "a".to_string(),
+            normalized_name: "a".to_string(),
             platform: None,
+            region: None,
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             adapter: CheatEmulatorAdapter::RetroArch,
@@ -19978,6 +20940,7 @@ mod tests {
             identity: CheatStepResource::NotLoaded,
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
+            transaction: CheatTransactionState::Idle,
             selected_profile_id: Some("native-user".to_string()),
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
@@ -20269,9 +21232,12 @@ mod tests {
         sender
             .send(Ok(CheatPreviewResponse {
                 key: old_key,
-                outcome: CheatPreviewOutcome::Failed(SharedPreviewError::InvalidRequest(
-                    archivefs_core::patch_manager::PreviewBlockerKind::SourceMissing,
+                outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::Shared(
+                    SharedPreviewError::InvalidRequest(
+                        archivefs_core::patch_manager::PreviewBlockerKind::SourceMissing,
+                    ),
                 )),
+                materialized: None,
             }))
             .unwrap();
         app.poll_cheat_workflow();
@@ -20311,6 +21277,23 @@ mod tests {
                 .and_then(|workflow| workflow.platform.as_deref()),
             None
         );
+    }
+
+    #[test]
+    fn preview_and_confirmation_key_changes_with_catalogue_snapshot() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.source_fetch = CheatStepResource::Ready(cheat_fetch_result_for(
+            "source-a",
+            CheatSourceFetchStatus::OfflineReused,
+        ));
+        let first = cheat_preview_key(workflow);
+        let CheatStepResource::Ready(result) = &mut workflow.source_fetch else {
+            unreachable!();
+        };
+        result.manifest.archive_sha256 = "b".repeat(64);
+        let second = cheat_preview_key(workflow);
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -21185,7 +22168,9 @@ mod tests {
         let mut workflow = CheatWorkflowState {
             archive_path: PathBuf::from("/roms/a.zip"),
             display_name: "a".to_string(),
+            normalized_name: "a".to_string(),
             platform: None,
+            region: None,
             source_root: PathBuf::from("/roms"),
             size_bytes: None,
             adapter: CheatEmulatorAdapter::RetroArch,
@@ -21193,6 +22178,7 @@ mod tests {
             identity: CheatStepResource::NotLoaded,
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
+            transaction: CheatTransactionState::Idle,
             selected_profile_id: None,
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
@@ -21544,6 +22530,9 @@ mod tests {
             confirm_mount_queue: false,
             active_mounts_confirm_unmount: None,
             history_filters: HistoryLogFilters::default(),
+            shared_history: SharedHistoryState::NotLoaded,
+            shared_history_operation: None,
+            shared_rollback: SharedRollbackState::Idle,
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
