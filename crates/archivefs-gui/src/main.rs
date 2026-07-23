@@ -2407,6 +2407,13 @@ enum LibraryTab {
 /// The `MainView` destination that currently renders `tab`'s content -
 /// the inverse of `library_tab_for_main_view`. Used by
 /// `ArchiveFsApp::navigate_to_library_tab`.
+///
+/// `#[allow(dead_code)]`: not yet called from any production UI (only
+/// from `navigate_to_library_tab`, itself not yet called from production
+/// UI, and from this milestone's tests) - deliberate Phase 1 foundation
+/// scaffolding for Phase 2's tab control, not an oversight. See
+/// docs/GUI_SIMPLIFICATION.md's "Library IA migration" section.
+#[allow(dead_code)]
 fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
     match tab {
         LibraryTab::Archives => MainView::Library,
@@ -2434,6 +2441,10 @@ fn library_tab_for_main_view(view: MainView) -> Option<LibraryTab> {
 /// The label Phase 2's tab UI should show for `tab` - kept as one shared
 /// source of truth now so that UI, rather than being invented ad hoc
 /// later, only has to be wired up to it.
+///
+/// `#[allow(dead_code)]`: see `main_view_for_library_tab` - same
+/// deliberate not-yet-wired-into-production-UI status.
+#[allow(dead_code)]
 fn library_tab_label(tab: LibraryTab) -> &'static str {
     match tab {
         LibraryTab::Archives => "Archives",
@@ -3018,10 +3029,24 @@ impl ArchiveFsApp {
     /// sidebar-click handler in `update`). Not yet called from any
     /// production UI - it exists for Phase 2's tab control to call, and
     /// is exercised directly by this milestone's tests.
+    #[allow(dead_code)]
     fn navigate_to_library_tab(&mut self, tab: LibraryTab) {
         self.view = main_view_for_library_tab(tab);
         self.library_tab = tab;
         self.tools_overlay = ToolsOverlay::None;
+    }
+
+    /// LibraryTab's synchronization rule, applied once. Called at the top
+    /// of every frame in `update`, before anything else runs - see
+    /// LibraryTab's doc comment for the rule itself. Broken out as its own
+    /// method (rather than inlined in `update`) purely so it can be
+    /// exercised directly by tests without going through a full
+    /// `eframe::App::update` call, which nothing else in this codebase
+    /// does either.
+    fn reconcile_library_tab(&mut self) {
+        if let Some(tab) = library_tab_for_main_view(self.view) {
+            self.library_tab = tab;
+        }
     }
 
     fn refresh(&mut self, context: &egui::Context) {
@@ -6868,11 +6893,7 @@ impl Drop for ArchiveFsApp {
 
 impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        // LibraryTab synchronization rule - see LibraryTab's doc comment.
-        // `view` is untouched by this; `library_tab` only ever follows it.
-        if let Some(tab) = library_tab_for_main_view(self.view) {
-            self.library_tab = tab;
-        }
+        self.reconcile_library_tab();
         self.poll_shared_history();
         if self.view != MainView::HistoryLogs
             && matches!(
@@ -21838,6 +21859,195 @@ mod tests {
             assert_eq!(main_view_title(view), label);
             let _ = main_view_content_width(view);
         }
+    }
+
+    #[test]
+    fn library_tab_for_main_view_covers_exactly_the_four_library_destinations() {
+        let library_destinations = [
+            (MainView::Library, LibraryTab::Archives),
+            (MainView::Health, LibraryTab::Health),
+            (MainView::Duplicates, LibraryTab::Duplicates),
+            (MainView::LibraryViews, LibraryTab::Views),
+        ];
+        for (view, expected_tab) in library_destinations {
+            assert_eq!(
+                library_tab_for_main_view(view),
+                Some(expected_tab),
+                "{view:?} must route to {expected_tab:?}"
+            );
+        }
+
+        // Every other destination, including RecentlyFound (its own
+        // primary destination, not one of the four unified tabs), must
+        // map to None rather than silently picking a tab.
+        let non_library_destinations = [
+            MainView::RecentlyFound,
+            MainView::Sources,
+            MainView::Mount,
+            MainView::Selected,
+            MainView::CheatsMods,
+            MainView::ActiveMounts,
+            MainView::Doctor,
+            MainView::HistoryLogs,
+            MainView::Settings,
+            MainView::About,
+        ];
+        for view in non_library_destinations {
+            assert_eq!(
+                library_tab_for_main_view(view),
+                None,
+                "{view:?} must not be treated as a Library tab"
+            );
+        }
+    }
+
+    #[test]
+    fn main_view_for_library_tab_round_trips_with_library_tab_for_main_view() {
+        for tab in [
+            LibraryTab::Archives,
+            LibraryTab::Health,
+            LibraryTab::Duplicates,
+            LibraryTab::Views,
+        ] {
+            let view = main_view_for_library_tab(tab);
+            assert_eq!(
+                library_tab_for_main_view(view),
+                Some(tab),
+                "main_view_for_library_tab({tab:?}) -> {view:?} must route back to {tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn library_tab_label_is_distinct_and_non_empty_for_every_tab() {
+        let labels: Vec<&str> = [
+            LibraryTab::Archives,
+            LibraryTab::Health,
+            LibraryTab::Duplicates,
+            LibraryTab::Views,
+        ]
+        .into_iter()
+        .map(library_tab_label)
+        .collect();
+        assert_eq!(labels, vec!["Archives", "Health", "Duplicates", "Views"]);
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "every tab label must be distinct"
+        );
+    }
+
+    #[test]
+    fn legacy_routes_reconcile_to_the_correct_library_tab() {
+        let mut app = app_for_operation_tests();
+        assert_eq!(
+            app.library_tab,
+            LibraryTab::Archives,
+            "a fresh app starts on the Archives tab"
+        );
+
+        for (legacy_view, expected_tab) in [
+            (MainView::Health, LibraryTab::Health),
+            (MainView::Duplicates, LibraryTab::Duplicates),
+            (MainView::LibraryViews, LibraryTab::Views),
+            (MainView::Library, LibraryTab::Archives),
+        ] {
+            // Simulates any of the ~11 legacy `self.view = MainView::X`
+            // call sites - none of them touch library_tab directly.
+            app.view = legacy_view;
+            app.reconcile_library_tab();
+            assert_eq!(
+                app.library_tab, expected_tab,
+                "navigating to {legacy_view:?} via the legacy route must select {expected_tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn library_tab_survives_navigating_away_to_an_unrelated_destination() {
+        let mut app = app_for_operation_tests();
+        app.view = MainView::Health;
+        app.reconcile_library_tab();
+        assert_eq!(app.library_tab, LibraryTab::Health);
+
+        // Visiting several unrelated destinations must never reset the
+        // remembered Library tab.
+        for unrelated_view in [
+            MainView::Settings,
+            MainView::Mount,
+            MainView::CheatsMods,
+            MainView::About,
+        ] {
+            app.view = unrelated_view;
+            app.reconcile_library_tab();
+            assert_eq!(
+                app.library_tab,
+                LibraryTab::Health,
+                "visiting {unrelated_view:?} must not change the remembered Library tab"
+            );
+        }
+    }
+
+    #[test]
+    fn navigate_to_library_tab_sets_view_and_library_tab_together() {
+        let mut app = app_for_operation_tests();
+        app.tools_overlay = ToolsOverlay::PlatformAliases;
+
+        app.navigate_to_library_tab(LibraryTab::Duplicates);
+
+        assert_eq!(app.view, MainView::Duplicates);
+        assert_eq!(app.library_tab, LibraryTab::Duplicates);
+        assert_eq!(
+            app.tools_overlay,
+            ToolsOverlay::None,
+            "navigating by tab must clear any open Tools overlay, like every other navigation call site"
+        );
+    }
+
+    #[test]
+    fn selected_archive_and_filters_survive_a_library_tab_switch() {
+        let mut app = app_for_operation_tests();
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.filter = "mario".to_string();
+        app.library_filters.missing = true;
+        app.health_filters.category = HealthIssueFilter::UnknownPlatform;
+        app.duplicate_filters.platform = Some("SNES".to_string());
+
+        for tab in [
+            LibraryTab::Health,
+            LibraryTab::Duplicates,
+            LibraryTab::Views,
+            LibraryTab::Archives,
+        ] {
+            app.navigate_to_library_tab(tab);
+        }
+
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(Path::new("/roms/a.zip")),
+            "the selected archive must survive switching Library tabs"
+        );
+        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(
+            app.filter, "mario",
+            "the Library free-text filter must survive switching tabs"
+        );
+        assert!(
+            app.library_filters.missing,
+            "Library row filters must survive switching tabs"
+        );
+        assert_eq!(
+            app.health_filters.category,
+            HealthIssueFilter::UnknownPlatform,
+            "Health filter state must survive switching tabs"
+        );
+        assert_eq!(
+            app.duplicate_filters.platform.as_deref(),
+            Some("SNES"),
+            "Duplicate filter state must survive switching tabs"
+        );
     }
 
     /// A deterministic, in-memory stand-in for `NativeClipboard` - the

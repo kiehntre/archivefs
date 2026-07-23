@@ -690,3 +690,202 @@ of its previous open questions (what the tab control would look like).
 
 Cheats & Mods structure milestone total: 434 tests (429 from Phase 2 +
 5 new) pass; 0 failures.
+
+---
+
+## Library IA migration - Phase 1 (`sonnet-library-tabs-foundation` branch)
+
+The Library-tab IA migration that every previous section deferred,
+finally begun - but only its foundation. This phase adds new state and
+routing logic; it does **not** touch the sidebar, remove any `MainView`
+variant, merge any visible page, or rename any render function. Nothing
+a user does today looks any different.
+
+### Audit findings
+
+The four Library-related `MainView` variants (`Library`, `Health`,
+`Duplicates`, `LibraryViews`) are reached through:
+
+- **The sidebar**, generically: `show_primary_navigation` returns a
+  clicked `MainView`, and the single handler at the top of `update`
+  (`if let Some(clicked) = navigation_request { self.view = clicked; ... }`)
+  sets `self.view` directly - this one path covers all four.
+- **~11 scattered direct assignments** elsewhere in `update`, each
+  reached from a different action enum's dispatch: `SourcesPageAction::
+  ViewInLibrary`, `DuplicateReviewAction::Close`/`ViewInLibrary`,
+  `HealthDashboardAction::BackToLibrary`/`OpenMissingReview`/
+  `OpenDuplicateReview`/`ViewInLibrary`, `CheatWorkflowAction::
+  OpenLibrary`, `ActiveMountsPageAction::OpenInLibrary`,
+  `AppOperationRequest::ShowInLibraryViews`, and the activity panel's
+  "show related archive". None of these call sites know about each
+  other or share any routing logic today.
+- **Four independent render functions**, each already large and
+  independently tested: `show_loaded_data` (Library/RecentlyFound,
+  ~1,000 lines), `show_health_dashboard_panel`, `show_duplicate_review_panel`,
+  `show_library_views_page` - dispatched from four separate `if self.view
+  == MainView::X { ...; return; }` blocks in `update`'s central-panel
+  closure, in this order: Sources, LibraryViews, Duplicates, Health,
+  CheatsMods, Mount, Selected, ActiveMounts, Doctor, HistoryLogs,
+  Settings, About, with Library/RecentlyFound falling through to the
+  bottom (`show_loaded_data`).
+- **Per-view rendering-policy tables** that already treat these four
+  destinations similarly but not identically: `main_view_content_width`
+  puts all four at `Wide`; `main_view_uses_page_scroll` is `false` for
+  Library/Health/Duplicates (they manage their own internal scroll
+  areas, e.g. the archive table) but `true` for `LibraryViews` (it uses
+  the shared page-level scroll wrapper) - a real, load-bearing difference
+  that any future visual unification will need to reconcile, not an
+  oversight to "fix" in passing.
+- **No persisted navigation state.** `ArchiveFsApp` is not serialized
+  between runs (no `eframe::set_value`/`get_value` or equivalent); `view`
+  always starts at its `#[default]` variant (`Library`) each launch. There
+  is nothing to migrate on disk.
+- **Test coupling**: 52+ existing tests reference Health/Duplicates/
+  LibraryViews by name, plus the navigation-destination tests
+  (`every_navigation_destination_has_a_title_and_width_policy`,
+  `all_navigation_destinations_are_reachable_via_a_real_click`, the
+  `primary_nav_rects` mirror) that iterate
+  `SECONDARY_NAVIGATION_DESTINATIONS`'s exact three entries. None of this
+  was touched - this phase adds only new, purely additive state and
+  functions.
+- **Keyboard paths** (arrow-key row navigation, etc.) are scoped to the
+  Library page's own archive table (`show_archive_rows`) and were not
+  found duplicated on the Health/Duplicates/LibraryViews pages - nothing
+  to reconcile for those in this phase either.
+
+### What was added
+
+- **`LibraryTab`** - a new enum (`Archives`, `Health`, `Duplicates`,
+  `Views`) representing the four lenses this migration will eventually
+  unify into one tabbed page. `Archives` maps to `MainView::Library`;
+  `Views` maps to `MainView::LibraryViews` (renamed in this enum only,
+  since "Library Views" would read as "Library" twice once tabs exist).
+- **One authoritative field**, `ArchiveFsApp::library_tab: LibraryTab`,
+  added alongside the existing `view: MainView` field.
+- **The synchronization rule** (documented on `LibraryTab` itself):
+  `view` remains the single source of truth for what renders, completely
+  unchanged. `library_tab` is a *read-only, derived* projection of it:
+  once per frame (`ArchiveFsApp::reconcile_library_tab`, called first
+  thing in `update`), if `view` is one of the four Library destinations,
+  `library_tab` is set to match; otherwise `library_tab` is left alone,
+  so it remembers the last Library tab across unrelated navigation. This
+  makes every existing legacy route - the sidebar click and all ~11
+  scattered direct assignments - a correct route into the right
+  `LibraryTab`, automatically, with zero of those call sites modified or
+  even aware `LibraryTab` exists.
+- **Three pure mapping functions**: `library_tab_for_main_view` (the
+  routing table above, `None` for every non-Library destination
+  including `RecentlyFound`), `main_view_for_library_tab` (its inverse),
+  and `library_tab_label` (the one shared source of truth for tab display
+  text Phase 2's tab UI will use - reusing the same naming precedent as
+  `main_view_title`).
+- **`ArchiveFsApp::navigate_to_library_tab(&mut self, tab)`** - the one
+  sanctioned way to navigate *by tab* (sets `view` and `library_tab`
+  together, clears `tools_overlay` like every other navigation call
+  site). Not called from any production UI yet; it is the compatibility
+  wrapper Phase 2's tab control will call.
+
+`main_view_for_library_tab`, `library_tab_label`, and
+`navigate_to_library_tab` currently carry `#[allow(dead_code)]`: they are
+deliberately-unwired-yet foundation code, exercised by this milestone's
+tests but not yet called from any production render path. This is an
+intentional, documented state, not an oversight - see "Phase 2 work"
+below for when they get wired in.
+
+### Compatibility mapping
+
+| `MainView` | `LibraryTab` |
+|---|---|
+| `Library` | `Archives` |
+| `Health` | `Health` |
+| `Duplicates` | `Duplicates` |
+| `LibraryViews` | `Views` |
+| everything else (including `RecentlyFound`) | *(none)* |
+
+### Functions/variants retained exactly as-is
+
+`MainView` (all 14 variants), `show_primary_navigation`,
+`PRIMARY_NAVIGATION_DESTINATIONS`, `SECONDARY_NAVIGATION_DESTINATIONS`,
+`navigation_destination_enabled`, `navigation_destination_selected`,
+`main_view_title`, `main_view_content_width`,
+`main_view_uses_page_scroll`, and all four render functions
+(`show_loaded_data`, `show_health_dashboard_panel`,
+`show_duplicate_review_panel`, `show_library_views_page`) - none renamed,
+none restructured, none of their call sites changed.
+
+### Extracting shared tab-content renderers - scoped down, and why
+
+The milestone brief asked for shared tab-content renderers "where
+useful." The four render functions above don't share render-worthy
+structure at the content level - they render an archive table, a health
+issue list, duplicate groups, and saved-view definitions respectively,
+each with its own data model, filters, and actions. Forcing a shared
+renderer across them would mean either a parameter-heavy dispatcher
+bundling all four functions' (collectively 30+) parameters, or actually
+merging their bodies - real, substantial, high-risk work touching
+1,000+ lines of already-tested code, and exactly the kind of change this
+foundation-only phase was scoped to avoid ("do not... change visible
+navigation structure" and "keep existing render functions... unchanged").
+What *is* shared and genuinely reusable - the routing/label logic - was
+extracted (see above). The actual page-body unification is Phase 2's
+job, described next.
+
+### Phase 2 work still required
+
+1. **Design and build the actual tab UI** - almost certainly reusing
+   `tab_row` (introduced in the Cheats & Mods structure milestone) for
+   the four `LibraryTab` options, wired to
+   `ArchiveFsApp::navigate_to_library_tab`.
+2. **Decide the single-page dispatch shape**: does one new `MainView`
+   variant (e.g. `MainView::LibraryArea`) replace all four, with
+   `library_tab` deciding which content renders inside it? Or do the four
+   `MainView` variants stay and the tab bar becomes a purely visual
+   overlay that still ends up calling `navigate_to_library_tab`,
+   preserving `MainView` unchanged a while longer? The former is the
+   "real" migration; the latter is lower-risk and could be an
+   intermediate step.
+3. **Reconcile `main_view_uses_page_scroll`'s Library-vs-LibraryViews
+   difference** noted in the audit above - once all four render inside
+   one page, they need one scroll-ownership answer, not three false and
+   one true.
+4. **Rewrite the navigation-destination tests** that assert on
+   `SECONDARY_NAVIGATION_DESTINATIONS`'s exact three entries
+   (`every_navigation_destination_has_a_title_and_width_policy`,
+   `all_navigation_destinations_are_reachable_via_a_real_click`, the
+   `primary_nav_rects` mirror) once the sidebar actually changes -
+   unchanged and passing today because nothing about the sidebar changed
+   yet.
+5. **Decide whether `MainView::Health`/`Duplicates`/`LibraryViews`
+   survive as enum variants** (e.g. only used internally for what
+   `library_tab` used to derive from) or are removed once `library_tab`
+   is the only thing driving tab content - removing them will touch
+   every one of the ~11 legacy call sites this phase deliberately left
+   alone, at which point they should be migrated to
+   `navigate_to_library_tab` directly.
+6. **Only then** consider whether genuinely shared rendering exists
+   across the four content bodies (e.g. a common filter-bar shape, a
+   common empty-state) worth extracting - premature before the page
+   structure around them is settled.
+
+## Test coverage added in the Library IA migration Phase 1
+
+- `main.rs`: `library_tab_for_main_view_covers_exactly_the_four_library_destinations`
+  and its inverse-mapping counterpart
+  (`main_view_for_library_tab_round_trips_with_library_tab_for_main_view`)
+  - the routing table is exhaustive and correct in both directions, and
+  no non-Library destination (explicitly including `RecentlyFound`) is
+  ever misrouted; `library_tab_label_is_distinct_and_non_empty_for_every_tab`;
+  `legacy_routes_reconcile_to_the_correct_library_tab` - simulates all
+  four legacy routes by setting `view` directly (as every real call site
+  does) and confirms `reconcile_library_tab` selects the right tab each
+  time; `library_tab_survives_navigating_away_to_an_unrelated_destination`
+  - visiting Settings/Mount/CheatsMods/About after Health never resets
+  the remembered tab; `navigate_to_library_tab_sets_view_and_library_tab_together`
+  - the write-direction wrapper keeps both fields in agreement and clears
+  `tools_overlay`; `selected_archive_and_filters_survive_a_library_tab_switch`
+  - the selected archive, the Library free-text filter, `library_filters`,
+  `health_filters`, and `duplicate_filters` are all still exactly as set
+  after cycling through all four tabs via `navigate_to_library_tab`.
+
+Library IA migration Phase 1 total: 441 tests (434 from the Cheats & Mods
+structure milestone + 7 new) pass; 0 failures.
