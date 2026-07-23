@@ -13753,61 +13753,70 @@ fn platform_is_dolphin(platform: Option<&str>) -> bool {
     })
 }
 
+/// The adapter's short, single-line description shown below the tab row
+/// for whichever system is currently selected - the same copy each
+/// option's card used to show unconditionally, now shown only for the
+/// active choice since the stages below already explain that system in
+/// full detail.
+fn cheat_emulator_adapter_description(adapter: CheatEmulatorAdapter) -> &'static str {
+    match adapter {
+        CheatEmulatorAdapter::RetroArch => {
+            "Profile discovery, existing cheat-directory inventory, and trusted catalogue retrieval."
+        }
+        CheatEmulatorAdapter::Pcsx2 => {
+            "Discovers local PCSX2 profiles and inspects existing PNACH files with fixed resource limits."
+        }
+        CheatEmulatorAdapter::Dolphin => {
+            "Discovers local Dolphin profiles and inspects existing GameSettings INI files with fixed resource limits."
+        }
+    }
+}
+
 fn show_cheat_emulator_adapter_selector(
     ui: &mut egui::Ui,
     workflow: &CheatWorkflowState,
 ) -> Option<CheatWorkflowAction> {
     widgets::section_header(
         ui,
-        "Emulator adapter",
+        "Choose a system",
         Some(
             "The adapter is separate from the archive, source, profile, destination, and installation state.",
         ),
     );
-    let mut selected = None;
-    widgets::card(ui, |ui| {
-        if ui
-            .radio(
-                workflow.adapter == CheatEmulatorAdapter::RetroArch,
-                "RetroArch",
-            )
-            .clicked()
-        {
-            selected = Some(CheatEmulatorAdapter::RetroArch);
-        }
-        ui.label("Profile discovery, existing cheat-directory inventory, and trusted catalogue retrieval.");
-    });
+    let mut options = vec![(CheatEmulatorAdapter::RetroArch, "RetroArch")];
     if platform_is_ps2(workflow.platform.as_deref()) {
-        widgets::card(ui, |ui| {
-            if ui
-                .radio(workflow.adapter == CheatEmulatorAdapter::Pcsx2, "PCSX2")
-                .clicked()
-            {
-                selected = Some(CheatEmulatorAdapter::Pcsx2);
-            }
-            ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(ui, "PS2 only", widgets::StatusTone::Info);
-                widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
-            });
-            ui.label("Discovers local PCSX2 profiles and inspects existing PNACH files with fixed resource limits.");
-        });
+        options.push((CheatEmulatorAdapter::Pcsx2, "PCSX2"));
     }
     if platform_is_dolphin(workflow.platform.as_deref()) {
-        widgets::card(ui, |ui| {
-            if ui
-                .radio(workflow.adapter == CheatEmulatorAdapter::Dolphin, "Dolphin")
-                .clicked()
-            {
-                selected = Some(CheatEmulatorAdapter::Dolphin);
-            }
-            ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(ui, "GameCube / Wii", widgets::StatusTone::Info);
-                widgets::status_badge(ui, "Read-only", widgets::StatusTone::Success);
-            });
-            ui.label("Discovers local Dolphin profiles and inspects existing GameSettings INI files with fixed resource limits.");
-        });
+        options.push((CheatEmulatorAdapter::Dolphin, "Dolphin"));
     }
-    selected
+    let clicked = widgets::card(ui, |ui| {
+        let clicked = widgets::tab_row(ui, &options, workflow.adapter);
+        match workflow.adapter {
+            CheatEmulatorAdapter::Pcsx2 => {
+                widgets::status_strip(
+                    ui,
+                    &[
+                        ("PS2 only", widgets::StatusTone::Info),
+                        ("Read-only", widgets::StatusTone::Success),
+                    ],
+                );
+            }
+            CheatEmulatorAdapter::Dolphin => {
+                widgets::status_strip(
+                    ui,
+                    &[
+                        ("GameCube / Wii", widgets::StatusTone::Info),
+                        ("Read-only", widgets::StatusTone::Success),
+                    ],
+                );
+            }
+            CheatEmulatorAdapter::RetroArch => {}
+        }
+        ui.label(cheat_emulator_adapter_description(workflow.adapter));
+        clicked
+    });
+    clicked
         .filter(|selected| *selected != workflow.adapter)
         .map(CheatWorkflowAction::SelectAdapter)
 }
@@ -15518,6 +15527,16 @@ fn show_cheats_mods_page(
         "Cheats & Mods",
         "Inspect emulator-managed cheats and patches or retrieve trusted catalogues for one exact archive.",
     );
+
+    // --- Overview: current archive, its readiness, and availability
+    // across every supported system - a concise summary, not a deep dive
+    // into whichever system happens to be selected right now (that lives
+    // in "Selected system workflow" below).
+    widgets::section_header(
+        ui,
+        "Overview",
+        Some("The selected archive, its readiness, and what each supported system can do with it."),
+    );
     let (integration_label, integration_tone) = match workflow.as_deref() {
         Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Pcsx2 => {
             pcsx2_integration_presentation(pcsx2_profiles)
@@ -15568,35 +15587,66 @@ fn show_cheats_mods_page(
             ));
         }
         widgets::status_strip(ui, &readiness_items);
-    });
-    ui.add_space(theme::SECTION_GAP);
 
-    show_cheats_mods_workflow_states(
-        ui,
-        workflow.as_deref(),
-        profiles,
-        pcsx2_profiles,
-        dolphin_profiles,
-    );
+        // Cross-system availability: composed entirely from the existing
+        // per-adapter presentation functions (no new detection logic),
+        // gated by the same platform checks the "Choose a system"
+        // selector below uses, so the two never disagree about which
+        // systems apply to this archive.
+        let mut system_lines: Vec<(String, widgets::StatusTone)> = Vec::new();
+        let (retroarch_label, retroarch_tone) = retroarch_integration_presentation(profiles);
+        system_lines.push((format!("RetroArch · {retroarch_label}"), retroarch_tone));
+        if workflow
+            .as_deref()
+            .is_some_and(|workflow| platform_is_ps2(workflow.platform.as_deref()))
+        {
+            let (label, tone) = pcsx2_integration_presentation(pcsx2_profiles);
+            system_lines.push((format!("PCSX2 · {label}"), tone));
+        }
+        if workflow
+            .as_deref()
+            .is_some_and(|workflow| platform_is_dolphin(workflow.platform.as_deref()))
+        {
+            let (label, tone) = dolphin_integration_presentation(dolphin_profiles);
+            system_lines.push((format!("Dolphin · {label}"), tone));
+        }
+        let system_items: Vec<(&str, widgets::StatusTone)> = system_lines
+            .iter()
+            .map(|(label, tone)| (label.as_str(), *tone))
+            .collect();
+        widgets::status_strip(ui, &system_items);
+    });
     ui.add_space(theme::SECTION_GAP);
     show_cheats_mods_safety_information(ui);
     ui.add_space(theme::SECTION_GAP);
 
+    // --- Choose a system: which adapter's workflow is shown below.
+    if let Some(workflow) = workflow.as_deref() {
+        action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
+        ui.add_space(theme::SECTION_GAP);
+    }
+
+    // --- Selected system workflow: everything specific to the archive
+    // and the currently selected adapter.
     widgets::section_header(
         ui,
-        "Cheats and emulator patches",
-        Some(
-            "Choose an emulator adapter explicitly. PCSX2 and Dolphin operations in this milestone are local and read-only.",
-        ),
+        "Selected system workflow",
+        Some("Profile, source, identity, preview, and installation state for the chosen system."),
     );
     if let Some(workflow) = workflow {
+        show_cheats_mods_workflow_states(
+            ui,
+            Some(workflow),
+            profiles,
+            pcsx2_profiles,
+            dolphin_profiles,
+        );
+        ui.add_space(theme::SECTION_GAP);
         show_cheat_archive_context(ui, workflow, live, cached, clipboard);
         ui.add_space(theme::SECTION_GAP);
         show_shared_game_identity(ui, workflow, clipboard);
         ui.add_space(theme::SECTION_GAP);
         action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
-        ui.add_space(theme::SECTION_GAP);
-        action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
         match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => {

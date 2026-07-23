@@ -176,6 +176,36 @@ pub(crate) fn status_rows(ui: &mut egui::Ui, rows: &[(&str, &str, StatusTone)]) 
     });
 }
 
+/// A horizontal row of tab-like selectable buttons for choosing between a
+/// small, fixed set of named options while keeping every option's label
+/// reachable at a glance - lighter than a selector built from N stacked
+/// cards (Cheats & Mods' RetroArch/PCSX2/Dolphin adapter chooser used to
+/// be three separate cards, one per option). Built on the same
+/// `egui::Button::selectable` primitive the primary sidebar navigation
+/// already uses, so it participates in ordinary click and keyboard focus
+/// behaviour identically - no new interaction model. Returns the newly
+/// clicked option, if any; callers decide whether that differs from the
+/// currently selected one. Written generically (not adapter-specific)
+/// because its second intended consumer is the documented future
+/// Library-tab IA migration (Health / Duplicates / Library Views as
+/// tabs) - see docs/GUI_SIMPLIFICATION.md.
+pub(crate) fn tab_row<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    options: &[(T, &str)],
+    selected: T,
+) -> Option<T> {
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        for (value, label) in options {
+            let button = egui::Button::selectable(*value == selected, *label);
+            if ui.add(button).clicked() {
+                chosen = Some(*value);
+            }
+        }
+    });
+    chosen
+}
+
 /// The shared "status badge + action name [+ timestamp]" header line for
 /// one activity/history entry - the piece that was rendered identically
 /// (or near-identically) by all three activity surfaces: the bottom
