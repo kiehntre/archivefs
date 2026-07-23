@@ -165,7 +165,10 @@ pub use retroarch::{
 };
 pub use retroarch_cheat_library::{
     RETROARCH_CHEAT_LIBRARY_MAX_DEPTH, RETROARCH_CHEAT_LIBRARY_MAX_ENTRIES,
-    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, inspect_retroarch_cheat_library,
+    RETROARCH_LOCAL_MAX_DIRECTORIES, RETROARCH_LOCAL_MAX_FILE_BYTES, RETROARCH_LOCAL_MAX_FILES,
+    RETROARCH_LOCAL_MAX_TOTAL_BYTES, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchLocalCheatMatchState, inspect_retroarch_cheat_library,
+    inspect_retroarch_cheat_library_for_game,
 };
 pub use retroarch_cheat_setup::{
     RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupDiscovery, RetroArchCheatSetupError,

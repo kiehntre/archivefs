@@ -2666,6 +2666,15 @@ pub enum ArchiveKind {
     MegaDriveRom,
 }
 
+impl ArchiveKind {
+    /// Whether this library entry is an ArchiveFS archive-mount input.
+    /// Loose cartridge ROMs remain selectable library content but never
+    /// become queue or mount candidates.
+    pub fn is_mount_input(self) -> bool {
+        !matches!(self, Self::MegaDriveRom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchiveHealth {
     Pending,
@@ -2965,6 +2974,7 @@ pub enum MountState {
     Pending,
     Mounted,
     MountPathExists,
+    NotMountable,
 }
 
 impl fmt::Display for MountState {
@@ -2973,6 +2983,7 @@ impl fmt::Display for MountState {
             Self::Pending => write!(f, "Pending"),
             Self::Mounted => write!(f, "Mounted"),
             Self::MountPathExists => write!(f, "MountPathExists"),
+            Self::NotMountable => write!(f, "NotMountable"),
         }
     }
 }
@@ -3018,6 +3029,10 @@ impl ArchiveRecord {
             mount_plan,
             mount_state,
         }
+    }
+
+    pub fn is_mount_input(&self) -> bool {
+        self.mount_plan.archive.kind.is_mount_input()
     }
 }
 
@@ -5376,7 +5391,7 @@ pub fn summarize_archive_records(records: &[ArchiveRecord]) -> ArchiveStats {
         match record.mount_state {
             MountState::Mounted => mounted_count += 1,
             MountState::Pending => pending_count += 1,
-            MountState::MountPathExists => {}
+            MountState::MountPathExists | MountState::NotMountable => {}
         }
 
         if let Some(size_bytes) = record.identity.size_bytes {
@@ -5516,7 +5531,7 @@ pub fn summarize_archive_index(index: &ArchiveIndex) -> ArchiveIndexSummary {
         match entry.mount_state {
             MountState::Mounted => mounted_count += 1,
             MountState::Pending => pending_count += 1,
-            MountState::MountPathExists => {}
+            MountState::MountPathExists | MountState::NotMountable => {}
         }
     }
 
@@ -6572,7 +6587,9 @@ fn records_from_plans(
 }
 
 fn mount_state_for_plan(plan: &MountPlan, mounted_paths: &HashSet<PathBuf>) -> MountState {
-    if mounted_paths.contains(&plan.mount_path) {
+    if !plan.archive.kind.is_mount_input() {
+        MountState::NotMountable
+    } else if mounted_paths.contains(&plan.mount_path) {
         MountState::Mounted
     } else if plan.mount_path.exists() {
         MountState::MountPathExists
@@ -6862,6 +6879,15 @@ mod tests {
         assert_eq!(discovery.skipped_unsupported_extension, 0);
         let mount_error = validate_archive_for_mount(&discovery.archives[0]).unwrap_err();
         assert!(mount_error.to_string().contains("not archive mount inputs"));
+        let loose_plan = MountPlan::new(
+            discovery.archives[0].clone(),
+            root.join("mount").join("Alien_3"),
+        );
+        assert_eq!(
+            mount_state_for_plan(&loose_plan, &HashSet::new()),
+            MountState::NotMountable,
+            "loose ROMs must be rejected by shared action eligibility before mounting"
+        );
         assert_eq!(
             archive_kind_in_root(
                 &root.join("megadrive").join("Alien 3.MD"),

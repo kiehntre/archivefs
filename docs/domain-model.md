@@ -149,6 +149,8 @@ MountState {
 - `Pending`: mount path is not currently mounted.
 - `Mounted`: mount path is currently mounted.
 - `MountPathExists`: mount path exists but is not detected as mounted.
+- `NotMountable`: a library item such as a loose cartridge ROM that is
+  intentionally excluded from ArchiveFS mount and queue operations.
 
 ## MountBackend
 

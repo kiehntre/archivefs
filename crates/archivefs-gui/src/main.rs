@@ -14,7 +14,11 @@ use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
     DiscoveryEnvironment, ProfileKind, ProfileScope,
 };
-use archivefs_core::game_identity::{GameIdentityReport, IdentityStatus, inspect_game_identity};
+#[cfg(test)]
+use archivefs_core::game_identity::inspect_game_identity;
+use archivefs_core::game_identity::{
+    GameIdentityReport, IdentityImageFormat, IdentityStatus, inspect_catalogued_game_identity,
+};
 use archivefs_core::patch_manager::{
     CheatCatalogueStatus, CheatSourceCancellation, CheatSourceError, CheatSourceFetchOptions,
     CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList,
@@ -26,18 +30,18 @@ use archivefs_core::patch_manager::{
     Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
     PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
     PreviewMatchStrength, PreviewSourceItem, PreviewState, RetroArchCheatLibraryInspection,
-    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchMaterializationError,
-    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
-    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
-    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
-    UNKNOWN_CODE_POLICY, adapter_write_support, build_shared_preview,
+    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
+    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
+    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
+    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
+    SharedTransactionPlan, UNKNOWN_CODE_POLICY, adapter_write_support, build_shared_preview,
     build_shared_transaction_plan, default_cheat_source_cache_root, default_shared_backup_root,
     default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
     discover_retroarch_cheat_setup_profiles, discover_shared_apply_history, execute_shared_apply,
     execute_shared_rollback, fetch_retroarch_cheat_source, generate_shared_operation_id,
-    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library,
+    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
     list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
     materialize_retroarch_shared_preview, preview_shared_rollback,
 };
@@ -1104,7 +1108,7 @@ fn pending_unmount_items(records: &[ArchiveRecord]) -> Vec<UnmountAllItem> {
 fn mount_all_items_for_paths(records: &[ArchiveRecord], paths: &[PathBuf]) -> Vec<MountAllItem> {
     records
         .iter()
-        .filter(|record| paths.contains(&record.mount_plan.archive.path))
+        .filter(|record| record.is_mount_input() && paths.contains(&record.mount_plan.archive.path))
         .map(|record| MountAllItem {
             archive_path: record.mount_plan.archive.path.clone(),
             mount_path: record.mount_plan.mount_path.clone(),
@@ -4737,7 +4741,7 @@ impl ArchiveFsApp {
         workflow.preview_request = None;
         workflow.preview = CheatStepResource::NotLoaded;
         thread::spawn(move || {
-            let report = inspect_game_identity(&path, platform.as_deref());
+            let report = inspect_catalogued_game_identity(&path, platform.as_deref());
             let _ = sender.send(Ok((worker_request, report)));
             context.request_repaint();
         });
@@ -5068,6 +5072,15 @@ impl ArchiveFsApp {
         {
             return;
         }
+        let loose_identity = ready_game_identity(workflow).and_then(|report| {
+            report.verified_loose_rom_sha256().map(|digest| {
+                (
+                    workflow.archive_path.clone(),
+                    workflow.platform.clone(),
+                    digest.to_string(),
+                )
+            })
+        });
         let history_root = match default_shared_history_root() {
             Ok(path) => path,
             Err(error) => {
@@ -5123,6 +5136,17 @@ impl ArchiveFsApp {
             format!("Shared apply '{operation_id}' started."),
         ));
         thread::spawn(move || {
+            if let Some((path, platform, expected_digest)) = loose_identity {
+                let current = inspect_catalogued_game_identity(&path, platform.as_deref());
+                if current.verified_loose_rom_sha256() != Some(expected_digest.as_str()) {
+                    let _ = sender.send(Err(
+                        "Loose ROM changed after preview; the approved plan was rejected before writing."
+                            .to_string(),
+                    ));
+                    context.request_repaint();
+                    return;
+                }
+            }
             let result = execute_shared_apply(&plan, &options);
             let _ = sender.send(Ok(result));
             context.request_repaint();
@@ -5196,10 +5220,13 @@ impl ArchiveFsApp {
             return;
         };
         let (sender, receiver) = mpsc::channel();
+        let platform = workflow.platform.clone().unwrap_or_default();
+        let display_name = workflow.display_name.clone();
         workflow.existing_library_profile_id = Some(profile_id);
         workflow.existing_library = CheatStepResource::Loading { receiver };
         thread::spawn(move || {
-            let result = inspect_retroarch_cheat_library(&destination);
+            let result =
+                inspect_retroarch_cheat_library_for_game(&destination, &platform, &display_name);
             let _ = sender.send(Ok(result));
             context.request_repaint();
         });
@@ -11141,6 +11168,7 @@ fn mount_validation_label(state: MountState) -> &'static str {
         MountState::Pending => "Ready to mount",
         MountState::Mounted => "Already mounted — will be skipped",
         MountState::MountPathExists => "Destination already exists — will be skipped",
+        MountState::NotMountable => "Loose ROM · no ArchiveFS mount required",
     }
 }
 
@@ -11169,6 +11197,7 @@ fn queued_pending_paths(queue: &[PathBuf], records: &[ArchiveRecord]) -> Vec<Pat
             records.iter().any(|record| {
                 record.mount_plan.archive.path == **path
                     && record.mount_state == MountState::Pending
+                    && record.is_mount_input()
             })
         })
         .cloned()
@@ -11263,6 +11292,7 @@ fn planned_action_label(state: MountState) -> &'static str {
         MountState::Pending => "Mount",
         MountState::Mounted => "Skip — already mounted",
         MountState::MountPathExists => "Skip — destination already exists",
+        MountState::NotMountable => "Skip — loose ROM needs no mount",
     }
 }
 struct SelectedPageViewState<'a> {
@@ -11691,6 +11721,7 @@ fn show_mount_page(
                             MountState::Pending => widgets::StatusTone::Success,
                             MountState::Mounted => widgets::StatusTone::Active,
                             MountState::MountPathExists => widgets::StatusTone::Blocked,
+                            MountState::NotMountable => widgets::StatusTone::Info,
                         };
                         widgets::status_badge(ui, mount_validation_label(record.mount_state), tone);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -13423,9 +13454,13 @@ fn show_cheat_archive_context(
     let persisted = selected_persisted_archive(cached, Some(&workflow.archive_path));
     widgets::section_header(
         ui,
-        "Selected archive context",
+        if record.is_some_and(|record| !record.is_mount_input()) {
+            "Selected loose-ROM context"
+        } else {
+            "Selected archive context"
+        },
         Some(
-            "This exact archive remains selected; opening this workspace changes no mount, queue, or platform state.",
+            "This exact library item remains selected; opening this workspace changes no mount, queue, or platform state.",
         ),
     );
     widgets::card(ui, |ui| {
@@ -13444,6 +13479,9 @@ fn show_cheat_archive_context(
                 widgets::StatusTone::Info,
             );
             if let Some(record) = record {
+                if !record.is_mount_input() {
+                    widgets::status_badge(ui, "Media kind · Loose ROM", widgets::StatusTone::Info);
+                }
                 widgets::status_badge(
                     ui,
                     mount_validation_label(record.mount_state),
@@ -13451,6 +13489,7 @@ fn show_cheat_archive_context(
                         MountState::Mounted => widgets::StatusTone::Active,
                         MountState::Pending => widgets::StatusTone::Success,
                         MountState::MountPathExists => widgets::StatusTone::Warning,
+                        MountState::NotMountable => widgets::StatusTone::Info,
                     },
                 );
             }
@@ -13461,13 +13500,21 @@ fn show_cheat_archive_context(
             }
             ui.label(egui::RichText::new(format_size(workflow.size_bytes)).color(theme::muted(ui)));
         });
-        if widgets::path_value(ui, "Archive", &workflow.archive_path) {
+        if widgets::path_value(
+            ui,
+            if record.is_some_and(|record| !record.is_mount_input()) {
+                "ROM file"
+            } else {
+                "Archive"
+            },
+            &workflow.archive_path,
+        ) {
             let _ = clipboard.set_text(workflow.archive_path.display().to_string());
         }
         if widgets::path_value(ui, "Source", &workflow.source_root) {
             let _ = clipboard.set_text(workflow.source_root.display().to_string());
         }
-        if let Some(record) = record
+        if let Some(record) = record.filter(|record| record.is_mount_input())
             && widgets::path_value(ui, "Mount destination", &record.mount_plan.mount_path)
         {
             let _ = clipboard.set_text(record.mount_plan.mount_path.display().to_string());
@@ -14641,6 +14688,9 @@ fn build_cheat_preview_request(
                     archive_normalized_name: workflow.normalized_name.clone(),
                     platform,
                     region: workflow.region.clone(),
+                    verified_loose_rom_sha256: identity
+                        .and_then(GameIdentityReport::verified_loose_rom_sha256)
+                        .map(str::to_owned),
                     destination_root,
                 }),
             ))
@@ -14697,8 +14747,17 @@ fn show_shared_game_identity(
                 }
                 ui.horizontal_wrapped(|ui| {
                     widgets::status_badge(ui, report.platform.label(), widgets::StatusTone::Info);
-                    ui.label(format!("Format: {:?}", report.format));
-                    ui.label(format!("{} bytes read", report.bytes_read));
+                    if report.format == IdentityImageFormat::LooseCartridgeRom {
+                        widgets::status_badge(
+                            ui,
+                            "Media kind · Loose ROM",
+                            widgets::StatusTone::Info,
+                        );
+                        ui.label(format!("{} bytes hashed", report.bytes_read));
+                    } else {
+                        ui.label(format!("Format: {:?}", report.format));
+                        ui.label(format!("{} bytes read", report.bytes_read));
+                    }
                     ui.label(format!(
                         "{} members · {} metadata paths",
                         report.archive_members_inspected, report.metadata_paths_inspected
@@ -15591,7 +15650,7 @@ fn show_existing_retroarch_library(
         if widgets::path_value(ui, "RetroArch cheat directory", path) {
             let _ = clipboard.set_text(destination.display.clone());
         }
-        ui.label("This inventory counts cheat-like filenames only; it does not prove format compatibility or safety.");
+        ui.label("Inspection is limited to reviewed platform aliases and plausible game filenames. Local files remain unverified compatibility evidence.");
     });
 
     if workflow.existing_library_profile_id.as_deref() != Some(selected_profile_id) {
@@ -15603,7 +15662,7 @@ fn show_existing_retroarch_library(
         CheatStepResource::Loading { .. } => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Inspecting the directory locally with fixed limits...");
+                ui.label("Inspecting only relevant platform and game paths with fixed limits...");
             });
             None
         }
@@ -15618,11 +15677,14 @@ fn show_existing_retroarch_library(
         }
         CheatStepResource::Ready(inspection) => {
             let (label, tone) = retroarch_library_state_presentation(inspection.state);
+            let (match_label, match_tone) =
+                retroarch_local_match_presentation(inspection.match_state);
             widgets::card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     widgets::status_badge(ui, label, tone);
+                    widgets::status_badge(ui, match_label, match_tone);
                     ui.label(format!(
-                        "Approximately {} cheat-like file{}",
+                        "{} relevant cheat file{}",
                         inspection.approximate_cheat_file_count,
                         if inspection.approximate_cheat_file_count == 1 {
                             ""
@@ -15630,13 +15692,58 @@ fn show_existing_retroarch_library(
                             "s"
                         }
                     ));
-                    ui.label(format!("{} entries examined", inspection.entries_examined));
+                    ui.label(format!(
+                        "{} directories · {} files · {} bytes inspected",
+                        inspection.directories_inspected,
+                        inspection.entries_examined,
+                        inspection.bytes_inspected
+                    ));
                 });
+                for path in &inspection.matching_files {
+                    if path.lossy {
+                        ui.label(
+                            "Matching path retained with non-UTF-8 identity (display is lossy).",
+                        );
+                    } else if widgets::path_value(ui, "Local candidate", Path::new(&path.display)) {
+                        let _ = clipboard.set_text(path.display.clone());
+                    }
+                }
                 if let Some(warning) = &inspection.warning {
                     ui.label(warning);
                 }
             });
             None
+        }
+    }
+}
+
+fn retroarch_local_match_presentation(
+    state: RetroArchLocalCheatMatchState,
+) -> (&'static str, widgets::StatusTone) {
+    match state {
+        RetroArchLocalCheatMatchState::NotTargeted => {
+            ("Not targeted", widgets::StatusTone::Pending)
+        }
+        RetroArchLocalCheatMatchState::NotFound => {
+            ("No local cheat found", widgets::StatusTone::Pending)
+        }
+        RetroArchLocalCheatMatchState::Candidate => {
+            ("Local filename candidate", widgets::StatusTone::Warning)
+        }
+        RetroArchLocalCheatMatchState::ExactLocalFile => {
+            ("Exact local filename", widgets::StatusTone::Success)
+        }
+        RetroArchLocalCheatMatchState::Ambiguous => {
+            ("Ambiguous local files", widgets::StatusTone::Warning)
+        }
+        RetroArchLocalCheatMatchState::LimitReached => {
+            ("Inspection limit reached", widgets::StatusTone::Warning)
+        }
+        RetroArchLocalCheatMatchState::Unsafe => {
+            ("Unsafe local path refused", widgets::StatusTone::Blocked)
+        }
+        RetroArchLocalCheatMatchState::Unavailable => {
+            ("Local inspection unavailable", widgets::StatusTone::Pending)
         }
     }
 }
@@ -19460,7 +19567,7 @@ fn show_single_row_context_menu(
     let record = selected_record(ctx.records, Some(&row.path));
     let persisted = selected_persisted_archive(ctx.cached, Some(&row.path));
 
-    if let Some(record) = record {
+    if let Some(record) = record.filter(|record| record.is_mount_input()) {
         let archive_action = available_action(record.mount_state);
         let label = match archive_action {
             ArchiveAction::Mount => "Mount",
@@ -19488,6 +19595,10 @@ fn show_single_row_context_menu(
         if !enabled && let Some(reason) = ctx.block_reason {
             ui.label(reason);
         }
+    } else if record.is_some() {
+        ui.add_enabled(false, egui::Button::new("No mount required"))
+            .on_disabled_hover_text("Loose ROM · no ArchiveFS mount required");
+        ui.label("Loose ROM · no ArchiveFS mount required");
     } else {
         ui.add_enabled(false, egui::Button::new("Mount"))
             .on_disabled_hover_text("Archive is catalogue-only.");
@@ -19642,6 +19753,7 @@ fn show_bulk_row_context_menu(
         .iter()
         .filter(|record| {
             selected_archives.contains(&record.mount_plan.archive.path)
+                && record.is_mount_input()
                 && matches!(
                     record.mount_state,
                     MountState::Pending | MountState::MountPathExists
@@ -20175,7 +20287,9 @@ fn resolved_platform_choice<'a>(choice: Option<&'a str>, custom_text: &'a str) -
 fn available_action(mount_state: MountState) -> ArchiveAction {
     match mount_state {
         MountState::Mounted => ArchiveAction::Unmount,
-        MountState::Pending | MountState::MountPathExists => ArchiveAction::Mount,
+        MountState::Pending | MountState::MountPathExists | MountState::NotMountable => {
+            ArchiveAction::Mount
+        }
     }
 }
 
@@ -20447,6 +20561,15 @@ fn show_selected_archive(
                 cheats_mods_request = Some(record.mount_plan.archive.path.clone());
             }
         });
+        if !record.is_mount_input() {
+            widgets::banner(
+                ui,
+                "No mount required",
+                "Loose ROM · no ArchiveFS mount required. Inspect, Cheats & Mods, copy-path, and library metadata actions remain available.",
+                widgets::StatusTone::Info,
+            );
+            return;
+        }
         ui.add_enabled_ui(!busy, |ui| {
             ui.checkbox(
                 cleanup_after_unmount,
@@ -21471,6 +21594,29 @@ mod tests {
         )
     }
 
+    fn loose_mega_drive_record(path: &str) -> ArchiveRecord {
+        let archive = Archive::from_path_in_root(path, "/roms").unwrap();
+        ArchiveRecord::new(
+            MountPlan::new(archive, PathBuf::from("/mnt/archivefs/Alien_3")),
+            MountState::NotMountable,
+            ArchiveMetadata {
+                title: None,
+                platform: Some("MegaDrive".to_string()),
+                region: None,
+                languages: None,
+                version: None,
+                disc: None,
+                publisher: None,
+                developer: None,
+                release_year: None,
+                genre: None,
+                notes: None,
+                source: None,
+            },
+            ArchiveHealth::Unsupported,
+        )
+    }
+
     #[test]
     fn queued_pending_paths_keeps_queue_order_and_only_pending_archives() {
         let records = vec![
@@ -21489,6 +21635,32 @@ mod tests {
             queued_pending_paths(&queue, &records),
             vec![PathBuf::from("/roms/d.zip"), PathBuf::from("/roms/b.zip")],
             "only Pending queued archives are attempted, in queue order"
+        );
+    }
+
+    #[test]
+    fn stale_loose_rom_queue_entry_is_visible_but_never_attempted() {
+        let loose = loose_mega_drive_record("/roms/genesis/Alien 3.md");
+        let archive = record("/roms/game.zip", MountState::Pending);
+        let records = vec![loose, archive];
+        let queue = vec![
+            PathBuf::from("/roms/genesis/Alien 3.md"),
+            PathBuf::from("/roms/game.zip"),
+        ];
+        assert_eq!(
+            queued_pending_paths(&queue, &records),
+            vec![PathBuf::from("/roms/game.zip")]
+        );
+        assert_eq!(
+            queue.len(),
+            2,
+            "stale loose entry remains removable by the user"
+        );
+        assert_eq!(pending_mount_items(&records).len(), 1);
+        assert!(
+            mount_all_items_for_paths(&records, &queue)
+                .iter()
+                .all(|item| item.archive_path != Path::new("/roms/genesis/Alien 3.md"))
         );
     }
 
@@ -21966,6 +22138,41 @@ mod tests {
     }
 
     #[test]
+    fn supported_loose_rom_identity_is_presented_without_unsupported_platform_wording() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-loose-identity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Alien 3 (USA, Europe).md");
+        std::fs::write(&path, b"synthetic ROM").unwrap();
+        let report = inspect_catalogued_game_identity(&path, Some("MegaDrive"));
+        let request = GameIdentityRequest {
+            archive_path: path.clone(),
+            platform: Some("MegaDrive".to_string()),
+            adapter: CheatEmulatorAdapter::RetroArch,
+        };
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.archive_path = path;
+        workflow.platform = Some("MegaDrive".to_string());
+        workflow.identity_request = Some(request.clone());
+        workflow.identity = CheatStepResource::Ready((request, report));
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_shared_game_identity(ui, workflow, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Media kind · Loose ROM"));
+        assert!(rendered_text_contains(&output, "Local ROM SHA-256"));
+        assert!(!rendered_text_contains(&output, "Unsupported platform"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn preview_result_is_rejected_after_profile_source_or_page_changes() {
         let mut app = app_with_cheats_mods_context();
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
@@ -22191,7 +22398,7 @@ mod tests {
             schema_version: CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
             stage: archivefs_core::patch_manager::CheatSourceErrorStage::Download,
             code: "download_too_large".into(),
-            message: "received 134217729 bytes, exceeding configured limit 134217728 bytes".into(),
+            message: "received 268435457 bytes, exceeding configured limit 268435456 bytes".into(),
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -22775,6 +22982,28 @@ mod tests {
             });
         });
         assert!(rendered_text_contains(&output, "Cheats & Mods"));
+    }
+
+    #[test]
+    fn loose_rom_context_menu_has_no_mount_action_but_keeps_cheats_mods() {
+        let records = vec![loose_mega_drive_record("/roms/genesis/Alien 3.md")];
+        let row = row_with_fields(
+            "/roms/genesis/Alien 3.md",
+            "MegaDrive",
+            "NotMountable",
+            "Alien 3.md",
+            "/mount/Alien_3",
+        );
+        let menu_context = row_menu_context_for(&records);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_single_row_context_menu(ui, &row, &menu_context);
+            });
+        });
+        assert!(rendered_text_contains(&output, "No mount required"));
+        assert!(rendered_text_contains(&output, "Cheats & Mods"));
+        assert!(!rendered_text_contains(&output, "Mount selected"));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 # Shared verified game identity
 
 ArchiveFS can inspect narrowly defined, local disc metadata for a selected
-PlayStation 2, GameCube, or Wii archive. The result is a typed evidence report,
-not a guessed game name. It is shown asynchronously in Cheats & Mods and can
-feed exact matching in the existing PCSX2 and Dolphin read-only adapters.
+PlayStation 2, GameCube, or Wii archive, and stable local-byte identity for a
+supported loose Mega Drive or SNES cartridge ROM. The result is a typed
+evidence report, not a guessed game name. It is shown asynchronously in Cheats
+& Mods and can feed the existing conservative adapter matchers.
 
 ## Evidence states
 
@@ -30,6 +31,15 @@ bounded image API for them in this milestone. It does not invoke `chdman`,
 `7z`, a mount helper, PCSX2, Dolphin, or any other process.
 
 ## Extracted identities
+
+For a loose cartridge ROM, exact trusted scanner or manual platform evidence
+is required. Mega Drive supports `.md`, `.gen`, `.smd`, and contextual `.bin`;
+SNES supports `.sfc` and `.smc` identity where an exact platform context is
+already available. ArchiveFS hashes the complete, unchanged on-disk file with
+SHA-256 within a 64 MiB limit and records the format, size, exact path, and a
+normalized display-title candidate. This is verified local-file identity, not
+a known-good or canonical dump hash. See
+[Loose-ROM RetroArch cheat support](LOOSE_ROM_CHEAT_SUPPORT.md).
 
 For GameCube and Wii, ArchiveFS reads bytes `0x00..0x20`, validates the
 platform-specific magic (`0x1c` for GameCube or `0x18` for Wii), and accepts a
@@ -65,6 +75,10 @@ deferred, or resource-limited, never guessed.
 | Boot executable size | 32 MiB |
 | Nested-container depth | 1 |
 | Retained warnings | 64 |
+
+Loose-ROM requests inspect one file, hash at most 64 MiB, retain at most 16
+warnings and 16 metadata tokens, and do not use the disc-container member
+limits above.
 
 ZIP central-directory parsing is delegated to the repository's existing
 `zip` library; the 64 MiB value bounds identity payload decompression and all

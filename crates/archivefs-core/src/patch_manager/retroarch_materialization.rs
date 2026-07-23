@@ -16,6 +16,7 @@ use super::shared_preview::{
     SharedPreviewRequest, build_shared_preview,
 };
 use crate::emulator_environment::HostReadOnlyFilesystem;
+use crate::game_identity::{IdentityPlatform, supported_loose_rom_format};
 
 pub const RETROARCH_MAX_MATERIALIZED_ENTRIES: usize = 64;
 
@@ -29,6 +30,9 @@ pub struct RetroArchMaterializationRequest {
     pub archive_normalized_name: String,
     pub platform: String,
     pub region: Option<String>,
+    /// Verified digest of the exact local loose-ROM bytes. Required for a
+    /// supported loose cartridge path; absent for ordinary archives.
+    pub verified_loose_rom_sha256: Option<String>,
     pub destination_root: PathBuf,
 }
 
@@ -68,6 +72,7 @@ pub enum RetroArchMaterializationErrorKind {
     SourceNotInManifest,
     SourceDigestMismatch,
     MatchingEntryExcluded,
+    IdentityUnavailable,
     NoEligibleMatch,
     ResourceLimitReached,
     PreviewFailed,
@@ -91,6 +96,15 @@ impl std::error::Error for RetroArchMaterializationError {}
 pub fn materialize_retroarch_shared_preview(
     request: &RetroArchMaterializationRequest,
 ) -> Result<RetroArchMaterializedPreview, RetroArchMaterializationError> {
+    let identity_platform = IdentityPlatform::from_catalogue(Some(&request.platform));
+    let loose_format = supported_loose_rom_format(&request.selected_archive, identity_platform);
+    if loose_format.is_some() && request.verified_loose_rom_sha256.is_none() {
+        return Err(error(
+            RetroArchMaterializationErrorKind::IdentityUnavailable,
+            Some(&request.selected_archive),
+            "supported loose ROM requires a verified stable local-byte identity before matching",
+        ));
+    }
     let snapshot_id = request
         .snapshot_root
         .file_name()
@@ -337,7 +351,15 @@ pub fn materialize_retroarch_shared_preview(
         ));
     }
     sources.sort_by(|left, right| left.source_path.cmp(&right.source_path));
-    let identity_value = format!("{}:archive:1", request.expected_snapshot_id);
+    let identity_value = request.verified_loose_rom_sha256.as_ref().map_or_else(
+        || format!("{}:archive:1", request.expected_snapshot_id),
+        |digest| {
+            format!(
+                "{}:loose-rom-sha256:{}",
+                request.expected_snapshot_id, digest
+            )
+        },
+    );
     let preview = build_shared_preview(&SharedPreviewRequest {
         adapter: PreviewAdapter::RetroArch,
         selected_archive: request.selected_archive.clone(),
@@ -502,6 +524,7 @@ mod tests {
             archive_normalized_name: "frogger usa".into(),
             platform: "Atari2600".into(),
             region: Some("USA".into()),
+            verified_loose_rom_sha256: None,
             destination_root: fixture.destination.clone(),
         }
     }
@@ -555,12 +578,21 @@ mod tests {
 
         let mut request = request(&fixture);
         request.selected_archive = fixture.root.join("Alien 3 (USA, Europe).md");
+        fs::write(&request.selected_archive, b"synthetic Mega Drive ROM").unwrap();
+        request.verified_loose_rom_sha256 = Some(sha256(b"synthetic Mega Drive ROM"));
         request.archive_display_name = "Alien 3 (USA, Europe)".into();
         request.archive_normalized_name = "alien 3 usa europe".into();
         request.platform = "MegaDrive".into();
         let matched = materialize_retroarch_shared_preview(&request).unwrap();
         assert_eq!(matched.sources.len(), 1);
         assert_eq!(matched.sources[0].source_path, fixture.source);
+        assert!(
+            matched.preview.entries[0]
+                .verified_identity
+                .as_deref()
+                .unwrap()
+                .contains(&sha256(b"synthetic Mega Drive ROM"))
+        );
         assert_eq!(
             matched.catalogue_index_state,
             CatalogueIndexState::UsablePartial
@@ -598,6 +630,8 @@ mod tests {
 
         let mut request = request(&fixture);
         request.selected_archive = fixture.root.join("Alien 3 (USA, Europe).md");
+        fs::write(&request.selected_archive, b"synthetic Mega Drive ROM").unwrap();
+        request.verified_loose_rom_sha256 = Some(sha256(b"synthetic Mega Drive ROM"));
         request.archive_display_name = "Alien 3 (USA, Europe)".into();
         request.archive_normalized_name = "alien 3 usa europe".into();
         request.platform = "MegaDrive".into();
@@ -607,6 +641,22 @@ mod tests {
             RetroArchMaterializationErrorKind::MatchingEntryExcluded
         );
         assert!(failure.detail.contains("could not be parsed"));
+    }
+
+    #[test]
+    fn loose_rom_match_is_blocked_without_verified_local_bytes() {
+        let fixture = fixture("loose-identity-required");
+        let mut request = request(&fixture);
+        request.selected_archive = fixture.root.join("Frogger (USA).md");
+        request.archive_display_name = "Frogger (USA)".into();
+        request.archive_normalized_name = "frogger usa".into();
+        request.platform = "MegaDrive".into();
+        request.verified_loose_rom_sha256 = None;
+        let failure = materialize_retroarch_shared_preview(&request).unwrap_err();
+        assert_eq!(
+            failure.kind,
+            RetroArchMaterializationErrorKind::IdentityUnavailable
+        );
     }
 
     #[test]
@@ -644,6 +694,8 @@ mod tests {
 
         let mut request = request(&fixture);
         request.selected_archive = fixture.root.join("Chrono Quest (USA).sfc");
+        fs::write(&request.selected_archive, b"synthetic SNES ROM").unwrap();
+        request.verified_loose_rom_sha256 = Some(sha256(b"synthetic SNES ROM"));
         request.archive_display_name = "Chrono Quest (USA)".into();
         request.archive_normalized_name = "chrono quest usa".into();
         request.platform = "SNES".into();
