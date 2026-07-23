@@ -90,6 +90,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "add source_folders scan-status columns: last_scan_status, last_scan_error, last_scan_at, last_successful_scan_at, last_archive_count",
         sql: include_str!("migrations/0003_source_folder_scan_status.sql"),
     },
+    Migration {
+        version: 4,
+        description: "retain unchanged, unsupported-extension, and ambiguous-platform scan counts",
+        sql: include_str!("migrations/0004_scan_skip_counts.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -1172,6 +1177,8 @@ pub struct ScanRunCounts {
     pub archives_unchanged: i64,
     pub archives_updated: i64,
     pub archives_missing: i64,
+    pub skipped_unsupported_extension: i64,
+    pub skipped_ambiguous_platform: i64,
     pub errors_count: i64,
 }
 
@@ -1348,6 +1355,7 @@ fn archive_kind_str(kind: ArchiveKind) -> &'static str {
         ArchiveKind::Zip => "zip",
         ArchiveKind::SevenZip => "sevenzip",
         ArchiveKind::Rar => "rar",
+        ArchiveKind::MegaDriveRom => "megadrive_rom",
     }
 }
 
@@ -2880,7 +2888,9 @@ impl Database {
             .execute(
                 "UPDATE scan_runs SET finished_at = ?2, status = 'completed', \
                  source_folders_scanned = ?3, archives_seen = ?4, archives_added = ?5, \
-                 archives_updated = ?6, archives_missing = ?7, errors_count = ?8, error_message = ?9 \
+                 archives_updated = ?6, archives_missing = ?7, errors_count = ?8, error_message = ?9, \
+                 archives_unchanged = ?10, skipped_unsupported_extension = ?11, \
+                 skipped_ambiguous_platform = ?12 \
                  WHERE id = ?1",
                 params![
                     scan_run_id,
@@ -2892,6 +2902,9 @@ impl Database {
                     counts.archives_missing,
                     counts.errors_count,
                     error_message,
+                    counts.archives_unchanged,
+                    counts.skipped_unsupported_extension,
+                    counts.skipped_ambiguous_platform,
                 ],
             )
             .map_err(|error| db_error("failed to complete scan run", error))?;
@@ -3106,7 +3119,8 @@ impl Database {
             .query_row(
                 "SELECT id, started_at, finished_at, triggered_by, source_folders_scanned, \
                  archives_seen, archives_added, archives_updated, archives_missing, \
-                 errors_count, error_message \
+                 errors_count, error_message, archives_unchanged, \
+                 skipped_unsupported_extension, skipped_ambiguous_platform \
                  FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1",
                 [],
                 |row| {
@@ -3122,11 +3136,52 @@ impl Database {
                         archives_missing: row.get(8)?,
                         errors_count: row.get(9)?,
                         error_message: row.get(10)?,
+                        archives_unchanged: row.get(11)?,
+                        skipped_unsupported_extension: row.get(12)?,
+                        skipped_ambiguous_platform: row.get(13)?,
                     })
                 },
             )
             .optional()
             .map_err(|error| db_error("failed to load latest completed scan", error))
+    }
+
+    /// Persistent additions from the newest completed scan. Partial-success
+    /// scans are completed runs and retain their committed additions; failed
+    /// transactions never appear here.
+    pub fn latest_scan_additions(&self) -> Result<Option<RecentScanAdditions>> {
+        const MAX_RECENT_ADDITIONS: usize = 10_000;
+        let Some(scan) = self.latest_completed_scan()? else {
+            return Ok(None);
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT archive_id FROM archive_scan_observations \
+                 WHERE scan_run_id = ?1 AND observation = 'added' ORDER BY archive_id LIMIT ?2",
+            )
+            .map_err(|error| db_error("failed to prepare recent additions", error))?;
+        let ids = statement
+            .query_map(
+                params![scan.scan_run_id, (MAX_RECENT_ADDITIONS + 1) as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| db_error("failed to load recent additions", error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| db_error("failed to decode recent additions", error))?;
+        let truncated = ids.len() > MAX_RECENT_ADDITIONS;
+        let wanted: HashSet<i64> = ids.into_iter().take(MAX_RECENT_ADDITIONS).collect();
+        let mut archives = self
+            .load_archives()?
+            .into_iter()
+            .filter(|archive| wanted.contains(&archive.id))
+            .collect::<Vec<_>>();
+        archives.sort_by(|left, right| left.absolute_path.cmp(&right.absolute_path));
+        Ok(Some(RecentScanAdditions {
+            scan,
+            archives,
+            truncated,
+        }))
     }
 }
 
@@ -3157,8 +3212,18 @@ pub struct CompletedScanSummary {
     pub archives_added: i64,
     pub archives_updated: i64,
     pub archives_missing: i64,
+    pub archives_unchanged: i64,
+    pub skipped_unsupported_extension: i64,
+    pub skipped_ambiguous_platform: i64,
     pub errors_count: i64,
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentScanAdditions {
+    pub scan: CompletedScanSummary,
+    pub archives: Vec<PersistedArchive>,
+    pub truncated: bool,
 }
 
 /// The highest schema version this build of ArchiveFS understands - the
@@ -3254,8 +3319,8 @@ fn scan_and_persist_folders_transaction(
             ratarmount_bin: String::new(),
         };
 
-        let archives = match ArchiveScanner::new(&folder_config).scan_archives() {
-            Ok(archives) => archives,
+        let discovery = match ArchiveScanner::new(&folder_config).scan_archives_with_summary() {
+            Ok(discovery) => discovery,
             Err(error) => {
                 counts.errors_count += 1;
                 let message = error.to_string();
@@ -3269,6 +3334,9 @@ fn scan_and_persist_folders_transaction(
                 continue;
             }
         };
+        counts.skipped_unsupported_extension += discovery.skipped_unsupported_extension as i64;
+        counts.skipped_ambiguous_platform += discovery.skipped_ambiguous_platform as i64;
+        let archives = discovery.archives;
 
         database.begin_folder_refresh()?;
         match persist_one_folder(database, scan_run_id, folder, &archives) {
@@ -5014,6 +5082,49 @@ mod tests {
     }
 
     #[test]
+    fn recently_found_persists_only_latest_completed_scan_additions() {
+        let root = temp_dir("recent-scan-additions");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "first.zip", b"one");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let first = scan_and_persist(&mut database, &config, "first").unwrap();
+        assert_eq!(first.counts.archives_added, 1);
+        assert_eq!(
+            database.latest_scan_additions().unwrap().unwrap().archives[0].display_name,
+            "first"
+        );
+
+        write_archive_file(&source, "second.zip", b"two");
+        fs::write(source.join("first.zip"), b"changed").unwrap();
+        fs::write(source.join("README.md"), b"markdown").unwrap();
+        fs::write(source.join("orphan.bin"), b"ambiguous rom").unwrap();
+        fs::write(source.join("manual.txt"), b"unsupported").unwrap();
+        let second = scan_and_persist(&mut database, &config, "second").unwrap();
+        assert_eq!(second.counts.archives_added, 1);
+        assert_eq!(second.counts.archives_changed, 1);
+        assert_eq!(second.counts.skipped_unsupported_extension, 1);
+        assert_eq!(second.counts.skipped_ambiguous_platform, 2);
+        let recent = database.latest_scan_additions().unwrap().unwrap();
+        assert_eq!(recent.scan.scan_run_id, second.scan_run_id);
+        assert_eq!(recent.archives.len(), 1);
+        assert_eq!(recent.archives[0].display_name, "second");
+
+        database.close().unwrap();
+        let reopened = Database::open_read_only(root.join("library.sqlite3")).unwrap();
+        let completed = reopened.latest_completed_scan().unwrap().unwrap();
+        assert_eq!(completed.archives_unchanged, 0);
+        assert_eq!(completed.skipped_unsupported_extension, 1);
+        assert_eq!(completed.skipped_ambiguous_platform, 2);
+        assert_eq!(
+            reopened.latest_scan_additions().unwrap().unwrap().archives[0].display_name,
+            "second"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn fail_scan_run_does_not_touch_archives() {
         let root = temp_dir("fail-scan-run-isolated");
         let source = root.join("source");
@@ -5035,6 +5146,9 @@ mod tests {
             before, after,
             "recording a failed scan run must not alter any archives row"
         );
+        let recent = database.latest_scan_additions().unwrap().unwrap();
+        assert_eq!(recent.archives.len(), 1);
+        assert_eq!(recent.archives[0].display_name, "game");
 
         let status: String = database
             .connection
@@ -7669,6 +7783,7 @@ mod tests {
         fs::remove_dir_all(&source_b).unwrap();
         fs::remove_dir_all(&source_c).unwrap();
         fs::write(&source_c, b"not a directory anymore").unwrap();
+        write_archive_file(&source_a, "new.zip", b"new despite partial scan");
 
         let second = scan_and_persist(&mut database, &config, "test").unwrap();
 
@@ -7702,13 +7817,19 @@ mod tests {
         // source_a's success is completely unaffected by the other two
         // sources both failing in the same run.
         assert_eq!(second.counts.source_folders_scanned, 1);
-        assert_eq!(second.counts.archives_seen, 1);
+        assert_eq!(second.counts.archives_seen, 2);
+        assert_eq!(second.counts.archives_added, 1);
         assert_eq!(second.counts.archives_unchanged, 1);
+
+        let recent = database.latest_scan_additions().unwrap().unwrap();
+        assert_eq!(recent.scan.scan_run_id, second.scan_run_id);
+        assert_eq!(recent.archives.len(), 1);
+        assert_eq!(recent.archives[0].display_name, "new");
 
         let archives = database.load_archives().unwrap();
         assert_eq!(
             archives.len(),
-            3,
+            4,
             "all three archives must still exist - a partial multi-source scan never marks \
              unrelated archives missing"
         );
