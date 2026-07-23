@@ -26,12 +26,12 @@ use archivefs_core::patch_manager::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewIdentity,
     PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem,
     PreviewState, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
-    UNKNOWN_CODE_POLICY, build_shared_preview, default_cheat_source_cache_root,
-    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
-    fetch_retroarch_cheat_source, inspect_dolphin_profile, inspect_pcsx2_profile,
-    inspect_retroarch_cheat_library, list_retroarch_cheat_sources, match_dolphin_inventory,
-    match_pcsx2_inventory,
+    RetroArchCheatSetupDiscovery, SharedAdapterWriteSupport, SharedPreviewError,
+    SharedPreviewReport, SharedPreviewRequest, UNKNOWN_CODE_POLICY, adapter_write_support,
+    build_shared_preview, default_cheat_source_cache_root, discover_dolphin_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles, fetch_retroarch_cheat_source,
+    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library,
+    list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
 };
 mod ui;
 
@@ -13450,7 +13450,7 @@ fn show_shared_cheat_preview(
     widgets::banner(
         ui,
         "Preview only. No files were changed.",
-        "ArchiveFS performs bounded local reads. Apply, Install, Replace, Enable, Delete, Backup, and Rollback controls are intentionally absent.",
+        "ArchiveFS performs bounded local reads. A write can be offered only after an exact materialized source enters the reviewed transaction pipeline.",
         widgets::StatusTone::Info,
     );
     match &workflow.preview {
@@ -13610,9 +13610,72 @@ fn show_shared_cheat_preview(
                         }
                     });
                 }
+                show_shared_transaction_readiness(ui, report);
             }
         },
     }
+}
+
+fn show_shared_transaction_readiness(ui: &mut egui::Ui, report: &SharedPreviewReport) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Review and controlled apply",
+        Some("Preview → Review → Confirm → Apply → Verify → Result"),
+    );
+    let support = adapter_write_support(report.adapter);
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for stage in [
+                "1 Preview",
+                "2 Review",
+                "3 Confirm",
+                "4 Apply",
+                "5 Verify",
+                "6 Result",
+            ] {
+                widgets::status_badge(ui, stage, widgets::StatusTone::Info);
+            }
+        });
+        match support {
+            SharedAdapterWriteSupport::ApplyAndRollback => {
+                widgets::status_badge(
+                    ui,
+                    "Transaction engine available",
+                    widgets::StatusTone::Success,
+                );
+                ui.label("RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected per-game catalogue source is materialized in this exact preview.");
+            }
+            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized => {
+                widgets::status_badge(ui, "Preview only", widgets::StatusTone::Pending);
+                ui.label("This adapter currently inventories emulator-managed files but does not provide an independent approved materialized source. Apply and rollback are unavailable; no shortcut is offered.");
+            }
+        }
+        let actionable = report
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.eligibility == PreviewEligibility::Eligible
+                    && matches!(
+                        entry.proposed_action,
+                        archivefs_core::patch_manager::PreviewProposedAction::Install
+                            | archivefs_core::patch_manager::PreviewProposedAction::Replace
+                    )
+            })
+            .count();
+        ui.label(format!(
+            "Actionable materialized entries in this page state: {actionable}"
+        ));
+        ui.label("General confirmation is operation-scoped. Replacement permission is separate and never preselected. Cancellation before the write phase changes nothing.");
+        if actionable == 0 {
+            widgets::banner(
+                ui,
+                "No write is available",
+                "There is no eligible materialized source bound to this exact preview, so ArchiveFS shows no Apply control.",
+                widgets::StatusTone::Pending,
+            );
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

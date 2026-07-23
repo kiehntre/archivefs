@@ -685,6 +685,7 @@ still owed and this section is the place to record it.
     replacement-permission requirement. It always states "Preview only. No
     files were changed." and exposes no mutation controls.
   - Failure notes:
+
 - [ ] **Action (In ArchiveFS GUI):** During preview, change archive, adapter,
       profile, source mode, destination, page, and platform context one at a
       time.
@@ -698,6 +699,35 @@ still owed and this section is the place to record it.
   - Expected: no file or directory is created, written, renamed, deleted,
     mounted, or timestamp-modified intentionally; no process is launched and no
     network connection is made. Only bounded regular-file reads occur.
+  - Failure notes:
+
+### Shared safe apply and rollback (synthetic fixtures only)
+
+- [ ] **Action (On Nobara desktop):** In an isolated temporary tree, create a
+      synthetic trusted RetroArch `.cht` source and exact eligible preview.
+      Review the six stages, cancel once, then explicitly confirm install-new.
+  - Expected: cancellation writes nothing. Confirmation is bound to the exact
+    plan; one destination appears atomically, verifies, and has one journal.
+    No emulator, helper process, mount, or network connection is started.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Preview replacement of a synthetic
+      different `.cht`; confirm generally without replacement permission, then
+      repeat with the separate replacement choice enabled.
+  - Expected: the first attempt preserves the original. The second creates and
+    verifies an operation-scoped backup before atomic replacement, retains the
+    backup, and records exact hashes and paths in History.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** Change archive, adapter, profile, source
+      mode, page, or platform after review and before confirmation.
+  - Expected: the stale plan cannot apply. Queue, mount, selected archive, and
+    platform state remain unchanged.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Preview rollback, modify the installed
+      destination, and attempt confirmation; restore the expected installed
+      bytes, preview again, confirm, and then attempt rollback a second time.
+  - Expected: modified content blocks rollback. The fresh exact preview safely
+    removes an install-new file or restores a verified replacement backup. The
+    second rollback is unavailable and unrelated content remains untouched.
   - Failure notes:
 
 ## 21. No-archive state

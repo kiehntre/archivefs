@@ -104,7 +104,9 @@ data, renames and deletes nothing, executes and mounts nothing, and performs no
 network operation or metadata upload. Synthetic fixture writes exist only in
 unit tests.
 
-A future apply milestone would need a fresh immediately-before-write safety
-check, explicit replacement consent, verified backups, durable journaling,
-atomic installation where supported, post-write verification, and tested
-rollback. None of those capabilities or controls exists here.
+The shared transaction foundation now provides fresh immediately-before-write
+checks, explicit replacement consent, verified backups, durable journaling,
+atomic installation, post-write verification, and rollback for adapters with a
+safe materialized source seam. PCSX2 and Dolphin remain preview-only, and the
+GUI RetroArch per-game materialization bridge remains deferred. See
+[`SHARED_SAFE_APPLY_ROLLBACK.md`](SHARED_SAFE_APPLY_ROLLBACK.md).

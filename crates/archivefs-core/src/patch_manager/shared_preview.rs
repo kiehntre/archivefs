@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::destination_safety::{
@@ -24,7 +24,7 @@ pub const PREVIEW_MAX_DESTINATION_PATHS: usize = 1024;
 pub const PREVIEW_MAX_CONFLICTS: usize = 128;
 pub const PREVIEW_MAX_WARNINGS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewAdapter {
     RetroArch,
@@ -106,7 +106,7 @@ pub enum PreviewState {
     ResourceLimitReached,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewDestinationState {
     Missing,
@@ -120,7 +120,7 @@ pub enum PreviewDestinationState {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewProposedAction {
     Install,

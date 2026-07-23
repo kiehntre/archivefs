@@ -41,6 +41,7 @@ mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
 mod shared_preview;
+mod shared_transaction;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -182,6 +183,20 @@ pub use shared_preview::{
     PreviewMatchStrength, PreviewProposedAction, PreviewSourceItem, PreviewState, PreviewSummary,
     PreviewWarning, PreviewWarningKind, SharedPreviewEntry, SharedPreviewError,
     SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
+};
+pub use shared_transaction::{
+    SHARED_APPLY_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES, SHARED_MAX_CREATED_DIRECTORIES,
+    SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES, SHARED_MAX_HISTORY_JOURNALS, SHARED_MAX_JOURNAL_BYTES,
+    SHARED_MAX_ROLLBACK_ENTRIES, SHARED_MAX_SOURCE_BYTES, SHARED_MAX_TEMP_FILES,
+    SHARED_MAX_TOTAL_WRITTEN_BYTES, SHARED_MAX_WARNINGS, SharedAdapterWriteSupport,
+    SharedApplyConfirmation, SharedApplyContext, SharedApplyEntry, SharedApplyFailure,
+    SharedApplyFailureKind, SharedApplyJournal, SharedApplyOptions, SharedApplyOutcome,
+    SharedApplyResult, SharedApplyStatus, SharedHistoryReport, SharedJournalWarning,
+    SharedPlanEntry, SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions,
+    SharedRollbackOutcome, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPath,
+    SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
+    build_shared_transaction_plan, discover_shared_apply_history, execute_shared_apply,
+    execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";

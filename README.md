@@ -491,6 +491,7 @@ Platforms:
 - [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
 - [Shared verified game identity](docs/SHARED_GAME_IDENTITY.md)
 - [Shared read-only Cheats & Mods preview](docs/SHARED_CHEAT_PREVIEW.md)
+- [Shared safe apply, journal, and rollback foundation](docs/SHARED_SAFE_APPLY_ROLLBACK.md)
 - [RetroArch environment discovery](docs/RETROARCH_ENVIRONMENT.md)
 - [RetroArch cheat/patch destination preview](docs/RETROARCH_PATCH_PREVIEW.md)
 - [RetroArch existing cheat/patch artifact inventory](docs/RETROARCH_ARTIFACT_INVENTORY.md)
