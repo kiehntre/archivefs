@@ -8969,14 +8969,14 @@ fn show_activity_panel(
                     let mut remove_index = None;
                     for (index, activity, outcome, text, archive_path) in &rows {
                         let response = widgets::card(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                widgets::status_badge(
-                                    ui,
-                                    outcome.to_string(),
-                                    activity_outcome_tone(*outcome),
-                                );
-                                ui.strong(activity.to_string());
-                            });
+                            widgets::activity_row_header(
+                                ui,
+                                outcome.to_string(),
+                                activity_outcome_tone(*outcome),
+                                activity.to_string(),
+                                None,
+                                |_ui| {},
+                            );
                             ui.add(
                                 egui::Label::new(text)
                                     .selectable(true)
@@ -12519,34 +12519,27 @@ fn show_history_logs_page(
     }
     for (entry, text) in visible_entries.iter().zip(&visible_texts) {
         widgets::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(
-                    ui,
-                    entry.outcome.to_string(),
-                    activity_outcome_tone(entry.outcome),
-                );
-                ui.strong(entry.action.to_string());
-                ui.label(
-                    egui::RichText::new(format_history_timestamp(entry.timestamp))
-                        .color(theme::muted(ui)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            widgets::activity_row_header(
+                ui,
+                entry.outcome.to_string(),
+                activity_outcome_tone(entry.outcome),
+                entry.action.to_string(),
+                Some(&format_history_timestamp(entry.timestamp)),
+                |ui| {
                     if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
                         .clicked()
                     {
                         let _ = clipboard.set_text(text.clone());
                     }
-                });
-            });
+                },
+            );
             ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
             if let Some(path) = &entry.archive_path {
-                egui::CollapsingHeader::new("Related archive")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if widgets::path_value(ui, "Archive", path) {
-                            let _ = clipboard.set_text(path.display().to_string());
-                        }
-                    });
+                widgets::technical_details(ui, ("history_related_archive", path), |ui| {
+                    if widgets::path_value(ui, "Archive", path) {
+                        let _ = clipboard.set_text(path.display().to_string());
+                    }
+                });
             }
         });
         ui.add_space(6.0);
@@ -13713,18 +13706,14 @@ fn show_recent_cheat_activity(
     }
     for entry in entries {
         widgets::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(
-                    ui,
-                    entry.outcome.to_string(),
-                    activity_outcome_tone(entry.outcome),
-                );
-                ui.strong(entry.action.to_string());
-                ui.label(
-                    egui::RichText::new(format_history_timestamp(entry.timestamp))
-                        .color(theme::muted(ui)),
-                );
-            });
+            widgets::activity_row_header(
+                ui,
+                entry.outcome.to_string(),
+                activity_outcome_tone(entry.outcome),
+                entry.action.to_string(),
+                Some(&format_history_timestamp(entry.timestamp)),
+                |_ui| {},
+            );
             ui.add(egui::Label::new(&entry.message).truncate())
                 .on_hover_text(&entry.message);
         });
@@ -18503,11 +18492,16 @@ fn show_loaded_data(
                             ui.colored_label(egui::Color32::from_rgb(210, 140, 40), warning);
                         }
                         if let Some(more_information) = &feedback.more_information {
-                            egui::CollapsingHeader::new("More information")
-                                .default_open(false)
-                                .show(ui, |ui| {
+                            widgets::technical_details(
+                                ui,
+                                (
+                                    "action_feedback_more_information",
+                                    more_information.as_str(),
+                                ),
+                                |ui| {
                                     ui.label(more_information);
-                                });
+                                },
+                            );
                         }
                         if let Some(cleanup) = &feedback.cleanup {
                             let color = if cleanup.succeeded {

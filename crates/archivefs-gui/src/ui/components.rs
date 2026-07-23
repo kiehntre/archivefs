@@ -176,6 +176,37 @@ pub(crate) fn status_rows(ui: &mut egui::Ui, rows: &[(&str, &str, StatusTone)]) 
     });
 }
 
+/// The shared "status badge + action name [+ timestamp]" header line for
+/// one activity/history entry - the piece that was rendered identically
+/// (or near-identically) by all three activity surfaces: the bottom
+/// activity bar, the full History & Logs page, and the Cheats & Mods
+/// "Recent related activity" card. `timestamp`, when present, is the
+/// already-formatted display string (the surfaces that can't spare the
+/// width for one, like the bottom bar's collapsed rows, pass `None`).
+/// Message rendering, per-row empty states, and what (if anything) sits in
+/// the row's own right-aligned `trailing` area (a Copy button on the full
+/// History & Logs page; nothing on the more space-constrained bottom bar
+/// and Cheats & Mods mini card, which instead offer Copy via a context
+/// menu) are deliberately left to each caller: those differ for real
+/// space/interaction reasons, not by accident.
+pub(crate) fn activity_row_header(
+    ui: &mut egui::Ui,
+    outcome_label: impl Into<String>,
+    outcome_tone: StatusTone,
+    action_label: impl Into<egui::RichText>,
+    timestamp: Option<&str>,
+    trailing: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal_wrapped(|ui| {
+        status_badge(ui, outcome_label, outcome_tone);
+        ui.strong(action_label);
+        if let Some(timestamp) = timestamp {
+            ui.label(egui::RichText::new(timestamp).color(theme::muted(ui)));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
+    });
+}
+
 /// One consistent presentation for "an operation failed, but the previous
 /// good result is still active" - the shape most retrieval/refresh
 /// failures in ArchiveFS take (the old cheat database, the old catalogue,
