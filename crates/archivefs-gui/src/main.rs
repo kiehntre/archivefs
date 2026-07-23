@@ -2366,35 +2366,38 @@ enum MainView {
     About,
 }
 
-/// The four lenses onto Library data, unified in spirit even though today
-/// each still has its own `MainView` destination, sidebar entry, and
-/// render function - this is the Phase 1 foundation for the eventual
-/// single tabbed Library page (see docs/GUI_SIMPLIFICATION.md's "Library
-/// IA migration" section). `Archives` corresponds to `MainView::Library`
-/// (the archive table); `Views` corresponds to `MainView::LibraryViews`
-/// (saved library views) - named differently from its `MainView` variant
-/// because "Library Views" read twice as "Library" once tabs exist.
+/// The four lenses onto Library data, now visibly unified as tabs of one
+/// Library page (see docs/GUI_SIMPLIFICATION.md's "Library IA migration"
+/// section) even though each still has its own `MainView` variant and
+/// render function underneath, retained for compatibility - see
+/// `ArchiveFsApp::update`'s central-panel dispatch, where all four are
+/// rendered from one block instead of four separate ones. `Archives`
+/// corresponds to `MainView::Library` (the archive table); `Views`
+/// corresponds to `MainView::LibraryViews` (saved library views) - named
+/// differently from its `MainView` variant because "Library Views" would
+/// read twice as "Library" now that it is a tab labelled "Library".
 ///
 /// # Synchronization rule
 ///
 /// `ArchiveFsApp::view` (`MainView`) remains the single source of truth
-/// for what actually renders in this phase - unchanged. `ArchiveFsApp::
-/// library_tab` (`LibraryTab`) is a *derived, read-only-from-the-rest-of-
-/// the-app* projection of it: once per frame, before anything renders,
+/// for which underlying render function actually runs - unchanged.
+/// `ArchiveFsApp::library_tab` (`LibraryTab`) is a *derived* projection of
+/// it: once per frame, before anything renders,
 /// `library_tab_for_main_view(self.view)` is consulted, and if `self.view`
 /// is one of the four Library-related destinations, `self.library_tab` is
 /// set to match. If `self.view` is anything else (Mount, Settings, ...),
 /// `self.library_tab` is left untouched, so it keeps remembering the last
-/// Library tab visited.
+/// Library tab visited. The unified Library shell then reads
+/// `self.library_tab` to decide which tab's content to render.
 ///
 /// This makes every existing way of navigating to a Library destination -
-/// the sidebar click, or any of the ~11 scattered `self.view =
-/// MainView::X` assignments elsewhere in the app - a correct "legacy
-/// route" into the right `LibraryTab` automatically, with no call site
-/// needing to know `LibraryTab` exists. The only sanctioned way to write
-/// `library_tab` going the other direction (choosing a tab and having
-/// `view` follow) is `ArchiveFsApp::navigate_to_library_tab`, the
-/// compatibility wrapper Phase 2's tab UI will call.
+/// the sidebar's single "Library" button, or any of the ~11 scattered
+/// `self.view = MainView::X` assignments elsewhere in the app - a correct
+/// "legacy route" into the right `LibraryTab` automatically, with no call
+/// site needing to know `LibraryTab` exists. The only sanctioned way to
+/// write `library_tab` going the other direction (choosing a tab and
+/// having `view` follow) is `ArchiveFsApp::navigate_to_library_tab`,
+/// which the shell's `tab_row` calls.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum LibraryTab {
     #[default]
@@ -7303,97 +7306,6 @@ impl eframe::App for ArchiveFsApp {
                     return;
                 }
 
-                if self.view == MainView::LibraryViews {
-                    let all_source_folders = self
-                        .database_state
-                        .snapshot()
-                        .map(|snapshot| snapshot.source_views.as_slice())
-                        .unwrap_or(&[]);
-                    let library_view_action = show_library_views_page(
-                        ui,
-                        &self.library_views,
-                        all_source_folders,
-                        self.library_view_action.is_some(),
-                        self.library_view_last_plan.as_ref(),
-                        self.library_view_focus_archive.as_deref(),
-                        &mut self.library_view_plan_filter,
-                        &mut self.library_view_form_dialog,
-                        &mut self.library_view_remove_dialog,
-                        &mut self.clipboard,
-                    );
-                    if let Some(library_view_action) = library_view_action {
-                        self.start_library_view_action(context.clone(), library_view_action);
-                    }
-                    return;
-                }
-
-                if self.view == MainView::Duplicates {
-                    if let Some(snapshot) = self.database_state.snapshot() {
-                        match show_duplicate_review_panel(
-                            ui,
-                            &snapshot.duplicate_report,
-                            DuplicateReviewViewState {
-                                filters: &mut self.duplicate_filters,
-                                sort_field: &mut self.duplicate_sort_field,
-                                sort_ascending: &mut self.duplicate_sort_ascending,
-                                selected_group: &mut self.selected_duplicate_group,
-                                selected_archive: &mut self.selected_duplicate_archive,
-                                clipboard: &mut self.clipboard,
-                            },
-                        ) {
-                            Some(DuplicateReviewAction::Close) => {
-                                self.view = MainView::Library;
-                            }
-                            Some(DuplicateReviewAction::ViewInLibrary(path)) => {
-                                self.view = MainView::Library;
-                                self.selected_archive = Some(path.clone());
-                                self.selected_archives = [path].into_iter().collect();
-                            }
-                            Some(DuplicateReviewAction::Inspect(path)) => {
-                                self.start_archive_inspection(context.clone(), path);
-                            }
-                            None => {}
-                        }
-                    } else {
-                        ui.label("Scan the library to review duplicates.");
-                    }
-                    return;
-                }
-
-                if self.view == MainView::Health {
-                    // `cached_health_issues` needs `&mut self` (it may rebuild
-                    // and store the cache); `.to_vec()` copies the small
-                    // already-built `Vec<HealthIssue>` out and ends that
-                    // mutable borrow immediately, so the immutable borrows of
-                    // `self.database_state`/`self.state` just below (for the
-                    // much larger `LoadedData`/`CachedLibrarySnapshot`, passed
-                    // by reference rather than cloned) never conflict with it.
-                    let issues = self.cached_health_issues().to_vec();
-                    if let Some(snapshot) = self.database_state.snapshot() {
-                        let live_data = match &self.state {
-                            LoadState::Ready(data) => Some(data.as_ref()),
-                            _ => None,
-                        };
-                        health_dashboard_action = show_health_dashboard_panel(
-                            ui,
-                            live_data,
-                            snapshot,
-                            &issues,
-                            HealthDashboardViewState {
-                                filters: &mut self.health_filters,
-                                sort_field: &mut self.health_sort_field,
-                                sort_ascending: &mut self.health_sort_ascending,
-                                selected_issue: &mut self.selected_health_issue,
-                                busy: archive_actions_blocked,
-                                clipboard: &mut self.clipboard,
-                            },
-                        );
-                    } else {
-                        ui.label("Scan the library to see the health dashboard.");
-                    }
-                    return;
-                }
-
                 if self.view == MainView::CheatsMods {
                     let live = match &self.state {
                         LoadState::Ready(data) => Some(data.as_ref()),
@@ -7839,20 +7751,21 @@ impl eframe::App for ArchiveFsApp {
 
                 // The unified Library shell: one heading and one tab
                 // selector shared by all four Library-related
-                // destinations. Only the Archives tab (MainView::Library)
-                // is routed through it so far - Health, Duplicates, and
-                // Library Views still render via their own `if self.view
-                // == MainView::X { ...; return; }` blocks below, unchanged.
-                // Folding those into this same block (removing their
-                // separate `if`s, matching on `self.library_tab` instead)
-                // is the very next change, so the shell covers every tab.
+                // destinations, dispatching to each tab's existing,
+                // otherwise-unmodified content. `library_tab_for_main_view`
+                // covers exactly MainView::Library/Health/Duplicates/
+                // LibraryViews (see its doc comment), so this replaces what
+                // used to be four separate `if self.view == MainView::X`
+                // blocks with one.
                 //
-                // Deliberately does *not* `return` for the Archives case:
+                // The Archives arm deliberately does *not* `return`:
                 // falling through to the existing `match &self.state`
                 // block below (shared with MainView::RecentlyFound,
                 // unchanged) is exactly how MainView::Library already
-                // reached it before this shell existed.
-                if self.view == MainView::Library {
+                // reached it before this shell existed. The other three
+                // arms `return` after rendering, exactly as their own
+                // standalone `if` blocks used to.
+                if library_tab_for_main_view(self.view).is_some() {
                     widgets::page_header(
                         ui,
                         "Library",
@@ -7872,6 +7785,104 @@ impl eframe::App for ArchiveFsApp {
                         self.navigate_to_library_tab(clicked_tab);
                     }
                     ui.add_space(theme::SECTION_GAP);
+
+                    match self.library_tab {
+                        LibraryTab::Archives => {}
+                        LibraryTab::Health => {
+                            // `cached_health_issues` needs `&mut self` (it
+                            // may rebuild and store the cache); `.to_vec()`
+                            // copies the small already-built
+                            // `Vec<HealthIssue>` out and ends that mutable
+                            // borrow immediately, so the immutable borrows
+                            // of `self.database_state`/`self.state` just
+                            // below (for the much larger
+                            // `LoadedData`/`CachedLibrarySnapshot`, passed
+                            // by reference rather than cloned) never
+                            // conflict with it.
+                            let issues = self.cached_health_issues().to_vec();
+                            if let Some(snapshot) = self.database_state.snapshot() {
+                                let live_data = match &self.state {
+                                    LoadState::Ready(data) => Some(data.as_ref()),
+                                    _ => None,
+                                };
+                                health_dashboard_action = show_health_dashboard_panel(
+                                    ui,
+                                    live_data,
+                                    snapshot,
+                                    &issues,
+                                    HealthDashboardViewState {
+                                        filters: &mut self.health_filters,
+                                        sort_field: &mut self.health_sort_field,
+                                        sort_ascending: &mut self.health_sort_ascending,
+                                        selected_issue: &mut self.selected_health_issue,
+                                        busy: archive_actions_blocked,
+                                        clipboard: &mut self.clipboard,
+                                    },
+                                );
+                            } else {
+                                ui.label("Scan the library to see the health dashboard.");
+                            }
+                            return;
+                        }
+                        LibraryTab::Duplicates => {
+                            if let Some(snapshot) = self.database_state.snapshot() {
+                                match show_duplicate_review_panel(
+                                    ui,
+                                    &snapshot.duplicate_report,
+                                    DuplicateReviewViewState {
+                                        filters: &mut self.duplicate_filters,
+                                        sort_field: &mut self.duplicate_sort_field,
+                                        sort_ascending: &mut self.duplicate_sort_ascending,
+                                        selected_group: &mut self.selected_duplicate_group,
+                                        selected_archive: &mut self.selected_duplicate_archive,
+                                        clipboard: &mut self.clipboard,
+                                    },
+                                ) {
+                                    Some(DuplicateReviewAction::Close) => {
+                                        self.view = MainView::Library;
+                                    }
+                                    Some(DuplicateReviewAction::ViewInLibrary(path)) => {
+                                        self.view = MainView::Library;
+                                        self.selected_archive = Some(path.clone());
+                                        self.selected_archives = [path].into_iter().collect();
+                                    }
+                                    Some(DuplicateReviewAction::Inspect(path)) => {
+                                        self.start_archive_inspection(context.clone(), path);
+                                    }
+                                    None => {}
+                                }
+                            } else {
+                                ui.label("Scan the library to review duplicates.");
+                            }
+                            return;
+                        }
+                        LibraryTab::Views => {
+                            let all_source_folders = self
+                                .database_state
+                                .snapshot()
+                                .map(|snapshot| snapshot.source_views.as_slice())
+                                .unwrap_or(&[]);
+                            let library_view_action = show_library_views_page(
+                                ui,
+                                &self.library_views,
+                                all_source_folders,
+                                self.library_view_action.is_some(),
+                                self.library_view_last_plan.as_ref(),
+                                self.library_view_focus_archive.as_deref(),
+                                &mut self.library_view_plan_filter,
+                                &mut self.library_view_form_dialog,
+                                &mut self.library_view_remove_dialog,
+                                &mut self.clipboard,
+                            );
+                            if let Some(library_view_action) = library_view_action {
+                                self.start_library_view_action(
+                                    context.clone(),
+                                    library_view_action,
+                                );
+                            }
+                            return;
+                        }
+                    }
                 }
 
                 match &self.state {
