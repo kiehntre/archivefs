@@ -27,12 +27,12 @@ and adapt paths accordingly - the expected result is what matters, not the
 exact machine name.
 
 Sections 15-19 cover the Cheats & Mods workspace's three adapters -
-RetroArch, PCSX2, and Dolphin - grouped together. Section 20 (Dolphin) is
-conditional: it covers a read-only Dolphin adapter implemented and
-validated on a separate branch that has **not** been merged into
-`sonnet-v0.5-release-prep`. Skip it - explicitly, on the sign-off
-checklist below, not silently - unless you are testing a build that
-actually contains that merge.
+RetroArch, PCSX2, and Dolphin - grouped together. **Historical note:**
+Section 20 (Dolphin) was originally written as conditional on a
+not-yet-merged branch; Dolphin merged before the `v0.5.0-alpha` tag was
+cut, so this section is unconditional for any build from that tag onward.
+See [`docs/MANUAL_QA_v0.6.0-alpha.md`](MANUAL_QA_v0.6.0-alpha.md) for the
+current consolidated plan.
 
 Test with a small, disposable, non-important set of archives. Do not run
 this plan against your only copy of anything you cannot afford to lose,
@@ -885,10 +885,12 @@ display/window).
 ## Sign-off
 
 - [ ] Sections 1-19 and 21-28 completed.
-- [ ] Section 20 (Dolphin) completed **only if** `codex-dolphin-readonly-adapter`
-      has been merged into the build under test; otherwise explicitly
-      marked "not applicable - Dolphin not yet merged" rather than left
-      blank or skipped silently.
+- [ ] Section 20 (Dolphin) completed. **Historical note:** at the time
+      this plan was written, Dolphin's merge into this branch was still
+      pending; it merged before the `v0.5.0-alpha` tag was cut, so this
+      section is unconditional for any build from that tag onward. See
+      [`docs/MANUAL_QA_v0.6.0-alpha.md`](MANUAL_QA_v0.6.0-alpha.md) for the
+      current consolidated plan.
 - [ ] Every failure note either resolved or explicitly deferred with a
       linked issue/tracking note.
 - [ ] `docs/release-checklist.md`'s Code section re-run and green on the

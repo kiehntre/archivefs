@@ -9,7 +9,7 @@ adapter-approved materialized local source, and an exact safe destination.
 
 | Adapter | Materialized source | Exact identity | Destination | Preview | Shared apply / rollback |
 |---|---|---|---|---|---|
-| RetroArch trusted catalogue | Available in the existing immutable catalogue snapshot | Exact or strong trusted catalogue match, bound to verified archive evidence | Canonical `.cht` path | Available in core | Available in the shared transaction API; GUI remains gated until its per-game catalogue source is materialized into the shared preview |
+| RetroArch trusted catalogue | Available in the existing immutable catalogue snapshot | Exact or strong trusted catalogue match, bound to verified archive evidence | Canonical `.cht` path | Available in core | **Available and wired into the GUI** through the per-game catalogue materialization bridge; see [`RETROARCH_GUI_APPLY_HISTORY.md`](RETROARCH_GUI_APPLY_HISTORY.md) |
 | PCSX2 | Unavailable; current adapter inventories emulator-managed PNACH files only | Verified executable CRC | Exact PNACH inventory path | Available | Preview-only: no independent approved source artifact |
 | Dolphin | Unavailable; current adapter inventories emulator-managed GameSettings INIs only | Verified Game ID, with revision kept distinct | Exact GameSettings INI inventory path | Available | Preview-only: no independent approved source artifact; no texture packs |
 
@@ -115,10 +115,9 @@ replacement backup remains available.
 
 Cheats & Mods presents the six-stage controlled flow and adapter readiness. It
 shows no Apply control for candidate, blocked, preview-only, or non-materialized
-entries. The current GUI does not yet bridge a fetched RetroArch catalogue's
-individual per-game source into the shared preview, so it truthfully remains
-gated even though the core and existing RetroArch installer have a reviewed
-materialized-source seam.
+entries. The GUI bridges a fetched RetroArch catalogue's individual per-game
+source into the shared preview through the same reviewed materialized-source
+seam the core and existing RetroArch installer already use.
 
 The pipeline performs no download, upload, mount, or process execution. It does
 not interpret cheat directives and never launches an emulator, script, binary,
@@ -126,6 +125,8 @@ or discovered executable. Writes are limited to explicitly approved destination
 files/directories and ArchiveFS-managed backup, history, temporary, and rollback
 marker paths.
 
-Future work includes the GUI RetroArch materialization bridge, multi-root
-transactions, cancellation checkpoints after writing begins, richer activity
-event projection, and conservative user-driven backup retention management.
+Future work includes multi-root transactions, cancellation checkpoints after
+writing begins, richer activity event projection, and conservative
+user-driven backup retention management. The GUI RetroArch materialization
+bridge is implemented; see
+[`RETROARCH_GUI_APPLY_HISTORY.md`](RETROARCH_GUI_APPLY_HISTORY.md).
