@@ -107,6 +107,7 @@ pub fn fetch_source(
         expected_sha256: options.expected_sha256.clone(),
         max_download_bytes: options.max_download_bytes,
         cancellation: None,
+        progress: None,
     };
     fetch_retroarch_cheat_source(source_id, &core_options, &HttpsCheatSourceTransport::new())
 }

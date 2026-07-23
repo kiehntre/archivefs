@@ -22,21 +22,23 @@ use archivefs_core::game_identity::{
 use archivefs_core::patch_manager::{
     CheatCatalogueStatus, CheatSourceCancellation, CheatSourceError, CheatSourceFetchOptions,
     CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList,
-    CheatSourceListEntry, DolphinGameIniInventory, DolphinInstallationType, DolphinMatchState,
-    DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinSettingsDirectoryState, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewSourceItem, PreviewState, RetroArchCheatLibraryInspection,
-    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
-    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
-    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
-    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, UNKNOWN_CODE_POLICY, adapter_write_support, build_shared_preview,
+    CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
+    CheatSourceProgressReporter, DolphinGameIniInventory, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
+    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType,
+    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory,
+    Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
+    PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewIdentity,
+    PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem,
+    PreviewState, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
+    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
+    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    UNKNOWN_CODE_POLICY, adapter_write_support, build_shared_preview,
     build_shared_transaction_plan, default_cheat_source_cache_root, default_shared_backup_root,
     default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
     discover_retroarch_cheat_setup_profiles, discover_shared_apply_history, execute_shared_apply,
@@ -3911,6 +3913,7 @@ impl ArchiveFsApp {
         let cancellation = CheatSourceCancellation::default();
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
             None,
@@ -3925,7 +3928,14 @@ impl ArchiveFsApp {
             source_id: source_id.clone(),
             cancellation,
             receiver,
+            progress_receiver,
+            progress: None,
             cancellation_requested: false,
+        });
+        let progress_context = context.clone();
+        let progress = CheatSourceProgressReporter::new(move |event| {
+            let _ = progress_sender.send(event);
+            progress_context.request_repaint();
         });
         thread::spawn(move || {
             let result = default_cheat_source_cache_root().and_then(|cache_root| {
@@ -3938,6 +3948,7 @@ impl ArchiveFsApp {
                         expected_sha256: None,
                         max_download_bytes: None,
                         cancellation: Some(worker_cancellation),
+                        progress: Some(progress),
                     },
                     &HttpsCheatSourceTransport::new(),
                 )
@@ -3960,8 +3971,14 @@ impl ArchiveFsApp {
                         stage: archivefs_core::patch_manager::CheatSourceErrorStage::Cache,
                         code: "status_worker_stopped".to_string(),
                         message: "catalogue status worker stopped unexpectedly".to_string(),
+                        retry_after_seconds: None,
                     });
                 }
+            }
+        }
+        if let Some(running) = self.catalogue_retrieval.as_mut() {
+            for progress in running.progress_receiver.try_iter() {
+                running.progress = Some(progress);
             }
         }
         let result = self.catalogue_retrieval.as_ref().and_then(|running| {
@@ -5359,6 +5376,7 @@ impl ArchiveFsApp {
                         expected_sha256: None,
                         max_download_bytes: None,
                         cancellation: None,
+                        progress: None,
                     };
                     let transport = HttpsCheatSourceTransport::new();
                     fetch_retroarch_cheat_source(&source_id, &options, &transport)
@@ -9756,6 +9774,8 @@ struct RunningCatalogueRetrieval {
     source_id: String,
     cancellation: CheatSourceCancellation,
     receiver: Receiver<Result<CheatSourceFetchResult, CheatSourceError>>,
+    progress_receiver: Receiver<CheatSourceProgress>,
+    progress: Option<CheatSourceProgress>,
     cancellation_requested: bool,
 }
 
@@ -10015,9 +10035,57 @@ fn show_retroarch_catalogue_manager(
                 ui.label(if running.cancellation_requested {
                     "Cancellation requested; the active snapshot will remain unchanged."
                 } else {
-                    "Resolving, downloading, verifying, and staging the catalogue…"
+                    "Catalogue retrieval is running; the active snapshot remains usable until activation."
                 });
             });
+            if let Some(progress) = &running.progress {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        catalogue_progress_label(progress.phase),
+                        if progress.phase == CheatSourceProgressPhase::Retrying {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Info
+                        },
+                    );
+                    if progress.attempt != 0 {
+                        ui.label(format!(
+                            "Attempt {} of {}",
+                            progress.attempt, progress.maximum_attempts
+                        ));
+                    }
+                });
+                if progress.phase == CheatSourceProgressPhase::Downloading {
+                    let received = format_transfer_bytes(progress.bytes_received);
+                    if let Some(total) = progress.total_bytes {
+                        let percentage = if total == 0 {
+                            0.0
+                        } else {
+                            progress.bytes_received as f64 * 100.0 / total as f64
+                        };
+                        ui.label(format!(
+                            "Received {received} of {} ({percentage:.1}%)",
+                            format_transfer_bytes(total)
+                        ));
+                        ui.add(
+                            egui::ProgressBar::new(
+                                (progress.bytes_received as f32 / total.max(1) as f32)
+                                    .clamp(0.0, 1.0),
+                            )
+                            .show_percentage(),
+                        );
+                    } else {
+                        ui.label(format!("Received {received}; server size is unknown."));
+                    }
+                }
+                if progress.phase == CheatSourceProgressPhase::Retrying {
+                    ui.label(format!(
+                        "Retrying after {} seconds.",
+                        progress.retry_delay_seconds.unwrap_or_default()
+                    ));
+                }
+            }
             if widgets::action_button(
                 ui,
                 "Cancel",
@@ -10084,6 +10152,31 @@ fn show_retroarch_catalogue_manager(
         }
     }
     action
+}
+
+fn catalogue_progress_label(phase: CheatSourceProgressPhase) -> &'static str {
+    match phase {
+        CheatSourceProgressPhase::ResolvingRevision => "Resolving exact revision",
+        CheatSourceProgressPhase::Connecting => "Connecting",
+        CheatSourceProgressPhase::Downloading => "Downloading",
+        CheatSourceProgressPhase::Retrying => "Retrying",
+        CheatSourceProgressPhase::VerifyingArchive => "Verifying archive digest",
+        CheatSourceProgressPhase::Extracting => "Extracting safely",
+        CheatSourceProgressPhase::VerifyingFiles => "Verifying catalogue files",
+        CheatSourceProgressPhase::Activating => "Activating verified snapshot",
+        CheatSourceProgressPhase::Cancelled => "Cancelled",
+    }
+}
+
+fn format_transfer_bytes(bytes: u64) -> String {
+    const MIB: f64 = (1024 * 1024) as f64;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn show_sources_page(
@@ -22399,6 +22492,7 @@ mod tests {
             stage: archivefs_core::patch_manager::CheatSourceErrorStage::Download,
             code: "download_too_large".into(),
             message: "received 268435457 bytes, exceeding configured limit 268435456 bytes".into(),
+            retry_after_seconds: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -22423,6 +22517,75 @@ mod tests {
         ] {
             assert!(rendered_text_contains(&output, expected));
         }
+    }
+
+    #[test]
+    fn sources_shows_streaming_bytes_percentage_retry_and_retained_snapshot_wording() {
+        let (_, _, list) = cheat_source_list_fixture();
+        let (_result_sender, result_receiver) = mpsc::channel();
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        let mut running = RunningCatalogueRetrieval {
+            generation: 1,
+            source_id: "libretro-buildbot-cheats".into(),
+            cancellation: CheatSourceCancellation::default(),
+            receiver: result_receiver,
+            progress_receiver,
+            progress: Some(CheatSourceProgress {
+                phase: CheatSourceProgressPhase::Downloading,
+                attempt: 1,
+                maximum_attempts: 3,
+                bytes_received: 89 * 1024 * 1024,
+                total_bytes: Some(178 * 1024 * 1024),
+                retry_delay_seconds: None,
+            }),
+            cancellation_requested: false,
+        };
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_retroarch_catalogue_manager(
+                    ui,
+                    &CatalogueManagerState::Ready(list.clone()),
+                    None,
+                    Some(&running),
+                    None,
+                    &mut clipboard,
+                );
+            });
+        });
+        for expected in [
+            "Downloading",
+            "Attempt 1 of 3",
+            "Received 89.0 MiB of 178.0 MiB (50.0%)",
+            "active snapshot remains usable until activation",
+        ] {
+            assert!(rendered_text_contains(&output, expected));
+        }
+
+        running.progress = Some(CheatSourceProgress {
+            phase: CheatSourceProgressPhase::Retrying,
+            attempt: 2,
+            maximum_attempts: 3,
+            bytes_received: 0,
+            total_bytes: None,
+            retry_delay_seconds: Some(5),
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_retroarch_catalogue_manager(
+                    ui,
+                    &CatalogueManagerState::Ready(list.clone()),
+                    None,
+                    Some(&running),
+                    None,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Retrying"));
+        assert!(rendered_text_contains(&output, "Attempt 2 of 3"));
+        assert!(rendered_text_contains(&output, "Retrying after 5 seconds"));
     }
 
     #[test]
@@ -22470,11 +22633,14 @@ mod tests {
             )))
             .unwrap();
         app.catalogue_generation = 2;
+        let (_progress_sender, progress_receiver) = mpsc::channel();
         app.catalogue_retrieval = Some(RunningCatalogueRetrieval {
             generation: 1,
             source_id: "libretro-buildbot-cheats".into(),
             cancellation: CheatSourceCancellation::default(),
             receiver,
+            progress_receiver,
+            progress: None,
             cancellation_requested: false,
         });
         app.poll_catalogue_manager(&egui::Context::default());

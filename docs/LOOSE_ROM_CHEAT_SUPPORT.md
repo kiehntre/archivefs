@@ -65,7 +65,8 @@ unverified. Trusted ArchiveFS snapshot matching is a separate pipeline.
 The official immutable catalogue remains bounded at 256 MiB compressed, 1 GiB
 expanded, 60,000 extracted entries, 50,000 indexed files, 8 MiB per file, 16
 MiB manifest, 1,024 path bytes, 250:1 compression ratio, three redirects, and a
-180-second global timeout. A failed or timed-out update leaves the prior active
+30-second connect, 60-second idle-read, and 15-minute overall transfer bounds.
+A failed, cancelled, or timed-out update leaves the prior active
 snapshot unchanged and the Sources page states that it remains usable.
 
 ## Manual Saltbox/Nobara QA
