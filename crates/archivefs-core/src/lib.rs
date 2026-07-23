@@ -38,6 +38,8 @@ pub use inspector::{
     is_inspectable,
 };
 
+pub mod game_identity;
+
 mod library_views;
 pub use library_views::{
     LibraryViewApplyEntryResult, LibraryViewApplyOutcome, LibraryViewApplyReport,

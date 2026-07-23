@@ -42,7 +42,8 @@ RetroArch cheat directory. A PS2-only PCSX2 adapter can also discover eligible
 or blocked native and Flatpak profiles and inspect existing PNACH files in
 `cheats`, `cheats_ws`, and an existing `patches` directory. It categorizes by
 directory, parses bounded metadata, and records CRC/title candidates without
-claiming exact identity. No PCSX2 installation or mutation action exists. See
+claiming exact identity unless the shared bounded ISO reader supplies a
+verified executable CRC. No PCSX2 installation or mutation action exists. See
 [`PCSX2_READONLY_ADAPTER.md`](PCSX2_READONLY_ADAPTER.md).
 
 For GameCube and Wii archives, the Dolphin adapter discovers documented native
@@ -50,7 +51,8 @@ and Flatpak user directories and inspects existing, regular
 `GameSettings/*.ini` files. It records filename Game ID/revision candidates and
 the names declared or enabled by supported frame-patch, Action Replay, Gecko,
 and Riivolution sections. It never evaluates codes or follows mod references,
-and a filename is not treated as verified archive identity. No Dolphin
+and a filename is not treated as verified archive identity. A verified ID from
+the shared bounded disc-header reader can establish an exact match. No Dolphin
 installation or mutation action exists. See
 [`DOLPHIN_READONLY_ADAPTER.md`](DOLPHIN_READONLY_ADAPTER.md).
 

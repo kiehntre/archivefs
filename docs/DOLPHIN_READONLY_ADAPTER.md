@@ -71,12 +71,12 @@ supplies those values as separately verified archive evidence. It distinguishes
 one exact ID match, an exact ID-and-revision match, multiple matching files, a
 revision mismatch, invalid input, and no match.
 
-The current GUI has no reviewed, bounded GameCube/Wii disc-header identity
-reader, so it reports verified identity extraction as unavailable. An INI
-filename Game ID is an observation about that INI, not proof that the selected
-archive is the same game. Future exact matching requires a separately reviewed
-reader for supported archive formats that does not mount, extract, or execute
-content.
+The shared identity reader now verifies a GameCube or Wii Game ID using a
+bounded disc-header read from supported ISO input. This enables exact ID
+matching. GameCube revision can enable revision-aware matching; Wii
+outer-header revision remains candidate-only. An INI or archive filename Game
+ID remains an observation, not verified identity. See
+[`SHARED_GAME_IDENTITY.md`](SHARED_GAME_IDENTITY.md).
 
 ## Privacy, safety, and future work
 
