@@ -297,7 +297,7 @@ fn retroarch_cht_folder_platform_alias_matches_canonical_catalogue_platform() {
 }
 
 #[test]
-fn malformed_cht_marks_parsing_incomplete_but_keeps_record() {
+fn malformed_cht_is_a_bounded_non_fatal_exclusion() {
     let root = temp_root("malformed-cht");
     fs::write(
         root.join("Game.cht"),
@@ -305,9 +305,18 @@ fn malformed_cht_marks_parsing_incomplete_but_keeps_record() {
     )
     .unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
-    assert_eq!(snapshot.games.len(), 1);
-    assert!(!snapshot.games[0].parsing_complete);
-    assert_eq!(snapshot.games[0].cheat_count, 1);
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
+    assert!(snapshot.games.is_empty());
+    assert_eq!(snapshot.excluded_entries.len(), 1);
+    assert_eq!(
+        snapshot.excluded_entries[0].kind,
+        CatalogueEntryExclusionKind::MalformedCht
+    );
+    assert_eq!(
+        snapshot.excluded_entries[0].source_game_name.as_deref(),
+        Some("Game")
+    );
 }
 
 #[test]
@@ -335,15 +344,82 @@ fn non_utf8_filename_is_skipped_with_diagnostic() {
     let root = temp_root("non-utf8-filename");
     let name = OsString::from_vec(b"bad-\xFF-name.cht".to_vec());
     fs::write(root.join(&name), "cheats = 0\n").unwrap();
+    fs::write(root.join("Good.cht"), "cheats = 0\n").unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
-    assert!(snapshot.games.is_empty());
-    assert!(!snapshot.complete);
-    assert!(
-        snapshot
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "catalogue_file_non_utf8_name_skipped")
+    assert_eq!(snapshot.games.len(), 1);
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
+    assert_eq!(snapshot.excluded_path_encoding_count(), 1);
+    assert!(snapshot.excluded_entries[0].path.lossy);
+    assert!(snapshot.diagnostics.is_empty());
+}
+
+#[test]
+fn invalid_utf8_content_is_excluded_without_poisoning_valid_entries() {
+    let root = temp_root("invalid-content-encoding");
+    fs::write(root.join("Good.cht"), "cheats = 0\n").unwrap();
+    fs::write(root.join("Bad.cht"), b"cheats = 1\n\xff").unwrap();
+
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
+    assert_eq!(snapshot.games.len(), 1);
+    assert_eq!(snapshot.excluded_unsupported_count(), 1);
+    assert_eq!(
+        snapshot.excluded_entries[0].kind,
+        CatalogueEntryExclusionKind::UnsupportedContentEncoding
     );
+}
+
+#[test]
+fn exclusion_examples_are_deterministic_and_bounded() {
+    let root = temp_root("deterministic-exclusions");
+    fs::write(root.join("Zed.cht"), b"\xff").unwrap();
+    fs::write(root.join("Alpha.cht"), "not an assignment\n").unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    let paths = snapshot
+        .excluded_entries
+        .iter()
+        .take(MAX_CATALOGUE_EXCLUSION_EXAMPLES)
+        .map(|entry| entry.path.display.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            root.join("Alpha.cht").display().to_string(),
+            root.join("Zed.cht").display().to_string(),
+        ]
+    );
+
+    let mut exclusions = Vec::new();
+    let mut diagnostics = Vec::new();
+    for index in 0..MAX_CATALOGUE_EXCLUDED_ENTRIES {
+        assert!(push_excluded_entry(
+            &mut exclusions,
+            CatalogueExcludedEntry {
+                kind: CatalogueEntryExclusionKind::MalformedCht,
+                path: EncodedPath::from_path(&root.join(format!("{index}.cht"))),
+                source_game_name: Some(index.to_string()),
+                source_platform: Some("SNES".into()),
+            },
+            &root,
+            &mut diagnostics,
+        ));
+    }
+    assert!(!push_excluded_entry(
+        &mut exclusions,
+        CatalogueExcludedEntry {
+            kind: CatalogueEntryExclusionKind::MalformedCht,
+            path: EncodedPath::from_path(&root.join("overflow.cht")),
+            source_game_name: Some("overflow".into()),
+            source_platform: Some("SNES".into()),
+        },
+        &root,
+        &mut diagnostics,
+    ));
+    assert_eq!(exclusions.len(), MAX_CATALOGUE_EXCLUDED_ENTRIES);
+    assert_eq!(diagnostics[0].code, "catalogue_exclusion_limit_reached");
 }
 
 #[cfg(unix)]
