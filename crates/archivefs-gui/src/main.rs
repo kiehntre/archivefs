@@ -2549,19 +2549,6 @@ const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 11] = [
     (MainView::Settings, "Settings"),
     (MainView::About, "About"),
 ];
-const SECONDARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 3] = [
-    (MainView::Health, "Health"),
-    (MainView::Duplicates, "Duplicates"),
-    (MainView::LibraryViews, "Library Views"),
-];
-/// "Library tools" rather than the former "Catalogue views": these three
-/// destinations are all secondary lenses onto the same Library data
-/// (health issues, duplicate groups, saved views), and "catalogue" is
-/// internal terminology a first-time user has no reason to know. Kept as
-/// its own destinations (not merged into `Library`) in this pass - see
-/// docs/GUI_SIMPLIFICATION.md for the proposed future tabbed-Library
-/// migration and why it is deferred.
-const SECONDARY_NAVIGATION_SECTION_LABEL: &str = "LIBRARY TOOLS";
 fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
     !matches!(
         view,
@@ -2569,8 +2556,21 @@ fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
     ) || has_database
 }
 
+/// Whether the sidebar button for `candidate` should render as selected
+/// given the currently active `current` view. Ordinary destinations use
+/// exact equality; `MainView::Library`'s button is the sole sidebar entry
+/// point into the unified Library shell, so it renders selected whenever
+/// `current` is *any* of the four Library-related destinations
+/// (`library_tab_for_main_view(current).is_some()`), not just
+/// `MainView::Library` itself - otherwise the sidebar would show no
+/// selected destination at all while on the Health, Duplicates, or Views
+/// tab.
 fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
-    current == candidate
+    if candidate == MainView::Library {
+        library_tab_for_main_view(current).is_some()
+    } else {
+        current == candidate
+    }
 }
 
 /// Whether the RetroArch cheat-database status should be (re)loaded for the
@@ -2619,11 +2619,35 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
     }
 }
 
+/// Whether `view`'s content should be wrapped in the outer page-level
+/// `ScrollArea` (`ui_layout::page`'s `scrollable` argument), rather than
+/// managing its own scrolling internally.
+///
+/// # The unified Library shell's scrolling rule
+///
+/// All four Library-related destinations (`Library`, `Health`,
+/// `Duplicates`, `LibraryViews`) are `false` here - no outer page scroll.
+/// Three of them (Library's archive table, Health's issue list,
+/// Duplicates' group list) already manage their own internal
+/// `ScrollArea`, sized to fill the available height; wrapping them in a
+/// second, outer scroll area would produce nested double scrollbars and
+/// fight their own height calculations. `LibraryViews` used to be `true`
+/// (the only Library-related destination that was): auditing its body
+/// found its two variable-length lists (the view definitions themselves,
+/// and a selected view's plan-entry details) are *already* each wrapped
+/// in their own bounded `egui::ScrollArea` (`max_height` 320.0 and 240.0
+/// respectively - see `show_library_views_page`), and everything else on
+/// the page (heading, "Add View" button, the Add/Edit/Remove dialogs,
+/// which are separate `egui::Window`s with their own scroll areas) is
+/// short, fixed-height content that was never actually at risk of
+/// overflowing. So flipping it to `false` - the smallest change that
+/// makes the shell's scroll behaviour consistent across all four tabs,
+/// with the tab row always pinned above whichever scroll area (if any) a
+/// tab owns - loses no reachable content and does not clip anything.
 fn main_view_uses_page_scroll(view: MainView) -> bool {
     matches!(
         view,
         MainView::Sources
-            | MainView::LibraryViews
             | MainView::Doctor
             | MainView::HistoryLogs
             | MainView::Settings
@@ -2651,22 +2675,6 @@ fn show_primary_navigation(
             let selected = navigation_destination_selected(current, view);
             let button = egui::Button::selectable(selected, label)
                 .min_size(egui::vec2(ui.available_width(), 34.0));
-            if ui.add_enabled(enabled, button).clicked() {
-                clicked_view = Some(view);
-            }
-        }
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new(SECONDARY_NAVIGATION_SECTION_LABEL)
-                .small()
-                .strong()
-                .color(theme::muted(ui)),
-        );
-        for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
-            let enabled = navigation_destination_enabled(view, has_database);
-            let button =
-                egui::Button::selectable(navigation_destination_selected(current, view), label)
-                    .min_size(egui::vec2(ui.available_width(), 34.0));
             if ui.add_enabled(enabled, button).clicked() {
                 clicked_view = Some(view);
             }
@@ -7092,6 +7100,12 @@ impl eframe::App for ArchiveFsApp {
                     self.tools_overlay = ToolsOverlay::None;
                     self.cheat_workflow = None;
                 }
+            } else if clicked == MainView::Library {
+                // The sidebar's one Library button must restore whichever
+                // Library tab was last selected (Archives, Health,
+                // Duplicates, or Views), not always reset to Archives -
+                // see LibraryTab's doc comment.
+                self.navigate_to_library_tab(self.library_tab);
             } else {
                 self.view = clicked;
                 self.tools_overlay = ToolsOverlay::None;
@@ -21885,10 +21899,7 @@ mod tests {
 
     #[test]
     fn every_navigation_destination_has_a_title_and_width_policy() {
-        for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS
-            .into_iter()
-            .chain(SECONDARY_NAVIGATION_DESTINATIONS)
-        {
+        for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
             assert_eq!(main_view_title(view), label);
             let _ = main_view_content_width(view);
         }
@@ -24875,12 +24886,24 @@ mod tests {
             MainView::Doctor,
             MainView::About,
             MainView::Sources,
-            MainView::LibraryViews,
             MainView::HistoryLogs,
         ] {
             assert!(main_view_uses_page_scroll(view));
         }
-        for view in [MainView::Library, MainView::RecentlyFound, MainView::Mount] {
+        // The unified Library shell's scrolling rule: all four
+        // Library-related destinations manage their own internal
+        // scrolling (Library/Health/Duplicates already did; LibraryViews
+        // moved here too - see main_view_uses_page_scroll's doc comment
+        // for why that is safe), so none of them use the outer page
+        // scroll.
+        for view in [
+            MainView::Library,
+            MainView::Health,
+            MainView::Duplicates,
+            MainView::LibraryViews,
+            MainView::RecentlyFound,
+            MainView::Mount,
+        ] {
             assert!(!main_view_uses_page_scroll(view));
         }
     }
@@ -32860,14 +32883,15 @@ mod tests {
     }
 
     /// Mirrors `show_primary_navigation`'s exact layout (same widgets, same
-    /// order, same enabled predicate) purely to discover each button's
-    /// rendered `Rect` for click simulation. The production function
-    /// itself only returns `Option<MainView>`, not per-button geometry;
-    /// egui's vertical layout is fully deterministic from widget order
-    /// and size alone, so this mirror's rects match the real function's.
-    /// Iterates the same `PRIMARY_NAVIGATION_DESTINATIONS` /
-    /// `SECONDARY_NAVIGATION_DESTINATIONS` consts production uses, so the
-    /// mirror cannot drift from the real destination list.
+    /// order, same enabled predicate, same selected predicate) purely to
+    /// discover each button's rendered `Rect` for click simulation. The
+    /// production function itself only returns `Option<MainView>`, not
+    /// per-button geometry; egui's vertical layout is fully deterministic
+    /// from widget order and size alone, so this mirror's rects match the
+    /// real function's. Iterates the same `PRIMARY_NAVIGATION_DESTINATIONS`
+    /// const production uses, so the mirror cannot drift from the real
+    /// destination list - now just one section since sidebar consolidation
+    /// removed the secondary "LIBRARY TOOLS" section entirely.
     /// The actual click below is driven through the real production
     /// function, not this mirror.
     fn primary_nav_rects(
@@ -32892,21 +32916,8 @@ mod tests {
                     );
                     for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
                         let enabled = navigation_destination_enabled(view, has_database);
-                        let button = egui::Button::selectable(current == view, label)
-                            .min_size(egui::vec2(ui.available_width(), 34.0));
-                        let resp = ui.add_enabled(enabled, button);
-                        rects.push((view, resp.rect));
-                    }
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(SECONDARY_NAVIGATION_SECTION_LABEL)
-                            .small()
-                            .strong()
-                            .color(theme::muted(ui)),
-                    );
-                    for (view, label) in SECONDARY_NAVIGATION_DESTINATIONS {
-                        let enabled = navigation_destination_enabled(view, has_database);
-                        let button = egui::Button::selectable(current == view, label)
+                        let selected = navigation_destination_selected(current, view);
+                        let button = egui::Button::selectable(selected, label)
                             .min_size(egui::vec2(ui.available_width(), 34.0));
                         let resp = ui.add_enabled(enabled, button);
                         rects.push((view, resp.rect));
@@ -32923,7 +32934,6 @@ mod tests {
 
         let all_destinations = PRIMARY_NAVIGATION_DESTINATIONS
             .iter()
-            .chain(SECONDARY_NAVIGATION_DESTINATIONS.iter())
             .map(|(view, _)| *view);
         for target in all_destinations {
             let rects = primary_nav_rects(&ctx, MainView::Library, true);
