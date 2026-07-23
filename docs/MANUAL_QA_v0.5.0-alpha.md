@@ -675,6 +675,31 @@ still owed and this section is the place to record it.
     inspection.
   - Failure notes:
 
+### Shared read-only preview (synthetic fixtures only)
+
+- [ ] **Action (On Nobara desktop):** Use isolated synthetic PCSX2 and Dolphin
+      sources with verified synthetic identities and destinations that are
+      missing, identical, different, symlinks, directories, and special files.
+  - Expected: Shared Preview reports the exact source and destination, typed
+    destination state, proposed action, eligibility, backup requirement, and
+    replacement-permission requirement. It always states "Preview only. No
+    files were changed." and exposes no mutation controls.
+  - Failure notes:
+- [ ] **Action (In ArchiveFS GUI):** During preview, change archive, adapter,
+      profile, source mode, destination, page, and platform context one at a
+      time.
+  - Expected: each superseded result is discarded; it never appears under the
+    new context, and the mount queue, current mounts, and selected platform are
+    unchanged.
+  - Failure notes:
+- [ ] **Action (On Nobara desktop):** Compare the isolated fixture tree before
+      and after missing/identical/different/conflict previews while monitoring
+      processes and network activity.
+  - Expected: no file or directory is created, written, renamed, deleted,
+    mounted, or timestamp-modified intentionally; no process is launched and no
+    network connection is made. Only bounded regular-file reads occur.
+  - Failure notes:
+
 ## 21. No-archive state
 
 - [ ] **Action (In ArchiveFS GUI):** Clear the Library selection entirely

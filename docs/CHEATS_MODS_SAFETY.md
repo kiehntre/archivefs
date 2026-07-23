@@ -56,6 +56,15 @@ the shared bounded disc-header reader can establish an exact match. No Dolphin
 installation or mutation action exists. See
 [`DOLPHIN_READONLY_ADAPTER.md`](DOLPHIN_READONLY_ADAPTER.md).
 
+The shared preview foundation revalidates matched source files, resolves
+destinations through the existing no-follow safety checks, and reports what a
+future operation would do without changing the filesystem. Only verified
+identity can authorize an exact PCSX2 or Dolphin preview; candidate evidence is
+shown but blocked. RetroArch exact/strong inputs are supported by the core
+model, while the GUI currently reports source unavailable until the trusted
+catalogue can materialize a per-game source item. See
+[`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
+
 The archive picker searches the already loaded ArchiveFS library by displayed
 name, platform, source, mount state, and path. Its tentative selection is
 separate from Library focus and mount queues. Applying a choice changes only the
