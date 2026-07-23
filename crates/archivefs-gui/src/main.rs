@@ -2472,6 +2472,14 @@ const SECONDARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 3] = [
     (MainView::Duplicates, "Duplicates"),
     (MainView::LibraryViews, "Library Views"),
 ];
+/// "Library tools" rather than the former "Catalogue views": these three
+/// destinations are all secondary lenses onto the same Library data
+/// (health issues, duplicate groups, saved views), and "catalogue" is
+/// internal terminology a first-time user has no reason to know. Kept as
+/// its own destinations (not merged into `Library`) in this pass - see
+/// docs/GUI_SIMPLIFICATION.md for the proposed future tabbed-Library
+/// migration and why it is deferred.
+const SECONDARY_NAVIGATION_SECTION_LABEL: &str = "LIBRARY TOOLS";
 fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
     !matches!(
         view,
@@ -2557,7 +2565,7 @@ fn show_primary_navigation(
         }
         ui.add_space(12.0);
         ui.label(
-            egui::RichText::new("CATALOGUE VIEWS")
+            egui::RichText::new(SECONDARY_NAVIGATION_SECTION_LABEL)
                 .small()
                 .strong()
                 .color(theme::muted(ui)),
@@ -9980,9 +9988,10 @@ fn show_retroarch_catalogue_manager(
                             action = Some(CatalogueManagerAction::Refresh);
                         }
                     });
-                    egui::CollapsingHeader::new("Open details")
-                        .default_open(false)
-                        .show(ui, |ui| {
+                    widgets::technical_details(
+                        ui,
+                        ("provider_technical_details", &entry.source.source_id),
+                        |ui| {
                             widgets::copyable_value(ui, "Provider ID", &entry.source.source_id);
                             widgets::copyable_value(
                                 ui,
@@ -10023,7 +10032,8 @@ fn show_retroarch_catalogue_manager(
                                     entry.source.revision_url
                                 ));
                             }
-                        });
+                        },
+                    );
                 });
             }
         }
@@ -31982,7 +31992,7 @@ mod tests {
                     }
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("CATALOGUE VIEWS")
+                        egui::RichText::new(SECONDARY_NAVIGATION_SECTION_LABEL)
                             .small()
                             .strong()
                             .color(theme::muted(ui)),

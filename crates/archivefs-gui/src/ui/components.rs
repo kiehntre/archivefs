@@ -127,6 +127,58 @@ pub(crate) fn path_value(ui: &mut egui::Ui, label: &str, path: &Path) -> bool {
     copyable_value(ui, label, &path.display().to_string())
 }
 
+/// The one place every "Technical details" / "Open details" disclosure in
+/// the app should go through, so provider IDs, digests, manifest paths,
+/// hashes, and other internals are always tucked behind the same label in
+/// the same collapsed-by-default shape instead of each call site inventing
+/// its own `CollapsingHeader` title and default state.
+pub(crate) fn technical_details<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    egui::CollapsingHeader::new("Technical details")
+        .id_salt(id_salt)
+        .default_open(false)
+        .show(ui, add_contents)
+        .body_returned
+}
+
+/// A compact single row of status badges, for pages that used to stack
+/// several large cards each stating one piece of status (profile, source,
+/// trust, identity, ...). Wraps onto more than one line if the available
+/// width is too narrow for all of them.
+pub(crate) fn status_strip(ui: &mut egui::Ui, items: &[(&str, StatusTone)]) {
+    ui.horizontal_wrapped(|ui| {
+        for (label, tone) in items {
+            status_badge(ui, *label, *tone);
+        }
+    });
+}
+
+/// One consistent presentation for "an operation failed, but the previous
+/// good result is still active" - the shape most retrieval/refresh
+/// failures in ArchiveFS take (the old cheat database, the old catalogue,
+/// the old snapshot all remain usable). Shows the plain-language headline
+/// and, when the prior state is still active, a short retained-state note,
+/// directly; the original detailed error text is preserved in full but
+/// moved behind [`technical_details`] rather than duplicated across a page
+/// alert, an activity-bar entry, and an activity-panel entry.
+pub(crate) fn failure_summary(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    headline: &str,
+    retained_note: Option<&str>,
+    detail: &str,
+) {
+    banner(ui, headline, retained_note.unwrap_or(""), StatusTone::Warning);
+    if !detail.is_empty() {
+        technical_details(ui, id_salt, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
+        });
+    }
+}
+
 pub(crate) fn copyable_value(ui: &mut egui::Ui, label: &str, full: &str) -> bool {
     let mut copy = false;
     ui.horizontal(|ui| {
