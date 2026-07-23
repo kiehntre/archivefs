@@ -8219,6 +8219,28 @@ fn describe_platform_assignment(platform: Option<&str>, source: Option<&str>) ->
     }
 }
 
+/// The one honest explanation shown everywhere platform detection came up
+/// empty. `detect_platform_with_details` (archivefs-core) only ever
+/// returns `Some` detection or `None` - it does not currently distinguish
+/// *why* it found nothing (unsupported extension vs. ambiguous folder vs.
+/// archive contents never inspected vs. no alias match), so the GUI must
+/// not invent a specific-sounding reason it cannot back up. This is that
+/// one generic, still-useful explanation, kept in one place so a future
+/// core change that adds a real per-entry reason only has to update the
+/// call sites below, not invent new copy. See docs/GUI_SIMPLIFICATION.md
+/// for the core API shape that would unlock per-entry reasons.
+const UNKNOWN_PLATFORM_EXPLANATION: &str = "ArchiveFS checks the filename, title, and folder \
+    path against known platform names and folder aliases. When none of those match, the \
+    platform is left Unknown rather than guessed. Assign a platform manually below, or add a \
+    folder alias in Sources so future scans recognize it automatically.";
+
+/// Aggregate-form headline for the Unknown-platform explanation banner
+/// shown on the Library page - see `UNKNOWN_PLATFORM_EXPLANATION`.
+fn unknown_platform_aggregate_headline(count: usize) -> String {
+    let noun = if count == 1 { "entry" } else { "entries" };
+    format!("{count} {noun} with unknown platform")
+}
+
 fn platform_source_label(source: Option<&str>) -> &'static str {
     match source {
         Some(MANUAL_PLATFORM_SOURCE) => "Manual assignment",
@@ -18914,6 +18936,15 @@ fn show_loaded_data(
         });
         let _ = filters_changed;
 
+        if library_filters.unknown_platform && unknown_count > 0 {
+            widgets::banner(
+                ui,
+                &unknown_platform_aggregate_headline(unknown_count),
+                UNKNOWN_PLATFORM_EXPLANATION,
+                widgets::StatusTone::Info,
+            );
+        }
+
         let configured_sources: &[SourceFolderView] = cached
             .map(|cached| cached.source_views.as_slice())
             .unwrap_or(&[]);
@@ -20822,6 +20853,14 @@ fn show_platform_section(
     };
     for (label, value) in platform_provenance_lines(details) {
         ui.label(format!("{label}: {value}"));
+    }
+    if details.platform.is_none() {
+        widgets::banner(
+            ui,
+            "Why is this Unknown?",
+            UNKNOWN_PLATFORM_EXPLANATION,
+            widgets::StatusTone::Info,
+        );
     }
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("platform_choice_combo")
