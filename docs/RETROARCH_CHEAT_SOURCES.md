@@ -95,13 +95,13 @@ Extraction refuses absolute, `.`/`..`, empty-component, Windows drive,
 UNC/backslash, NUL, oversized/deep, duplicate, case-fold-colliding, symlink,
 hard-link, device, FIFO, socket, and other special entries. Files use
 no-overwrite creation beneath symlink-checked staging. Limits are 60,000
-entries, 64 MiB per extracted file, 1 GiB total expanded, 1,024 path bytes, 24
+entries, 256 MiB per extracted file, 1 GiB total expanded, 1,024 path bytes, 24
 components, and 250:1 compression ratio. The per-file extraction limit was
-raised from 8 MiB because the complete official immutable repository contains
-larger non-cheat data files, including its J2ME DAT metadata. Those files remain
-part of the verified manifest even though only `.cht` files enter cheat
-matching. Any individual entry above 64 MiB still fails closed. Nested archives
-remain inert files and are never recursively extracted.
+raised because the complete official immutable repository contains larger
+non-cheat data files, including `Mobile - J2ME.dat`, observed at 82,656,891
+bytes. Those files remain part of the verified manifest even though only `.cht`
+files enter cheat matching. Any individual entry above 256 MiB still fails
+closed. Nested archives remain inert files and are never recursively extracted.
 
 The compressed archive download limit remains 256 MiB and the total expanded
 content limit remains 1 GiB. The revision response limit is 64 KiB,

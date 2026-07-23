@@ -63,9 +63,10 @@ unverified. Trusted ArchiveFS snapshot matching is a separate pipeline.
 ## Catalogue retrieval bounds
 
 The official immutable catalogue remains bounded at 256 MiB compressed, 1 GiB
-expanded, 60,000 extracted entries, 50,000 indexed files, 64 MiB per extracted file, 16
-MiB manifest, 1,024 path bytes, 250:1 compression ratio, three redirects, and a
-30-second connect, 60-second idle-read, and 15-minute overall transfer bounds.
+expanded, 60,000 extracted entries, 50,000 indexed files, 256 MiB per extracted
+file, 16 MiB manifest, 1,024 path bytes, 250:1 compression ratio, three
+redirects, and a 30-second connect, 60-second idle-read, and 15-minute overall
+transfer bounds.
 A failed, cancelled, or timed-out update leaves the prior active
 snapshot unchanged and the Sources page states that it remains usable.
 
