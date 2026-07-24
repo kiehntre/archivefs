@@ -7390,7 +7390,7 @@ impl eframe::App for ArchiveFsApp {
                     ui.add_space(theme::SECTION_GAP);
                     widgets::section_header(
                         ui,
-                        "Database and catalogue management",
+                        "Database and sources",
                         Some(
                             "Download, update, or verify the trusted cheat database ArchiveFS uses for cheat setup.",
                         ),
@@ -16101,7 +16101,7 @@ fn show_cheats_mods_page(
                 if workflow.is_some() {
                     "Choose another archive"
                 } else {
-                    "Choose an archive"
+                    "Choose archive"
                 },
                 widgets::ActionStyle::Secondary,
                 true,
