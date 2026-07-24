@@ -7313,18 +7313,6 @@ impl eframe::App for ArchiveFsApp {
                 }
 
                 if self.view == MainView::Sources {
-                    let catalogue_action = show_retroarch_catalogue_manager(
-                        ui,
-                        &self.catalogue_manager,
-                        self.catalogue_review.as_ref(),
-                        self.catalogue_retrieval.as_ref(),
-                        self.catalogue_last_result.as_ref(),
-                        &mut self.clipboard,
-                    );
-                    if let Some(catalogue_action) = catalogue_action {
-                        self.handle_catalogue_manager_action(context, catalogue_action);
-                    }
-                    ui.add_space(theme::SECTION_GAP);
                     let sources = self
                         .database_state
                         .snapshot()
@@ -7334,6 +7322,20 @@ impl eframe::App for ArchiveFsApp {
                         LoadState::Ready(data) => Some(data.mount_root.as_path()),
                         LoadState::Loading { .. } | LoadState::Error(_) => None,
                     };
+
+                    widgets::page_header(
+                        ui,
+                        "Sources",
+                        "Manage the configured folders ArchiveFS scans for archives, and keep the trusted cheat database up to date.",
+                    );
+                    show_sources_overview(
+                        ui,
+                        sources,
+                        &self.catalogue_manager,
+                        self.catalogue_retrieval.as_ref(),
+                    );
+                    ui.add_space(theme::SECTION_GAP);
+
                     let sources_action = show_sources_page(
                         ui,
                         sources,
@@ -7383,6 +7385,26 @@ impl eframe::App for ArchiveFsApp {
                                 self.library_source_filter = Some(Some(path));
                             }
                         }
+                    }
+
+                    ui.add_space(theme::SECTION_GAP);
+                    widgets::section_header(
+                        ui,
+                        "Database and catalogue management",
+                        Some(
+                            "Download, update, or verify the trusted cheat database ArchiveFS uses for cheat setup.",
+                        ),
+                    );
+                    let catalogue_action = show_retroarch_catalogue_manager(
+                        ui,
+                        &self.catalogue_manager,
+                        self.catalogue_review.as_ref(),
+                        self.catalogue_retrieval.as_ref(),
+                        self.catalogue_last_result.as_ref(),
+                        &mut self.clipboard,
+                    );
+                    if let Some(catalogue_action) = catalogue_action {
+                        self.handle_catalogue_manager_action(context, catalogue_action);
                     }
                     return;
                 }
@@ -10508,6 +10530,135 @@ fn format_transfer_bytes(bytes: u64) -> String {
     }
 }
 
+/// The cheat-database readiness summary the Sources Overview shows -
+/// derived entirely from state `show_retroarch_catalogue_manager` (the
+/// card rendered lower on the page) already owns, never a second,
+/// independently-drifting classification. `running` takes priority over
+/// `state`'s own per-entry status, since a retrieval in progress is the
+/// most current, most actionable fact.
+fn sources_catalogue_overview_status(
+    state: &CatalogueManagerState,
+    running: Option<&RunningCatalogueRetrieval>,
+) -> (String, widgets::StatusTone) {
+    if let Some(running) = running {
+        return if running.cancellation_requested {
+            (
+                "Cheat database update: cancelling".to_string(),
+                widgets::StatusTone::Warning,
+            )
+        } else {
+            (
+                "Cheat database update in progress".to_string(),
+                widgets::StatusTone::Active,
+            )
+        };
+    }
+    match state {
+        CatalogueManagerState::NotLoaded | CatalogueManagerState::Loading(_) => (
+            "Checking cheat database status…".to_string(),
+            widgets::StatusTone::Pending,
+        ),
+        CatalogueManagerState::Failed(_) => (
+            "Cheat database status unavailable".to_string(),
+            widgets::StatusTone::Blocked,
+        ),
+        CatalogueManagerState::Ready(list) => {
+            let worst = list
+                .entries
+                .iter()
+                .map(|entry| entry.status)
+                .max_by_key(|status| match status {
+                    CheatCatalogueStatus::Ready => 0,
+                    CheatCatalogueStatus::ReadyWithWarnings => 1,
+                    CheatCatalogueStatus::Stale | CheatCatalogueStatus::Cancelled => 2,
+                    CheatCatalogueStatus::Missing => 3,
+                    _ => 4,
+                });
+            match worst {
+                None => (
+                    "No cheat database provider configured".to_string(),
+                    widgets::StatusTone::Pending,
+                ),
+                Some(status) => {
+                    let tone = match status {
+                        CheatCatalogueStatus::Ready => widgets::StatusTone::Success,
+                        CheatCatalogueStatus::ReadyWithWarnings
+                        | CheatCatalogueStatus::Stale
+                        | CheatCatalogueStatus::Cancelled => widgets::StatusTone::Warning,
+                        CheatCatalogueStatus::Missing => widgets::StatusTone::Pending,
+                        _ => widgets::StatusTone::Blocked,
+                    };
+                    (
+                        format!("Cheat database: {}", catalogue_status_label(status)),
+                        tone,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// The Sources page's Overview: how many source folders are configured
+/// and their availability at a glance, plus the cheat database's current
+/// readiness - both summarised from data the sections below already show
+/// in full detail (the configured-source list and the RetroArch cheat
+/// catalogue card), never a third, independently-computed source of
+/// truth.
+fn show_sources_overview(
+    ui: &mut egui::Ui,
+    sources: &[SourceFolderView],
+    catalogue_manager: &CatalogueManagerState,
+    catalogue_retrieval: Option<&RunningCatalogueRetrieval>,
+) {
+    widgets::section_header(
+        ui,
+        "Overview",
+        Some("Configured source folders and cheat database readiness at a glance."),
+    );
+    widgets::card(ui, |ui| {
+        let available = sources
+            .iter()
+            .filter(|source| source.availability == SourceAvailability::Available)
+            .count();
+        let disabled = sources.iter().filter(|source| !source.enabled).count();
+        let blocked = sources
+            .iter()
+            .filter(|source| {
+                source.enabled
+                    && matches!(
+                        source.availability,
+                        SourceAvailability::Unavailable
+                            | SourceAvailability::PermissionDenied
+                            | SourceAvailability::ScanFailed
+                    )
+            })
+            .count();
+        ui.label(format!(
+            "{} configured source folder{}",
+            sources.len(),
+            if sources.len() == 1 { "" } else { "s" }
+        ));
+        let mut items: Vec<(String, widgets::StatusTone)> = vec![(
+            format!("{available} available"),
+            widgets::StatusTone::Success,
+        )];
+        if disabled > 0 {
+            items.push((format!("{disabled} disabled"), widgets::StatusTone::Pending));
+        }
+        if blocked > 0 {
+            items.push((format!("{blocked} blocked"), widgets::StatusTone::Blocked));
+        }
+        let (catalogue_label, catalogue_tone) =
+            sources_catalogue_overview_status(catalogue_manager, catalogue_retrieval);
+        items.push((catalogue_label, catalogue_tone));
+        let item_refs: Vec<(&str, widgets::StatusTone)> = items
+            .iter()
+            .map(|(label, tone)| (label.as_str(), *tone))
+            .collect();
+        widgets::status_strip(ui, &item_refs);
+    });
+}
+
 fn show_sources_page(
     ui: &mut egui::Ui,
     sources: &[SourceFolderView],
@@ -10519,10 +10670,17 @@ fn show_sources_page(
 ) -> Option<SourcesPageAction> {
     let mut action = None;
 
-    widgets::page_header(
+    // No `widgets::page_header` here any more: the Sources page's one
+    // "Sources" heading now lives at the app-level call site, above the
+    // Overview section this function's content follows - see the
+    // `MainView::Sources` dispatch in `update`. Nothing here changed
+    // otherwise; this function keeps its exact signature and every
+    // existing test that calls it directly still gets the same content,
+    // just without the now-redundant page-level heading repeating.
+    widgets::section_header(
         ui,
-        "Sources",
-        "Manage the configured folders ArchiveFS scans for archives.",
+        "Configured sources",
+        Some("Manage the configured folders ArchiveFS scans for archives."),
     );
 
     widgets::card(ui, |ui| {
