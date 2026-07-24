@@ -14958,13 +14958,11 @@ fn show_pcsx2_profile_card(
             ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
         }
         if profile.blockers.len() > 1 {
-            egui::CollapsingHeader::new("All technical blockers")
-                .default_open(false)
-                .show(ui, |ui| {
-                    for blocker in &profile.blockers {
-                        ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
-                    }
-                });
+            widgets::technical_details(ui, ("pcsx2_profile_blockers", &profile.profile_id), |ui| {
+                for blocker in &profile.blockers {
+                    ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+                }
+            });
         }
     });
 }
@@ -16957,16 +16955,15 @@ fn show_cheat_workflow_step1(
                         ui.label(format!("{} — {}", blocker.code, blocker.detail));
                     }
                     if profile.blockers.len() > 1 {
-                        egui::CollapsingHeader::new(format!(
-                            "All technical blockers ({})",
-                            profile.blockers.len()
-                        ))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            for blocker in &profile.blockers {
-                                ui.label(format!("{} — {}", blocker.code, blocker.detail));
-                            }
-                        });
+                        widgets::technical_details(
+                            ui,
+                            ("retroarch_profile_blockers", &profile.profile_id),
+                            |ui| {
+                                for blocker in &profile.blockers {
+                                    ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                                }
+                            },
+                        );
                     }
                 });
                 ui.add_space(6.0);
