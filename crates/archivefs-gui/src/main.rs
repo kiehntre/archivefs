@@ -33950,6 +33950,7 @@ mod tests {
         });
 
         for expected in [
+            "Configured sources",
             "/home/davedap/Archives",
             "/mnt/usbdrive/retro",
             "/mnt/nvme2/collections",
@@ -33957,6 +33958,7 @@ mod tests {
             "Unavailable",
             "Disabled",
             "1242",
+            "No such file or directory (os error 2)",
             "Add folder",
             "Scan all enabled",
             "Refresh status",
@@ -33977,6 +33979,195 @@ mod tests {
             &output,
             "Mount-root editing will be added after multi-source scanning is stable."
         ));
+    }
+
+    #[test]
+    fn sources_overview_reports_configured_counts_and_catalogue_readiness() {
+        let ctx = egui::Context::default();
+        let sources = three_source_views();
+        let (_, _, list) = cheat_source_list_fixture();
+        let state = CatalogueManagerState::Ready(list);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_sources_overview(ui, &sources, &state, None);
+            });
+        });
+        for expected in [
+            "Overview",
+            "3 configured source folders",
+            "1 available",
+            "1 disabled",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "expected the Sources Overview to render {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sources_catalogue_overview_status_prioritizes_a_running_retrieval() {
+        let (label, tone) =
+            sources_catalogue_overview_status(&CatalogueManagerState::NotLoaded, None);
+        assert!(label.contains("Checking"));
+        assert_eq!(tone, widgets::StatusTone::Pending);
+
+        let cancellation = CheatSourceCancellation::default();
+        let (_result_sender, result_receiver) = mpsc::channel();
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        let running = RunningCatalogueRetrieval {
+            generation: 1,
+            source_id: "libretro-buildbot-cheats".into(),
+            cancellation,
+            receiver: result_receiver,
+            progress_receiver,
+            progress: None,
+            cancellation_requested: false,
+        };
+        let (label, tone) =
+            sources_catalogue_overview_status(&CatalogueManagerState::NotLoaded, Some(&running));
+        assert!(
+            label.contains("in progress"),
+            "a running retrieval must take priority over the idle NotLoaded state"
+        );
+        assert_eq!(tone, widgets::StatusTone::Active);
+    }
+
+    #[test]
+    fn sources_recent_activity_shows_only_relevant_entries_through_the_shared_row_header() {
+        let ctx = egui::Context::default();
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::SourceScan,
+            None,
+            ActivityOutcome::Completed,
+            "Scanned /roms: 12 archives found.",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            Some(PathBuf::from("/roms/a.zip")),
+            ActivityOutcome::Completed,
+            "Mounted a.zip",
+        ));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_sources_recent_activity(ui, &history);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Recent activity"));
+        assert!(rendered_text_contains(
+            &output,
+            "Scanned /roms: 12 archives found."
+        ));
+        assert!(
+            !rendered_text_contains(&output, "Mounted a.zip"),
+            "Recent activity on Sources must not show unrelated mount activity"
+        );
+    }
+
+    #[test]
+    fn sources_recent_activity_empty_state_is_truthful() {
+        let ctx = egui::Context::default();
+        let history = OperationHistory::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_sources_recent_activity(ui, &history);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "No source or cheat-database activity has been recorded in this session."
+        ));
+    }
+
+    #[test]
+    fn sources_page_actions_are_reachable_via_real_clicks() {
+        let ctx = egui::Context::default();
+        let sources = three_source_views();
+        for target in ["Add folder", "Scan all enabled", "Refresh status"] {
+            let mut add_dialog = None;
+            let mut remove_dialog = None;
+            let mut clipboard = InMemoryClipboard::default();
+            let discovery_output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_sources_page(
+                        ui,
+                        &sources,
+                        Some(Path::new("/mnt/archivefs")),
+                        false,
+                        &mut add_dialog,
+                        &mut remove_dialog,
+                        &mut clipboard,
+                    );
+                });
+            });
+            let target_pos = find_exact_text_center(&discovery_output, target)
+                .unwrap_or_else(|| panic!("{target:?} must be rendered on the Sources page"));
+
+            let clicked_action: std::rc::Rc<std::cell::RefCell<Option<SourcesPageAction>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
+            let captured = std::rc::Rc::clone(&clicked_action);
+            let add_dialog = std::cell::RefCell::new(None);
+            let remove_dialog = std::cell::RefCell::new(None);
+            let clipboard = std::cell::RefCell::new(InMemoryClipboard::default());
+            let sources_for_render = sources.clone();
+            let render = move |ui: &mut egui::Ui| -> egui::Response {
+                let inner = ui.scope(|ui| {
+                    show_sources_page(
+                        ui,
+                        &sources_for_render,
+                        Some(Path::new("/mnt/archivefs")),
+                        false,
+                        &mut add_dialog.borrow_mut(),
+                        &mut remove_dialog.borrow_mut(),
+                        &mut *clipboard.borrow_mut(),
+                    )
+                });
+                if let Some(action) = inner.inner {
+                    *captured.borrow_mut() = Some(action);
+                }
+                inner.response
+            };
+            simulate_row_click(&ctx, target_pos, egui::Modifiers::default(), render);
+
+            if target == "Add folder" {
+                // AddFolder isn't a SourcesPageAction returned by a single
+                // click - clicking it opens the dialog (add_dialog is set)
+                // rather than producing an action directly. Confirmed
+                // separately by sources_add_dialog_accepts_a_real_directory_and_would_start_add_folder.
+                continue;
+            }
+            let expected_matches = match target {
+                "Scan all enabled" => {
+                    matches!(*clicked_action.borrow(), Some(SourcesPageAction::ScanAll))
+                }
+                "Refresh status" => matches!(
+                    *clicked_action.borrow(),
+                    Some(SourcesPageAction::RefreshStatus)
+                ),
+                _ => unreachable!(),
+            };
+            assert!(
+                expected_matches,
+                "clicking {target:?} must produce the matching SourcesPageAction"
+            );
+        }
+    }
+
+    #[test]
+    fn sources_dialog_state_survives_navigating_away_and_back() {
+        let mut app = app_for_operation_tests();
+        app.view = MainView::Sources;
+        app.sources_add_dialog = Some(SourcesAddDialogState::default());
+
+        app.view = MainView::Settings;
+        app.reconcile_library_tab();
+        app.view = MainView::Sources;
+
+        assert!(
+            app.sources_add_dialog.is_some(),
+            "navigating away from Sources and back must not discard an in-progress Add Folder dialog"
+        );
     }
 
     #[test]

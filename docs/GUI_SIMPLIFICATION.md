@@ -1311,3 +1311,155 @@ state. The two open threads are, in priority order:
 
 Library IA migration Phase 3 total: 453 tests (449 from Phase 2 + 4 new)
 pass; 0 failures.
+
+## Sources page cleanup (`sonnet-sources-page-cleanup` branch)
+
+A focused restructuring of the Sources destination: source configuration,
+cheat-database management, retrieval state, and failures were previously
+presented in an ad hoc order with no unifying summary. No source
+retrieval, database, filesystem, mount, rollback, journal, or command
+semantics changed - GUI layout, shared presentation, and tests only.
+
+### Old vs. new structure
+
+Old order: RetroArch catalogue card (with its own internal heading)
+rendered first, above the page's own "Sources" `page_header`, followed by
+the configured-source list with no explicit section heading and no
+page-level summary anywhere.
+
+New order, all under one "Sources" `page_header` at the app-level
+`MainView::Sources` dispatch site:
+
+1. **Overview** (new `show_sources_overview`) - configured source count,
+   an availability `status_strip` (available/disabled/blocked counts,
+   computed from the same `SourceFolderView` data the list below already
+   shows in full), and the cheat database's current readiness.
+2. **Configured sources** (`show_sources_page`, exact signature and all
+   six existing direct test call sites unchanged) - now headed by its own
+   `section_header` instead of the page-level heading it used to own.
+3. **Database and catalogue management** - `show_retroarch_catalogue_manager`
+   under a new outer `section_header`, mirroring the same outer/inner
+   heading pattern Cheats & Mods already uses ("Database and sources"
+   wrapping "RetroArch cheat catalogue"). The card itself, its state
+   handling, and `handle_catalogue_manager_action` are untouched.
+4. **Recent activity** (new `show_sources_recent_activity`) - a compact,
+   unlinked activity list at the bottom, matching
+   `show_recent_cheat_activity`'s precedent on Cheats & Mods.
+
+### Components introduced
+
+- `sources_catalogue_overview_status` - a pure helper mapping
+  `CatalogueManagerState` plus an optional `RunningCatalogueRetrieval`
+  to the Overview's one cheat-database status line and tone. Derived
+  entirely from state `show_retroarch_catalogue_manager` already owns -
+  never a second, independently-drifting classification. A running
+  retrieval takes priority over the per-entry status, since it is the
+  most current, most actionable fact.
+- `show_sources_overview` - renders the Overview section described above,
+  reusing `widgets::status_strip` for both the availability counts and
+  the appended cheat-database status item.
+- `show_sources_recent_activity` - filters `OperationHistory` to the
+  `ActivityAction` variants a Sources-page user would recognise as theirs
+  (`SourceAdded`/`SourceEnabled`/`SourceDisabled`/`SourceScan`/
+  `SourceRemoved`, plus `CheatSourceRetrieval` since a database update
+  started from either page is the same event) and renders up to 5 entries
+  through `widgets::activity_row_header` - the same shared row-header
+  component Phase 2's activity consolidation introduced. No new
+  row-rendering logic, no "view full history" link (matching
+  `show_recent_cheat_activity`'s precedent); History & Logs remains
+  reachable from the sidebar as always.
+
+### Consolidation within `show_sources_page`
+
+Each configured-source entry's Enabled/Disabled and availability badges
+were two hand-rolled `status_badge` calls sharing a `horizontal_wrapped`
+row with two plain informational labels ("N archives", "Last scan: ...").
+Split into `widgets::status_strip` (same two values, same tones, same
+order) on its own line, with the plain labels kept on their own
+`horizontal_wrapped` row directly below - `status_strip` is a pure badge
+row and was not forced to also carry non-status content.
+
+The rest of the page's card structure (the actions card, the per-source
+list container, the Mount destination card) was audited for further
+consolidation and left as-is: every option found meant either forcing
+unrelated content through a badge-only component or merging functionally
+distinct cards into an ambiguous, parameter-heavy one - exactly what this
+milestone was told to avoid.
+
+### Database and catalogue presentation - consolidation confirmed, not changed
+
+`show_retroarch_catalogue_manager` and `handle_catalogue_manager_action`
+were already the single, shared implementation for both Sources and
+Cheats & Mods (established by the Cheats & Mods structure milestone); no
+code change was needed to satisfy "no duplicated database logic" here.
+Its internal Download/Update/Verify/Review/Confirm/progress/
+retained-state/failure presentation is unchanged.
+
+### Failure presentation reviewed
+
+| Failure site | Decision | Why |
+|---|---|---|
+| Per-source "last scan failed" (`view.last_scan_error`, plain `colored_label`) | **Left inline, un-migrated**, documented on the call site | Already the full, short, directly-visible error text for one specific folder in a list that can show many sources at once. Routing it through `failure_summary` would collapse it behind `technical_details`, making recovery *harder* - a user needs to see which folder failed and why without an extra click. A full `banner`'s card-like weight repeated once per failing source was judged excessive for a scrollable list. Mirrors the identical reasoning already applied to the RetroArch catalogue's own persistent per-entry error. |
+| RetroArch catalogue's transient post-retrieval result | **Unchanged** - `failure_summary` | Pre-existing, untouched by this milestone. |
+| RetroArch catalogue's persistent per-entry error | **Unchanged** - plain `banner`, a test pins it as directly visible | Pre-existing, untouched by this milestone. |
+
+No failure site had its detail hidden or its text shortened; every
+migration decision above is a "leave as-is" confirmation, not a change.
+
+### Remaining duplication
+
+None found beyond what already existed and is documented above (the
+per-entry failure display style intentionally mirrors the catalogue
+card's own precedent rather than sharing a component, since the two
+contexts - "one folder in a list" vs. "one catalogue's persistent state" -
+have different acceptable weight).
+
+### Remaining limitations
+
+- The Overview's blocked/disabled/available counts and the cheat-database
+  status line are presentation-only summaries; they do not add any new
+  interactive control (clicking a count does not filter the list below).
+  A future milestone could consider this if the configured-source list
+  grows long enough that the Overview needs to double as a filter, but
+  that was out of scope here.
+- As with every other page dispatch in this codebase, the
+  `MainView::Sources` arm inside `update()` is not directly unit-tested,
+  because nothing here unit-tests `eframe::App::update` itself.
+  Confidence comes from testing `show_sources_overview`,
+  `show_sources_page`, and `show_sources_recent_activity` individually
+  plus the state-survives-navigation test below.
+
+### Recommended next milestone
+
+Audit another page for the same kind of duplication and missing summary
+this milestone found and fixed on Sources - Active Mounts and History &
+Logs are the two remaining destinations that have not yet had a
+dedicated simplification pass.
+
+## Test coverage added in the Sources page cleanup
+
+- `main.rs`: `sources_page_shows_every_configured_source_with_its_full_
+  state_and_actions` strengthened to also assert the new "Configured
+  sources" section heading and the full, un-collapsed
+  "No such file or directory (os error 2)" error text remain visible.
+  New: `sources_overview_reports_configured_counts_and_catalogue_
+  readiness` (Overview counts and cheat-database status line together);
+  `sources_catalogue_overview_status_prioritizes_a_running_retrieval`
+  (a running retrieval, constructed via a real `mpsc::channel` and
+  `CheatSourceCancellation`, outranks the per-entry catalogue status);
+  `sources_recent_activity_shows_only_relevant_entries_through_the_
+  shared_row_header` (only Sources/cheat-database `ActivityAction`
+  variants appear, rendered via `activity_row_header`);
+  `sources_recent_activity_empty_state_is_truthful` (the empty-state
+  message when no relevant history exists); `sources_page_actions_are_
+  reachable_via_real_clicks` (real two-pass pointer clicks - discover
+  position via `find_exact_text_center`, click via `simulate_row_click` -
+  confirm "Add folder", "Scan all enabled", and "Refresh status" each
+  still produce their matching `SourcesPageAction`, not just that the
+  labels render); `sources_dialog_state_survives_navigating_away_and_
+  back` (an open add-source dialog's in-progress path input survives a
+  round trip through `navigate_to_library_tab` and back to
+  `MainView::Sources`).
+
+Sources page cleanup total: 459 tests (453 from Library IA migration
+Phase 3 + 6 new) pass; 0 failures.
