@@ -3262,8 +3262,8 @@ impl ArchiveFsApp {
     }
 
     /// Starts a background database load. `run_scan_first =
-    /// true` is "Scan Library" (runs `scan_and_persist` before reloading);
-    /// `false` is "Refresh Database Status" / "Retry Database Load" (a
+    /// true` is "Scan library" (runs `scan_and_persist` before reloading);
+    /// `false` is "Refresh database status" / "Retry database load" (a
     /// read-only reload). Never blocks the UI thread - mirrors
     /// `refresh`/`start_load` exactly.
     fn start_database_action(&mut self, context: egui::Context, run_scan_first: bool) {
@@ -7056,14 +7056,14 @@ impl eframe::App for ArchiveFsApp {
                 });
                 ui.menu_button("Library", |ui| {
                     if ui
-                        .add_enabled(!loading && !busy, egui::Button::new("Scan Library"))
+                        .add_enabled(!loading && !busy, egui::Button::new("Scan library"))
                         .clicked()
                     {
                         self.start_database_action(context.clone(), true);
                         ui.close();
                     }
                     if ui
-                        .add_enabled(!busy, egui::Button::new("Refresh Database Status"))
+                        .add_enabled(!busy, egui::Button::new("Refresh database status"))
                         .clicked()
                     {
                         self.start_database_action(context.clone(), false);
@@ -8086,7 +8086,7 @@ impl eframe::App for ArchiveFsApp {
                             );
                             ui.label(error);
                             ui.add_space(8.0);
-                            retry = ui.button("Try again").clicked();
+                            retry = ui.button("Retry").clicked();
                         });
                     }
                     LoadState::Ready(data) => {
@@ -11247,10 +11247,13 @@ fn show_library_views_page(
 ) -> Option<LibraryViewAction> {
     let mut action = None;
 
-    ui.heading("Library Views");
-    ui.label(
-        "Organised, symlink-based folder trees that point at your existing archives. ArchiveFS \
-         never moves, copies, renames, or deletes an original archive file.",
+    widgets::section_header(
+        ui,
+        "Views",
+        Some(
+            "Organised, symlink-based folder trees that point at your existing archives. \
+             ArchiveFS never moves, copies, renames, or deletes an original archive file.",
+        ),
     );
     ui.add_space(2.0);
     if let Some(archive_path) = focus_archive {
@@ -17416,7 +17419,7 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
             ui.horizontal(|ui| {
                 let loading = state.is_loading();
                 if ui
-                    .add_enabled(!loading, egui::Button::new("Scan Library"))
+                    .add_enabled(!loading, egui::Button::new("Scan library"))
                     .clicked()
                 {
                     action = Some(DatabasePanelAction::ScanLibrary);
@@ -17432,7 +17435,7 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
                 match state {
                     DatabaseState::Ready { .. } => {
                         if ui
-                            .add_enabled(!loading, egui::Button::new("Refresh Database Status"))
+                            .add_enabled(!loading, egui::Button::new("Refresh database status"))
                             .clicked()
                         {
                             action = Some(DatabasePanelAction::RefreshStatus);
@@ -17442,7 +17445,7 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
                     | DatabaseState::Outdated { .. }
                     | DatabaseState::Error { .. } => {
                         if ui
-                            .add_enabled(!loading, egui::Button::new("Retry Database Load"))
+                            .add_enabled(!loading, egui::Button::new("Retry database load"))
                             .clicked()
                         {
                             action = Some(DatabasePanelAction::RetryLoad);
@@ -17731,14 +17734,17 @@ fn show_duplicate_review_panel(
         clipboard,
     } = view_state;
     let mut action = None;
-    ui.horizontal(|ui| {
-        ui.heading("Duplicate Review");
-        ui.label("Review only — ArchiveFS will not change archive files here.");
-        if ui.button("Back to Library").clicked() {
-            action = Some(DuplicateReviewAction::Close);
-        }
-    });
-    ui.label("Groups are likely duplicates, not claims that files are byte-identical.");
+    widgets::section_header(
+        ui,
+        "Duplicates",
+        Some(
+            "Review only — ArchiveFS will not change archive files here. Groups are likely \
+             duplicates, not claims that files are byte-identical.",
+        ),
+    );
+    if widgets::action_button(ui, "Back to Library", widgets::ActionStyle::Quiet, true).clicked() {
+        action = Some(DuplicateReviewAction::Close);
+    }
     ui.add_space(2.0);
 
     ui.horizontal_wrapped(|ui| {
@@ -18313,17 +18319,17 @@ fn show_health_dashboard_panel(
     } = view_state;
 
     let mut action = None;
-    ui.horizontal(|ui| {
-        ui.heading("Health Dashboard");
-        ui.label("Read-only overview of archive and catalogue health.");
-        if ui.button("Back to Library").clicked() {
-            action = Some(HealthDashboardAction::BackToLibrary);
-        }
-    });
-    ui.label(
-        "Filtering, sorting, and selection here are independent of the ordinary library view \
-         and Duplicate Review.",
+    widgets::section_header(
+        ui,
+        "Health",
+        Some(
+            "Read-only overview of archive and catalogue health. Filtering, sorting, and \
+             selection here are independent of the ordinary library view and Duplicate Review.",
+        ),
     );
+    if widgets::action_button(ui, "Back to Library", widgets::ActionStyle::Quiet, true).clicked() {
+        action = Some(HealthDashboardAction::BackToLibrary);
+    }
     ui.add_space(2.0);
 
     let Some(data) = live_data else {
@@ -25934,7 +25940,7 @@ mod tests {
         }
 
         for expected in [
-            "Duplicate Review",
+            "Duplicates",
             "Likely duplicate group",
             "Filename and platform",
             "Matching normalized filename and platform",
