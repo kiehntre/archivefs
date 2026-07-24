@@ -2347,6 +2347,26 @@ struct HealthReportCache {
     remount_offers: HashSet<PathBuf>,
     issues: Vec<HealthIssue>,
 }
+/// Every top-level destination the app can show. `Health`, `Duplicates`,
+/// and `LibraryViews` are **compatibility dispatch keys**, not separate
+/// sidebar destinations any more (see `LibraryTab`): they exist purely so
+/// `self.view` (still the single source of truth for what actually
+/// renders) can name which Library tab is active without a second,
+/// parallel field. Each maps 1:1 to a `LibraryTab` via
+/// `library_tab_for_main_view`/`main_view_for_library_tab`.
+///
+/// Kept as real enum variants (Library IA migration Phase 3 decision,
+/// evidence in docs/GUI_SIMPLIFICATION.md's "Library IA migration -
+/// Phase 3" section) rather than removed and replaced with `LibraryTab`
+/// alone: production code still keys the shell's content dispatch off
+/// `self.view` matching them (`library_tab_for_main_view`,
+/// `main_view_title`, `main_view_content_width`,
+/// `main_view_uses_page_scroll` all still need an exhaustive `MainView`
+/// match), and 50+ existing tests across three milestones construct or
+/// compare against these three variants directly. No persisted,
+/// external, or CLI state depends on them - the only reasons to keep
+/// them are internal (production dispatch + test surface), not
+/// backward-compatibility with anything outside this process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum MainView {
     #[default]
@@ -2584,6 +2604,18 @@ const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 11] = [
     (MainView::Settings, "Settings"),
     (MainView::About, "About"),
 ];
+/// Whether `view`'s sidebar button (if it has one) should be clickable
+/// given `has_database`. Only ever called with `PRIMARY_NAVIGATION_
+/// DESTINATIONS` entries (`show_primary_navigation`'s loop, and its test
+/// mirror), which no longer includes `MainView::Health`/`Duplicates` -
+/// those two arms are unreachable through any live sidebar call site
+/// today, but deliberately left in rather than pruned: the same
+/// database-readiness gate would be the correct one to apply if the
+/// unified Library shell's tab row ever needs to grey out the
+/// Health/Duplicates tabs before a scan completes (their content bodies
+/// already show a "Scan the library..." fallback instead, which was
+/// judged sufficient for now - see docs/GUI_SIMPLIFICATION.md). Kept
+/// correct and ready rather than deleted and potentially reinvented.
 fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
     !matches!(
         view,
@@ -9713,6 +9745,17 @@ fn show_archive_inspector_panel(
 /// renders - a heading plus one "Back to Library" button. Returns `true`
 /// exactly when that button was clicked, so the caller can close the
 /// overlay.
+///
+/// Reviewed for the Library IA migration and deliberately left as-is:
+/// despite the label, clicking it does not navigate anywhere - it only
+/// clears `self.tools_overlay`, returning to whatever `view` was already
+/// active (Mount, Settings, or anything else a Tools overlay can be
+/// opened from, not only Library). The label predates the unified
+/// Library shell and is a pre-existing minor inaccuracy for the
+/// non-Library case, not something this migration introduced or should
+/// fix in passing - changing its target to actually navigate to Library
+/// would be a real, unrelated behaviour change for users who open a
+/// Tools overlay from a non-Library page.
 fn show_tools_overlay_header(ui: &mut egui::Ui, title: &str) -> bool {
     let mut close = false;
     ui.horizontal(|ui| {
@@ -17430,6 +17473,14 @@ struct DuplicateReviewViewState<'a> {
     clipboard: &'a mut dyn ClipboardBackend,
 }
 
+/// Reviewed for the Library IA migration: its "Back to Library" button
+/// (`DuplicateReviewAction::Close`) is kept rather than removed, even
+/// though the unified Library shell's Archives tab is now also one click
+/// away via the tab row - the button sits right at the top of this
+/// content, above the same internal scroll area the tab row itself is
+/// pinned outside of, so it is not meaningfully redundant, and removing
+/// a working exit action was judged not worth the small risk for a small
+/// convenience gain. Its handler now calls `navigate_to_library_tab`.
 fn show_duplicate_review_panel(
     ui: &mut egui::Ui,
     report: &CatalogueDuplicateReport,
@@ -18003,6 +18054,12 @@ struct HealthDashboardViewState<'a> {
     clipboard: &'a mut dyn ClipboardBackend,
 }
 
+/// Reviewed for the Library IA migration: its "Back to Library" button
+/// (`HealthDashboardAction::BackToLibrary`) is kept for the same reason
+/// `show_duplicate_review_panel`'s is - not meaningfully redundant with
+/// the tab row, and removing a working exit action wasn't worth it for a
+/// small convenience gain. Its handler now calls
+/// `navigate_to_library_tab`.
 fn show_health_dashboard_panel(
     ui: &mut egui::Ui,
     live_data: Option<&LoadedData>,
