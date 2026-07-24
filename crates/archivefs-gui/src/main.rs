@@ -7406,6 +7406,9 @@ impl eframe::App for ArchiveFsApp {
                     if let Some(catalogue_action) = catalogue_action {
                         self.handle_catalogue_manager_action(context, catalogue_action);
                     }
+
+                    ui.add_space(theme::SECTION_GAP);
+                    show_sources_recent_activity(ui, &self.history);
                     return;
                 }
 
@@ -10770,6 +10773,25 @@ fn show_sources_page(
                                         view.last_scan_at.as_deref().unwrap_or("never")
                                     ));
                                 });
+                                // Reviewed for the Sources cleanup and
+                                // deliberately left as a plain inline
+                                // label, not routed through
+                                // `widgets::failure_summary` or
+                                // `widgets::banner`: this is the full,
+                                // already-short error text for exactly
+                                // this one source folder's last scan, and
+                                // a source list can show many of these
+                                // rows at once. Collapsing it behind
+                                // `technical_details` (as `failure_summary`
+                                // would) is exactly the "would make
+                                // recovery harder" case this milestone was
+                                // told to avoid - the user needs to see
+                                // *which* folder failed and *why* without
+                                // an extra click, right where the folder
+                                // itself is listed. `banner`'s heavier
+                                // card-like treatment was also judged too
+                                // much visual weight to repeat once per
+                                // failing source in a scrollable list.
                                 if let Some(error) = &view.last_scan_error {
                                     ui.colored_label(ui.visuals().error_fg_color, error);
                                 }
@@ -11010,6 +11032,63 @@ fn show_sources_page(
     }
 
     action
+}
+
+/// The Sources page's compact "Recent activity" - reuses
+/// `widgets::activity_row_header` (the same shared row-header component
+/// Phase 2's activity consolidation introduced for the bottom activity
+/// bar, the History & Logs page, and the Cheats & Mods mini card), scoped
+/// to the `ActivityAction` variants a Sources-page user would recognise as
+/// theirs: adding/enabling/disabling/removing/scanning a source folder,
+/// and cheat-database retrieval (shared with Cheats & Mods, since a
+/// database update started from either page is the same event). No new
+/// activity-rendering logic - only a new filter over the same
+/// `OperationHistory` every other activity surface already reads.
+///
+/// There is no "view full history" link here, matching
+/// `show_recent_cheat_activity`'s precedent on Cheats & Mods (which
+/// doesn't have one either) - not invented for this page specifically.
+/// Full History & Logs remains reachable from the sidebar as always.
+fn show_sources_recent_activity(ui: &mut egui::Ui, history: &OperationHistory) {
+    let entries: Vec<&HistoryEntry> = history
+        .entries()
+        .filter(|entry| {
+            matches!(
+                entry.action,
+                ActivityAction::SourceAdded
+                    | ActivityAction::SourceEnabled
+                    | ActivityAction::SourceDisabled
+                    | ActivityAction::SourceScan
+                    | ActivityAction::SourceRemoved
+                    | ActivityAction::CheatSourceRetrieval
+            )
+        })
+        .take(5)
+        .collect();
+    widgets::section_header(
+        ui,
+        "Recent activity",
+        Some("A compact view of this session's source and cheat-database changes."),
+    );
+    if entries.is_empty() {
+        ui.weak("No source or cheat-database activity has been recorded in this session.");
+        return;
+    }
+    for entry in entries {
+        widgets::card(ui, |ui| {
+            widgets::activity_row_header(
+                ui,
+                entry.outcome.to_string(),
+                activity_outcome_tone(entry.outcome),
+                entry.action.to_string(),
+                Some(&format_history_timestamp(entry.timestamp)),
+                |_ui| {},
+            );
+            ui.add(egui::Label::new(&entry.message).truncate())
+                .on_hover_text(&entry.message);
+        });
+        ui.add_space(4.0);
+    }
 }
 
 /// Renders the currently-previewed plan's counts and (filtered) entry
