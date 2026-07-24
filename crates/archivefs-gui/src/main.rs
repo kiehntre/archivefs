@@ -50,7 +50,9 @@ use archivefs_core::patch_manager::{
 mod ui;
 
 #[cfg(test)]
-use archivefs_core::patch_manager::Pcsx2PatchDirectory;
+use archivefs_core::patch_manager::{
+    Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+};
 
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
@@ -37897,5 +37899,283 @@ mod tests {
             &output,
             "Cleanup after each successful unmount: enabled."
         ));
+    }
+
+    #[test]
+    fn active_mounts_recent_activity_shows_only_relevant_entries_through_the_shared_row_header() {
+        let ctx = egui::Context::default();
+        let mut history = OperationHistory::default();
+        history.record(HistoryEntry::new(
+            ActivityAction::Mount,
+            Some(PathBuf::from("/roms/a.zip")),
+            ActivityOutcome::Completed,
+            "Mounted a.zip",
+        ));
+        history.record(HistoryEntry::new(
+            ActivityAction::SourceScan,
+            None,
+            ActivityOutcome::Completed,
+            "Scanned /roms: 12 archives found.",
+        ));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_active_mounts_recent_activity(ui, &history);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Recent activity"));
+        assert!(rendered_text_contains(&output, "Mounted a.zip"));
+        assert!(
+            !rendered_text_contains(&output, "Scanned /roms: 12 archives found."),
+            "Recent activity on Active Mounts must not show unrelated source activity"
+        );
+    }
+
+    #[test]
+    fn active_mounts_recent_activity_empty_state_is_truthful() {
+        let ctx = egui::Context::default();
+        let history = OperationHistory::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_active_mounts_recent_activity(ui, &history);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "No mount or unmount activity has been recorded in this session."
+        ));
+    }
+
+    #[test]
+    fn library_sub_tab_headings_match_their_own_tab_bar_labels() {
+        let ctx = egui::Context::default();
+        let report = catalogue_filename_duplicates(&duplicate_catalogue_for_gui());
+        let mut filters = DuplicateReviewFilters::initial();
+        let mut sort_field = DuplicateSortField::Title;
+        let mut sort_ascending = true;
+        let mut selected_group = None;
+        let mut selected_archive = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_duplicate_review_panel(
+                    ui,
+                    &report,
+                    DuplicateReviewViewState {
+                        filters: &mut filters,
+                        sort_field: &mut sort_field,
+                        sort_ascending: &mut sort_ascending,
+                        selected_group: &mut selected_group,
+                        selected_archive: &mut selected_archive,
+                        clipboard: &mut clipboard,
+                    },
+                );
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "Duplicates"),
+            "the Duplicates tab's own heading must match its tab-bar label"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Duplicate Review"),
+            "the old, differently-worded heading must not still be rendered"
+        );
+
+        let mut views: Vec<LibraryViewConfig> = Vec::new();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = None;
+        let mut remove_dialog = None;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_library_views_page(
+                    ui,
+                    &views,
+                    &[],
+                    false,
+                    None,
+                    None,
+                    &mut plan_filter,
+                    &mut form_dialog,
+                    &mut remove_dialog,
+                    &mut clipboard,
+                );
+            });
+        });
+        let _ = &mut views;
+        assert!(
+            rendered_text_contains(&output, "Views"),
+            "the Views tab's own heading must match its tab-bar label"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Library Views"),
+            "the old, differently-worded heading must not still be rendered"
+        );
+    }
+
+    #[test]
+    fn mount_and_selected_pages_use_identical_mount_queue_button_wording() {
+        let ctx = egui::Context::default();
+        let records = vec![record("/roms/pending.zip", MountState::Pending)];
+        let data = loaded_data_with_records("/mnt/archivefs", records.clone());
+        let mut queue = vec![PathBuf::from("/roms/pending.zip")];
+        let mut confirm = false;
+        let mut search = String::new();
+        let mount_output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_mount_page(
+                    ui,
+                    Some(&data),
+                    None,
+                    MountPageViewState {
+                        queue: &mut queue,
+                        search: &mut search,
+                        confirm: &mut confirm,
+                        busy: false,
+                        block_reason: None,
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(&mount_output, "Mount queue (1)"));
+
+        let mut selected_queue = vec![PathBuf::from("/roms/pending.zip")];
+        let mut selected_confirm = false;
+        let selected_output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_page(
+                    ui,
+                    Some(&data),
+                    None,
+                    SelectedPageViewState {
+                        selected_archive: None,
+                        selected_count: 0,
+                        retroarch_profiles: &RetroArchProfilesState::NotScanned,
+                        queue: &mut selected_queue,
+                        confirm: &mut selected_confirm,
+                        busy: false,
+                        block_reason: None,
+                    },
+                );
+            });
+        });
+        assert!(
+            rendered_text_contains(&selected_output, "Mount queue (1)"),
+            "the Selected page's own queue button must use the same wording as the Mount page's"
+        );
+        assert!(!rendered_text_contains(
+            &selected_output,
+            "Mount ready archives"
+        ));
+    }
+
+    #[test]
+    fn history_logs_page_has_a_recovery_heading_above_its_rollback_card() {
+        let ctx = egui::Context::default();
+        let shared_history = SharedHistoryState::NotLoaded;
+        let mut rollback = SharedRollbackState::Idle;
+        let mut history = OperationHistory::default();
+        let mut filters = HistoryLogFilters::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_history_logs_page(
+                    ui,
+                    &shared_history,
+                    &mut rollback,
+                    None,
+                    &mut history,
+                    &mut filters,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Recovery"));
+        assert!(rendered_text_contains(
+            &output,
+            "Rollback always begins with a fresh read-only preview"
+        ));
+    }
+
+    #[test]
+    fn pcsx2_profile_card_shows_the_first_blocker_directly_and_the_rest_behind_technical_details() {
+        let ctx = egui::Context::default();
+        let mut workflow = CheatWorkflowState {
+            archive_path: PathBuf::from("/roms/a.zip"),
+            display_name: "a".to_string(),
+            normalized_name: "a".to_string(),
+            platform: Some("PS2".to_string()),
+            region: None,
+            source_root: PathBuf::from("/roms"),
+            size_bytes: None,
+            adapter: CheatEmulatorAdapter::Pcsx2,
+            identity_request: None,
+            identity: CheatStepResource::NotLoaded,
+            preview_request: None,
+            preview: CheatStepResource::NotLoaded,
+            transaction: CheatTransactionState::Idle,
+            selected_profile_id: None,
+            selected_pcsx2_profile_id: None,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
+            selected_dolphin_profile_id: None,
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
+            source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: None,
+            fetch_force_refresh: false,
+        };
+        let profile = Pcsx2Profile {
+            profile_id: "pcsx2-user".to_string(),
+            installation_type: Pcsx2InstallationType::Native,
+            scope: Pcsx2ProfileScope::User,
+            configuration_path: PathBuf::from("/isolated/PCSX2"),
+            provenance: "test fixture",
+            eligible: false,
+            blockers: vec![
+                Pcsx2ProfileBlocker {
+                    kind: Pcsx2ProfileBlockerKind::MissingConfiguration,
+                    path: EncodedPath::from_path(Path::new("/isolated/PCSX2")),
+                    detail: "first blocker detail".to_string(),
+                },
+                Pcsx2ProfileBlocker {
+                    kind: Pcsx2ProfileBlockerKind::MissingPcsx2Evidence,
+                    path: EncodedPath::from_path(Path::new("/isolated/PCSX2")),
+                    detail: "second blocker detail".to_string(),
+                },
+            ],
+            patch_directories: Vec::new(),
+            configuration_identity: None,
+        };
+        let discovery = Pcsx2ProfileDiscovery {
+            profiles: vec![profile],
+            warnings: Vec::new(),
+            complete: true,
+        };
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(
+                    ui,
+                    &mut workflow,
+                    &Pcsx2ProfilesState::Ready(discovery.clone()),
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "first blocker detail"),
+            "the first blocker must stay directly visible, not hidden behind a disclosure"
+        );
+        assert!(
+            rendered_text_contains(&output, "Technical details"),
+            "the remaining blockers must be reachable behind the shared technical_details label"
+        );
+        assert!(
+            !rendered_text_contains(&output, "All technical blockers"),
+            "the old bespoke CollapsingHeader wording must no longer render"
+        );
     }
 }

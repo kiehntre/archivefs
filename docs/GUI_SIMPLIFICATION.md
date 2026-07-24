@@ -1463,3 +1463,277 @@ dedicated simplification pass.
 
 Sources page cleanup total: 459 tests (453 from Library IA migration
 Phase 3 + 6 new) pass; 0 failures.
+
+## Final GUI polish (`sonnet-final-gui-polish` branch)
+
+The last broad pass before release: consistency across every major page
+rather than restructuring any one of them. No source retrieval, database,
+filesystem, mount, rollback, journal, or command-execution semantics
+changed - GUI layout, shared presentation, terminology, and tests only.
+Built directly on top of the Sources page cleanup above (this branch's
+first four commits are that milestone's, fast-forwarded in before this
+pass began).
+
+### Pages audited
+
+Library (shell, Archives, Health, Duplicates, Views), Mount, Selected,
+Active Mounts, History & Logs, Sources, Cheats & Mods, Settings, Doctor,
+About, Recently Found, plus every confirmation/review/failure/batch-result
+dialog and overlay reachable from those pages. The initial audit ran via
+a read-only research pass across the whole of `main.rs` and
+`ui/components.rs`/`ui/layout.rs`/`ui/theme.rs`; two of its findings
+(claimed heading gaps on Sources and Cheats & Mods) were later found
+inaccurate on direct inspection of the actual functions and corrected
+before any code changed - see "Remaining intentional inconsistencies"
+below for what that means in practice.
+
+### Pages changed
+
+- **Library**: Health, Duplicates, and Views tabs each rendered their own
+  raw `ui.heading` below the unified shell's own "Library" `page_header`,
+  worded differently from their own tab-bar label ("Health Dashboard" vs
+  "Health", "Duplicate Review" vs "Duplicates", "Library Views" vs
+  "Views"). All three now use `widgets::section_header` with wording that
+  matches their tab label exactly. Health and Duplicates' "Back to
+  Library" buttons now use `widgets::action_button(..., ActionStyle::
+  Quiet, ...)` instead of a raw `ui.button`; Views has no Close-style
+  `LibraryViewAction` variant, so no back button was added there.
+- **Mount / Selected**: the sidebar "Selected" page's "Mount queue"
+  section had its own primary button reading "Mount ready archives (N)" -
+  different wording from both its own section heading and from the Mount
+  page's button for the exact same `show_mount_queue_confirmation`-backed
+  action ("Mount queue (N)"). Standardized both to "Mount queue (N)".
+- **Active Mounts**: had no "Recent activity" section, unlike Sources and
+  Cheats & Mods. Added `show_active_mounts_recent_activity`, following
+  the identical pattern `show_sources_recent_activity` established:
+  reuses `widgets::activity_row_header`, filters `OperationHistory` to
+  the Mount/MountAll/Unmount/UnmountAll/LazyUnmount/Remount/Cleanup
+  `ActivityAction` variants, caps at 5 entries, no "view full history"
+  link. `show_active_mounts_page`'s own signature is unchanged.
+- **Sources**: already had the Overview / Configured sources / Database
+  and catalogue management / Recent activity hierarchy from the prior
+  milestone - the polish audit's claim that it didn't was based on a
+  stale pre-merge branch, corrected once this branch was fast-forwarded
+  onto the merged Sources cleanup. Only its database section heading
+  changed, see "Terminology changes" below.
+- **Cheats & Mods**: "Choose a system" and "Mods" both already had their
+  own `section_header` - the audit's claim of a heading gap was based on
+  reading call-site context rather than the called functions themselves,
+  and was corrected on direct inspection. One real duplicate-wording
+  case was fixed: with no archive selected, the Overview card's action
+  button read "Choose an archive" while the "Selected system workflow"
+  empty state's own button, visible on the same screen for the identical
+  `CheatWorkflowAction::ChooseArchive`, read "Choose archive". Both now
+  read "Choose archive" ("Choose another archive" - shown only once an
+  archive is already selected, when the second button no longer renders
+  - is unchanged).
+- **History & Logs**: the rollback card rendered directly under the
+  page's `page_header` with no section heading of its own, unlike the
+  "Verified transaction journals" and "Session activity" sections below
+  it. Added a "Recovery" `section_header` above it (the exact vocabulary
+  this milestone's brief suggested for this concept), and gave "Session
+  activity" a description line (it previously passed `None` while every
+  other `section_header` on the page has one).
+- **Cheats & Mods diagnostics**: the PCSX2 and RetroArch profile cards'
+  "All technical blockers" / "All technical blockers (N)" raw
+  `CollapsingHeader`s were migrated to `widgets::technical_details`. In
+  both cases the first blocker is always shown directly (the actionable
+  signal stays visible without expanding anything) and the collapsible
+  only ever appears for additional blockers beyond the first - exactly
+  the shape `technical_details` exists for.
+
+### Pages deliberately unchanged
+
+Mount, Selected, Active Mounts, History & Logs, Settings, Doctor, About,
+and Recently Found were all reviewed against the milestone's full
+checklist (hierarchy, spacing, terminology, action placement, status
+visibility, error presentation, empty states, card density, navigation,
+scrolling) and found to already meet it, beyond the specific fixes listed
+above. In particular: Active Mounts' internal `ScrollArea` for the
+mounted-archive list was confirmed not nested inside an outer page-level
+scroll (`MainView::ActiveMounts` is absent from
+`main_view_uses_page_scroll`) - no double-scroll issue exists there.
+Settings' numbered section headings ("1. ArchiveFS locations" through
+"5. Intentionally unavailable") are unique to that page but were judged
+to serve its checklist-like structure well enough not to remove for
+consistency alone. About's compact version/system-information layout,
+Doctor's summary-plus-checks structure, and all overlay/dialog
+close-confirm-cancel ordering and warning visibility were reviewed and
+left unchanged - no correctness or clarity issue was found.
+
+### Terminology changes
+
+- Library tab content headings realigned to their tab-bar labels: "Health
+  Dashboard" -> "Health", "Duplicate Review" -> "Duplicates", "Library
+  Views" -> "Views".
+- Sources' database section heading "Database and catalogue management"
+  -> "Database and sources", matching Cheats & Mods' heading for the
+  exact same shared `show_retroarch_catalogue_manager` component - one
+  name for one component, not two.
+- Cheats & Mods' no-archive-selected button: "Choose an archive" ->
+  "Choose archive", matching the sibling button visible on the same
+  screen at the same time for the same action.
+- A handful of button labels that had no test pinning them were
+  standardized to sentence case, matching the dominant convention used by
+  `widgets::action_button` everywhere else: "Try again" -> "Retry"
+  (top-level load-failure screen), "Refresh Database Status" -> "Refresh
+  database status", "Retry Database Load" -> "Retry database load", "Scan
+  Library" -> "Scan library" (Settings' and the Doctor Tools-overlay's
+  database panels).
+
+### Cards combined or removed
+
+No cards were merged or removed in this pass - every change was a
+heading/label/section-boundary fix or a new, previously-missing section
+(Active Mounts' Recent activity, History & Logs' Recovery heading). The
+milestone's own guidance not to force unrelated content into one
+ambiguous card was followed throughout; nothing found during the audit
+justified combining cards further than the earlier Sources and
+Cheats & Mods milestones already had.
+
+### Components introduced or expanded
+
+- `show_active_mounts_recent_activity` (new) - Active Mounts' compact
+  "Recent activity" section, exactly mirroring
+  `show_sources_recent_activity`'s shape and precedent (shared
+  `activity_row_header`, a new `OperationHistory` filter, no "view full
+  history" link).
+- No changes to `ui/components.rs` itself - `widgets::technical_details`,
+  `section_header`, and `action_button` were used exactly as they already
+  existed; no new shared component was needed for anything found this
+  pass.
+
+### Components reused
+
+`widgets::section_header`, `widgets::action_button`, `widgets::
+technical_details`, `widgets::activity_row_header`, `widgets::card`,
+`widgets::status_strip` - all used as-is, at their existing call sites
+plus the small number of new ones listed above.
+
+### Failure and technical-detail changes
+
+Migrated to `widgets::technical_details`: the PCSX2 and RetroArch profile
+cards' "All technical blockers" disclosures (see "Pages changed" above).
+
+Reviewed and deliberately left as raw `CollapsingHeader`s, each for a
+documented reason (see the "Consolidate shared presentation and remaining
+diagnostics" commit for the full per-site reasoning): "Failed archives" /
+"Cleanup failures" (Mount-all/Unmount-all results) and "Inspection
+warnings (N)" - failure/warning lists that must stay visible, not generic
+detail, per the milestone's own instruction not to hide the only useful
+recovery information behind a collapsed section; "Passed checks (N)"
+(Doctor) and "Inspected PNACH/Game INI files (N)" (PCSX2/Dolphin) - the
+count in each header is meaningful summary information `technical_
+details`' fixed "Technical details" label cannot carry; "Safety,
+privacy, and responsible use" (Cheats & Mods) - policy content, not a
+detail disclosure; "Advanced retrieval options" (RetroArch workflow) -
+contains a live interactive checkbox, not passive detail; "Library
+Database" and "Custom Platform Aliases" (Settings) - structural,
+default-open section toggles with their own controls; "Debug: action
+readiness" (Selected archive panel) - a test-pinned special disclosure
+the milestone brief explicitly says not to convert.
+
+No error text was shortened, hidden, or duplicated. No retained-state
+notice was removed or made harder to reach.
+
+### Empty-state changes
+
+No empty-state wording changed. Active Mounts' new Recent activity
+section follows the same truthful-empty-state pattern
+`show_sources_recent_activity` established ("No mount or unmount
+activity has been recorded in this session.").
+
+### Navigation and scrolling changes
+
+No sidebar destinations, ordering, or routing changed. No `MainView`
+compatibility variant was touched. Active Mounts' scroll behaviour was
+reviewed and confirmed already correct (see "Pages deliberately
+unchanged" above) - no scrolling code changed anywhere in this pass.
+
+### Dialogs and overlays reviewed
+
+All confirmation, review, failure, and batch-result dialogs/overlays were
+reviewed for close/confirm/cancel ordering, warning-before-confirmation
+visibility, and keyboard escape/enter behaviour. No confirmation
+semantics were changed. Dialog title casing (question form like "Use
+Lazy Unmount?" vs statement form like "Confirm unmount") and the
+internally-consistent Title Case batch-dialog button family (Mount All /
+Unmount All / Lazy Unmount / Confirm Lazy Unmount / Try Normal Unmount
+Again / Remove Source) were both reviewed and left unchanged - see
+"Remaining intentional inconsistencies" below.
+
+### Tests added or converted
+
+Six new tests, all exercising real render functions with real fixtures
+(no test weakened or deleted):
+`active_mounts_recent_activity_shows_only_relevant_entries_through_the_
+shared_row_header` and `active_mounts_recent_activity_empty_state_is_
+truthful` (mirroring the equivalent Sources tests);
+`library_sub_tab_headings_match_their_own_tab_bar_labels` (Duplicates and
+Views panels render their new heading text and never the old wording);
+`mount_and_selected_pages_use_identical_mount_queue_button_wording`
+(both pages' primary queue button reads "Mount queue (1)" for the same
+one-item queue); `history_logs_page_has_a_recovery_heading_above_its_
+rollback_card`; `pcsx2_profile_card_shows_the_first_blocker_directly_
+and_the_rest_behind_technical_details` (a two-blocker fixture confirms
+the first blocker stays directly visible, the second is reachable behind
+"Technical details", and the old "All technical blockers" wording no
+longer renders anywhere).
+
+One existing test's expectations were updated in place (not weakened):
+`real_duplicate_review_renders_paths_states_details_and_no_deletion_
+controls` now expects "Duplicates" instead of the old "Duplicate Review"
+heading text.
+
+Final GUI polish total: 465 tests (459 from the Sources page cleanup +
+6 new) pass; 0 failures.
+
+### Remaining intentional inconsistencies
+
+- Dialog window titles mix question form ("Use Lazy Unmount?", "Mount All
+  pending archives?") and statement form ("Confirm unmount", "Add
+  Folder"), and the batch-dialog button family (Mount All / Unmount All /
+  Lazy Unmount / Confirm Lazy Unmount / Try Normal Unmount Again / Remove
+  Source) uses Title Case where the rest of the app uses sentence case.
+  Both are internally consistent within their own family and are
+  exercised by many existing confirmation tests; renaming them is a
+  cosmetic-only change with real regression risk for a purely visual
+  gain, so both were left as-is.
+- Settings' numbered section headings ("1." through "5.") are unique to
+  that page. Kept deliberately - see "Pages deliberately unchanged".
+- The Library "Selected archive" panel presents identity/platform/
+  metadata as one dense `egui::Grid` rather than the several-cards
+  pattern used elsewhere in the app. Reviewed and left as-is: it is a
+  working, fully-tested, different density choice for a panel that is
+  itself already embedded inside a resizable bottom panel, not a
+  duplication problem.
+
+### Known limitations
+
+- Active Mounts still has no lazy-unmount trigger of its own (only the
+  Library "Selected archive" panel offers it). Wiring lazy unmount into a
+  second entry point is new workflow surface, not polish, and was left
+  for a future milestone rather than attempted here.
+- `show_tools_overlay_header`'s "Back to Library" label remains
+  inaccurate for the non-Library case (a pre-existing, previously
+  documented Library IA migration Phase 3 finding) - still out of scope
+  for a polish pass, since fixing the label's target would be a real
+  behaviour change.
+
+### Work explicitly deferred
+
+- Renaming the Title Case batch-dialog family and unifying dialog title
+  casing app-wide (see "Remaining intentional inconsistencies").
+- Any further reduction of the three legacy `MainView` compatibility
+  variants (`Health`, `Duplicates`, `LibraryViews`) - explicitly out of
+  scope for this pass per the milestone brief, and already fully
+  documented under "Library IA migration - Phase 3" above.
+
+### Recommended next milestone
+
+Non-GUI: audit the backend's own error-message strings for the same kind
+of terminology consistency this pass gave the GUI - several GUI-side
+failure banners currently pass through backend error text verbatim
+(correctly, per this milestone's failure-presentation rules), and any
+future backend wording pass should account for those GUI call sites
+directly, rather than the GUI needing another pass to catch up.
