@@ -7692,6 +7692,8 @@ impl eframe::App for ArchiveFsApp {
                         Some(ActiveMountsPageAction::Refresh) => self.refresh(context),
                         None => {}
                     }
+                    ui.add_space(theme::SECTION_GAP);
+                    show_active_mounts_recent_activity(ui, &self.history);
                     return;
                 }
 
@@ -12096,7 +12098,7 @@ fn show_selected_page(
             let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
             if widgets::action_button(
                 ui,
-                format!("Mount ready archives ({})", attempted.len()),
+                format!("Mount queue ({})", attempted.len()),
                 widgets::ActionStyle::Primary,
                 mount_enabled,
             )
@@ -12593,6 +12595,58 @@ fn show_active_mounts_page(
         });
     action
 }
+
+/// Active Mounts' compact "Recent activity" - reuses
+/// `widgets::activity_row_header`, the same shared row-header component
+/// `show_sources_recent_activity` and `show_recent_cheat_activity` already
+/// use, scoped to the `ActivityAction` variants a mount/unmount user would
+/// recognise as theirs. No new row-rendering logic, only a new filter over
+/// the same `OperationHistory` every other activity surface already reads.
+/// No "view full history" link, matching the same precedent; full History
+/// & Logs remains reachable from the sidebar as always.
+fn show_active_mounts_recent_activity(ui: &mut egui::Ui, history: &OperationHistory) {
+    let entries: Vec<&HistoryEntry> = history
+        .entries()
+        .filter(|entry| {
+            matches!(
+                entry.action,
+                ActivityAction::Mount
+                    | ActivityAction::MountAll
+                    | ActivityAction::Unmount
+                    | ActivityAction::UnmountAll
+                    | ActivityAction::LazyUnmount
+                    | ActivityAction::Remount
+                    | ActivityAction::Cleanup
+            )
+        })
+        .take(5)
+        .collect();
+    widgets::section_header(
+        ui,
+        "Recent activity",
+        Some("A compact view of this session's mount and unmount changes."),
+    );
+    if entries.is_empty() {
+        ui.weak("No mount or unmount activity has been recorded in this session.");
+        return;
+    }
+    for entry in entries {
+        widgets::card(ui, |ui| {
+            widgets::activity_row_header(
+                ui,
+                entry.outcome.to_string(),
+                activity_outcome_tone(entry.outcome),
+                entry.action.to_string(),
+                Some(&format_history_timestamp(entry.timestamp)),
+                |_ui| {},
+            );
+            ui.add(egui::Label::new(&entry.message).truncate())
+                .on_hover_text(&entry.message);
+        });
+        ui.add_space(4.0);
+    }
+}
+
 fn show_history_logs_page(
     ui: &mut egui::Ui,
     shared_history: &SharedHistoryState,
