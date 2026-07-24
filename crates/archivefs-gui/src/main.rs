@@ -14352,24 +14352,26 @@ fn show_recent_cheat_activity(
     }
 }
 
+/// A compact, honest notice - not a full section with its own heading and
+/// card - since Mods has no workflow of its own yet and must not occupy
+/// prime space above the real, working RetroArch cheat workflow. See
+/// `docs/CHEATS_MODS_FUNCTIONAL_REPAIR.md` for the deferred mod-adapter
+/// design this notice points at.
 fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only: bool) {
-    widgets::section_header(
-        ui,
-        "Mods",
-        Some("A stable future home for verified, emulator-specific mod adapters."),
-    );
-    widgets::card(ui, |ui| {
-        if pcsx2_read_only {
-            widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
-            ui.label("PCSX2 widescreen and other PNACH patch directories can be inspected above. Preview, installation, enabling, disabling, replacement, and rollback are unavailable.");
-        } else if dolphin_read_only {
-            widgets::status_badge(ui, "Read-only inventory", widgets::StatusTone::Info);
-            ui.label("Dolphin frame patches, Action Replay, Gecko, and Riivolution declarations can be inspected above. Installation, enabling, disabling, replacement, and rollback are unavailable.");
-        } else {
-            widgets::status_badge(ui, "Planned", widgets::StatusTone::Pending);
-            ui.label(MODS_UNAVAILABLE_BODY);
-        }
-    });
+    let (tone, detail): (widgets::StatusTone, &str) = if pcsx2_read_only {
+        (
+            widgets::StatusTone::Info,
+            "PCSX2 widescreen and other PNACH patch directories can be inspected above. Preview, installation, enabling, disabling, replacement, and rollback are unavailable.",
+        )
+    } else if dolphin_read_only {
+        (
+            widgets::StatusTone::Info,
+            "Dolphin frame patches, Action Replay, Gecko, and Riivolution declarations can be inspected above. Installation, enabling, disabling, replacement, and rollback are unavailable.",
+        )
+    } else {
+        (widgets::StatusTone::Pending, MODS_UNAVAILABLE_BODY)
+    };
+    widgets::banner(ui, "Mods: planned", detail, tone);
 }
 
 fn platform_is_ps2(platform: Option<&str>) -> bool {
