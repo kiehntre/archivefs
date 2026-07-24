@@ -1737,3 +1737,59 @@ failure banners currently pass through backend error text verbatim
 (correctly, per this milestone's failure-presentation rules), and any
 future backend wording pass should account for those GUI call sites
 directly, rather than the GUI needing another pass to catch up.
+
+## Cheats & Mods functional repair (`sonnet-cheats-mods-functional-repair` branch)
+
+Unlike every milestone above, this one was explicitly **not** cosmetic:
+hands-on testing found the Cheats & Mods workflow itself broken or
+unusable, and the brief said so directly ("Stop doing cosmetic cleanup").
+Full detail is in `docs/CHEATS_MODS_FUNCTIONAL_REPAIR.md` (the deferred
+mod-adapter survey) and the branch's own final report; this section
+records only the state-model and terminology-relevant facts other
+GUI_SIMPLIFICATION.md readers would expect to find here.
+
+### Archive-selection model change
+
+Prior milestones (see "Library IA migration" above) treated
+`cheat_workflow`'s archive as an intentionally independent context from
+`selected_archive` - `reconcile_cheats_mods_context`'s old doc comment
+said so explicitly. That design caused the reported "No archive context
+selected" bug: `cheat_workflow` was a fifth, separately-maintained copy
+of "which archive," populated only by four discrete action handlers, not
+kept in sync every frame.
+
+This milestone reverses that decision: `selected_archive` is now the one
+authoritative field Library, Selected, Cheats & Mods, and Mount all read
+and write. `reconcile_cheats_mods_context` runs every frame the page is
+open and actively syncs `cheat_workflow` to match it, rather than only
+validating it against the live snapshot. Choosing an archive from inside
+Cheats & Mods now also updates `selected_archive` so the reverse
+direction holds too. This is a real, intentional behaviour change from
+the prior milestones' design, not a bug in them - it reflects the
+functional-repair brief's explicit requirement that selection be
+"authoritative and consistent across" pages, which the prior,
+deliberately-decoupled design did not attempt to provide.
+
+### New terminology
+
+- `ActivityAction::CheatInstall` (History & Logs "Operation" filter,
+  Activity panel) - distinguishes a confirmed, file-writing cheat
+  installation from `ActivityAction::CheatPreview`'s read-only preview/
+  inspection steps, which previously shared one tag.
+- Match-strength badges (`preview_match_strength_presentation`): "Verified
+  exact match" / "Strong match" / "Candidate match" / "Ambiguous" /
+  "Unsupported", each with a one-sentence, engine-accurate explanation -
+  replaces a raw `{:?}` Debug dump of `PreviewMatchStrength`.
+- Mods section: no longer has its own "Mods" heading + card; now a single
+  compact banner titled "Mods: planned" (or the existing read-only-
+  inventory wording for PCSX2/Dolphin).
+
+### Diagnostic presentation
+
+`show_cheat_warnings_summary` (new shared helper) replaces three
+unbounded per-entry warning-banner loops - the Sources page's RetroArch
+catalogue manager, the Cheats & Mods trusted-source list, and its
+post-fetch result card - with one bounded pattern: a count banner, up to
+3 representative entries, and the complete list behind
+`widgets::technical_details` with a "Copy all" action. No diagnostic data
+was discarded.

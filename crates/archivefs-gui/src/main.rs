@@ -24154,6 +24154,39 @@ mod tests {
     }
 
     #[test]
+    fn no_eligible_match_is_reported_honestly_with_no_installation_ready_wording() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let key = cheat_preview_key(workflow);
+        workflow.preview = CheatStepResource::Ready(CheatPreviewResponse {
+            key,
+            outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::Materialization(
+                RetroArchMaterializationError {
+                    kind: RetroArchMaterializationErrorKind::NoEligibleMatch,
+                    path: None,
+                    detail: "no exact or approved strong match".into(),
+                },
+            )),
+            materialized: None,
+        });
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_shared_cheat_preview(ui, workflow, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(&output, "No matching cheat found"));
+        assert!(rendered_text_contains(&output, "Nothing can be applied"));
+        for forbidden in ["Install now", "Ready to install", "Apply now"] {
+            assert!(
+                !rendered_text_contains(&output, forbidden),
+                "an unmatched archive must never show an installation-ready action or badge"
+            );
+        }
+    }
+
+    #[test]
     fn stale_catalogue_result_is_rejected_without_touching_library_state() {
         let mut app = app_for_operation_tests();
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
