@@ -16279,8 +16279,15 @@ fn show_cheats_mods_page(
         ui.add_space(theme::SECTION_GAP);
         show_shared_game_identity(ui, workflow, clipboard);
         ui.add_space(theme::SECTION_GAP);
-        action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
-        ui.add_space(theme::SECTION_GAP);
+        // Step order matters here: profile/source selection first, then
+        // the preview that depends on them - showing the preview above an
+        // unfilled profile picker used to read as "Preview waiting" before
+        // the reader had even seen what it was waiting for. Also, only the
+        // RetroArch adapter has any shared preview/install pipeline at all
+        // (PCSX2 and Dolphin are read-only-only, per the Mods section) -
+        // rendering `show_shared_cheat_preview` unconditionally used to
+        // show a permanently-empty "Preview waiting" card even while a
+        // read-only adapter was selected.
         match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => {
                 action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
@@ -16294,6 +16301,8 @@ fn show_cheats_mods_page(
                     }
                 };
                 action = action.or(source_action);
+                ui.add_space(theme::SECTION_GAP);
+                action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
             }
             CheatEmulatorAdapter::Pcsx2 => {
                 action = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, clipboard).or(action);
@@ -23485,6 +23494,80 @@ mod tests {
             assert!(
                 rendered_text_contains(&output, expected),
                 "Cheats & Mods page did not render {expected:?} under the new hierarchy"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selection() {
+        let mut app = app_with_cheats_mods_context();
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+
+        // RetroArch (the default adapter for app_with_cheats_mods_context):
+        // the shared preview step must be reachable, and it must render
+        // after (not above) the profile-selection step it depends on.
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Shared preview"));
+        let profile_step_position =
+            find_exact_text_center(&output, "Stage 1 · Archive and RetroArch profile");
+        let preview_position = find_exact_text_center(&output, "Shared preview");
+        if let (Some(profile_pos), Some(preview_pos)) = (profile_step_position, preview_position) {
+            assert!(
+                profile_pos.y < preview_pos.y,
+                "profile selection must render above the preview that depends on it"
+            );
+        }
+
+        // PCSX2 and Dolphin have no shared preview/install pipeline at all
+        // (read-only inspection only) - the preview step must not render a
+        // permanently-empty "Preview waiting" card for them.
+        for (platform, adapter) in [
+            ("PS2", CheatEmulatorAdapter::Pcsx2),
+            ("GameCube", CheatEmulatorAdapter::Dolphin),
+        ] {
+            let workflow = app.cheat_workflow.as_mut().unwrap();
+            workflow.platform = Some(platform.to_string());
+            workflow.adapter = adapter;
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_cheats_mods_page(
+                        ui,
+                        app.cheat_workflow.as_mut(),
+                        &app.retroarch_profiles,
+                        &app.pcsx2_profiles,
+                        &app.dolphin_profiles,
+                        None,
+                        None,
+                        &history,
+                        false,
+                        &mut clipboard,
+                    );
+                });
+            });
+            assert!(
+                !rendered_text_contains(&output, "Shared preview"),
+                "{adapter:?} has no shared preview pipeline and must not render its section"
+            );
+            assert!(
+                !rendered_text_contains(&output, "Preview waiting"),
+                "{adapter:?} must not show a permanently-empty preview placeholder"
             );
         }
     }
