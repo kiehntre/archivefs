@@ -12662,6 +12662,13 @@ fn show_history_logs_page(
         "History & Logs",
         "Filter, inspect, copy, or export operations from this application session.",
     );
+    widgets::section_header(
+        ui,
+        "Recovery",
+        Some(
+            "Roll back the most recent set of destructive, journal-tracked operations if something went wrong.",
+        ),
+    );
     widgets::card(ui, |ui| match rollback {
         SharedRollbackState::Idle => {
             ui.label("Rollback always begins with a fresh read-only preview and a separate confirmation.");
@@ -12898,7 +12905,11 @@ fn show_history_logs_page(
         }
     }
     ui.add_space(theme::SECTION_GAP);
-    widgets::section_header(ui, "Session activity", None);
+    widgets::section_header(
+        ui,
+        "Session activity",
+        Some("This session's recorded operations - filter, copy, or export what's shown below."),
+    );
     if history.entries().next().is_none() {
         widgets::empty_state(
             ui,
