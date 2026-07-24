@@ -22376,6 +22376,60 @@ mod tests {
         assert_eq!(app.library_tab, LibraryTab::Health);
     }
 
+    #[test]
+    fn migrated_navigation_sites_preserve_their_own_side_effects_alongside_the_tab_switch() {
+        // Mirrors HealthDashboardAction::OpenMissingReview's exact
+        // dispatch lines (now navigate_to_library_tab + the same
+        // library_filters.missing write it always had).
+        let mut app = app_for_operation_tests();
+        app.navigate_to_library_tab(LibraryTab::Archives);
+        app.library_filters.missing = true;
+        assert_eq!(app.view, MainView::Library);
+        assert_eq!(app.library_tab, LibraryTab::Archives);
+        assert!(app.library_filters.missing);
+
+        // Mirrors AppOperationRequest::ShowInLibraryViews's exact
+        // dispatch lines.
+        let mut app = app_for_operation_tests();
+        let archive_path = PathBuf::from("/roms/focus.zip");
+        app.navigate_to_library_tab(LibraryTab::Views);
+        app.library_view_focus_archive = Some(archive_path.clone());
+        assert_eq!(app.view, MainView::LibraryViews);
+        assert_eq!(app.library_tab, LibraryTab::Views);
+        assert_eq!(app.library_view_focus_archive, Some(archive_path));
+
+        // Mirrors HealthDashboardAction::OpenDuplicateReview's exact
+        // dispatch line - the one migrated site that targets a specific
+        // non-Archives tab rather than "go to Library" generically.
+        let mut app = app_for_operation_tests();
+        app.navigate_to_library_tab(LibraryTab::Duplicates);
+        assert_eq!(app.view, MainView::Duplicates);
+        assert_eq!(app.library_tab, LibraryTab::Duplicates);
+    }
+
+    #[test]
+    fn back_to_library_actions_land_on_the_archives_tab_from_any_starting_tab() {
+        for starting_tab in [
+            LibraryTab::Health,
+            LibraryTab::Duplicates,
+            LibraryTab::Views,
+        ] {
+            // Mirrors HealthDashboardAction::BackToLibrary's and
+            // DuplicateReviewAction::Close's identical dispatch line.
+            let mut app = app_for_operation_tests();
+            app.navigate_to_library_tab(starting_tab);
+            assert_eq!(app.library_tab, starting_tab);
+
+            app.navigate_to_library_tab(LibraryTab::Archives);
+            assert_eq!(
+                app.view,
+                MainView::Library,
+                "a Back to Library control from {starting_tab:?} must land on Library/Archives"
+            );
+            assert_eq!(app.library_tab, LibraryTab::Archives);
+        }
+    }
+
     /// A deterministic, in-memory stand-in for `NativeClipboard` - the
     /// injectable clipboard every context-menu test uses instead of the
     /// real OS clipboard, so assertions never depend on (or pollute) the
@@ -33288,6 +33342,25 @@ mod tests {
             .find_map(|clipped| find_in_shape(&clipped.shape, needle))
     }
 
+    /// Counts every `Shape::Text` whose laid-out string *exactly matches*
+    /// `needle` - the exact-match counterpart of `rendered_text_contains`,
+    /// used where "present" isn't precise enough (e.g. confirming a
+    /// heading renders exactly once, not zero or two times).
+    fn count_exact_text_occurrences(output: &egui::FullOutput, needle: &str) -> usize {
+        fn count_in_shape(shape: &egui::Shape, needle: &str) -> usize {
+            match shape {
+                egui::Shape::Text(text_shape) => usize::from(text_shape.galley.text() == needle),
+                egui::Shape::Vec(nested) => nested.iter().map(|s| count_in_shape(s, needle)).sum(),
+                _ => 0,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .map(|clipped| count_in_shape(&clipped.shape, needle))
+            .sum()
+    }
+
     /// Renders the real `show_loaded_data` (what the Library page actually
     /// dispatches to) with only `selected_archives` and
     /// `select_all_visible_requested` under the caller's control - every
@@ -33415,6 +33488,144 @@ mod tests {
                  page or Tools overlay"
             );
         }
+    }
+
+    #[test]
+    fn archives_tab_shows_exactly_one_library_heading() {
+        let ctx = egui::Context::default();
+
+        let shell_output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_library_shell_header(ui, LibraryTab::Archives);
+            });
+        });
+        assert_eq!(
+            count_exact_text_occurrences(&shell_output, "Library"),
+            1,
+            "the unified Library shell must render exactly one 'Library' heading"
+        );
+
+        let data = empty_loaded_data("/mnt/library");
+        let mut selected_archives = HashSet::new();
+        let mut select_all_visible_requested = false;
+        let body_output = render_show_loaded_data_for_test(
+            &ctx,
+            &data,
+            &mut selected_archives,
+            &mut select_all_visible_requested,
+        );
+        assert_eq!(
+            count_exact_text_occurrences(&body_output, "Library"),
+            0,
+            "the Archives tab body (show_loaded_data with recent_view: false) must not \
+             render its own 'Library' heading any more - the shell already did"
+        );
+    }
+
+    #[test]
+    fn recently_found_still_shows_its_own_heading_with_no_library_duplicate() {
+        let ctx = egui::Context::default();
+        let data = empty_loaded_data("/mnt/library");
+        let mut filter = String::new();
+        let mut filtered_rows = None;
+        let mut selected_archive = None;
+        let mut confirm_unmount = None;
+        let mut confirm_lazy_unmount = None;
+        let mut confirm_lazy_unmount_final = None;
+        let mut confirm_mount_all = None;
+        let mut focus_mount_all_cancel = false;
+        let mut confirm_unmount_all = None;
+        let mut focus_unmount_all_cancel = false;
+        let mut confirm_unmount_selected = None;
+        let mut focus_unmount_selected_cancel = false;
+        let mut focus_lazy_cancel = false;
+        let mut focus_final_lazy_cancel = false;
+        let lazy_unmount_offers = HashSet::new();
+        let remount_offers = HashSet::new();
+        let mut cleanup_after_unmount = false;
+        let mut history = OperationHistory::default();
+        let mut library_filters = LibraryRowFilters::default();
+        let mut platform_choice = None;
+        let mut platform_custom_text = String::new();
+        let mut bulk_platform_choice = None;
+        let mut confirm_remove_missing = None;
+        let mut sort_field = None;
+        let mut sort_ascending = true;
+        let mut library_scroll_offset = 0.0;
+        let mut clipboard = InMemoryClipboard::default();
+        let mut library_source_filter = None;
+        let mut library_column_widths = LibraryColumnWidths::default();
+        let mut selected_archives = HashSet::new();
+        let mut select_all_visible_requested = false;
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_loaded_data(
+                    ui,
+                    &data,
+                    LoadedViewState {
+                        filter: &mut filter,
+                        filtered_rows: &mut filtered_rows,
+                        selected_archive: &mut selected_archive,
+                        operation: None,
+                        busy: false,
+                        block_reason: None,
+                        action_readiness_debug_lines: &[],
+                        feedback: None,
+                        confirm_unmount: &mut confirm_unmount,
+                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                        confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
+                        confirm_mount_all: &mut confirm_mount_all,
+                        focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                        confirm_unmount_all: &mut confirm_unmount_all,
+                        focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                        confirm_unmount_selected: &mut confirm_unmount_selected,
+                        focus_unmount_selected_cancel: &mut focus_unmount_selected_cancel,
+                        focus_lazy_cancel: &mut focus_lazy_cancel,
+                        focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
+                        lazy_unmount_offers: &lazy_unmount_offers,
+                        remount_offers: &remount_offers,
+                        cleanup_after_unmount: &mut cleanup_after_unmount,
+                        mount_all_result: None,
+                        unmount_all_result: None,
+                        history: &mut history,
+                        cached: None,
+                        library_filters: &mut library_filters,
+                        platform_choice: &mut platform_choice,
+                        platform_custom_text: &mut platform_custom_text,
+                        platform_busy: false,
+                        retroarch_profiles: &RetroArchProfilesState::NotScanned,
+                        selected_archives: &mut selected_archives,
+                        bulk_platform_choice: &mut bulk_platform_choice,
+                        bulk_platform_busy: false,
+                        missing_removal_available: false,
+                        missing_removal_busy: false,
+                        confirm_remove_missing: &mut confirm_remove_missing,
+                        sort_field: &mut sort_field,
+                        sort_ascending: &mut sort_ascending,
+                        library_scroll_offset: &mut library_scroll_offset,
+                        clipboard: &mut clipboard,
+                        select_all_visible_requested: &mut select_all_visible_requested,
+                        library_source_filter: &mut library_source_filter,
+                        library_column_widths: &mut library_column_widths,
+                        library_views_configured: false,
+                        library_view_last_plan: None,
+                        recent_scan: None,
+                        recent_view: true,
+                    },
+                );
+            });
+        });
+
+        assert!(
+            rendered_text_contains(&output, "Recently Found"),
+            "Recently Found must keep its own heading"
+        );
+        assert_eq!(
+            count_exact_text_occurrences(&output, "Library"),
+            0,
+            "Recently Found must never render a bare 'Library' heading"
+        );
     }
 
     #[test]

@@ -1104,3 +1104,210 @@ which is the authoritative source; this section summarizes it.
 
 Library IA migration Phase 2 total: 449 tests (441 from Phase 1 + 8 new)
 pass; 0 failures.
+
+---
+
+## Library IA migration - Phase 3 (`sonnet-library-tabs-phase-3-cleanup` branch)
+
+Cleanup of the compatibility rough edges Phase 2 deliberately left open,
+plus an evidence-backed decision on the legacy `MainView` variants. No
+`MainView` variant removed, no sidebar structure changed, no render
+function renamed.
+
+### How the duplicate heading was fixed
+
+Audited every production caller of `show_loaded_data` with
+`recent_view == false`: only one remained (the unified shell's Archives
+arm, since Phase 2 routed everything else through it), and no test
+asserted the "Library" heading text it printed. Removed exactly that
+`widgets::page_header(ui, "Library", ...)` call, replacing it with just
+its description line (kept as a plain muted label - it says something
+the shell's own, more general four-tab description doesn't) plus the
+same spacing. `recent_view == true` (Recently Found) is a separate `if`
+and was not touched. No extraction, no new rendering mode, no new
+parameter on `show_loaded_data` or `LoadedViewState` - the smallest
+change that fixed it.
+
+### Direct navigation assignments migrated
+
+All 11 remaining direct `self.view = MainView::X` assignments to the
+four Library-related destinations were migrated to
+`navigate_to_library_tab`. None were retained as plain assignments -
+the audit found no test exercising the real `update()` dispatch (this
+codebase never calls `eframe::App::update` directly in a test), so
+nothing depended on the raw-assignment form specifically, and
+`navigate_to_library_tab` is a strict superset of what each assignment
+did (same `view`, immediate correct `library_tab` instead of waiting a
+frame for `reconcile_library_tab`, and a `tools_overlay` clear that was
+already a no-op at every one of these eleven sites).
+
+Target tab by site (every other field write at each site - selected
+archive, `library_source_filter`, `library_filters.missing`,
+`library_view_focus_archive` - preserved exactly as it was):
+
+| Site | Target tab |
+|---|---|
+| `ActivityPanelAction::ShowRelatedArchive` | Archives |
+| `SourcesPageAction::ViewInLibrary` | Archives |
+| `CheatWorkflowAction::OpenLibrary` | Archives |
+| `ActiveMountsPageAction::OpenInLibrary` | Archives |
+| `DuplicateReviewAction::Close` | Archives |
+| `DuplicateReviewAction::ViewInLibrary` | Archives |
+| `HealthDashboardAction::BackToLibrary` | Archives |
+| `HealthDashboardAction::OpenMissingReview` | Archives |
+| `HealthDashboardAction::ViewInLibrary` | Archives |
+| `HealthDashboardAction::OpenDuplicateReview` | **Duplicates** |
+| `AppOperationRequest::ShowInLibraryViews` | **Views** |
+
+Also updated `health_context_menu_show_in_library_resolves_the_exact_
+archive`, a test whose own comment says it intentionally mirrors this
+exact dispatch line rather than calling it, to mirror the new
+`navigate_to_library_tab` call and assert `library_tab` too.
+
+### "Back to Library" control decisions
+
+| Control | Decision | Why |
+|---|---|---|
+| `show_duplicate_review_panel`'s "Back to Library" (`DuplicateReviewAction::Close`) | **Kept**, handler migrated to `navigate_to_library_tab(Archives)` | Sits above the same internal scroll area the tab row is pinned outside of - not meaningfully redundant with the tab row; removing a working exit action for a small convenience gain wasn't worth the risk. |
+| `show_health_dashboard_panel`'s "Back to Library" (`HealthDashboardAction::BackToLibrary`) | **Kept**, same migration | Same reasoning. |
+| Cheats & Mods' "Open Library" (`CheatWorkflowAction::OpenLibrary`) | **Kept**, handler migrated to `navigate_to_library_tab(Archives)` | Distinct workflow meaning (leave Cheats & Mods to go pick an archive) - not a Library-internal control at all. |
+| `show_tools_overlay_header`'s "Back to Library" (used by every Tools overlay screen without its own dismiss action) | **Left completely unchanged** | Despite the label, it only clears `self.tools_overlay` and returns to whatever page was already active - not necessarily Library (Tools overlays open from any page). This is a pre-existing label inaccuracy that predates the Library shell; changing its actual target to navigate to Library would be a real, unrelated behaviour change for anyone who opened a Tools overlay from a non-Library page. Documented on the function rather than fixed, since it's out of this migration's scope. |
+
+No "Back to Library"-style control was removed. None were found to be
+fully redundant given the button-vs-tab-row position analysis above.
+
+### Legacy `MainView` variant status
+
+**Decision: kept `Health`, `Duplicates`, and `LibraryViews` as real enum
+variants this phase** - the default the milestone brief specified,
+applied because removal was not clearly safe, small, and test-backed:
+
+- **Production code still needs them.** `library_tab_for_main_view`,
+  `main_view_title`, `main_view_content_width`, and
+  `main_view_uses_page_scroll` all pattern-match every `MainView`
+  variant exhaustively; the shell's content dispatch is keyed off
+  `self.view` matching them via that mapping.
+- **50+ tests across three milestones** construct or compare against
+  these three variants directly (confirmed by grep across the Phase 1,
+  2, and 3 branches' test additions plus the pre-existing suite).
+- **No external, persisted, or CLI dependency found.** `ArchiveFsApp` is
+  never serialized between runs (`view` always starts at its
+  `#[default]`, `Library`, each launch); the CLI is a separate binary
+  with no awareness of the GUI's `MainView` enum. This is the one thing
+  that would *not* block removal - the blockers are entirely internal
+  (production dispatch + test surface).
+- **Removing them would not simplify synchronization further** at this
+  point - `LibraryTab` already is the single tab-identity source of
+  truth for anything that reads it (nothing reads raw `MainView::Health`
+  and treats it differently from `LibraryTab::Health`); removing the
+  `MainView` variants would just relocate the same information, not
+  eliminate a real duplication.
+
+Reduced to documented compatibility aliases as instructed: `MainView`
+now carries a doc comment explaining exactly this (production dispatch
+keys + test surface, no external dependency), and each of the three
+variants' names make clear they exist to be routed through
+`library_tab_for_main_view`, not as independent destinations.
+
+**No removal proposed.** If a future milestone wants to reconsider this,
+the exact remaining work is listed under "Phase 4" below.
+
+### Compatibility code removed or retained
+
+- **Removed:** nothing needed removing - the previous milestone already
+  resolved every `#[allow(dead_code)]` introduced during the foundation
+  phase (confirmed: none remain in the codebase).
+- **Retained, now documented:** `navigation_destination_enabled`'s
+  `MainView::Health | MainView::Duplicates` match arms are unreachable
+  through any live sidebar call site today (neither appears in
+  `PRIMARY_NAVIGATION_DESTINATIONS` any more), but were not pruned - the
+  same database-readiness gate is the correct one to reuse if the tab
+  row ever needs to grey out those two tabs before a scan completes.
+  Documented as "kept ready," not "kept out of caution," on the function
+  itself.
+- **No wrapper functions were introduced or removed** - `show_loaded_data`,
+  `show_health_dashboard_panel`, `show_duplicate_review_panel`, and
+  `show_library_views_page` remain exactly as Phase 2 left them (only
+  the one heading line inside `show_loaded_data` changed in this phase).
+
+### Remaining limitations
+
+- The three legacy `MainView` variants remain a form of duplication with
+  `LibraryTab` - documented and justified, not eliminated.
+- `show_tools_overlay_header`'s "Back to Library" label remains slightly
+  inaccurate for the non-Library case, deliberately left alone as
+  out-of-scope for this migration.
+- As in Phase 2: the `match self.library_tab { ... }` content dispatch
+  inside `update()` (including the eleven now-migrated
+  `navigate_to_library_tab` call sites) is not directly unit-tested,
+  because nothing in this codebase unit-tests `eframe::App::update`
+  itself. Confidence comes from mirrored dispatch tests (this phase
+  added three: `migrated_navigation_sites_preserve_their_own_side_
+  effects_alongside_the_tab_switch`, `back_to_library_actions_land_on_
+  the_archives_tab_from_any_starting_tab`, plus the updated
+  `health_context_menu_show_in_library_resolves_the_exact_archive`) that
+  exercise the exact same statements the real dispatch runs, plus full
+  coverage of `navigate_to_library_tab` and `reconcile_library_tab`
+  themselves from Phase 1.
+
+### Exact work remaining before legacy MainView variants could be removed
+
+1. Confirm (or re-confirm, since test counts will have grown) that no
+   test still needs to construct/compare `MainView::Health`/
+   `Duplicates`/`LibraryViews` directly - likely requires updating
+   50+ tests to use `LibraryTab` instead, or introducing test-only
+   helper constructors that hide the distinction.
+2. Decide what `self.view`'s type becomes once it no longer needs to
+   name these three specifically - either `self.view` stops being the
+   single source of truth for Library tab content (and `library_tab`
+   takes over that role fully, with `view` only tracking "am I in the
+   Library area at all"), or some other restructuring.
+3. Update `main_view_title`/`main_view_content_width`/
+   `main_view_uses_page_scroll`/`library_tab_for_main_view` accordingly
+   once the variants are gone.
+4. Re-run the full navigation and Library test suite and expect
+   significant, not incremental, churn - this is explicitly *not* the
+   "small, evidence-backed" removal this phase's default-to-keep
+   instruction requires; it would be its own milestone.
+
+### Recommended next milestone
+
+No further Library-tabs cleanup is urgent - the visible shell, its
+navigation, and its compatibility layer are all in a stable, documented
+state. The two open threads are, in priority order:
+
+1. **A different area of the GUI entirely** - the Library IA migration
+   (Phases 1-3) has reached a natural stopping point; further polish
+   here has diminishing returns relative to auditing other pages for
+   the same kind of duplication this migration found in Library.
+2. **If Library work continues**, the honest next step is not "remove
+   the legacy MainView variants" (see above - not small) but revisiting
+   whether the per-tab-body content (archive table, health list,
+   duplicate groups, saved views) has any genuinely shared rendering
+   worth extracting now that the page's final shape (heading + tab row +
+   one dispatch) has been stable across two full phases - the question
+   Phase 1 and Phase 2 both deferred as "premature."
+
+## Test coverage added in the Library IA migration Phase 3
+
+- `main.rs`: `count_exact_text_occurrences` (new test helper, the
+  exact-match counting counterpart of the existing
+  `rendered_text_contains`/`find_exact_text_center`) -
+  `archives_tab_shows_exactly_one_library_heading` uses it to confirm
+  the shell contributes exactly one "Library" heading and
+  `show_loaded_data`'s Archives-tab body contributes zero;
+  `recently_found_still_shows_its_own_heading_with_no_library_duplicate`
+  confirms Recently Found's own heading is intact and it never renders a
+  bare "Library" heading; `migrated_navigation_sites_preserve_their_own_
+  side_effects_alongside_the_tab_switch` mirrors three of the newly
+  migrated dispatch sites (OpenMissingReview, ShowInLibraryViews,
+  OpenDuplicateReview) and confirms both the correct destination tab and
+  each site's own side-effect field survive together;
+  `back_to_library_actions_land_on_the_archives_tab_from_any_starting_
+  tab` confirms a Back-to-Library action reaches Archives regardless of
+  which tab it was invoked from; `health_context_menu_show_in_library_
+  resolves_the_exact_archive` updated to mirror the migrated dispatch
+  line and assert `library_tab` too (see above).
+
+Library IA migration Phase 3 total: 453 tests (449 from Phase 2 + 4 new)
+pass; 0 failures.
