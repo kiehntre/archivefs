@@ -266,12 +266,17 @@ enum ActivityAction {
     DolphinGameIniInspection,
     /// Shared bounded source-to-destination preview and conflict detection.
     CheatPreview,
+    /// The confirmed, file-writing shared apply for a reviewed cheat
+    /// installation - distinct from `CheatPreview`, which covers every
+    /// read-only preview/inspection step leading up to it, so History &
+    /// Logs can tell "previewed" apart from "actually installed".
+    CheatInstall,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 36] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 37] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -308,6 +313,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 36] = [
     ActivityAction::DolphinProfileScan,
     ActivityAction::DolphinGameIniInspection,
     ActivityAction::CheatPreview,
+    ActivityAction::CheatInstall,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -397,6 +403,7 @@ impl std::fmt::Display for ActivityAction {
             Self::DolphinProfileScan => "Dolphin profile scan",
             Self::DolphinGameIniInspection => "Dolphin Game INI inspection",
             Self::CheatPreview => "Cheats & Mods preview",
+            Self::CheatInstall => "Cheats & Mods install",
         })
     }
 }
@@ -5345,7 +5352,7 @@ impl ArchiveFsApp {
             Ok(path) => path,
             Err(error) => {
                 self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
+                    ActivityAction::CheatInstall,
                     Some(workflow.archive_path.clone()),
                     ActivityOutcome::Failed,
                     format!("Apply root unavailable: {}", error.detail),
@@ -5357,7 +5364,7 @@ impl ArchiveFsApp {
             Ok(path) => path,
             Err(error) => {
                 self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
+                    ActivityAction::CheatInstall,
                     Some(workflow.archive_path.clone()),
                     ActivityOutcome::Failed,
                     format!("Backup root unavailable: {}", error.detail),
@@ -5390,7 +5397,7 @@ impl ArchiveFsApp {
             receiver,
         };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            ActivityAction::CheatInstall,
             Some(archive),
             ActivityOutcome::Started,
             format!("Shared apply '{operation_id}' started."),
@@ -5799,7 +5806,7 @@ impl ArchiveFsApp {
                         SharedApplyStatus::DryRun => ActivityOutcome::Skipped,
                     };
                     preview_history_entry = Some(HistoryEntry::new(
-                        ActivityAction::CheatPreview,
+                        ActivityAction::CheatInstall,
                         Some(workflow.archive_path.clone()),
                         outcome,
                         format!(
@@ -5811,7 +5818,7 @@ impl ArchiveFsApp {
                 }
                 Ok(Err(message)) => {
                     preview_history_entry = Some(HistoryEntry::new(
-                        ActivityAction::CheatPreview,
+                        ActivityAction::CheatInstall,
                         Some(workflow.archive_path.clone()),
                         ActivityOutcome::Failed,
                         format!("Shared apply worker failed: {message}"),
@@ -15627,6 +15634,46 @@ fn preview_state_tone(state: PreviewState) -> widgets::StatusTone {
     }
 }
 
+/// The user-facing label, tone, and one-sentence explanation for a
+/// candidate's `PreviewMatchStrength` - the coarse match-confidence
+/// category the matching engine actually produces today. This is the
+/// full granularity available: the engine does not currently report
+/// which specific piece of evidence (title, serial, CRC, region,
+/// filename) drove a match, only the resulting confidence tier, so the
+/// explanation stays honest about that rather than inventing detail the
+/// engine doesn't have.
+fn preview_match_strength_presentation(
+    strength: PreviewMatchStrength,
+) -> (&'static str, widgets::StatusTone, &'static str) {
+    match strength {
+        PreviewMatchStrength::VerifiedExact => (
+            "Verified exact match",
+            widgets::StatusTone::Success,
+            "The catalogue's identity was independently verified against this exact archive.",
+        ),
+        PreviewMatchStrength::Strong => (
+            "Strong match",
+            widgets::StatusTone::Success,
+            "A high-confidence automatic pairing, short of independent verification.",
+        ),
+        PreviewMatchStrength::Candidate => (
+            "Candidate match",
+            widgets::StatusTone::Warning,
+            "A plausible pairing that has not been confirmed exact - review before installing.",
+        ),
+        PreviewMatchStrength::Ambiguous => (
+            "Ambiguous",
+            widgets::StatusTone::Blocked,
+            "More than one catalogue entry could apply here. ArchiveFS will not guess between them.",
+        ),
+        PreviewMatchStrength::Unsupported => (
+            "Unsupported",
+            widgets::StatusTone::Blocked,
+            "No automatic matching is possible for this archive and adapter combination.",
+        ),
+    }
+}
+
 fn destination_state_label(state: PreviewDestinationState) -> &'static str {
     match state {
         PreviewDestinationState::Missing => "Missing",
@@ -15801,7 +15848,12 @@ fn show_shared_cheat_preview(
                         } else {
                             ui.label("Verified identity: unavailable");
                         }
-                        ui.label(format!("Match strength: {:?}", entry.match_strength));
+                        {
+                            let (label, tone, explanation) =
+                                preview_match_strength_presentation(entry.match_strength);
+                            widgets::status_badge(ui, label, tone);
+                            ui.label(explanation);
+                        }
                         if let Some(source) = &entry.source_path
                             && widgets::path_value(ui, "Source item", source)
                         {
@@ -25319,6 +25371,41 @@ mod tests {
         assert_eq!(
             planned_action_label(MountState::MountPathExists),
             "Skip — destination already exists"
+        );
+    }
+
+    #[test]
+    fn preview_match_strength_presentation_covers_every_variant_with_a_distinct_honest_explanation()
+    {
+        let all = [
+            PreviewMatchStrength::VerifiedExact,
+            PreviewMatchStrength::Strong,
+            PreviewMatchStrength::Candidate,
+            PreviewMatchStrength::Ambiguous,
+            PreviewMatchStrength::Unsupported,
+        ];
+        let mut labels = std::collections::HashSet::new();
+        for strength in all {
+            let (label, _tone, explanation) = preview_match_strength_presentation(strength);
+            assert!(!label.is_empty());
+            assert!(
+                !explanation.is_empty(),
+                "{strength:?} must explain itself, not just carry a bare label"
+            );
+            assert!(
+                labels.insert(label),
+                "{strength:?} must not share a label with another match strength"
+            );
+        }
+        // The two "don't trust this without review" tiers must be visibly
+        // distinct in tone from the two "safe to proceed" tiers.
+        assert_eq!(
+            preview_match_strength_presentation(PreviewMatchStrength::VerifiedExact).1,
+            widgets::StatusTone::Success
+        );
+        assert_eq!(
+            preview_match_strength_presentation(PreviewMatchStrength::Ambiguous).1,
+            widgets::StatusTone::Blocked
         );
     }
 
