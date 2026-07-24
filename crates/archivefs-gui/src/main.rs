@@ -4777,6 +4777,8 @@ impl ArchiveFsApp {
                 self.tools_overlay = ToolsOverlay::None;
             }
             Some(MountPageAction::OpenCheatsMods(archive_path)) => {
+                self.selected_archive = Some(archive_path.clone());
+                self.selected_archives = [archive_path.clone()].into_iter().collect();
                 self.open_cheats_mods_workspace(context, archive_path);
             }
             Some(MountPageAction::ScanRetroArchProfiles) => {
@@ -5419,8 +5421,12 @@ impl ArchiveFsApp {
         ));
     }
 
-    /// Applies one explicit picker choice without touching Library focus,
-    /// multi-selection, queue membership, or mount state.
+    /// Applies one explicit picker choice. Also writes the choice back to
+    /// `selected_archive`/`selected_archives` (the field Library, Selected,
+    /// and Mount all read) so the archive picked here is immediately the
+    /// one every other page considers selected too - archive selection is
+    /// authoritative and shared, not a Cheats & Mods-only copy. Queue
+    /// membership and mount state are untouched.
     fn apply_cheat_archive_choice(&mut self, context: &egui::Context, archive_path: PathBuf) {
         self.confirm_cheat_archive_change = None;
         self.cheat_archive_picker = None;
@@ -5428,6 +5434,8 @@ impl ArchiveFsApp {
             self.retroarch_profiles,
             RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
         );
+        self.selected_archive = Some(archive_path.clone());
+        self.selected_archives = [archive_path.clone()].into_iter().collect();
         self.open_cheats_mods_workspace(context, archive_path);
         if self.cheat_workflow.is_some() && needs_profile_scan {
             self.start_retroarch_profile_scan(context.clone());
@@ -5998,12 +6006,31 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Revalidates the independent workspace context against the live
-    /// snapshot. Library focus is intentionally irrelevant: clearing or
-    /// changing it must not silently replace this explicit context.
-    fn reconcile_cheats_mods_context(&mut self) {
+    /// Keeps the Cheats & Mods workspace in sync with `selected_archive`,
+    /// the one authoritative "which archive" field shared with Library and
+    /// Mount (see the module-level note on archive-selection continuity).
+    /// Runs every frame while this page is open, so entering the page,
+    /// switching the Library selection while already here, and navigating
+    /// away and back all converge on the same archive without a stale
+    /// "No archive context selected" state. An explicit in-page "Choose
+    /// archive" pick writes back to `selected_archive` itself (see
+    /// `apply_cheat_archive_choice`), so this never fights a user's
+    /// explicit in-workspace choice - it only ever catches up to it.
+    fn reconcile_cheats_mods_context(&mut self, context: &egui::Context) {
         if self.view != MainView::CheatsMods {
             return;
+        }
+        match self.selected_archive.clone() {
+            Some(path)
+                if !self
+                    .cheat_workflow
+                    .as_ref()
+                    .is_some_and(|workflow| workflow.archive_path == path) =>
+            {
+                self.open_cheats_mods_workspace(context, path);
+            }
+            None => self.cheat_workflow = None,
+            Some(_) => {}
         }
         let context_is_current =
             self.cheat_workflow
@@ -7162,13 +7189,12 @@ impl eframe::App for ArchiveFsApp {
             });
         if let Some(clicked) = navigation_request {
             if clicked == MainView::CheatsMods {
-                if let Some(path) = self.selected_archive.clone() {
-                    self.open_cheats_mods_workspace(context, path);
-                } else {
-                    self.view = MainView::CheatsMods;
-                    self.tools_overlay = ToolsOverlay::None;
-                    self.cheat_workflow = None;
-                }
+                // `reconcile_cheats_mods_context`, called below every frame
+                // this page is open, does the actual sync against
+                // `selected_archive` - navigating here never needs its own
+                // copy of that logic.
+                self.view = MainView::CheatsMods;
+                self.tools_overlay = ToolsOverlay::None;
             } else if clicked == MainView::Library {
                 // The sidebar's one Library button must restore whichever
                 // Library tab was last selected (Archives, Health,
@@ -7222,7 +7248,7 @@ impl eframe::App for ArchiveFsApp {
                 ui_layout::ContentWidth::Normal
             };
             ui_layout::page(ui, width, main_view_uses_page_scroll(self.view), self.view, |ui| {
-                self.reconcile_cheats_mods_context();
+                self.reconcile_cheats_mods_context(context);
 
                 if self.tools_overlay != ToolsOverlay::None {
                     match self.tools_overlay {
@@ -8277,6 +8303,8 @@ impl eframe::App for ArchiveFsApp {
                     self.library_view_focus_archive = Some(archive_path);
                 }
                 AppOperationRequest::OpenCheatsMods(archive_path) => {
+                    self.selected_archive = Some(archive_path.clone());
+                    self.selected_archives = [archive_path.clone()].into_iter().collect();
                     self.open_cheats_mods_workspace(context, archive_path);
                 }
             }
@@ -24181,11 +24209,14 @@ mod tests {
     }
 
     #[test]
-    fn cheats_mods_navigation_and_reconciliation_never_alter_selection_or_queue() {
+    fn cheats_mods_navigation_and_reconciliation_track_selection_without_touching_the_queue() {
+        let ctx = egui::Context::default();
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
             data.records
                 .push(record("/roms/a.zip", MountState::Pending));
+            data.records
+                .push(record("/roms/other.zip", MountState::Pending));
         }
         app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
         app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
@@ -24205,25 +24236,103 @@ mod tests {
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
 
         // Matching selection: the full-page workflow stays available.
-        app.reconcile_cheats_mods_context();
+        app.reconcile_cheats_mods_context(&ctx);
         assert!(app.cheat_workflow.is_some());
         assert_eq!(app.view, MainView::CheatsMods);
 
-        // Library focus changes and clearing are independent from this context.
+        // `selected_archive` is the one authoritative field: changing it
+        // while already on the page must be picked up here, without a
+        // second explicit navigation.
         app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
-        app.reconcile_cheats_mods_context();
+        app.reconcile_cheats_mods_context(&ctx);
         assert_eq!(
             app.cheat_workflow
                 .as_ref()
                 .map(|workflow| workflow.archive_path.as_path()),
-            Some(Path::new("/roms/a.zip"))
+            Some(Path::new("/roms/other.zip")),
+            "reconciliation must follow selected_archive, not keep the stale workflow"
         );
+
+        // Clearing the selection clears the workspace too - no page is
+        // allowed to keep showing an archive no other page still considers
+        // selected. Mount queue membership is never touched by any of this.
         app.selected_archive = None;
-        app.reconcile_cheats_mods_context();
-        assert!(app.cheat_workflow.is_some());
-        assert_eq!(app.selected_archive.as_deref(), None);
-        assert_eq!(app.selected_archives.len(), 1);
+        app.reconcile_cheats_mods_context(&ctx);
+        assert!(
+            app.cheat_workflow.is_none(),
+            "clearing selected_archive must clear the Cheats & Mods workspace too"
+        );
+        assert_eq!(
+            app.selected_archives.len(),
+            1,
+            "selected_archives is untouched by reconciliation - only the explicit clear/select paths update it"
+        );
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    }
+
+    #[test]
+    fn selecting_an_archive_in_library_reaches_cheats_mods_without_a_separate_picker_step() {
+        let ctx = egui::Context::default();
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/a.zip", MountState::Pending));
+        }
+
+        // The exact effect of clicking an archive row in Library: only
+        // `selected_archive`/`selected_archives` change, mirroring
+        // `apply_row_click` - no Cheats & Mods-specific call is made here.
+        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        assert!(
+            app.cheat_workflow.is_none(),
+            "selecting a row in Library must not, by itself, open the Cheats & Mods workspace"
+        );
+
+        // The exact effect of the sidebar's "Cheats & Mods" click: just a
+        // view switch (see the MainView::CheatsMods arm of the navigation
+        // click handler) - reconciliation does the rest below.
+        app.view = MainView::CheatsMods;
+        app.reconcile_cheats_mods_context(&ctx);
+
+        let workflow = app
+            .cheat_workflow
+            .as_ref()
+            .expect("the already-selected archive must be available immediately, with no separate 'Choose archive' step");
+        assert_eq!(workflow.archive_path, PathBuf::from("/roms/a.zip"));
+    }
+
+    #[test]
+    fn cheats_mods_context_survives_navigating_away_and_back() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_cheats_mods_context();
+        let archive_path = app.cheat_workflow.as_ref().unwrap().archive_path.clone();
+        app.reconcile_cheats_mods_context(&ctx);
+        assert!(app.cheat_workflow.is_some());
+
+        // Leaving the page: reconciliation is a no-op while `view` is
+        // anything else, so the workspace is preserved rather than reset.
+        app.view = MainView::Mount;
+        app.reconcile_cheats_mods_context(&ctx);
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.clone()),
+            Some(archive_path.clone()),
+            "navigating away must not discard the in-progress workflow"
+        );
+
+        // Coming back: the same archive is still selected, so the exact
+        // same workflow (not a freshly reset one) is what's shown again.
+        app.view = MainView::CheatsMods;
+        app.reconcile_cheats_mods_context(&ctx);
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.clone()),
+            Some(archive_path),
+            "navigating back must not lose or replace the preserved workflow"
+        );
     }
 
     #[test]
@@ -24248,6 +24357,37 @@ mod tests {
         );
 
         assert!(app.confirm_cheat_archive_change.is_none());
+    }
+
+    #[test]
+    fn choosing_an_archive_inside_cheats_mods_updates_selection_everywhere_else_too() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_cheats_mods_context();
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/b.zip", MountState::Pending));
+        }
+        let original = app.cheat_workflow.as_ref().unwrap().archive_path.clone();
+        app.selected_archive = Some(original.clone());
+        app.selected_archives = [original].into_iter().collect();
+
+        app.apply_cheat_archive_choice(&ctx, PathBuf::from("/roms/b.zip"));
+
+        assert_eq!(
+            app.selected_archive.as_deref(),
+            Some(Path::new("/roms/b.zip")),
+            "choosing an archive inside Cheats & Mods must update selected_archive, so Library and Mount agree with it"
+        );
+        assert_eq!(
+            app.selected_archives,
+            [PathBuf::from("/roms/b.zip")].into_iter().collect()
+        );
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.clone()),
+            Some(PathBuf::from("/roms/b.zip"))
+        );
     }
 
     #[test]
