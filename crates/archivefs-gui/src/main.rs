@@ -10732,34 +10732,33 @@ fn show_sources_page(
                                 if widgets::path_value(ui, "Source", &view.path) {
                                     let _ = clipboard.set_text(view.path.display().to_string());
                                 }
+                                let availability_tone = match view.availability {
+                                    SourceAvailability::Available => widgets::StatusTone::Success,
+                                    SourceAvailability::Disabled => widgets::StatusTone::Pending,
+                                    SourceAvailability::Unavailable
+                                    | SourceAvailability::PermissionDenied
+                                    | SourceAvailability::ScanFailed => {
+                                        widgets::StatusTone::Blocked
+                                    }
+                                };
+                                widgets::status_strip(
+                                    ui,
+                                    &[
+                                        (
+                                            if view.enabled { "Enabled" } else { "Disabled" },
+                                            if view.enabled {
+                                                widgets::StatusTone::Active
+                                            } else {
+                                                widgets::StatusTone::Pending
+                                            },
+                                        ),
+                                        (
+                                            source_availability_label(view.availability),
+                                            availability_tone,
+                                        ),
+                                    ],
+                                );
                                 ui.horizontal_wrapped(|ui| {
-                                    widgets::status_badge(
-                                        ui,
-                                        if view.enabled { "Enabled" } else { "Disabled" },
-                                        if view.enabled {
-                                            widgets::StatusTone::Active
-                                        } else {
-                                            widgets::StatusTone::Pending
-                                        },
-                                    );
-                                    let availability_tone = match view.availability {
-                                        SourceAvailability::Available => {
-                                            widgets::StatusTone::Success
-                                        }
-                                        SourceAvailability::Disabled => {
-                                            widgets::StatusTone::Pending
-                                        }
-                                        SourceAvailability::Unavailable
-                                        | SourceAvailability::PermissionDenied
-                                        | SourceAvailability::ScanFailed => {
-                                            widgets::StatusTone::Blocked
-                                        }
-                                    };
-                                    widgets::status_badge(
-                                        ui,
-                                        source_availability_label(view.availability),
-                                        availability_tone,
-                                    );
                                     ui.label(format!(
                                         "{} archives",
                                         view.last_archive_count
