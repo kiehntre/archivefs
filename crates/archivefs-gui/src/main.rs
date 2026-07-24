@@ -10303,14 +10303,12 @@ fn show_retroarch_catalogue_manager(
                             ));
                         }
                     });
-                    for warning in summarise_cheat_warnings(&entry.warnings) {
-                        widgets::banner(
-                            ui,
-                            "Verified catalogue exclusion",
-                            &warning,
-                            widgets::StatusTone::Warning,
-                        );
-                    }
+                    show_cheat_warnings_summary(
+                        ui,
+                        &entry.warnings,
+                        ("catalogue_entry_warnings", &entry.source.source_id),
+                        clipboard,
+                    );
                     if let Some(error) = &entry.last_error {
                         widgets::banner(
                             ui,
@@ -13683,6 +13681,55 @@ fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Renders catalogue-indexing warnings as a concise, bounded summary
+/// instead of dumping every entry directly into the page - the Sources
+/// page's original complaint was thousands of malformed/unsupported
+/// cheat-file diagnostics rendered as one banner each, unbounded, right
+/// in the normal workflow. Shows a compact "N verification notes, the
+/// catalogue is still usable" banner plus up to `SAMPLE_LIMIT`
+/// representative entries, with the complete list (plus a "Copy all"
+/// action) always reachable behind `technical_details` - no diagnostic
+/// data is discarded, only its default on-screen footprint is bounded.
+fn show_cheat_warnings_summary(
+    ui: &mut egui::Ui,
+    warnings: &[String],
+    id_salt: impl std::hash::Hash,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    const SAMPLE_LIMIT: usize = 3;
+    if warnings.is_empty() {
+        return;
+    }
+    let summarised = summarise_cheat_warnings(warnings);
+    widgets::banner(
+        ui,
+        &format!(
+            "{} verification note{}",
+            summarised.len(),
+            if summarised.len() == 1 { "" } else { "s" }
+        ),
+        "The catalogue remains usable for matching and installation - these entries were excluded, not the whole source.",
+        widgets::StatusTone::Warning,
+    );
+    for warning in summarised.iter().take(SAMPLE_LIMIT) {
+        ui.label(format!("• {warning}"));
+    }
+    if summarised.len() > SAMPLE_LIMIT {
+        ui.weak(format!(
+            "+ {} more - see Technical details below.",
+            summarised.len() - SAMPLE_LIMIT
+        ));
+    }
+    widgets::technical_details(ui, id_salt, |ui| {
+        if widgets::action_button(ui, "Copy all", widgets::ActionStyle::Quiet, true).clicked() {
+            let _ = clipboard.set_text(summarised.join("\n"));
+        }
+        for warning in &summarised {
+            ui.label(format!("• {warning}"));
+        }
+    });
+}
+
 /// What the cheat workflow panel asks `update` to do.
 enum CheatWorkflowAction {
     ChooseArchive,
@@ -16297,7 +16344,7 @@ fn show_cheats_mods_page(
                         show_existing_retroarch_library(ui, workflow, profiles, clipboard)
                     }
                     CheatSourceMode::ArchiveFsTrustedCatalogue => {
-                        show_cheat_workflow_step2(ui, workflow, busy)
+                        show_cheat_workflow_step2(ui, workflow, busy, clipboard)
                     }
                 };
                 action = action.or(source_action);
@@ -16620,6 +16667,7 @@ fn show_cheat_workflow_step2(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
     busy: bool,
+    clipboard: &mut dyn ClipboardBackend,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
     ui.add_space(theme::SECTION_GAP);
@@ -16712,16 +16760,12 @@ fn show_cheat_workflow_step2(
                             }
                         });
                         ui.label(&source.provenance);
-                        if !entry.warnings.is_empty() {
-                            for warning in summarise_cheat_warnings(&entry.warnings) {
-                                widgets::banner(
-                                    ui,
-                                    "Notice",
-                                    &warning,
-                                    widgets::StatusTone::Warning,
-                                );
-                            }
-                        }
+                        show_cheat_warnings_summary(
+                            ui,
+                            &entry.warnings,
+                            ("cheat_source_warnings", &source.source_id),
+                            clipboard,
+                        );
                         widgets::technical_details(
                             ui,
                             ("cheat_source_technical_details", &source.source_id),
@@ -16860,14 +16904,15 @@ fn show_cheat_workflow_step2(
                         widgets::StatusTone::Warning,
                     );
                 }
-                for warning in summarise_cheat_warnings(&result.warnings) {
-                    widgets::banner(
-                        ui,
-                        "Catalogue notice",
-                        &warning,
-                        widgets::StatusTone::Warning,
-                    );
-                }
+                show_cheat_warnings_summary(
+                    ui,
+                    &result.warnings,
+                    (
+                        "cheat_fetch_result_warnings",
+                        &result.manifest.archive_sha256,
+                    ),
+                    clipboard,
+                );
                 widgets::technical_details(
                     ui,
                     (
@@ -25490,6 +25535,58 @@ mod tests {
             preview_match_strength_presentation(PreviewMatchStrength::Ambiguous).1,
             widgets::StatusTone::Blocked
         );
+    }
+
+    #[test]
+    fn cheat_warnings_summary_shows_a_bounded_sample_and_keeps_the_rest_reachable() {
+        let ctx = egui::Context::default();
+        let warnings: Vec<String> = (0..12)
+            .map(|index| {
+                format!(
+                    "{index} files retained but are non-actionable because parsing was incomplete"
+                )
+            })
+            .collect();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheat_warnings_summary(ui, &warnings, "warnings_summary_test", &mut clipboard);
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "12 verification notes"),
+            "the full count must be visible even though only a sample renders directly"
+        );
+        assert!(
+            rendered_text_contains(&output, "catalogue remains usable"),
+            "must reassure the user the catalogue is still usable despite these exclusions"
+        );
+        assert!(rendered_text_contains(
+            &output,
+            "0 catalogue files could not be parsed and were excluded from matching."
+        ));
+        assert!(
+            !rendered_text_contains(
+                &output,
+                "11 catalogue files could not be parsed and were excluded from matching."
+            ),
+            "only a bounded sample renders directly - the rest stays behind Technical details"
+        );
+        assert!(rendered_text_contains(&output, "+ 9 more"));
+        assert!(rendered_text_contains(&output, "Technical details"));
+    }
+
+    #[test]
+    fn cheat_warnings_summary_is_silent_when_there_is_nothing_to_report() {
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_cheat_warnings_summary(ui, &[], "empty_warnings_test", &mut clipboard);
+            });
+        });
+        assert!(!rendered_text_contains(&output, "verification note"));
+        assert!(!rendered_text_contains(&output, "Technical details"));
     }
 
     #[test]
