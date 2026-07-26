@@ -215,6 +215,16 @@ fn library_view_submit_blocker(name: &str, destination: &str, busy: bool) -> Opt
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 const HISTORY_LIMIT: usize = 50;
 const ACTIVITY_EXPANDED_BY_DEFAULT: bool = false;
+/// Matches the collapsed activity panel's real content: one row of
+/// buttons/badges plus its frame margin. Only used as the very first
+/// frame's guess for the "activity_collapsed" panel id - actual content
+/// height takes over immediately after and is what gets persisted.
+const ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT: f32 = 44.0;
+/// Matches the expanded activity panel's real content: the button row,
+/// separator, and the history list's own `max_height(220.0)` scroll area.
+/// Only used as the very first frame's guess for the "activity_expanded"
+/// panel id, for the same reason as the collapsed default above.
+const ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT: f32 = 280.0;
 const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
 const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
 const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
@@ -5096,49 +5106,84 @@ impl ArchiveFsApp {
     /// Bound to the same request key the preview uses, so a result that
     /// arrives after the archive, profile, or snapshot changed is discarded
     /// rather than shown against the wrong context.
+    /// Stage 4's dispatch target - reached from the "Find matching cheat
+    /// files" button. Every call produces exactly one immediately visible
+    /// outcome: it starts a background match (`Loading`, then `Ready` or a
+    /// worker `Failed`), or it sets an explained `Failed` state on the spot
+    /// when a prerequisite is unmet (`CheatCandidatePrerequisite`) - never
+    /// a silent no-op. A call while a match is already running is itself a
+    /// no-op (guards against a double click restarting the work).
     fn start_cheat_candidate_match(&mut self, context: egui::Context) {
-        let Some((key, catalogue_root, archive)) = self
-            .cheat_workflow
-            .as_ref()
-            .and_then(|workflow| build_cheat_candidate_request(workflow, &self.retroarch_profiles))
-        else {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
-        let archive_path = key.archive_path.clone();
-        let worker_key = key.clone();
-        let worker_root = catalogue_root.clone();
-        let (sender, receiver) = mpsc::channel();
-        let Some(workflow) = self.cheat_workflow.as_mut() else {
+        if workflow.adapter != CheatEmulatorAdapter::RetroArch
+            || workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue
+            || matches!(workflow.candidates, CheatStepResource::Loading { .. })
+        {
             return;
-        };
-        workflow.candidates_request = Some(key);
-        workflow.candidates = CheatStepResource::Loading { receiver };
-        workflow.candidate_selection = None;
-        workflow.candidate_load_error = None;
-        workflow.preview = CheatStepResource::NotLoaded;
-        workflow.preview_request = None;
-        workflow.transaction = CheatTransactionState::Idle;
-        self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
-            Some(archive_path),
-            ActivityOutcome::Started,
-            "Matching the selected archive against the trusted cheat catalogue.",
-        ));
-        thread::spawn(move || {
-            let snapshot = load_cheat_catalogue_snapshot(
-                &HostReadOnlyFilesystem,
-                "trusted-catalogue",
-                &worker_root,
-            );
-            let list =
-                build_cheat_candidates(&snapshot, &archive, &CheatCandidateOptions::default());
-            let _ = sender.send(Ok(CheatCandidateStage {
-                key: worker_key,
-                catalogue_root: worker_root,
-                list,
-            }));
-            context.request_repaint();
-        });
+        }
+        let archive_path = workflow.archive_path.clone();
+        let outcome = build_cheat_candidate_request(workflow, &self.retroarch_profiles);
+        match outcome {
+            Ok((key, catalogue_root, archive)) => {
+                let worker_key = key.clone();
+                let worker_root = catalogue_root.clone();
+                let (sender, receiver) = mpsc::channel();
+                let Some(workflow) = self.cheat_workflow.as_mut() else {
+                    return;
+                };
+                workflow.candidates_request = Some(key);
+                workflow.candidates = CheatStepResource::Loading { receiver };
+                workflow.candidate_selection = None;
+                workflow.candidate_load_error = None;
+                workflow.preview = CheatStepResource::NotLoaded;
+                workflow.preview_request = None;
+                workflow.transaction = CheatTransactionState::Idle;
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Started,
+                    "Matching the selected archive against the trusted cheat catalogue.",
+                ));
+                thread::spawn(move || {
+                    let snapshot = load_cheat_catalogue_snapshot(
+                        &HostReadOnlyFilesystem,
+                        "trusted-catalogue",
+                        &worker_root,
+                    );
+                    let list = build_cheat_candidates(
+                        &snapshot,
+                        &archive,
+                        &CheatCandidateOptions::default(),
+                    );
+                    let _ = sender.send(Ok(CheatCandidateStage {
+                        key: worker_key,
+                        catalogue_root: worker_root,
+                        list,
+                    }));
+                    context.request_repaint();
+                });
+            }
+            Err(reason) => {
+                let Some(workflow) = self.cheat_workflow.as_mut() else {
+                    return;
+                };
+                workflow.candidates_request = None;
+                workflow.candidates = CheatStepResource::Failed(format!(
+                    "{CHEAT_MATCH_BLOCKED_PREFIX}{}",
+                    reason.message()
+                ));
+                workflow.candidate_selection = None;
+                workflow.candidate_load_error = None;
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Rejected,
+                    format!("Matching blocked: {}", reason.message()),
+                ));
+            }
+        }
     }
 
     /// Stage 5/6: opens one chosen candidate and builds its cheat picker.
@@ -7465,14 +7510,15 @@ impl eframe::App for ArchiveFsApp {
         {
             self.start_cheat_preview(context.clone());
         }
-        if self.view == MainView::CheatsMods
-            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
-                workflow.candidates_request.is_none()
-                    && matches!(workflow.candidates, CheatStepResource::NotLoaded)
-            })
-        {
-            self.start_cheat_candidate_match(context.clone());
-        }
+        // Matching is deliberately manual only - triggered by the "Find
+        // matching cheat files" button (`start_cheat_candidate_match`),
+        // never auto-started here. An earlier version auto-triggered this
+        // every frame whenever `candidates` was `NotLoaded`; when a
+        // prerequisite silently failed, that auto-trigger raced the
+        // button's own click on the same silent failure, forever, with
+        // neither ever producing a visible result. Matching now has
+        // exactly one entry point, and every call to it produces a visible
+        // state (see `start_cheat_candidate_match`'s doc comment).
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
@@ -9650,8 +9696,34 @@ fn show_activity_panel(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<ActivityPanelAction> {
     let mut action = None;
-    egui::TopBottomPanel::bottom("activity")
+    // Root cause of the bottom-clipping bug: `TopBottomPanel::bottom` picks
+    // this frame's panel height by loading `PanelState` persisted under
+    // its *own id* from the previous frame (egui's `panel.rs`), and only
+    // falls back to a fresh default the very first time that id is ever
+    // shown. Collapsed and expanded here render wildly different content
+    // heights (one status row vs. a history list up to ~220px tall plus a
+    // button row), but previously both used the *same* id ("activity") -
+    // so the frame right after toggling from collapsed to expanded loaded
+    // the collapsed height, squeezed the expanded content into it (that
+    // content's own clip rect is the panel rect: see egui's `panel.rs`,
+    // "If we overflow, don't do so visibly"), and only corrected itself
+    // one frame later. A user's screenshot taken in that window - or
+    // rendered while the app is between reactive repaints - shows exactly
+    // "one line of content" jammed near the screen edge. Giving each
+    // visual state its own id keeps their persisted heights from ever
+    // contaminating each other, so there is no longer a wrong state to
+    // render even transiently.
+    let (panel_id, default_height) = if *expanded {
+        ("activity_expanded", ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT)
+    } else {
+        (
+            "activity_collapsed",
+            ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT,
+        )
+    };
+    egui::TopBottomPanel::bottom(panel_id)
         .resizable(*expanded)
+        .default_height(default_height)
         .show(context, |ui| {
             ui.horizontal(|ui| {
                 if widgets::action_button(
@@ -15920,24 +15992,58 @@ fn cheat_content_basename(workflow: &CheatWorkflowState) -> Option<String> {
 /// catalogue root to match against, and the archive identity to match.
 /// `None` whenever any of those is not yet available, which is what keeps
 /// matching from running against a half-built context.
+/// Why matching cannot start right now. Every variant carries an exact,
+/// user-facing reason - this is what makes clicking "Find matching cheat
+/// files" with an unmet prerequisite a visible, explained "blocked" state
+/// instead of the click silently doing nothing (see `start_cheat_candidate_match`).
+/// Marks a `CheatStepResource::Failed` message for stage 4 as a blocked
+/// prerequisite rather than an actual worker failure, so the UI can show a
+/// visibly different state for the two ("blocked with an exact reason" vs
+/// "failed with an exact error" - both required, and distinguishable).
+const CHEAT_MATCH_BLOCKED_PREFIX: &str = "\u{1}blocked\u{1}";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheatCandidatePrerequisite {
+    ProfileCheatDirectoryUnresolved,
+    CatalogueNotRetrieved,
+    CatalogueLocalPathUnavailable,
+}
+
+impl CheatCandidatePrerequisite {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ProfileCheatDirectoryUnresolved => {
+                "Select an eligible RetroArch profile with a resolved cheat directory (Stage 1) before matching."
+            }
+            Self::CatalogueNotRetrieved => {
+                "Retrieve or reuse the trusted catalogue snapshot in the Trusted catalogue details section before matching."
+            }
+            Self::CatalogueLocalPathUnavailable => {
+                "The trusted catalogue's local path cannot be represented exactly; re-fetch it before matching."
+            }
+        }
+    }
+}
+
+/// Gathers everything stage 4 needs, or explains exactly why it cannot
+/// start yet. Assumes the caller has already confirmed the adapter and
+/// source mode are RetroArch + ArchiveFS trusted catalogue - the only
+/// context "Find matching cheat files" is ever shown in.
 fn build_cheat_candidate_request(
     workflow: &CheatWorkflowState,
     profiles: &RetroArchProfilesState,
-) -> Option<(CheatPreviewRequestKey, PathBuf, CheatCandidateArchive)> {
-    if workflow.adapter != CheatEmulatorAdapter::RetroArch
-        || workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue
-    {
-        return None;
+) -> Result<(CheatPreviewRequestKey, PathBuf, CheatCandidateArchive), CheatCandidatePrerequisite> {
+    if selected_retroarch_cheat_root(workflow, profiles).is_none() {
+        return Err(CheatCandidatePrerequisite::ProfileCheatDirectoryUnresolved);
     }
-    selected_retroarch_cheat_root(workflow, profiles)?;
     let CheatStepResource::Ready(fetch) = &workflow.source_fetch else {
-        return None;
+        return Err(CheatCandidatePrerequisite::CatalogueNotRetrieved);
     };
     if fetch.local_catalogue_path.lossy {
-        return None;
+        return Err(CheatCandidatePrerequisite::CatalogueLocalPathUnavailable);
     }
     let identity = ready_game_identity(workflow);
-    Some((
+    Ok((
         cheat_preview_key(workflow),
         PathBuf::from(&fetch.local_catalogue_path.display),
         CheatCandidateArchive {
@@ -16403,14 +16509,7 @@ fn show_cheat_candidate_stages(
                     "Select a RetroArch profile and retrieve the trusted catalogue, then \
                      ArchiveFS matches this exact archive against it.",
                 );
-                if widgets::action_button(
-                    ui,
-                    "Find matching cheat files",
-                    widgets::ActionStyle::Primary,
-                    true,
-                )
-                .clicked()
-                {
+                if show_find_matching_cheats_button(ui).clicked() {
                     action = Some(CheatWorkflowAction::MatchCandidates);
                 }
             });
@@ -16426,14 +16525,30 @@ fn show_cheat_candidate_stages(
             return action;
         }
         CheatStepResource::Failed(message) => {
-            widgets::banner(ui, "Matching failed", message, widgets::StatusTone::Blocked);
-            widgets::card(ui, |ui| {
-                if widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
+            if let Some(reason) = message.strip_prefix(CHEAT_MATCH_BLOCKED_PREFIX) {
+                widgets::banner(ui, "Matching blocked", reason, widgets::StatusTone::Pending);
+                widgets::card(ui, |ui| {
+                    if widgets::action_button(ui, "Try again", widgets::ActionStyle::Primary, true)
+                        .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::MatchCandidates);
+                    }
+                });
+            } else {
+                widgets::banner(ui, "Matching failed", message, widgets::StatusTone::Blocked);
+                widgets::card(ui, |ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Try again",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
                     .clicked()
-                {
-                    action = Some(CheatWorkflowAction::MatchCandidates);
-                }
-            });
+                    {
+                        action = Some(CheatWorkflowAction::MatchCandidates);
+                    }
+                });
+            }
             return action;
         }
         CheatStepResource::Ready(_) => {}
@@ -16526,6 +16641,18 @@ fn show_cheat_candidate_stages(
         });
     }
     action
+}
+
+/// The stage-4 primary action. Extracted into its own function (rather
+/// than inlined at its one call site) so a test can render and click this
+/// exact widget directly - see `find_matching_cheat_files_button_*` below.
+fn show_find_matching_cheats_button(ui: &mut egui::Ui) -> egui::Response {
+    widgets::action_button(
+        ui,
+        "Find matching cheat files",
+        widgets::ActionStyle::Primary,
+        true,
+    )
 }
 
 fn candidate_classification_presentation(
@@ -17374,8 +17501,6 @@ fn show_cheats_mods_page(
         widgets::status_strip(ui, &system_items);
     });
     ui.add_space(theme::SECTION_GAP);
-    show_cheats_mods_safety_information(ui);
-    ui.add_space(theme::SECTION_GAP);
 
     // --- Choose a system: which adapter's workflow is shown below.
     if let Some(workflow) = workflow.as_deref() {
@@ -17391,17 +17516,7 @@ fn show_cheats_mods_page(
         Some("Profile, source, identity, preview, and installation state for the chosen system."),
     );
     if let Some(workflow) = workflow {
-        show_cheats_mods_workflow_states(
-            ui,
-            Some(workflow),
-            profiles,
-            pcsx2_profiles,
-            dolphin_profiles,
-        );
-        ui.add_space(theme::SECTION_GAP);
         show_cheat_archive_context(ui, workflow, live, cached, clipboard);
-        ui.add_space(theme::SECTION_GAP);
-        show_shared_game_identity(ui, workflow, clipboard);
         ui.add_space(theme::SECTION_GAP);
         // Step order matters here: profile/source selection first, then
         // the preview that depends on them - showing the preview above an
@@ -17443,6 +17558,28 @@ fn show_cheats_mods_page(
                     show_dolphin_workflow(ui, workflow, dolphin_profiles, clipboard).or(action);
             }
         }
+
+        // --- Diagnostics: everything a user needs only occasionally
+        // (workflow-state badges, bounded identity evidence, safety/
+        // privacy copy) lives below the primary flow, collapsed by
+        // default, rather than between the archive picker and the first
+        // real action - see the Cheats & Mods workflow simplification.
+        ui.add_space(theme::SECTION_GAP);
+        egui::CollapsingHeader::new("Workflow diagnostics")
+            .default_open(false)
+            .show(ui, |ui| {
+                show_cheats_mods_workflow_states(
+                    ui,
+                    Some(workflow),
+                    profiles,
+                    pcsx2_profiles,
+                    dolphin_profiles,
+                );
+                ui.add_space(theme::SECTION_GAP);
+                show_shared_game_identity(ui, workflow, clipboard);
+                ui.add_space(theme::SECTION_GAP);
+                show_cheats_mods_safety_information(ui);
+            });
     } else {
         widgets::card(ui, |ui| {
             widgets::section_header(
@@ -23417,6 +23554,7 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use archivefs_core::emulator_environment::EncodedPath;
     use archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport;
@@ -24491,6 +24629,649 @@ mod tests {
         );
     }
 
+    /// Generic 3-frame real pointer click on a single widget, mirroring
+    /// `simulate_row_click`'s documented reasoning (egui hit-tests a
+    /// frame's pointer events against the *previous* frame's registered
+    /// rects, so a widget rendered for the first time cannot be clicked
+    /// within that same frame - see that function's doc comment).
+    fn click_widget(
+        ctx: &egui::Context,
+        screen_size: egui::Vec2,
+        render: impl Fn(&mut egui::Ui) -> egui::Response,
+    ) -> egui::Response {
+        let base = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
+            ..Default::default()
+        };
+        let call = |input: egui::RawInput| -> egui::Response {
+            let mut out = None;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(render(ui));
+                });
+            });
+            out.expect("render closure always returns a response")
+        };
+        let first = call(base.clone());
+        let pos = first.rect.center();
+        call(egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..base.clone()
+        });
+        call(egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..base
+        })
+    }
+
+    #[test]
+    fn find_matching_cheat_files_button_registers_a_real_pointer_click() {
+        let ctx = egui::Context::default();
+        let response = click_widget(&ctx, egui::vec2(1200.0, 900.0), |ui| {
+            show_find_matching_cheats_button(ui)
+        });
+        assert!(
+            response.clicked(),
+            "a real press-then-release on the button's own rect must register as a click"
+        );
+    }
+
+    /// The blocked-prerequisite case this milestone's manual test actually
+    /// hit: a profile is selected and the trusted catalogue has been
+    /// listed and a source chosen, but the catalogue itself was never
+    /// retrieved into `source_fetch` (no "Use cached snapshot" / fetch was
+    /// ever run). Previously this made `start_cheat_candidate_match`
+    /// return silently with no state change - the dead click.
+    fn app_with_unfetched_trusted_catalogue() -> ArchiveFsApp {
+        let mut app = app_with_cheats_mods_context();
+        app.retroarch_profiles =
+            RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
+                "native-user",
+                true,
+            )]));
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.adapter = CheatEmulatorAdapter::RetroArch;
+        workflow.source_mode = CheatSourceMode::ArchiveFsTrustedCatalogue;
+        workflow.selected_profile_id = Some("native-user".to_string());
+        workflow.selected_source_id = Some("test-source".to_string());
+        // source_fetch is deliberately left NotLoaded here.
+        app
+    }
+
+    fn app_with_fetched_trusted_catalogue() -> ArchiveFsApp {
+        let mut app = app_with_unfetched_trusted_catalogue();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.source_fetch = CheatStepResource::Ready(cheat_fetch_result_for(
+            "test-source",
+            CheatSourceFetchStatus::Fetched,
+        ));
+        app
+    }
+
+    #[test]
+    fn matching_dispatches_exactly_once_and_becomes_loading_immediately() {
+        let mut app = app_with_fetched_trusted_catalogue();
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().candidates,
+            CheatStepResource::NotLoaded
+        ));
+        let before = app.history.entries().count();
+
+        app.start_cheat_candidate_match(egui::Context::default());
+
+        assert!(
+            matches!(
+                app.cheat_workflow.as_ref().unwrap().candidates,
+                CheatStepResource::Loading { .. }
+            ),
+            "one dispatch must immediately produce a visible Loading state"
+        );
+        assert_eq!(
+            app.history.entries().count(),
+            before + 1,
+            "exactly one activity entry for one dispatch"
+        );
+    }
+
+    #[test]
+    fn matching_eventually_produces_a_ready_candidate_list() {
+        let mut app = app_with_fetched_trusted_catalogue();
+        app.start_cheat_candidate_match(egui::Context::default());
+        for _ in 0..200 {
+            app.poll_cheat_workflow();
+            if matches!(
+                app.cheat_workflow.as_ref().unwrap().candidates,
+                CheatStepResource::Ready(_)
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            matches!(
+                app.cheat_workflow.as_ref().unwrap().candidates,
+                CheatStepResource::Ready(_)
+            ),
+            "the worker result must reach a terminal, visible state"
+        );
+    }
+
+    #[test]
+    fn a_no_match_result_is_a_visible_ready_state_with_an_empty_list() {
+        let mut app = app_with_fetched_trusted_catalogue();
+        // The fixture catalogue's manifest describes no games, so no
+        // archive can ever match it - a real "no candidates" outcome.
+        app.start_cheat_candidate_match(egui::Context::default());
+        for _ in 0..200 {
+            app.poll_cheat_workflow();
+            if !matches!(
+                app.cheat_workflow.as_ref().unwrap().candidates,
+                CheatStepResource::Loading { .. }
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let CheatStepResource::Ready(stage) = &app.cheat_workflow.as_ref().unwrap().candidates
+        else {
+            panic!("expected a Ready state");
+        };
+        assert!(
+            stage.list.is_empty(),
+            "no matching game means an empty, still-visible list"
+        );
+    }
+
+    #[test]
+    fn clicking_without_a_retrieved_catalogue_shows_the_exact_blocked_reason() {
+        let mut app = app_with_unfetched_trusted_catalogue();
+        let before = app.history.entries().count();
+
+        app.start_cheat_candidate_match(egui::Context::default());
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let CheatStepResource::Failed(message) = &workflow.candidates else {
+            panic!("prerequisite failure must be a visible Failed state, not NotLoaded");
+        };
+        assert!(
+            message.contains("Retrieve or reuse the trusted catalogue snapshot"),
+            "the exact reason must be shown, not a generic error: {message}"
+        );
+        assert_eq!(
+            app.history.entries().count(),
+            before + 1,
+            "a blocked click still creates exactly one activity entry"
+        );
+
+        let history_message = &app.history.entries().next().unwrap().message;
+        assert!(
+            history_message.contains("Matching blocked"),
+            "the activity entry states the click was blocked: {history_message}"
+        );
+    }
+
+    #[test]
+    fn the_blocked_state_renders_as_visibly_different_from_a_worker_failure() {
+        let mut app = app_with_unfetched_trusted_catalogue();
+        app.start_cheat_candidate_match(egui::Context::default());
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Matching blocked"));
+        assert!(!rendered_text_contains(&output, "Matching failed"));
+    }
+
+    #[test]
+    fn a_second_dispatch_while_loading_is_a_no_op() {
+        let mut app = app_with_fetched_trusted_catalogue();
+        app.start_cheat_candidate_match(egui::Context::default());
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().candidates,
+            CheatStepResource::Loading { .. }
+        ));
+        let before = app.history.entries().count();
+        let request_before = app
+            .cheat_workflow
+            .as_ref()
+            .unwrap()
+            .candidates_request
+            .clone();
+
+        // Simulates a rapid double click: dispatching again while the
+        // first match is still running must not restart the work or
+        // record a second activity entry.
+        app.start_cheat_candidate_match(egui::Context::default());
+
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "a repeated click while matching is active must be a no-op"
+        );
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().candidates_request,
+            request_before,
+            "the original request key must survive an ignored repeat click"
+        );
+    }
+
+    #[test]
+    fn a_click_through_the_real_rendered_page_reaches_the_dispatch_target() {
+        // Proves the wiring documented at the top of this bug's fix: the
+        // real button's response, when clicked, produces exactly the
+        // action the app-level dispatcher matches on to call
+        // `start_cheat_candidate_match`.
+        let ctx = egui::Context::default();
+        let response = click_widget(&ctx, egui::vec2(1200.0, 900.0), |ui| {
+            show_find_matching_cheats_button(ui)
+        });
+        let action = response
+            .clicked()
+            .then_some(CheatWorkflowAction::MatchCandidates);
+        assert!(matches!(action, Some(CheatWorkflowAction::MatchCandidates)));
+    }
+
+    /// Real mouse-wheel scroll (not the `page()` scroll wrapper's Home/End
+    /// keyboard shortcuts, which are not wired for Cheats & Mods' own
+    /// scroll area) repeated across many frames, matching how a real user
+    /// scrolls: `PointerMoved` over the content followed by a
+    /// `MouseWheel` event, each frame.
+    fn scroll_to_bottom_with_mouse_wheel(
+        ctx: &egui::Context,
+        app: &mut ArchiveFsApp,
+        frame: &mut eframe::Frame,
+        base_input: &egui::RawInput,
+        screen: egui::Vec2,
+    ) -> egui::FullOutput {
+        use eframe::App as _;
+        let mut output = None;
+        for _ in 0..40 {
+            let scroll_input = egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(screen.x / 2.0, screen.y / 2.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -20.0),
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..base_input.clone()
+            };
+            output = Some(ctx.run(scroll_input, |ctx| app.update(ctx, frame)));
+        }
+        output.unwrap()
+    }
+
+    /// Builds a Cheats & Mods workflow with 40 candidate cards - enough
+    /// real content that the page unambiguously overflows any reasonable
+    /// window, so a scroll is actually required to reach the end.
+    fn app_with_overflowing_cheats_mods_page() -> ArchiveFsApp {
+        let mut app = app_with_fetched_trusted_catalogue();
+        app.view = MainView::CheatsMods;
+        let key = cheat_preview_key(app.cheat_workflow.as_ref().unwrap());
+        let candidates: Vec<CheatCandidate> = (0..40)
+            .map(|index| CheatCandidate {
+                catalogue_relative_path: format!("NES/game{index}.cht"),
+                display_name: format!("Game {index}"),
+                platform: Some("NES".to_string()),
+                region: None,
+                revision: None,
+                classification: CheatCandidateClassification::Weak,
+                confidence_score: 100,
+                evidence: Vec::new(),
+                cheat_count: 3,
+                source_file_hash: None,
+                auto_selectable: false,
+                manually_selectable: true,
+            })
+            .collect();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.candidates_request = Some(key.clone());
+        workflow.candidates = CheatStepResource::Ready(CheatCandidateStage {
+            key,
+            catalogue_root: PathBuf::from("/catalogue"),
+            list: CheatCandidateList {
+                total_matched: candidates.len(),
+                truncated: false,
+                query: None,
+                records_scanned: candidates.len(),
+                scan_limit_reached: false,
+                candidates,
+            },
+        });
+        app
+    }
+
+    /// Asserts that `needle` - the last distinctive text on a page - is
+    /// both present and actually visible (its position falls inside its
+    /// own paint clip rect) after scrolling. Presence alone is not enough:
+    /// a clipped widget is still laid out and still shows up in
+    /// `output.shapes`, it just paints outside where anyone can see it.
+    fn assert_final_content_reachable(output: &egui::FullOutput, needle: &str) {
+        let position = find_exact_text_position_and_clip(output, needle);
+        let (pos, clip_rect) = position
+            .unwrap_or_else(|| panic!("final content {needle:?} must be rendered somewhere"));
+        assert!(
+            pos.y <= clip_rect.max.y,
+            "final content {needle:?} must fall within its own clip rect at maximum scroll:              pos.y={} clip_rect={:?}",
+            pos.y,
+            clip_rect
+        );
+    }
+
+    fn run_settle_frames(
+        ctx: &egui::Context,
+        app: &mut ArchiveFsApp,
+        frame: &mut eframe::Frame,
+        base_input: &egui::RawInput,
+        count: usize,
+    ) {
+        use eframe::App as _;
+        for _ in 0..count {
+            let _ = ctx.run(base_input.clone(), |ctx| app.update(ctx, frame));
+        }
+    }
+
+    #[test]
+    fn cheats_mods_final_section_is_reachable_at_maximum_scroll() {
+        let mut app = app_with_overflowing_cheats_mods_page();
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let screen = egui::vec2(1600.0, 900.0);
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
+        let output =
+            scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
+        assert_final_content_reachable(
+            &output,
+            "No related activity has been recorded in this session.",
+        );
+    }
+
+    #[test]
+    fn cheats_mods_final_section_is_reachable_at_a_smaller_viewport() {
+        let mut app = app_with_overflowing_cheats_mods_page();
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        // A small laptop-class window, not just the large screenshot size.
+        let screen = egui::vec2(1024.0, 600.0);
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
+        let output =
+            scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
+        assert_final_content_reachable(
+            &output,
+            "No related activity has been recorded in this session.",
+        );
+    }
+
+    #[test]
+    fn resizing_the_window_does_not_reintroduce_clipping() {
+        // Renders at one size, then resizes to a different size mid-session
+        // (the same `egui::Context`, a new `screen_rect`) and confirms the
+        // final content is still reachable after the resize.
+        let mut app = app_with_overflowing_cheats_mods_page();
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let large = egui::vec2(1600.0, 900.0);
+        let large_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, large)),
+            ..Default::default()
+        };
+        run_settle_frames(&ctx, &mut app, &mut frame, &large_input, 3);
+        let _ = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &large_input, large);
+
+        let small = egui::vec2(1024.0, 600.0);
+        let small_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, small)),
+            ..Default::default()
+        };
+        run_settle_frames(&ctx, &mut app, &mut frame, &small_input, 3);
+        let output =
+            scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &small_input, small);
+        assert_final_content_reachable(
+            &output,
+            "No related activity has been recorded in this session.",
+        );
+    }
+
+    /// Root-cause regression test for the bottom-clipping bug: egui's
+    /// `TopBottomPanel` picks each frame's height by loading `PanelState`
+    /// persisted under the panel's own id from the previous frame, falling
+    /// back to a fresh default only the very first time that id is ever
+    /// shown (see `containers/panel.rs` in egui 0.32). The collapsed and
+    /// expanded activity panel render very different content heights (one
+    /// status row vs. a history list up to ~220px plus a button row); if
+    /// they shared one panel id, the frame right after expanding would
+    /// load the *collapsed* height, squeeze the expanded content's own
+    /// paint clip rect into it (a `TopBottomPanel` clips its content to
+    /// its own panel rect - "if we overflow, don't do so visibly"), and
+    /// only correct itself one frame later. A screenshot taken in that
+    /// window - or a render that lands between reactive repaints - shows
+    /// exactly the reported symptom: page content jammed into a sliver
+    /// near the screen edge. `show_activity_panel` now uses a distinct id
+    /// per visual state so their persisted heights can never contaminate
+    /// each other.
+    #[test]
+    fn expanding_the_activity_panel_does_not_compress_its_content() {
+        let mut app = app_for_operation_tests();
+        for index in 0..8 {
+            app.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                None,
+                ActivityOutcome::Completed,
+                format!("Activity entry {index} with a realistic message length."),
+            ));
+        }
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let screen = egui::vec2(1600.0, 900.0);
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        // Settle in the collapsed state first - this is what persists a
+        // small collapsed-content height, which used to leak into the
+        // very next frame once expanded.
+        run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
+
+        app.show_activity = true;
+        use eframe::App as _;
+        let first_expanded_frame = ctx.run(base_input.clone(), |ctx| app.update(ctx, &mut frame));
+
+        fn activity_content_span(output: &egui::FullOutput) -> (f32, f32) {
+            fn walk(shape: &egui::Shape, min_y: &mut f32, max_y: &mut f32) {
+                match shape {
+                    egui::Shape::Text(text_shape) => {
+                        let text = text_shape.galley.text();
+                        if text.starts_with("Activity entry") || text == "Clear activity" {
+                            *min_y = min_y.min(text_shape.pos.y);
+                            *max_y = max_y.max(text_shape.pos.y + text_shape.galley.size().y);
+                        }
+                    }
+                    egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, min_y, max_y)),
+                    _ => {}
+                }
+            }
+            let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut min_y, &mut max_y);
+            }
+            (min_y, max_y)
+        }
+
+        let (min_y, max_y) = activity_content_span(&first_expanded_frame);
+        assert!(
+            min_y.is_finite() && max_y.is_finite(),
+            "the expanded activity panel's own content must be present on its first frame"
+        );
+        // Before the fix this span was ~14px (everything squeezed against
+        // the screen edge, e.g. [880, 894] of a 900px-tall screen). A
+        // history list plus a button row needs meaningfully more room than
+        // that even in principle.
+        assert!(
+            max_y - min_y > 100.0,
+            "the expanded activity panel's content must not be compressed into a sliver on its              first rendered frame: span = [{min_y}, {max_y}]"
+        );
+        assert!(
+            rendered_text_contains(&first_expanded_frame, "Clear activity"),
+            "the expanded panel's own controls must be present on the very first frame"
+        );
+    }
+
+    /// The activity panel is a shared component rendered identically
+    /// regardless of `self.view` - this confirms the fix above holds for
+    /// every page the task named, not only Cheats & Mods.
+    #[test]
+    fn activity_panel_expansion_does_not_obscure_content_on_any_named_page() {
+        for view in [
+            MainView::Library,
+            MainView::Sources,
+            MainView::Selected,
+            MainView::HistoryLogs,
+            MainView::CheatsMods,
+        ] {
+            let mut app = app_for_operation_tests();
+            app.view = view;
+            for index in 0..8 {
+                app.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!("Activity entry {index}."),
+                ));
+            }
+            let ctx = egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let screen = egui::vec2(1600.0, 900.0);
+            let base_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                ..Default::default()
+            };
+            run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
+            app.show_activity = true;
+            use eframe::App as _;
+            let output = ctx.run(base_input, |ctx| app.update(ctx, &mut frame));
+            assert!(
+                rendered_text_contains(&output, "Clear activity"),
+                "{view:?}: expanded activity controls must be present"
+            );
+        }
+    }
+
+    /// History & Logs keeps only the 50 most recent activity entries
+    /// (`HISTORY_LIMIT`) - a data-layer cap, not a rendering bug. This
+    /// stays within that cap and confirms the oldest *kept* entry is
+    /// reachable by scrolling, exercising the same shared `page()` scroll
+    /// wrapper Sources/Doctor/Settings/About also use (unlike Cheats &
+    /// Mods' own separate scroll area).
+    #[test]
+    fn workflow_diagnostics_are_collapsed_so_the_primary_action_is_not_buried() {
+        // Regression test for the Cheats & Mods workflow simplification:
+        // the "Find matching cheat files" primary action must render
+        // before any diagnostic text on the page, not several screens of
+        // status badges and identity evidence below it.
+        let mut app = app_with_unfetched_trusted_catalogue();
+        let history = OperationHistory::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        let primary_action =
+            find_exact_text_center(&output, "Find matching cheat files").expect("button renders");
+        let diagnostics_header =
+            find_exact_text_center(&output, "Workflow diagnostics").expect("section renders");
+        assert!(
+            primary_action.y < diagnostics_header.y,
+            "the primary action must appear above the collapsed diagnostics section:              action.y={} diagnostics.y={}",
+            primary_action.y,
+            diagnostics_header.y
+        );
+        assert!(
+            !rendered_text_contains(&output, "Emulator profile"),
+            "diagnostics content must stay collapsed by default"
+        );
+    }
+
+    #[test]
+    fn history_logs_final_entry_is_reachable_at_maximum_scroll() {
+        let mut app = app_for_operation_tests();
+        app.view = MainView::HistoryLogs;
+        // Leave headroom below HISTORY_LIMIT: entering this page triggers
+        // its own "refreshing history" activity entries, which would
+        // otherwise evict the oldest of a *full* 50-entry buffer before
+        // the assertion below ever runs.
+        for index in 0..HISTORY_LIMIT - 4 {
+            app.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                None,
+                ActivityOutcome::Completed,
+                format!("History page entry {index} with enough text to take real space."),
+            ));
+        }
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let screen = egui::vec2(1600.0, 900.0);
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
+        let output =
+            scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
+        // Entry 0 is the oldest recorded and therefore the last one shown
+        // in a newest-first list - the true bottom of the page.
+        assert_final_content_reachable(
+            &output,
+            "History page entry 0 with enough text to take real space.",
+        );
+    }
+
     fn app_with_cheats_mods_context() -> ArchiveFsApp {
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
@@ -24815,7 +25596,11 @@ mod tests {
             "Overview",
             "Choose a system",
             "Selected system workflow",
-            "Emulator profile",
+            // Workflow-state details ("Emulator profile" and friends) now
+            // live behind the collapsed "Workflow diagnostics" section, so
+            // the primary flow is not interrupted by them - see the
+            // Cheats & Mods workflow simplification.
+            "Workflow diagnostics",
             "Recent related activity",
         ] {
             assert!(
@@ -24823,6 +25608,10 @@ mod tests {
                 "Cheats & Mods page did not render {expected:?} under the new hierarchy"
             );
         }
+        assert!(
+            !rendered_text_contains(&output, "Emulator profile"),
+            "workflow-state details must be collapsed by default, not shown inline"
+        );
     }
 
     #[test]
@@ -26229,7 +27018,9 @@ mod tests {
             source_name.as_str(),
             "Trusted built-in",
             "Shared preview",
-            "Controlled apply available after eligible preview",
+            // "Controlled apply available after eligible preview" now lives
+            // behind the collapsed "Workflow diagnostics" section - covered
+            // separately by `cheats_mods_page_renders_the_new_hierarchy_headings`.
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
@@ -35382,6 +36173,30 @@ mod tests {
     /// `needle` - the exact-match counterpart of `rendered_text_contains`,
     /// used where "present" isn't precise enough (e.g. confirming a
     /// heading renders exactly once, not zero or two times).
+    /// Like `find_exact_text_center`, but also returns the clip rect the
+    /// shape was painted with - the boundary egui actually enforces at
+    /// paint time. If the shape's own position falls outside that clip
+    /// rect, the text is not actually visible on screen even though it
+    /// was laid out and painted (a scroll area clips its content to its
+    /// own viewport rect; a bottom panel overlapping that viewport would
+    /// clip content the same way scrolling too little would).
+    fn find_exact_text_position_and_clip(
+        output: &egui::FullOutput,
+        needle: &str,
+    ) -> Option<(egui::Pos2, egui::Rect)> {
+        fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                    .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+                egui::Shape::Vec(nested) => nested.iter().find_map(|s| find_in_shape(s, needle)),
+                _ => None,
+            }
+        }
+        output.shapes.iter().find_map(|clipped| {
+            find_in_shape(&clipped.shape, needle).map(|pos| (pos, clipped.clip_rect))
+        })
+    }
+
     fn count_exact_text_occurrences(output: &egui::FullOutput, needle: &str) -> usize {
         fn count_in_shape(shape: &egui::Shape, needle: &str) -> usize {
             match shape {
