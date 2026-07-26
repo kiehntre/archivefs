@@ -546,10 +546,20 @@ fn an_installable_candidate_maps_to_a_preview_strength() {
             .expect("allowed"),
         PreviewMatchStrength::Strong
     );
+    // An Ambiguous or Weak candidate is only ever passed to this function
+    // after the user has explicitly picked it (see the function's own doc
+    // comment), so from here on it is treated the same as a Strong match -
+    // not blocked by shared_preview's own "ambiguous means unresolved"
+    // rule, which exists to stop an *automatic* process from guessing.
     assert_eq!(
         match_strength_for_candidate(&candidate(CheatCandidateClassification::Ambiguous))
-            .expect("allowed after an explicit choice"),
-        PreviewMatchStrength::Ambiguous
+            .expect("installable once the user has explicitly chosen it"),
+        PreviewMatchStrength::Strong
+    );
+    assert_eq!(
+        match_strength_for_candidate(&candidate(CheatCandidateClassification::Weak))
+            .expect("installable once the user has explicitly chosen it"),
+        PreviewMatchStrength::Strong
     );
 }
 

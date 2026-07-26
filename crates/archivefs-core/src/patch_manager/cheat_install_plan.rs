@@ -883,14 +883,30 @@ fn preview_error(failure: &SharedPreviewError) -> CheatInstallPlanError {
 
 /// Maps a candidate's classification onto the shared preview's own strength
 /// vocabulary, and refuses one that must never be installed.
+/// Maps a chosen candidate's classification onto the shared preview
+/// pipeline's own match-strength vocabulary.
+///
+/// This is only ever called for a candidate the user has already picked by
+/// clicking it explicitly (`CheatWorkflowAction::SelectCandidate`), never
+/// for one still sitting unresolved in the candidate list. That distinction
+/// matters for `Ambiguous` and `Weak`: `shared_preview`'s own blocking rule
+/// (`PreviewMatchStrength::Ambiguous` is always refused - see
+/// `shared_preview.rs`) exists to stop an *automatic* process from ever
+/// silently picking between tied or weakly-evidenced matches. A human
+/// explicitly choosing one of them is exactly the disambiguation that rule
+/// is protecting against skipping, so from this point on the chosen
+/// candidate is installable the same way a `Strong` one is - never
+/// auto-selected (that is decided earlier, in `cheat_candidates`), but no
+/// longer blocked by a safety rule aimed at automatic selection.
 pub fn match_strength_for_candidate(
     candidate: &CheatCandidate,
 ) -> Result<PreviewMatchStrength, CheatInstallPlanError> {
     use super::cheat_candidates::CheatCandidateClassification as Classification;
     match candidate.classification {
         Classification::VerifiedExact => Ok(PreviewMatchStrength::VerifiedExact),
-        Classification::Strong => Ok(PreviewMatchStrength::Strong),
-        Classification::Ambiguous | Classification::Weak => Ok(PreviewMatchStrength::Ambiguous),
+        Classification::Strong | Classification::Ambiguous | Classification::Weak => {
+            Ok(PreviewMatchStrength::Strong)
+        }
         Classification::CrossPlatform | Classification::Unsupported => Err(error(
             CheatInstallPlanErrorKind::CandidateNotInstallable,
             None,

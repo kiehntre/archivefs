@@ -268,6 +268,137 @@ fn a_selected_subset_installs_to_the_real_retroarch_destination() {
 }
 
 #[test]
+fn an_explicitly_chosen_ambiguous_candidate_still_installs() {
+    // Two catalogue files with the same normalized title on the same
+    // platform tie in ranking and are both classified Ambiguous - real,
+    // common shape for a multi-region ROM set (e.g. several "Metroid"
+    // region variants all matching a title-only archive). Choosing one of
+    // them explicitly must not then be blocked again by shared_preview's
+    // own "ambiguous means unresolved" rule, which exists to stop an
+    // *automatic* process from guessing, not to second-guess a human's
+    // explicit choice.
+    let fixture = Fixture::new("ambiguous-explicit-choice");
+    let catalogue_root = fixture.dir("catalogue");
+    fixture.write(
+        &format!("catalogue/{PLATFORM}/Chrono Quest (Europe).cht"),
+        CATALOGUE_CHT,
+    );
+    fixture.write(
+        &format!("catalogue/{PLATFORM}/Chrono Quest (Beta).cht"),
+        CATALOGUE_CHT,
+    );
+    let cheat_root = fixture.dir("retroarch/cheats");
+    fixture.dir(&format!("retroarch/cheats/{PLATFORM}"));
+    let staging_root = fixture.path("managed/generated-cheats");
+    let history_root = fixture.dir("managed/history");
+    let backup_root = fixture.dir("managed/backups");
+    let archive = fixture.write("library/Chrono Quest.zip", "archive bytes");
+
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "test", &catalogue_root);
+    let list = build_cheat_candidates(
+        &snapshot,
+        &CheatCandidateArchive {
+            display_name: "Chrono Quest".to_string(),
+            platform: Some(PLATFORM.to_string()),
+            content_basename: Some("Chrono Quest".to_string()),
+            ..CheatCandidateArchive::default()
+        },
+        &CheatCandidateOptions::default(),
+    );
+    assert_eq!(list.candidates.len(), 2, "the two entries must tie");
+    assert!(
+        list.candidates
+            .iter()
+            .all(|candidate| candidate.classification == CheatCandidateClassification::Ambiguous),
+        "a genuine tie is never resolved silently: {:?}",
+        list.candidates
+    );
+    assert!(list.automatic_choice().is_none());
+
+    // The user explicitly picks one of the two tied candidates.
+    let chosen = list
+        .candidates
+        .iter()
+        .find(|candidate| candidate.catalogue_relative_path.contains("Beta"))
+        .expect("the Beta candidate is present")
+        .clone();
+    assert!(chosen.manually_selectable);
+
+    let loaded = load_candidate_document(
+        &catalogue_root,
+        &chosen.catalogue_relative_path,
+        chosen.source_file_hash.as_deref(),
+    )
+    .expect("candidate loads");
+    let mut selection = CheatSelection::from_document(&loaded.document);
+    assert!(selection.set_selected(0, true));
+    let entries = selection
+        .resolve(&loaded.document)
+        .expect("selection resolves");
+
+    let destination = resolve_cheat_destination(&CheatDestinationRequest {
+        profile_cheat_root: cheat_root.clone(),
+        platform: Some(PLATFORM.to_string()),
+        content_basename: Some("Chrono Quest".to_string()),
+        playlist_name: None,
+        catalogue_name: chosen.display_name.clone(),
+    })
+    .expect("destination resolves");
+
+    let staged = stage_generated_cheat_file(&staging_root, "Chrono Quest", &entries, &[])
+        .expect("staging succeeds");
+
+    let match_strength =
+        match_strength_for_candidate(&chosen).expect("an explicitly chosen tie is installable");
+    assert_eq!(
+        match_strength,
+        archivefs_core::patch_manager::PreviewMatchStrength::Strong,
+        "an explicit choice must not be re-blocked as unresolved ambiguity"
+    );
+
+    let preview = build_cheat_install_preview(&CheatInstallPreviewRequest {
+        selected_archive: archive.clone(),
+        platform: Some(PLATFORM.to_string()),
+        verified_identity: format!("test:{}", loaded.digest),
+        destination: destination.clone(),
+        profile_cheat_root: cheat_root.clone(),
+        staged: staged.clone(),
+        match_strength,
+    })
+    .expect("preview builds");
+    assert_eq!(preview.report.summary.blocked, 0, "must not be blocked");
+
+    let plan = build_shared_transaction_plan(
+        &preview.report,
+        "test-profile",
+        "ArchiveFS cached catalogue",
+        &staging_root,
+    )
+    .expect("plan builds");
+    let options = SharedApplyOptions {
+        dry_run: false,
+        confirmation: Some(SharedApplyConfirmation {
+            plan_id: plan.plan_id.clone(),
+            general_approved: true,
+            replacement_approved: false,
+        }),
+        operation_id: "ambiguous-explicit-choice-op".to_string(),
+        timestamp_unix_seconds: 1_700_000_200,
+        current_context: plan.context.clone(),
+        history_root,
+        backup_root,
+    };
+    let result = execute_shared_apply(&plan, &options);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert!(
+        fs::read_to_string(&destination.path)
+            .expect("installed")
+            .contains("Infinite Health"),
+        "the explicitly chosen tied candidate's cheat is actually written"
+    );
+}
+
+#[test]
 fn the_enabled_flag_survives_into_the_installed_file() {
     let fixture = Fixture::new("enabled");
     let workflow = Workflow::new(&fixture);
