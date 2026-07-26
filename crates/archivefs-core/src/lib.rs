@@ -4687,6 +4687,41 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("vita", "PlayStation Vita"),
     ("colecovision", "ColecoVision"),
     ("vectrex", "Vectrex"),
+    // libretro-database names, which are the exact directory names inside a
+    // RetroArch cheat catalogue tree (`cheats/<Database Name>/<Game>.cht`).
+    // Without these, a cheat file's platform can never agree with the
+    // selected archive's, so every candidate for these systems would stay a
+    // weak title-only match and no install destination could be resolved.
+    // The forms already covered by a shorter alias above (Sega - Mega Drive
+    // - Genesis, Sony - PlayStation, Atari - 2600, ...) are not repeated.
+    ("nintendonintendoentertainmentsystem", "NES"),
+    ("nintendofamilycomputerdisksystem", "NES"),
+    ("nintendonintendo64", "N64"),
+    ("nintendogameboy", "Game Boy"),
+    ("nintendogameboycolor", "Game Boy Color"),
+    ("nintendogameboyadvance", "Game Boy Advance"),
+    ("nintendonintendods", "Nintendo DS"),
+    ("nintendonintendodsi", "Nintendo DS"),
+    ("segamastersystemmarkiii", "MasterSystem"),
+    ("segamegacdsegacd", "Sega CD"),
+    ("sega32x32x", "Sega 32X"),
+    ("sonyplaystationportable", "PSP"),
+    ("necpcenginesupergrafx", "PC Engine"),
+    ("necpcengineturbografx16", "PC Engine"),
+    ("snkneogeopocket", "Neo Geo Pocket"),
+    ("snkneogeopocketcolor", "Neo Geo Pocket Color"),
+    ("bandaiwonderswan", "WonderSwan"),
+    ("bandaiwonderswancolor", "WonderSwan Color"),
+    ("coleco", "ColecoVision"),
+    ("gcevectrex", "Vectrex"),
+    ("microsoftmsx", "MSX"),
+    ("microsoftmsx2", "MSX2"),
+    ("atarilynxlynx", "Atari Lynx"),
+    // Deliberately absent: libretro database names whose systems this build
+    // has no canonical platform for at all (Virtual Boy, SG-1000, PC Engine
+    // CD, ...). Adding them here would silently invent a new canonical
+    // platform for the whole application, which is a much larger change than
+    // recognising an existing one under its libretro spelling.
 ];
 
 /// Every canonical platform name this build recognises via the

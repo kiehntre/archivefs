@@ -22,6 +22,7 @@
 mod adapter;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
+mod cheat_candidates;
 mod cheat_catalogue;
 mod cheat_history;
 mod cheat_install_result;
@@ -68,6 +69,12 @@ pub use cheat_cache_maintenance::{
     SnapshotVerificationState, execute_retroarch_cheat_cache_prune,
     inventory_retroarch_cheat_snapshots, plan_retroarch_cheat_cache_prune,
     set_retroarch_cheat_snapshot_pin, verify_retroarch_cheat_snapshots,
+};
+pub use cheat_candidates::{
+    CheatCandidate, CheatCandidateArchive, CheatCandidateClassification, CheatCandidateEvidence,
+    CheatCandidateEvidenceKind, CheatCandidateList, CheatCandidateOptions,
+    MAX_CHEAT_CANDIDATE_EVIDENCE, MAX_CHEAT_CANDIDATE_RECORDS_SCANNED, MAX_CHEAT_CANDIDATES,
+    build_cheat_candidates,
 };
 pub use cheat_catalogue::{
     CHEAT_CATALOGUE_FORMAT_VERSION, CatalogueDiagnostic, CatalogueEntryExclusionKind,

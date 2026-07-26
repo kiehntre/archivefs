@@ -231,7 +231,6 @@ impl ChtEntry {
         }
     }
 
-    #[must_use]
     pub fn blocking_warnings(&self) -> impl Iterator<Item = &ChtEntryWarning> {
         self.warnings
             .iter()
@@ -316,10 +315,10 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
     let mut seen_any_body_line = false;
     let mut limit_reported = false;
 
-    let mut push_warning = |warnings: &mut Vec<ChtDocumentWarning>,
-                            kind: ChtDocumentWarningKind,
-                            line: Option<u32>,
-                            detail: String| {
+    let push_warning = |warnings: &mut Vec<ChtDocumentWarning>,
+                        kind: ChtDocumentWarningKind,
+                        line: Option<u32>,
+                        detail: String| {
         if warnings.len() < MAX_CHT_DOCUMENT_WARNINGS {
             warnings.push(ChtDocumentWarning { kind, line, detail });
         }
@@ -469,7 +468,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                     });
                 }
             }
-            other if other.is_empty() => {
+            "" => {
                 push_warning(
                     &mut warnings,
                     ChtDocumentWarningKind::MalformedEntryIndex,
@@ -502,7 +501,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 kind: ChtEntryWarningKind::MissingCode,
                 detail: format!("cheat{index} has no cheat{index}_code key"),
             }),
-            Some(code) if code.is_empty() => entry_warnings.push(ChtEntryWarning {
+            Some("") => entry_warnings.push(ChtEntryWarning {
                 kind: ChtEntryWarningKind::EmptyCode,
                 detail: format!("cheat{index}_code is empty"),
             }),
