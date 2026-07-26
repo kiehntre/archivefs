@@ -29,6 +29,7 @@ mod cheat_installer;
 mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
+mod cht_document;
 mod destination_safety;
 mod dolphin_local;
 mod import_safety;
@@ -125,6 +126,13 @@ pub use cheat_sources::{
     fetch_retroarch_cheat_source, inspect_retroarch_cheat_source,
     inspect_retroarch_cheat_source_snapshot, list_retroarch_cheat_sources,
     trusted_retroarch_cheat_sources,
+};
+pub use cht_document::{
+    ChtDocument, ChtDocumentWarning, ChtDocumentWarningKind, ChtEntry, ChtEntryWarning,
+    ChtEntryWarningKind, ChtInstallEntry, ChtParseError, ChtParseErrorKind,
+    MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_EXTRA_FIELDS_PER_ENTRY,
+    MAX_CHT_FIELD_BYTES, MAX_CHT_GLOBAL_FIELDS, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes,
+    parse_cht_text, render_cht_file,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,
