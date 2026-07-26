@@ -567,3 +567,68 @@ fn a_cross_platform_or_unsupported_candidate_can_never_reach_a_preview() {
         );
     }
 }
+
+// -----------------------------------------------------------------------
+// Real-world RetroArch layout
+// -----------------------------------------------------------------------
+
+#[test]
+fn an_existing_libretro_database_directory_is_used_instead_of_a_new_one() {
+    // A real RetroArch cheat root is laid out by libretro database name,
+    // not by this project's canonical short name. Installing into a second
+    // directory for the same system would put the file somewhere the user
+    // does not already look.
+    let fixture = Fixture::new("libretro-layout");
+    let root = fixture.dir("cheats");
+    fixture.dir("cheats/Nintendo - Nintendo Entertainment System");
+    fixture.dir("cheats/Sega - Mega Drive - Genesis");
+
+    let resolved = resolve_cheat_destination(&destination_request(&root)).expect("resolves");
+    assert_eq!(
+        resolved.platform_directory,
+        "Nintendo - Nintendo Entertainment System"
+    );
+    assert_eq!(
+        resolved.platform_directory_source,
+        CheatPlatformDirectorySource::ExistingProfileDirectory
+    );
+    assert_eq!(
+        resolved.path,
+        root.join("Nintendo - Nintendo Entertainment System")
+            .join("Chrono Quest (USA).cht")
+    );
+}
+
+#[test]
+fn a_cheat_root_with_no_matching_directory_falls_back_to_the_canonical_name() {
+    let fixture = Fixture::new("no-libretro-dir");
+    let root = fixture.dir("cheats");
+    fixture.dir("cheats/Sega - Mega Drive - Genesis");
+
+    let resolved = resolve_cheat_destination(&destination_request(&root)).expect("resolves");
+    assert_eq!(resolved.platform_directory, "NES");
+    assert_eq!(
+        resolved.platform_directory_source,
+        CheatPlatformDirectorySource::CanonicalPlatformName
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_platform_directory_is_never_chosen_as_an_existing_one() {
+    let fixture = Fixture::new("symlinked-platform-dir");
+    let root = fixture.dir("cheats");
+    let outside = fixture.dir("outside");
+    std::os::unix::fs::symlink(
+        &outside,
+        root.join("Nintendo - Nintendo Entertainment System"),
+    )
+    .expect("symlink");
+
+    let resolved = resolve_cheat_destination(&destination_request(&root)).expect("resolves");
+    assert_eq!(
+        resolved.platform_directory_source,
+        CheatPlatformDirectorySource::CanonicalPlatformName,
+        "a symlinked directory is skipped rather than followed"
+    );
+}

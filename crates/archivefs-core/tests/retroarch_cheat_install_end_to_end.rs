@@ -106,7 +106,13 @@ impl Workflow {
         Self {
             catalogue_root,
             archive: fixture.write("library/Chrono Quest (USA).zip", "archive bytes"),
-            cheat_root: fixture.dir("retroarch/cheats"),
+            cheat_root: {
+                let root = fixture.dir("retroarch/cheats");
+                // A real RetroArch cheat root already has one directory per
+                // libretro database name; the resolver must install into it.
+                fixture.dir(&format!("retroarch/cheats/{PLATFORM}"));
+                root
+            },
             staging_root: fixture.path("managed/generated-cheats"),
             history_root: fixture.dir("managed/history"),
             backup_root: fixture.dir("managed/backups"),
@@ -235,9 +241,9 @@ fn a_selected_subset_installs_to_the_real_retroarch_destination() {
         destination,
         workflow
             .cheat_root
-            .join("NES")
+            .join(PLATFORM)
             .join("Chrono Quest (USA).cht"),
-        "the file lands in the profile's own cheat directory, under the canonical platform"
+        "the file lands in the profile's own existing libretro cheat directory"
     );
     assert!(!destination.exists(), "nothing is written before apply");
 
@@ -358,7 +364,10 @@ fn replacement_without_separate_approval_does_not_overwrite() {
     let fixture = Fixture::new("no-approval");
     let workflow = Workflow::new(&fixture);
     let existing = "cheats = 1\n\ncheat0_desc = \"Old cheat\"\ncheat0_code = \"OLD\"\n";
-    fixture.write("retroarch/cheats/NES/Chrono Quest (USA).cht", existing);
+    fixture.write(
+        &format!("retroarch/cheats/{PLATFORM}/Chrono Quest (USA).cht"),
+        existing,
+    );
 
     let (report, destination, _) = workflow.prepare(select_first_and_third);
     let result = workflow.apply(&report, true, false);
@@ -484,6 +493,10 @@ fn the_installed_file_is_reachable_at_the_path_retroarch_browses() {
     let relative = destination
         .strip_prefix(&workflow.cheat_root)
         .expect("inside the profile cheat directory");
-    assert_eq!(relative, Path::new("NES/Chrono Quest (USA).cht"));
+    assert_eq!(
+        relative,
+        Path::new(PLATFORM).join("Chrono Quest (USA).cht"),
+        "the installed path matches the libretro layout RetroArch already uses"
+    );
     assert!(destination.is_file());
 }

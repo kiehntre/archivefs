@@ -96,9 +96,10 @@ pub use cheat_history::{
 };
 pub use cheat_install_plan::{
     CheatDestinationNameSource, CheatDestinationRequest, CheatInstallPlanError,
-    CheatInstallPlanErrorKind, CheatInstallPreview, CheatInstallPreviewRequest, CheatSelection,
-    CheatSelectionEntry, GENERATED_FILE_PROVENANCE, LoadedCandidate, MAX_CANDIDATE_FILE_BYTES,
-    MAX_GENERATED_FILE_BYTES, ResolvedCheatDestination, StagedCheatFile,
+    CheatInstallPlanErrorKind, CheatInstallPreview, CheatInstallPreviewRequest,
+    CheatPlatformDirectorySource, CheatSelection, CheatSelectionEntry, GENERATED_FILE_PROVENANCE,
+    LoadedCandidate, MAX_CANDIDATE_FILE_BYTES, MAX_GENERATED_FILE_BYTES,
+    MAX_PLATFORM_DIRECTORY_CANDIDATES, ResolvedCheatDestination, StagedCheatFile,
     build_cheat_install_preview, load_candidate_document, match_strength_for_candidate,
     resolve_cheat_destination, stage_generated_cheat_file,
 };

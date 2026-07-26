@@ -16755,8 +16755,9 @@ fn show_generated_install_preview(
             let _ = clipboard.set_text(generated.destination.path.display().to_string());
         }
         ui.label(format!(
-            "Filename taken from the {}.",
-            generated.destination.name_source.label()
+            "Filename taken from the {}; platform directory from the {}.",
+            generated.destination.name_source.label(),
+            generated.destination.platform_directory_source.label()
         ));
         ui.label(if generated.destination.replaces_existing {
             "A cheat file already exists at this path. Installing replaces it, and the existing file is backed up first."
