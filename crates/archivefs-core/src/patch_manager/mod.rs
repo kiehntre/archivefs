@@ -25,6 +25,7 @@ mod cheat_cache_maintenance;
 mod cheat_candidates;
 mod cheat_catalogue;
 mod cheat_history;
+mod cheat_install_plan;
 mod cheat_install_result;
 mod cheat_installer;
 mod cheat_rollback;
@@ -92,6 +93,14 @@ pub use cheat_history::{
     CheatInspectionPath, CheatJournalInspection, CheatJournalInspectionError,
     CheatRollbackAvailability, CheatRollbackJournalMatch, discover_cheat_history,
     inspect_cheat_install_journal,
+};
+pub use cheat_install_plan::{
+    CheatDestinationNameSource, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPlanErrorKind, CheatInstallPreview, CheatInstallPreviewRequest, CheatSelection,
+    CheatSelectionEntry, GENERATED_FILE_PROVENANCE, LoadedCandidate, MAX_CANDIDATE_FILE_BYTES,
+    MAX_GENERATED_FILE_BYTES, ResolvedCheatDestination, StagedCheatFile,
+    build_cheat_install_preview, load_candidate_document, match_strength_for_candidate,
+    resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
     CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
