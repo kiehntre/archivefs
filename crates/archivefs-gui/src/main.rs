@@ -24305,6 +24305,191 @@ mod tests {
         )
     }
 
+    /// Builds a workflow that has already reached stage 6: a candidate
+    /// list, a chosen candidate, and a cheat selection, so the tests below
+    /// can assert what survives a context change and what does not.
+    fn workflow_at_cheat_selection_stage(app: &mut ArchiveFsApp) {
+        let document = archivefs_core::patch_manager::parse_cht_text(
+            "cheats = 2\ncheat0_desc = \"A\"\ncheat0_code = \"AA\"\n\
+             cheat1_desc = \"B\"\ncheat1_code = \"BB\"\n",
+        )
+        .expect("fixture parses");
+        let candidate = CheatCandidate {
+            catalogue_relative_path: "NES/a.cht".to_string(),
+            display_name: "a".to_string(),
+            platform: Some("NES".to_string()),
+            region: None,
+            revision: None,
+            classification: CheatCandidateClassification::Strong,
+            confidence_score: 700,
+            evidence: Vec::new(),
+            cheat_count: 2,
+            source_file_hash: None,
+            auto_selectable: false,
+            manually_selectable: true,
+        };
+        let mut selection = CheatSelection::from_document(&document);
+        assert!(selection.set_selected(0, true));
+        let key = cheat_preview_key(app.cheat_workflow.as_ref().expect("workflow"));
+        let workflow = app.cheat_workflow.as_mut().expect("workflow");
+        workflow.candidates_request = Some(key.clone());
+        workflow.candidates = CheatStepResource::Ready(CheatCandidateStage {
+            key,
+            catalogue_root: PathBuf::from("/catalogue"),
+            list: CheatCandidateList {
+                candidates: vec![candidate.clone()],
+                total_matched: 1,
+                truncated: false,
+                query: None,
+                records_scanned: 1,
+                scan_limit_reached: false,
+            },
+        });
+        workflow.candidate_selection = Some(CheatCandidateSelection {
+            candidate,
+            loaded: LoadedCandidate {
+                absolute_path: PathBuf::from("/catalogue/NES/a.cht"),
+                digest: "a".repeat(64),
+                document,
+            },
+            selection,
+        });
+    }
+
+    #[test]
+    fn navigating_away_and_back_keeps_the_candidate_and_its_cheat_selection() {
+        let mut app = app_with_cheats_mods_context();
+        workflow_at_cheat_selection_stage(&mut app);
+
+        app.view = MainView::Library;
+        app.poll_cheat_workflow();
+        app.view = MainView::CheatsMods;
+        app.poll_cheat_workflow();
+
+        let workflow = app.cheat_workflow.as_ref().expect("workflow");
+        let selection = workflow
+            .candidate_selection
+            .as_ref()
+            .expect("the chosen candidate survives leaving the page");
+        assert_eq!(selection.candidate.catalogue_relative_path, "NES/a.cht");
+        assert_eq!(
+            selection.selection.selected_count(),
+            1,
+            "the cheat selection survives too"
+        );
+    }
+
+    #[test]
+    fn changing_the_archive_clears_the_candidate_and_selection() {
+        let mut app = app_with_cheats_mods_context();
+        workflow_at_cheat_selection_stage(&mut app);
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records
+                .push(record("/roms/b.zip", MountState::Pending));
+        }
+
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/b.zip")));
+
+        let workflow = app.cheat_workflow.as_ref().expect("workflow");
+        assert!(
+            workflow.candidate_selection.is_none(),
+            "a candidate from another archive must never carry over"
+        );
+        assert!(matches!(workflow.candidates, CheatStepResource::NotLoaded));
+        assert!(workflow.candidates_request.is_none());
+    }
+
+    #[test]
+    fn changing_the_retroarch_profile_clears_the_destination_derived_state() {
+        let mut app = app_with_cheats_mods_context();
+        workflow_at_cheat_selection_stage(&mut app);
+        let workflow = app.cheat_workflow.as_mut().expect("workflow");
+        workflow.selected_profile_id = Some("flatpak-user".to_string());
+        // The profile radio applies exactly this reset; the destination and
+        // everything computed from it must be recalculated, not reused.
+        clear_cheat_candidate_state(workflow);
+
+        assert!(workflow.candidate_selection.is_none());
+        assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+    }
+
+    #[test]
+    fn editing_the_cheat_selection_invalidates_a_preview_built_from_the_old_one() {
+        let mut app = app_with_cheats_mods_context();
+        workflow_at_cheat_selection_stage(&mut app);
+        let key = cheat_preview_key(app.cheat_workflow.as_ref().expect("workflow"));
+        if let Some(workflow) = app.cheat_workflow.as_mut() {
+            workflow.preview_request = Some(key);
+            workflow.preview = CheatStepResource::Failed("stale".to_string());
+        }
+
+        app.update_cheat_selection(|selection| {
+            selection.select_all();
+        });
+
+        let workflow = app.cheat_workflow.as_ref().expect("workflow");
+        assert!(
+            matches!(workflow.preview, CheatStepResource::NotLoaded),
+            "a preview of a different selection must not survive the edit"
+        );
+        assert!(workflow.preview_request.is_none());
+        assert_eq!(
+            workflow
+                .candidate_selection
+                .as_ref()
+                .expect("selection")
+                .selection
+                .selected_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_uninstallable_candidate_can_never_become_the_selection() {
+        let mut app = app_with_cheats_mods_context();
+        let key = cheat_preview_key(app.cheat_workflow.as_ref().expect("workflow"));
+        if let Some(workflow) = app.cheat_workflow.as_mut() {
+            workflow.candidates_request = Some(key.clone());
+            workflow.candidates = CheatStepResource::Ready(CheatCandidateStage {
+                key,
+                catalogue_root: PathBuf::from("/catalogue"),
+                list: CheatCandidateList {
+                    candidates: vec![CheatCandidate {
+                        catalogue_relative_path: "MegaDrive/a.cht".to_string(),
+                        display_name: "a".to_string(),
+                        platform: Some("MegaDrive".to_string()),
+                        region: None,
+                        revision: None,
+                        classification: CheatCandidateClassification::CrossPlatform,
+                        confidence_score: 0,
+                        evidence: Vec::new(),
+                        cheat_count: 1,
+                        source_file_hash: None,
+                        auto_selectable: false,
+                        manually_selectable: false,
+                    }],
+                    total_matched: 1,
+                    truncated: false,
+                    query: None,
+                    records_scanned: 1,
+                    scan_limit_reached: false,
+                },
+            });
+        }
+
+        app.apply_cheat_candidate_choice("MegaDrive/a.cht");
+
+        assert!(
+            app.cheat_workflow
+                .as_ref()
+                .expect("workflow")
+                .candidate_selection
+                .is_none(),
+            "a cross-platform candidate is refused even if something asks for it directly"
+        );
+    }
+
     fn app_with_cheats_mods_context() -> ArchiveFsApp {
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
