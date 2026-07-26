@@ -17,35 +17,41 @@ use archivefs_core::emulator_environment::retroarch::{
 #[cfg(test)]
 use archivefs_core::game_identity::inspect_game_identity;
 use archivefs_core::game_identity::{
-    GameIdentityReport, IdentityImageFormat, IdentityStatus, inspect_catalogued_game_identity,
+    GameIdentityReport, IdentityImageFormat, IdentityKind, IdentityStatus,
+    inspect_catalogued_game_identity,
 };
 use archivefs_core::patch_manager::{
-    CheatCatalogueStatus, CheatSourceCancellation, CheatSourceError, CheatSourceFetchOptions,
-    CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList,
-    CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
+    CheatCandidate, CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList,
+    CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation, CheatSourceError,
+    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
+    CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
     CheatSourceProgressReporter, DolphinGameIniInventory, DolphinInstallationType,
     DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
     DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
-    ImportSourceKind, ImportTrustState, LocalSafetyScanningState, Pcsx2InstallationType,
-    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory,
-    Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewIdentity,
-    PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem,
-    PreviewState, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
-    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
-    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
-    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
-    UNKNOWN_CODE_POLICY, adapter_write_support, build_shared_preview,
+    ImportSourceKind, ImportTrustState, LoadedCandidate, LocalSafetyScanningState,
+    Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState,
+    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots,
+    Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState, PreviewEligibility,
+    PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
+    PreviewSourceItem, PreviewState, ResolvedCheatDestination, RetroArchCheatLibraryInspection,
+    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
+    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
+    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
+    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
+    SharedTransactionPlan, StagedCheatFile, UNKNOWN_CODE_POLICY, adapter_write_support,
+    build_cheat_candidates, build_cheat_install_preview, build_shared_preview,
     build_shared_transaction_plan, default_cheat_source_cache_root, default_shared_backup_root,
     default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
     discover_retroarch_cheat_setup_profiles, discover_shared_apply_history, execute_shared_apply,
     execute_shared_rollback, fetch_retroarch_cheat_source, generate_shared_operation_id,
     inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
-    list_retroarch_cheat_sources, match_dolphin_inventory, match_pcsx2_inventory,
-    materialize_retroarch_shared_preview, preview_shared_rollback,
+    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
+    match_dolphin_inventory, match_pcsx2_inventory, match_strength_for_candidate,
+    materialize_retroarch_shared_preview, preview_shared_rollback, resolve_cheat_destination,
+    stage_generated_cheat_file,
 };
 mod ui;
 
@@ -4283,9 +4289,7 @@ impl ArchiveFsApp {
                 if let Some(workflow) = self.cheat_workflow.as_mut() {
                     workflow.source_fetch = CheatStepResource::Ready(fetch.clone());
                     workflow.source_list = CheatStepResource::NotLoaded;
-                    workflow.preview_request = None;
-                    workflow.preview = CheatStepResource::NotLoaded;
-                    workflow.transaction = CheatTransactionState::Idle;
+                    clear_cheat_candidate_state(workflow);
                 }
             }
             Err(error) => {
@@ -4952,6 +4956,11 @@ impl ArchiveFsApp {
             source_fetch: CheatStepResource::NotLoaded,
             selected_source_id,
             fetch_force_refresh,
+            candidates: CheatStepResource::NotLoaded,
+            candidates_request: None,
+            candidate_query: String::new(),
+            candidate_selection: None,
+            candidate_load_error: None,
         });
         true
     }
@@ -5075,9 +5084,331 @@ impl ArchiveFsApp {
                 key: worker_key,
                 outcome,
                 materialized,
+                generated: None,
             }));
             context.request_repaint();
         });
+    }
+
+    /// Stage 4: builds the ranked candidate list for the selected archive
+    /// against the verified catalogue snapshot, off the UI thread.
+    ///
+    /// Bound to the same request key the preview uses, so a result that
+    /// arrives after the archive, profile, or snapshot changed is discarded
+    /// rather than shown against the wrong context.
+    fn start_cheat_candidate_match(&mut self, context: egui::Context) {
+        let Some((key, catalogue_root, archive)) = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| build_cheat_candidate_request(workflow, &self.retroarch_profiles))
+        else {
+            return;
+        };
+        let archive_path = key.archive_path.clone();
+        let worker_key = key.clone();
+        let worker_root = catalogue_root.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.candidates_request = Some(key);
+        workflow.candidates = CheatStepResource::Loading { receiver };
+        workflow.candidate_selection = None;
+        workflow.candidate_load_error = None;
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Matching the selected archive against the trusted cheat catalogue.",
+        ));
+        thread::spawn(move || {
+            let snapshot = load_cheat_catalogue_snapshot(
+                &HostReadOnlyFilesystem,
+                "trusted-catalogue",
+                &worker_root,
+            );
+            let list =
+                build_cheat_candidates(&snapshot, &archive, &CheatCandidateOptions::default());
+            let _ = sender.send(Ok(CheatCandidateStage {
+                key: worker_key,
+                catalogue_root: worker_root,
+                list,
+            }));
+            context.request_repaint();
+        });
+    }
+
+    /// Stage 5/6: opens one chosen candidate and builds its cheat picker.
+    ///
+    /// Deliberately synchronous: this is one bounded read of a single small
+    /// file in direct response to a click, and doing it inline keeps the
+    /// chosen candidate and its parsed cheats impossible to get out of step.
+    fn apply_cheat_candidate_choice(&mut self, relative_path: &str) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let CheatStepResource::Ready(stage) = &workflow.candidates else {
+            return;
+        };
+        let Some(candidate) = stage
+            .list
+            .candidates
+            .iter()
+            .find(|candidate| candidate.catalogue_relative_path == relative_path)
+            .cloned()
+        else {
+            return;
+        };
+        if !candidate.manually_selectable {
+            // The UI never offers this, but a candidate that can never be
+            // installed must not become the selection through any path.
+            return;
+        }
+        let catalogue_root = stage.catalogue_root.clone();
+        let archive_path = workflow.archive_path.clone();
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        match load_candidate_document(
+            &catalogue_root,
+            &candidate.catalogue_relative_path,
+            candidate.source_file_hash.as_deref(),
+        ) {
+            Ok(loaded) => {
+                let selection = CheatSelection::from_document(&loaded.document);
+                let cheat_count = selection.entries.len();
+                let blocked = selection.blocked_count();
+                workflow.candidate_load_error = None;
+                workflow.candidate_selection = Some(CheatCandidateSelection {
+                    candidate,
+                    loaded,
+                    selection,
+                });
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Completed,
+                    format!(
+                        "Candidate '{relative_path}' opened: {cheat_count} cheat(s), {blocked} unavailable."
+                    ),
+                ));
+            }
+            Err(error) => {
+                workflow.candidate_selection = None;
+                workflow.candidate_load_error = Some(error.detail.clone());
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    format!(
+                        "Candidate '{relative_path}' could not be opened: {}",
+                        error.detail
+                    ),
+                ));
+            }
+        }
+    }
+
+    /// Stage 7: renders the selected cheats, stages them, and previews the
+    /// install - all off the UI thread, because previewing hashes files.
+    fn start_generated_cheat_preview(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let Some(selection) = workflow.candidate_selection.as_ref() else {
+            return;
+        };
+        let Some(destination_root) =
+            selected_retroarch_cheat_root(workflow, &self.retroarch_profiles)
+        else {
+            return;
+        };
+        let Some(key) =
+            workflow
+                .candidates_request
+                .clone()
+                .or_else(|| match &workflow.candidates {
+                    CheatStepResource::Ready(stage) => Some(stage.key.clone()),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+
+        let entries = match selection.selection.resolve(&selection.loaded.document) {
+            Ok(entries) => entries,
+            Err(error) => {
+                let archive = workflow.archive_path.clone();
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive),
+                    ActivityOutcome::Rejected,
+                    format!("Install preview blocked: {}", error.detail),
+                ));
+                return;
+            }
+        };
+
+        let destination_request = CheatDestinationRequest {
+            profile_cheat_root: destination_root.clone(),
+            platform: workflow.platform.clone(),
+            content_basename: cheat_content_basename(workflow),
+            playlist_name: None,
+            catalogue_name: selection.candidate.display_name.clone(),
+        };
+        let match_strength = match match_strength_for_candidate(&selection.candidate) {
+            Ok(strength) => strength,
+            Err(error) => {
+                let archive = workflow.archive_path.clone();
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive),
+                    ActivityOutcome::Rejected,
+                    format!("Install preview blocked: {}", error.detail),
+                ));
+                return;
+            }
+        };
+        let staging_root = match default_generated_cheat_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                let archive = workflow.archive_path.clone();
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive),
+                    ActivityOutcome::Failed,
+                    message,
+                ));
+                return;
+            }
+        };
+        let archive_path = workflow.archive_path.clone();
+        let platform = workflow.platform.clone();
+        let candidate_display_name = selection.candidate.display_name.clone();
+        let identity = format!(
+            "retroarch-catalogue:{}:{}",
+            selection.candidate.catalogue_relative_path, selection.loaded.digest
+        );
+        let comments = vec![format!(
+            "Source catalogue file: {}",
+            selection.candidate.catalogue_relative_path
+        )];
+
+        let worker_key = key.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Loading { receiver };
+        workflow.transaction = CheatTransactionState::Idle;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            Some(archive_path.clone()),
+            ActivityOutcome::Started,
+            format!(
+                "Generating an install preview for {} selected cheat(s).",
+                entries.len()
+            ),
+        ));
+        thread::spawn(move || {
+            let response = (|| {
+                let destination = resolve_cheat_destination(&destination_request)?;
+                let staged = stage_generated_cheat_file(
+                    &staging_root,
+                    destination
+                        .file_name
+                        .strip_suffix(".cht")
+                        .unwrap_or(&destination.file_name),
+                    &entries,
+                    &comments,
+                )?;
+                let preview = build_cheat_install_preview(&CheatInstallPreviewRequest {
+                    selected_archive: archive_path.clone(),
+                    platform,
+                    verified_identity: identity,
+                    destination: destination.clone(),
+                    profile_cheat_root: destination_request.profile_cheat_root.clone(),
+                    staged: staged.clone(),
+                    match_strength,
+                })?;
+                Ok::<_, CheatInstallPlanError>((preview, destination, staged, staging_root))
+            })();
+            let message = match response {
+                Ok((preview, destination, staged, staging_root)) => CheatPreviewResponse {
+                    key: worker_key,
+                    outcome: CheatPreviewOutcome::Ready(preview.report),
+                    materialized: None,
+                    generated: Some(GeneratedCheatInstall {
+                        staging_root,
+                        destination,
+                        staged,
+                        candidate_display_name,
+                    }),
+                },
+                Err(error) => CheatPreviewResponse {
+                    key: worker_key,
+                    outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::InstallPlan(error)),
+                    materialized: None,
+                    generated: None,
+                },
+            };
+            let _ = sender.send(Ok(message));
+            context.request_repaint();
+        });
+    }
+
+    /// Applies one picker edit and invalidates anything downstream of it.
+    /// A preview built from a different selection must never survive a
+    /// change to that selection.
+    fn update_cheat_selection(&mut self, edit: impl FnOnce(&mut CheatSelection)) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(selection) = workflow.candidate_selection.as_mut() else {
+            return;
+        };
+        edit(&mut selection.selection);
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    /// Stage 9: rolls the completed install back through the same
+    /// journal-backed machinery History & Logs uses, so there is exactly
+    /// one rollback implementation.
+    fn start_cheat_install_rollback(&mut self, context: egui::Context) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let CheatTransactionState::Result { result, .. } = &workflow.transaction else {
+            return;
+        };
+        let Some(journal_path) = result.journal_path.clone() else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatInstall,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                "Rollback unavailable: this install wrote no journal.",
+            ));
+            return;
+        };
+        let destination_root = PathBuf::from(&result.journal.destination_root.display);
+        let archive = workflow.archive_path.clone();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatInstall,
+            Some(archive),
+            ActivityOutcome::Started,
+            format!(
+                "Rollback requested for install '{}'.",
+                result.journal.operation_id
+            ),
+        ));
+        self.view = MainView::HistoryLogs;
+        self.start_shared_rollback_preview(context, journal_path, destination_root);
     }
 
     fn review_cheat_apply(&mut self) {
@@ -5090,8 +5421,23 @@ impl ArchiveFsApp {
         let CheatStepResource::Ready(response) = &workflow.preview else {
             return;
         };
-        let (CheatPreviewOutcome::Ready(report), Some(materialized)) =
-            (&response.outcome, response.materialized.as_ref())
+        let CheatPreviewOutcome::Ready(report) = &response.outcome else {
+            return;
+        };
+        // The approved source root differs by path: a whole-file catalogue
+        // install is approved against the immutable snapshot it came from,
+        // while a generated selected-cheat install is approved against the
+        // private staging root its bytes were written into.
+        let Some(approved_source_root) = response
+            .generated
+            .as_ref()
+            .map(|generated| generated.staging_root.clone())
+            .or_else(|| {
+                response
+                    .materialized
+                    .as_ref()
+                    .map(|materialized| materialized.snapshot_root.clone())
+            })
         else {
             return;
         };
@@ -5102,7 +5448,7 @@ impl ArchiveFsApp {
             report,
             profile_id,
             workflow.source_mode.label(),
-            &materialized.snapshot_root,
+            &approved_source_root,
         ) {
             Ok(plan) => {
                 workflow.transaction = CheatTransactionState::Review {
@@ -5609,8 +5955,7 @@ impl ArchiveFsApp {
         let force_refresh = workflow.fetch_force_refresh && !offline;
         let (sender, receiver) = mpsc::channel();
         workflow.source_fetch = CheatStepResource::Loading { receiver };
-        workflow.preview_request = None;
-        workflow.preview = CheatStepResource::NotLoaded;
+        clear_cheat_candidate_state(workflow);
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
             Some(archive_path),
@@ -5650,6 +5995,7 @@ impl ArchiveFsApp {
     /// never arrive here at all.
     fn poll_cheat_workflow(&mut self) {
         let identity_page_is_current = self.view == MainView::CheatsMods;
+        let mut automatic_candidate: Option<String> = None;
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -5726,6 +6072,18 @@ impl ArchiveFsApp {
                                         materialized.indexed_file_count,
                                         materialized.excluded_file_count,
                                         report.entries.len()
+                                    ),
+                                )
+                            }
+                            CheatPreviewOutcome::Ready(report) if response.generated.is_some() => {
+                                let generated = response.generated.as_ref().unwrap();
+                                (
+                                    ActivityOutcome::Completed,
+                                    format!(
+                                        "Install preview created: {} cheat(s) from '{}' -> {}. No files changed yet.",
+                                        generated.staged.selected_cheat_count,
+                                        generated.candidate_display_name,
+                                        generated.destination.path.display()
                                     ),
                                 )
                             }
@@ -5957,6 +6315,62 @@ impl ArchiveFsApp {
                 }
             }
         }
+        // Stage 4 result. Bound to the request key that produced it, so a
+        // match that finishes after the archive, profile, or snapshot
+        // changed is dropped rather than shown against the new context.
+        let mut candidate_history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.candidates {
+            let current_key = workflow.candidates_request.clone();
+            match receiver.try_recv() {
+                Ok(Ok(stage)) if Some(&stage.key) == current_key.as_ref() => {
+                    let installable = stage.list.installable().count();
+                    candidate_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        Some(workflow.archive_path.clone()),
+                        if installable == 0 {
+                            ActivityOutcome::Rejected
+                        } else {
+                            ActivityOutcome::Completed
+                        },
+                        format!(
+                            "Match completed: {} candidate(s) shown of {} matched, {installable} installable.",
+                            stage.list.candidates.len(),
+                            stage.list.total_matched
+                        ),
+                    ));
+                    // A single verified-exact best candidate is the one case
+                    // where choosing for the user is safe; anything else
+                    // stays an explicit choice.
+                    let automatic = stage
+                        .list
+                        .automatic_choice()
+                        .map(|candidate| candidate.catalogue_relative_path.clone());
+                    workflow.candidates = CheatStepResource::Ready(stage);
+                    if let Some(relative_path) = automatic {
+                        automatic_candidate = Some(relative_path);
+                    }
+                }
+                Ok(Ok(_)) => {
+                    workflow.candidates = CheatStepResource::NotLoaded;
+                    workflow.candidates_request = None;
+                }
+                Ok(Err(message)) => {
+                    candidate_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("Catalogue matching failed: {message}"),
+                    ));
+                    workflow.candidates = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.candidates = CheatStepResource::Failed(
+                        "Catalogue matching stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
         let mut history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.source_fetch {
             match receiver.try_recv() {
@@ -5998,6 +6412,12 @@ impl ArchiveFsApp {
                     );
                 }
             }
+        }
+        if let Some(entry) = candidate_history_entry {
+            self.history.record(entry);
+        }
+        if let Some(relative_path) = automatic_candidate {
+            self.apply_cheat_candidate_choice(&relative_path);
         }
         if let Some(entry) = history_entry {
             self.history.record(entry);
@@ -6076,8 +6496,7 @@ impl ArchiveFsApp {
             workflow.platform = live_platform;
             workflow.identity_request = None;
             workflow.identity = CheatStepResource::NotLoaded;
-            workflow.preview_request = None;
-            workflow.preview = CheatStepResource::NotLoaded;
+            clear_cheat_candidate_state(workflow);
         }
     }
 
@@ -7046,6 +7465,14 @@ impl eframe::App for ArchiveFsApp {
         {
             self.start_cheat_preview(context.clone());
         }
+        if self.view == MainView::CheatsMods
+            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                workflow.candidates_request.is_none()
+                    && matches!(workflow.candidates, CheatStepResource::NotLoaded)
+            })
+        {
+            self.start_cheat_candidate_match(context.clone());
+        }
         let loading = matches!(self.state, LoadState::Loading { .. });
         let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
         let busy = self.is_busy();
@@ -7581,6 +8008,51 @@ impl eframe::App for ArchiveFsApp {
                             if let Some(workflow) = self.cheat_workflow.as_mut() {
                                 workflow.transaction = CheatTransactionState::Idle;
                             }
+                            self.history.record(HistoryEntry::new(
+                                ActivityAction::CheatInstall,
+                                self.cheat_workflow
+                                    .as_ref()
+                                    .map(|workflow| workflow.archive_path.clone()),
+                                ActivityOutcome::Cancelled,
+                                "Install cancelled before the write phase; nothing was changed.",
+                            ));
+                        }
+                        Some(CheatWorkflowAction::MatchCandidates) => {
+                            self.start_cheat_candidate_match(context.clone());
+                        }
+                        Some(CheatWorkflowAction::SelectCandidate(relative_path)) => {
+                            self.apply_cheat_candidate_choice(&relative_path);
+                        }
+                        Some(CheatWorkflowAction::ClearCandidateChoice) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.candidate_selection = None;
+                                workflow.candidate_load_error = None;
+                                workflow.preview = CheatStepResource::NotLoaded;
+                                workflow.preview_request = None;
+                                workflow.transaction = CheatTransactionState::Idle;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ToggleCheatSelected { index, selected }) => {
+                            self.update_cheat_selection(|selection| {
+                                selection.set_selected(index, selected);
+                            });
+                        }
+                        Some(CheatWorkflowAction::ToggleCheatEnabled { index, enabled }) => {
+                            self.update_cheat_selection(|selection| {
+                                selection.set_enabled(index, enabled);
+                            });
+                        }
+                        Some(CheatWorkflowAction::SelectAllCheats) => {
+                            self.update_cheat_selection(CheatSelection::select_all);
+                        }
+                        Some(CheatWorkflowAction::ClearAllCheats) => {
+                            self.update_cheat_selection(CheatSelection::clear_all);
+                        }
+                        Some(CheatWorkflowAction::BuildInstallPreview) => {
+                            self.start_generated_cheat_preview(context.clone());
+                        }
+                        Some(CheatWorkflowAction::RollbackInstall) => {
+                            self.start_cheat_install_rollback(context.clone());
                         }
                         Some(CheatWorkflowAction::OpenApplyHistory) => {
                             self.shared_history_operation = self
@@ -13181,6 +13653,45 @@ struct CheatWorkflowState {
     /// short-circuit (the CLI's `--force-refresh`). Never applies to
     /// offline reuse.
     fetch_force_refresh: bool,
+    /// Stage 4: the ranked candidate cheat files for this exact archive,
+    /// bound to the key that produced them.
+    candidates: CheatStepResource<CheatCandidateStage>,
+    candidates_request: Option<CheatPreviewRequestKey>,
+    /// Stage 4 search box, used only when the list is capped.
+    candidate_query: String,
+    /// Stages 5 and 6: the chosen candidate, its parsed cheats, and the
+    /// user's per-cheat choices. Cleared whenever the candidate list is.
+    candidate_selection: Option<CheatCandidateSelection>,
+    /// A candidate the user chose that could not be opened - kept so the
+    /// failure stays on screen instead of silently reverting the choice.
+    candidate_load_error: Option<String>,
+}
+
+/// One completed candidate match, bound to the exact context that produced
+/// it so a stale result can never be shown against a different archive,
+/// profile, or catalogue snapshot.
+struct CheatCandidateStage {
+    key: CheatPreviewRequestKey,
+    catalogue_root: PathBuf,
+    list: CheatCandidateList,
+}
+
+/// The chosen candidate and everything derived from it.
+struct CheatCandidateSelection {
+    candidate: CheatCandidate,
+    loaded: LoadedCandidate,
+    selection: CheatSelection,
+}
+
+/// What one generated-install preview produced, alongside the shared
+/// report. Retained so review, confirmation, and the result view can all
+/// name the exact destination and staged bytes the user approved.
+#[derive(Clone)]
+struct GeneratedCheatInstall {
+    staging_root: PathBuf,
+    destination: ResolvedCheatDestination,
+    staged: StagedCheatFile,
+    candidate_display_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13211,6 +13722,8 @@ enum CheatPreviewOutcome {
 enum CheatPreviewFailure {
     Shared(SharedPreviewError),
     Materialization(RetroArchMaterializationError),
+    /// Generating, staging, or previewing a selected-cheat install failed.
+    InstallPlan(CheatInstallPlanError),
 }
 
 impl std::fmt::Display for CheatPreviewFailure {
@@ -13218,15 +13731,18 @@ impl std::fmt::Display for CheatPreviewFailure {
         match self {
             Self::Shared(error) => error.fmt(formatter),
             Self::Materialization(error) => error.fmt(formatter),
+            Self::InstallPlan(error) => error.fmt(formatter),
         }
     }
 }
 
-#[derive(Debug)]
 struct CheatPreviewResponse {
     key: CheatPreviewRequestKey,
     outcome: CheatPreviewOutcome,
     materialized: Option<RetroArchMaterializedPreview>,
+    /// Present only for the generated-file install path: the staged bytes
+    /// and the destination they were previewed against.
+    generated: Option<GeneratedCheatInstall>,
 }
 
 enum CheatPreviewWork {
@@ -13298,6 +13814,22 @@ fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulato
     workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
     workflow.dolphin_inventory_profile_id = None;
     workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+    clear_cheat_candidate_state(workflow);
+}
+
+/// Drops every candidate-derived stage. Called whenever the archive,
+/// profile, adapter, source mode, or catalogue snapshot changes, so a
+/// candidate, cheat selection, or preview from one context can never be
+/// shown - or applied - against another.
+fn clear_cheat_candidate_state(workflow: &mut CheatWorkflowState) {
+    workflow.candidates = CheatStepResource::NotLoaded;
+    workflow.candidates_request = None;
+    workflow.candidate_query.clear();
+    workflow.candidate_selection = None;
+    workflow.candidate_load_error = None;
+    workflow.preview_request = None;
+    workflow.preview = CheatStepResource::NotLoaded;
+    workflow.transaction = CheatTransactionState::Idle;
 }
 
 #[derive(Default)]
@@ -13748,6 +14280,28 @@ enum CheatWorkflowAction {
     ConfirmApply,
     CancelApply,
     OpenApplyHistory,
+    /// Stage 4: build (or rebuild) the ranked candidate list.
+    MatchCandidates,
+    /// Stage 4: choose one candidate by its catalogue-relative path.
+    SelectCandidate(String),
+    /// Stage 5: go back to the candidate list without losing it.
+    ClearCandidateChoice,
+    /// Stage 6 toggles. `enabled` distinguishes "included in the installed
+    /// file" from "active as soon as RetroArch loads it".
+    ToggleCheatSelected {
+        index: u32,
+        selected: bool,
+    },
+    ToggleCheatEnabled {
+        index: u32,
+        enabled: bool,
+    },
+    SelectAllCheats,
+    ClearAllCheats,
+    /// Stage 7: generate the file and preview installing it.
+    BuildInstallPreview,
+    /// Stage 9: restore whatever the install replaced.
+    RollbackInstall,
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -15333,6 +15887,87 @@ fn preview_identity(
     }
 }
 
+/// The selected profile's own resolved cheat directory, or `None` when no
+/// eligible profile is selected or its path cannot be represented exactly.
+/// ArchiveFS never invents a default cheat directory.
+fn selected_retroarch_cheat_root(
+    workflow: &CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+) -> Option<PathBuf> {
+    let selected = workflow.selected_profile_id.as_deref()?;
+    let RetroArchProfilesState::Ready(discovery) = profiles else {
+        return None;
+    };
+    let profile = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.eligible && profile.profile_id == selected)?;
+    let root = profile.cheat_destination_root.as_ref()?;
+    (!root.lossy).then(|| PathBuf::from(&root.display))
+}
+
+/// The content file's basename without extension - the strongest filename
+/// identity available, and the name RetroArch itself shows for the content.
+fn cheat_content_basename(workflow: &CheatWorkflowState) -> Option<String> {
+    workflow
+        .archive_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+}
+
+/// Everything stage 4 needs: the request key it is bound to, the verified
+/// catalogue root to match against, and the archive identity to match.
+/// `None` whenever any of those is not yet available, which is what keeps
+/// matching from running against a half-built context.
+fn build_cheat_candidate_request(
+    workflow: &CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+) -> Option<(CheatPreviewRequestKey, PathBuf, CheatCandidateArchive)> {
+    if workflow.adapter != CheatEmulatorAdapter::RetroArch
+        || workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue
+    {
+        return None;
+    }
+    selected_retroarch_cheat_root(workflow, profiles)?;
+    let CheatStepResource::Ready(fetch) = &workflow.source_fetch else {
+        return None;
+    };
+    if fetch.local_catalogue_path.lossy {
+        return None;
+    }
+    let identity = ready_game_identity(workflow);
+    Some((
+        cheat_preview_key(workflow),
+        PathBuf::from(&fetch.local_catalogue_path.display),
+        CheatCandidateArchive {
+            display_name: workflow.display_name.clone(),
+            platform: workflow.platform.clone(),
+            region: workflow.region.clone(),
+            serial: identity
+                .and_then(|report| report.verified_value(IdentityKind::Ps2Serial))
+                .map(str::to_owned),
+            content_hash: identity
+                .and_then(GameIdentityReport::verified_loose_rom_sha256)
+                .map(str::to_owned),
+            content_basename: cheat_content_basename(workflow),
+        },
+    ))
+}
+
+/// The private directory generated cheat files are staged into before they
+/// enter the transaction pipeline. Kept beside the other managed roots so
+/// it is never a directory the user browses or an emulator reads.
+fn default_generated_cheat_staging_root() -> Result<PathBuf, String> {
+    default_shared_backup_root()
+        .map(|root| {
+            root.parent()
+                .map(|parent| parent.join("generated-cheats"))
+                .unwrap_or_else(|| root.join("generated-cheats"))
+        })
+        .map_err(|error| format!("Staging root unavailable: {}", error.detail))
+}
+
 fn build_cheat_preview_request(
     workflow: &CheatWorkflowState,
     retroarch_profiles: &RetroArchProfilesState,
@@ -15452,7 +16087,13 @@ fn build_cheat_preview_request(
             ))
         }
         CheatEmulatorAdapter::RetroArch => {
-            if workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue {
+            // The trusted-catalogue path no longer auto-materializes a whole
+            // catalogue file. It goes through candidate selection and
+            // individual cheat selection first, and its preview is produced
+            // by `start_generated_cheat_preview` on an explicit request -
+            // auto-previewing would re-run on every checkbox toggle and
+            // would preview a file the user had not chosen the contents of.
+            if workflow.source_mode == CheatSourceMode::ArchiveFsTrustedCatalogue {
                 return None;
             }
             let selected = workflow.selected_profile_id.as_deref()?;
@@ -15737,6 +16378,403 @@ fn destination_state_label(state: PreviewDestinationState) -> &'static str {
     }
 }
 
+/// Stages 4-6 of the Cheats & Mods workflow: candidate matches, the
+/// evidence for the chosen one, and its individual cheats.
+///
+/// Only the stage the user is actually on is expanded. Before a candidate
+/// is chosen this is a list; afterwards it is that candidate's identity,
+/// evidence, and cheat picker, with one control to go back to the list.
+fn show_cheat_candidate_stages(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Candidate matches",
+        Some("Cheat files from the trusted catalogue that could belong to this archive."),
+    );
+
+    match &workflow.candidates {
+        CheatStepResource::NotLoaded => {
+            widgets::card(ui, |ui| {
+                ui.label(
+                    "Select a RetroArch profile and retrieve the trusted catalogue, then \
+                     ArchiveFS matches this exact archive against it.",
+                );
+                if widgets::action_button(
+                    ui,
+                    "Find matching cheat files",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::MatchCandidates);
+                }
+            });
+            return action;
+        }
+        CheatStepResource::Loading { .. } => {
+            widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Matching this archive against the trusted catalogue…");
+                });
+            });
+            return action;
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(ui, "Matching failed", message, widgets::StatusTone::Blocked);
+            widgets::card(ui, |ui| {
+                if widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::MatchCandidates);
+                }
+            });
+            return action;
+        }
+        CheatStepResource::Ready(_) => {}
+    }
+
+    // Stage 5 and 6: a candidate is chosen, so the list collapses to a
+    // single "change" control and the page moves on to its contents.
+    if workflow.candidate_selection.is_some() {
+        action = show_selected_candidate(ui, workflow, clipboard).or(action);
+        return action;
+    }
+
+    if let Some(message) = workflow.candidate_load_error.clone() {
+        widgets::banner(
+            ui,
+            "That candidate could not be opened",
+            &message,
+            widgets::StatusTone::Blocked,
+        );
+    }
+
+    let CheatStepResource::Ready(stage) = &workflow.candidates else {
+        return action;
+    };
+    if stage.list.is_empty() {
+        widgets::banner(
+            ui,
+            "No matching cheat file",
+            "The trusted catalogue has no cheat file that matches this archive's title, \
+             platform, serial, or content hash. Nothing can be installed.",
+            widgets::StatusTone::Pending,
+        );
+        return action;
+    }
+
+    if stage.list.truncated {
+        widgets::card(ui, |ui| {
+            ui.label(format!(
+                "Showing the {} strongest of {} matching cheat files. Search to narrow the list.",
+                stage.list.candidates.len(),
+                stage.list.total_matched
+            ));
+            ui.text_edit_singleline(&mut workflow.candidate_query);
+            if widgets::action_button(ui, "Search", widgets::ActionStyle::Secondary, true).clicked()
+            {
+                action = Some(CheatWorkflowAction::MatchCandidates);
+            }
+        });
+    }
+
+    let CheatStepResource::Ready(stage) = &workflow.candidates else {
+        return action;
+    };
+    for candidate in &stage.list.candidates {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let (label, tone) = candidate_classification_presentation(candidate.classification);
+                widgets::status_badge(ui, label, tone);
+                ui.strong(&candidate.display_name);
+                if let Some(platform) = &candidate.platform {
+                    ui.label(platform);
+                }
+                if let Some(region) = &candidate.region {
+                    ui.label(region);
+                }
+                ui.label(format!("{} cheats", candidate.cheat_count));
+            });
+            ui.label(&candidate.catalogue_relative_path);
+            show_candidate_evidence(ui, candidate);
+            if candidate.manually_selectable {
+                if widgets::action_button(
+                    ui,
+                    "Use this cheat file",
+                    if candidate.classification == CheatCandidateClassification::Ambiguous {
+                        widgets::ActionStyle::Secondary
+                    } else {
+                        widgets::ActionStyle::Primary
+                    },
+                    true,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::SelectCandidate(
+                        candidate.catalogue_relative_path.clone(),
+                    ));
+                }
+            } else {
+                ui.label(candidate_block_reason(candidate.classification));
+            }
+        });
+    }
+    action
+}
+
+fn candidate_classification_presentation(
+    classification: CheatCandidateClassification,
+) -> (&'static str, widgets::StatusTone) {
+    match classification {
+        CheatCandidateClassification::VerifiedExact => {
+            ("Verified exact", widgets::StatusTone::Success)
+        }
+        CheatCandidateClassification::Strong => ("Strong match", widgets::StatusTone::Info),
+        CheatCandidateClassification::Ambiguous => ("Ambiguous", widgets::StatusTone::Warning),
+        CheatCandidateClassification::Weak => ("Weak match", widgets::StatusTone::Warning),
+        CheatCandidateClassification::CrossPlatform => {
+            ("Different platform", widgets::StatusTone::Blocked)
+        }
+        CheatCandidateClassification::Unsupported => ("Unsupported", widgets::StatusTone::Blocked),
+    }
+}
+
+fn candidate_block_reason(classification: CheatCandidateClassification) -> &'static str {
+    match classification {
+        CheatCandidateClassification::CrossPlatform => {
+            "This cheat file is for a different system, so it can never be installed for this archive."
+        }
+        CheatCandidateClassification::Unsupported => {
+            "This cheat file targets another emulator or did not parse cleanly, so it cannot be installed."
+        }
+        _ => "",
+    }
+}
+
+/// Why this candidate matched, in the catalogue's own terms. Every line
+/// corresponds to a comparison that was actually made.
+fn show_candidate_evidence(ui: &mut egui::Ui, candidate: &CheatCandidate) {
+    if candidate.evidence.is_empty() {
+        return;
+    }
+    for evidence in &candidate.evidence {
+        let tone = if evidence.kind.is_supporting() {
+            widgets::StatusTone::Success
+        } else {
+            widgets::StatusTone::Warning
+        };
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, evidence.kind.code(), tone);
+            ui.label(&evidence.detail);
+        });
+    }
+}
+
+/// Stage 5 (evidence for the chosen candidate) and stage 6 (its cheats).
+fn show_selected_candidate(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let Some(selection) = workflow.candidate_selection.as_ref() else {
+        return action;
+    };
+    let candidate = &selection.candidate;
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let (label, tone) = candidate_classification_presentation(candidate.classification);
+            widgets::status_badge(ui, label, tone);
+            ui.strong(&candidate.display_name);
+            if widgets::action_button(
+                ui,
+                "Choose a different cheat file",
+                widgets::ActionStyle::Quiet,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ClearCandidateChoice);
+            }
+        });
+        if widgets::path_value(ui, "Catalogue file", &selection.loaded.absolute_path) {
+            let _ = clipboard.set_text(selection.loaded.absolute_path.display().to_string());
+        }
+        widgets::copyable_value(ui, "Catalogue file SHA-256", &selection.loaded.digest);
+        show_candidate_evidence(ui, candidate);
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    action = show_cheat_entry_picker(ui, workflow).or(action);
+    action
+}
+
+/// Stage 6: the individual cheats, in catalogue order.
+fn show_cheat_entry_picker(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let Some(selection) = workflow.candidate_selection.as_ref() else {
+        return action;
+    };
+    let selected_count = selection.selection.selected_count();
+    let selectable_count = selection.selection.selectable_count();
+    let blocked_count = selection.selection.blocked_count();
+    let document_warnings: Vec<String> = selection
+        .loaded
+        .document
+        .warnings
+        .iter()
+        .map(|warning| warning.detail.clone())
+        .collect();
+
+    widgets::section_header(
+        ui,
+        "Cheats to install",
+        Some(
+            "Ticked cheats are written into the installed file. 'Active' decides whether RetroArch turns one on as soon as it loads.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("{selected_count} of {selectable_count} selected"));
+            if blocked_count > 0 {
+                widgets::status_badge(
+                    ui,
+                    format!("{blocked_count} unavailable"),
+                    widgets::StatusTone::Warning,
+                );
+            }
+            if widgets::action_button(
+                ui,
+                "Select all",
+                widgets::ActionStyle::Secondary,
+                selectable_count > 0 && selected_count < selectable_count,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::SelectAllCheats);
+            }
+            if widgets::action_button(
+                ui,
+                "Clear all",
+                widgets::ActionStyle::Quiet,
+                selected_count > 0,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ClearAllCheats);
+            }
+        });
+        for warning in &document_warnings {
+            widgets::status_badge(ui, warning.as_str(), widgets::StatusTone::Warning);
+        }
+    });
+
+    let Some(selection) = workflow.candidate_selection.as_ref() else {
+        return action;
+    };
+    for entry in &selection.selection.entries {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if entry.selectable {
+                    let mut selected = entry.selected;
+                    if ui.checkbox(&mut selected, &entry.description).changed() {
+                        action = Some(CheatWorkflowAction::ToggleCheatSelected {
+                            index: entry.source_index,
+                            selected,
+                        });
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Checkbox::new(&mut false, &entry.description));
+                    widgets::status_badge(ui, "Unavailable", widgets::StatusTone::Blocked);
+                }
+                if entry.selectable && entry.selected {
+                    let mut enabled = entry.enabled;
+                    if ui.checkbox(&mut enabled, "Active on load").changed() {
+                        action = Some(CheatWorkflowAction::ToggleCheatEnabled {
+                            index: entry.source_index,
+                            enabled,
+                        });
+                    }
+                }
+            });
+            for warning in &entry.warnings {
+                ui.label(warning);
+            }
+        });
+    }
+
+    let Some(selection) = workflow.candidate_selection.as_ref() else {
+        return action;
+    };
+    ui.add_space(theme::SECTION_GAP);
+    widgets::card(ui, |ui| {
+        if selection.selection.can_apply() {
+            if widgets::action_button(
+                ui,
+                "Preview the installed file",
+                widgets::ActionStyle::Primary,
+                !matches!(workflow.preview, CheatStepResource::Loading { .. }),
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::BuildInstallPreview);
+            }
+        } else {
+            widgets::banner(
+                ui,
+                "Choose at least one cheat",
+                "Nothing can be previewed or installed until at least one usable cheat is selected.",
+                widgets::StatusTone::Pending,
+            );
+        }
+    });
+    action
+}
+
+/// Stage 7: exactly what installing would write, before anything is
+/// written.
+fn show_generated_install_preview(
+    ui: &mut egui::Ui,
+    generated: &GeneratedCheatInstall,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Preview only", widgets::StatusTone::Info);
+        ui.strong(format!("From: {}", generated.candidate_display_name));
+        if widgets::path_value(ui, "Destination", &generated.destination.path) {
+            let _ = clipboard.set_text(generated.destination.path.display().to_string());
+        }
+        ui.label(format!(
+            "Filename taken from the {}.",
+            generated.destination.name_source.label()
+        ));
+        ui.label(if generated.destination.replaces_existing {
+            "A cheat file already exists at this path. Installing replaces it, and the existing file is backed up first."
+        } else {
+            "No file exists at this path yet. Installing creates it."
+        });
+        ui.label(format!(
+            "{} cheat(s) will be written; {} of them start active.",
+            generated.staged.selected_cheat_count, generated.staged.enabled_cheat_count
+        ));
+        widgets::copyable_value(ui, "New file SHA-256", &generated.staged.digest);
+        widgets::technical_details(ui, "generated_cheat_file_contents", |ui| {
+            ui.label("Exact file contents:");
+            ui.code(&generated.staged.contents);
+        });
+    });
+}
+
 fn show_shared_cheat_preview(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -15794,6 +16832,14 @@ fn show_shared_cheat_preview(
                     widgets::StatusTone::Pending,
                 )
             }
+            CheatPreviewOutcome::Failed(CheatPreviewFailure::InstallPlan(error)) => {
+                widgets::banner(
+                    ui,
+                    "Install preview blocked",
+                    &error.detail,
+                    widgets::StatusTone::Blocked,
+                )
+            }
             CheatPreviewOutcome::Failed(error) => widgets::banner(
                 ui,
                 "Preview unavailable",
@@ -15801,6 +16847,9 @@ fn show_shared_cheat_preview(
                 widgets::StatusTone::Blocked,
             ),
             CheatPreviewOutcome::Ready(report) => {
+                if let Some(generated) = &response.generated {
+                    show_generated_install_preview(ui, generated, clipboard);
+                }
                 if let Some(materialized) = &response.materialized {
                     widgets::card(ui, |ui| {
                         widgets::status_badge(
@@ -15981,7 +17030,7 @@ fn show_shared_cheat_preview(
                 action = show_shared_transaction_readiness(
                     ui,
                     report,
-                    response.materialized.is_some(),
+                    response.materialized.is_some() || response.generated.is_some(),
                     &mut workflow.transaction,
                     clipboard,
                 );
@@ -16164,15 +17213,40 @@ fn show_shared_transaction_readiness(
                 {
                     let _ = clipboard.set_text(path.display().to_string());
                 }
-                if widgets::action_button(
-                    ui,
-                    "Open exact operation in History & Logs",
-                    widgets::ActionStyle::Secondary,
-                    result.journal_path.is_some(),
-                )
-                .clicked()
-                {
-                    action = Some(CheatWorkflowAction::OpenApplyHistory);
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Open exact operation in History & Logs",
+                        widgets::ActionStyle::Secondary,
+                        result.journal_path.is_some(),
+                    )
+                    .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::OpenApplyHistory);
+                    }
+                    // Rollback is journal-backed, so it is offered exactly
+                    // when a journal exists to roll back from - including
+                    // after a partial failure, which is when it matters most.
+                    let rollback_available = result.journal_path.is_some()
+                        && matches!(
+                            result.journal.status,
+                            SharedApplyStatus::Success | SharedApplyStatus::PartialFailure
+                        );
+                    if widgets::action_button(
+                        ui,
+                        "Roll back this install",
+                        widgets::ActionStyle::Destructive,
+                        rollback_available,
+                    )
+                    .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::RollbackInstall);
+                    }
+                });
+                if result.journal_path.is_none() {
+                    ui.label(
+                        "No journal was written for this operation, so there is nothing to roll back from.",
+                    );
                 }
             }
             CheatTransactionState::Idle => {}
@@ -16350,6 +17424,13 @@ fn show_cheats_mods_page(
                     }
                 };
                 action = action.or(source_action);
+                // Stages 4-6 exist only for the trusted-catalogue install
+                // path; the existing-library mode is a read-only inspection
+                // with nothing to select or generate.
+                if workflow.source_mode == CheatSourceMode::ArchiveFsTrustedCatalogue {
+                    ui.add_space(theme::SECTION_GAP);
+                    action = show_cheat_candidate_stages(ui, workflow, clipboard).or(action);
+                }
                 ui.add_space(theme::SECTION_GAP);
                 action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
             }
@@ -16452,10 +17533,13 @@ fn show_cheat_source_modes(
             show_trusted(ui, trusted_selected),
         )
     };
-    if existing_clicked {
+    if existing_clicked && workflow.source_mode != CheatSourceMode::ExistingRetroArchLibrary {
         workflow.source_mode = CheatSourceMode::ExistingRetroArchLibrary;
-    } else if trusted_clicked {
+        clear_cheat_candidate_state(workflow);
+    } else if trusted_clicked && workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue
+    {
         workflow.source_mode = CheatSourceMode::ArchiveFsTrustedCatalogue;
+        clear_cheat_candidate_state(workflow);
     }
     let show_planned = |ui: &mut egui::Ui, kind, body| {
         let (label, state) = import_source_presentation(kind);
@@ -17075,6 +18159,11 @@ fn show_cheat_workflow_step1(
                                 workflow.selected_profile_id = Some(profile.profile_id.clone());
                                 workflow.existing_library_profile_id = None;
                                 workflow.existing_library = CheatStepResource::NotLoaded;
+                                // A different profile has a different cheat
+                                // directory, so the destination - and every
+                                // stage computed from it - must be recomputed
+                                // rather than carried across.
+                                clear_cheat_candidate_state(workflow);
                             }
                         } else {
                             ui.add_enabled(
@@ -23257,6 +24346,11 @@ mod tests {
             source_fetch: CheatStepResource::NotLoaded,
             selected_source_id: Some("source-a".to_string()),
             fetch_force_refresh: false,
+            candidates: CheatStepResource::NotLoaded,
+            candidates_request: None,
+            candidate_query: String::new(),
+            candidate_selection: None,
+            candidate_load_error: None,
         });
         app.view = MainView::CheatsMods;
         app.tools_overlay = ToolsOverlay::None;
@@ -23817,6 +24911,7 @@ mod tests {
                     ),
                 )),
                 materialized: None,
+                generated: None,
             }))
             .unwrap();
         app.poll_cheat_workflow();
@@ -24137,6 +25232,7 @@ mod tests {
                 },
             )),
             materialized: None,
+            generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -24168,6 +25264,7 @@ mod tests {
                 },
             )),
             materialized: None,
+            generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -25244,6 +26341,11 @@ mod tests {
             source_fetch: CheatStepResource::NotLoaded,
             selected_source_id: None,
             fetch_force_refresh: false,
+            candidates: CheatStepResource::NotLoaded,
+            candidates_request: None,
+            candidate_query: String::new(),
+            candidate_selection: None,
+            candidate_load_error: None,
         };
 
         // Ineligible profile: blocker code and detail are rendered.
@@ -38568,6 +39670,11 @@ mod tests {
             source_fetch: CheatStepResource::NotLoaded,
             selected_source_id: None,
             fetch_force_refresh: false,
+            candidates: CheatStepResource::NotLoaded,
+            candidates_request: None,
+            candidate_query: String::new(),
+            candidate_selection: None,
+            candidate_load_error: None,
         };
         let profile = Pcsx2Profile {
             profile_id: "pcsx2-user".to_string(),
