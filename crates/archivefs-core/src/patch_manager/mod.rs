@@ -164,9 +164,11 @@ pub use dolphin_gecko_install_plan::{
     DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,
     DolphinCandidateOutcome, DolphinCodeSelection, DolphinCodeSelectionEntry,
     DolphinInstallPlanError, DolphinInstallPlanErrorKind, DolphinInstallPreview,
-    DolphinInstallPreviewRequest, GENERATED_INI_PROVENANCE, LoadedDolphinIni,
-    MAX_DOLPHIN_INI_BYTES, MAX_GENERATED_INI_BYTES, StagedDolphinIni, build_dolphin_candidate,
-    build_dolphin_install_preview, load_dolphin_ini, stage_dolphin_ini,
+    DolphinInstallPreviewRequest, DolphinProviderCodeSelection, DolphinProviderCodeSelectionEntry,
+    GENERATED_INI_PROVENANCE, LoadedDolphinDestination, LoadedDolphinIni, MAX_DOLPHIN_INI_BYTES,
+    MAX_GENERATED_INI_BYTES, StagedDolphinIni, build_dolphin_candidate,
+    build_dolphin_install_preview, load_dolphin_destination, load_dolphin_ini, stage_dolphin_ini,
+    stage_dolphin_provider_ini,
 };
 pub use dolphin_gecko_provider::{
     DOLPHIN_UPSTREAM_ATTRIBUTION, DOLPHIN_UPSTREAM_LICENSE, DOLPHIN_UPSTREAM_PROVIDER_ID,
@@ -193,8 +195,9 @@ pub use dolphin_local::{
 };
 pub use gecko_document::{
     DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
-    GeckoCodeWarningKind, MAX_GECKO_CODE_LINES, MAX_GECKO_CODES, MAX_GECKO_LINE_BYTES,
-    parse_dolphin_ini, replace_gecko_enabled_section,
+    GeckoCodeWarningKind, GeckoMergeError, MAX_GECKO_CODE_LINES, MAX_GECKO_CODES,
+    MAX_GECKO_LINE_BYTES, merge_external_gecko_codes, parse_dolphin_ini,
+    replace_gecko_enabled_section,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,

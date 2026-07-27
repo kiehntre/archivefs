@@ -755,9 +755,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::patch_manager::{
-        CheatSourceError, CheatSourceErrorStage, CheatSourceHttpResponse,
-    };
+    use crate::patch_manager::{CheatSourceError, CheatSourceErrorStage, CheatSourceHttpResponse};
 
     const GAFE01: &str = include_str!("../../tests/fixtures/dolphin_upstream/GAFE01.ini");
 

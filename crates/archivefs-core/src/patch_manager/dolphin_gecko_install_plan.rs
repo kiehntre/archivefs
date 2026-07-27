@@ -1,18 +1,11 @@
-//! Turning one matched GameSettings INI and a chosen set of its own Gecko
-//! codes into a real, safely-applied Dolphin cheat install.
+//! Turning externally provided Gecko definitions into a real, safely-applied Dolphin install.
 //!
 //! ## Why the "candidate" here is unlike RetroArch's
 //!
-//! A RetroArch cheat candidate comes from an external trusted catalogue,
-//! and the SOURCE and DESTINATION are different files. For Dolphin there
-//! is no external catalogue in this milestone: the source of truth is the
-//! *same* GameSettings INI [`super::dolphin_local::inspect_dolphin_profile`]
-//! already finds for the selected profile - a real Dolphin install (or a
-//! bundled compatibility database copied into place) already ships full
-//! `[Gecko]` code bodies for a game, typically with none of them enabled.
-//! "Installing" therefore means: open that exact file, let the user choose
-//! which of its own codes to enable, and write the result back to that
-//! same file - never a new one.
+//! The provider owns discovery and inert code metadata. This adapter owns the destination and
+//! transaction. An existing GameSettings file is optional destination state, never the source of
+//! discoverable cheats. It may contribute already-installed state and unrelated settings that the
+//! generated file must preserve.
 //!
 //! [`build_dolphin_candidate`] wraps the existing, unmodified
 //! [`super::dolphin_local::match_dolphin_inventory`] (which already
@@ -25,9 +18,13 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::dolphin_gecko_provider::{
+    GeckoApplicabilityDecision, GeckoProviderEntry, GeckoProviderResult, revision_applicability,
+};
 use super::dolphin_local::{DolphinGameIniInventory, DolphinMatchResult, DolphinMatchState};
 use super::gecko_document::{
-    DolphinIniDocument, GeckoCode, parse_dolphin_ini, replace_gecko_enabled_section,
+    DolphinIniDocument, GeckoCode, merge_external_gecko_codes, parse_dolphin_ini,
+    replace_gecko_enabled_section,
 };
 use super::shared_preview::{
     PreviewAdapter, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
@@ -51,6 +48,7 @@ pub enum DolphinInstallPlanErrorKind {
     CandidateMissing,
     CandidateUnreadable,
     CandidateTooLarge,
+    DestinationUnsafe,
     /// Nothing was selected, or everything selected was unsafe.
     NoSelectedCodes,
     /// A selected entry does not exist in the document, or is unsafe.
@@ -289,6 +287,14 @@ pub struct LoadedDolphinIni {
     pub document: DolphinIniDocument,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadedDolphinDestination {
+    pub path: PathBuf,
+    pub existed: bool,
+    pub digest: Option<String>,
+    pub document: DolphinIniDocument,
+}
+
 /// Re-reads and parses the matched GameSettings file. The path always
 /// comes from an already-discovered, already-inspected
 /// [`DolphinCandidate`] (itself derived from a profile the caller
@@ -336,6 +342,243 @@ pub fn load_dolphin_ini(path: &Path) -> Result<LoadedDolphinIni, DolphinInstallP
         digest: hex_sha256(&bytes),
         document,
     })
+}
+
+/// Loads an optional exact-ID destination. Missing GameSettings directories and files are valid:
+/// the shared transaction may create them after preview and confirmation. Existing symlinks or
+/// non-directory path components are rejected before any staging occurs.
+pub fn load_dolphin_destination(
+    configuration_path: &Path,
+    game_id: &str,
+) -> Result<LoadedDolphinDestination, DolphinInstallPlanError> {
+    if !configuration_path.is_absolute()
+        || configuration_path.parent().is_none()
+        || game_id.len() != 6
+        || !game_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(error(
+            DolphinInstallPlanErrorKind::DestinationUnsafe,
+            Some(configuration_path),
+            "Dolphin destination requires an absolute non-root profile and exact six-character game ID",
+        ));
+    }
+    let configuration_metadata = fs::symlink_metadata(configuration_path).map_err(|failure| {
+        error(
+            DolphinInstallPlanErrorKind::DestinationUnsafe,
+            Some(configuration_path),
+            format!("Dolphin profile is inaccessible: {failure}"),
+        )
+    })?;
+    if configuration_metadata.file_type().is_symlink() || !configuration_metadata.is_dir() {
+        return Err(error(
+            DolphinInstallPlanErrorKind::DestinationUnsafe,
+            Some(configuration_path),
+            "Dolphin profile is a symlink or not a directory",
+        ));
+    }
+    let game_settings = configuration_path.join("GameSettings");
+    match fs::symlink_metadata(&game_settings) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(error(
+                DolphinInstallPlanErrorKind::DestinationUnsafe,
+                Some(&game_settings),
+                "Dolphin GameSettings path is a symlink or not a directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {}
+        Err(failure) => {
+            return Err(error(
+                DolphinInstallPlanErrorKind::DestinationUnsafe,
+                Some(&game_settings),
+                format!("Dolphin GameSettings path is inaccessible: {failure}"),
+            ));
+        }
+    }
+    let path = game_settings.join(format!("{game_id}.ini"));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let loaded = load_dolphin_ini(&path)?;
+            Ok(LoadedDolphinDestination {
+                path,
+                existed: true,
+                digest: Some(loaded.digest),
+                document: loaded.document,
+            })
+        }
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            Ok(LoadedDolphinDestination {
+                path,
+                existed: false,
+                digest: None,
+                document: parse_dolphin_ini(""),
+            })
+        }
+        Err(failure) => Err(error(
+            DolphinInstallPlanErrorKind::CandidateUnreadable,
+            Some(&path),
+            format!("Dolphin destination is inaccessible: {failure}"),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DolphinProviderCodeSelectionEntry {
+    pub index: usize,
+    pub provider_entry_id: String,
+    pub name: String,
+    pub selectable: bool,
+    pub selected: bool,
+    pub already_present: bool,
+    pub already_enabled: bool,
+    pub uncertain_revision: bool,
+    pub notes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DolphinProviderCodeSelection {
+    pub entries: Vec<DolphinProviderCodeSelectionEntry>,
+}
+
+impl DolphinProviderCodeSelection {
+    #[must_use]
+    pub fn from_provider(
+        provider: &GeckoProviderResult,
+        destination: &LoadedDolphinDestination,
+    ) -> Self {
+        let entries = provider
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let existing = destination
+                    .document
+                    .gecko_codes
+                    .iter()
+                    .find(|code| code.name == entry.name);
+                let already_present = existing
+                    .is_some_and(|code| code.lines == entry.code_lines);
+                let body_conflict = existing.is_some() && !already_present;
+                let applicability =
+                    revision_applicability(entry.revision_applicability, provider.revision);
+                let mut warnings = entry.parse_warnings.clone();
+                if body_conflict {
+                    warnings.push(
+                        "An existing code has this name but a different body; it will not be overwritten."
+                            .to_string(),
+                    );
+                }
+                if applicability == GeckoApplicabilityDecision::Reject {
+                    warnings.push(format!(
+                        "This code does not apply to disc revision {}.",
+                        provider.revision
+                    ));
+                }
+                let already_enabled = destination
+                    .document
+                    .gecko_enabled_names
+                    .iter()
+                    .any(|name| name == &entry.name);
+                DolphinProviderCodeSelectionEntry {
+                    index,
+                    provider_entry_id: entry.provider_entry_id.clone(),
+                    name: entry.name.clone(),
+                    selectable: entry.safe_to_offer
+                        && !body_conflict
+                        && applicability != GeckoApplicabilityDecision::Reject,
+                    selected: already_enabled && already_present,
+                    already_present,
+                    already_enabled,
+                    uncertain_revision: applicability
+                        == GeckoApplicabilityDecision::OfferWithWarning,
+                    notes: entry.notes.clone(),
+                    warnings,
+                }
+            })
+            .collect();
+        Self { entries }
+    }
+
+    #[must_use]
+    pub fn selected_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.selected).count()
+    }
+
+    #[must_use]
+    pub fn selectable_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.selectable).count()
+    }
+
+    #[must_use]
+    pub fn can_preview(&self) -> bool {
+        self.selected_count() > 0
+    }
+
+    pub fn set_selected(&mut self, index: usize, selected: bool) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.index == index) else {
+            return false;
+        };
+        if selected && !entry.selectable {
+            return false;
+        }
+        entry.selected = selected;
+        true
+    }
+
+    pub fn select_all(&mut self) {
+        for entry in &mut self.entries {
+            if entry.selectable {
+                entry.selected = true;
+            }
+        }
+    }
+
+    pub fn clear_all(&mut self) {
+        for entry in &mut self.entries {
+            entry.selected = false;
+        }
+    }
+
+    pub fn resolve_names(
+        &self,
+        provider: &GeckoProviderResult,
+    ) -> Result<Vec<String>, DolphinInstallPlanError> {
+        let mut names = Vec::new();
+        for selection in self.entries.iter().filter(|entry| entry.selected) {
+            let entry = provider.entries.get(selection.index).ok_or_else(|| {
+                error(
+                    DolphinInstallPlanErrorKind::SelectionInvalid,
+                    None,
+                    "selected provider entry no longer exists",
+                )
+            })?;
+            if entry.provider_entry_id != selection.provider_entry_id
+                || !selection.selectable
+                || !entry.safe_to_offer
+            {
+                return Err(error(
+                    DolphinInstallPlanErrorKind::SelectionInvalid,
+                    None,
+                    format!(
+                        "selected provider code {:?} is not safe to install",
+                        entry.name
+                    ),
+                ));
+            }
+            names.push(entry.name.clone());
+        }
+        if names.is_empty() {
+            return Err(error(
+                DolphinInstallPlanErrorKind::NoSelectedCodes,
+                None,
+                "no provider codes are selected; choose at least one before preview",
+            ));
+        }
+        Ok(names)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -497,6 +740,9 @@ pub struct StagedDolphinIni {
     pub digest: String,
     pub contents: String,
     pub selected_code_count: usize,
+    pub selected_code_names: Vec<String>,
+    pub destination_existed: bool,
+    pub preserved_sections: Vec<String>,
 }
 
 /// Renders the full file with only `[Gecko_Enabled]` replaced, and writes
@@ -556,7 +802,109 @@ pub fn stage_dolphin_ini(
         digest: hex_sha256(contents.as_bytes()),
         contents,
         selected_code_count: selected_names.len(),
+        selected_code_names: selected_names.to_vec(),
+        destination_existed: true,
+        preserved_sections: document.section_names(),
     })
+}
+
+/// Stages a generated destination from external provider definitions. The provider result is inert
+/// input; only this adapter knows the existing destination or Dolphin file format.
+pub fn stage_dolphin_provider_ini(
+    staging_root: &Path,
+    destination: &LoadedDolphinDestination,
+    provider: &GeckoProviderResult,
+    selection: &DolphinProviderCodeSelection,
+) -> Result<StagedDolphinIni, DolphinInstallPlanError> {
+    let expected_file_name = format!("{}.ini", provider.game_id);
+    if provider.game_id.len() != 6
+        || destination.path.file_name().and_then(|name| name.to_str())
+            != Some(expected_file_name.as_str())
+    {
+        return Err(error(
+            DolphinInstallPlanErrorKind::SelectionInvalid,
+            Some(&destination.path),
+            "provider game ID does not match the exact Dolphin destination",
+        ));
+    }
+    let selected_names = selection.resolve_names(provider)?;
+    let provider_codes: Vec<GeckoCode> = provider
+        .entries
+        .iter()
+        .filter(|entry| entry.safe_to_offer)
+        .map(provider_entry_as_gecko_code)
+        .collect();
+    let contents =
+        merge_external_gecko_codes(&destination.document, &provider_codes, &selected_names)
+            .map_err(|failure| {
+                error(
+                    DolphinInstallPlanErrorKind::SelectionInvalid,
+                    Some(&destination.path),
+                    failure.to_string(),
+                )
+            })?;
+    if contents.len() > MAX_GENERATED_INI_BYTES {
+        return Err(error(
+            DolphinInstallPlanErrorKind::GeneratedFileTooLarge,
+            Some(&destination.path),
+            format!("generated GameSettings file exceeds {MAX_GENERATED_INI_BYTES} bytes"),
+        ));
+    }
+    fs::create_dir_all(staging_root).map_err(|failure| {
+        error(
+            DolphinInstallPlanErrorKind::StagingUnavailable,
+            Some(staging_root),
+            format!("staging directory unavailable: {failure}"),
+        )
+    })?;
+    let file_name = destination
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            error(
+                DolphinInstallPlanErrorKind::DestinationUnsafe,
+                Some(&destination.path),
+                "Dolphin destination has no usable filename",
+            )
+        })?;
+    let path = staging_root.join(file_name);
+    let temporary = staging_root.join(format!(".{file_name}.partial"));
+    fs::write(&temporary, &contents).map_err(|failure| {
+        error(
+            DolphinInstallPlanErrorKind::StagingUnavailable,
+            Some(&temporary),
+            format!("staged file could not be written: {failure}"),
+        )
+    })?;
+    fs::rename(&temporary, &path).map_err(|failure| {
+        let _ = fs::remove_file(&temporary);
+        error(
+            DolphinInstallPlanErrorKind::StagingUnavailable,
+            Some(&path),
+            format!("staged file could not be finalized: {failure}"),
+        )
+    })?;
+    Ok(StagedDolphinIni {
+        staging_root: staging_root.to_path_buf(),
+        path,
+        digest: hex_sha256(contents.as_bytes()),
+        contents,
+        selected_code_count: selected_names.len(),
+        selected_code_names: selected_names,
+        destination_existed: destination.existed,
+        preserved_sections: destination.document.section_names(),
+    })
+}
+
+fn provider_entry_as_gecko_code(entry: &GeckoProviderEntry) -> GeckoCode {
+    GeckoCode {
+        name: entry.name.clone(),
+        lines: entry.code_lines.clone(),
+        notes: entry.notes.clone(),
+        enabled_by_default: false,
+        warnings: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone)]

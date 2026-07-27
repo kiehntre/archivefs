@@ -172,7 +172,30 @@ impl DolphinIniDocument {
     pub fn has_gecko_section(&self) -> bool {
         self.sections.iter().any(|section| is_gecko(&section.name))
     }
+
+    #[must_use]
+    pub fn section_names(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .filter(|section| !section.name.is_empty())
+            .map(|section| section.name.clone())
+            .collect()
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GeckoMergeError {
+    pub code_name: Option<String>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for GeckoMergeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for GeckoMergeError {}
 
 fn is_gecko(name: &str) -> bool {
     name.eq_ignore_ascii_case("gecko")
@@ -400,6 +423,120 @@ pub fn replace_gecko_enabled_section(
         }),
     }
     render_sections(&sections)
+}
+
+/// Adds selected external definitions and updates only their enabled state. Existing unrelated
+/// settings, Gecko definitions, and enabled names are preserved. A provider name that already
+/// exists with a different body is an explicit conflict; it is never overwritten or duplicated.
+pub fn merge_external_gecko_codes(
+    document: &DolphinIniDocument,
+    provider_codes: &[GeckoCode],
+    selected_names: &[String],
+) -> Result<String, GeckoMergeError> {
+    let provider_names: std::collections::BTreeSet<&str> = provider_codes
+        .iter()
+        .map(|code| code.name.as_str())
+        .collect();
+    let selected: std::collections::BTreeSet<&str> =
+        selected_names.iter().map(String::as_str).collect();
+    if selected.is_empty() {
+        return Err(GeckoMergeError {
+            code_name: None,
+            detail: "at least one external Gecko code must be selected".to_string(),
+        });
+    }
+    if let Some(unknown) = selected
+        .iter()
+        .find(|name| !provider_names.contains(**name))
+    {
+        return Err(GeckoMergeError {
+            code_name: Some((*unknown).to_string()),
+            detail: format!("selected Gecko code {unknown:?} is not in the provider result"),
+        });
+    }
+
+    let mut additions = Vec::new();
+    for code in provider_codes
+        .iter()
+        .filter(|code| selected.contains(code.name.as_str()))
+    {
+        if !code.is_selectable() {
+            return Err(GeckoMergeError {
+                code_name: Some(code.name.clone()),
+                detail: format!(
+                    "Gecko code {:?} is malformed and cannot be merged",
+                    code.name
+                ),
+            });
+        }
+        match document
+            .gecko_codes
+            .iter()
+            .find(|existing| existing.name == code.name)
+        {
+            Some(existing) if existing.lines == code.lines => {}
+            Some(_) => {
+                return Err(GeckoMergeError {
+                    code_name: Some(code.name.clone()),
+                    detail: format!(
+                        "an existing Gecko code named {:?} has a different body; ArchiveFS will not overwrite it",
+                        code.name
+                    ),
+                });
+            }
+            None => additions.push(code.clone()),
+        }
+    }
+
+    let mut sections = document.sections.clone();
+    if !additions.is_empty() {
+        let gecko = match sections.iter_mut().find(|section| is_gecko(&section.name)) {
+            Some(section) => section,
+            None => {
+                sections.push(IniSection {
+                    name: "Gecko".to_string(),
+                    raw_lines: Vec::new(),
+                });
+                sections.last_mut().expect("just inserted Gecko section")
+            }
+        };
+        if !gecko.raw_lines.is_empty()
+            && gecko.raw_lines.last().is_some_and(|line| !line.is_empty())
+        {
+            gecko.raw_lines.push(String::new());
+        }
+        for code in additions {
+            gecko.raw_lines.push(format!("${}", code.name));
+            gecko.raw_lines.extend(code.lines);
+            gecko
+                .raw_lines
+                .extend(code.notes.into_iter().map(|note| format!("*{note}")));
+        }
+    }
+
+    let mut enabled: Vec<String> = document
+        .gecko_enabled_names
+        .iter()
+        .filter(|name| !provider_names.contains(name.as_str()))
+        .cloned()
+        .collect();
+    for name in selected_names {
+        if !enabled.contains(name) {
+            enabled.push(name.clone());
+        }
+    }
+    let new_body = render_gecko_enabled_body(&enabled);
+    match sections
+        .iter_mut()
+        .find(|section| is_gecko_enabled(&section.name))
+    {
+        Some(section) => section.raw_lines = new_body,
+        None => sections.push(IniSection {
+            name: "Gecko_Enabled".to_string(),
+            raw_lines: new_body,
+        }),
+    }
+    Ok(render_sections(&sections))
 }
 
 fn render_sections(sections: &[IniSection]) -> String {

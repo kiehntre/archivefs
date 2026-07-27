@@ -26,42 +26,44 @@ use archivefs_core::patch_manager::{
     CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation, CheatSourceError,
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DolphinCandidate, DolphinCandidateBlockedReason,
-    DolphinCandidateOutcome, DolphinCodeSelection, DolphinGameIniInventory,
-    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
-    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
-    DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
-    ImportSourceKind, ImportTrustState, LoadedCandidate, LoadedDolphinIni,
-    LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewSourceItem, PreviewState, ResolvedCheatDestination,
-    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
-    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    CheatSourceProgressReporter, DolphinGameIniInventory, DolphinInstallPlanError,
+    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
+    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState,
+    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
+    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
+    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
+    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
     SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
     SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
     StagedCheatFile, StagedDolphinIni, UNKNOWN_CODE_POLICY, adapter_write_support,
-    build_cheat_candidates, build_cheat_install_preview, build_dolphin_candidate,
-    build_dolphin_install_preview, build_shared_preview, build_shared_transaction_plan,
-    default_cheat_source_cache_root, default_shared_backup_root, default_shared_history_root,
-    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
+    build_shared_preview, build_shared_transaction_plan, default_cheat_source_cache_root,
+    default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
-    fetch_retroarch_cheat_source, generate_shared_operation_id, inspect_dolphin_profile,
-    inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
-    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_ini,
-    match_dolphin_inventory, match_pcsx2_inventory, match_strength_for_candidate,
-    materialize_retroarch_shared_preview, preview_shared_rollback, resolve_cheat_destination,
-    stage_dolphin_ini, stage_generated_cheat_file,
+    fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, generate_shared_operation_id,
+    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
+    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
+    load_dolphin_destination, match_dolphin_inventory, match_pcsx2_inventory,
+    match_strength_for_candidate, materialize_retroarch_shared_preview, preview_shared_rollback,
+    region_for_game_id, resolve_cheat_destination, stage_dolphin_provider_ini,
+    stage_generated_cheat_file,
 };
 mod ui;
 
 #[cfg(test)]
 use archivefs_core::patch_manager::{
-    DolphinGameIniFile, Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+    GeckoProviderEntry, GeckoProviderResult, GeckoRegion, GeckoRevisionApplicability,
+    Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
 };
 
 use archivefs_core::{
@@ -4971,8 +4973,10 @@ impl ArchiveFsApp {
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
-            dolphin_candidate_outcome: None,
-            dolphin_selection: None,
+            dolphin_provider_request: None,
+            dolphin_provider: CheatStepResource::NotLoaded,
+            dolphin_provider_selection: None,
+            dolphin_destination_error: None,
             source_mode,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -5275,95 +5279,96 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Stage 7: renders the selected cheats, stages them, and previews the
-    /// install - all off the UI thread, because previewing hashes files.
-    /// Dolphin Stage 3/4: matches the verified GameCube game ID against the
-    /// matched profile's own GameSettings inventory and, if exactly one
-    /// file matches, opens it and builds the code picker. Deliberately
-    /// synchronous, for the same reason `apply_cheat_candidate_choice` is:
-    /// this is one bounded read of a single small local file.
-    fn start_dolphin_candidate_match(&mut self) {
-        let Some(workflow) = self.cheat_workflow.as_mut() else {
-            return;
-        };
-        if workflow.adapter != CheatEmulatorAdapter::Dolphin {
-            return;
-        }
-        let CheatStepResource::Ready(inventory) = &workflow.dolphin_inventory else {
-            return;
-        };
-        let identity = ready_game_identity(workflow);
-        let verified_game_id = identity.and_then(GameIdentityReport::verified_dolphin_game_id);
-        let verified_revision = identity.and_then(GameIdentityReport::verified_dolphin_revision);
-        let outcome = build_dolphin_candidate(inventory, None, verified_game_id, verified_revision);
-        workflow.preview = CheatStepResource::NotLoaded;
-        workflow.preview_request = None;
-        workflow.transaction = CheatTransactionState::Idle;
-        let archive_path = workflow.archive_path.clone();
-        match &outcome.candidate {
-            Some(candidate) => match load_dolphin_ini(&candidate.path) {
-                Ok(loaded) => {
-                    let selection = DolphinCodeSelection::from_document(&loaded.document);
-                    let selectable_count = selection.selectable_count();
-                    let selected_count = selection.selected_count();
-                    workflow.dolphin_selection = Some(DolphinCodeSelectionState {
-                        candidate: candidate.clone(),
-                        loaded,
-                        selection,
-                    });
-                    self.history.record(HistoryEntry::new(
-                        ActivityAction::DolphinGeckoCandidateMatch,
-                        Some(archive_path),
-                        ActivityOutcome::Completed,
-                        format!(
-                            "Matched '{}': {selectable_count} usable Gecko code(s), {selected_count} already enabled.",
-                            candidate.path.display()
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    workflow.dolphin_selection = None;
-                    self.history.record(HistoryEntry::new(
-                        ActivityAction::DolphinGeckoCandidateMatch,
-                        Some(archive_path),
-                        ActivityOutcome::Failed,
-                        format!("Matched file could not be opened: {}", error.detail),
-                    ));
-                }
-            },
-            None => {
-                workflow.dolphin_selection = None;
-                let reason = outcome
-                    .blocked_reason
-                    .map(|reason| reason.message())
-                    .unwrap_or("No matching Game INI file was found.");
-                self.history.record(HistoryEntry::new(
-                    ActivityAction::DolphinGeckoCandidateMatch,
-                    Some(archive_path),
-                    ActivityOutcome::Rejected,
-                    format!("No exact Gecko candidate: {reason}"),
-                ));
-            }
-        }
-        let Some(workflow) = self.cheat_workflow.as_mut() else {
-            return;
-        };
-        workflow.dolphin_candidate_outcome = Some(outcome);
-    }
-
     /// Applies one Dolphin code picker edit and invalidates anything
     /// downstream, the same way `update_cheat_selection` does for RetroArch.
-    fn update_dolphin_code_selection(&mut self, edit: impl FnOnce(&mut DolphinCodeSelection)) {
+    fn update_dolphin_code_selection(
+        &mut self,
+        edit: impl FnOnce(&mut DolphinProviderCodeSelection),
+    ) {
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
-        let Some(state) = workflow.dolphin_selection.as_mut() else {
+        let Some(state) = workflow.dolphin_provider_selection.as_mut() else {
             return;
         };
         edit(&mut state.selection);
         workflow.preview = CheatStepResource::NotLoaded;
         workflow.preview_request = None;
         workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    fn start_dolphin_provider_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Dolphin
+            || matches!(workflow.dolphin_provider, CheatStepResource::Loading { .. })
+        {
+            return;
+        }
+        let Some(identity) = ready_game_identity(workflow) else {
+            return;
+        };
+        let Some(game_id) = identity.verified_dolphin_game_id().map(str::to_string) else {
+            return;
+        };
+        let Some(revision) = identity.verified_dolphin_revision() else {
+            return;
+        };
+        let Some(region) = region_for_game_id(&game_id) else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let mut options = match GeckoProviderFetchOptions::with_default_cache(now) {
+            Ok(options) => options,
+            Err(error) => {
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.dolphin_provider = CheatStepResource::Failed(error.to_string());
+                }
+                return;
+            }
+        };
+        options.force_refresh = force_refresh;
+        let query = GeckoProviderQuery {
+            game_id: game_id.clone(),
+            region,
+            revision,
+        };
+        let key = DolphinProviderRequestKey {
+            archive_path: workflow.archive_path.clone(),
+            game_id,
+            revision,
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.dolphin_provider_request = Some(key);
+        workflow.dolphin_provider = CheatStepResource::Loading { receiver };
+        workflow.dolphin_provider_selection = None;
+        workflow.dolphin_destination_error = None;
+        workflow.preview_request = None;
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.transaction = CheatTransactionState::Idle;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinGeckoCandidateMatch,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            if force_refresh {
+                "Refreshing exact-ID Gecko definitions from Dolphin upstream."
+            } else {
+                "Loading exact-ID Gecko definitions from Dolphin upstream or its local cache."
+            },
+        ));
+        thread::spawn(move || {
+            let result =
+                fetch_dolphin_upstream_gecko(&query, &options).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
     }
 
     /// Dolphin Stage 5: stages the surgically edited GameSettings file and
@@ -5376,7 +5381,10 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.selected_dolphin_profile_id.clone() else {
             return;
         };
-        let Some(state) = workflow.dolphin_selection.as_ref() else {
+        let CheatStepResource::Ready(provider) = &workflow.dolphin_provider else {
+            return;
+        };
+        let Some(state) = workflow.dolphin_provider_selection.as_ref() else {
             return;
         };
         let key = cheat_preview_key(workflow);
@@ -5398,7 +5406,7 @@ impl ArchiveFsApp {
             ));
             return;
         };
-        let names = match state.selection.resolve_names(&state.loaded.document) {
+        let names = match state.selection.resolve_names(&provider.result) {
             Ok(names) => names,
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -5422,13 +5430,6 @@ impl ArchiveFsApp {
                 return;
             }
         };
-        let file_name = state
-            .candidate
-            .path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_string();
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatPreview,
             Some(archive_path.clone()),
@@ -5439,13 +5440,17 @@ impl ArchiveFsApp {
             ),
         ));
         let response = (|| {
-            let staged =
-                stage_dolphin_ini(&staging_root, &file_name, &state.loaded.document, &names)?;
+            let staged = stage_dolphin_provider_ini(
+                &staging_root,
+                &state.destination,
+                &provider.result,
+                &state.selection,
+            )?;
             let preview = build_dolphin_install_preview(&DolphinInstallPreviewRequest {
                 selected_archive: archive_path.clone(),
                 configuration_path,
-                game_id: state.candidate.game_id.clone(),
-                revision: state.candidate.revision,
+                game_id: provider.result.game_id.clone(),
+                revision: Some(provider.result.revision),
                 staged: staged.clone(),
             })?;
             Ok::<_, archivefs_core::patch_manager::DolphinInstallPlanError>((
@@ -5462,7 +5467,8 @@ impl ArchiveFsApp {
                 generated: None,
                 dolphin_generated: Some(GeneratedDolphinInstall {
                     staging_root,
-                    candidate: state.candidate.clone(),
+                    provider: provider.clone(),
+                    destination: state.destination.path.clone(),
                     staged,
                 }),
             },
@@ -6290,6 +6296,20 @@ impl ArchiveFsApp {
     fn poll_cheat_workflow(&mut self) {
         let identity_page_is_current = self.view == MainView::CheatsMods;
         let mut automatic_candidate: Option<String> = None;
+        let dolphin_profile_paths: HashMap<String, PathBuf> = match &self.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .filter(|profile| profile.eligible)
+                .map(|profile| {
+                    (
+                        profile.profile_id.clone(),
+                        profile.configuration_path.clone(),
+                    )
+                })
+                .collect(),
+            _ => HashMap::new(),
+        };
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -6326,6 +6346,92 @@ impl ArchiveFsApp {
             }
         }
         let mut preview_history_entry = None;
+        if let CheatStepResource::Loading { receiver } = &workflow.dolphin_provider {
+            match receiver.try_recv() {
+                Ok(Ok(fetch)) => {
+                    let current_identity = ready_game_identity(workflow);
+                    let current_key = current_identity.and_then(|identity| {
+                        Some(DolphinProviderRequestKey {
+                            archive_path: workflow.archive_path.clone(),
+                            game_id: identity.verified_dolphin_game_id()?.to_string(),
+                            revision: identity.verified_dolphin_revision()?,
+                        })
+                    });
+                    if workflow.adapter == CheatEmulatorAdapter::Dolphin
+                        && current_key.as_ref() == workflow.dolphin_provider_request.as_ref()
+                        && current_key.as_ref().is_some_and(|key| {
+                            key.game_id == fetch.result.game_id
+                                && key.revision == fetch.result.revision
+                        })
+                    {
+                        let selection = workflow
+                            .selected_dolphin_profile_id
+                            .as_ref()
+                            .and_then(|profile_id| dolphin_profile_paths.get(profile_id))
+                            .map(|configuration_path| {
+                                load_dolphin_destination(configuration_path, &fetch.result.game_id)
+                            });
+                        workflow.dolphin_destination_error = None;
+                        workflow.dolphin_provider_selection = match selection {
+                            Some(Ok(destination)) => {
+                                let codes = DolphinProviderCodeSelection::from_provider(
+                                    &fetch.result,
+                                    &destination,
+                                );
+                                Some(DolphinProviderSelectionState {
+                                    destination,
+                                    selection: codes,
+                                })
+                            }
+                            Some(Err(error)) => {
+                                workflow.dolphin_destination_error = Some(error.to_string());
+                                None
+                            }
+                            None => {
+                                workflow.dolphin_destination_error = Some(
+                                    "Choose an eligible Dolphin profile before selecting provider codes."
+                                        .to_string(),
+                                );
+                                None
+                            }
+                        };
+                        preview_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::DolphinGeckoCandidateMatch,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "External Gecko provider returned {} exact-ID code(s) for {} ({}).",
+                                fetch.result.entries.len(),
+                                fetch.result.game_id,
+                                dolphin_provider_fetch_status_label(fetch.status)
+                            ),
+                        ));
+                        workflow.dolphin_provider = CheatStepResource::Ready(fetch);
+                    } else {
+                        workflow.dolphin_provider_request = None;
+                        workflow.dolphin_provider = CheatStepResource::NotLoaded;
+                        workflow.dolphin_provider_selection = None;
+                    }
+                }
+                Ok(Err(message)) => {
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::DolphinGeckoCandidateMatch,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("External Gecko provider failed: {message}"),
+                    ));
+                    workflow.dolphin_provider = CheatStepResource::Failed(message);
+                    workflow.dolphin_provider_selection = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.dolphin_provider = CheatStepResource::Failed(
+                        "External Gecko provider stopped unexpectedly.".to_string(),
+                    );
+                    workflow.dolphin_provider_selection = None;
+                }
+            }
+        }
         if identity_page_is_current {
             let current_key = cheat_preview_key(workflow);
             if workflow
@@ -7777,16 +7883,6 @@ impl eframe::App for ArchiveFsApp {
         {
             self.start_dolphin_inventory(context.clone());
         }
-        if self.view == MainView::CheatsMods
-            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
-                workflow.adapter == CheatEmulatorAdapter::Dolphin
-                    && matches!(workflow.dolphin_inventory, CheatStepResource::Ready(_))
-                    && workflow.dolphin_candidate_outcome.is_none()
-                    && ready_game_identity(workflow).is_some()
-            })
-        {
-            self.start_dolphin_candidate_match();
-        }
         if catalogue_status_load_needed(self.view, &self.catalogue_manager) {
             self.start_catalogue_status_load(context.clone());
         }
@@ -8364,8 +8460,8 @@ impl eframe::App for ArchiveFsApp {
                         Some(CheatWorkflowAction::RollbackInstall) => {
                             self.start_cheat_install_rollback(context.clone());
                         }
-                        Some(CheatWorkflowAction::MatchDolphinCandidate) => {
-                            self.start_dolphin_candidate_match();
+                        Some(CheatWorkflowAction::FetchDolphinProvider { force_refresh }) => {
+                            self.start_dolphin_provider_fetch(context.clone(), force_refresh);
                         }
                         Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
                             index,
@@ -8376,10 +8472,14 @@ impl eframe::App for ArchiveFsApp {
                             });
                         }
                         Some(CheatWorkflowAction::SelectAllDolphinCodes) => {
-                            self.update_dolphin_code_selection(DolphinCodeSelection::select_all);
+                            self.update_dolphin_code_selection(
+                                DolphinProviderCodeSelection::select_all,
+                            );
                         }
                         Some(CheatWorkflowAction::ClearAllDolphinCodes) => {
-                            self.update_dolphin_code_selection(DolphinCodeSelection::clear_all);
+                            self.update_dolphin_code_selection(
+                                DolphinProviderCodeSelection::clear_all,
+                            );
                         }
                         Some(CheatWorkflowAction::BuildDolphinInstallPreview) => {
                             self.start_dolphin_install_preview();
@@ -13996,12 +14096,12 @@ struct CheatWorkflowState {
     /// The Dolphin profile identity bound to this archive's inventory.
     dolphin_inventory_profile_id: Option<String>,
     dolphin_inventory: CheatStepResource<DolphinGameIniInventory>,
-    /// Stage 3: the outcome of matching the verified GameCube game ID
-    /// against the inspected inventory's own GameSettings files.
-    dolphin_candidate_outcome: Option<DolphinCandidateOutcome>,
-    /// Stage 4: the matched file, opened, with the user's code choices.
-    /// Cleared whenever the candidate outcome is rebuilt.
-    dolphin_selection: Option<DolphinCodeSelectionState>,
+    /// External discovery is bound only to exact archive/game/revision identity.
+    /// Dolphin paths enter only when the adapter builds the selection below.
+    dolphin_provider_request: Option<DolphinProviderRequestKey>,
+    dolphin_provider: CheatStepResource<GeckoProviderFetchResult>,
+    dolphin_provider_selection: Option<DolphinProviderSelectionState>,
+    dolphin_destination_error: Option<String>,
     /// Independent source mode. Changing it never changes the archive,
     /// profile, destination, or any fetched result retained by another mode.
     source_mode: CheatSourceMode,
@@ -14065,15 +14165,19 @@ struct GeneratedCheatInstall {
     candidate_display_name: String,
 }
 
-/// The matched Dolphin GameSettings file, opened and ready for the user to
-/// choose which of its own Gecko codes to install - the Dolphin equivalent
-/// of `CheatCandidateSelection`. There is at most one candidate: the file
-/// either exact-matches the verified GameCube game ID and revision, or it
-/// doesn't.
-struct DolphinCodeSelectionState {
-    candidate: DolphinCandidate,
-    loaded: LoadedDolphinIni,
-    selection: DolphinCodeSelection,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DolphinProviderRequestKey {
+    archive_path: PathBuf,
+    game_id: String,
+    revision: u16,
+}
+
+/// Adapter-owned state derived from inert provider results plus the selected
+/// Dolphin destination. Provider retrieval never receives either of these paths.
+#[derive(Clone)]
+struct DolphinProviderSelectionState {
+    destination: LoadedDolphinDestination,
+    selection: DolphinProviderCodeSelection,
 }
 
 /// The Dolphin equivalent of `GeneratedCheatInstall`: the same matched file,
@@ -14081,7 +14185,8 @@ struct DolphinCodeSelectionState {
 #[derive(Clone)]
 struct GeneratedDolphinInstall {
     staging_root: PathBuf,
-    candidate: DolphinCandidate,
+    provider: GeckoProviderFetchResult,
+    destination: PathBuf,
     staged: StagedDolphinIni,
 }
 
@@ -14569,6 +14674,15 @@ fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
     }
 }
 
+fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'static str {
+    match status {
+        GeckoProviderFetchStatus::Downloaded => "downloaded",
+        GeckoProviderFetchStatus::FreshCache => "fresh cache",
+        GeckoProviderFetchStatus::RateLimitedCache => "rate-limited cache",
+        GeckoProviderFetchStatus::StaleCacheFallback => "stale cache fallback",
+    }
+}
+
 fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
     warnings
         .iter()
@@ -14680,9 +14794,11 @@ enum CheatWorkflowAction {
     BuildInstallPreview,
     /// Stage 9: restore whatever the install replaced.
     RollbackInstall,
-    /// Dolphin Stage 3: match the verified GameCube game ID against the
-    /// matched profile's own GameSettings files and open the exact match.
-    MatchDolphinCandidate,
+    /// Retrieve exact-ID Gecko definitions from the one configured external
+    /// provider. Refresh bypasses only a fresh cache, subject to rate limiting.
+    FetchDolphinProvider {
+        force_refresh: bool,
+    },
     /// Dolphin Stage 4 toggles.
     ToggleDolphinCodeSelected {
         index: usize,
@@ -15034,13 +15150,13 @@ fn show_dolphin_workflow_states(
             ("Emulator profile", profile_label.as_str(), profile_tone),
             (
                 "Cheat or mod source",
-                "Existing Dolphin-managed files",
+                "Dolphin upstream GameSettings provider",
                 widgets::StatusTone::Info,
             ),
             (
                 "Trust state",
-                "Unverified local content",
-                widgets::StatusTone::Warning,
+                "Exact-ID provider data · locally validated",
+                widgets::StatusTone::Info,
             ),
             ("Inspection state", inspection_label, inspection_tone),
             (
@@ -15050,8 +15166,8 @@ fn show_dolphin_workflow_states(
             ),
             (
                 "Installation state",
-                "Unavailable · read-only adapter",
-                widgets::StatusTone::Pending,
+                "Preview, journal-backed apply, and rollback available",
+                widgets::StatusTone::Success,
             ),
         ],
     );
@@ -15319,7 +15435,7 @@ fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only
     } else if dolphin_read_only {
         (
             widgets::StatusTone::Info,
-            "Individual Gecko codes from an existing exact-match Game INI can be selected, applied, and rolled back above. Texture packs, Riivolution assets, and other Dolphin mod types remain unavailable.",
+            "Individual exact-ID Gecko codes from the external provider can be selected, applied, and rolled back above. Texture packs, Riivolution assets, and other Dolphin mod types remain unavailable.",
         )
     } else {
         (widgets::StatusTone::Pending, MODS_UNAVAILABLE_BODY)
@@ -15635,6 +15751,11 @@ fn show_dolphin_workflow(
         action = Some(CheatWorkflowAction::RescanDolphinProfiles);
     }
 
+    ensure_dolphin_provider_destination(workflow, profiles);
+
+    ui.add_space(theme::SECTION_GAP);
+    action = show_dolphin_external_provider(ui, workflow, clipboard).or(action);
+
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
@@ -15697,13 +15818,320 @@ fn show_dolphin_workflow(
             show_dolphin_inventory(ui, workflow, inventory, clipboard)
         }
     }
-    if matches!(workflow.dolphin_inventory, CheatStepResource::Ready(_)) {
-        ui.add_space(theme::SECTION_GAP);
-        action = show_dolphin_candidate_and_selection(ui, workflow, clipboard).or(action);
+    if workflow.dolphin_provider_selection.is_some() {
         ui.add_space(theme::SECTION_GAP);
         action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
+    }
+    action
+}
+
+fn ensure_dolphin_provider_destination(
+    workflow: &mut CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+) {
+    let (Some(profile_id), CheatStepResource::Ready(fetch)) = (
+        workflow.selected_dolphin_profile_id.as_deref(),
+        &workflow.dolphin_provider,
+    ) else {
+        return;
+    };
+    let Some(configuration_path) = (match profiles {
+        DolphinProfilesState::Ready(discovery) => discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.eligible && profile.profile_id == profile_id)
+            .map(|profile| profile.configuration_path.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+    let expected = configuration_path
+        .join("GameSettings")
+        .join(format!("{}.ini", fetch.result.game_id));
+    if workflow
+        .dolphin_provider_selection
+        .as_ref()
+        .is_some_and(|state| state.destination.path == expected)
+    {
+        return;
+    }
+    match load_dolphin_destination(&configuration_path, &fetch.result.game_id) {
+        Ok(destination) => {
+            let selection =
+                DolphinProviderCodeSelection::from_provider(&fetch.result, &destination);
+            workflow.dolphin_provider_selection = Some(DolphinProviderSelectionState {
+                destination,
+                selection,
+            });
+            workflow.dolphin_destination_error = None;
+        }
+        Err(error) => {
+            workflow.dolphin_provider_selection = None;
+            workflow.dolphin_destination_error = Some(error.to_string());
+        }
+    }
+}
+
+fn show_dolphin_external_provider(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 2 · External Gecko provider",
+        Some(
+            "ArchiveFS looks up the exact GameCube ID in Dolphin's upstream GameSettings dataset. The provider discovers codes; the Dolphin adapter installs selected definitions.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        widgets::status_rows(
+            ui,
+            &[
+                (
+                    "Provider",
+                    "Dolphin upstream GameSettings",
+                    widgets::StatusTone::Info,
+                ),
+                (
+                    "Dataset",
+                    "dolphin-emu/dolphin · GPL-2.0-or-later",
+                    widgets::StatusTone::Info,
+                ),
+            ],
+        );
+        ui.label("Gecko definitions from the Dolphin Emulator upstream GameSettings dataset.");
+    });
+    let identity_ready = ready_game_identity(workflow)
+        .and_then(GameIdentityReport::verified_dolphin_game_id)
+        .is_some()
+        && ready_game_identity(workflow)
+            .and_then(GameIdentityReport::verified_dolphin_revision)
+            .is_some();
+    let profile_ready = workflow.selected_dolphin_profile_id.is_some();
+    match &workflow.dolphin_provider {
+        CheatStepResource::NotLoaded => {
+            if widgets::action_button(
+                ui,
+                "Fetch Gecko codes",
+                widgets::ActionStyle::Primary,
+                identity_ready && profile_ready,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchDolphinProvider {
+                    force_refresh: false,
+                });
+            }
+            if !identity_ready {
+                ui.weak("Waiting for a verified GameCube game ID and disc revision.");
+            } else if !profile_ready {
+                ui.weak("Choose an eligible Dolphin profile before loading destination state.");
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Retrieving exact-ID Gecko definitions...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Provider retrieval failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+            if widgets::action_button(
+                ui,
+                "Retry",
+                widgets::ActionStyle::Primary,
+                identity_ready && profile_ready,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchDolphinProvider {
+                    force_refresh: false,
+                });
+            }
+        }
+        CheatStepResource::Ready(fetch) => {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        dolphin_provider_fetch_status_label(fetch.status),
+                        if fetch.status == GeckoProviderFetchStatus::StaleCacheFallback {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Success
+                        },
+                    );
+                    ui.strong(format!(
+                        "{} · {} · revision {}",
+                        fetch.result.game_id,
+                        fetch.result.region.display_name(),
+                        fetch.result.revision
+                    ));
+                });
+                if let Some(title) = &fetch.result.title {
+                    ui.label(title);
+                }
+                widgets::copyable_value(ui, "Source", &fetch.result.source_identity);
+                ui.label(format!(
+                    "Retrieved: {}",
+                    format_unix_timestamp_utc(fetch.result.retrieved_at_unix_seconds as i64)
+                ));
+                ui.label(format!("Licence: {}", fetch.result.license));
+                ui.label(&fetch.result.attribution);
+                for warning in &fetch.result.warnings {
+                    widgets::banner(
+                        ui,
+                        "Provider warning",
+                        warning,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                if let Some(error) = &fetch.refresh_error {
+                    widgets::banner(
+                        ui,
+                        "Refresh unavailable; cached codes retained",
+                        error,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                if widgets::action_button(
+                    ui,
+                    "Refresh",
+                    widgets::ActionStyle::Quiet,
+                    identity_ready && profile_ready,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchDolphinProvider {
+                        force_refresh: true,
+                    });
+                }
+            });
+        }
+    }
+    if let Some(message) = &workflow.dolphin_destination_error {
+        widgets::banner(
+            ui,
+            "Dolphin destination unavailable",
+            message,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    ui.add_space(theme::SECTION_GAP);
+    action = show_dolphin_provider_code_picker(ui, workflow, clipboard).or(action);
+    action
+}
+
+fn show_dolphin_provider_code_picker(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let (CheatStepResource::Ready(fetch), Some(state)) = (
+        &workflow.dolphin_provider,
+        workflow.dolphin_provider_selection.as_ref(),
+    ) else {
+        return None;
+    };
+    let selected_count = state.selection.selected_count();
+    let selectable_count = state.selection.selectable_count();
+    widgets::section_header(
+        ui,
+        "Stage 3 · Codes to install",
+        Some(
+            "Select individual validated definitions. Revision uncertainty is shown and never hidden.",
+        ),
+    );
+    if widgets::path_value(ui, "Exact destination", &state.destination.path) {
+        let _ = clipboard.set_text(state.destination.path.display().to_string());
+    }
+    ui.label(if state.destination.existed {
+        "The destination exists; unrelated sections and Gecko entries will be preserved."
     } else {
-        show_dolphin_installation_unavailable(ui);
+        "No existing GameSettings file is required; apply will create this exact destination."
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!("{selected_count} of {selectable_count} selected"));
+        if widgets::action_button(
+            ui,
+            "Select all",
+            widgets::ActionStyle::Secondary,
+            selected_count < selectable_count,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::SelectAllDolphinCodes);
+        }
+        if widgets::action_button(
+            ui,
+            "Clear all",
+            widgets::ActionStyle::Quiet,
+            selected_count > 0,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::ClearAllDolphinCodes);
+        }
+    });
+    for entry in &state.selection.entries {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut selected = entry.selected;
+                if ui
+                    .add_enabled(
+                        entry.selectable,
+                        egui::Checkbox::new(&mut selected, &entry.name),
+                    )
+                    .changed()
+                {
+                    action = Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
+                        index: entry.index,
+                        selected,
+                    });
+                }
+                if entry.already_present {
+                    widgets::status_badge(ui, "Already installed", widgets::StatusTone::Info);
+                }
+                if entry.already_enabled {
+                    widgets::status_badge(ui, "Enabled", widgets::StatusTone::Success);
+                }
+                if entry.uncertain_revision {
+                    widgets::status_badge(ui, "Revision uncertain", widgets::StatusTone::Warning);
+                }
+                if !entry.selectable {
+                    widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                }
+            });
+            for note in &entry.notes {
+                ui.label(note);
+            }
+            for warning in &entry.warnings {
+                ui.weak(warning);
+            }
+            if let Some(provider_entry) = fetch.result.entries.get(entry.index) {
+                widgets::technical_details(ui, ("provider_code", &entry.provider_entry_id), |ui| {
+                    ui.code(provider_entry.code_lines.join("\n"));
+                });
+            }
+        });
+    }
+    if widgets::action_button(
+        ui,
+        "Preview the installed file",
+        widgets::ActionStyle::Primary,
+        state.selection.can_preview(),
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::BuildDolphinInstallPreview);
     }
     action
 }
@@ -15711,6 +16139,7 @@ fn show_dolphin_workflow(
 /// Dolphin Stage 3/4: matches the verified game ID against the inspected
 /// profile's own GameSettings files and, once matched, lets the user pick
 /// which of that file's own Gecko codes to install.
+#[cfg(any())]
 fn show_dolphin_candidate_and_selection(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -15766,6 +16195,7 @@ fn show_dolphin_candidate_and_selection(
     action
 }
 
+#[cfg(any())]
 fn show_dolphin_candidate_evidence(
     ui: &mut egui::Ui,
     candidate: &DolphinCandidate,
@@ -15796,6 +16226,7 @@ fn show_dolphin_candidate_evidence(
 }
 
 /// Dolphin Stage 4: the matched file's own Gecko codes, in file order.
+#[cfg(any())]
 fn show_dolphin_code_picker(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -15913,17 +16344,39 @@ fn show_dolphin_generated_install_preview(
 ) {
     widgets::card(ui, |ui| {
         widgets::status_badge(ui, "Preview only", widgets::StatusTone::Info);
-        ui.strong(format!("Game ID: {}", generated.candidate.game_id));
-        if widgets::path_value(ui, "Destination", &generated.candidate.path) {
-            let _ = clipboard.set_text(generated.candidate.path.display().to_string());
+        ui.strong(format!(
+            "{} · Game ID {} · revision {}",
+            generated.provider.result.provider_display_name,
+            generated.provider.result.game_id,
+            generated.provider.result.revision
+        ));
+        if widgets::path_value(ui, "Destination", &generated.destination) {
+            let _ = clipboard.set_text(generated.destination.display().to_string());
         }
-        ui.label(
-            "This file already exists. Installing replaces it in place, preserving every \
-             section except [Gecko_Enabled], and the existing file is backed up first.",
-        );
+        ui.label(if generated.staged.destination_existed {
+            "The existing file will be backed up. Unrelated Dolphin settings and unrelated Gecko definitions are preserved."
+        } else {
+            "The GameSettings file does not exist yet. Apply will create it; rollback will remove that newly-created file."
+        });
         ui.label(format!(
             "{} code(s) selected for [Gecko_Enabled].",
             generated.staged.selected_code_count
+        ));
+        ui.label(format!(
+            "Selected: {}",
+            generated.staged.selected_code_names.join(", ")
+        ));
+        ui.label(format!(
+            "Preserved existing sections: {}",
+            if generated.staged.preserved_sections.is_empty() {
+                "none (new file)".to_string()
+            } else {
+                generated.staged.preserved_sections.join(", ")
+            }
+        ));
+        ui.label(format!(
+            "Source: {} ({})",
+            generated.provider.result.source_identity, generated.provider.result.license
         ));
         widgets::copyable_value(ui, "New file SHA-256", &generated.staged.digest);
         widgets::technical_details(ui, "generated_dolphin_ini_contents", |ui| {
@@ -15948,6 +16401,11 @@ fn show_dolphin_profile_card(
                     workflow.selected_dolphin_profile_id = Some(profile.profile_id.clone());
                     workflow.dolphin_inventory_profile_id = None;
                     workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                    workflow.dolphin_provider_selection = None;
+                    workflow.dolphin_destination_error = None;
+                    workflow.preview_request = None;
+                    workflow.preview = CheatStepResource::NotLoaded;
+                    workflow.transaction = CheatTransactionState::Idle;
                 }
             } else {
                 widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
@@ -16107,11 +16565,11 @@ fn show_dolphin_inventory(
 
 fn show_dolphin_installation_unavailable(ui: &mut egui::Ui) {
     ui.add_space(theme::SECTION_GAP);
-    widgets::section_header(ui, "Stage 3 · Preview and controlled installation", None);
+    widgets::section_header(ui, "Preview and controlled installation", None);
     widgets::banner(
         ui,
-        "Unavailable · read-only milestone",
-        "ArchiveFS does not install, apply, enable, disable, replace, fix, delete, generate, or roll back Dolphin files.",
+        "Waiting for Dolphin profile",
+        "Choose an eligible profile to resolve the exact GameSettings destination. Provider discovery does not require an existing GameSettings file.",
         widgets::StatusTone::Pending,
     );
 }
@@ -25847,8 +26305,10 @@ mod tests {
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
-            dolphin_candidate_outcome: None,
-            dolphin_selection: None,
+            dolphin_provider_request: None,
+            dolphin_provider: CheatStepResource::NotLoaded,
+            dolphin_provider_selection: None,
+            dolphin_destination_error: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -26125,7 +26585,7 @@ mod tests {
     }
 
     #[test]
-    fn dolphin_workflow_presents_inventory_with_no_fake_actions_before_matching() {
+    fn dolphin_workflow_presents_provider_before_optional_local_inventory() {
         let mut app = app_with_cheats_mods_context();
         let workflow = app.cheat_workflow.as_mut().unwrap();
         workflow.platform = Some("GameCube".to_string());
@@ -26147,14 +26607,14 @@ mod tests {
         });
         for expected in [
             "Stage 1 · Dolphin profile",
+            "Stage 2 · External Gecko provider",
+            "Dolphin upstream GameSettings",
             "Existing Dolphin-managed files",
             "Uploaded · No",
             "Executed · No",
             "Changed · No",
             "Verified Game ID unavailable",
-            "Stage 3 · Matching Gecko codes",
-            "Not matched yet",
-            "Find matching Gecko codes",
+            "Waiting for a verified GameCube game ID and disc revision",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
@@ -26177,6 +26637,7 @@ mod tests {
     /// `DolphinGameIniFile` inventory record pointing at it - enough for
     /// `build_dolphin_candidate` to match it and `load_dolphin_ini` to
     /// really open it, exactly as the real pipeline would.
+    #[cfg(any())]
     fn real_dolphin_ini_fixture(directory: &std::path::Path, game_id: &str) -> DolphinGameIniFile {
         let contents = "[Core]\n\
 FastDiscSpeed = True\n\
@@ -26221,19 +26682,21 @@ $Instant Growth [Nayr]\n";
         game_id: &str,
     ) -> ArchiveFsApp {
         let mut app = app_with_cheats_mods_context();
+        let profile = DolphinProfile {
+            configuration_path: directory.to_path_buf(),
+            game_settings_path: directory.join("GameSettings"),
+            game_settings_state: DolphinSettingsDirectoryState::Missing,
+            ..dolphin_profile_fixture()
+        };
+        app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![profile],
+            warnings: Vec::new(),
+            complete: true,
+        });
         let workflow = app.cheat_workflow.as_mut().unwrap();
         workflow.platform = Some("GameCube".to_string());
         workflow.adapter = CheatEmulatorAdapter::Dolphin;
         workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
-        workflow.dolphin_inventory_profile_id = Some("dolphin-native-test".to_string());
-        workflow.dolphin_inventory = CheatStepResource::Ready(DolphinGameIniInventory {
-            profile_id: "dolphin-native-test".to_string(),
-            files: vec![real_dolphin_ini_fixture(directory, game_id)],
-            warnings: Vec::new(),
-            entries_visited: 1,
-            bytes_inspected: 200,
-            complete: true,
-        });
         workflow.identity_request = Some(GameIdentityRequest {
             archive_path: workflow.archive_path.clone(),
             platform: workflow.platform.clone(),
@@ -26283,6 +26746,163 @@ $Instant Growth [Nayr]\n";
         app
     }
 
+    fn gafe01_provider_fetch() -> GeckoProviderFetchResult {
+        GeckoProviderFetchResult {
+            result: GeckoProviderResult {
+                provider_id: "dolphin_upstream_gamesettings".to_string(),
+                provider_display_name: "Dolphin upstream GameSettings".to_string(),
+                source_identity: "https://raw.githubusercontent.com/dolphin-emu/dolphin/master/Data/Sys/GameSettings/GAFE01.ini".to_string(),
+                retrieved_at_unix_seconds: 1,
+                game_id: "GAFE01".to_string(),
+                title: Some("Animal Crossing".to_string()),
+                region: GeckoRegion::Usa,
+                revision: 0,
+                entries: vec![GeckoProviderEntry {
+                    provider_entry_id: "gafe01-widescreen".to_string(),
+                    name: "16:9 Widescreen".to_string(),
+                    code_lines: vec![
+                        "040037A0 3C608000".to_string(),
+                        "040037A4 C38337AC".to_string(),
+                    ],
+                    notes: Vec::new(),
+                    region: GeckoRegion::Usa,
+                    revision_applicability: GeckoRevisionApplicability::Uncertain,
+                    parse_warnings: vec!["Revision applicability is not declared.".to_string()],
+                    safe_to_offer: true,
+                }],
+                warnings: Vec::new(),
+                attribution: "Gecko definitions from Dolphin upstream.".to_string(),
+                license: "GPL-2.0-or-later".to_string(),
+            },
+            status: GeckoProviderFetchStatus::FreshCache,
+            refresh_error: None,
+        }
+    }
+
+    fn install_provider_fixture(app: &mut ArchiveFsApp, configuration_path: &Path) {
+        let fetch = gafe01_provider_fetch();
+        let destination = load_dolphin_destination(configuration_path, "GAFE01").unwrap();
+        let selection = DolphinProviderCodeSelection::from_provider(&fetch.result, &destination);
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_provider_request = Some(DolphinProviderRequestKey {
+            archive_path: workflow.archive_path.clone(),
+            game_id: "GAFE01".to_string(),
+            revision: 0,
+        });
+        workflow.dolphin_provider = CheatStepResource::Ready(fetch);
+        workflow.dolphin_provider_selection = Some(DolphinProviderSelectionState {
+            destination,
+            selection,
+        });
+    }
+
+    #[test]
+    fn gamecube_provider_codes_render_without_a_preexisting_ini_or_retroarch_controls() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-provider-no-ini-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        install_provider_fixture(&mut app, &temp);
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let workflow = app.cheat_workflow.as_mut().unwrap();
+                let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+            });
+        });
+        for expected in [
+            "External Gecko provider",
+            "GAFE01",
+            "Animal Crossing",
+            "16:9 Widescreen",
+            "No existing GameSettings file is required",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for forbidden in ["RetroArch profile", "Fetch / Update catalogue"] {
+            assert!(!rendered_text_contains(&output, forbidden));
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn individual_provider_selection_invalidates_preview_and_rendering_never_fetches() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-provider-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        install_provider_fixture(&mut app, &temp);
+        app.update_dolphin_code_selection(|selection| {
+            assert!(selection.set_selected(0, true));
+        });
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(
+            workflow
+                .dolphin_provider_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .selected_count(),
+            1
+        );
+        assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
+
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let workflow = app.cheat_workflow.as_mut().unwrap();
+                    let _ =
+                        show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+                });
+            });
+            assert!(matches!(
+                app.cheat_workflow.as_ref().unwrap().dolphin_provider,
+                CheatStepResource::Ready(_)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn changing_archive_clears_external_provider_selection_and_preview_state() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-provider-archive-change-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        install_provider_fixture(&mut app, &temp);
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut second = record("/roms/b.zip", MountState::Pending);
+            second.identity.platform = Some("GameCube".to_string());
+            data.records.push(second);
+        }
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/b.zip")));
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(matches!(
+            workflow.dolphin_provider,
+            CheatStepResource::NotLoaded
+        ));
+        assert!(workflow.dolphin_provider_selection.is_none());
+        assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(any())]
     #[test]
     fn dolphin_candidate_match_opens_a_real_matched_file_with_its_own_gecko_codes() {
         let temp = std::env::temp_dir().join(format!(
@@ -26374,6 +26994,7 @@ $Instant Growth [Nayr]\n";
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    #[cfg(any())]
     #[test]
     fn changing_archive_clears_stale_dolphin_candidate_preview_and_transaction_state() {
         let temp = std::env::temp_dir().join(format!(
@@ -26419,6 +27040,7 @@ $Instant Growth [Nayr]\n";
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    #[cfg(any())]
     #[test]
     fn dolphin_candidate_match_records_a_rejected_activity_event_when_nothing_matches() {
         let temp = std::env::temp_dir().join(format!(
@@ -26455,6 +27077,7 @@ $Instant Growth [Nayr]\n";
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    #[cfg(any())]
     #[test]
     fn toggling_a_dolphin_code_invalidates_a_stale_preview() {
         let temp = std::env::temp_dir().join(format!(
@@ -26501,6 +27124,7 @@ $Instant Growth [Nayr]\n";
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    #[cfg(any())]
     #[test]
     fn select_all_and_clear_all_dolphin_codes_update_the_real_selection_counts() {
         let temp = std::env::temp_dir().join(format!(
@@ -26543,6 +27167,7 @@ $Instant Growth [Nayr]\n";
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    #[cfg(any())]
     #[test]
     fn dolphin_code_picker_renders_the_already_enabled_distinction_and_toggle_action() {
         let temp = std::env::temp_dir().join(format!(
@@ -28086,13 +28711,13 @@ $Instant Growth [Nayr]\n";
         for expected in [
             "Emulator profile",
             "Cheat or mod source",
-            "Existing Dolphin-managed files",
+            "Dolphin upstream GameSettings provider",
             "Trust state",
-            "Unverified local content",
+            "Exact-ID provider data · locally validated",
             "Inspection state",
             "Destination",
             "Installation state",
-            "Unavailable · read-only adapter",
+            "Preview, journal-backed apply, and rollback available",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
@@ -28264,8 +28889,10 @@ $Instant Growth [Nayr]\n";
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
-            dolphin_candidate_outcome: None,
-            dolphin_selection: None,
+            dolphin_provider_request: None,
+            dolphin_provider: CheatStepResource::NotLoaded,
+            dolphin_provider_selection: None,
+            dolphin_destination_error: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -41744,8 +42371,10 @@ $Instant Growth [Nayr]\n";
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
-            dolphin_candidate_outcome: None,
-            dolphin_selection: None,
+            dolphin_provider_request: None,
+            dolphin_provider: CheatStepResource::NotLoaded,
+            dolphin_provider_selection: None,
+            dolphin_destination_error: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
