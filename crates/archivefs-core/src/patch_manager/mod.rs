@@ -34,6 +34,7 @@ mod cheat_sources;
 mod cht_document;
 mod destination_safety;
 mod dolphin_gecko_install_plan;
+mod dolphin_gecko_provider;
 mod dolphin_local;
 mod gecko_document;
 mod import_safety;
@@ -166,6 +167,13 @@ pub use dolphin_gecko_install_plan::{
     DolphinInstallPreviewRequest, GENERATED_INI_PROVENANCE, LoadedDolphinIni,
     MAX_DOLPHIN_INI_BYTES, MAX_GENERATED_INI_BYTES, StagedDolphinIni, build_dolphin_candidate,
     build_dolphin_install_preview, load_dolphin_ini, stage_dolphin_ini,
+};
+pub use dolphin_gecko_provider::{
+    DOLPHIN_UPSTREAM_ATTRIBUTION, DOLPHIN_UPSTREAM_LICENSE, DOLPHIN_UPSTREAM_PROVIDER_ID,
+    DOLPHIN_UPSTREAM_PROVIDER_NAME, DOLPHIN_UPSTREAM_REPOSITORY, DolphinUpstreamGeckoProvider,
+    GeckoApplicabilityDecision, GeckoCodeProvider, GeckoProviderEntry, GeckoProviderError,
+    GeckoProviderErrorKind, GeckoProviderQuery, GeckoProviderResult, GeckoRegion,
+    GeckoRevisionApplicability, region_for_game_id, revision_applicability,
 };
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
