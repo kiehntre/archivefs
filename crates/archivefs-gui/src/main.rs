@@ -21135,29 +21135,40 @@ fn show_loaded_data(
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "{mounted_selected_count} of the {selected_count} selected archives are \
-                     currently mounted."
-                ));
-                ui.label(format!(
-                    "Only those {mounted_selected_count} mounted archives will be unmounted, \
-                     one at a time. The rest of the selection is not currently mounted and will \
-                     not be touched."
-                ));
-                ui.label("Close applications using these mounts before continuing. Files that are still open may prevent normal unmounting.");
-                ui.label("A failure will be recorded, and later archives will still be attempted.");
-                ui.label(format!(
-                    "Cleanup after each successful unmount: {}.",
-                    if *cleanup_after_unmount {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                ));
-                ui.label(
-                    "Original archive files will not be deleted or modified - unmounting only \
-                     detaches the read-only mount, it never touches the archive itself.",
-                );
+                // Keep the decision controls reachable even on a short viewport. Long safety
+                // copy may scroll, but confirmation and cancellation must never be clipped.
+                let detail_height = (ui.ctx().input(|input| input.screen_rect().height()) * 0.55)
+                    .clamp(80.0, 360.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("unmount_selected_confirmation_details")
+                    .max_height(detail_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.label(format!(
+                            "{mounted_selected_count} of the {selected_count} selected archives \
+                             are currently mounted."
+                        ));
+                        ui.label(format!(
+                            "Only those {mounted_selected_count} mounted archives will be \
+                             unmounted, one at a time. The rest of the selection is not currently \
+                             mounted and will not be touched."
+                        ));
+                        ui.label("Close applications using these mounts before continuing. Files that are still open may prevent normal unmounting.");
+                        ui.label("A failure will be recorded, and later archives will still be attempted.");
+                        ui.label(format!(
+                            "Cleanup after each successful unmount: {}.",
+                            if *cleanup_after_unmount {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ));
+                        ui.label(
+                            "Original archive files will not be deleted or modified - \
+                             unmounting only detaches the read-only mount, it never touches the \
+                             archive itself.",
+                        );
+                    });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let cancel = ui.add_enabled(
@@ -41291,6 +41302,9 @@ $Instant Growth [Nayr]\n";
         );
 
         let ctx = egui::Context::default();
+        harness.render(&ctx, &data, bounded_test_input());
+        // An anchored, auto-sized egui window needs one frame to settle its measured position
+        // before pointer coordinates from its painted controls are stable.
         harness.render(&ctx, &data, bounded_test_input());
         let pos = find_exact_text_center(harness.last_output.as_ref().unwrap(), "Cancel")
             .expect("the real dialog must render a \"Cancel\" button");
