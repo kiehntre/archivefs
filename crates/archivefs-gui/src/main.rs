@@ -116,22 +116,6 @@ const MAX_RESIZABLE_COLUMN_WIDTH: f32 = 2400.0;
 /// handle never occupy overlapping screen space (and therefore never
 /// compete for the same click/drag).
 const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
-const SUMMARY_PANEL_MIN_HEIGHT: f32 = 32.0;
-const SUMMARY_PANEL_DEFAULT_HEIGHT: f32 = 64.0;
-const SUMMARY_PANEL_MAX_HEIGHT: f32 = 320.0;
-const SELECTED_ARCHIVE_PANEL_MIN_HEIGHT: f32 = 48.0;
-const SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT: f32 = 320.0;
-const SELECTED_ARCHIVE_PANEL_MAX_HEIGHT: f32 = 900.0;
-
-// A build-time guard against a future typo in the constants above -
-// stronger than a unit test, since a violation fails the build itself.
-const _: () = assert!(SUMMARY_PANEL_MIN_HEIGHT > 0.0);
-const _: () = assert!(SUMMARY_PANEL_MIN_HEIGHT <= SUMMARY_PANEL_DEFAULT_HEIGHT);
-const _: () = assert!(SUMMARY_PANEL_DEFAULT_HEIGHT <= SUMMARY_PANEL_MAX_HEIGHT);
-const _: () = assert!(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT > 0.0);
-const _: () = assert!(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT <= SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT);
-const _: () = assert!(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT <= SELECTED_ARCHIVE_PANEL_MAX_HEIGHT);
-
 /// The Library table's two user-resizable column widths - Platform and
 /// State are not part of this (see `COLUMN_WIDTHS`'s doc comment); they
 /// stay fixed. Lives on `ArchiveFsApp` for the app's whole session, so a
@@ -228,7 +212,7 @@ const ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT: f32 = 44.0;
 /// separator, and the history list's own `max_height(220.0)` scroll area.
 /// Only used as the very first frame's guess for the "activity_expanded"
 /// panel id, for the same reason as the collapsed default above.
-const ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT: f32 = 280.0;
+const ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT: f32 = 220.0;
 const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
 const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
 const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
@@ -9997,9 +9981,16 @@ fn show_activity_panel(
             ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT,
         )
     };
+    let maximum_height = if *expanded {
+        (context.input(|input| input.screen_rect().height()) * 0.28)
+            .clamp(120.0, ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT)
+    } else {
+        ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT
+    };
     egui::TopBottomPanel::bottom(panel_id)
         .resizable(*expanded)
         .default_height(default_height)
+        .height_range(ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT..=maximum_height)
         .show(context, |ui| {
             ui.horizontal(|ui| {
                 if widgets::action_button(
@@ -20904,22 +20895,10 @@ fn show_loaded_data(
         );
         ui.add_space(theme::SECTION_GAP);
     }
-    // A resizable top panel (egui's own built-in support - session
-    // persistence, drag-handle hover cursor, and min/max clamping all come
-    // for free from `ctx.memory`, keyed by this panel id - see
-    // `SUMMARY_PANEL_MIN_HEIGHT`'s doc comment) so the summary stays
-    // compact by default (`SUMMARY_PANEL_DEFAULT_HEIGHT` fits its ordinary
-    // one-line content) while remaining expandable to read a longer
-    // feedback/"More information" message without it being clipped.
-    egui::TopBottomPanel::top("library_summary_panel")
-        .resizable(true)
-        .default_height(SUMMARY_PANEL_DEFAULT_HEIGHT)
-        .height_range(SUMMARY_PANEL_MIN_HEIGHT..=SUMMARY_PANEL_MAX_HEIGHT)
-        .show_inside(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("library_summary_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+    // Natural-height summary: it may grow only with content visible now;
+    // no persisted panel height can starve the result table on a later
+    // frame or after a window resize.
+    widgets::card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         summary_value(ui, "Total archives", data.stats.total_archives);
                         summary_value(ui, "Mounted", data.stats.mounted_count);
@@ -21011,8 +20990,7 @@ fn show_loaded_data(
                             ui.colored_label(color, &cleanup.message);
                         }
                     }
-                });
-        });
+    });
     if confirm_mount_all.is_some() {
         let actions_available = !busy;
         egui::Window::new("Mount All pending archives?")
@@ -21187,14 +21165,15 @@ fn show_loaded_data(
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
-    let selected_actions = egui::TopBottomPanel::top("library_selected_archive_panel")
-        .resizable(true)
-        .default_height(SELECTED_ARCHIVE_PANEL_DEFAULT_HEIGHT)
-        .height_range(SELECTED_ARCHIVE_PANEL_MIN_HEIGHT..=SELECTED_ARCHIVE_PANEL_MAX_HEIGHT)
-        .show_inside(ui, |ui| {
+    let selected_actions = if let Some(path) = selected_archive.as_deref() {
+        egui::CollapsingHeader::new(format!("Focused archive · {}", path.display()))
+            .id_salt("library_focused_archive_details")
+            .default_open(false)
+            .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("library_selected_archive_scroll")
-                .auto_shrink([false, false])
+                    .max_height((ui.available_height() * 0.35).clamp(120.0, 280.0))
+                    .auto_shrink([false, true])
                 .show(ui, |ui| {
                     show_selected_archive(
                         ui,
@@ -21221,8 +21200,13 @@ fn show_loaded_data(
                     )
                 })
                 .inner
-        })
-        .inner;
+            })
+            .body_returned
+            .unwrap_or_default()
+    } else {
+        ui.weak("No focused archive. Select a Library row to establish workflow context.");
+        SelectedArchiveActions::default()
+    };
     if let Some(request) = selected_actions.operation {
         requested_action = Some(AppOperationRequest::Archive(request));
     }
@@ -21414,12 +21398,20 @@ fn show_loaded_data(
         });
     }
 
+    let filter_max_height = (ui.available_height() * 0.25).clamp(110.0, 180.0);
     widgets::card(ui, |ui| {
-        widgets::section_header(
-            ui,
-            "Find and filter",
-            Some("Search paths and metadata, then narrow the catalogue without changing it."),
-        );
+        egui::ScrollArea::vertical()
+            .id_salt("library_filters_scroll")
+            .max_height(filter_max_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                widgets::section_header(
+                    ui,
+                    "Find and filter",
+                    Some(
+                        "Search paths and metadata, then narrow the catalogue without changing it.",
+                    ),
+                );
 
         let mut filter_changed = false;
         ui.horizontal_wrapped(|ui| {
@@ -21581,6 +21573,7 @@ fn show_loaded_data(
                 });
             });
         }
+            });
     });
     ui.add_space(8.0);
 
