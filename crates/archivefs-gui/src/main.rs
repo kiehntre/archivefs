@@ -32,31 +32,41 @@ use archivefs_core::patch_manager::{
     DolphinProviderCodeSelection, DolphinSettingsDirectoryState, GeckoProviderFetchOptions,
     GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
     HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
-    LoadedDolphinDestination, LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
-    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
-    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
-    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
-    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
-    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
-    StagedCheatFile, StagedDolphinIni, UNKNOWN_CODE_POLICY, adapter_write_support,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState,
+    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots,
+    Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState, PreviewEligibility,
+    PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
+    PreviewSourceItem, PreviewState, ResolvedCheatDestination, RetroArchCheatLibraryInspection,
+    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
+    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
+    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
+    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
+    SharedTransactionPlan, StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile,
+    UNKNOWN_CODE_POLICY, XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateOutcome,
+    XeniaInstallPlanError, XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile,
+    XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, adapter_write_support,
     build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
-    build_shared_preview, build_shared_transaction_plan, default_cheat_source_cache_root,
-    default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
-    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
-    discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
-    fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, generate_shared_operation_id,
-    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
-    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
-    load_dolphin_destination, match_dolphin_inventory, match_pcsx2_inventory,
+    build_shared_preview, build_shared_transaction_plan, build_xenia_candidates,
+    build_xenia_install_preview, default_cheat_source_cache_root, default_shared_backup_root,
+    default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
+    discover_retroarch_cheat_setup_profiles, discover_shared_apply_history,
+    discover_xenia_profiles, execute_shared_apply, execute_shared_rollback,
+    fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
+    generate_shared_operation_id, inspect_dolphin_profile, inspect_pcsx2_profile,
+    inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
+    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_destination,
+    load_xenia_destination, match_dolphin_inventory, match_pcsx2_inventory,
     match_strength_for_candidate, materialize_retroarch_shared_preview, preview_shared_rollback,
     region_for_game_id, resolve_cheat_destination, stage_dolphin_provider_ini,
-    stage_generated_cheat_file,
+    stage_generated_cheat_file, stage_xenia_patch_file,
+};
+use archivefs_core::patch_manager::{
+    XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE, XENIA_UPSTREAM_REPOSITORY,
+    XeniaPatchesDirectoryState, XeniaProviderFetchOptions, XeniaProviderFetchResult,
+    XeniaProviderFetchStatus,
 };
 mod ui;
 
@@ -274,6 +284,11 @@ enum ActivityAction {
     /// GameSettings files for an exact Gecko cheat candidate - distinct
     /// from `DolphinGameIniInspection`, which only inventories files.
     DolphinGeckoCandidateMatch,
+    /// Read-only discovery of explicitly supplied Xenia Canary directories.
+    XeniaProfileScan,
+    /// Retrieving, and matching Title ID/Media ID/module-hash compatibility
+    /// against, the Xenia Canary game-patches upstream provider.
+    XeniaPatchCandidateMatch,
     /// Shared bounded source-to-destination preview and conflict detection.
     CheatPreview,
     /// The confirmed, file-writing shared apply for a reviewed cheat
@@ -286,7 +301,7 @@ enum ActivityAction {
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 38] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 40] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -323,6 +338,8 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 38] = [
     ActivityAction::DolphinProfileScan,
     ActivityAction::DolphinGameIniInspection,
     ActivityAction::DolphinGeckoCandidateMatch,
+    ActivityAction::XeniaProfileScan,
+    ActivityAction::XeniaPatchCandidateMatch,
     ActivityAction::CheatPreview,
     ActivityAction::CheatInstall,
 ];
@@ -414,6 +431,8 @@ impl std::fmt::Display for ActivityAction {
             Self::DolphinProfileScan => "Dolphin profile scan",
             Self::DolphinGameIniInspection => "Dolphin Game INI inspection",
             Self::DolphinGeckoCandidateMatch => "Dolphin Gecko candidate match",
+            Self::XeniaProfileScan => "Xenia profile scan",
+            Self::XeniaPatchCandidateMatch => "Xenia patch candidate match",
             Self::CheatPreview => "Cheats & Mods preview",
             Self::CheatInstall => "Cheats & Mods install",
         })
@@ -2856,6 +2875,8 @@ struct ArchiveFsApp {
     pcsx2_profiles: Pcsx2ProfilesState,
     /// Read-only Dolphin profile discovery shared by GameCube and Wii archives.
     dolphin_profiles: DolphinProfilesState,
+    /// Explicit-directory-only Xenia Canary profile discovery.
+    xenia_profiles: XeniaProfilesState,
     /// The full-page Cheats & Mods workspace's current archive and
     /// trusted-catalogue state. It survives ordinary page navigation so
     /// returning to the same exact archive does not discard a completed
@@ -3068,6 +3089,7 @@ impl ArchiveFsApp {
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
+            xenia_profiles: XeniaProfilesState::NotScanned,
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -4977,6 +4999,13 @@ impl ArchiveFsApp {
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            selected_xenia_profile_id: None,
+            xenia_explicit_root: String::new(),
+            xenia_provider_request: None,
+            xenia_provider: CheatStepResource::NotLoaded,
+            xenia_selected_candidate_index: None,
+            xenia_selection: None,
+            xenia_destination_error: None,
             source_mode,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -5117,6 +5146,7 @@ impl ArchiveFsApp {
                 materialized,
                 generated: None,
                 dolphin_generated: None,
+                xenia_generated: None,
             }));
             context.request_repaint();
         });
@@ -5472,6 +5502,7 @@ impl ArchiveFsApp {
                     destination: state.destination.path.clone(),
                     staged,
                 }),
+                xenia_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -5488,6 +5519,246 @@ impl ArchiveFsApp {
                     materialized: None,
                     generated: None,
                     dolphin_generated: None,
+                    xenia_generated: None,
+                }
+            }
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Ready(message);
+        workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    /// Explicit-directory-only and synchronous - see
+    /// `discover_xenia_profiles`'s own documentation for why this never
+    /// needs a background thread or a failure state.
+    fn start_xenia_profile_scan(&mut self) {
+        let explicit_root = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| workflow.xenia_explicit_root.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let roots = XeniaProfileDiscoveryRoots {
+            explicit_configuration_roots: explicit_root.into_iter().collect(),
+        };
+        let discovery = discover_xenia_profiles(&roots);
+        self.history.record(HistoryEntry::new(
+            ActivityAction::XeniaProfileScan,
+            None,
+            ActivityOutcome::Completed,
+            format!(
+                "Xenia Canary profile discovery found {} profile(s) ({} eligible).",
+                discovery.profiles.len(),
+                discovery
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.eligible)
+                    .count()
+            ),
+        ));
+        self.xenia_profiles = XeniaProfilesState::Ready(discovery);
+    }
+
+    fn start_xenia_provider_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Xenia
+            || matches!(workflow.xenia_provider, CheatStepResource::Loading { .. })
+        {
+            return;
+        }
+        let Some(title_id) = ready_game_identity(workflow)
+            .and_then(GameIdentityReport::verified_xex_title_id)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let mut options = match XeniaProviderFetchOptions::with_default_cache(now) {
+            Ok(options) => options,
+            Err(error) => {
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.xenia_provider = CheatStepResource::Failed(error.to_string());
+                }
+                return;
+            }
+        };
+        options.force_refresh = force_refresh;
+        let key = XeniaProviderRequestKey {
+            archive_path: workflow.archive_path.clone(),
+            title_id: title_id.clone(),
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.xenia_provider_request = Some(key);
+        workflow.xenia_provider = CheatStepResource::Loading { receiver };
+        workflow.xenia_selected_candidate_index = None;
+        workflow.xenia_selection = None;
+        workflow.xenia_destination_error = None;
+        workflow.preview_request = None;
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.transaction = CheatTransactionState::Idle;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::XeniaPatchCandidateMatch,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            if force_refresh {
+                "Refreshing exact Title ID patches from the Xenia Canary game-patches provider."
+            } else {
+                "Loading exact Title ID patches from the Xenia Canary game-patches provider or its local cache."
+            },
+        ));
+        thread::spawn(move || {
+            let result = fetch_xenia_provider_patches(&title_id, &options)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Applies one Xenia patch picker edit and invalidates anything
+    /// downstream, the same way `update_dolphin_code_selection` does.
+    fn update_xenia_patch_selection(&mut self, edit: impl FnOnce(&mut XeniaPatchSelection)) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(state) = workflow.xenia_selection.as_mut() else {
+            return;
+        };
+        edit(&mut state.selection);
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    /// Stages the merged `.patch.toml` and builds its shared install
+    /// preview. Synchronous for the same reason as Dolphin's local path -
+    /// a single small local file.
+    fn start_xenia_install_preview(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let Some(profile_id) = workflow.selected_xenia_profile_id.clone() else {
+            return;
+        };
+        let Some(state) = workflow.xenia_selection.as_ref() else {
+            return;
+        };
+        let key = cheat_preview_key(workflow);
+        let archive_path = workflow.archive_path.clone();
+        let configuration_path = match &self.xenia_profiles {
+            XeniaProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == profile_id)
+                .map(|profile| profile.configuration_path.clone()),
+            XeniaProfilesState::NotScanned => None,
+        };
+        let Some(configuration_path) = configuration_path else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(archive_path),
+                ActivityOutcome::Rejected,
+                "Install preview blocked: the selected Xenia profile is no longer eligible.",
+            ));
+            return;
+        };
+        let names = match state.selection.resolve_names() {
+            Ok(names) => names,
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Rejected,
+                    format!("Install preview blocked: {}", error.detail),
+                ));
+                return;
+            }
+        };
+        let staging_root = match default_generated_xenia_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    message,
+                ));
+                return;
+            }
+        };
+        let file_name = state
+            .destination
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            Some(archive_path.clone()),
+            ActivityOutcome::Started,
+            format!(
+                "Generating an install preview for {} selected patch(es).",
+                names.len()
+            ),
+        ));
+        let response = (|| {
+            let staged = stage_xenia_patch_file(
+                &staging_root,
+                &file_name,
+                &state.candidate,
+                state.destination.document.as_ref(),
+                &names,
+            )?;
+            let preview = build_xenia_install_preview(&XeniaInstallPreviewRequest {
+                selected_archive: archive_path.clone(),
+                configuration_path,
+                title_id: state.candidate.title_id.clone(),
+                compatibility: state.candidate.compatibility,
+                staged: staged.clone(),
+            })?;
+            Ok::<_, XeniaInstallPlanError>((preview, staged, staging_root))
+        })();
+        let message = match response {
+            Ok((preview, staged, staging_root)) => CheatPreviewResponse {
+                key: key.clone(),
+                outcome: CheatPreviewOutcome::Ready(preview.report),
+                materialized: None,
+                generated: None,
+                dolphin_generated: None,
+                xenia_generated: Some(GeneratedXeniaInstall {
+                    staging_root,
+                    candidate: state.candidate.clone(),
+                    destination: state.destination.path.clone(),
+                    staged,
+                }),
+            },
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    format!("Install preview failed: {}", error.detail),
+                ));
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::XeniaInstallPlan(
+                        error,
+                    )),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
                 }
             }
         };
@@ -5634,6 +5905,7 @@ impl ArchiveFsApp {
                         candidate_display_name,
                     }),
                     dolphin_generated: None,
+                    xenia_generated: None,
                 },
                 Err(error) => CheatPreviewResponse {
                     key: worker_key,
@@ -5641,6 +5913,7 @@ impl ArchiveFsApp {
                     materialized: None,
                     generated: None,
                     dolphin_generated: None,
+                    xenia_generated: None,
                 },
             };
             let _ = sender.send(Ok(message));
@@ -5704,7 +5977,9 @@ impl ArchiveFsApp {
         };
         if !matches!(
             workflow.adapter,
-            CheatEmulatorAdapter::RetroArch | CheatEmulatorAdapter::Dolphin
+            CheatEmulatorAdapter::RetroArch
+                | CheatEmulatorAdapter::Dolphin
+                | CheatEmulatorAdapter::Xenia
         ) {
             return;
         }
@@ -5716,9 +5991,9 @@ impl ArchiveFsApp {
         };
         // The approved source root differs by path: a whole-file catalogue
         // install is approved against the immutable snapshot it came from,
-        // while a generated selected-cheat/selected-code install (RetroArch
-        // or Dolphin) is approved against the private staging root its
-        // bytes were written into.
+        // while a generated selected-cheat/selected-code install (RetroArch,
+        // Dolphin, or Xenia) is approved against the private staging root
+        // its bytes were written into.
         let Some(approved_source_root) = response
             .generated
             .as_ref()
@@ -5726,6 +6001,12 @@ impl ArchiveFsApp {
             .or_else(|| {
                 response
                     .dolphin_generated
+                    .as_ref()
+                    .map(|generated| generated.staging_root.clone())
+            })
+            .or_else(|| {
+                response
+                    .xenia_generated
                     .as_ref()
                     .map(|generated| generated.staging_root.clone())
             })
@@ -5741,6 +6022,7 @@ impl ArchiveFsApp {
         let profile_id = match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => workflow.selected_profile_id.as_deref(),
             CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.as_deref(),
+            CheatEmulatorAdapter::Xenia => workflow.selected_xenia_profile_id.as_deref(),
             CheatEmulatorAdapter::Pcsx2 | CheatEmulatorAdapter::Unsupported => None,
         };
         let Some(profile_id) = profile_id else {
@@ -6430,6 +6712,61 @@ impl ArchiveFsApp {
                         "External Gecko provider stopped unexpectedly.".to_string(),
                     );
                     workflow.dolphin_provider_selection = None;
+                }
+            }
+        }
+        if let CheatStepResource::Loading { receiver } = &workflow.xenia_provider {
+            match receiver.try_recv() {
+                Ok(Ok(fetch)) => {
+                    let current_identity = ready_game_identity(workflow);
+                    let current_key = current_identity.and_then(|identity| {
+                        Some(XeniaProviderRequestKey {
+                            archive_path: workflow.archive_path.clone(),
+                            title_id: identity.verified_xex_title_id()?.to_string(),
+                        })
+                    });
+                    if workflow.adapter == CheatEmulatorAdapter::Xenia
+                        && current_key.as_ref() == workflow.xenia_provider_request.as_ref()
+                        && current_key
+                            .as_ref()
+                            .is_some_and(|key| key.title_id == fetch.result.title_id)
+                    {
+                        preview_history_entry = Some(HistoryEntry::new(
+                            ActivityAction::XeniaPatchCandidateMatch,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Completed,
+                            format!(
+                                "Xenia Canary provider returned {} file(s) for Title ID {}.",
+                                fetch.result.documents.len(),
+                                fetch.result.title_id
+                            ),
+                        ));
+                        workflow.xenia_selected_candidate_index = None;
+                        workflow.xenia_selection = None;
+                        workflow.xenia_destination_error = None;
+                        workflow.xenia_provider = CheatStepResource::Ready(fetch);
+                    } else {
+                        workflow.xenia_provider_request = None;
+                        workflow.xenia_provider = CheatStepResource::NotLoaded;
+                        workflow.xenia_selection = None;
+                    }
+                }
+                Ok(Err(message)) => {
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::XeniaPatchCandidateMatch,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("Xenia Canary provider failed: {message}"),
+                    ));
+                    workflow.xenia_provider = CheatStepResource::Failed(message);
+                    workflow.xenia_selection = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.xenia_provider = CheatStepResource::Failed(
+                        "Xenia Canary provider stopped unexpectedly.".to_string(),
+                    );
+                    workflow.xenia_selection = None;
                 }
             }
         }
@@ -8331,6 +8668,7 @@ impl eframe::App for ArchiveFsApp {
                                 &self.retroarch_profiles,
                                 &self.pcsx2_profiles,
                                 &self.dolphin_profiles,
+                                &self.xenia_profiles,
                                 live,
                                 self.database_state.snapshot(),
                                 &self.history,
@@ -8463,6 +8801,58 @@ impl eframe::App for ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::FetchDolphinProvider { force_refresh }) => {
                             self.start_dolphin_provider_fetch(context.clone(), force_refresh);
+                        }
+                        Some(CheatWorkflowAction::RescanXeniaProfiles) => {
+                            self.start_xenia_profile_scan();
+                        }
+                        Some(CheatWorkflowAction::FetchXeniaProvider { force_refresh }) => {
+                            self.start_xenia_provider_fetch(context.clone(), force_refresh);
+                        }
+                        Some(CheatWorkflowAction::SelectXeniaCandidate(index)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.xenia_selected_candidate_index = Some(index);
+                                workflow.xenia_selection = None;
+                                workflow.xenia_destination_error = None;
+                                workflow.preview = CheatStepResource::NotLoaded;
+                                workflow.preview_request = None;
+                                workflow.transaction = CheatTransactionState::Idle;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ClearXeniaCandidateChoice) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.xenia_selected_candidate_index = None;
+                                workflow.xenia_selection = None;
+                                workflow.xenia_destination_error = None;
+                                workflow.preview = CheatStepResource::NotLoaded;
+                                workflow.preview_request = None;
+                                workflow.transaction = CheatTransactionState::Idle;
+                            }
+                        }
+                        Some(CheatWorkflowAction::AcknowledgeXeniaPartialVerification(
+                            acknowledged,
+                        )) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut()
+                                && let Some(state) = workflow.xenia_selection.as_mut()
+                            {
+                                state.selection.partial_verification_acknowledged = acknowledged;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
+                            index,
+                            selected,
+                        }) => {
+                            self.update_xenia_patch_selection(|selection| {
+                                selection.set_selected(index, selected);
+                            });
+                        }
+                        Some(CheatWorkflowAction::SelectAllXeniaPatches) => {
+                            self.update_xenia_patch_selection(XeniaPatchSelection::select_all);
+                        }
+                        Some(CheatWorkflowAction::ClearAllXeniaPatches) => {
+                            self.update_xenia_patch_selection(XeniaPatchSelection::clear_all);
+                        }
+                        Some(CheatWorkflowAction::BuildXeniaInstallPreview) => {
+                            self.start_xenia_install_preview();
                         }
                         Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
                             index,
@@ -14103,6 +14493,19 @@ struct CheatWorkflowState {
     dolphin_provider: CheatStepResource<GeckoProviderFetchResult>,
     dolphin_provider_selection: Option<DolphinProviderSelectionState>,
     dolphin_destination_error: Option<String>,
+    selected_xenia_profile_id: Option<String>,
+    /// An explicit Xenia Canary directory typed by the user - the only
+    /// way ArchiveFS ever learns of a Xenia install, since it has no
+    /// single standard location.
+    xenia_explicit_root: String,
+    xenia_provider_request: Option<XeniaProviderRequestKey>,
+    xenia_provider: CheatStepResource<XeniaProviderFetchResult>,
+    /// Which of the provider's returned candidate documents the user
+    /// picked - Xenia's own dataset legitimately has multiple files per
+    /// Title ID (different Title Update/module-hash variants).
+    xenia_selected_candidate_index: Option<usize>,
+    xenia_selection: Option<XeniaSelectionState>,
+    xenia_destination_error: Option<String>,
     /// Independent source mode. Changing it never changes the archive,
     /// profile, destination, or any fetched result retained by another mode.
     source_mode: CheatSourceMode,
@@ -14181,6 +14584,21 @@ struct DolphinProviderSelectionState {
     selection: DolphinProviderCodeSelection,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct XeniaProviderRequestKey {
+    archive_path: PathBuf,
+    title_id: String,
+}
+
+/// Adapter-owned state derived from the chosen candidate document plus
+/// the real destination file it would install to.
+#[derive(Clone)]
+struct XeniaSelectionState {
+    candidate: XeniaCandidate,
+    destination: LoadedXeniaDestination,
+    selection: XeniaPatchSelection,
+}
+
 /// The Dolphin equivalent of `GeneratedCheatInstall`: the same matched file,
 /// re-written with only `[Gecko_Enabled]` replaced.
 #[derive(Clone)]
@@ -14189,6 +14607,16 @@ struct GeneratedDolphinInstall {
     provider: GeckoProviderFetchResult,
     destination: PathBuf,
     staged: StagedDolphinIni,
+}
+
+/// The Xenia equivalent of `GeneratedDolphinInstall`: the exact chosen
+/// candidate document, staged as a real merged `.patch.toml`.
+#[derive(Clone)]
+struct GeneratedXeniaInstall {
+    staging_root: PathBuf,
+    candidate: XeniaCandidate,
+    destination: PathBuf,
+    staged: StagedXeniaPatchFile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14223,6 +14651,8 @@ enum CheatPreviewFailure {
     InstallPlan(CheatInstallPlanError),
     /// Generating, staging, or previewing a Dolphin Gecko install failed.
     DolphinInstallPlan(DolphinInstallPlanError),
+    /// Generating, staging, or previewing a Xenia patch install failed.
+    XeniaInstallPlan(XeniaInstallPlanError),
 }
 
 impl std::fmt::Display for CheatPreviewFailure {
@@ -14232,6 +14662,7 @@ impl std::fmt::Display for CheatPreviewFailure {
             Self::Materialization(error) => error.fmt(formatter),
             Self::InstallPlan(error) => error.fmt(formatter),
             Self::DolphinInstallPlan(error) => error.fmt(formatter),
+            Self::XeniaInstallPlan(error) => error.fmt(formatter),
         }
     }
 }
@@ -14245,6 +14676,8 @@ struct CheatPreviewResponse {
     generated: Option<GeneratedCheatInstall>,
     /// Present only for the Dolphin Gecko install path.
     dolphin_generated: Option<GeneratedDolphinInstall>,
+    /// Present only for the Xenia patch install path.
+    xenia_generated: Option<GeneratedXeniaInstall>,
 }
 
 enum CheatPreviewWork {
@@ -14274,6 +14707,7 @@ enum CheatEmulatorAdapter {
     RetroArch,
     Pcsx2,
     Dolphin,
+    Xenia,
     Unsupported,
 }
 
@@ -14809,6 +15243,27 @@ enum CheatWorkflowAction {
     ClearAllDolphinCodes,
     /// Dolphin Stage 5: stage the edited file and preview installing it.
     BuildDolphinInstallPreview,
+    RescanXeniaProfiles,
+    /// Retrieve patches for the verified Title ID from the Xenia Canary
+    /// game-patches upstream provider. Refresh bypasses only a fresh
+    /// cache, subject to rate limiting.
+    FetchXeniaProvider {
+        force_refresh: bool,
+    },
+    /// Choose which returned candidate document to work with - Xenia's
+    /// own dataset legitimately has multiple files per Title ID.
+    SelectXeniaCandidate(usize),
+    ClearXeniaCandidateChoice,
+    /// The explicit expert override required before a partially verified
+    /// (module-hash-unverified) candidate can ever be staged.
+    AcknowledgeXeniaPartialVerification(bool),
+    ToggleXeniaPatchSelected {
+        index: usize,
+        selected: bool,
+    },
+    SelectAllXeniaPatches,
+    ClearAllXeniaPatches,
+    BuildXeniaInstallPreview,
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -14880,6 +15335,21 @@ fn show_cheats_mods_workflow_states(
     }
     if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin) {
         show_dolphin_workflow_states(ui, workflow.unwrap(), dolphin_profiles);
+        return;
+    }
+    if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia) {
+        let workflow = workflow.unwrap();
+        widgets::status_strip(
+            ui,
+            &[(
+                "Xenia Canary profile",
+                if workflow.selected_xenia_profile_id.is_some() {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Pending
+                },
+            )],
+        );
         return;
     }
     if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Unsupported) {
@@ -15464,6 +15934,14 @@ fn platform_is_gamecube(platform: Option<&str>) -> bool {
     })
 }
 
+fn platform_is_xenia(platform: Option<&str>) -> bool {
+    platform.is_some_and(|platform| {
+        ["Xbox360", "Xbox 360"]
+            .iter()
+            .any(|candidate| platform.eq_ignore_ascii_case(candidate))
+    })
+}
+
 /// Routes one canonical library platform to exactly one workflow. This is
 /// intentionally not a UI preference: rendering two adapters against one
 /// archive allowed stale profile/candidate state from the wrong system to
@@ -15473,6 +15951,8 @@ fn cheat_adapter_route(platform: Option<&str>) -> CheatEmulatorAdapter {
         CheatEmulatorAdapter::Pcsx2
     } else if platform_is_dolphin(platform) {
         CheatEmulatorAdapter::Dolphin
+    } else if platform_is_xenia(platform) {
+        CheatEmulatorAdapter::Xenia
     } else if platform.is_some_and(|platform| {
         !platform.trim().is_empty() && !platform.eq_ignore_ascii_case("unknown")
     }) {
@@ -16152,6 +16632,642 @@ fn show_dolphin_provider_code_picker(
         action = Some(CheatWorkflowAction::BuildDolphinInstallPreview);
     }
     action
+}
+
+fn xenia_compatibility_label(
+    compatibility: XeniaCandidateCompatibility,
+) -> (&'static str, widgets::StatusTone) {
+    match compatibility {
+        XeniaCandidateCompatibility::ExactCompatible => {
+            ("Exact compatible", widgets::StatusTone::Success)
+        }
+        XeniaCandidateCompatibility::PartiallyVerified => {
+            ("Partially verified", widgets::StatusTone::Warning)
+        }
+        XeniaCandidateCompatibility::Incompatible => ("Incompatible", widgets::StatusTone::Blocked),
+    }
+}
+
+fn eligible_xenia_profile_ids(discovery: &XeniaProfileDiscovery) -> Vec<&str> {
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+/// Route to Xbox 360/Xenia only: this page never shows Dolphin or
+/// RetroArch controls, matching every other adapter's dedicated workflow.
+fn show_xenia_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &XeniaProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Xbox 360 identity",
+        Some("Read directly from the bounded, unencrypted XEX2 module header."),
+    );
+    widgets::card(ui, |ui| {
+        widgets::status_rows(
+            ui,
+            &[
+                (
+                    "Platform",
+                    workflow.platform.as_deref().unwrap_or("Unknown"),
+                    widgets::StatusTone::Info,
+                ),
+                (
+                    "Title ID",
+                    ready_game_identity(workflow)
+                        .and_then(GameIdentityReport::verified_xex_title_id)
+                        .unwrap_or("Waiting for verified identity"),
+                    if ready_game_identity(workflow)
+                        .and_then(GameIdentityReport::verified_xex_title_id)
+                        .is_some()
+                    {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Pending
+                    },
+                ),
+            ],
+        );
+        if let Some(media_id) =
+            ready_game_identity(workflow).and_then(GameIdentityReport::verified_xex_media_id)
+        {
+            ui.label(format!("Media ID: {media_id}"));
+        }
+        ui.label(
+            "ArchiveFS never computes or verifies a module hash - patches that require one are always shown as only partially verified.",
+        );
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Stage 1 · Xenia Canary profile",
+        Some(
+            "Xenia Canary has no single standard install location; supply its directory explicitly.",
+        ),
+    );
+    match profiles {
+        XeniaProfilesState::NotScanned => widgets::banner(
+            ui,
+            "Profile not checked yet",
+            "Type the Xenia Canary directory below and rescan.",
+            widgets::StatusTone::Pending,
+        ),
+        XeniaProfilesState::Ready(discovery) => {
+            let eligible = eligible_xenia_profile_ids(discovery);
+            if let Some(selected) = workflow.selected_xenia_profile_id.clone()
+                && !eligible.contains(&selected.as_str())
+            {
+                workflow.selected_xenia_profile_id = None;
+                workflow.xenia_selection = None;
+            }
+            if discovery.profiles.is_empty() {
+                widgets::banner(
+                    ui,
+                    "No Xenia Canary directory checked yet",
+                    "Type an explicit Xenia Canary directory below and rescan.",
+                    widgets::StatusTone::Pending,
+                );
+            } else if eligible.len() > 1 && workflow.selected_xenia_profile_id.is_none() {
+                ui.label(format!(
+                    "{} eligible profiles were found. Choose one explicitly.",
+                    eligible.len()
+                ));
+            }
+            for profile in &discovery.profiles {
+                show_xenia_profile_card(ui, workflow, profile, clipboard);
+                ui.add_space(6.0);
+            }
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Xenia Canary directory:");
+        ui.text_edit_singleline(&mut workflow.xenia_explicit_root);
+    });
+    ui.label(
+        "The folder containing xenia_canary.exe and xenia-canary.config.toml (portable installs, including under Wine/Proton).",
+    );
+    if widgets::action_button(
+        ui,
+        "Rescan Xenia profiles",
+        widgets::ActionStyle::Quiet,
+        true,
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::RescanXeniaProfiles);
+    }
+
+    ensure_xenia_selection_state(workflow, profiles);
+
+    ui.add_space(theme::SECTION_GAP);
+    action = show_xenia_external_provider(ui, workflow, clipboard).or(action);
+
+    if workflow.xenia_selection.is_some() {
+        ui.add_space(theme::SECTION_GAP);
+        action = show_shared_cheat_preview(ui, workflow, clipboard).or(action);
+    }
+    action
+}
+
+fn show_xenia_profile_card(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profile: &XeniaProfile,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if profile.eligible {
+                let selected = workflow.selected_xenia_profile_id.as_deref()
+                    == Some(profile.profile_id.as_str());
+                if ui.radio(selected, &profile.profile_id).clicked() {
+                    workflow.selected_xenia_profile_id = Some(profile.profile_id.clone());
+                    workflow.xenia_selection = None;
+                    workflow.xenia_destination_error = None;
+                    workflow.preview_request = None;
+                    workflow.preview = CheatStepResource::NotLoaded;
+                    workflow.transaction = CheatTransactionState::Idle;
+                }
+            } else {
+                widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                ui.strong(&profile.profile_id);
+            }
+        });
+        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+            let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+        }
+        ui.horizontal_wrapped(|ui| {
+            let (label, tone) = match profile.patches_state {
+                XeniaPatchesDirectoryState::Available => ("Exists", widgets::StatusTone::Success),
+                XeniaPatchesDirectoryState::Missing => ("Missing", widgets::StatusTone::Pending),
+                XeniaPatchesDirectoryState::UnsafePath => {
+                    ("Unsafe path", widgets::StatusTone::Blocked)
+                }
+                XeniaPatchesDirectoryState::NotDirectory
+                | XeniaPatchesDirectoryState::Unreadable => {
+                    ("Unreadable", widgets::StatusTone::Warning)
+                }
+            };
+            widgets::status_badge(ui, label, tone);
+            if widgets::path_value(ui, "patches", &profile.patches_path) {
+                let _ = clipboard.set_text(profile.patches_path.display().to_string());
+            }
+        });
+        if let Some(warning) = &profile.patches_warning {
+            ui.label(warning);
+        }
+        for blocker in &profile.blockers {
+            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+        }
+    });
+}
+
+/// Recomputes which real destination file the currently chosen candidate
+/// (if any) would install to, and (re)loads it. Called every render, the
+/// same way `ensure_dolphin_provider_destination` is - cheap, bounded,
+/// local reads only.
+fn ensure_xenia_selection_state(workflow: &mut CheatWorkflowState, profiles: &XeniaProfilesState) {
+    let (Some(profile_id), CheatStepResource::Ready(fetch), Some(candidate_index)) = (
+        workflow.selected_xenia_profile_id.as_deref(),
+        &workflow.xenia_provider,
+        workflow.xenia_selected_candidate_index,
+    ) else {
+        return;
+    };
+    let Some(configuration_path) = (match profiles {
+        XeniaProfilesState::Ready(discovery) => discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.eligible && profile.profile_id == profile_id)
+            .map(|profile| profile.configuration_path.clone()),
+        XeniaProfilesState::NotScanned => None,
+    }) else {
+        return;
+    };
+    let outcome = build_xenia_candidates(
+        &fetch.result,
+        Some(fetch.result.title_id.as_str()),
+        ready_game_identity(workflow).and_then(GameIdentityReport::verified_xex_media_id),
+    );
+    let Some(candidate) = outcome.candidates.get(candidate_index) else {
+        workflow.xenia_selection = None;
+        workflow.xenia_destination_error =
+            Some("The chosen candidate is no longer present in the provider result.".to_string());
+        return;
+    };
+    let Some(file_name) = Path::new(&candidate.source_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return;
+    };
+    let patches_directory = configuration_path.join("patches");
+    let expected = patches_directory.join(file_name);
+    if workflow
+        .xenia_selection
+        .as_ref()
+        .is_some_and(|state| state.destination.path == expected)
+    {
+        return;
+    }
+    match load_xenia_destination(&patches_directory, file_name) {
+        Ok(destination) => {
+            let selection =
+                XeniaPatchSelection::from_candidate(candidate, destination.document.as_ref());
+            workflow.xenia_selection = Some(XeniaSelectionState {
+                candidate: candidate.clone(),
+                destination,
+                selection,
+            });
+            workflow.xenia_destination_error = None;
+        }
+        Err(error) => {
+            workflow.xenia_selection = None;
+            workflow.xenia_destination_error = Some(error.to_string());
+        }
+    }
+}
+
+fn show_xenia_external_provider(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Stage 2 · External Xenia patch provider",
+        Some(
+            "ArchiveFS looks up the exact Title ID in the xenia-canary/game-patches upstream dataset. The provider retrieves and normalises patches; the Xenia adapter installs selected definitions.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        widgets::status_rows(
+            ui,
+            &[(
+                "Provider",
+                XENIA_UPSTREAM_REPOSITORY,
+                widgets::StatusTone::Info,
+            )],
+        );
+        ui.label(XENIA_UPSTREAM_ATTRIBUTION);
+        ui.label(XENIA_UPSTREAM_LICENSE);
+    });
+    let identity_ready = ready_game_identity(workflow)
+        .and_then(GameIdentityReport::verified_xex_title_id)
+        .is_some();
+    let profile_ready = workflow.selected_xenia_profile_id.is_some();
+    match &workflow.xenia_provider {
+        CheatStepResource::NotLoaded => {
+            if widgets::action_button(
+                ui,
+                "Fetch patches",
+                widgets::ActionStyle::Primary,
+                identity_ready && profile_ready,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchXeniaProvider {
+                    force_refresh: false,
+                });
+            }
+            if !identity_ready {
+                ui.weak("Waiting for a verified Xbox 360 Title ID.");
+            } else if !profile_ready {
+                ui.weak(
+                    "Choose an eligible Xenia Canary profile before loading destination state.",
+                );
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Retrieving exact Title ID patches...");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Provider retrieval failed",
+                message,
+                widgets::StatusTone::Blocked,
+            );
+            if widgets::action_button(
+                ui,
+                "Retry",
+                widgets::ActionStyle::Primary,
+                identity_ready && profile_ready,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchXeniaProvider {
+                    force_refresh: false,
+                });
+            }
+        }
+        CheatStepResource::Ready(fetch) => {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        match fetch.status {
+                            XeniaProviderFetchStatus::Downloaded => "downloaded",
+                            XeniaProviderFetchStatus::FreshCache => "fresh cache",
+                            XeniaProviderFetchStatus::RateLimitedCache => "rate-limited cache",
+                            XeniaProviderFetchStatus::StaleCacheFallback => "stale cache fallback",
+                            XeniaProviderFetchStatus::OfflineCache => "offline cache",
+                        },
+                        if fetch.status == XeniaProviderFetchStatus::StaleCacheFallback {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Success
+                        },
+                    );
+                    ui.strong(format!("Title ID {}", fetch.result.title_id));
+                });
+                widgets::copyable_value(ui, "Source revision", &fetch.result.source_commit);
+                ui.label(format!(
+                    "Retrieved: {}",
+                    format_unix_timestamp_utc(fetch.result.retrieved_at_unix_seconds as i64)
+                ));
+                for warning in &fetch.result.warnings {
+                    widgets::banner(
+                        ui,
+                        "Provider warning",
+                        warning,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                if let Some(error) = &fetch.refresh_error {
+                    widgets::banner(
+                        ui,
+                        "Refresh unavailable; cached patches retained",
+                        error,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+                if widgets::action_button(
+                    ui,
+                    "Refresh",
+                    widgets::ActionStyle::Quiet,
+                    identity_ready && profile_ready,
+                )
+                .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchXeniaProvider {
+                        force_refresh: true,
+                    });
+                }
+            });
+            let outcome = build_xenia_candidates(
+                &fetch.result,
+                Some(fetch.result.title_id.as_str()),
+                ready_game_identity(workflow).and_then(GameIdentityReport::verified_xex_media_id),
+            );
+            action = show_xenia_candidate_picker(ui, workflow, &outcome, clipboard).or(action);
+        }
+    }
+    if let Some(message) = &workflow.xenia_destination_error {
+        widgets::banner(
+            ui,
+            "Xenia destination unavailable",
+            message,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    ui.add_space(theme::SECTION_GAP);
+    action = show_xenia_patch_picker(ui, workflow, clipboard).or(action);
+    action
+}
+
+/// Stage 2b: which of the (possibly several) returned candidate documents
+/// to work with. Xenia's own dataset legitimately has multiple files per
+/// Title ID (Title Update / module-hash variants); the user always
+/// chooses explicitly, never an automatic pick.
+fn show_xenia_candidate_picker(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    outcome: &XeniaCandidateOutcome,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    if let Some(reason) = outcome.blocked_reason {
+        widgets::banner(
+            ui,
+            "No candidate available",
+            reason.message(),
+            widgets::StatusTone::Pending,
+        );
+        return action;
+    }
+    if outcome.candidates.is_empty() {
+        widgets::banner(
+            ui,
+            "No files for this Title ID",
+            "The provider returned no patch files declaring this exact Title ID.",
+            widgets::StatusTone::Pending,
+        );
+        return action;
+    }
+    widgets::section_header(
+        ui,
+        "Candidate files",
+        Some(
+            "Title similarity is never used - only exact Title ID, Media ID, and module-hash evidence.",
+        ),
+    );
+    for (index, candidate) in outcome.candidates.iter().enumerate() {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let (label, tone) = xenia_compatibility_label(candidate.compatibility);
+                widgets::status_badge(ui, label, tone);
+                ui.strong(&candidate.title_name);
+                let selected = workflow.xenia_selected_candidate_index == Some(index);
+                if candidate.manually_selectable() {
+                    if ui.radio(selected, "Choose this file").clicked() {
+                        action = Some(CheatWorkflowAction::SelectXeniaCandidate(index));
+                    }
+                } else {
+                    widgets::status_badge(ui, "Never selectable", widgets::StatusTone::Blocked);
+                }
+            });
+            ui.label(&candidate.source_path);
+            for evidence in &candidate.evidence {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(ui, evidence.label, widgets::StatusTone::Info);
+                    ui.label(&evidence.detail);
+                });
+            }
+            for warning in &candidate.document_warnings {
+                ui.weak(warning);
+            }
+            let _ = clipboard;
+        });
+    }
+    if workflow.xenia_selected_candidate_index.is_some()
+        && widgets::action_button(
+            ui,
+            "Choose a different file",
+            widgets::ActionStyle::Quiet,
+            true,
+        )
+        .clicked()
+    {
+        action = Some(CheatWorkflowAction::ClearXeniaCandidateChoice);
+    }
+    action
+}
+
+/// Stage 3: the chosen candidate's own patches.
+fn show_xenia_patch_picker(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let state = workflow.xenia_selection.as_ref()?;
+    widgets::section_header(
+        ui,
+        "Stage 3 · Patches to install",
+        Some(
+            "Nothing is selected by default. A partially verified file requires explicit acknowledgement below.",
+        ),
+    );
+    if widgets::path_value(ui, "Exact destination", &state.destination.path) {
+        let _ = clipboard.set_text(state.destination.path.display().to_string());
+    }
+    ui.label(if state.destination.existed {
+        "The destination exists; unrelated patch definitions will be preserved."
+    } else {
+        "No existing patch file is required; apply will create this exact destination."
+    });
+    if state.selection.compatibility == XeniaCandidateCompatibility::PartiallyVerified {
+        widgets::banner(
+            ui,
+            "Partially verified candidate",
+            "This file's module hash cannot be computed or verified by ArchiveFS. Acknowledge explicitly before any patch from it can be applied.",
+            widgets::StatusTone::Warning,
+        );
+        let mut acknowledged = state.selection.partial_verification_acknowledged;
+        if ui
+            .checkbox(
+                &mut acknowledged,
+                "I understand the module hash is not verified and want to proceed",
+            )
+            .changed()
+        {
+            action = Some(CheatWorkflowAction::AcknowledgeXeniaPartialVerification(
+                acknowledged,
+            ));
+        }
+    }
+    let selected_count = state.selection.selected_count();
+    let selectable_count = state.selection.selectable_count();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!("{selected_count} of {selectable_count} selected"));
+        if widgets::action_button(
+            ui,
+            "Select all",
+            widgets::ActionStyle::Secondary,
+            selected_count < selectable_count,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::SelectAllXeniaPatches);
+        }
+        if widgets::action_button(
+            ui,
+            "Clear all",
+            widgets::ActionStyle::Quiet,
+            selected_count > 0,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::ClearAllXeniaPatches);
+        }
+    });
+    for entry in &state.selection.entries {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut selected = entry.selected;
+                if ui
+                    .add_enabled(
+                        entry.selectable,
+                        egui::Checkbox::new(&mut selected, &entry.name),
+                    )
+                    .changed()
+                {
+                    action = Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
+                        index: entry.index,
+                        selected,
+                    });
+                }
+                if entry.already_enabled {
+                    widgets::status_badge(ui, "Already enabled in file", widgets::StatusTone::Info);
+                }
+                if !entry.selectable {
+                    widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                }
+            });
+            if !entry.author.is_empty() {
+                ui.label(format!("Author: {}", entry.author));
+            }
+            if !entry.description.is_empty() {
+                ui.label(&entry.description);
+            }
+            for warning in &entry.warnings {
+                ui.weak(warning);
+            }
+        });
+    }
+    if widgets::action_button(
+        ui,
+        "Preview the installed file",
+        widgets::ActionStyle::Primary,
+        state.selection.can_apply(),
+    )
+    .clicked()
+    {
+        action = Some(CheatWorkflowAction::BuildXeniaInstallPreview);
+    }
+    action
+}
+
+/// Stage 4: exactly what installing would write - the Xenia equivalent
+/// of `show_generated_install_preview`/`show_dolphin_generated_install_preview`.
+fn show_xenia_generated_install_preview(
+    ui: &mut egui::Ui,
+    generated: &GeneratedXeniaInstall,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Preview only", widgets::StatusTone::Info);
+        ui.strong(format!("Title ID: {}", generated.candidate.title_id));
+        if widgets::path_value(ui, "Destination", &generated.destination) {
+            let _ = clipboard.set_text(generated.destination.display().to_string());
+        }
+        ui.label(
+            "This file already exists. Installing replaces it in place, preserving every patch definition not part of the chosen candidate, and the existing file is backed up first.",
+        );
+        ui.label(format!(
+            "{} patch(es) selected.",
+            generated.staged.selected_patch_count
+        ));
+        widgets::copyable_value(ui, "New file SHA-256", &generated.staged.digest);
+        widgets::technical_details(ui, "generated_xenia_patch_toml_contents", |ui| {
+            ui.label("Exact file contents:");
+            ui.code(&generated.staged.contents);
+        });
+    });
 }
 
 /// Dolphin Stage 3/4: matches the verified game ID against the inspected
@@ -16954,6 +18070,7 @@ fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
         CheatEmulatorAdapter::RetroArch => workflow.selected_profile_id.clone(),
         CheatEmulatorAdapter::Pcsx2 => workflow.selected_pcsx2_profile_id.clone(),
         CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.clone(),
+        CheatEmulatorAdapter::Xenia => workflow.selected_xenia_profile_id.clone(),
         CheatEmulatorAdapter::Unsupported => None,
     };
     CheatPreviewRequestKey {
@@ -17113,6 +18230,16 @@ fn default_generated_dolphin_staging_root() -> Result<PathBuf, String> {
             root.parent()
                 .map(|parent| parent.join("generated-dolphin"))
                 .unwrap_or_else(|| root.join("generated-dolphin"))
+        })
+        .map_err(|error| format!("Staging root unavailable: {}", error.detail))
+}
+
+fn default_generated_xenia_staging_root() -> Result<PathBuf, String> {
+    default_shared_backup_root()
+        .map(|root| {
+            root.parent()
+                .map(|parent| parent.join("generated-xenia"))
+                .unwrap_or_else(|| root.join("generated-xenia"))
         })
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
@@ -17280,7 +18407,10 @@ fn build_cheat_preview_request(
                 }),
             ))
         }
-        CheatEmulatorAdapter::Unsupported => None,
+        // Xenia has no local bulk file inventory to match against - its
+        // preview is built directly from the chosen provider candidate by
+        // `start_xenia_install_preview`, never through this dispatcher.
+        CheatEmulatorAdapter::Xenia | CheatEmulatorAdapter::Unsupported => None,
     }
 }
 
@@ -17424,6 +18554,7 @@ fn show_shared_game_identity(
                     _ => None,
                 },
                 CheatEmulatorAdapter::RetroArch => None,
+                CheatEmulatorAdapter::Xenia => None,
                 CheatEmulatorAdapter::Unsupported => None,
             };
             widgets::card(ui, |ui| {
@@ -18026,6 +19157,9 @@ fn show_shared_cheat_preview(
                 if let Some(generated) = &response.dolphin_generated {
                     show_dolphin_generated_install_preview(ui, generated, clipboard);
                 }
+                if let Some(generated) = &response.xenia_generated {
+                    show_xenia_generated_install_preview(ui, generated, clipboard);
+                }
                 if let Some(materialized) = &response.materialized {
                     widgets::card(ui, |ui| {
                         widgets::status_badge(
@@ -18208,7 +19342,8 @@ fn show_shared_cheat_preview(
                     report,
                     response.materialized.is_some()
                         || response.generated.is_some()
-                        || response.dolphin_generated.is_some(),
+                        || response.dolphin_generated.is_some()
+                        || response.xenia_generated.is_some(),
                     &mut workflow.transaction,
                     clipboard,
                 );
@@ -18255,6 +19390,7 @@ fn show_shared_transaction_readiness(
                 );
                 ui.label(match report.adapter {
                     PreviewAdapter::Dolphin => "This Dolphin GameSettings file has a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected codes are staged in this exact preview.",
+                    PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected patches are staged in this exact preview.",
                     _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected per-game catalogue source is materialized in this exact preview.",
                 });
             }
@@ -18443,6 +19579,7 @@ fn show_cheats_mods_page(
     profiles: &RetroArchProfilesState,
     pcsx2_profiles: &Pcsx2ProfilesState,
     dolphin_profiles: &DolphinProfilesState,
+    xenia_profiles: &XeniaProfilesState,
     live: Option<&LoadedData>,
     cached: Option<&CachedLibrarySnapshot>,
     history: &OperationHistory,
@@ -18579,6 +19716,9 @@ fn show_cheats_mods_page(
             CheatEmulatorAdapter::Dolphin => {
                 action =
                     show_dolphin_workflow(ui, workflow, dolphin_profiles, clipboard).or(action);
+            }
+            CheatEmulatorAdapter::Xenia => {
+                action = show_xenia_workflow(ui, workflow, xenia_profiles, clipboard).or(action);
             }
             CheatEmulatorAdapter::Unsupported => {
                 widgets::banner(
@@ -19397,6 +20537,16 @@ enum DolphinProfilesState {
     },
     Ready(DolphinProfileDiscovery),
     Error(String),
+}
+
+/// Unlike Dolphin/PCSX2, Xenia Canary discovery only ever validates
+/// caller-supplied explicit directories (no environment/HOME lookup, no
+/// failure mode) - so it is synchronous and infallible; there is no
+/// `Scanning` or `Error` state to represent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum XeniaProfilesState {
+    NotScanned,
+    Ready(XeniaProfileDiscovery),
 }
 
 /// Display label for a discovered profile's installation type.
@@ -25851,6 +27001,7 @@ mod tests {
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -26230,6 +27381,7 @@ mod tests {
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -26327,6 +27479,13 @@ mod tests {
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            selected_xenia_profile_id: None,
+            xenia_explicit_root: String::new(),
+            xenia_provider_request: None,
+            xenia_provider: CheatStepResource::NotLoaded,
+            xenia_selected_candidate_index: None,
+            xenia_selection: None,
+            xenia_destination_error: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -26469,6 +27628,7 @@ mod tests {
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -26499,6 +27659,7 @@ mod tests {
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -26546,6 +27707,7 @@ mod tests {
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -26583,6 +27745,7 @@ mod tests {
                         &app.retroarch_profiles,
                         &app.pcsx2_profiles,
                         &app.dolphin_profiles,
+                        &app.xenia_profiles,
                         None,
                         None,
                         &history,
@@ -27011,6 +28174,7 @@ $Instant Growth [Nayr]\n";
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -27147,6 +28311,7 @@ $Instant Growth [Nayr]\n";
             materialized: None,
             generated: None,
             dolphin_generated: None,
+            xenia_generated: None,
         });
 
         app.update_dolphin_code_selection(|selection| {
@@ -27420,6 +28585,7 @@ $Instant Growth [Nayr]\n";
                 materialized: None,
                 generated: None,
                 dolphin_generated: None,
+                xenia_generated: None,
             }))
             .unwrap();
         app.poll_cheat_workflow();
@@ -27748,6 +28914,7 @@ $Instant Growth [Nayr]\n";
             materialized: None,
             generated: None,
             dolphin_generated: None,
+            xenia_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -27781,6 +28948,7 @@ $Instant Growth [Nayr]\n";
             materialized: None,
             generated: None,
             dolphin_generated: None,
+            xenia_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -28580,6 +29748,7 @@ $Instant Growth [Nayr]\n";
                     &RetroArchProfilesState::NotScanned,
                     &Pcsx2ProfilesState::NotScanned,
                     &DolphinProfilesState::NotScanned,
+                    &XeniaProfilesState::NotScanned,
                     None,
                     None,
                     &history,
@@ -28622,6 +29791,7 @@ $Instant Growth [Nayr]\n";
                     &app.retroarch_profiles,
                     &app.pcsx2_profiles,
                     &app.dolphin_profiles,
+                    &app.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -28937,6 +30107,13 @@ $Instant Growth [Nayr]\n";
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            selected_xenia_profile_id: None,
+            xenia_explicit_root: String::new(),
+            xenia_provider_request: None,
+            xenia_provider: CheatStepResource::NotLoaded,
+            xenia_selected_candidate_index: None,
+            xenia_selection: None,
+            xenia_destination_error: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -29379,6 +30556,7 @@ $Instant Growth [Nayr]\n";
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
+            xenia_profiles: XeniaProfilesState::NotScanned,
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -42419,6 +43597,13 @@ $Instant Growth [Nayr]\n";
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            selected_xenia_profile_id: None,
+            xenia_explicit_root: String::new(),
+            xenia_provider_request: None,
+            xenia_provider: CheatStepResource::NotLoaded,
+            xenia_selected_candidate_index: None,
+            xenia_selection: None,
+            xenia_destination_error: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
