@@ -2785,11 +2785,60 @@ fn show_primary_navigation(
     clicked_view
 }
 
+/// Authoritative archive context shared by every primary workflow.
+///
+/// Invariants:
+/// - `focused` is the Library/Selected detail identity, never a row index.
+/// - `selected` is the exact multi-selection used for highlighting and bulk
+///   actions. A single selection always equals `focused`.
+/// - the active Cheats & Mods archive is derived from `focused`; it is not
+///   stored a second time. Adapter state may be cached for this identity,
+///   but may never choose a different archive.
+/// - queue membership and mounted records are independent and must never
+///   clear or replace this context.
+#[derive(Default)]
+struct ArchiveContext {
+    focused: Option<PathBuf>,
+    selected: HashSet<PathBuf>,
+}
+
+impl ArchiveContext {
+    fn select_only(&mut self, path: PathBuf) {
+        self.selected.clear();
+        self.selected.insert(path.clone());
+        self.focused = Some(path);
+    }
+
+    fn clear_selection(&mut self) {
+        self.focused = None;
+        self.selected.clear();
+    }
+
+    fn prune(&mut self, rows: &[ArchiveRow]) {
+        self.selected
+            .retain(|path| rows.iter().any(|row| &row.path == path));
+        if self
+            .focused
+            .as_ref()
+            .is_some_and(|focused| !rows.iter().any(|row| &row.path == focused))
+        {
+            self.focused = None;
+        }
+    }
+
+    fn active_cheats(&self) -> Option<&Path> {
+        self.focused.as_deref()
+    }
+}
+
 struct ArchiveFsApp {
     state: LoadState,
     filter: String,
     filtered_rows: Option<Vec<usize>>,
-    selected_archive: Option<PathBuf>,
+    /// The sole owner of primary archive identity across Library, Selected,
+    /// Mount, and Cheats & Mods. Mount state remains derived from live
+    /// records and is intentionally not stored here.
+    archive_context: ArchiveContext,
     operation: Option<RunningOperation>,
     mount_all: Option<RunningMountAll>,
     unmount_all: Option<RunningUnmountAll>,
@@ -2868,15 +2917,6 @@ struct ArchiveFsApp {
     confirm_remove_missing: Option<Vec<PathBuf>>,
     new_alias_text: String,
     new_alias_platform_choice: Option<String>,
-    /// The exact-identity multi-selection (requirement 1): every
-    /// currently multi-selected row's `ArchiveRow::path`. Never row
-    /// indices - see `prune_selection` for how this survives a
-    /// filter/reload without pointing at the wrong archive.
-    /// `selected_archive` (above) remains, unchanged, the single
-    /// "focused" row driving the details panel; this is a separate,
-    /// additive overlay used only for row highlighting and the bulk
-    /// action bar.
-    selected_archives: HashSet<PathBuf>,
     bulk_platform_action: Option<RunningBulkPlatformAction>,
     bulk_platform_choice: Option<String>,
     sort_field: Option<SortField>,
@@ -3024,7 +3064,7 @@ impl ArchiveFsApp {
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
-            selected_archive: None,
+            archive_context: ArchiveContext::default(),
             operation: None,
             mount_all: None,
             unmount_all: None,
@@ -3074,7 +3114,6 @@ impl ArchiveFsApp {
             confirm_remove_missing: None,
             new_alias_text: String::new(),
             new_alias_platform_choice: None,
-            selected_archives: HashSet::new(),
             bulk_platform_action: None,
             bulk_platform_choice: None,
             sort_field: None,
@@ -3463,13 +3502,7 @@ impl ArchiveFsApp {
     /// display string, and never touches row indices - there are none to
     /// go stale here in the first place.
     fn prune_selection(&mut self, merged_rows: &[ArchiveRow]) {
-        self.selected_archives
-            .retain(|path| merged_rows.iter().any(|row| &row.path == path));
-        if let Some(selected) = &self.selected_archive
-            && !merged_rows.iter().any(|row| &row.path == selected)
-        {
-            self.selected_archive = None;
-        }
+        self.archive_context.prune(merged_rows);
     }
 
     fn refresh_diagnostics(&mut self, context: &egui::Context) {
@@ -4808,8 +4841,7 @@ impl ArchiveFsApp {
                 self.tools_overlay = ToolsOverlay::None;
             }
             Some(MountPageAction::OpenCheatsMods(archive_path)) => {
-                self.selected_archive = Some(archive_path.clone());
-                self.selected_archives = [archive_path.clone()].into_iter().collect();
+                self.archive_context.select_only(archive_path.clone());
                 self.open_cheats_mods_workspace(context, archive_path);
             }
             Some(MountPageAction::ScanRetroArchProfiles) => {
@@ -6078,8 +6110,7 @@ impl ArchiveFsApp {
             self.retroarch_profiles,
             RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
         );
-        self.selected_archive = Some(archive_path.clone());
-        self.selected_archives = [archive_path.clone()].into_iter().collect();
+        self.archive_context.select_only(archive_path.clone());
         self.open_cheats_mods_workspace(context, archive_path);
         if self.cheat_workflow.is_some() && needs_profile_scan {
             self.start_retroarch_profile_scan(context.clone());
@@ -6738,7 +6769,7 @@ impl ArchiveFsApp {
         if self.view != MainView::CheatsMods {
             return;
         }
-        match self.selected_archive.clone() {
+        match self.archive_context.active_cheats().map(Path::to_path_buf) {
             Some(path)
                 if !self
                     .cheat_workflow
@@ -7843,12 +7874,12 @@ impl eframe::App for ArchiveFsApp {
                     }
                     if ui
                         .add_enabled(
-                            !self.selected_archives.is_empty(),
+                            !self.archive_context.selected.is_empty(),
                             egui::Button::new("Clear selection"),
                         )
                         .clicked()
                     {
-                        self.selected_archives.clear();
+                        self.archive_context.clear_selection();
                         ui.close();
                     }
                     ui.separator();
@@ -7952,8 +7983,7 @@ impl eframe::App for ArchiveFsApp {
             &mut self.clipboard,
         ) {
             self.navigate_to_library_tab(LibraryTab::Archives);
-            self.selected_archive = Some(path.clone());
-            self.selected_archives = [path].into_iter().collect();
+            self.archive_context.select_only(path);
         }
 
         if self.show_about {
@@ -8480,8 +8510,8 @@ impl eframe::App for ArchiveFsApp {
                         live,
                         self.mount_all_result.as_ref(),
                         SelectedPageViewState {
-                            selected_archive: self.selected_archive.as_deref(),
-                            selected_count: self.selected_archives.len(),
+                            selected_archive: self.archive_context.focused.as_deref(),
+                            selected_count: self.archive_context.selected.len(),
                             retroarch_profiles: &self.retroarch_profiles,
                             queue: &mut self.mount_queue,
                             confirm: &mut self.confirm_mount_queue,
@@ -8517,8 +8547,7 @@ impl eframe::App for ArchiveFsApp {
                         }
                         Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
                             self.navigate_to_library_tab(LibraryTab::Archives);
-                            self.selected_archive = Some(path.clone());
-                            self.selected_archives = [path].into_iter().collect();
+                            self.archive_context.select_only(path);
                         }
                         Some(ActiveMountsPageAction::Refresh) => self.refresh(context),
                         None => {}
@@ -8766,8 +8795,7 @@ impl eframe::App for ArchiveFsApp {
                                     }
                                     Some(DuplicateReviewAction::ViewInLibrary(path)) => {
                                         self.navigate_to_library_tab(LibraryTab::Archives);
-                                        self.selected_archive = Some(path.clone());
-                                        self.selected_archives = [path].into_iter().collect();
+                                        self.archive_context.select_only(path);
                                     }
                                     Some(DuplicateReviewAction::Inspect(path)) => {
                                         self.start_archive_inspection(context.clone(), path);
@@ -8929,7 +8957,7 @@ impl eframe::App for ArchiveFsApp {
                             LoadedViewState {
                                 filter: &mut self.filter,
                                 filtered_rows: &mut self.filtered_rows,
-                                selected_archive: &mut self.selected_archive,
+                                selected_archive: &mut self.archive_context.focused,
                                 operation: self.operation.as_ref(),
                                 busy: archive_actions_blocked,
                                 block_reason: archive_action_block_reason,
@@ -8959,7 +8987,7 @@ impl eframe::App for ArchiveFsApp {
                                 platform_custom_text: &mut self.platform_custom_text,
                                 platform_busy: self.platform_action.is_some(),
                                 retroarch_profiles: &self.retroarch_profiles,
-                                selected_archives: &mut self.selected_archives,
+                                selected_archives: &mut self.archive_context.selected,
                                 bulk_platform_choice: &mut self.bulk_platform_choice,
                                 bulk_platform_busy: self.bulk_platform_action.is_some(),
                                 missing_removal_available,
@@ -9047,8 +9075,7 @@ impl eframe::App for ArchiveFsApp {
                 }
                 HealthDashboardAction::ViewInLibrary(path) => {
                     self.navigate_to_library_tab(LibraryTab::Archives);
-                    self.selected_archive = Some(path.clone());
-                    self.selected_archives = [path].into_iter().collect();
+                    self.archive_context.select_only(path);
                 }
                 HealthDashboardAction::Inspect(path) => {
                     requested_action = Some(AppOperationRequest::InspectArchive(path));
@@ -9106,8 +9133,7 @@ impl eframe::App for ArchiveFsApp {
                     self.library_view_focus_archive = Some(archive_path);
                 }
                 AppOperationRequest::OpenCheatsMods(archive_path) => {
-                    self.selected_archive = Some(archive_path.clone());
-                    self.selected_archives = [archive_path.clone()].into_iter().collect();
+                    self.archive_context.select_only(archive_path.clone());
                     self.open_cheats_mods_workspace(context, archive_path);
                 }
             }
@@ -24413,8 +24439,8 @@ mod tests {
     #[test]
     fn selected_archive_and_filters_survive_a_library_tab_switch() {
         let mut app = app_for_operation_tests();
-        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         app.filter = "mario".to_string();
         app.library_filters.missing = true;
         app.health_filters.category = HealthIssueFilter::UnknownPlatform;
@@ -24430,11 +24456,11 @@ mod tests {
         }
 
         assert_eq!(
-            app.selected_archive.as_deref(),
+            app.archive_context.focused.as_deref(),
             Some(Path::new("/roms/a.zip")),
             "the selected archive must survive switching Library tabs"
         );
-        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.archive_context.selected.len(), 1);
         assert_eq!(
             app.filter, "mario",
             "the Library free-text filter must survive switching tabs"
@@ -25865,8 +25891,8 @@ mod tests {
             data.records
                 .push(record("/roms/a.zip", MountState::Pending));
         }
-        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         app.retroarch_profiles =
             RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
                 "native-user",
@@ -26683,7 +26709,7 @@ $Instant Growth [Nayr]\n";
             CheatStepResource::NotLoaded
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
-        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(app.archive_context.focused, Some(PathBuf::from("/roms/a.zip")));
         assert_eq!(
             app.cheat_workflow
                 .as_ref()
@@ -26831,7 +26857,7 @@ $Instant Growth [Nayr]\n";
             CheatStepResource::NotLoaded
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
-        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(app.archive_context.focused, Some(PathBuf::from("/roms/a.zip")));
         assert_eq!(
             app.cheat_workflow
                 .as_ref()
@@ -26908,13 +26934,13 @@ $Instant Growth [Nayr]\n";
             data.records.push(ps2);
         }
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
-        app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
+        app.archive_context.focused = Some(PathBuf::from("/roms/other.zip"));
         assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.zip")));
         let workflow = app.cheat_workflow.as_ref().unwrap();
         assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
         assert_eq!(workflow.archive_path, PathBuf::from("/roms/game.zip"));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
-        assert_eq!(app.selected_archive, Some(PathBuf::from("/roms/other.zip")));
+        assert_eq!(app.archive_context.focused, Some(PathBuf::from("/roms/other.zip")));
         let live = match &app.state {
             LoadState::Ready(data) => &data.records[0],
             _ => unreachable!(),
@@ -27176,7 +27202,7 @@ $Instant Growth [Nayr]\n";
     fn stale_catalogue_result_is_rejected_without_touching_library_state() {
         let mut app = app_for_operation_tests();
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
-        app.selected_archive = Some(PathBuf::from("/roms/Alien 3.md"));
+        app.archive_context.focused = Some(PathBuf::from("/roms/Alien 3.md"));
         let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(cheat_fetch_result_for(
@@ -27200,7 +27226,7 @@ $Instant Growth [Nayr]\n";
         assert!(app.catalogue_last_result.is_none());
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
         assert_eq!(
-            app.selected_archive,
+            app.archive_context.focused,
             Some(PathBuf::from("/roms/Alien 3.md"))
         );
     }
@@ -27379,8 +27405,8 @@ $Instant Growth [Nayr]\n";
             data.records
                 .push(record("/roms/a.zip", MountState::Pending));
         }
-        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
 
         // Two eligible profiles: no silent choice.
         app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
@@ -27419,8 +27445,8 @@ $Instant Growth [Nayr]\n";
             data.records
                 .push(record("/roms/other.zip", MountState::Pending));
         }
-        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
         app.retroarch_profiles =
             RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile(
@@ -27430,10 +27456,10 @@ $Instant Growth [Nayr]\n";
 
         app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
         assert_eq!(
-            app.selected_archive.as_deref(),
+            app.archive_context.focused.as_deref(),
             Some(Path::new("/roms/a.zip"))
         );
-        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.archive_context.selected.len(), 1);
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
 
         // Matching selection: the full-page workflow stays available.
@@ -27444,7 +27470,7 @@ $Instant Growth [Nayr]\n";
         // `selected_archive` is the one authoritative field: changing it
         // while already on the page must be picked up here, without a
         // second explicit navigation.
-        app.selected_archive = Some(PathBuf::from("/roms/other.zip"));
+        app.archive_context.focused = Some(PathBuf::from("/roms/other.zip"));
         app.reconcile_cheats_mods_context(&ctx);
         assert_eq!(
             app.cheat_workflow
@@ -27457,14 +27483,14 @@ $Instant Growth [Nayr]\n";
         // Clearing the selection clears the workspace too - no page is
         // allowed to keep showing an archive no other page still considers
         // selected. Mount queue membership is never touched by any of this.
-        app.selected_archive = None;
+        app.archive_context.focused = None;
         app.reconcile_cheats_mods_context(&ctx);
         assert!(
             app.cheat_workflow.is_none(),
             "clearing selected_archive must clear the Cheats & Mods workspace too"
         );
         assert_eq!(
-            app.selected_archives.len(),
+            app.archive_context.selected.len(),
             1,
             "selected_archives is untouched by reconciliation - only the explicit clear/select paths update it"
         );
@@ -27483,8 +27509,8 @@ $Instant Growth [Nayr]\n";
         // The exact effect of clicking an archive row in Library: only
         // `selected_archive`/`selected_archives` change, mirroring
         // `apply_row_click` - no Cheats & Mods-specific call is made here.
-        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         assert!(
             app.cheat_workflow.is_none(),
             "selecting a row in Library must not, by itself, open the Cheats & Mods workspace"
@@ -27569,18 +27595,18 @@ $Instant Growth [Nayr]\n";
                 .push(record("/roms/b.zip", MountState::Pending));
         }
         let original = app.cheat_workflow.as_ref().unwrap().archive_path.clone();
-        app.selected_archive = Some(original.clone());
-        app.selected_archives = [original].into_iter().collect();
+        app.archive_context.focused = Some(original.clone());
+        app.archive_context.selected = [original].into_iter().collect();
 
         app.apply_cheat_archive_choice(&ctx, PathBuf::from("/roms/b.zip"));
 
         assert_eq!(
-            app.selected_archive.as_deref(),
+            app.archive_context.focused.as_deref(),
             Some(Path::new("/roms/b.zip")),
             "choosing an archive inside Cheats & Mods must update selected_archive, so Library and Mount agree with it"
         );
         assert_eq!(
-            app.selected_archives,
+            app.archive_context.selected,
             [PathBuf::from("/roms/b.zip")].into_iter().collect()
         );
         assert_eq!(
@@ -27664,8 +27690,8 @@ $Instant Growth [Nayr]\n";
                 record("/roms/b.zip", MountState::Pending),
             ];
         }
-        app.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        app.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
 
         assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip")));
@@ -27683,10 +27709,10 @@ $Instant Growth [Nayr]\n";
             Some(Path::new("/roms/b.zip"))
         );
         assert_eq!(
-            app.selected_archive.as_deref(),
+            app.archive_context.focused.as_deref(),
             Some(Path::new("/roms/a.zip"))
         );
-        assert_eq!(app.selected_archives.len(), 1);
+        assert_eq!(app.archive_context.selected.len(), 1);
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
         let LoadState::Ready(data) = &app.state else {
             panic!("test fixture must remain ready");
@@ -28652,7 +28678,7 @@ $Instant Growth [Nayr]\n";
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
-            selected_archive: None,
+            archive_context: ArchiveContext::default(),
             operation: None,
             mount_all: None,
             unmount_all: None,
@@ -28705,7 +28731,6 @@ $Instant Growth [Nayr]\n";
             confirm_remove_missing: None,
             new_alias_text: String::new(),
             new_alias_platform_choice: None,
-            selected_archives: HashSet::new(),
             bulk_platform_action: None,
             bulk_platform_choice: None,
             sort_field: None,
@@ -29288,7 +29313,7 @@ $Instant Growth [Nayr]\n";
         app.filter = "ordinary search".to_string();
         app.library_filters.missing = true;
         app.sort_field = Some(SortField::State);
-        app.selected_archive = Some(PathBuf::from("/roms/library.zip"));
+        app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
         let history_len = app.history.entries.len();
 
         app.view = MainView::Duplicates;
@@ -29300,7 +29325,7 @@ $Instant Growth [Nayr]\n";
         assert!(app.library_filters.missing);
         assert_eq!(app.sort_field, Some(SortField::State));
         assert_eq!(
-            app.selected_archive,
+            app.archive_context.focused,
             Some(PathBuf::from("/roms/library.zip"))
         );
         assert_eq!(app.history.entries.len(), history_len);
@@ -29585,8 +29610,8 @@ $Instant Growth [Nayr]\n";
             snapshot: Box::new(cached_snapshot(vec![persisted_archive(path.clone(), true)])),
             last_scan_summary: None,
         };
-        app.selected_archives.insert(path.clone());
-        app.selected_archive = Some(path);
+        app.archive_context.selected.insert(path.clone());
+        app.archive_context.focused = Some(path);
         app.library_filters.missing = true;
         app.sort_field = Some(SortField::ArchivePath);
         app.sort_ascending = false;
@@ -29623,8 +29648,8 @@ $Instant Growth [Nayr]\n";
             snapshot: Box::new(cached_snapshot(vec![persisted_archive(path.clone(), true)])),
             last_scan_summary: None,
         };
-        app.selected_archives.insert(path.clone());
-        app.selected_archive = Some(path.clone());
+        app.archive_context.selected.insert(path.clone());
+        app.archive_context.focused = Some(path.clone());
         app.library_filters.missing = true;
         app.sort_field = Some(SortField::State);
         let (sender, receiver) = mpsc::channel();
@@ -29637,8 +29662,8 @@ $Instant Growth [Nayr]\n";
         app.poll_missing_removal(&egui::Context::default());
 
         assert!(matches!(app.database_state, DatabaseState::Ready { .. }));
-        assert_eq!(app.selected_archives, [path.clone()].into_iter().collect());
-        assert_eq!(app.selected_archive, Some(path));
+        assert_eq!(app.archive_context.selected, [path.clone()].into_iter().collect());
+        assert_eq!(app.archive_context.focused, Some(path));
         assert!(app.library_filters.missing);
         assert_eq!(app.sort_field, Some(SortField::State));
         assert_eq!(app.database_state.snapshot().unwrap().archives.len(), 1);
@@ -29648,13 +29673,13 @@ $Instant Growth [Nayr]\n";
     fn vanished_missing_selections_are_pruned_after_cache_refresh() {
         let path = PathBuf::from("/roms/removed.zip");
         let mut app = app_for_operation_tests();
-        app.selected_archives.insert(path.clone());
-        app.selected_archive = Some(path);
+        app.archive_context.selected.insert(path.clone());
+        app.archive_context.focused = Some(path);
 
         app.prune_selection(&[]);
 
-        assert!(app.selected_archives.is_empty());
-        assert!(app.selected_archive.is_none());
+        assert!(app.archive_context.selected.is_empty());
+        assert!(app.archive_context.focused.is_none());
     }
 
     #[test]
@@ -33143,7 +33168,7 @@ $Instant Growth [Nayr]\n";
         let mut app = app_for_operation_tests();
         app.library_filters.unknown_platform = true;
         let archive_path = PathBuf::from("/roms/mystery.zip");
-        app.selected_archive = Some(archive_path.clone());
+        app.archive_context.focused = Some(archive_path.clone());
         let generation = app.database_generation;
         let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
         app.database_state = DatabaseState::Loading {
@@ -33186,13 +33211,13 @@ $Instant Growth [Nayr]\n";
         // selection-independent-of-filter-visibility behavior (see
         // `RowOrigin`'s doc comment), not a new special case.
         assert_eq!(
-            app.selected_archive.as_deref(),
+            app.archive_context.focused.as_deref(),
             Some(archive_path.as_path())
         );
         assert_eq!(
             selected_persisted_archive(
                 app.database_state.snapshot(),
-                app.selected_archive.as_deref()
+                app.archive_context.focused.as_deref()
             )
             .and_then(|persisted| persisted.platform.as_deref()),
             Some("GameCube")
@@ -34002,8 +34027,7 @@ $Instant Growth [Nayr]\n";
     struct RealLoadedDataHarness {
         filter: String,
         filtered_rows: Option<Vec<usize>>,
-        selected_archive: Option<PathBuf>,
-        selected_archives: HashSet<PathBuf>,
+        archive_context: ArchiveContext,
         library_filters: LibraryRowFilters,
         sort_field: Option<SortField>,
         sort_ascending: bool,
@@ -34030,8 +34054,7 @@ $Instant Growth [Nayr]\n";
             Self {
                 filter: String::new(),
                 filtered_rows: None,
-                selected_archive: None,
-                selected_archives: HashSet::new(),
+                archive_context: ArchiveContext::default(),
                 library_filters: LibraryRowFilters::default(),
                 sort_field: None,
                 sort_ascending: true,
@@ -34084,7 +34107,7 @@ $Instant Growth [Nayr]\n";
                         LoadedViewState {
                             filter: &mut self.filter,
                             filtered_rows: &mut self.filtered_rows,
-                            selected_archive: &mut self.selected_archive,
+                            selected_archive: &mut self.archive_context.focused,
                             operation: None,
                             busy: false,
                             block_reason: None,
@@ -34113,7 +34136,7 @@ $Instant Growth [Nayr]\n";
                             platform_custom_text: &mut platform_custom_text,
                             platform_busy: false,
                             retroarch_profiles: &RetroArchProfilesState::NotScanned,
-                            selected_archives: &mut self.selected_archives,
+                            selected_archives: &mut self.archive_context.selected,
                             bulk_platform_choice: &mut bulk_platform_choice,
                             bulk_platform_busy: false,
                             missing_removal_available: false,
@@ -34170,7 +34193,8 @@ $Instant Growth [Nayr]\n";
         let data = empty_loaded_data("/mount");
 
         let mut one_selected = RealLoadedDataHarness::new();
-        one_selected.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        one_selected.archive_context.selected =
+            [PathBuf::from("/roms/a.zip")].into_iter().collect();
         let one_selected_height = one_selected.render(&ctx, &data, bounded_test_input());
 
         let mut none_selected = RealLoadedDataHarness::new();
@@ -34195,11 +34219,12 @@ $Instant Growth [Nayr]\n";
         let data = empty_loaded_data("/mount");
 
         let mut one_selected = RealLoadedDataHarness::new();
-        one_selected.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        one_selected.archive_context.selected =
+            [PathBuf::from("/roms/a.zip")].into_iter().collect();
         let one_selected_height = one_selected.render(&ctx, &data, bounded_test_input());
 
         let mut three_selected = RealLoadedDataHarness::new();
-        three_selected.selected_archives = [
+        three_selected.archive_context.selected = [
             PathBuf::from("/roms/a.zip"),
             PathBuf::from("/roms/b.zip"),
             PathBuf::from("/roms/c.zip"),
@@ -34661,7 +34686,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
                 .into_iter()
                 .collect(),
@@ -34692,18 +34717,18 @@ $Instant Growth [Nayr]\n";
                     ui,
                     &merged_rows,
                     &visible_indices,
-                    &mut app.selected_archives,
+                    &mut app.archive_context.selected,
                 );
             });
         });
         // A direct call proves the button's own code path, not just its
         // rendering, is exercised - `show_selection_controls_row` only
-        // ever receives `&mut app.selected_archives`, never the duplicate
+        // ever receives `&mut app.archive_context.selected`, never the duplicate
         // fields, so it is structurally unable to touch them.
-        app.selected_archives = select_all_visible(&merged_rows, &visible_indices);
+        app.archive_context.selected = select_all_visible(&merged_rows, &visible_indices);
 
         assert_eq!(
-            app.selected_archives,
+            app.archive_context.selected,
             [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
                 .into_iter()
                 .collect(),
@@ -35125,8 +35150,8 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archive = Some(PathBuf::from("/roms/b.zip"));
-        harness.selected_archives = [PathBuf::from("/roms/b.zip")].into_iter().collect();
+        harness.archive_context.focused = Some(PathBuf::from("/roms/b.zip"));
+        harness.archive_context.selected = [PathBuf::from("/roms/b.zip")].into_iter().collect();
         harness.sort_field = Some(SortField::Platform);
         harness.sort_ascending = false;
         harness.library_column_widths.archive_path += 150.0;
@@ -35135,12 +35160,12 @@ $Instant Growth [Nayr]\n";
         harness.render(&ctx, &data, bounded_test_input());
 
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/b.zip")),
             "a resized column must never change the focused row"
         );
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/b.zip")].into_iter().collect(),
             "a resized column must never change the multi-selection"
         );
@@ -35159,8 +35184,8 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archive = Some(PathBuf::from("/roms/b.zip"));
-        harness.selected_archives = [PathBuf::from("/roms/b.zip")].into_iter().collect();
+        harness.archive_context.focused = Some(PathBuf::from("/roms/b.zip"));
+        harness.archive_context.selected = [PathBuf::from("/roms/b.zip")].into_iter().collect();
         harness.sort_field = Some(SortField::Platform);
         harness.sort_ascending = false;
         harness.library_filters.present = true;
@@ -35182,12 +35207,12 @@ $Instant Growth [Nayr]\n";
         harness.render(&ctx, &data, tall_input);
 
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/b.zip")),
             "a changed window/panel height must never change the focused row"
         );
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/b.zip")].into_iter().collect(),
             "a changed window/panel height must never change the multi-selection"
         );
@@ -35207,7 +35232,7 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        harness.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
         harness.sort_field = Some(SortField::Platform);
         harness.sort_ascending = true;
 
@@ -35222,7 +35247,7 @@ $Instant Growth [Nayr]\n";
         harness.render(&ctx, &data, scroll_input);
 
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/a.zip")),
             "a horizontal scroll must never change the focused row"
         );
@@ -35241,7 +35266,7 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
             .into_iter()
             .collect();
 
@@ -35252,7 +35277,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert!(
-            harness.selected_archives.is_empty(),
+            harness.archive_context.selected.is_empty(),
             "Escape must clear the complete selected_archives set"
         );
     }
@@ -35281,7 +35306,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
                 .into_iter()
                 .collect(),
@@ -35320,7 +35345,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert!(
-            harness.selected_archives.is_empty(),
+            harness.archive_context.selected.is_empty(),
             "Ctrl+A must be ignored for table selection while the search box has keyboard focus"
         );
     }
@@ -35337,7 +35362,7 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
 
         // Frame 1: render once (registers everything with this Context).
         harness.render(&ctx, &data, bounded_test_input());
@@ -35360,7 +35385,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/a.zip")].into_iter().collect(),
             "Ctrl+A must be ignored for table selection while a ComboBox popup is open"
         );
@@ -35389,9 +35414,9 @@ $Instant Growth [Nayr]\n";
             &data,
             key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
         );
-        assert_eq!(harness.selected_archive, Some(PathBuf::from("/roms/c.zip")));
+        assert_eq!(harness.archive_context.focused, Some(PathBuf::from("/roms/c.zip")));
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/c.zip")].into_iter().collect()
         );
 
@@ -35400,9 +35425,9 @@ $Instant Growth [Nayr]\n";
             &data,
             key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
         );
-        assert_eq!(harness.selected_archive, Some(PathBuf::from("/roms/b.zip")));
+        assert_eq!(harness.archive_context.focused, Some(PathBuf::from("/roms/b.zip")));
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/b.zip")].into_iter().collect(),
             "moving focus without Ctrl must replace the selection with the newly focused row"
         );
@@ -35420,7 +35445,7 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archive = Some(PathBuf::from("/roms/b.zip"));
+        harness.archive_context.focused = Some(PathBuf::from("/roms/b.zip"));
         // A filter has just excluded b.zip - only a.zip and c.zip (at new
         // positions 0 and 1) remain visible; b.zip's old position no
         // longer means anything.
@@ -35433,7 +35458,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/a.zip")),
             "focus must fall back to the first visible row, never use a stale index that \
              would have pointed at whatever now occupies the old visible position 1"
@@ -35466,8 +35491,8 @@ $Instant Growth [Nayr]\n";
         ]
         .into_iter()
         .collect();
-        harness.selected_archives = full_selection.clone();
-        harness.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        harness.archive_context.selected = full_selection.clone();
+        harness.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
 
         harness.render(
             &ctx,
@@ -35475,12 +35500,12 @@ $Instant Growth [Nayr]\n";
             key_press_input(egui::Key::ArrowDown, egui::Modifiers::CTRL),
         );
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/b.zip")),
             "Ctrl+Down must move the focused archive to the next visible row"
         );
         assert_eq!(
-            harness.selected_archives, full_selection,
+            harness.archive_context.selected, full_selection,
             "Ctrl+Down must leave every multi-selected row exactly as it was"
         );
 
@@ -35490,12 +35515,12 @@ $Instant Growth [Nayr]\n";
             key_press_input(egui::Key::ArrowUp, egui::Modifiers::CTRL),
         );
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/a.zip")),
             "Ctrl+Up must move the focused archive to the previous visible row"
         );
         assert_eq!(
-            harness.selected_archives, full_selection,
+            harness.archive_context.selected, full_selection,
             "Ctrl+Up must also leave every multi-selected row exactly as it was"
         );
     }
@@ -35520,7 +35545,7 @@ $Instant Growth [Nayr]\n";
             .collect();
         let data = loaded_data_with_rows("/mount", rows);
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archive = Some(PathBuf::from("/roms/00.zip"));
+        harness.archive_context.focused = Some(PathBuf::from("/roms/00.zip"));
 
         for _ in 0..29 {
             harness.render(
@@ -35531,7 +35556,7 @@ $Instant Growth [Nayr]\n";
         }
 
         assert_eq!(
-            harness.selected_archive,
+            harness.archive_context.focused,
             Some(PathBuf::from("/roms/29.zip")),
             "sanity check: focus must actually have reached the last row"
         );
@@ -35555,19 +35580,19 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
             .into_iter()
             .collect();
 
         harness.render(&ctx, &data, bounded_test_input());
-        assert_eq!(harness.selected_archives.len(), 2);
+        assert_eq!(harness.archive_context.selected.len(), 2);
 
         harness.sort_field = Some(SortField::Platform);
         harness.sort_ascending = false;
         harness.render(&ctx, &data, bounded_test_input());
 
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
                 .into_iter()
                 .collect(),
@@ -35639,7 +35664,7 @@ $Instant Growth [Nayr]\n";
         let mut app = app_for_operation_tests();
         let path_a = PathBuf::from("/roms/a.zip");
         let path_b = PathBuf::from("/roms/b.zip");
-        app.selected_archives = [path_a.clone(), path_b.clone()].into_iter().collect();
+        app.archive_context.selected = [path_a.clone(), path_b.clone()].into_iter().collect();
         let record_a = record_at(path_a, MountState::Pending);
         let record_b = record_at(path_b, MountState::Pending);
         let rows = vec![row_for(&record_a), row_for(&record_b)];
@@ -35647,7 +35672,7 @@ $Instant Growth [Nayr]\n";
         app.prune_selection(&rows);
 
         assert_eq!(
-            app.selected_archives.len(),
+            app.archive_context.selected.len(),
             2,
             "both selected rows are still in the catalogue"
         );
@@ -35658,21 +35683,21 @@ $Instant Growth [Nayr]\n";
         let mut app = app_for_operation_tests();
         let still_present = PathBuf::from("/roms/a.zip");
         let vanished = PathBuf::from("/roms/b.zip");
-        app.selected_archives = [still_present.clone(), vanished.clone()]
+        app.archive_context.selected = [still_present.clone(), vanished.clone()]
             .into_iter()
             .collect();
-        app.selected_archive = Some(vanished.clone());
+        app.archive_context.focused = Some(vanished.clone());
         let record = record_at(still_present.clone(), MountState::Pending);
         let rows = vec![row_for(&record)];
 
         app.prune_selection(&rows);
 
         assert_eq!(
-            app.selected_archives,
+            app.archive_context.selected,
             [still_present].into_iter().collect::<HashSet<_>>()
         );
         assert_eq!(
-            app.selected_archive, None,
+            app.archive_context.focused, None,
             "the focused row must be cleared once it no longer exists in the catalogue"
         );
     }
@@ -35824,7 +35849,7 @@ $Instant Growth [Nayr]\n";
             [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
                 .into_iter()
                 .collect();
-        app.selected_archives = selected.clone();
+        app.archive_context.selected = selected.clone();
         let (sender, receiver) = mpsc::channel();
         app.bulk_platform_action = Some(RunningBulkPlatformAction {
             kind: BulkPlatformActionKind::Set("GameCube".to_string()),
@@ -35854,7 +35879,7 @@ $Instant Growth [Nayr]\n";
                 other.status_label()
             ),
         }
-        assert_eq!(app.selected_archives, selected);
+        assert_eq!(app.archive_context.selected, selected);
     }
 
     #[test]
@@ -36889,8 +36914,8 @@ $Instant Growth [Nayr]\n";
         app.filter = "ordinary search".to_string();
         app.library_filters.missing = true;
         app.sort_field = Some(SortField::State);
-        app.selected_archive = Some(PathBuf::from("/roms/library.zip"));
-        app.selected_archives = [PathBuf::from("/roms/library.zip")].into_iter().collect();
+        app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/library.zip")].into_iter().collect();
         app.selected_duplicate_archive = Some(PathBuf::from("/backup/Other.7z"));
         let history_len = app.history.entries.len();
 
@@ -36906,11 +36931,11 @@ $Instant Growth [Nayr]\n";
         assert!(app.library_filters.missing);
         assert_eq!(app.sort_field, Some(SortField::State));
         assert_eq!(
-            app.selected_archive,
+            app.archive_context.focused,
             Some(PathBuf::from("/roms/library.zip"))
         );
         assert_eq!(
-            app.selected_archives,
+            app.archive_context.selected,
             [PathBuf::from("/roms/library.zip")].into_iter().collect()
         );
         assert_eq!(
@@ -36932,7 +36957,7 @@ $Instant Growth [Nayr]\n";
         app.filter = "ordinary search".to_string();
         app.library_filters.missing = true;
         app.sort_field = Some(SortField::State);
-        app.selected_archive = Some(PathBuf::from("/roms/library.zip"));
+        app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
         app.library_source_filter = Some(Some(PathBuf::from("/home/davedap/Archives")));
         let history_len = app.history.entries.len();
 
@@ -36948,7 +36973,7 @@ $Instant Growth [Nayr]\n";
         assert!(app.library_filters.missing);
         assert_eq!(app.sort_field, Some(SortField::State));
         assert_eq!(
-            app.selected_archive,
+            app.archive_context.focused,
             Some(PathBuf::from("/roms/library.zip"))
         );
         assert_eq!(
@@ -39205,7 +39230,7 @@ $Instant Growth [Nayr]\n";
         );
 
         assert!(
-            harness.selected_archives.is_empty(),
+            harness.archive_context.selected.is_empty(),
             "Ctrl+A must still be ignored for table selection while the search box - now \
              rendered through the shared context-menu helper - has keyboard focus"
         );
@@ -40482,8 +40507,8 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archive = Some(PathBuf::from("/roms/a.zip"));
-        harness.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        harness.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         harness.sort_field = Some(SortField::Platform);
         harness.sort_ascending = false;
         harness.library_filters.present = true;
@@ -40613,23 +40638,23 @@ $Instant Growth [Nayr]\n";
         // "View in Library" button and the new issue-row context menu's
         // "Show archive in Library" item produce.
         app.view = MainView::Duplicates;
-        app.selected_archive = None;
-        app.selected_archives.clear();
+        app.archive_context.focused = None;
+        app.archive_context.selected.clear();
         let action = HealthDashboardAction::ViewInLibrary(path.clone());
         match action {
             HealthDashboardAction::ViewInLibrary(resolved) => {
                 app.navigate_to_library_tab(LibraryTab::Archives);
-                app.selected_archive = Some(resolved.clone());
-                app.selected_archives = [resolved].into_iter().collect();
+                app.archive_context.focused = Some(resolved.clone());
+                app.archive_context.selected = [resolved].into_iter().collect();
             }
             _ => unreachable!(),
         }
 
         assert_eq!(app.view, MainView::Library);
         assert_eq!(app.library_tab, LibraryTab::Archives);
-        assert_eq!(app.selected_archive, Some(path.clone()));
+        assert_eq!(app.archive_context.focused, Some(path.clone()));
         assert_eq!(
-            app.selected_archives,
+            app.archive_context.selected,
             [path].into_iter().collect::<HashSet<_>>()
         );
     }
@@ -41022,7 +41047,7 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn unmount_selected_confirmation_dialog_shows_the_exact_mounted_count_and_required_wording() {
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [
+        harness.archive_context.selected = [
             PathBuf::from("/roms/a.zip"),
             PathBuf::from("/roms/b.zip"),
             PathBuf::from("/roms/c.zip"),
@@ -41061,7 +41086,7 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn unmount_selected_confirmation_cleanup_wording_matches_the_current_option() {
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
         harness.confirm_unmount_selected = Some(UnmountSelectedConfirmation);
         harness.cleanup_after_unmount = false;
         let data = loaded_data_with_records(
@@ -41136,8 +41161,8 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn unmount_selected_cancel_has_no_side_effects() {
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [PathBuf::from("/roms/a.zip")].into_iter().collect();
-        harness.selected_archive = Some(PathBuf::from("/roms/a.zip"));
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+        harness.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
         harness.sort_field = Some(SortField::Platform);
         harness.sort_ascending = false;
         harness.library_filters.present = true;
@@ -41172,13 +41197,13 @@ $Instant Growth [Nayr]\n";
             "Cancel must never request an unmount"
         );
         assert_eq!(
-            harness.selected_archives,
+            harness.archive_context.selected,
             [PathBuf::from("/roms/a.zip")]
                 .into_iter()
                 .collect::<HashSet<_>>(),
             "Cancel must preserve the selection"
         );
-        assert_eq!(harness.selected_archive, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(harness.archive_context.focused, Some(PathBuf::from("/roms/a.zip")));
         assert_eq!(harness.sort_field, Some(SortField::Platform));
         assert!(!harness.sort_ascending);
         assert!(harness.library_filters.present);
@@ -41193,7 +41218,7 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn unmount_selected_confirm_uses_the_same_batch_engine_with_only_mounted_selected_items() {
         let mut harness = RealLoadedDataHarness::new();
-        harness.selected_archives = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+        harness.archive_context.selected = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
             .into_iter()
             .collect();
         harness.confirm_unmount_selected = Some(UnmountSelectedConfirmation);
