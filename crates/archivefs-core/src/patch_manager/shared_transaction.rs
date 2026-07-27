@@ -103,7 +103,7 @@ pub enum SharedAdapterWriteSupport {
 
 pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSupport {
     match adapter {
-        PreviewAdapter::RetroArch | PreviewAdapter::Dolphin => {
+        PreviewAdapter::RetroArch | PreviewAdapter::Dolphin | PreviewAdapter::Xenia => {
             SharedAdapterWriteSupport::ApplyAndRollback
         }
         PreviewAdapter::Pcsx2 => SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized,
@@ -952,7 +952,7 @@ fn apply_one(
         if !plan.parent_creation_approved
             || !matches!(
                 plan.adapter,
-                PreviewAdapter::RetroArch | PreviewAdapter::Dolphin
+                PreviewAdapter::RetroArch | PreviewAdapter::Dolphin | PreviewAdapter::Xenia
             )
         {
             return fail_result(
