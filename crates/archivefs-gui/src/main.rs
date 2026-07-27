@@ -60,7 +60,7 @@ mod ui;
 
 #[cfg(test)]
 use archivefs_core::patch_manager::{
-    Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+    DolphinGameIniFile, Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
 };
 
 use archivefs_core::{
@@ -26300,6 +26300,295 @@ mod tests {
         ] {
             assert!(!rendered_text_contains(&output, forbidden));
         }
+    }
+
+    /// Writes a real GameSettings INI to a real temp file and returns a
+    /// `DolphinGameIniFile` inventory record pointing at it - enough for
+    /// `build_dolphin_candidate` to match it and `load_dolphin_ini` to
+    /// really open it, exactly as the real pipeline would.
+    fn real_dolphin_ini_fixture(directory: &std::path::Path, game_id: &str) -> DolphinGameIniFile {
+        let contents = "[Core]\n\
+FastDiscSpeed = True\n\
+[Gecko]\n\
+$Infinite Bells [Nayr]\n\
+28134C58 00000001\n\
+*Gives you lots of bells\n\
+$Instant Growth [Nayr]\n\
+C913CEF5 00000000\n\
+[Gecko_Enabled]\n\
+$Instant Growth [Nayr]\n";
+        let path = directory.join(format!("{game_id}.ini"));
+        std::fs::write(&path, contents).expect("write real fixture INI");
+        DolphinGameIniFile {
+            path,
+            filename_stem: std::ffi::OsString::from(game_id),
+            game_id_candidate: Some(game_id.to_string()),
+            revision_candidate: None,
+            region_candidate: Some("E".to_string()),
+            frame_patch_names: Vec::new(),
+            action_replay_names: Vec::new(),
+            gecko_names: vec![
+                "Infinite Bells [Nayr]".to_string(),
+                "Instant Growth [Nayr]".to_string(),
+            ],
+            riivolution_names: Vec::new(),
+            enabled_frame_patch_names: Vec::new(),
+            enabled_action_replay_names: Vec::new(),
+            enabled_gecko_names: vec!["Instant Growth [Nayr]".to_string()],
+            enabled_riivolution_names: Vec::new(),
+            size_bytes: contents.len() as u64,
+            sha256: "0".repeat(64),
+            duplicate_game_identity: false,
+            duplicate_filename: false,
+            duplicate_content: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn dolphin_workflow_with_matched_identity(
+        directory: &std::path::Path,
+        game_id: &str,
+    ) -> ArchiveFsApp {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("GameCube".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Dolphin;
+        workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
+        workflow.dolphin_inventory_profile_id = Some("dolphin-native-test".to_string());
+        workflow.dolphin_inventory = CheatStepResource::Ready(DolphinGameIniInventory {
+            profile_id: "dolphin-native-test".to_string(),
+            files: vec![real_dolphin_ini_fixture(directory, game_id)],
+            warnings: Vec::new(),
+            entries_visited: 1,
+            bytes_inspected: 200,
+            complete: true,
+        });
+        workflow.identity_request = Some(GameIdentityRequest {
+            archive_path: workflow.archive_path.clone(),
+            platform: workflow.platform.clone(),
+            adapter: CheatEmulatorAdapter::Dolphin,
+        });
+        let report = GameIdentityReport {
+            archive_path: workflow.archive_path.clone(),
+            platform: archivefs_core::game_identity::IdentityPlatform::GameCube,
+            format: IdentityImageFormat::Iso,
+            evidence: vec![archivefs_core::game_identity::IdentityEvidence {
+                kind: IdentityKind::DolphinGameId,
+                status: IdentityStatus::Verified,
+                value: Some(game_id.to_string()),
+                confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                provenance: archivefs_core::game_identity::IdentityProvenance {
+                    archive_path: workflow.archive_path.clone(),
+                    member_path: None,
+                    member_index: None,
+                    method: "test fixture disc header read".to_string(),
+                },
+                diagnostic: "test fixture".to_string(),
+            }],
+            warnings: Vec::new(),
+            bytes_read: 512,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        };
+        workflow.identity = CheatStepResource::Ready((
+            workflow.identity_request.clone().unwrap(),
+            report,
+        ));
+        app
+    }
+
+    #[test]
+    fn dolphin_candidate_match_opens_a_real_matched_file_with_its_own_gecko_codes() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-dolphin-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+
+        app.start_dolphin_candidate_match();
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let outcome = workflow.dolphin_candidate_outcome.as_ref().unwrap();
+        let candidate = outcome.candidate.as_ref().expect("candidate matched");
+        assert_eq!(candidate.game_id, "GAFE01");
+        let selection = workflow.dolphin_selection.as_ref().expect("selection opened");
+        assert_eq!(selection.selection.entries.len(), 2);
+        assert_eq!(selection.selection.selected_count(), 1, "already-enabled code pre-selected");
+        let already_enabled = selection
+            .selection
+            .entries
+            .iter()
+            .find(|entry| entry.name == "Instant Growth [Nayr]")
+            .unwrap();
+        assert!(already_enabled.already_enabled);
+        assert!(already_enabled.selected);
+        let not_enabled = selection
+            .selection
+            .entries
+            .iter()
+            .find(|entry| entry.name == "Infinite Bells [Nayr]")
+            .unwrap();
+        assert!(!not_enabled.already_enabled);
+        assert!(!not_enabled.selected);
+        assert_eq!(
+            app.history.entries().next().unwrap().action,
+            ActivityAction::DolphinGeckoCandidateMatch
+        );
+        assert_eq!(
+            app.history.entries().next().unwrap().outcome,
+            ActivityOutcome::Completed
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn dolphin_candidate_match_records_a_rejected_activity_event_when_nothing_matches() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-dolphin-test-nomatch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        // The inventory has GAFE01, but the verified identity is a
+        // different game - never guessed, never fabricated.
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.identity = CheatStepResource::NotLoaded;
+        workflow.identity_request = None;
+
+        app.start_dolphin_candidate_match();
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(workflow.dolphin_candidate_outcome.as_ref().unwrap().candidate.is_none());
+        assert!(workflow.dolphin_selection.is_none());
+        let latest = app.history.entries().next().unwrap();
+        assert_eq!(latest.action, ActivityAction::DolphinGeckoCandidateMatch);
+        assert_eq!(latest.outcome, ActivityOutcome::Rejected);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn toggling_a_dolphin_code_invalidates_a_stale_preview() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-dolphin-test-toggle-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        app.start_dolphin_candidate_match();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let key = cheat_preview_key(workflow);
+        workflow.preview = CheatStepResource::Ready(CheatPreviewResponse {
+            key,
+            outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::Shared(
+                SharedPreviewError::InvalidRequest(
+                    archivefs_core::patch_manager::PreviewBlockerKind::SourceMissing,
+                ),
+            )),
+            materialized: None,
+            generated: None,
+            dolphin_generated: None,
+        });
+
+        app.update_dolphin_code_selection(|selection| {
+            selection.set_selected(0, true);
+        });
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+        assert!(workflow.dolphin_selection.as_ref().unwrap().selection.entries[0].selected);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn select_all_and_clear_all_dolphin_codes_update_the_real_selection_counts() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-dolphin-test-selectall-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        app.start_dolphin_candidate_match();
+
+        app.update_dolphin_code_selection(DolphinCodeSelection::select_all);
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .dolphin_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .selected_count(),
+            2
+        );
+
+        app.update_dolphin_code_selection(DolphinCodeSelection::clear_all);
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .dolphin_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .selected_count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn dolphin_code_picker_renders_the_already_enabled_distinction_and_toggle_action() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-dolphin-test-render-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        app.start_dolphin_candidate_match();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_dolphin_code_picker(ui, workflow);
+            });
+        });
+        for expected in [
+            "Stage 4 · Codes to install",
+            "Infinite Bells [Nayr]",
+            "Instant Growth [Nayr]",
+            "Already enabled in file",
+            "1 of 2 selected",
+            "Preview the installed file",
+        ] {
+            assert!(rendered_text_contains(&output, expected), "missing {expected}");
+        }
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
