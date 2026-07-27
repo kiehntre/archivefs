@@ -171,9 +171,14 @@ pub use dolphin_gecko_install_plan::{
 pub use dolphin_gecko_provider::{
     DOLPHIN_UPSTREAM_ATTRIBUTION, DOLPHIN_UPSTREAM_LICENSE, DOLPHIN_UPSTREAM_PROVIDER_ID,
     DOLPHIN_UPSTREAM_PROVIDER_NAME, DOLPHIN_UPSTREAM_REPOSITORY, DolphinUpstreamGeckoProvider,
-    GeckoApplicabilityDecision, GeckoCodeProvider, GeckoProviderEntry, GeckoProviderError,
-    GeckoProviderErrorKind, GeckoProviderQuery, GeckoProviderResult, GeckoRegion,
-    GeckoRevisionApplicability, region_for_game_id, revision_applicability,
+    GECKO_PROVIDER_CACHE_FRESH_SECONDS, GECKO_PROVIDER_MAX_RESPONSE_BYTES,
+    GECKO_PROVIDER_MIN_REFRESH_SECONDS, GECKO_PROVIDER_TIMEOUT_SECONDS, GeckoApplicabilityDecision,
+    GeckoCodeProvider, GeckoProviderEntry, GeckoProviderError, GeckoProviderErrorKind,
+    GeckoProviderFetchError, GeckoProviderFetchErrorKind, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery, GeckoProviderResult,
+    GeckoRegion, GeckoRevisionApplicability, default_gecko_provider_cache_root,
+    fetch_dolphin_upstream_gecko, fetch_dolphin_upstream_gecko_with_transport, region_for_game_id,
+    revision_applicability,
 };
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
