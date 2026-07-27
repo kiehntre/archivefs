@@ -34,6 +34,7 @@ mod cheat_sources;
 mod cht_document;
 mod destination_safety;
 mod dolphin_local;
+mod gecko_document;
 mod import_safety;
 mod matching;
 mod pcsx2;
@@ -167,6 +168,11 @@ pub use dolphin_local::{
     DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
     DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
     inspect_dolphin_profile, match_dolphin_inventory,
+};
+pub use gecko_document::{
+    DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
+    GeckoCodeWarningKind, MAX_GECKO_CODE_LINES, MAX_GECKO_CODES, MAX_GECKO_LINE_BYTES,
+    parse_dolphin_ini, replace_gecko_enabled_section,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
