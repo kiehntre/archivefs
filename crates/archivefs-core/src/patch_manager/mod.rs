@@ -49,6 +49,7 @@ mod retroarch_inventory;
 mod retroarch_materialization;
 mod shared_preview;
 mod shared_transaction;
+mod xenia_install_plan;
 mod xenia_local;
 mod xenia_patch_document;
 mod xenia_provider;
@@ -281,6 +282,14 @@ pub use shared_transaction::{
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
+};
+pub use xenia_install_plan::{
+    LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,
+    StagedXeniaPatchFile, XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateEvidence,
+    XeniaCandidateOutcome, XeniaInstallPlanError, XeniaInstallPlanErrorKind, XeniaInstallPreview,
+    XeniaInstallPreviewRequest, XeniaOutcomeBlockedReason, XeniaPatchSelection,
+    XeniaPatchSelectionEntry, build_xenia_candidates, build_xenia_install_preview,
+    load_xenia_destination, stage_xenia_patch_file,
 };
 pub use xenia_local::{
     XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaPatchesDirectoryState,
