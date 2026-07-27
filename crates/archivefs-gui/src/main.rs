@@ -5302,6 +5302,7 @@ impl ArchiveFsApp {
             return;
         };
         if workflow.adapter != CheatEmulatorAdapter::Dolphin
+            || !platform_is_gamecube(workflow.platform.as_deref())
             || matches!(workflow.dolphin_provider, CheatStepResource::Loading { .. })
         {
             return;
@@ -15455,6 +15456,14 @@ fn platform_is_dolphin(platform: Option<&str>) -> bool {
     })
 }
 
+fn platform_is_gamecube(platform: Option<&str>) -> bool {
+    platform.is_some_and(|platform| {
+        ["GameCube", "Nintendo GameCube"]
+            .iter()
+            .any(|candidate| platform.eq_ignore_ascii_case(candidate))
+    })
+}
+
 /// Routes one canonical library platform to exactly one workflow. This is
 /// intentionally not a UI preference: rendering two adapters against one
 /// archive allowed stale profile/candidate state from the wrong system to
@@ -15903,6 +15912,15 @@ fn show_dolphin_external_provider(
         );
         ui.label("Gecko definitions from the Dolphin Emulator upstream GameSettings dataset.");
     });
+    if !platform_is_gamecube(workflow.platform.as_deref()) {
+        widgets::banner(
+            ui,
+            "External provider unavailable for this platform",
+            "This milestone supports exact-ID external Gecko retrieval for GameCube only. Existing Wii GameSettings inspection remains read-only.",
+            widgets::StatusTone::Pending,
+        );
+        return None;
+    }
     let identity_ready = ready_game_identity(workflow)
         .and_then(GameIdentityReport::verified_dolphin_game_id)
         .is_some()
@@ -26899,6 +26917,32 @@ $Instant Growth [Nayr]\n";
         assert!(workflow.dolphin_provider_selection.is_none());
         assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
         assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn external_gecko_provider_is_not_offered_for_wii() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-provider-wii-scope-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        app.cheat_workflow.as_mut().unwrap().platform = Some("Wii".to_string());
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let workflow = app.cheat_workflow.as_mut().unwrap();
+                let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "supports exact-ID external Gecko retrieval for GameCube only"
+        ));
+        assert!(!rendered_text_contains(&output, "Fetch Gecko codes"));
         let _ = std::fs::remove_dir_all(&temp);
     }
 
