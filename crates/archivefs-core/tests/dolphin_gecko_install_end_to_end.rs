@@ -402,16 +402,35 @@ fn external_gafe01_provider() -> GeckoProviderResult {
     }
 }
 
-#[test]
-fn external_provider_creates_a_missing_ini_and_rollback_removes_it() {
-    let fixture = Fixture::new("provider-create-rollback");
+struct AppliedExternalProvider {
+    configuration_path: PathBuf,
+    destination: PathBuf,
+    history_root: PathBuf,
+    backup_root: PathBuf,
+    journal_path: PathBuf,
+}
+
+fn apply_external_provider(
+    fixture: &Fixture,
+    operation: &str,
+    create_game_settings: bool,
+    previous: Option<&[u8]>,
+) -> AppliedExternalProvider {
     let configuration_path = fixture.dir("dolphin");
+    let game_settings = configuration_path.join("GameSettings");
+    if create_game_settings || previous.is_some() {
+        fs::create_dir(&game_settings).unwrap();
+    }
+    let destination_path = game_settings.join("GAFE01.ini");
+    if let Some(previous) = previous {
+        fs::write(&destination_path, previous).unwrap();
+    }
     let archive = fixture.write("library/Animal Crossing (USA).zip", "zip fixture");
     let staging_root = fixture.path("managed/generated-dolphin");
     let history_root = fixture.dir("managed/history");
     let backup_root = fixture.dir("managed/backups");
     let destination = load_dolphin_destination(&configuration_path, "GAFE01").unwrap();
-    assert!(!destination.existed);
+    assert_eq!(destination.existed, previous.is_some());
     let provider = external_gafe01_provider();
     let mut selection = DolphinProviderCodeSelection::from_provider(&provider, &destination);
     selection.select_all();
@@ -439,9 +458,9 @@ fn external_provider_creates_a_missing_ini_and_rollback_removes_it() {
             confirmation: Some(SharedApplyConfirmation {
                 plan_id: plan.plan_id.clone(),
                 general_approved: true,
-                replacement_approved: false,
+                replacement_approved: previous.is_some(),
             }),
-            operation_id: "provider-create".to_string(),
+            operation_id: operation.to_string(),
             timestamp_unix_seconds: 1_700_000_500,
             current_context: plan.context.clone(),
             history_root: history_root.clone(),
@@ -457,30 +476,135 @@ fn external_provider_creates_a_missing_ini_and_rollback_removes_it() {
         fs::read_to_string(&destination.path).unwrap(),
         staged.contents
     );
-    assert!(
-        applied.journal.entries[0].backup_path.is_none(),
-        "a newly-created file has no previous bytes to back up"
+    let entry = &applied.journal.entries[0];
+    assert_eq!(
+        entry.destination_existed_before_apply,
+        Some(previous.is_some())
     );
+    assert_eq!(
+        entry.destination_parent_existed_before_apply,
+        Some(create_game_settings || previous.is_some())
+    );
+    if let Some(previous) = previous {
+        let backup = entry.backup_path.as_ref().unwrap().to_path_buf().unwrap();
+        assert_eq!(fs::read(backup).unwrap(), previous);
+    } else {
+        assert!(entry.backup_path.is_none());
+    }
+    AppliedExternalProvider {
+        configuration_path,
+        destination: destination_path,
+        history_root,
+        backup_root,
+        journal_path: applied.journal_path.unwrap(),
+    }
+}
 
+fn rollback_external_provider(
+    applied: &AppliedExternalProvider,
+    operation: &str,
+) -> archivefs_core::patch_manager::SharedRollbackResult {
     let rollback_preview = preview_shared_rollback(
-        applied.journal_path.as_ref().unwrap(),
-        &configuration_path,
-        &backup_root,
+        &applied.journal_path,
+        &applied.configuration_path,
+        &applied.backup_root,
     );
     assert!(rollback_preview.available);
-    let rollback = execute_shared_rollback(
+    execute_shared_rollback(
         &rollback_preview,
         &SharedRollbackOptions {
             confirmation: SharedRollbackConfirmation {
                 preview_id: rollback_preview.preview_id.clone(),
                 approved: true,
             },
-            rollback_operation_id: "provider-create-rollback".to_string(),
+            rollback_operation_id: operation.to_string(),
             timestamp_unix_seconds: 1_700_000_600,
-            history_root,
-            backup_root,
+            history_root: applied.history_root.clone(),
+            backup_root: applied.backup_root.clone(),
         },
-    );
+    )
+}
+
+#[test]
+fn absent_destination_in_existing_directory_is_removed_but_directory_remains() {
+    let fixture = Fixture::new("provider-existing-parent");
+    let applied = apply_external_provider(&fixture, "existing-parent", true, None);
+    let rollback = rollback_external_provider(&applied, "existing-parent-rollback");
     assert_eq!(rollback.status, SharedApplyStatus::Success);
-    assert!(!destination.path.exists());
+    assert!(!applied.destination.exists());
+    assert!(applied.destination.parent().unwrap().is_dir());
+
+    let repeated = preview_shared_rollback(
+        &applied.journal_path,
+        &applied.configuration_path,
+        &applied.backup_root,
+    );
+    assert!(!repeated.available);
+    assert_eq!(
+        repeated.entries[0].outcome,
+        SharedRollbackOutcome::AlreadyRolledBack
+    );
+}
+
+#[test]
+fn absent_destination_and_directory_are_both_removed_on_rollback() {
+    let fixture = Fixture::new("provider-missing-parent");
+    let applied = apply_external_provider(&fixture, "missing-parent", false, None);
+    let game_settings = applied.destination.parent().unwrap().to_path_buf();
+    assert!(game_settings.is_dir());
+    let rollback = rollback_external_provider(&applied, "missing-parent-rollback");
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(!applied.destination.exists());
+    assert!(!game_settings.exists());
+}
+
+#[test]
+fn preexisting_empty_destination_is_restored_and_kept() {
+    let fixture = Fixture::new("provider-empty-existing");
+    let applied = apply_external_provider(&fixture, "empty-existing", true, Some(b""));
+    let rollback = rollback_external_provider(&applied, "empty-existing-rollback");
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(applied.destination.is_file());
+    assert_eq!(fs::read(&applied.destination).unwrap(), b"");
+    assert!(applied.destination.parent().unwrap().is_dir());
+}
+
+#[test]
+fn preexisting_nonempty_destination_is_restored_byte_for_byte() {
+    let fixture = Fixture::new("provider-nonempty-existing");
+    let previous = b"[Core]\nFastDiscSpeed = True\n";
+    let applied = apply_external_provider(&fixture, "nonempty-existing", true, Some(previous));
+    let rollback = rollback_external_provider(&applied, "nonempty-existing-rollback");
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert_eq!(fs::read(&applied.destination).unwrap(), previous);
+}
+
+#[test]
+fn unrelated_file_prevents_created_directory_removal() {
+    let fixture = Fixture::new("provider-unrelated");
+    let applied = apply_external_provider(&fixture, "unrelated", false, None);
+    let game_settings = applied.destination.parent().unwrap();
+    let unrelated = game_settings.join("OTHER01.ini");
+    fs::write(&unrelated, b"unrelated").unwrap();
+    let rollback = rollback_external_provider(&applied, "unrelated-rollback");
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(!applied.destination.exists());
+    assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
+    assert!(game_settings.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_gamesettings_escape_remains_blocked() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("provider-symlink");
+    let configuration_path = fixture.dir("dolphin");
+    let outside = fixture.dir("outside");
+    symlink(outside, configuration_path.join("GameSettings")).unwrap();
+    let error = load_dolphin_destination(&configuration_path, "GAFE01").unwrap_err();
+    assert_eq!(
+        error.kind,
+        archivefs_core::patch_manager::DolphinInstallPlanErrorKind::DestinationUnsafe
+    );
 }

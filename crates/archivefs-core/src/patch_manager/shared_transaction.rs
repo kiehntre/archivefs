@@ -70,6 +70,7 @@ enum FaultPoint {
     ParentCreationRace,
     SourceMutation,
     DestinationMutation,
+    RollbackRemovalVerification,
     RollbackRestore,
 }
 
@@ -299,6 +300,13 @@ pub enum SharedApplyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedApplyEntry {
     pub plan_entry: SharedPlanEntry,
+    /// Explicit filesystem facts observed under the destination lock before
+    /// apply. These are not inferred from byte length: an existing empty file
+    /// is still an existing file and must be restored, not removed.
+    #[serde(default)]
+    pub destination_existed_before_apply: Option<bool>,
+    #[serde(default)]
+    pub destination_parent_existed_before_apply: Option<bool>,
     pub observed_source_digest: Option<String>,
     pub observed_destination_digest: Option<String>,
     pub backup_path: Option<SharedTransactionPath>,
@@ -763,6 +771,8 @@ fn apply_one(
 ) -> SharedApplyEntry {
     let mut result = SharedApplyEntry {
         plan_entry: plan.clone(),
+        destination_existed_before_apply: None,
+        destination_parent_existed_before_apply: None,
         observed_source_digest: None,
         observed_destination_digest: None,
         backup_path: None,
@@ -870,6 +880,7 @@ fn apply_one(
         }
     };
     let destination = assessment.proposed_destination.path().to_path_buf();
+    let parent = destination.parent().unwrap_or(destination_root);
     let current = if assessment.destination_state == DestinationState::RegularFile {
         match stable_hash(&destination, SHARED_MAX_SOURCE_BYTES) {
             Ok(value) => Some(value),
@@ -886,6 +897,8 @@ fn apply_one(
     } else {
         None
     };
+    result.destination_existed_before_apply = Some(current.is_some());
+    result.destination_parent_existed_before_apply = Some(parent.exists());
     result.observed_destination_digest = current.as_ref().map(|value| value.digest.clone());
     if should_inject(FaultPoint::DestinationMutation) {
         return fail_result(
@@ -935,7 +948,6 @@ fn apply_one(
         result.outcome = SharedApplyOutcome::DryRun;
         return result;
     }
-    let parent = destination.parent().unwrap_or(destination_root);
     if !parent.exists() {
         if !plan.parent_creation_approved
             || !matches!(
@@ -1212,15 +1224,28 @@ pub fn execute_shared_rollback(
             rollback.outcome = SharedRollbackOutcome::Failed;
             continue;
         };
-        match install.outcome {
-            SharedApplyOutcome::InstalledNew => match fs::remove_file(&destination) {
-                Ok(()) => {
-                    rollback.outcome = SharedRollbackOutcome::RemovedInstalledFile;
-                    cleanup_created_directories(install, &root);
+        let existed_before = install.destination_existed_before_apply.unwrap_or(matches!(
+            install.outcome,
+            SharedApplyOutcome::ReplacedExisting
+        ));
+        match (install.outcome, existed_before) {
+            (SharedApplyOutcome::InstalledNew, false) => {
+                match remove_and_verify_new_destination(&destination) {
+                    Ok(()) => {
+                        rollback.outcome = SharedRollbackOutcome::RemovedInstalledFile;
+                        cleanup_created_directories(install, &root);
+                    }
+                    Err(kind) => {
+                        rollback.outcome = SharedRollbackOutcome::Failed;
+                        rollback.failure = Some(failure(
+                            kind,
+                            Some(&destination),
+                            "newly installed destination could not be removed and verified absent",
+                        ));
+                    }
                 }
-                Err(_) => rollback.outcome = SharedRollbackOutcome::Failed,
-            },
-            SharedApplyOutcome::ReplacedExisting => {
+            }
+            (SharedApplyOutcome::ReplacedExisting, true) => {
                 let Some(backup) = install.backup_path.as_ref() else {
                     rollback.outcome = SharedRollbackOutcome::Failed;
                     continue;
@@ -1236,8 +1261,23 @@ pub fn execute_shared_rollback(
                 }
                 match atomic_write(&backup, &destination, expected, false) {
                     Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
-                    Err(_) => rollback.outcome = SharedRollbackOutcome::Failed,
+                    Err((kind, _)) => {
+                        rollback.outcome = SharedRollbackOutcome::Failed;
+                        rollback.failure = Some(failure(
+                            kind,
+                            Some(&destination),
+                            "previous destination bytes could not be restored and verified",
+                        ));
+                    }
                 }
+            }
+            (SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting, _) => {
+                rollback.outcome = SharedRollbackOutcome::Failed;
+                rollback.failure = Some(failure(
+                    SharedApplyFailureKind::InvalidJournal,
+                    Some(&destination),
+                    "journal outcome contradicts explicit pre-apply destination existence",
+                ));
             }
             _ => rollback.outcome = SharedRollbackOutcome::NoChangeRequired,
         }
@@ -1584,6 +1624,20 @@ fn rollback_entry_preview(
         result.outcome = SharedRollbackOutcome::NoChangeRequired;
         return result;
     }
+    if entry
+        .destination_existed_before_apply
+        .is_some_and(|existed| {
+            existed != matches!(entry.outcome, SharedApplyOutcome::ReplacedExisting)
+        })
+    {
+        result.outcome = SharedRollbackOutcome::JournalMalformed;
+        result.failure = Some(failure(
+            SharedApplyFailureKind::InvalidJournal,
+            destination.as_deref().ok(),
+            "journal outcome contradicts explicit pre-apply destination existence",
+        ));
+        return result;
+    }
     let Ok(destination) = destination else {
         result.outcome = SharedRollbackOutcome::DestinationUnsafe;
         return result;
@@ -1634,7 +1688,27 @@ fn rollback_entry_preview(
     result
 }
 
+fn remove_and_verify_new_destination(destination: &Path) -> Result<(), SharedApplyFailureKind> {
+    reject_symlink_components(destination)?;
+    fs::remove_file(destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+    if should_inject(FaultPoint::RollbackRemovalVerification) {
+        fs::write(destination, b"").map_err(|_| SharedApplyFailureKind::VerificationFailed)?;
+    }
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = destination.parent() {
+                sync_directory(parent);
+            }
+            Ok(())
+        }
+        _ => Err(SharedApplyFailureKind::VerificationFailed),
+    }
+}
+
 fn cleanup_created_directories(entry: &SharedApplyEntry, root: &Path) {
+    if entry.destination_parent_existed_before_apply == Some(true) {
+        return;
+    }
     for encoded in entry.created_directories.iter().rev() {
         let Ok(path) = encoded.to_path_buf() else {
             continue;
@@ -1880,6 +1954,8 @@ fn failed_entry(
     fail_result(
         SharedApplyEntry {
             plan_entry: plan.clone(),
+            destination_existed_before_apply: None,
+            destination_parent_existed_before_apply: None,
             observed_source_digest: None,
             observed_destination_digest: None,
             backup_path: None,
@@ -2149,6 +2225,14 @@ mod tests {
         let destination = fixture.destination_root().join("Nintendo - NES/game.cht");
         assert_eq!(fs::read(&destination).unwrap(), b"new");
         assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert_eq!(
+            result.journal.entries[0].destination_existed_before_apply,
+            Some(false)
+        );
+        assert_eq!(
+            result.journal.entries[0].destination_parent_existed_before_apply,
+            Some(false)
+        );
         let journal_path = result.journal_path.unwrap();
         assert!(journal_path.exists());
         assert_eq!(
@@ -2193,6 +2277,57 @@ mod tests {
     }
 
     #[test]
+    fn rollback_reports_verification_failure_when_a_removed_new_file_reappears() {
+        let fixture = Fixture::new("rollback-remove-verification");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "remove-verification", false, true, false),
+        );
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::RollbackRemovalVerification));
+        let failed = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "remove-verification-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_eq!(failed.status, SharedApplyStatus::Failed);
+        assert_eq!(
+            failed.preview.entries[0].outcome,
+            SharedRollbackOutcome::Failed
+        );
+        assert_eq!(
+            failed.preview.entries[0]
+                .failure
+                .as_ref()
+                .map(|failure| failure.kind),
+            Some(SharedApplyFailureKind::VerificationFailed)
+        );
+        assert!(failed.journal_path.is_none());
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .is_file()
+        );
+    }
+
+    #[test]
     fn replacement_requires_permission_creates_verified_backup_and_restores_it() {
         let fixture = Fixture::new("replace");
         let report = preview(&fixture, b"new", Some(b"old"));
@@ -2215,6 +2350,8 @@ mod tests {
         );
         let entry = &result.journal.entries[0];
         assert_eq!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert_eq!(entry.destination_existed_before_apply, Some(true));
+        assert_eq!(entry.destination_parent_existed_before_apply, Some(true));
         let backup = entry.backup_path.as_ref().unwrap().to_path_buf().unwrap();
         assert_eq!(fs::read(&backup).unwrap(), b"old");
         let journal = result.journal_path.unwrap();
