@@ -190,7 +190,10 @@ impl XeniaPatchDocument {
 
     #[must_use]
     pub fn selectable_patch_count(&self) -> usize {
-        self.patches.iter().filter(|patch| patch.is_selectable()).count()
+        self.patches
+            .iter()
+            .filter(|patch| patch.is_selectable())
+            .count()
     }
 }
 
@@ -218,7 +221,10 @@ fn malformed(detail: impl Into<String>) -> XeniaPatchDocument {
         hashes: Vec::new(),
         media_ids: Vec::new(),
         patches: Vec::new(),
-        warnings: vec![document_warning(XeniaDocumentWarningKind::ParseError, detail)],
+        warnings: vec![document_warning(
+            XeniaDocumentWarningKind::ParseError,
+            detail,
+        )],
     }
 }
 
@@ -467,7 +473,9 @@ fn parse_patch_entry(table: &toml::Table) -> XeniaPatch {
     let known_keys = ["name", "desc", "author", "is_enabled"];
     for (key, value) in table {
         if known_keys.contains(&key.as_str())
-            || XeniaWriteKind::ALL.iter().any(|kind| kind.toml_key() == key)
+            || XeniaWriteKind::ALL
+                .iter()
+                .any(|kind| kind.toml_key() == key)
         {
             continue;
         }
@@ -508,12 +516,15 @@ fn parse_write(
             format!("address 0x{address:x} does not fit in 32 bits"),
         )
     })?;
-    let value = table.get("value").ok_or_else(|| {
-        patch_warning(XeniaPatchWarningKind::InvalidValue, "value is missing")
-    })?;
+    let value = table
+        .get("value")
+        .ok_or_else(|| patch_warning(XeniaPatchWarningKind::InvalidValue, "value is missing"))?;
 
     let write_value = match kind {
-        XeniaWriteKind::Be8 | XeniaWriteKind::Be16 | XeniaWriteKind::Be32 | XeniaWriteKind::Be64 => {
+        XeniaWriteKind::Be8
+        | XeniaWriteKind::Be16
+        | XeniaWriteKind::Be32
+        | XeniaWriteKind::Be64 => {
             let integer = value.as_integer().ok_or_else(|| {
                 patch_warning(
                     XeniaPatchWarningKind::InvalidValue,

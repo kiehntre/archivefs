@@ -34,6 +34,27 @@ const GAMECUBE_MAGIC_OFFSET: usize = 0x1c;
 const WII_MAGIC: [u8; 4] = [0x5d, 0x1c, 0x9e, 0xa3];
 const GAMECUBE_MAGIC: [u8; 4] = [0xc2, 0x33, 0x9f, 0x3d];
 
+/// Xbox 360 XEX2 module header - see `xex2_header` in Xenia's
+/// `xex2_info.h`. Only the unencrypted, uncompressed header is ever read;
+/// the compressed/encrypted module body is never touched.
+const XEX_MAGIC: [u8; 4] = *b"XEX2";
+const XEX_BASE_HEADER_BYTES: usize = 0x18;
+const XEX_HEADER_COUNT_OFFSET: usize = 0x14;
+const XEX_OPT_HEADER_TABLE_OFFSET: u64 = 0x18;
+const XEX_OPT_HEADER_ENTRY_BYTES: u64 = 8;
+/// `XEX_HEADER_EXECUTION_INFO` in Xenia's `xex2_header_keys`.
+const XEX_EXECUTION_INFO_KEY: u32 = 0x0004_0006;
+/// `sizeof(xex2_opt_execution_info)` (`static_assert_size(..., 0x18)`).
+const XEX_EXECUTION_INFO_BYTES: usize = 0x18;
+/// Bounds the optional-header table read (real XEX files carry a few
+/// dozen entries at most); prevents a corrupt `header_count` from
+/// requesting an unreasonable allocation.
+const MAX_XEX_OPT_HEADERS: u32 = 512;
+/// Bounds how much of a ZIP-contained XEX member is buffered before
+/// parsing. Real Xenia headers are a few KiB; this is generous enough for
+/// any legitimate header while remaining a small, fixed, safe read.
+const XEX_HEADER_PREFIX_BYTES: u64 = 16 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentityStatus {
     Verified,
@@ -74,6 +95,8 @@ pub enum IdentityKind {
     LooseRomSha256,
     LooseRomFormat,
     LooseRomTitle,
+    XexTitleId,
+    XexMediaId,
 }
 
 impl fmt::Display for IdentityKind {
@@ -89,6 +112,8 @@ impl fmt::Display for IdentityKind {
             Self::LooseRomSha256 => "Local ROM SHA-256",
             Self::LooseRomFormat => "Loose ROM format",
             Self::LooseRomTitle => "Normalized ROM title",
+            Self::XexTitleId => "Xbox 360 Title ID",
+            Self::XexMediaId => "Xbox 360 Media ID",
         };
         f.write_str(value)
     }
@@ -110,6 +135,7 @@ pub enum IdentityPlatform {
     Wii,
     MegaDrive,
     Snes,
+    Xbox360,
     Other,
 }
 
@@ -128,6 +154,7 @@ impl IdentityPlatform {
             | "super nintendo entertainment system"
             | "nintendo super nintendo entertainment system"
             | "super famicom" => Self::Snes,
+            "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             _ => Self::Other,
         }
     }
@@ -139,6 +166,7 @@ impl IdentityPlatform {
             Self::Wii => "Wii",
             Self::MegaDrive => "Mega Drive / Genesis",
             Self::Snes => "SNES",
+            Self::Xbox360 => "Xbox 360",
             Self::Other => "Unsupported platform",
         }
     }
@@ -149,6 +177,8 @@ pub enum IdentityImageFormat {
     Iso,
     ZipContainingIso,
     LooseCartridgeRom,
+    Xex,
+    ZipContainingXex,
     Deferred,
     Unsupported,
 }
@@ -215,6 +245,20 @@ impl GameIdentityReport {
     pub fn is_verified_loose_rom(&self) -> bool {
         self.format == IdentityImageFormat::LooseCartridgeRom
             && self.verified_loose_rom_sha256().is_some()
+    }
+
+    /// The verified Xbox 360 Title ID, formatted as eight uppercase hex
+    /// characters (matching the `xenia-canary/game-patches` filename and
+    /// `title_id` field convention).
+    pub fn verified_xex_title_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::XexTitleId)
+    }
+
+    /// The verified Xbox 360 Media ID, formatted as eight uppercase hex
+    /// characters. Read directly from the XEX execution-info header;
+    /// never derived from a title or filename.
+    pub fn verified_xex_media_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::XexMediaId)
     }
 }
 
@@ -300,7 +344,9 @@ fn inspect_game_identity_with_platform_trust(
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
-        "iso" => inspect_direct_iso(&mut report),
+        "iso" if platform != IdentityPlatform::Xbox360 => inspect_direct_iso(&mut report),
+        "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report),
+        "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report),
         "zip" => inspect_zip_iso(&mut report),
         "chd" | "cso" | "rvz" | "wbfs" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
@@ -313,7 +359,7 @@ fn inspect_game_identity_with_platform_trust(
         _ => add_unavailable(
             &mut report,
             IdentityStatus::Unsupported,
-            "only direct ISO and a single ISO inside ZIP are supported",
+            "only direct ISO, a single ISO inside ZIP, direct XEX, and a single XEX inside ZIP are supported",
         ),
     }
     report
@@ -657,6 +703,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport) {
         IdentityPlatform::PlayStation2
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
+        | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -677,6 +724,340 @@ fn inspect_zip_iso(report: &mut GameIdentityReport) {
     inspect_iso_source(report, &mut source, Some(member_path), Some(index));
 }
 
+fn inspect_direct_xex(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::Xex;
+    let file = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut source = FileSource {
+        file,
+        len,
+        bytes_read: 0,
+    };
+    inspect_xex_header(report, &mut source, None, None);
+    report.bytes_read = source.bytes_read;
+}
+
+fn inspect_zip_xex(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::ZipContainingXex;
+    report.nested_container_depth = 1;
+    let file = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("invalid ZIP: {error}"),
+            );
+            return;
+        }
+    };
+    if archive.len() > MAX_ARCHIVE_MEMBERS {
+        report.archive_members_inspected = MAX_ARCHIVE_MEMBERS;
+        add_unavailable(
+            report,
+            IdentityStatus::ResourceLimitReached,
+            "ZIP member limit reached before identity inspection",
+        );
+        return;
+    }
+    let mut xex_members = Vec::new();
+    for index in 0..archive.len() {
+        report.archive_members_inspected += 1;
+        let raw = match archive.by_index_raw(index) {
+            Ok(raw) => raw,
+            Err(error) => {
+                add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        };
+        if raw.encrypted() {
+            add_unavailable(
+                report,
+                IdentityStatus::Unsupported,
+                "encrypted ZIP entries are refused",
+            );
+            return;
+        }
+        if !raw.is_dir() && ascii_extension_is_xex(raw.name_raw()) {
+            xex_members.push((index, raw.name_raw().to_vec(), raw.size()));
+        }
+    }
+    if xex_members.is_empty() {
+        add_unavailable(
+            report,
+            IdentityStatus::Missing,
+            "ZIP contains no XEX member",
+        );
+        return;
+    }
+    if xex_members.len() != 1 {
+        add_unavailable(
+            report,
+            IdentityStatus::Ambiguous,
+            "ZIP contains multiple XEX members; none was selected implicitly",
+        );
+        return;
+    }
+    let (index, member_path, member_size) = xex_members.remove(0);
+    if member_path.len() > MAX_PATH_BYTES {
+        add_unavailable(
+            report,
+            IdentityStatus::ResourceLimitReached,
+            "XEX member path exceeds the path-length limit",
+        );
+        return;
+    }
+    let mut entry = match archive.by_index(index) {
+        Ok(entry) => entry,
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let read_cap = member_size.min(XEX_HEADER_PREFIX_BYTES);
+    let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
+    if let Err(error) = entry.by_ref().take(read_cap).read_to_end(&mut data) {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            &format!("could not read XEX member: {error}"),
+        );
+        return;
+    }
+    report.bytes_read = data.len() as u64;
+    let mut source = SliceSource {
+        data: &data,
+        declared_len: member_size,
+        truncated: member_size > data.len() as u64,
+    };
+    inspect_xex_header(report, &mut source, Some(member_path), Some(index));
+}
+
+/// Reads the unencrypted, uncompressed XEX2 module header: magic, the
+/// optional-header table, and (when present) the execution-info optional
+/// header holding `media_id`/`title_id`. Never reads the compressed or
+/// encrypted module body.
+fn inspect_xex_header(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut base = [0_u8; XEX_BASE_HEADER_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut base) {
+        let status = source_error_status(&error);
+        push_with_source(
+            report,
+            IdentityKind::XexTitleId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path.clone(),
+            member_index,
+            "bounded XEX header read",
+            "XEX header is truncated or unavailable",
+        );
+        push_with_source(
+            report,
+            IdentityKind::XexMediaId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "bounded XEX header read",
+            "XEX header is truncated or unavailable",
+        );
+        return;
+    }
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    if base[0..4] != XEX_MAGIC {
+        push_with_source(
+            report,
+            IdentityKind::XexTitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path.clone(),
+            member_index,
+            "XEX2 magic check",
+            "file does not begin with the XEX2 magic",
+        );
+        push_with_source(
+            report,
+            IdentityKind::XexMediaId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XEX2 magic check",
+            "file does not begin with the XEX2 magic",
+        );
+        return;
+    }
+    let header_count = u32::from_be_bytes(
+        base[XEX_HEADER_COUNT_OFFSET..XEX_HEADER_COUNT_OFFSET + 4]
+            .try_into()
+            .expect("4-byte slice"),
+    );
+    if header_count == 0 || header_count > MAX_XEX_OPT_HEADERS {
+        push_with_source(
+            report,
+            IdentityKind::XexTitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path.clone(),
+            member_index,
+            "XEX optional header count",
+            "optional header count is zero or exceeds the bounded limit",
+        );
+        push_with_source(
+            report,
+            IdentityKind::XexMediaId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XEX optional header count",
+            "optional header count is zero or exceeds the bounded limit",
+        );
+        return;
+    }
+    let mut table = vec![0_u8; (u64::from(header_count) * XEX_OPT_HEADER_ENTRY_BYTES) as usize];
+    if let Err(error) = source.read_exact_at(XEX_OPT_HEADER_TABLE_OFFSET, &mut table) {
+        let status = source_error_status(&error);
+        push_with_source(
+            report,
+            IdentityKind::XexTitleId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path.clone(),
+            member_index,
+            "XEX optional header table read",
+            "optional header table is truncated or unavailable",
+        );
+        push_with_source(
+            report,
+            IdentityKind::XexMediaId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XEX optional header table read",
+            "optional header table is truncated or unavailable",
+        );
+        return;
+    }
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    let execution_info_offset = table.chunks_exact(8).find_map(|entry| {
+        let key = u32::from_be_bytes(entry[0..4].try_into().expect("4-byte slice"));
+        (key == XEX_EXECUTION_INFO_KEY)
+            .then(|| u32::from_be_bytes(entry[4..8].try_into().expect("4-byte slice")))
+    });
+    let Some(offset) = execution_info_offset else {
+        push_with_source(
+            report,
+            IdentityKind::XexTitleId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path.clone(),
+            member_index,
+            "XEX optional header table",
+            "no execution-info optional header is present",
+        );
+        push_with_source(
+            report,
+            IdentityKind::XexMediaId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XEX optional header table",
+            "no execution-info optional header is present",
+        );
+        return;
+    };
+    let mut execution_info = [0_u8; XEX_EXECUTION_INFO_BYTES];
+    if let Err(error) = source.read_exact_at(u64::from(offset), &mut execution_info) {
+        let status = source_error_status(&error);
+        push_with_source(
+            report,
+            IdentityKind::XexTitleId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path.clone(),
+            member_index,
+            "XEX execution-info optional header read",
+            "execution-info header is truncated or unavailable",
+        );
+        push_with_source(
+            report,
+            IdentityKind::XexMediaId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XEX execution-info optional header read",
+            "execution-info header is truncated or unavailable",
+        );
+        return;
+    }
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    let media_id = u32::from_be_bytes(execution_info[0x0..0x4].try_into().expect("4-byte slice"));
+    let title_id = u32::from_be_bytes(execution_info[0xC..0x10].try_into().expect("4-byte slice"));
+    push_with_source(
+        report,
+        IdentityKind::XexTitleId,
+        IdentityStatus::Verified,
+        Some(format!("{title_id:08X}")),
+        IdentityConfidence::ExactBytes,
+        member_path.clone(),
+        member_index,
+        "XEX execution-info optional header (title_id)",
+        "verified directly from the reviewed XEX execution-info header",
+    );
+    push_with_source(
+        report,
+        IdentityKind::XexMediaId,
+        IdentityStatus::Verified,
+        Some(format!("{media_id:08X}")),
+        IdentityConfidence::ExactBytes,
+        member_path,
+        member_index,
+        "XEX execution-info optional header (media_id)",
+        "verified directly from the reviewed XEX execution-info header",
+    );
+    report.complete = true;
+}
+
 fn inspect_iso_source(
     report: &mut GameIdentityReport,
     source: &mut dyn ByteSource,
@@ -690,7 +1071,10 @@ fn inspect_iso_source(
         IdentityPlatform::PlayStation2 => {
             inspect_ps2_iso(report, source, member_path, member_index)
         }
-        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => {}
+        IdentityPlatform::MegaDrive
+        | IdentityPlatform::Snes
+        | IdentityPlatform::Xbox360
+        | IdentityPlatform::Other => {}
     }
 }
 
@@ -1457,6 +1841,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
+        IdentityPlatform::Xbox360 => &[IdentityKind::XexTitleId, IdentityKind::XexMediaId],
         IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => &[],
     };
     for kind in kinds {
@@ -1518,6 +1903,22 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
                 }
             }
         }
+        IdentityPlatform::Xbox360 => {
+            for token in stem.split(|character: char| !character.is_ascii_alphanumeric()) {
+                if token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    report.evidence.push(evidence(
+                        report,
+                        IdentityKind::XexTitleId,
+                        IdentityStatus::Candidate,
+                        Some(token.to_string()),
+                        IdentityConfidence::FilenameOnly,
+                        "archive filename is candidate evidence only",
+                        "archive filename token",
+                    ));
+                    break;
+                }
+            }
+        }
         IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => {}
     }
 }
@@ -1538,6 +1939,16 @@ fn ascii_extension_is_iso(path: &[u8]) -> bool {
         return false;
     };
     name[dot + 1..].eq_ignore_ascii_case(b"iso")
+}
+
+fn ascii_extension_is_xex(path: &[u8]) -> bool {
+    let Some(name) = path.rsplit(|byte| *byte == b'/' || *byte == b'\\').next() else {
+        return false;
+    };
+    let Some(dot) = name.iter().rposition(|byte| *byte == b'.') else {
+        return false;
+    };
+    name[dot + 1..].eq_ignore_ascii_case(b"xex")
 }
 
 fn strip_iso_version(name: &[u8]) -> &[u8] {
@@ -2019,5 +2430,152 @@ mod tests {
                 .any(|warning| warning.contains("path encoding"))
         );
         assert!(real.exists());
+    }
+
+    /// A minimal, well-formed XEX2 header: magic, one optional header
+    /// entry (execution-info) pointing at a real `xex2_opt_execution_info`
+    /// struct holding `media_id`/`title_id`.
+    fn xex_fixture(title_id: u32, media_id: u32) -> Vec<u8> {
+        const EXECUTION_INFO_OFFSET: u32 = 0x30;
+        let mut bytes = vec![0_u8; EXECUTION_INFO_OFFSET as usize + XEX_EXECUTION_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&XEX_MAGIC);
+        bytes[XEX_HEADER_COUNT_OFFSET..XEX_HEADER_COUNT_OFFSET + 4]
+            .copy_from_slice(&1_u32.to_be_bytes());
+        let table_offset = XEX_OPT_HEADER_TABLE_OFFSET as usize;
+        bytes[table_offset..table_offset + 4]
+            .copy_from_slice(&XEX_EXECUTION_INFO_KEY.to_be_bytes());
+        bytes[table_offset + 4..table_offset + 8]
+            .copy_from_slice(&EXECUTION_INFO_OFFSET.to_be_bytes());
+        let info_offset = EXECUTION_INFO_OFFSET as usize;
+        bytes[info_offset..info_offset + 4].copy_from_slice(&media_id.to_be_bytes());
+        bytes[info_offset + 0xC..info_offset + 0x10].copy_from_slice(&title_id.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn verifies_xex_title_id_and_media_id_from_execution_info() {
+        let directory = FixtureDir::new("xex");
+        let path = write_fixture(
+            &directory,
+            "default.xex",
+            &xex_fixture(0x4156_07D2, 0x4C27_792A),
+        );
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), Some("415607D2"));
+        assert_eq!(report.verified_xex_media_id(), Some("4C27792A"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn xex_wrong_magic_never_becomes_verified() {
+        let directory = FixtureDir::new("xex-bad-magic");
+        let mut bytes = xex_fixture(0x4156_07D2, 0);
+        bytes[0..4].copy_from_slice(b"NOPE");
+        let path = write_fixture(&directory, "default.xex", &bytes);
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn truncated_xex_header_is_invalid_not_verified() {
+        let directory = FixtureDir::new("xex-truncated");
+        let path = write_fixture(&directory, "default.xex", b"XEX2");
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), None);
+        assert_eq!(report.verified_xex_media_id(), None);
+    }
+
+    #[test]
+    fn xex_with_no_execution_info_header_is_missing_not_fabricated() {
+        let directory = FixtureDir::new("xex-no-exec-info");
+        let mut bytes = xex_fixture(0x4156_07D2, 0);
+        // Point the one optional-header entry at an unrelated key so no
+        // execution-info header is found.
+        let table_offset = XEX_OPT_HEADER_TABLE_OFFSET as usize;
+        bytes[table_offset..table_offset + 4].copy_from_slice(&0x0002_0000_u32.to_be_bytes());
+        let path = write_fixture(&directory, "default.xex", &bytes);
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::XexTitleId && item.status == IdentityStatus::Missing
+        }));
+    }
+
+    #[test]
+    fn zip_with_one_xex_reads_only_the_xex_header() {
+        let directory = FixtureDir::new("zip-xex");
+        let path = directory.0.join("container.zip");
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file(
+                "default.xex",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )
+            .unwrap();
+        let mut image = xex_fixture(0x4156_07D2, 0x0000_0000);
+        image.resize(2 * 1024 * 1024, 0);
+        writer.write_all(&image).unwrap();
+        writer.finish().unwrap();
+
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), Some("415607D2"));
+        assert_eq!(report.archive_members_inspected, 1);
+        assert_eq!(report.nested_container_depth, 1);
+        assert!(report.bytes_read <= XEX_HEADER_PREFIX_BYTES);
+    }
+
+    #[test]
+    fn zip_with_multiple_xex_members_is_ambiguous_not_guessed() {
+        let directory = FixtureDir::new("zip-xex-ambiguous");
+        let path = directory.0.join("container.zip");
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        for name in ["default.xex", "dash.xex"] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&xex_fixture(0x4156_07D2, 0)).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn xex_filename_token_is_only_ever_a_candidate() {
+        let report = inspect_game_identity(Path::new("/games/415607D2.chd"), Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::XexTitleId
+                && item.status == IdentityStatus::Candidate
+                && item.value.as_deref() == Some("415607D2")
+        }));
+    }
+
+    #[test]
+    fn xbox_360_never_reads_an_iso_extension_as_a_disc_image() {
+        let directory = FixtureDir::new("xex-not-iso");
+        let path = write_fixture(
+            &directory,
+            "game.iso",
+            &dolphin_fixture(IdentityPlatform::GameCube, b"GM8E01", 0),
+        );
+        let report = inspect_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(report.verified_xex_title_id(), None);
+        assert_eq!(report.format, IdentityImageFormat::Unsupported);
     }
 }
