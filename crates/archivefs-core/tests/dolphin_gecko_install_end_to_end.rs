@@ -183,7 +183,10 @@ impl Workflow {
                 general_approved: true,
                 replacement_approved,
             }),
-            operation_id: format!("test-dolphin-op-{}", COUNTER.fetch_add(1, Ordering::Relaxed)),
+            operation_id: format!(
+                "test-dolphin-op-{}",
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
             timestamp_unix_seconds: 1_700_000_300,
             current_context: plan.context.clone(),
             history_root: self.history_root.clone(),
@@ -292,14 +295,10 @@ fn install_and_rollback_round_trip_restores_the_exact_original_file() {
     );
     assert_eq!(rollback.status, SharedApplyStatus::Success);
     assert!(
-        rollback
-            .preview
-            .entries
-            .iter()
-            .all(|entry| matches!(
-                entry.outcome,
-                SharedRollbackOutcome::RestoredBackup | SharedRollbackOutcome::Available
-            )),
+        rollback.preview.entries.iter().all(|entry| matches!(
+            entry.outcome,
+            SharedRollbackOutcome::RestoredBackup | SharedRollbackOutcome::Available
+        )),
         "{:?}",
         rollback.preview.entries
     );

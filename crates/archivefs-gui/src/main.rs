@@ -31,28 +31,29 @@ use archivefs_core::patch_manager::{
     DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
     DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
     DolphinProfileScope, DolphinSettingsDirectoryState, HttpsCheatSourceTransport,
-    ImportSourceKind, ImportTrustState, LoadedCandidate, LoadedDolphinIni, LocalSafetyScanningState,
-    Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState,
-    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots,
-    Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState, PreviewEligibility,
-    PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
-    PreviewSourceItem, PreviewState, ResolvedCheatDestination, RetroArchCheatLibraryInspection,
-    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
-    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
-    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
-    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, StagedCheatFile, StagedDolphinIni, UNKNOWN_CODE_POLICY,
-    adapter_write_support, build_cheat_candidates, build_cheat_install_preview,
-    build_dolphin_candidate, build_dolphin_install_preview, build_shared_preview,
-    build_shared_transaction_plan, default_cheat_source_cache_root, default_shared_backup_root,
-    default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
-    discover_retroarch_cheat_setup_profiles, discover_shared_apply_history, execute_shared_apply,
-    execute_shared_rollback, fetch_retroarch_cheat_source, generate_shared_operation_id,
-    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
-    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
-    load_dolphin_ini, match_dolphin_inventory, match_pcsx2_inventory, match_strength_for_candidate,
+    ImportSourceKind, ImportTrustState, LoadedCandidate, LoadedDolphinIni,
+    LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, ResolvedCheatDestination,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
+    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
+    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    StagedCheatFile, StagedDolphinIni, UNKNOWN_CODE_POLICY, adapter_write_support,
+    build_cheat_candidates, build_cheat_install_preview, build_dolphin_candidate,
+    build_dolphin_install_preview, build_shared_preview, build_shared_transaction_plan,
+    default_cheat_source_cache_root, default_shared_backup_root, default_shared_history_root,
+    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
+    fetch_retroarch_cheat_source, generate_shared_operation_id, inspect_dolphin_profile,
+    inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
+    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_ini,
+    match_dolphin_inventory, match_pcsx2_inventory, match_strength_for_candidate,
     materialize_retroarch_shared_preview, preview_shared_rollback, resolve_cheat_destination,
     stage_dolphin_ini, stage_generated_cheat_file,
 };
@@ -4966,6 +4967,7 @@ impl ArchiveFsApp {
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id,
+            dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
             dolphin_candidate_outcome: None,
@@ -5433,12 +5435,8 @@ impl ArchiveFsApp {
             ),
         ));
         let response = (|| {
-            let staged = stage_dolphin_ini(
-                &staging_root,
-                &file_name,
-                &state.loaded.document,
-                &names,
-            )?;
+            let staged =
+                stage_dolphin_ini(&staging_root, &file_name, &state.loaded.document, &names)?;
             let preview = build_dolphin_install_preview(&DolphinInstallPreviewRequest {
                 selected_archive: archive_path.clone(),
                 configuration_path,
@@ -6868,8 +6866,20 @@ impl ArchiveFsApp {
             "Dolphin profile discovery started.",
         ));
         self.dolphin_profiles = DolphinProfilesState::Scanning { receiver };
+        let explicit_root = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| workflow.dolphin_explicit_root.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         thread::spawn(move || {
-            let result = DolphinProfileDiscoveryRoots::from_environment()
+            let result = DolphinProfileDiscoveryRoots::from_environment().map(|mut roots| {
+                if let Some(explicit_root) = explicit_root {
+                    roots.explicit_configuration_roots.push(explicit_root);
+                }
+                roots
+            });
+            let result = result
                 .and_then(|roots| discover_dolphin_profiles(&roots))
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);
@@ -13968,6 +13978,12 @@ struct CheatWorkflowState {
     pcsx2_inventory_profile_id: Option<String>,
     pcsx2_inventory: CheatStepResource<Pcsx2PnachInventory>,
     selected_dolphin_profile_id: Option<String>,
+    /// An optional additional Dolphin configuration directory to scan,
+    /// typed by the user - covers portable/AppImage installs, which have
+    /// no fixed native or Flatpak path ArchiveFS can discover on its own.
+    /// Never auto-populated; rescanning without it drops nothing already
+    /// found under the standard native/Flatpak locations.
+    dolphin_explicit_root: String,
     /// The Dolphin profile identity bound to this archive's inventory.
     dolphin_inventory_profile_id: Option<String>,
     dolphin_inventory: CheatStepResource<DolphinGameIniInventory>,
@@ -15614,6 +15630,13 @@ fn show_dolphin_workflow(
             }
         }
     }
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Additional Dolphin directory (portable/AppImage installs):");
+        ui.text_edit_singleline(&mut workflow.dolphin_explicit_root);
+    });
+    ui.label(
+        "Optional. Native and Flatpak installs are found automatically; a portable install's own User directory is not, and must be typed here.",
+    );
     if widgets::action_button(
         ui,
         "Rescan Dolphin profiles",
@@ -15737,7 +15760,12 @@ fn show_dolphin_candidate_and_selection(
                     .blocked_reason
                     .map(DolphinCandidateBlockedReason::message)
                     .unwrap_or("No matching Game INI file was found.");
-                widgets::banner(ui, "No exact candidate", message, widgets::StatusTone::Pending);
+                widgets::banner(
+                    ui,
+                    "No exact candidate",
+                    message,
+                    widgets::StatusTone::Pending,
+                );
                 for path in &outcome.conflicting_paths {
                     if widgets::path_value(ui, "Conflicting file", path) {
                         let _ = clipboard.set_text(path.display().to_string());
@@ -15849,11 +15877,7 @@ fn show_dolphin_code_picker(
                     widgets::status_badge(ui, "Unavailable", widgets::StatusTone::Blocked);
                 }
                 if entry.already_enabled {
-                    widgets::status_badge(
-                        ui,
-                        "Already enabled in file",
-                        widgets::StatusTone::Info,
-                    );
+                    widgets::status_badge(ui, "Already enabled in file", widgets::StatusTone::Info);
                 }
             });
             for note in &entry.notes {
@@ -25867,6 +25891,7 @@ mod tests {
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id: None,
+            dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
             dolphin_candidate_outcome: None,
@@ -26392,10 +26417,8 @@ $Instant Growth [Nayr]\n";
             nested_container_depth: 0,
             complete: true,
         };
-        workflow.identity = CheatStepResource::Ready((
-            workflow.identity_request.clone().unwrap(),
-            report,
-        ));
+        workflow.identity =
+            CheatStepResource::Ready((workflow.identity_request.clone().unwrap(), report));
         app
     }
 
@@ -26418,9 +26441,16 @@ $Instant Growth [Nayr]\n";
         let outcome = workflow.dolphin_candidate_outcome.as_ref().unwrap();
         let candidate = outcome.candidate.as_ref().expect("candidate matched");
         assert_eq!(candidate.game_id, "GAFE01");
-        let selection = workflow.dolphin_selection.as_ref().expect("selection opened");
+        let selection = workflow
+            .dolphin_selection
+            .as_ref()
+            .expect("selection opened");
         assert_eq!(selection.selection.entries.len(), 2);
-        assert_eq!(selection.selection.selected_count(), 1, "already-enabled code pre-selected");
+        assert_eq!(
+            selection.selection.selected_count(),
+            1,
+            "already-enabled code pre-selected"
+        );
         let already_enabled = selection
             .selection
             .entries
@@ -26469,7 +26499,14 @@ $Instant Growth [Nayr]\n";
         app.start_dolphin_candidate_match();
 
         let workflow = app.cheat_workflow.as_ref().unwrap();
-        assert!(workflow.dolphin_candidate_outcome.as_ref().unwrap().candidate.is_none());
+        assert!(
+            workflow
+                .dolphin_candidate_outcome
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_none()
+        );
         assert!(workflow.dolphin_selection.is_none());
         let latest = app.history.entries().next().unwrap();
         assert_eq!(latest.action, ActivityAction::DolphinGeckoCandidateMatch);
@@ -26511,7 +26548,15 @@ $Instant Growth [Nayr]\n";
         let workflow = app.cheat_workflow.as_ref().unwrap();
         assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
         assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
-        assert!(workflow.dolphin_selection.as_ref().unwrap().selection.entries[0].selected);
+        assert!(
+            workflow
+                .dolphin_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .entries[0]
+                .selected
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -26586,7 +26631,10 @@ $Instant Growth [Nayr]\n";
             "1 of 2 selected",
             "Preview the installed file",
         ] {
-            assert!(rendered_text_contains(&output, expected), "missing {expected}");
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
         }
         let _ = std::fs::remove_dir_all(&temp);
     }
@@ -28175,6 +28223,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id: None,
+            dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
             dolphin_candidate_outcome: None,
@@ -41530,6 +41579,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id: None,
+            dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
             dolphin_candidate_outcome: None,
