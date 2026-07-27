@@ -1,11 +1,12 @@
-# Read-only Dolphin Cheats & Mods adapter
+# Dolphin Cheats & Mods adapter
 
 ArchiveFS can discover local Dolphin user profiles and inspect their existing
 per-game INI files from the Cheats & Mods workspace for GameCube and Wii
-archives. The adapter is observational only. It does not start Dolphin,
-evaluate cheat codes or patches, follow referenced mod paths, download
-content, or create, copy, modify, enable, disable, rename, delete, sanitize, or
-generate any Dolphin file.
+archives. Discovery and inventory are read-only. After an exact verified
+GameCube identity match, the reviewed Gecko transaction path can replace only
+the existing file's `[Gecko_Enabled]` section after preview and confirmation,
+with backup, journal, and rollback. It does not start Dolphin, evaluate code,
+follow referenced mod paths, download definitions, or fabricate a Game INI.
 
 ## Discovery
 
@@ -78,22 +79,23 @@ outer-header revision remains candidate-only. An INI or archive filename Game
 ID remains an observation, not verified identity. See
 [`SHARED_GAME_IDENTITY.md`](SHARED_GAME_IDENTITY.md).
 
-The shared read-only preview uses the verified Game ID, preserving an optional
+The shared preview uses the verified Game ID, preserving an optional
 verified revision as distinct evidence, and maps only a conservative
 `GameSettings/<matched file>.ini` destination beneath the approved Dolphin
 root. Candidate filename IDs are visible but blocked. Texture-pack preview is
-not supported. Existing different content is reported as a future replacement
-requiring both backup and explicit replacement permission; no replacement is
-performed. See [`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
+not supported. Existing different content requires backup and explicit
+replacement permission. See [`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
 
 ## Privacy, safety, and future work
 
 All profile inspection is local. No filename, content, hash, result, or
 metadata is uploaded. The adapter exposes no network or process-execution path,
-and original Dolphin files remain untouched. Structural inspection is not
-antivirus scanning and does not prove that a cheat or patch is benign.
+and original Dolphin files remain untouched during discovery and inventory.
+Structural inspection is not antivirus scanning and does not prove that a
+cheat or patch is benign.
 
-The preview and conflict report is implemented read-only. Installation,
-verified backup, journaling, rollback, enabling, disabling, and referenced
-Riivolution asset inspection remain future work, and the GUI exposes none of
-those actions.
+The Gecko workflow supports individual code selection, preview, explicit
+apply, verified backup, journaling, and rollback for an existing exact-match
+Game INI. Downloading definitions, creating a missing `GAFE01.ini`, general
+section editing, Action Replay installation, and referenced Riivolution asset
+inspection remain future work.

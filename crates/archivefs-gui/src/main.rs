@@ -15319,7 +15319,7 @@ fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only
     } else if dolphin_read_only {
         (
             widgets::StatusTone::Info,
-            "Dolphin frame patches, Action Replay, Gecko, and Riivolution declarations can be inspected above. Installation, enabling, disabling, replacement, and rollback are unavailable.",
+            "Individual Gecko codes from an existing exact-match Game INI can be selected, applied, and rolled back above. Texture packs, Riivolution assets, and other Dolphin mod types remain unavailable.",
         )
     } else {
         (widgets::StatusTone::Pending, MODS_UNAVAILABLE_BODY)
@@ -18041,7 +18041,7 @@ fn show_cheats_mods_page(
         if workflow.is_none() {
             readiness_items.push(("Matching pending", widgets::StatusTone::Pending));
             readiness_items.push(("Installation gated", widgets::StatusTone::Pending));
-        } else if pcsx2_read_only || dolphin_read_only {
+        } else if pcsx2_read_only {
             readiness_items.push(("Read-only preview", widgets::StatusTone::Info));
             readiness_items.push(("Preview only", widgets::StatusTone::Pending));
         } else {
