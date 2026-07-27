@@ -49,6 +49,7 @@ mod retroarch_inventory;
 mod retroarch_materialization;
 mod shared_preview;
 mod shared_transaction;
+mod xenia_patch_document;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -278,6 +279,13 @@ pub use shared_transaction::{
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
+};
+pub use xenia_patch_document::{
+    MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,
+    MAX_PATCHES_PER_FILE, MAX_STRING_VALUE_BYTES, MAX_WRITES_PER_PATCH, XeniaDocumentWarning,
+    XeniaDocumentWarningKind, XeniaPatch, XeniaPatchDocument, XeniaPatchWarning,
+    XeniaPatchWarningKind, XeniaPatchWrite, XeniaWriteKind, XeniaWriteValue,
+    parse_xenia_patch_toml,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
