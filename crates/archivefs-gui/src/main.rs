@@ -2517,7 +2517,7 @@ fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Opti
         (LibraryTab::Views, library_tab_label(LibraryTab::Views)),
     ];
     let clicked = widgets::tab_row(ui, &tab_options, current_tab);
-    ui.add_space(theme::SECTION_GAP);
+    ui.add_space(8.0);
     clicked
 }
 
@@ -20935,28 +20935,10 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
-    if !recent_view {
-        // No `widgets::page_header`/heading here: the only production
-        // caller left with `recent_view == false` is the unified Library
-        // shell's Archives tab (see `show_library_shell_header`), which
-        // already renders the page's one "Library" heading above the tab
-        // row - a second "Library" heading here would just repeat it.
-        // The archive-table-specific description that used to accompany
-        // that heading is kept as a plain label, since it says something
-        // the shell's own (more general, four-tab) description doesn't.
-        ui.label(
-            egui::RichText::new(
-                "Search the archive catalogue, review metadata, and use context menus for focused actions.",
-            )
-            .color(theme::muted(ui)),
-        );
-        ui.add_space(theme::SECTION_GAP);
-    }
     // Natural-height summary: it may grow only with content visible now;
     // no persisted panel height can starve the result table on a later
     // frame or after a window resize.
-    widgets::card(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+    ui.horizontal_wrapped(|ui| {
                         summary_value(ui, "Total archives", data.stats.total_archives);
                         summary_value(ui, "Mounted", data.stats.mounted_count);
                         summary_value(ui, "Pending", data.stats.pending_count);
@@ -21006,7 +20988,7 @@ fn show_loaded_data(
                             ("Doctor needs attention", widgets::StatusTone::Warning)
                         };
                         widgets::status_badge(ui, readiness, tone);
-                    });
+    });
 
                     if let Some(result) = mount_all_result {
                         show_mount_all_result(ui, result);
@@ -21015,8 +20997,8 @@ fn show_loaded_data(
                         show_unmount_all_result(ui, result);
                     }
 
-                    ui.separator();
                     if let Some(feedback) = feedback {
+                        ui.separator();
                         let color = if feedback.succeeded {
                             egui::Color32::from_rgb(70, 170, 90)
                         } else {
@@ -21047,7 +21029,6 @@ fn show_loaded_data(
                             ui.colored_label(color, &cleanup.message);
                         }
                     }
-    });
     if confirm_mount_all.is_some() {
         let actions_available = !busy;
         egui::Window::new("Mount All pending archives?")
@@ -21455,20 +21436,8 @@ fn show_loaded_data(
         });
     }
 
-    let filter_max_height = (ui.available_height() * 0.25).clamp(110.0, 180.0);
     widgets::card(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("library_filters_scroll")
-            .max_height(filter_max_height)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                widgets::section_header(
-                    ui,
-                    "Find and filter",
-                    Some(
-                        "Search paths and metadata, then narrow the catalogue without changing it.",
-                    ),
-                );
+        ui.strong("Find and filter");
 
         let mut filter_changed = false;
         ui.horizontal_wrapped(|ui| {
@@ -21491,6 +21460,10 @@ fn show_loaded_data(
             *filtered_rows = matching_row_indices(&merged_rows, filter);
         }
 
+        egui::CollapsingHeader::new("More filters")
+            .id_salt("library_more_filters")
+            .default_open(false)
+            .show(ui, |ui| {
         let unknown_count = merged_rows
             .iter()
             .filter(|row| row.unknown_platform)
@@ -26263,19 +26236,34 @@ $Instant Growth [Nayr]\n";
             archive_path: workflow.archive_path.clone(),
             platform: archivefs_core::game_identity::IdentityPlatform::GameCube,
             format: IdentityImageFormat::Iso,
-            evidence: vec![archivefs_core::game_identity::IdentityEvidence {
-                kind: IdentityKind::DolphinGameId,
-                status: IdentityStatus::Verified,
-                value: Some(game_id.to_string()),
-                confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
-                provenance: archivefs_core::game_identity::IdentityProvenance {
-                    archive_path: workflow.archive_path.clone(),
-                    member_path: None,
-                    member_index: None,
-                    method: "test fixture disc header read".to_string(),
+            evidence: vec![
+                archivefs_core::game_identity::IdentityEvidence {
+                    kind: IdentityKind::DolphinGameId,
+                    status: IdentityStatus::Verified,
+                    value: Some(game_id.to_string()),
+                    confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                    provenance: archivefs_core::game_identity::IdentityProvenance {
+                        archive_path: workflow.archive_path.clone(),
+                        member_path: None,
+                        member_index: None,
+                        method: "test fixture disc header read".to_string(),
+                    },
+                    diagnostic: "test fixture".to_string(),
                 },
-                diagnostic: "test fixture".to_string(),
-            }],
+                archivefs_core::game_identity::IdentityEvidence {
+                    kind: IdentityKind::DolphinRevision,
+                    status: IdentityStatus::Verified,
+                    value: Some("0".to_string()),
+                    confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                    provenance: archivefs_core::game_identity::IdentityProvenance {
+                        archive_path: workflow.archive_path.clone(),
+                        member_path: None,
+                        member_index: None,
+                        method: "test fixture disc header read".to_string(),
+                    },
+                    diagnostic: "test fixture".to_string(),
+                },
+            ],
             warnings: Vec::new(),
             bytes_read: 512,
             archive_members_inspected: 0,
@@ -26341,6 +26329,82 @@ $Instant Growth [Nayr]\n";
             app.history.entries().next().unwrap().outcome,
             ActivityOutcome::Completed
         );
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let history = OperationHistory::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    None,
+                    None,
+                    &history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        for expected in [
+            "GameCube",
+            "GAFE01",
+            "Revision: 0",
+            "Infinite Bells [Nayr]",
+            "Instant Growth [Nayr]",
+        ] {
+            assert!(rendered_text_contains(&output, expected), "missing {expected}");
+        }
+        assert!(!rendered_text_contains(
+            &output,
+            "Stage 1 · Archive and RetroArch profile"
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn changing_archive_clears_stale_dolphin_candidate_preview_and_transaction_state() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-dolphin-context-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        app.start_dolphin_candidate_match();
+        assert!(app
+            .cheat_workflow
+            .as_ref()
+            .unwrap()
+            .dolphin_selection
+            .is_some());
+        let stale_key = cheat_preview_key(app.cheat_workflow.as_ref().unwrap());
+        let (stale_sender, stale_receiver) = mpsc::channel();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.preview = CheatStepResource::Failed("stale preview".to_string());
+        workflow.transaction = CheatTransactionState::Applying {
+            key: stale_key,
+            receiver: stale_receiver,
+        };
+
+        let other_path = PathBuf::from("/roms/other-gamecube.zip");
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut other = record_at(other_path.clone(), MountState::Pending);
+            other.identity.platform = Some("GameCube".to_string());
+            data.rows.push(row_for(&other));
+            data.records.push(other);
+        }
+        app.archive_context.select_only(other_path.clone());
+        assert!(app.prepare_cheats_mods_workspace(other_path.clone()));
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.archive_path, other_path);
+        assert!(workflow.dolphin_candidate_outcome.is_none());
+        assert!(workflow.dolphin_selection.is_none());
+        assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+        assert!(stale_sender.send(Err("stale result".to_string())).is_err());
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -27375,6 +27439,86 @@ $Instant Growth [Nayr]\n";
             .as_ref()
             .expect("the already-selected archive must be available immediately, with no separate 'Choose archive' step");
         assert_eq!(workflow.archive_path, PathBuf::from("/roms/a.zip"));
+    }
+
+    #[test]
+    fn one_library_selection_is_the_same_context_on_selected_and_cheats_mods() {
+        let path = PathBuf::from("/roms/animal-crossing.zip");
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut animal_crossing = record_at(path.clone(), MountState::Pending);
+            animal_crossing.identity.platform = Some("GameCube".to_string());
+            data.rows.push(row_for(&animal_crossing));
+            data.records.push(animal_crossing);
+        }
+
+        app.archive_context.select_only(path.clone());
+        assert_eq!(app.archive_context.focused.as_deref(), Some(path.as_path()));
+        assert_eq!(app.archive_context.active_cheats(), Some(path.as_path()));
+        assert_eq!(app.archive_context.selected.len(), 1);
+
+        let ctx = egui::Context::default();
+        let mut queue = Vec::new();
+        let mut confirm = false;
+        let live = match &app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            _ => None,
+        };
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_page(
+                    ui,
+                    live,
+                    None,
+                    SelectedPageViewState {
+                        selected_archive: app.archive_context.focused.as_deref(),
+                        selected_count: app.archive_context.selected.len(),
+                        retroarch_profiles: &app.retroarch_profiles,
+                        queue: &mut queue,
+                        confirm: &mut confirm,
+                        busy: false,
+                        block_reason: None,
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            path.to_string_lossy().as_ref()
+        ));
+
+        app.view = MainView::CheatsMods;
+        app.reconcile_cheats_mods_context(&egui::Context::default());
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .map(|workflow| workflow.archive_path.as_path()),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().adapter,
+            CheatEmulatorAdapter::Dolphin
+        );
+    }
+
+    #[test]
+    fn mount_state_change_and_rescan_preserve_archive_context() {
+        let path = PathBuf::from("/roms/animal-crossing.zip");
+        let mut app = app_for_operation_tests();
+        app.archive_context.select_only(path.clone());
+
+        let pending = record_at(path.clone(), MountState::Pending);
+        let pending_status = row_for(&pending);
+        let pending_rows = build_display_rows(&[pending], &[pending_status], None);
+        app.prune_selection(&pending_rows);
+        assert_eq!(app.archive_context.focused.as_deref(), Some(path.as_path()));
+
+        let mounted = record_at(path.clone(), MountState::Mounted);
+        let mounted_status = row_for(&mounted);
+        let mounted_rows = build_display_rows(&[mounted], &[mounted_status], None);
+        app.prune_selection(&mounted_rows);
+        assert_eq!(app.archive_context.focused.as_deref(), Some(path.as_path()));
+        assert_eq!(app.archive_context.selected, [path].into_iter().collect());
     }
 
     #[test]
@@ -36987,6 +37131,30 @@ $Instant Growth [Nayr]\n";
         })
     }
 
+    fn fully_visible_exact_text_count(output: &egui::FullOutput, needles: &[String]) -> usize {
+        fn find_rect(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::Shape::Vec(nested) => nested.iter().find_map(|shape| find_rect(shape, needle)),
+                _ => None,
+            }
+        }
+
+        needles
+            .iter()
+            .filter(|needle| {
+                output.shapes.iter().any(|clipped| {
+                    find_rect(&clipped.shape, needle).is_some_and(|rect| {
+                        rect.top() >= clipped.clip_rect.top()
+                            && rect.bottom() <= clipped.clip_rect.bottom()
+                    })
+                })
+            })
+            .count()
+    }
+
     fn count_exact_text_occurrences(output: &egui::FullOutput, needle: &str) -> usize {
         fn count_in_shape(shape: &egui::Shape, needle: &str) -> usize {
             match shape {
@@ -37002,6 +37170,78 @@ $Instant Growth [Nayr]\n";
             .sum()
     }
 
+    fn library_app_with_test_rows(count: usize) -> (ArchiveFsApp, Vec<String>) {
+        let paths: Vec<String> = (0..count)
+            .map(|index| format!("/roms/library-row-{index:02}.zip"))
+            .collect();
+        let records = paths
+            .iter()
+            .map(|path| record(path, MountState::Pending))
+            .collect();
+        let mut app = app_for_operation_tests();
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.view = MainView::Library;
+        app.library_tab = LibraryTab::Archives;
+        app.archive_context
+            .select_only(PathBuf::from(paths[0].as_str()));
+        (app, paths)
+    }
+
+    #[test]
+    fn library_renders_multiple_complete_rows_at_desktop_and_small_viewports() {
+        for (size, minimum_rows) in [
+            (egui::vec2(1920.0, 1080.0), 6_usize),
+            (egui::vec2(1100.0, 700.0), 3_usize),
+        ] {
+            let (mut app, paths) = library_app_with_test_rows(30);
+            let ctx = egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
+            use eframe::App as _;
+            let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+            let visible = fully_visible_exact_text_count(&output, &paths);
+            assert!(
+                visible >= minimum_rows,
+                "{size:?} must show at least {minimum_rows} complete Library rows, showed {visible}; first row rendered={}, geometry={:?}",
+                rendered_text_contains(&output, &paths[0]),
+                find_exact_text_position_and_clip(&output, &paths[0])
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_activity_bar_does_not_cover_library_rows() {
+        let (mut app, paths) = library_app_with_test_rows(30);
+        app.show_activity = true;
+        for index in 0..8 {
+            app.history.record(HistoryEntry::new(
+                ActivityAction::Refresh,
+                None,
+                ActivityOutcome::Completed,
+                format!("Library activity {index}"),
+            ));
+        }
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let size = egui::vec2(1920.0, 1080.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
+        use eframe::App as _;
+        let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+        assert!(rendered_text_contains(&output, "Clear activity"));
+        assert!(
+            fully_visible_exact_text_count(&output, &paths) >= 4,
+            "the expanded bottom activity bar must leave several complete rows visible"
+        );
+    }
+
     /// Renders the real `show_loaded_data` (what the Library page actually
     /// dispatches to) with only `selected_archives` and
     /// `select_all_visible_requested` under the caller's control - every
@@ -37012,6 +37252,7 @@ $Instant Growth [Nayr]\n";
         data: &LoadedData,
         selected_archives: &mut HashSet<PathBuf>,
         select_all_visible_requested: &mut bool,
+        viewport_size: Option<egui::Vec2>,
     ) -> egui::FullOutput {
         let mut filter = String::new();
         let mut filtered_rows = None;
@@ -37043,7 +37284,11 @@ $Instant Growth [Nayr]\n";
         let mut library_source_filter = None;
         let mut library_column_widths = LibraryColumnWidths::default();
 
-        ctx.run(egui::RawInput::default(), |ctx| {
+        let input = egui::RawInput {
+            screen_rect: viewport_size.map(|size| egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..egui::RawInput::default()
+        };
+        ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = show_loaded_data(
                     ui,
@@ -37115,6 +37360,7 @@ $Instant Growth [Nayr]\n";
             &data,
             &mut selected_archives,
             &mut select_all_visible_requested,
+            None,
         );
 
         for forbidden in [
@@ -37154,6 +37400,7 @@ $Instant Growth [Nayr]\n";
             &data,
             &mut selected_archives,
             &mut select_all_visible_requested,
+            None,
         );
         assert_eq!(
             count_exact_text_occurrences(&body_output, "Library"),
@@ -37281,6 +37528,7 @@ $Instant Growth [Nayr]\n";
             &data,
             &mut selected_archives,
             &mut select_all_visible_requested,
+            None,
         );
 
         assert!(
