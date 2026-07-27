@@ -15548,8 +15548,8 @@ fn show_dolphin_workflow(
                 ),
             ],
         );
-        if let Some(revision) = ready_game_identity(workflow)
-            .and_then(GameIdentityReport::verified_dolphin_revision)
+        if let Some(revision) =
+            ready_game_identity(workflow).and_then(GameIdentityReport::verified_dolphin_revision)
         {
             ui.label(format!("Revision: {revision}"));
         }
@@ -18052,7 +18052,6 @@ fn show_cheats_mods_page(
             ));
         }
         widgets::status_strip(ui, &readiness_items);
-
     });
     ui.add_space(theme::SECTION_GAP);
 
@@ -20939,96 +20938,91 @@ fn show_loaded_data(
     // no persisted panel height can starve the result table on a later
     // frame or after a window resize.
     ui.horizontal_wrapped(|ui| {
-                        summary_value(ui, "Total archives", data.stats.total_archives);
-                        summary_value(ui, "Mounted", data.stats.mounted_count);
-                        summary_value(ui, "Pending", data.stats.pending_count);
-                        if widgets::action_button(
-                            ui,
-                            "Mount all",
-                            widgets::ActionStyle::Primary,
-                            mount_all_available(pending_count, busy),
-                        )
-                        .clicked()
-                        {
-                            *confirm_mount_all = Some(MountAllConfirmation);
-                            *focus_mount_all_cancel = true;
-                            history.record(HistoryEntry::new(
-                                ActivityAction::MountAll,
-                                None,
-                                ActivityOutcome::Offered,
-                                format!(
-                                    "Mount All offered for {} pending archives.",
-                                    pending_count
-                                ),
-                            ));
-                        }
-                        if widgets::action_button(
-                            ui,
-                            "Unmount all",
-                            widgets::ActionStyle::Destructive,
-                            mounted_count > 0 && !busy,
-                        )
-                        .clicked()
-                        {
-                            *confirm_unmount_all = Some(UnmountAllConfirmation);
-                            *focus_unmount_all_cancel = true;
-                            history.record(HistoryEntry::new(
-                                ActivityAction::UnmountAll,
-                                None,
-                                ActivityOutcome::Offered,
-                                format!(
-                                    "Unmount All offered for {mounted_count} mounted archives."
-                                ),
-                            ));
-                        }
-                        ui.separator();
-                        let (readiness, tone) = if data.doctor.is_ready() {
-                            ("Doctor ready", widgets::StatusTone::Success)
-                        } else {
-                            ("Doctor needs attention", widgets::StatusTone::Warning)
-                        };
-                        widgets::status_badge(ui, readiness, tone);
+        summary_value(ui, "Total archives", data.stats.total_archives);
+        summary_value(ui, "Mounted", data.stats.mounted_count);
+        summary_value(ui, "Pending", data.stats.pending_count);
+        if widgets::action_button(
+            ui,
+            "Mount all",
+            widgets::ActionStyle::Primary,
+            mount_all_available(pending_count, busy),
+        )
+        .clicked()
+        {
+            *confirm_mount_all = Some(MountAllConfirmation);
+            *focus_mount_all_cancel = true;
+            history.record(HistoryEntry::new(
+                ActivityAction::MountAll,
+                None,
+                ActivityOutcome::Offered,
+                format!("Mount All offered for {} pending archives.", pending_count),
+            ));
+        }
+        if widgets::action_button(
+            ui,
+            "Unmount all",
+            widgets::ActionStyle::Destructive,
+            mounted_count > 0 && !busy,
+        )
+        .clicked()
+        {
+            *confirm_unmount_all = Some(UnmountAllConfirmation);
+            *focus_unmount_all_cancel = true;
+            history.record(HistoryEntry::new(
+                ActivityAction::UnmountAll,
+                None,
+                ActivityOutcome::Offered,
+                format!("Unmount All offered for {mounted_count} mounted archives."),
+            ));
+        }
+        ui.separator();
+        let (readiness, tone) = if data.doctor.is_ready() {
+            ("Doctor ready", widgets::StatusTone::Success)
+        } else {
+            ("Doctor needs attention", widgets::StatusTone::Warning)
+        };
+        widgets::status_badge(ui, readiness, tone);
     });
 
-                    if let Some(result) = mount_all_result {
-                        show_mount_all_result(ui, result);
-                    }
-                    if let Some(result) = unmount_all_result {
-                        show_unmount_all_result(ui, result);
-                    }
+    if let Some(result) = mount_all_result {
+        show_mount_all_result(ui, result);
+    }
+    if let Some(result) = unmount_all_result {
+        show_unmount_all_result(ui, result);
+    }
 
-                    if let Some(feedback) = feedback {
-                        ui.separator();
-                        let color = if feedback.succeeded {
-                            egui::Color32::from_rgb(70, 170, 90)
-                        } else {
-                            ui.visuals().error_fg_color
-                        };
-                        ui.colored_label(color, &feedback.message);
-                        if let Some(warning) = &feedback.warning {
-                            ui.colored_label(egui::Color32::from_rgb(210, 140, 40), warning);
-                        }
-                        if let Some(more_information) = &feedback.more_information {
-                            widgets::technical_details(
-                                ui,
-                                (
-                                    "action_feedback_more_information",
-                                    more_information.as_str(),
-                                ),
-                                |ui| {
-                                    ui.label(more_information);
-                                },
-                            );
-                        }
-                        if let Some(cleanup) = &feedback.cleanup {
-                            let color = if cleanup.succeeded {
-                                egui::Color32::from_rgb(70, 170, 90)
-                            } else {
-                                ui.visuals().error_fg_color
-                            };
-                            ui.colored_label(color, &cleanup.message);
-                        }
-                    }
+    if let Some(feedback) = feedback {
+        ui.separator();
+        let color = if feedback.succeeded {
+            egui::Color32::from_rgb(70, 170, 90)
+        } else {
+            ui.visuals().error_fg_color
+        };
+        ui.colored_label(color, &feedback.message);
+        if let Some(warning) = &feedback.warning {
+            ui.colored_label(egui::Color32::from_rgb(210, 140, 40), warning);
+        }
+        if let Some(more_information) = &feedback.more_information {
+            widgets::technical_details(
+                ui,
+                (
+                    "action_feedback_more_information",
+                    more_information.as_str(),
+                ),
+                |ui| {
+                    ui.label(more_information);
+                },
+            );
+        }
+        if let Some(cleanup) = &feedback.cleanup {
+            let color = if cleanup.succeeded {
+                egui::Color32::from_rgb(70, 170, 90)
+            } else {
+                ui.visuals().error_fg_color
+            };
+            ui.colored_label(color, &cleanup.message);
+        }
+    }
     if confirm_mount_all.is_some() {
         let actions_available = !busy;
         egui::Window::new("Mount All pending archives?")
@@ -21208,36 +21202,36 @@ fn show_loaded_data(
             .id_salt("library_focused_archive_details")
             .default_open(false)
             .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("library_selected_archive_scroll")
+                egui::ScrollArea::vertical()
+                    .id_salt("library_selected_archive_scroll")
                     .max_height((ui.available_height() * 0.35).clamp(120.0, 280.0))
                     .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    show_selected_archive(
-                        ui,
-                        selected_record(&data.records, selected_archive.as_deref()),
-                        selected_persisted,
-                        selected_platform_details(cached, selected_persisted),
-                        selected_source_path,
-                        SelectedArchiveViewState {
-                            operation,
-                            busy,
-                            block_reason,
-                            action_readiness_debug_lines,
-                            confirm_unmount,
-                            confirm_lazy_unmount,
-                            focus_lazy_cancel,
-                            lazy_unmount_offers,
-                            remount_offers,
-                            cleanup_after_unmount,
-                            platform_choice,
-                            platform_custom_text,
-                            platform_busy,
-                            clipboard,
-                        },
-                    )
-                })
-                .inner
+                    .show(ui, |ui| {
+                        show_selected_archive(
+                            ui,
+                            selected_record(&data.records, selected_archive.as_deref()),
+                            selected_persisted,
+                            selected_platform_details(cached, selected_persisted),
+                            selected_source_path,
+                            SelectedArchiveViewState {
+                                operation,
+                                busy,
+                                block_reason,
+                                action_readiness_debug_lines,
+                                confirm_unmount,
+                                confirm_lazy_unmount,
+                                focus_lazy_cancel,
+                                lazy_unmount_offers,
+                                remount_offers,
+                                cleanup_after_unmount,
+                                platform_choice,
+                                platform_custom_text,
+                                platform_busy,
+                                clipboard,
+                            },
+                        )
+                    })
+                    .inner
             })
             .body_returned
             .unwrap_or_default()
@@ -21464,145 +21458,148 @@ fn show_loaded_data(
             .id_salt("library_more_filters")
             .default_open(false)
             .show(ui, |ui| {
-        let unknown_count = merged_rows
-            .iter()
-            .filter(|row| row.unknown_platform)
-            .count();
-        let mut filters_changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Show:");
-            filters_changed |= ui
-                .checkbox(&mut library_filters.present, "Present")
-                .changed();
-            filters_changed |= ui
-                .checkbox(&mut library_filters.missing, "Missing")
-                .changed();
-            filters_changed |= ui
-                .checkbox(
-                    &mut library_filters.awaiting_validation,
-                    "Awaiting validation",
-                )
-                .changed();
-            filters_changed |= ui
-                .checkbox(&mut library_filters.known_platform, "Known platform")
-                .changed();
-            filters_changed |= ui
-                .checkbox(
-                    &mut library_filters.unknown_platform,
-                    format!("Unknown platform ({unknown_count})"),
-                )
-                .changed();
-            if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
-                *library_filters = LibraryRowFilters::default();
-                filters_changed = true;
-            }
-        });
-        let _ = filters_changed;
-
-        if unknown_platform_banner_visible(library_filters, unknown_count) {
-            widgets::banner(
-                ui,
-                &unknown_platform_aggregate_headline(unknown_count),
-                UNKNOWN_PLATFORM_EXPLANATION,
-                widgets::StatusTone::Info,
-            );
-        }
-
-        let configured_sources: &[SourceFolderView] = cached
-            .map(|cached| cached.source_views.as_slice())
-            .unwrap_or(&[]);
-        if !configured_sources.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Source:");
-                let selected_text = match library_source_filter {
-                    None => "All sources".to_string(),
-                    Some(None) => "Unassigned / Legacy".to_string(),
-                    Some(Some(path)) => path.display().to_string(),
-                };
-                egui::ComboBox::from_id_salt("library_source_filter")
-                    .selected_text(selected_text)
-                    .width((ui.available_width() - 16.0).clamp(220.0, 520.0))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(library_source_filter, None, "All sources");
-                        for source in configured_sources {
-                            ui.selectable_value(
-                                library_source_filter,
-                                Some(Some(source.path.clone())),
-                                source.path.display().to_string(),
-                            );
-                        }
-                        ui.selectable_value(
-                            library_source_filter,
-                            Some(None),
-                            "Unassigned / Legacy",
-                        );
-                    });
-            });
-        }
-
-        let missing_count = merged_rows
-            .iter()
-            .filter(|row| row.origin == RowOrigin::CachedMissing)
-            .count();
-        let mut missing_only = library_filters.missing
-            && !library_filters.present
-            && !library_filters.awaiting_validation;
-        let selected_missing = selected_missing_paths(cached, selected_archives);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("Missing catalogue entries: {missing_count}"));
-            if ui
-                .checkbox(&mut missing_only, "Show missing only")
-                .changed()
-            {
-                set_missing_review_mode(library_filters, missing_only);
-            }
-            let enabled = missing_removal_available && selected_missing.is_ok();
-            let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
-            if !enabled && let Err(reason) = &selected_missing {
-                response.clone().on_hover_text(reason);
-            }
-            if response.clicked()
-                && let Ok(paths) = &selected_missing
-            {
-                *confirm_remove_missing = Some(paths.clone());
-            }
-            if missing_removal_busy {
-                ui.spinner();
-                ui.label("Removing catalogue entries...");
-            }
-        });
-
-        if let Some(paths) = confirm_remove_missing.clone() {
-            let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
-            let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
-            egui::Window::new(format!(
-                "Remove {} missing catalogue entr{}?",
-                paths.len(),
-                if paths.len() == 1 { "y" } else { "ies" }
-            ))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ui.ctx(), |ui| {
-                ui.label(missing_removal_confirmation_text(paths.len()));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
-                        *confirm_remove_missing = None;
-                    }
-                    if ui
-                        .add_enabled(
-                            missing_removal_available && still_valid,
-                            egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
+                let unknown_count = merged_rows
+                    .iter()
+                    .filter(|row| row.unknown_platform)
+                    .count();
+                let mut filters_changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Show:");
+                    filters_changed |= ui
+                        .checkbox(&mut library_filters.present, "Present")
+                        .changed();
+                    filters_changed |= ui
+                        .checkbox(&mut library_filters.missing, "Missing")
+                        .changed();
+                    filters_changed |= ui
+                        .checkbox(
+                            &mut library_filters.awaiting_validation,
+                            "Awaiting validation",
                         )
-                        .clicked()
-                    {
-                        requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
-                        *confirm_remove_missing = None;
+                        .changed();
+                    filters_changed |= ui
+                        .checkbox(&mut library_filters.known_platform, "Known platform")
+                        .changed();
+                    filters_changed |= ui
+                        .checkbox(
+                            &mut library_filters.unknown_platform,
+                            format!("Unknown platform ({unknown_count})"),
+                        )
+                        .changed();
+                    if library_filters.is_active() && ui.small_button("Clear filters").clicked() {
+                        *library_filters = LibraryRowFilters::default();
+                        filters_changed = true;
                     }
                 });
-            });
-        }
+                let _ = filters_changed;
+
+                if unknown_platform_banner_visible(library_filters, unknown_count) {
+                    widgets::banner(
+                        ui,
+                        &unknown_platform_aggregate_headline(unknown_count),
+                        UNKNOWN_PLATFORM_EXPLANATION,
+                        widgets::StatusTone::Info,
+                    );
+                }
+
+                let configured_sources: &[SourceFolderView] = cached
+                    .map(|cached| cached.source_views.as_slice())
+                    .unwrap_or(&[]);
+                if !configured_sources.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Source:");
+                        let selected_text = match library_source_filter {
+                            None => "All sources".to_string(),
+                            Some(None) => "Unassigned / Legacy".to_string(),
+                            Some(Some(path)) => path.display().to_string(),
+                        };
+                        egui::ComboBox::from_id_salt("library_source_filter")
+                            .selected_text(selected_text)
+                            .width((ui.available_width() - 16.0).clamp(220.0, 520.0))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(library_source_filter, None, "All sources");
+                                for source in configured_sources {
+                                    ui.selectable_value(
+                                        library_source_filter,
+                                        Some(Some(source.path.clone())),
+                                        source.path.display().to_string(),
+                                    );
+                                }
+                                ui.selectable_value(
+                                    library_source_filter,
+                                    Some(None),
+                                    "Unassigned / Legacy",
+                                );
+                            });
+                    });
+                }
+
+                let missing_count = merged_rows
+                    .iter()
+                    .filter(|row| row.origin == RowOrigin::CachedMissing)
+                    .count();
+                let mut missing_only = library_filters.missing
+                    && !library_filters.present
+                    && !library_filters.awaiting_validation;
+                let selected_missing = selected_missing_paths(cached, selected_archives);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Missing catalogue entries: {missing_count}"));
+                    if ui
+                        .checkbox(&mut missing_only, "Show missing only")
+                        .changed()
+                    {
+                        set_missing_review_mode(library_filters, missing_only);
+                    }
+                    let enabled = missing_removal_available && selected_missing.is_ok();
+                    let response =
+                        ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
+                    if !enabled && let Err(reason) = &selected_missing {
+                        response.clone().on_hover_text(reason);
+                    }
+                    if response.clicked()
+                        && let Ok(paths) = &selected_missing
+                    {
+                        *confirm_remove_missing = Some(paths.clone());
+                    }
+                    if missing_removal_busy {
+                        ui.spinner();
+                        ui.label("Removing catalogue entries...");
+                    }
+                });
+
+                if let Some(paths) = confirm_remove_missing.clone() {
+                    let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
+                    let still_valid =
+                        selected_missing_paths(cached, &confirmation_selection).is_ok();
+                    egui::Window::new(format!(
+                        "Remove {} missing catalogue entr{}?",
+                        paths.len(),
+                        if paths.len() == 1 { "y" } else { "ies" }
+                    ))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(missing_removal_confirmation_text(paths.len()));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
+                                *confirm_remove_missing = None;
+                            }
+                            if ui
+                                .add_enabled(
+                                    missing_removal_available && still_valid,
+                                    egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
+                                )
+                                .clicked()
+                            {
+                                requested_action =
+                                    Some(AppOperationRequest::RemoveMissing(paths.clone()));
+                                *confirm_remove_missing = None;
+                            }
+                        });
+                    });
+                }
             });
     });
     ui.add_space(8.0);
@@ -25958,9 +25955,7 @@ mod tests {
             gamecube.identity.platform = Some("GameCube".to_string());
             data.records.push(gamecube);
         }
-        assert!(app.prepare_cheats_mods_workspace(PathBuf::from(
-            "/roms/animal-crossing.zip"
-        )));
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/animal-crossing.zip")));
         assert_eq!(
             app.cheat_workflow.as_ref().unwrap().adapter,
             CheatEmulatorAdapter::Dolphin
@@ -26355,7 +26350,10 @@ $Instant Growth [Nayr]\n";
             "Infinite Bells [Nayr]",
             "Instant Growth [Nayr]",
         ] {
-            assert!(rendered_text_contains(&output, expected), "missing {expected}");
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
         }
         assert!(!rendered_text_contains(
             &output,
@@ -26373,12 +26371,13 @@ $Instant Growth [Nayr]\n";
         std::fs::create_dir_all(&temp).unwrap();
         let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
         app.start_dolphin_candidate_match();
-        assert!(app
-            .cheat_workflow
-            .as_ref()
-            .unwrap()
-            .dolphin_selection
-            .is_some());
+        assert!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .dolphin_selection
+                .is_some()
+        );
         let stale_key = cheat_preview_key(app.cheat_workflow.as_ref().unwrap());
         let (stale_sender, stale_receiver) = mpsc::channel();
         let workflow = app.cheat_workflow.as_mut().unwrap();
@@ -26617,7 +26616,10 @@ $Instant Growth [Nayr]\n";
             CheatStepResource::NotLoaded
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
-        assert_eq!(app.archive_context.focused, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(
+            app.archive_context.focused,
+            Some(PathBuf::from("/roms/a.zip"))
+        );
         assert_eq!(
             app.cheat_workflow
                 .as_ref()
@@ -26769,7 +26771,10 @@ $Instant Growth [Nayr]\n";
             CheatStepResource::NotLoaded
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
-        assert_eq!(app.archive_context.focused, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(
+            app.archive_context.focused,
+            Some(PathBuf::from("/roms/a.zip"))
+        );
         assert_eq!(
             app.cheat_workflow
                 .as_ref()
@@ -26852,7 +26857,10 @@ $Instant Growth [Nayr]\n";
         assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
         assert_eq!(workflow.archive_path, PathBuf::from("/roms/game.zip"));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
-        assert_eq!(app.archive_context.focused, Some(PathBuf::from("/roms/other.zip")));
+        assert_eq!(
+            app.archive_context.focused,
+            Some(PathBuf::from("/roms/other.zip"))
+        );
         let live = match &app.state {
             LoadState::Ready(data) => &data.records[0],
             _ => unreachable!(),
@@ -29654,7 +29662,10 @@ $Instant Growth [Nayr]\n";
         app.poll_missing_removal(&egui::Context::default());
 
         assert!(matches!(app.database_state, DatabaseState::Ready { .. }));
-        assert_eq!(app.archive_context.selected, [path.clone()].into_iter().collect());
+        assert_eq!(
+            app.archive_context.selected,
+            [path.clone()].into_iter().collect()
+        );
         assert_eq!(app.archive_context.focused, Some(path));
         assert!(app.library_filters.missing);
         assert_eq!(app.sort_field, Some(SortField::State));
@@ -35258,9 +35269,10 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.archive_context.selected = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
-            .into_iter()
-            .collect();
+        harness.archive_context.selected =
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect();
 
         harness.render(
             &ctx,
@@ -35406,7 +35418,10 @@ $Instant Growth [Nayr]\n";
             &data,
             key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
         );
-        assert_eq!(harness.archive_context.focused, Some(PathBuf::from("/roms/c.zip")));
+        assert_eq!(
+            harness.archive_context.focused,
+            Some(PathBuf::from("/roms/c.zip"))
+        );
         assert_eq!(
             harness.archive_context.selected,
             [PathBuf::from("/roms/c.zip")].into_iter().collect()
@@ -35417,7 +35432,10 @@ $Instant Growth [Nayr]\n";
             &data,
             key_press_input(egui::Key::ArrowDown, egui::Modifiers::default()),
         );
-        assert_eq!(harness.archive_context.focused, Some(PathBuf::from("/roms/b.zip")));
+        assert_eq!(
+            harness.archive_context.focused,
+            Some(PathBuf::from("/roms/b.zip"))
+        );
         assert_eq!(
             harness.archive_context.selected,
             [PathBuf::from("/roms/b.zip")].into_iter().collect(),
@@ -35572,9 +35590,10 @@ $Instant Growth [Nayr]\n";
             ],
         );
         let mut harness = RealLoadedDataHarness::new();
-        harness.archive_context.selected = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
-            .into_iter()
-            .collect();
+        harness.archive_context.selected =
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/c.zip")]
+                .into_iter()
+                .collect();
 
         harness.render(&ctx, &data, bounded_test_input());
         assert_eq!(harness.archive_context.selected.len(), 2);
@@ -37137,7 +37156,9 @@ $Instant Growth [Nayr]\n";
                 egui::Shape::Text(text) if text.galley.text() == needle => {
                     Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
                 }
-                egui::Shape::Vec(nested) => nested.iter().find_map(|shape| find_rect(shape, needle)),
+                egui::Shape::Vec(nested) => {
+                    nested.iter().find_map(|shape| find_rect(shape, needle))
+                }
                 _ => None,
             }
         }
@@ -37285,7 +37306,8 @@ $Instant Growth [Nayr]\n";
         let mut library_column_widths = LibraryColumnWidths::default();
 
         let input = egui::RawInput {
-            screen_rect: viewport_size.map(|size| egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            screen_rect: viewport_size
+                .map(|size| egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             ..egui::RawInput::default()
         };
         ctx.run(input, |ctx| {
@@ -41299,7 +41321,10 @@ $Instant Growth [Nayr]\n";
                 .collect::<HashSet<_>>(),
             "Cancel must preserve the selection"
         );
-        assert_eq!(harness.archive_context.focused, Some(PathBuf::from("/roms/a.zip")));
+        assert_eq!(
+            harness.archive_context.focused,
+            Some(PathBuf::from("/roms/a.zip"))
+        );
         assert_eq!(harness.sort_field, Some(SortField::Platform));
         assert!(!harness.sort_ascending);
         assert!(harness.library_filters.present);
@@ -41314,9 +41339,10 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn unmount_selected_confirm_uses_the_same_batch_engine_with_only_mounted_selected_items() {
         let mut harness = RealLoadedDataHarness::new();
-        harness.archive_context.selected = [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
-            .into_iter()
-            .collect();
+        harness.archive_context.selected =
+            [PathBuf::from("/roms/a.zip"), PathBuf::from("/roms/b.zip")]
+                .into_iter()
+                .collect();
         harness.confirm_unmount_selected = Some(UnmountSelectedConfirmation);
         harness.cleanup_after_unmount = true;
         let data = loaded_data_with_records(
