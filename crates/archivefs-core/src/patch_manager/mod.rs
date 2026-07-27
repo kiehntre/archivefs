@@ -50,6 +50,7 @@ mod retroarch_materialization;
 mod shared_preview;
 mod shared_transaction;
 mod xenia_patch_document;
+mod xenia_provider;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -286,6 +287,16 @@ pub use xenia_patch_document::{
     XeniaDocumentWarningKind, XeniaPatch, XeniaPatchDocument, XeniaPatchWarning,
     XeniaPatchWarningKind, XeniaPatchWrite, XeniaWriteKind, XeniaWriteValue,
     parse_xenia_patch_toml,
+};
+pub use xenia_provider::{
+    XENIA_PROVIDER_FILE_MAX_BYTES, XENIA_PROVIDER_ID, XENIA_PROVIDER_INDEX_FRESH_SECONDS,
+    XENIA_PROVIDER_INDEX_MAX_BYTES, XENIA_PROVIDER_MAX_INDEX_ENTRIES,
+    XENIA_PROVIDER_MAX_MATCHED_FILES, XENIA_PROVIDER_MIN_REFRESH_SECONDS, XENIA_PROVIDER_NAME,
+    XENIA_PROVIDER_TIMEOUT_SECONDS, XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE,
+    XENIA_UPSTREAM_REPOSITORY, XeniaProviderDocument, XeniaProviderFetchError,
+    XeniaProviderFetchErrorKind, XeniaProviderFetchOptions, XeniaProviderFetchResult,
+    XeniaProviderFetchStatus, XeniaProviderResult, default_xenia_provider_cache_root,
+    fetch_xenia_provider_patches, fetch_xenia_provider_patches_with_transport,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
