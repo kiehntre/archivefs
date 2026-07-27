@@ -73,7 +73,8 @@ mod ui;
 #[cfg(test)]
 use archivefs_core::patch_manager::{
     GeckoProviderEntry, GeckoProviderResult, GeckoRegion, GeckoRevisionApplicability,
-    Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+    Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind, XeniaInstallationType,
+    XeniaProfileScope, XeniaProviderDocument, XeniaProviderResult,
 };
 
 use archivefs_core::{
@@ -27585,6 +27586,12 @@ mod tests {
                 CheatEmulatorAdapter::Dolphin
             );
         }
+        for platform in ["Xbox360", "Xbox 360"] {
+            assert_eq!(
+                cheat_adapter_route(Some(platform)),
+                CheatEmulatorAdapter::Xenia
+            );
+        }
         assert_eq!(
             cheat_adapter_route(Some("PS3")),
             CheatEmulatorAdapter::RetroArch
@@ -27925,6 +27932,264 @@ $Instant Growth [Nayr]\n";
         workflow.identity =
             CheatStepResource::Ready((workflow.identity_request.clone().unwrap(), report));
         app
+    }
+
+    fn xenia_profile_fixture(directory: &std::path::Path) -> XeniaProfile {
+        XeniaProfile {
+            profile_id: "xenia-explicit-test".to_string(),
+            installation_type: XeniaInstallationType::Explicit,
+            scope: XeniaProfileScope::Explicit,
+            configuration_path: directory.to_path_buf(),
+            provenance: "test fixture",
+            eligible: true,
+            blockers: Vec::new(),
+            patches_path: directory.join("patches"),
+            patches_state: XeniaPatchesDirectoryState::Missing,
+            patches_warning: None,
+            configuration_identity: None,
+        }
+    }
+
+    fn xenia_workflow_with_matched_identity(
+        directory: &std::path::Path,
+        title_id: &str,
+    ) -> ArchiveFsApp {
+        let mut app = app_with_cheats_mods_context();
+        app.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+            profiles: vec![xenia_profile_fixture(directory)],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("Xbox360".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Xenia;
+        workflow.selected_xenia_profile_id = Some("xenia-explicit-test".to_string());
+        workflow.identity_request = Some(GameIdentityRequest {
+            archive_path: workflow.archive_path.clone(),
+            platform: workflow.platform.clone(),
+            adapter: CheatEmulatorAdapter::Xenia,
+        });
+        let report = GameIdentityReport {
+            archive_path: workflow.archive_path.clone(),
+            platform: archivefs_core::game_identity::IdentityPlatform::Xbox360,
+            format: IdentityImageFormat::Xex,
+            evidence: vec![archivefs_core::game_identity::IdentityEvidence {
+                kind: IdentityKind::XexTitleId,
+                status: IdentityStatus::Verified,
+                value: Some(title_id.to_string()),
+                confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                provenance: archivefs_core::game_identity::IdentityProvenance {
+                    archive_path: workflow.archive_path.clone(),
+                    member_path: None,
+                    member_index: None,
+                    method: "test fixture XEX header read".to_string(),
+                },
+                diagnostic: "test fixture".to_string(),
+            }],
+            warnings: Vec::new(),
+            bytes_read: 512,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        };
+        workflow.identity =
+            CheatStepResource::Ready((workflow.identity_request.clone().unwrap(), report));
+        app
+    }
+
+    fn quake4_provider_fetch() -> XeniaProviderFetchResult {
+        XeniaProviderFetchResult {
+            result: XeniaProviderResult {
+                provider_id: "xenia_canary_game_patches".to_string(),
+                provider_display_name: "Xenia Canary game-patches".to_string(),
+                source_repository: "xenia-canary/game-patches".to_string(),
+                source_commit: "1".repeat(40),
+                retrieved_at_unix_seconds: 1,
+                title_id: "415607D2".to_string(),
+                documents: vec![XeniaProviderDocument {
+                    source_path: "patches/415607D2 - Quake 4.patch.toml".to_string(),
+                    document: archivefs_core::patch_manager::parse_xenia_patch_toml(
+                        "title_name = \"Quake 4\"\ntitle_id = \"415607D2\"\nhash = \"4768B579A3C5F134\"\n\n[[patch]]\n    name = \"Performance fix\"\n    desc = \"\"\n    author = \"Sowa_95\"\n    is_enabled = false\n    [[patch.be32]]\n        address = 0x821b7140\n        value = 0x39600001\n",
+                    ),
+                }],
+                attribution: "test".to_string(),
+                license: "test".to_string(),
+                warnings: Vec::new(),
+            },
+            status: XeniaProviderFetchStatus::Downloaded,
+            refresh_error: None,
+        }
+    }
+
+    #[test]
+    fn xenia_workflow_shows_no_dolphin_or_retroarch_controls_before_fetching() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-xenia-workflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_with_matched_identity(&directory, "415607D2");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+            profiles: vec![xenia_profile_fixture(&directory)],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_xenia_workflow(ui, workflow, &xenia_profiles, &mut clipboard);
+            });
+        });
+        for expected in [
+            "Xbox 360 identity",
+            "Title ID",
+            "415607D2",
+            "Stage 1 · Xenia Canary profile",
+            "Stage 2 · External Xenia patch provider",
+            "xenia-canary/game-patches",
+            "Fetch patches",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for forbidden in [
+            "GameSettings",
+            "Gecko",
+            "RetroArch cheat catalogue",
+            "Dolphin.ini",
+        ] {
+            assert!(
+                !rendered_text_contains(&output, forbidden),
+                "unexpected {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn xenia_candidate_picker_shows_compatibility_and_requires_explicit_choice() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-xenia-candidate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_with_matched_identity(&directory, "415607D2");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.xenia_provider = CheatStepResource::Ready(quake4_provider_fetch());
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_xenia_external_provider(ui, workflow, &mut clipboard);
+            });
+        });
+        for expected in [
+            "Candidate files",
+            "Quake 4",
+            "Partially verified",
+            "Choose this file",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        // Nothing is selected/staged until the user explicitly chooses.
+        assert!(workflow.xenia_selection.is_none());
+    }
+
+    #[test]
+    fn selecting_a_xenia_candidate_loads_the_real_destination_and_opens_the_picker() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-xenia-select-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_with_matched_identity(&directory, "415607D2");
+        let profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+            profiles: vec![xenia_profile_fixture(&directory)],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.xenia_provider = CheatStepResource::Ready(quake4_provider_fetch());
+        workflow.xenia_selected_candidate_index = Some(0);
+        ensure_xenia_selection_state(workflow, &profiles);
+        let state = workflow
+            .xenia_selection
+            .as_ref()
+            .expect("selection state built");
+        assert_eq!(state.candidate.title_id, "415607D2");
+        assert_eq!(state.selection.entries.len(), 1);
+        assert!(!state.destination.existed);
+        assert_eq!(
+            state.selection.compatibility,
+            XeniaCandidateCompatibility::PartiallyVerified
+        );
+    }
+
+    #[test]
+    fn xenia_patch_picker_requires_acknowledgement_only_for_partially_verified_candidates() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-xenia-ack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_with_matched_identity(&directory, "415607D2");
+        let profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+            profiles: vec![xenia_profile_fixture(&directory)],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.xenia_provider = CheatStepResource::Ready(quake4_provider_fetch());
+        workflow.xenia_selected_candidate_index = Some(0);
+        ensure_xenia_selection_state(workflow, &profiles);
+        assert!(
+            !workflow
+                .xenia_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .can_apply(),
+            "nothing selected yet"
+        );
+
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_xenia_patch_picker(ui, workflow, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Partially verified candidate"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "I understand the module hash is not verified"
+        ));
     }
 
     fn gafe01_provider_fetch() -> GeckoProviderFetchResult {
