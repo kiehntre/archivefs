@@ -4872,7 +4872,6 @@ impl ArchiveFsApp {
             previous_profile_id,
             previous_pcsx2_profile_id,
             previous_dolphin_profile_id,
-            previous_adapter,
         ) = self
             .cheat_workflow
             .as_ref()
@@ -4884,14 +4883,12 @@ impl ArchiveFsApp {
                     workflow.selected_profile_id.clone(),
                     workflow.selected_pcsx2_profile_id.clone(),
                     workflow.selected_dolphin_profile_id.clone(),
-                    Some(workflow.adapter),
                 )
             })
             .unwrap_or((
                 CheatSourceMode::ArchiveFsTrustedCatalogue,
                 None,
                 false,
-                None,
                 None,
                 None,
                 None,
@@ -4922,19 +4919,7 @@ impl ArchiveFsApp {
             self.cheat_workflow = None;
             return false;
         };
-        let ps2 = platform_is_ps2(platform.as_deref());
-        let dolphin = platform_is_dolphin(platform.as_deref());
-        let adapter = if ps2 {
-            previous_adapter
-                .filter(|adapter| *adapter != CheatEmulatorAdapter::Dolphin)
-                .unwrap_or(CheatEmulatorAdapter::Pcsx2)
-        } else if dolphin {
-            previous_adapter
-                .filter(|adapter| *adapter != CheatEmulatorAdapter::Pcsx2)
-                .unwrap_or(CheatEmulatorAdapter::Dolphin)
-        } else {
-            CheatEmulatorAdapter::RetroArch
-        };
+        let adapter = cheat_adapter_route(platform.as_deref());
         let selected_profile_id = match &self.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
                 let eligible = eligible_profile_ids(discovery);
@@ -5058,6 +5043,9 @@ impl ArchiveFsApp {
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
+        if workflow.adapter == CheatEmulatorAdapter::Unsupported {
+            return;
+        }
         let request = GameIdentityRequest {
             archive_path: workflow.archive_path.clone(),
             platform: workflow.platform.clone(),
@@ -5762,7 +5750,7 @@ impl ArchiveFsApp {
         let profile_id = match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => workflow.selected_profile_id.as_deref(),
             CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.as_deref(),
-            CheatEmulatorAdapter::Pcsx2 => None,
+            CheatEmulatorAdapter::Pcsx2 | CheatEmulatorAdapter::Unsupported => None,
         };
         let Some(profile_id) = profile_id else {
             return;
@@ -6812,13 +6800,28 @@ impl ArchiveFsApp {
                 }),
                 LoadState::Error(_) => None,
             });
-        if let (Some(workflow), Some(live_platform)) = (self.cheat_workflow.as_mut(), live_platform)
-            && workflow.platform != live_platform
-        {
-            workflow.platform = live_platform;
-            workflow.identity_request = None;
-            workflow.identity = CheatStepResource::NotLoaded;
-            clear_cheat_candidate_state(workflow);
+        if let Some(live_platform) = live_platform {
+            let route_changed = self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                workflow.platform != live_platform
+                    && workflow.adapter != cheat_adapter_route(live_platform.as_deref())
+            });
+            if route_changed {
+                let archive = self
+                    .cheat_workflow
+                    .as_ref()
+                    .map(|workflow| workflow.archive_path.clone());
+                self.cheat_workflow = None;
+                if let Some(archive) = archive {
+                    self.open_cheats_mods_workspace(context, archive);
+                }
+            } else if let Some(workflow) = self.cheat_workflow.as_mut()
+                && workflow.platform != live_platform
+            {
+                workflow.platform = live_platform;
+                workflow.identity_request = None;
+                workflow.identity = CheatStepResource::NotLoaded;
+                clear_cheat_candidate_state(workflow);
+            }
         }
     }
 
@@ -8214,6 +8217,9 @@ impl eframe::App for ArchiveFsApp {
                         LoadState::Loading { previous, .. } => previous.as_deref(),
                         LoadState::Error(_) => None,
                     };
+                    let retroarch_route = self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                        workflow.adapter == CheatEmulatorAdapter::RetroArch
+                    });
                     let (action, catalogue_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
@@ -8230,34 +8236,24 @@ impl eframe::App for ArchiveFsApp {
                                 busy || self.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
                             );
-                            ui.add_space(theme::SECTION_GAP);
-                            // Database and sources: the RetroArch cheat
-                            // database, reachable without leaving Cheats &
-                            // Mods (previously only from Sources, via
-                            // "Manage catalogue in Sources"). Renders
-                            // through the exact same component, state, and
-                            // Review-then-Confirm dispatch as the Sources
-                            // page - see `handle_catalogue_manager_action` -
-                            // so this shortcut cannot diverge in behaviour
-                            // or safety from the full Sources management
-                            // view. Left directly visible (not collapsed):
-                            // Download / Update / Verify are primary actions
-                            // here, not technical detail.
-                            widgets::section_header(
-                                ui,
-                                "Database and sources",
-                                Some(
-                                    "Download, update, or verify the trusted cheat database without leaving this page.",
-                                ),
-                            );
-                            let catalogue_action = show_retroarch_catalogue_manager(
-                                ui,
-                                &self.catalogue_manager,
-                                self.catalogue_review.as_ref(),
-                                self.catalogue_retrieval.as_ref(),
-                                self.catalogue_last_result.as_ref(),
-                                &mut self.clipboard,
-                            );
+                            let catalogue_action = retroarch_route.then(|| {
+                                ui.add_space(theme::SECTION_GAP);
+                                widgets::section_header(
+                                    ui,
+                                    "Database and sources",
+                                    Some(
+                                        "Download, update, or verify the trusted RetroArch cheat database without leaving this page.",
+                                    ),
+                                );
+                                show_retroarch_catalogue_manager(
+                                    ui,
+                                    &self.catalogue_manager,
+                                    self.catalogue_review.as_ref(),
+                                    self.catalogue_retrieval.as_ref(),
+                                    self.catalogue_last_result.as_ref(),
+                                    &mut self.clipboard,
+                                )
+                            }).flatten();
                             (action, catalogue_action)
                         })
                         .inner;
@@ -8279,30 +8275,6 @@ impl eframe::App for ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::OpenLibrary) => {
                             self.navigate_to_library_tab(LibraryTab::Archives);
-                        }
-                        Some(CheatWorkflowAction::SelectAdapter(adapter)) => {
-                            if let Some(workflow) = self.cheat_workflow.as_mut() {
-                                select_cheat_adapter(workflow, adapter);
-                            }
-                            self.start_game_identity_inspection(context.clone());
-                            if adapter == CheatEmulatorAdapter::Pcsx2
-                                && matches!(
-                                    self.pcsx2_profiles,
-                                    Pcsx2ProfilesState::NotScanned
-                                        | Pcsx2ProfilesState::Error(_)
-                                )
-                            {
-                                self.start_pcsx2_profile_scan(context.clone());
-                            }
-                            if adapter == CheatEmulatorAdapter::Dolphin
-                                && matches!(
-                                    self.dolphin_profiles,
-                                    DolphinProfilesState::NotScanned
-                                        | DolphinProfilesState::Error(_)
-                                )
-                            {
-                                self.start_dolphin_profile_scan(context.clone());
-                            }
                         }
                         Some(CheatWorkflowAction::RescanProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
@@ -14185,6 +14157,7 @@ enum CheatEmulatorAdapter {
     RetroArch,
     Pcsx2,
     Dolphin,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14210,24 +14183,6 @@ fn cheat_archive_change_requires_confirmation(
         workflow.archive_path != candidate
             && !matches!(workflow.source_fetch, CheatStepResource::NotLoaded)
     })
-}
-
-fn select_cheat_adapter(workflow: &mut CheatWorkflowState, adapter: CheatEmulatorAdapter) {
-    if workflow.adapter == adapter {
-        return;
-    }
-    workflow.adapter = adapter;
-    workflow.identity_request = None;
-    workflow.identity = CheatStepResource::NotLoaded;
-    workflow.preview_request = None;
-    workflow.preview = CheatStepResource::NotLoaded;
-    // Dropping a loading receiver is the stale-result boundary: the
-    // superseded worker cannot apply its result to the new adapter.
-    workflow.pcsx2_inventory_profile_id = None;
-    workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
-    workflow.dolphin_inventory_profile_id = None;
-    workflow.dolphin_inventory = CheatStepResource::NotLoaded;
-    clear_cheat_candidate_state(workflow);
 }
 
 /// Drops every candidate-derived stage. Called whenever the archive,
@@ -14679,7 +14634,6 @@ fn show_cheat_warnings_summary(
 enum CheatWorkflowAction {
     ChooseArchive,
     OpenLibrary,
-    SelectAdapter(CheatEmulatorAdapter),
     RescanProfiles,
     RescanPcsx2Profiles,
     InspectPcsx2Profile,
@@ -14798,6 +14752,15 @@ fn show_cheats_mods_workflow_states(
     }
     if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin) {
         show_dolphin_workflow_states(ui, workflow.unwrap(), dolphin_profiles);
+        return;
+    }
+    if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Unsupported) {
+        widgets::banner(
+            ui,
+            "Unsupported platform",
+            "No emulator adapter, source, preview, or transaction is active for this archive.",
+            widgets::StatusTone::Warning,
+        );
         return;
     }
     let (profile_label, profile_tone) = retroarch_integration_presentation(profiles);
@@ -15365,72 +15328,22 @@ fn platform_is_dolphin(platform: Option<&str>) -> bool {
     })
 }
 
-/// The adapter's short, single-line description shown below the tab row
-/// for whichever system is currently selected - the same copy each
-/// option's card used to show unconditionally, now shown only for the
-/// active choice since the stages below already explain that system in
-/// full detail.
-fn cheat_emulator_adapter_description(adapter: CheatEmulatorAdapter) -> &'static str {
-    match adapter {
-        CheatEmulatorAdapter::RetroArch => {
-            "Profile discovery, existing cheat-directory inventory, and trusted catalogue retrieval."
-        }
-        CheatEmulatorAdapter::Pcsx2 => {
-            "Discovers local PCSX2 profiles and inspects existing PNACH files with fixed resource limits."
-        }
-        CheatEmulatorAdapter::Dolphin => {
-            "Discovers local Dolphin profiles and inspects existing GameSettings INI files with fixed resource limits."
-        }
+/// Routes one canonical library platform to exactly one workflow. This is
+/// intentionally not a UI preference: rendering two adapters against one
+/// archive allowed stale profile/candidate state from the wrong system to
+/// remain reachable.
+fn cheat_adapter_route(platform: Option<&str>) -> CheatEmulatorAdapter {
+    if platform_is_ps2(platform) {
+        CheatEmulatorAdapter::Pcsx2
+    } else if platform_is_dolphin(platform) {
+        CheatEmulatorAdapter::Dolphin
+    } else if platform.is_some_and(|platform| {
+        !platform.trim().is_empty() && !platform.eq_ignore_ascii_case("unknown")
+    }) {
+        CheatEmulatorAdapter::RetroArch
+    } else {
+        CheatEmulatorAdapter::Unsupported
     }
-}
-
-fn show_cheat_emulator_adapter_selector(
-    ui: &mut egui::Ui,
-    workflow: &CheatWorkflowState,
-) -> Option<CheatWorkflowAction> {
-    widgets::section_header(
-        ui,
-        "Choose a system",
-        Some(
-            "The adapter is separate from the archive, source, profile, destination, and installation state.",
-        ),
-    );
-    let mut options = vec![(CheatEmulatorAdapter::RetroArch, "RetroArch")];
-    if platform_is_ps2(workflow.platform.as_deref()) {
-        options.push((CheatEmulatorAdapter::Pcsx2, "PCSX2"));
-    }
-    if platform_is_dolphin(workflow.platform.as_deref()) {
-        options.push((CheatEmulatorAdapter::Dolphin, "Dolphin"));
-    }
-    let clicked = widgets::card(ui, |ui| {
-        let clicked = widgets::tab_row(ui, &options, workflow.adapter);
-        match workflow.adapter {
-            CheatEmulatorAdapter::Pcsx2 => {
-                widgets::status_strip(
-                    ui,
-                    &[
-                        ("PS2 only", widgets::StatusTone::Info),
-                        ("Read-only", widgets::StatusTone::Success),
-                    ],
-                );
-            }
-            CheatEmulatorAdapter::Dolphin => {
-                widgets::status_strip(
-                    ui,
-                    &[
-                        ("GameCube / Wii", widgets::StatusTone::Info),
-                        ("Read-only", widgets::StatusTone::Success),
-                    ],
-                );
-            }
-            CheatEmulatorAdapter::RetroArch => {}
-        }
-        ui.label(cheat_emulator_adapter_description(workflow.adapter));
-        clicked
-    });
-    clicked
-        .filter(|selected| *selected != workflow.adapter)
-        .map(CheatWorkflowAction::SelectAdapter)
 }
 
 fn show_pcsx2_workflow(
@@ -16517,6 +16430,7 @@ fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
         CheatEmulatorAdapter::RetroArch => workflow.selected_profile_id.clone(),
         CheatEmulatorAdapter::Pcsx2 => workflow.selected_pcsx2_profile_id.clone(),
         CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.clone(),
+        CheatEmulatorAdapter::Unsupported => None,
     };
     CheatPreviewRequestKey {
         archive_path: workflow.archive_path.clone(),
@@ -16842,6 +16756,7 @@ fn build_cheat_preview_request(
                 }),
             ))
         }
+        CheatEmulatorAdapter::Unsupported => None,
     }
 }
 
@@ -16985,6 +16900,7 @@ fn show_shared_game_identity(
                     _ => None,
                 },
                 CheatEmulatorAdapter::RetroArch => None,
+                CheatEmulatorAdapter::Unsupported => None,
             };
             widgets::card(ui, |ui| {
                 ui.strong("Exact adapter match result");
@@ -18041,6 +17957,10 @@ fn show_cheats_mods_page(
         Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Dolphin => {
             dolphin_integration_presentation(dolphin_profiles)
         }
+        Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Unsupported => (
+            "Unsupported platform".to_string(),
+            widgets::StatusTone::Warning,
+        ),
         _ => retroarch_integration_presentation(profiles),
     };
     widgets::card(ui, |ui| {
@@ -18085,41 +18005,8 @@ fn show_cheats_mods_page(
         }
         widgets::status_strip(ui, &readiness_items);
 
-        // Cross-system availability: composed entirely from the existing
-        // per-adapter presentation functions (no new detection logic),
-        // gated by the same platform checks the "Choose a system"
-        // selector below uses, so the two never disagree about which
-        // systems apply to this archive.
-        let mut system_lines: Vec<(String, widgets::StatusTone)> = Vec::new();
-        let (retroarch_label, retroarch_tone) = retroarch_integration_presentation(profiles);
-        system_lines.push((format!("RetroArch · {retroarch_label}"), retroarch_tone));
-        if workflow
-            .as_deref()
-            .is_some_and(|workflow| platform_is_ps2(workflow.platform.as_deref()))
-        {
-            let (label, tone) = pcsx2_integration_presentation(pcsx2_profiles);
-            system_lines.push((format!("PCSX2 · {label}"), tone));
-        }
-        if workflow
-            .as_deref()
-            .is_some_and(|workflow| platform_is_dolphin(workflow.platform.as_deref()))
-        {
-            let (label, tone) = dolphin_integration_presentation(dolphin_profiles);
-            system_lines.push((format!("Dolphin · {label}"), tone));
-        }
-        let system_items: Vec<(&str, widgets::StatusTone)> = system_lines
-            .iter()
-            .map(|(label, tone)| (label.as_str(), *tone))
-            .collect();
-        widgets::status_strip(ui, &system_items);
     });
     ui.add_space(theme::SECTION_GAP);
-
-    // --- Choose a system: which adapter's workflow is shown below.
-    if let Some(workflow) = workflow.as_deref() {
-        action = show_cheat_emulator_adapter_selector(ui, workflow).or(action);
-        ui.add_space(theme::SECTION_GAP);
-    }
 
     // --- Selected system workflow: everything specific to the archive
     // and the currently selected adapter.
@@ -18169,6 +18056,14 @@ fn show_cheats_mods_page(
             CheatEmulatorAdapter::Dolphin => {
                 action =
                     show_dolphin_workflow(ui, workflow, dolphin_profiles, clipboard).or(action);
+            }
+            CheatEmulatorAdapter::Unsupported => {
+                widgets::banner(
+                    ui,
+                    "Unsupported platform",
+                    "ArchiveFS has no Cheats & Mods adapter for this archive's platform. Assign a supported platform in Library if the catalogue metadata is wrong.",
+                    widgets::StatusTone::Warning,
+                );
             }
         }
 
@@ -26010,138 +25905,53 @@ mod tests {
     }
 
     #[test]
-    fn pcsx2_adapter_is_visible_only_for_ps2_archives() {
-        let mut app = app_with_cheats_mods_context();
-        let workflow = app.cheat_workflow.as_mut().unwrap();
-        workflow.platform = Some("PS2".to_string());
-        let ctx = egui::Context::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
-            });
-        });
-        assert!(rendered_text_contains(&output, "PCSX2"));
-
-        workflow.platform = Some("PS3".to_string());
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
-            });
-        });
-        assert!(!rendered_text_contains(&output, "PCSX2"));
-    }
-
-    #[test]
-    fn dolphin_adapter_is_visible_only_for_gamecube_and_wii_archives() {
-        let mut app = app_with_cheats_mods_context();
-        let workflow = app.cheat_workflow.as_mut().unwrap();
-        let ctx = egui::Context::default();
-        for platform in ["GameCube", "Nintendo Wii"] {
-            workflow.platform = Some(platform.to_string());
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = show_cheat_emulator_adapter_selector(ui, workflow);
-                });
-            });
-            assert!(rendered_text_contains(&output, "Dolphin"));
+    fn adapter_routing_is_platform_authoritative() {
+        assert_eq!(
+            cheat_adapter_route(Some("PS2")),
+            CheatEmulatorAdapter::Pcsx2
+        );
+        for platform in ["GameCube", "Nintendo GameCube", "Wii", "Nintendo Wii"] {
+            assert_eq!(
+                cheat_adapter_route(Some(platform)),
+                CheatEmulatorAdapter::Dolphin
+            );
         }
-        workflow.platform = Some("PS3".to_string());
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
-            });
-        });
-        assert!(!rendered_text_contains(&output, "Dolphin"));
-    }
-
-    #[test]
-    fn choose_a_system_tabs_are_reachable_via_a_real_click() {
-        let mut app = app_with_cheats_mods_context();
-        let workflow = app.cheat_workflow.as_mut().unwrap();
-        workflow.platform = Some("PS2".to_string());
-        let workflow = app.cheat_workflow.as_ref().unwrap();
-        let ctx = egui::Context::default();
-
-        let discovery_output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_cheat_emulator_adapter_selector(ui, workflow);
-            });
-        });
-        let pcsx2_pos = find_exact_text_center(&discovery_output, "PCSX2")
-            .expect("the PCSX2 tab label must be rendered for a PS2 archive");
-
-        let clicked_action: std::rc::Rc<std::cell::RefCell<Option<CheatWorkflowAction>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let captured = std::rc::Rc::clone(&clicked_action);
-        let render = move |ui: &mut egui::Ui| -> egui::Response {
-            let inner = ui.scope(|ui| show_cheat_emulator_adapter_selector(ui, workflow));
-            if let Some(action) = inner.inner {
-                *captured.borrow_mut() = Some(action);
-            }
-            inner.response
-        };
-        simulate_row_click(&ctx, pcsx2_pos, egui::Modifiers::default(), render);
-
-        assert!(
-            matches!(
-                *clicked_action.borrow(),
-                Some(CheatWorkflowAction::SelectAdapter(
-                    CheatEmulatorAdapter::Pcsx2
-                ))
-            ),
-            "clicking the PCSX2 tab must select it as the emulator adapter"
+        assert_eq!(
+            cheat_adapter_route(Some("PS3")),
+            CheatEmulatorAdapter::RetroArch
+        );
+        assert_eq!(cheat_adapter_route(None), CheatEmulatorAdapter::Unsupported);
+        assert_eq!(
+            cheat_adapter_route(Some("Unknown")),
+            CheatEmulatorAdapter::Unsupported
         );
     }
 
     #[test]
-    fn per_adapter_profile_selections_survive_a_real_adapter_switch() {
-        let mut app = app_with_cheats_mods_context();
-        let workflow = app.cheat_workflow.as_mut().unwrap();
-        workflow.platform = Some("PS2".to_string());
-        workflow.selected_profile_id = Some("native-user".to_string());
-        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
-        workflow.source_mode = CheatSourceMode::ArchiveFsTrustedCatalogue;
-        workflow.selected_source_id = Some("source-a".to_string());
-
-        select_cheat_adapter(workflow, CheatEmulatorAdapter::Pcsx2);
-        assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
+    fn gamecube_route_cannot_select_retroarch() {
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut gamecube = record("/roms/animal-crossing.zip", MountState::Pending);
+            gamecube.identity.platform = Some("GameCube".to_string());
+            data.records.push(gamecube);
+        }
+        assert!(app.prepare_cheats_mods_workspace(PathBuf::from(
+            "/roms/animal-crossing.zip"
+        )));
         assert_eq!(
-            workflow.selected_profile_id.as_deref(),
-            Some("native-user"),
-            "switching to PCSX2 must not discard the RetroArch profile choice"
-        );
-        assert_eq!(
-            workflow.selected_pcsx2_profile_id.as_deref(),
-            Some("pcsx2-native-test")
-        );
-        assert_eq!(
-            workflow.source_mode,
-            CheatSourceMode::ArchiveFsTrustedCatalogue
-        );
-        assert_eq!(workflow.selected_source_id.as_deref(), Some("source-a"));
-
-        select_cheat_adapter(workflow, CheatEmulatorAdapter::RetroArch);
-        assert_eq!(workflow.adapter, CheatEmulatorAdapter::RetroArch);
-        assert_eq!(
-            workflow.selected_profile_id.as_deref(),
-            Some("native-user"),
-            "switching back to RetroArch must still remember its own profile choice"
-        );
-        assert_eq!(
-            workflow.selected_pcsx2_profile_id.as_deref(),
-            Some("pcsx2-native-test"),
-            "the PCSX2 profile choice must remain remembered even while RetroArch is active"
+            app.cheat_workflow.as_ref().unwrap().adapter,
+            CheatEmulatorAdapter::Dolphin
         );
     }
 
     #[test]
-    fn overview_lists_availability_only_for_applicable_systems() {
+    fn gamecube_page_renders_dolphin_without_retroarch_content() {
         let mut app = app_with_cheats_mods_context();
         let history = OperationHistory::default();
         let mut clipboard = InMemoryClipboard::default();
-
-        // A PS3 archive: only RetroArch applies.
-        app.cheat_workflow.as_mut().unwrap().platform = Some("PS3".to_string());
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("GameCube".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Dolphin;
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -26159,31 +25969,12 @@ mod tests {
                 );
             });
         });
-        assert!(rendered_text_contains(&output, "RetroArch ·"));
-        assert!(!rendered_text_contains(&output, "PCSX2 ·"));
-        assert!(!rendered_text_contains(&output, "Dolphin ·"));
-
-        // A PS2 archive: RetroArch and PCSX2 both apply.
-        app.cheat_workflow.as_mut().unwrap().platform = Some("PS2".to_string());
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_cheats_mods_page(
-                    ui,
-                    app.cheat_workflow.as_mut(),
-                    &app.retroarch_profiles,
-                    &app.pcsx2_profiles,
-                    &app.dolphin_profiles,
-                    None,
-                    None,
-                    &history,
-                    false,
-                    &mut clipboard,
-                );
-            });
-        });
-        assert!(rendered_text_contains(&output, "RetroArch ·"));
-        assert!(rendered_text_contains(&output, "PCSX2 ·"));
-        assert!(!rendered_text_contains(&output, "Dolphin ·"));
+        assert!(rendered_text_contains(&output, "Stage 1 · Dolphin profile"));
+        assert!(!rendered_text_contains(
+            &output,
+            "Stage 1 · Archive and RetroArch profile"
+        ));
+        assert!(!rendered_text_contains(&output, "Choose a system"));
     }
 
     #[test]
@@ -26210,7 +26001,6 @@ mod tests {
         });
         for expected in [
             "Overview",
-            "Choose a system",
             "Selected system workflow",
             // Workflow-state details ("Emulator profile" and friends) now
             // live behind the collapsed "Workflow diagnostics" section, so
@@ -26666,7 +26456,7 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
-    fn adapter_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
+    fn route_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
         let mut app = app_with_cheats_mods_context();
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
         let workflow = app.cheat_workflow.as_mut().unwrap();
@@ -26688,7 +26478,11 @@ $Instant Growth [Nayr]\n";
             receiver: identity_receiver,
         };
 
-        select_cheat_adapter(workflow, CheatEmulatorAdapter::RetroArch);
+        if let LoadState::Ready(data) = &mut app.state {
+            data.records[0].identity.platform = Some("PS3".to_string());
+        }
+        app.view = MainView::CheatsMods;
+        app.reconcile_cheats_mods_context(&egui::Context::default());
 
         assert!(sender.send(Ok(empty_pcsx2_inventory())).is_err());
         assert!(
@@ -26703,9 +26497,9 @@ $Instant Growth [Nayr]\n";
                 )))
                 .is_err()
         );
-        assert_eq!(workflow.archive_path, archive);
+        assert_eq!(app.cheat_workflow.as_ref().unwrap().archive_path, archive);
         assert!(matches!(
-            workflow.pcsx2_inventory,
+            app.cheat_workflow.as_ref().unwrap().pcsx2_inventory,
             CheatStepResource::NotLoaded
         ));
         assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
@@ -26714,7 +26508,11 @@ $Instant Growth [Nayr]\n";
             app.cheat_workflow
                 .as_ref()
                 .and_then(|workflow| workflow.platform.as_deref()),
-            Some("PS2")
+            Some("PS3")
+        );
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().adapter,
+            CheatEmulatorAdapter::RetroArch
         );
     }
 
