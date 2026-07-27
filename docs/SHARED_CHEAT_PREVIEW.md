@@ -112,7 +112,7 @@ The shared transaction foundation provides fresh immediately-before-write
 checks, explicit replacement consent, verified backups, durable journaling,
 atomic installation, post-write verification, and rollback for adapters with a
 safe materialized source seam. The GUI RetroArch per-game materialization
-bridge is implemented and wired into Cheats & Mods. PCSX2 and Dolphin remain
-preview-only, since neither has an independent, approved local source
-artifact to materialize. See
+bridge and Dolphin external Gecko-provider staging bridge are implemented and
+wired into Cheats & Mods. PCSX2 remains preview-only because it has no
+independent, approved source artifact to materialize. See
 [`SHARED_SAFE_APPLY_ROLLBACK.md`](SHARED_SAFE_APPLY_ROLLBACK.md).

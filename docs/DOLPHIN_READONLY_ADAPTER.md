@@ -1,12 +1,12 @@
 # Dolphin Cheats & Mods adapter
 
-ArchiveFS can discover local Dolphin user profiles and inspect their existing
-per-game INI files from the Cheats & Mods workspace for GameCube and Wii
-archives. Discovery and inventory are read-only. After an exact verified
-GameCube identity match, the reviewed Gecko transaction path can replace only
-the existing file's `[Gecko_Enabled]` section after preview and confirmation,
-with backup, journal, and rollback. It does not start Dolphin, evaluate code,
-follow referenced mod paths, download definitions, or fabricate a Game INI.
+ArchiveFS can discover local Dolphin user profiles, inspect optional existing
+per-game INI files, and retrieve Gecko definitions from the official Dolphin
+upstream GameSettings dataset. Provider retrieval and Dolphin installation are
+separate components. After an exact verified GameCube identity lookup, selected
+definitions can be previewed and installed with backup, journal, verification,
+and rollback. ArchiveFS does not start Dolphin, evaluate code, or follow
+referenced mod paths.
 
 ## Discovery
 
@@ -25,7 +25,9 @@ A profile must be an absolute, non-root path with no symlink in an existing
 component, and `Dolphin.ini` at its root must be a regular, non-symlink file.
 Existing unsafe or unproven candidates remain visible as blocked. Missing
 standard candidates are ignored; missing explicit roots are blocked. ArchiveFS
-creates neither profiles nor `GameSettings`.
+never creates profiles. A confirmed Gecko install may create the one exact
+`GameSettings/<GAMEID>.ini` destination and its immediate `GameSettings`
+directory when absent; discovery and inspection themselves never do.
 Unix device/inode identity is captured during discovery and checked before
 inventory. Exactly one eligible profile may be selected automatically;
 multiple eligible profiles require an explicit choice.
@@ -79,23 +81,48 @@ outer-header revision remains candidate-only. An INI or archive filename Game
 ID remains an observation, not verified identity. See
 [`SHARED_GAME_IDENTITY.md`](SHARED_GAME_IDENTITY.md).
 
-The shared preview uses the verified Game ID, preserving an optional
-verified revision as distinct evidence, and maps only a conservative
-`GameSettings/<matched file>.ini` destination beneath the approved Dolphin
-root. Candidate filename IDs are visible but blocked. Texture-pack preview is
-not supported. Existing different content requires backup and explicit
-replacement permission. See [`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
+The shared preview uses the verified Game ID and revision and maps only the
+conservative `GameSettings/<GAMEID>.ini` destination beneath the approved
+Dolphin root. Existing different content requires backup and explicit
+replacement permission. A missing file is a valid new-file destination, not a
+discovery prerequisite. Texture-pack preview is not supported. See
+[`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
+
+## External Gecko provider
+
+This milestone uses exactly one provider: the maintained
+`dolphin-emu/dolphin` repository's structured
+`Data/Sys/GameSettings/<GAMEID>.ini` dataset. It was chosen because GAFE01 is
+present with a complete Gecko body, the format is already parsed by Dolphin,
+anonymous HTTPS retrieval is supported, and the repository is licensed
+GPL-2.0-or-later. ArchiveFS shows the source URL, attribution, licence,
+retrieval time, exact game ID, encoded region, and revision warning.
+
+The GAFE01 dataset currently supplies `16:9 Widescreen` with five complete
+code lines. Upstream does not declare per-entry disc-revision applicability,
+so ArchiveFS labels that uncertainty rather than claiming revision-0 proof.
+Wrong-region IDs, mismatched response identities, explicitly wrong revisions,
+malformed bodies, and ambiguous duplicate names are blocked.
+
+Retrieval uses an ArchiveFS User-Agent, a 15-second overall timeout, a 256 KiB
+response bound, and a 30-second minimum refresh interval. Parsed results are
+cached locally for 24 hours. Refresh is explicit; rendering never initiates a
+request. A validated stale cache remains usable when refresh fails, with the
+failure shown. Remote content remains inert text and remote URLs are never
+treated as local paths.
 
 ## Privacy, safety, and future work
 
-All profile inspection is local. No filename, content, hash, result, or
-metadata is uploaded. The adapter exposes no network or process-execution path,
-and original Dolphin files remain untouched during discovery and inventory.
-Structural inspection is not antivirus scanning and does not prove that a
-cheat or patch is benign.
+Profile inspection is local. The external request contains only the already
+verified six-character Game ID in the provider URL. ArchiveFS does not upload
+archive filenames, ROM content, local paths, hashes, or profile metadata. It
+has no process-execution path, and original Dolphin files remain untouched
+during discovery, retrieval, inventory, and preview. Structural inspection is
+not antivirus scanning and does not prove that a cheat or patch is benign.
 
 The Gecko workflow supports individual code selection, preview, explicit
-apply, verified backup, journaling, and rollback for an existing exact-match
-Game INI. Downloading definitions, creating a missing `GAFE01.ini`, general
-section editing, Action Replay installation, and referenced Riivolution asset
-inspection remain future work.
+apply, verified backup, journaling, and rollback for existing or missing exact
+ID Game INIs. It preserves unrelated settings and Gecko entries and updates
+`[Gecko]` and `[Gecko_Enabled]` without duplicate definitions. General section
+editing, Action Replay installation, Wii provider routing, and referenced
+Riivolution asset inspection remain future work.

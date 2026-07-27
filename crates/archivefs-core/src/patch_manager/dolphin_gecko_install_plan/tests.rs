@@ -383,3 +383,144 @@ fn deterministic_staging_produces_identical_bytes() {
     assert_eq!(staged1.digest, staged2.digest);
     assert_eq!(staged1.contents, staged2.contents);
 }
+
+fn external_gafe01_result() -> GeckoProviderResult {
+    GeckoProviderResult {
+        provider_id: "dolphin_upstream_gamesettings".to_string(),
+        provider_display_name: "Dolphin upstream GameSettings".to_string(),
+        source_identity: "fixture:GAFE01.ini".to_string(),
+        retrieved_at_unix_seconds: 1,
+        game_id: "GAFE01".to_string(),
+        title: Some("Animal Crossing".to_string()),
+        region: super::super::dolphin_gecko_provider::GeckoRegion::Usa,
+        revision: 0,
+        entries: vec![GeckoProviderEntry {
+            provider_entry_id: "gafe01-widescreen".to_string(),
+            name: "16:9 Widescreen".to_string(),
+            code_lines: vec![
+                "040037A0 3C608000".to_string(),
+                "040037A4 C38337AC".to_string(),
+                "040037A8 4805ACBC".to_string(),
+                "040037AC 3FE38E39".to_string(),
+                "0405E460 4BFA5340".to_string(),
+            ],
+            notes: Vec::new(),
+            region: super::super::dolphin_gecko_provider::GeckoRegion::Usa,
+            revision_applicability:
+                super::super::dolphin_gecko_provider::GeckoRevisionApplicability::Uncertain,
+            parse_warnings: vec!["revision applicability is uncertain".to_string()],
+            safe_to_offer: true,
+        }],
+        warnings: Vec::new(),
+        attribution: "Dolphin upstream".to_string(),
+        license: "GPL-2.0-or-later".to_string(),
+    }
+}
+
+#[test]
+fn external_provider_discovery_does_not_require_a_preexisting_ini() {
+    let fixture = Fixture::new("provider-new");
+    let configuration_path = fixture.dir("dolphin");
+    let destination = load_dolphin_destination(&configuration_path, "GAFE01").unwrap();
+    assert!(!destination.existed);
+    let provider = external_gafe01_result();
+    let mut selection = DolphinProviderCodeSelection::from_provider(&provider, &destination);
+    selection.select_all();
+    let staged = stage_dolphin_provider_ini(
+        &fixture.path("staging"),
+        &destination,
+        &provider,
+        &selection,
+    )
+    .unwrap();
+    assert!(!staged.destination_existed);
+    assert!(staged.contents.contains("$16:9 Widescreen\n"));
+    assert!(
+        staged
+            .contents
+            .contains("[Gecko_Enabled]\n$16:9 Widescreen\n")
+    );
+    assert_eq!(staged.selected_code_names, vec!["16:9 Widescreen"]);
+}
+
+#[test]
+fn external_provider_merge_preserves_existing_settings_and_unrelated_gecko_codes() {
+    let fixture = Fixture::new("provider-existing");
+    let configuration_path = fixture.dir("dolphin");
+    fixture.write(
+        "dolphin/GameSettings/GAFE01.ini",
+        "[Core]\nFastDiscSpeed = True\n[Gecko]\n$Existing Code\n04000000 60000000\n[Gecko_Enabled]\n$Existing Code\n",
+    );
+    let destination = load_dolphin_destination(&configuration_path, "GAFE01").unwrap();
+    let provider = external_gafe01_result();
+    let mut selection = DolphinProviderCodeSelection::from_provider(&provider, &destination);
+    selection.select_all();
+    let staged = stage_dolphin_provider_ini(
+        &fixture.path("staging"),
+        &destination,
+        &provider,
+        &selection,
+    )
+    .unwrap();
+    assert!(staged.contents.contains("[Core]\nFastDiscSpeed = True\n"));
+    assert!(
+        staged
+            .contents
+            .contains("$Existing Code\n04000000 60000000\n")
+    );
+    assert!(
+        staged
+            .contents
+            .contains("[Gecko_Enabled]\n$Existing Code\n$16:9 Widescreen\n")
+    );
+}
+
+#[test]
+fn an_identical_existing_provider_code_is_not_duplicated() {
+    let fixture = Fixture::new("provider-duplicate");
+    let configuration_path = fixture.dir("dolphin");
+    let provider = external_gafe01_result();
+    let body = provider.entries[0].code_lines.join("\n");
+    fixture.write(
+        "dolphin/GameSettings/GAFE01.ini",
+        &format!("[Gecko]\n$16:9 Widescreen\n{body}\n"),
+    );
+    let destination = load_dolphin_destination(&configuration_path, "GAFE01").unwrap();
+    let mut selection = DolphinProviderCodeSelection::from_provider(&provider, &destination);
+    assert!(selection.entries[0].already_present);
+    selection.select_all();
+    let staged = stage_dolphin_provider_ini(
+        &fixture.path("staging"),
+        &destination,
+        &provider,
+        &selection,
+    )
+    .unwrap();
+    assert_eq!(staged.contents.matches("$16:9 Widescreen").count(), 2);
+}
+
+#[test]
+fn external_provider_preview_is_deterministic() {
+    let fixture = Fixture::new("provider-deterministic");
+    let configuration_path = fixture.dir("dolphin");
+    let destination = load_dolphin_destination(&configuration_path, "GAFE01").unwrap();
+    let provider = external_gafe01_result();
+    let mut selection = DolphinProviderCodeSelection::from_provider(&provider, &destination);
+    selection.select_all();
+    let first = stage_dolphin_provider_ini(
+        &fixture.path("stage-a"),
+        &destination,
+        &provider,
+        &selection,
+    )
+    .unwrap();
+    let second = stage_dolphin_provider_ini(
+        &fixture.path("stage-b"),
+        &destination,
+        &provider,
+        &selection,
+    )
+    .unwrap();
+    assert_eq!(first.contents, second.contents);
+    assert_eq!(first.digest, second.digest);
+}

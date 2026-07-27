@@ -51,18 +51,20 @@ and virtualized vertical rows remain independent and usable.
    directory.
 6. Select **Rescan Dolphin profiles**. Confirm the profile configuration path
    and its `GameSettings` directory are displayed.
-7. ArchiveFS automatically inventories that profile and matches `GAFE01.ini`.
-   Confirm the Gecko codes and their individual checkboxes appear.
-8. Choose codes, preview the installed file, review the exact destination,
-   and confirm apply.
-9. Open Dolphin and verify the chosen Gecko codes are enabled for Animal
-   Crossing.
+7. Select **Fetch Gecko codes**. Confirm the external Dolphin upstream provider
+   reports exact game ID `GAFE01`, USA, revision `0`, its source URL and
+   attribution, and the `16:9 Widescreen` candidate. This must work even when
+   `GameSettings/GAFE01.ini` does not exist.
+8. Select one code and choose **Preview the installed file**. Review the exact
+   destination, selected names, complete generated sections, preserved
+   sections, creation/backup state, warnings, and SHA-256.
+9. Review and confirm apply. Open Dolphin and verify the chosen Gecko code is
+   displayed for Animal Crossing.
 10. Return to ArchiveFS and use **Roll back this install**; verify Dolphin's
-    prior `[Gecko_Enabled]` state is restored.
+    prior file is restored exactly, or that a file created by this transaction
+    is removed.
 
-ArchiveFS never invents Gecko definitions. If step 7 reports no exact
-candidate, Dolphin's profile does not currently contain `GameSettings/GAFE01.ini`.
-Use Dolphin's own supported mechanism to populate that file, rescan, and repeat
-the match. The currently inspected profile on the recovery machine did not
-contain that file, so candidate/apply/rollback still require manual proof after
-that external prerequisite is met.
+ArchiveFS never invents Gecko definitions. GAFE01 definitions come from the
+official Dolphin upstream GameSettings dataset. Provider retrieval, apply,
+Dolphin display, and rollback still require manual proof on the real profile;
+automated tests use recorded provider fixtures and isolated temporary paths.

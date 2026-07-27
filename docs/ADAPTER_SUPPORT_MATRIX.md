@@ -29,7 +29,7 @@ documents linked in each row for full detail.
 |---|---|---|---|---|---|---|---|---|---|
 | **RetroArch** | Verified (exact/strong trusted-catalogue match bound to archive evidence) | N/A - the source is the trusted catalogue itself, not an emulator-managed directory to inventory | **Yes** - reviewed `libretro-database` provider, Download/Update/Verify from Sources, immutable content-addressed snapshots | Yes, shared model | **Yes** - explicit confirmation, separate replacement approval, background execution | Yes - verified, never-overwritten backup before any replacement | Yes - fresh preview re-derived before acting, blocks on user-modified content or a missing/changed backup | Not implemented | An open catalogue parse-tolerance issue (some malformed entries can affect the whole snapshot) is being fixed on a parallel branch, not yet merged |
 | **PCSX2** | Verified (PCSX2 executable CRC via the shared bounded ISO reader) | Yes - inventories existing `cheats`/`cheats_ws`/`patches` directories and `.pnach` files, read-only | No - no official-provider integration exists yet; only emulator-managed local files are inspected | Yes, shared model | **No** - no independent, approved source artifact to apply from; this is a scope decision, not a bug | N/A (no apply) | N/A (no apply) | Not implemented | No official `pcsx2_patches` provider yet; no per-section selection or safe PNACH merge yet |
-| **Dolphin** | Verified Game ID and revision via the shared bounded ISO/ZIP reader | Yes - inventories existing `GameSettings/*.ini` files for the selected GameCube/Wii archive | The selected Dolphin profile's existing GameSettings file; no remote provider | Yes, including individual Gecko-code selection | **Yes** - replaces only `[Gecko_Enabled]` after explicit preview/confirmation | Yes - verified, never-overwritten backup before replacement | Yes - journal-backed shared rollback with fresh safety checks | Not implemented | Dolphin must already have a matching `<GAMEID>.ini`; ArchiveFS does not fabricate or download Gecko definitions |
+| **Dolphin** | Verified Game ID and revision via the shared bounded ISO/ZIP reader | Yes - inventories optional existing `GameSettings/*.ini` files | **Yes** - exact-ID lookup in the official Dolphin upstream GameSettings dataset, with bounded retrieval and local cache | Yes, including individual Gecko-code selection, complete generated sections, preserved sections, and final hash | **Yes** - safely merges `[Gecko]` and `[Gecko_Enabled]` after explicit preview/confirmation; creates the exact INI when absent | Yes - verified, never-overwritten backup before replacement | Yes - restores exact previous bytes or removes an INI created by the transaction | Not implemented | Upstream does not declare per-code disc revisions, so uncertain applicability is always labelled |
 
 ## Notes on "Apply" specifically
 
@@ -39,8 +39,9 @@ backup before replacement, journal, and rollback). It does **not** mean
 "ArchiveFS runs the cheat" - ArchiveFS never executes cheat, patch, or mod
 content at any stage, for any adapter, in preview, apply, or rollback.
 "No Apply" for PCSX2 means exactly that: it remains read-only. Dolphin's
-reviewed Gecko path can update `[Gecko_Enabled]` in an existing exact-ID
-GameSettings file; it does not install new definitions or other mod types.
+reviewed Gecko path can merge selected upstream definitions into an existing
+exact-ID GameSettings file or create that file when absent. It does not install
+other mod types.
 
 ## Snapshot vs. individual-entry trust
 
