@@ -21133,6 +21133,7 @@ fn show_loaded_data(
         egui::Window::new("Unmount selected mounted archives?")
             .collapsible(false)
             .resizable(false)
+            .default_width(700.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ui.ctx(), |ui| {
                 // Keep the decision controls reachable even on a short viewport. Long safety
