@@ -937,7 +937,12 @@ fn apply_one(
     }
     let parent = destination.parent().unwrap_or(destination_root);
     if !parent.exists() {
-        if !plan.parent_creation_approved || plan.adapter != PreviewAdapter::RetroArch {
+        if !plan.parent_creation_approved
+            || !matches!(
+                plan.adapter,
+                PreviewAdapter::RetroArch | PreviewAdapter::Dolphin
+            )
+        {
             return fail_result(
                 result,
                 SharedApplyOutcome::WriteFailed,

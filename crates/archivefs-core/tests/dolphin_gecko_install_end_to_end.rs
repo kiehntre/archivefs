@@ -13,11 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::patch_manager::{
     DolphinCandidateBlockedReason, DolphinCodeSelection, DolphinInstallPreviewRequest,
-    DolphinProfileDiscoveryRoots, SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackOutcome,
-    build_dolphin_candidate, build_dolphin_install_preview, build_shared_transaction_plan,
-    discover_dolphin_profiles, execute_shared_apply, execute_shared_rollback,
-    inspect_dolphin_profile, load_dolphin_ini, preview_shared_rollback, stage_dolphin_ini,
+    DolphinProfileDiscoveryRoots, DolphinProviderCodeSelection, GeckoProviderEntry,
+    GeckoProviderResult, GeckoRegion, GeckoRevisionApplicability, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
+    SharedRollbackOutcome, build_dolphin_candidate, build_dolphin_install_preview,
+    build_shared_transaction_plan, discover_dolphin_profiles, execute_shared_apply,
+    execute_shared_rollback, inspect_dolphin_profile, load_dolphin_destination, load_dolphin_ini,
+    preview_shared_rollback, stage_dolphin_ini, stage_dolphin_provider_ini,
 };
 
 const REAL_WORLD_INI: &str = "[Core]\n\
@@ -366,4 +368,119 @@ fn selecting_zero_codes_blocks_before_any_write() {
     let selection = DolphinCodeSelection::from_document(&loaded.document);
     assert!(!selection.can_apply());
     assert!(selection.resolve_names(&loaded.document).is_err());
+}
+
+fn external_gafe01_provider() -> GeckoProviderResult {
+    GeckoProviderResult {
+        provider_id: "dolphin_upstream_gamesettings".to_string(),
+        provider_display_name: "Dolphin upstream GameSettings".to_string(),
+        source_identity: "fixture:GAFE01.ini".to_string(),
+        retrieved_at_unix_seconds: 1,
+        game_id: "GAFE01".to_string(),
+        title: Some("Animal Crossing".to_string()),
+        region: GeckoRegion::Usa,
+        revision: 0,
+        entries: vec![GeckoProviderEntry {
+            provider_entry_id: "gafe01-widescreen".to_string(),
+            name: "16:9 Widescreen".to_string(),
+            code_lines: vec![
+                "040037A0 3C608000".to_string(),
+                "040037A4 C38337AC".to_string(),
+                "040037A8 4805ACBC".to_string(),
+                "040037AC 3FE38E39".to_string(),
+                "0405E460 4BFA5340".to_string(),
+            ],
+            notes: Vec::new(),
+            region: GeckoRegion::Usa,
+            revision_applicability: GeckoRevisionApplicability::Uncertain,
+            parse_warnings: vec!["revision applicability is uncertain".to_string()],
+            safe_to_offer: true,
+        }],
+        warnings: Vec::new(),
+        attribution: "Dolphin upstream".to_string(),
+        license: "GPL-2.0-or-later".to_string(),
+    }
+}
+
+#[test]
+fn external_provider_creates_a_missing_ini_and_rollback_removes_it() {
+    let fixture = Fixture::new("provider-create-rollback");
+    let configuration_path = fixture.dir("dolphin");
+    let archive = fixture.write("library/Animal Crossing (USA).zip", "zip fixture");
+    let staging_root = fixture.path("managed/generated-dolphin");
+    let history_root = fixture.dir("managed/history");
+    let backup_root = fixture.dir("managed/backups");
+    let destination = load_dolphin_destination(&configuration_path, "GAFE01").unwrap();
+    assert!(!destination.existed);
+    let provider = external_gafe01_provider();
+    let mut selection = DolphinProviderCodeSelection::from_provider(&provider, &destination);
+    selection.select_all();
+    let staged =
+        stage_dolphin_provider_ini(&staging_root, &destination, &provider, &selection).unwrap();
+    let preview = build_dolphin_install_preview(&DolphinInstallPreviewRequest {
+        selected_archive: archive,
+        configuration_path: configuration_path.clone(),
+        game_id: "GAFE01".to_string(),
+        revision: Some(0),
+        staged: staged.clone(),
+    })
+    .unwrap();
+    let plan = build_shared_transaction_plan(
+        &preview.report,
+        "test-dolphin-profile",
+        "Dolphin upstream GameSettings",
+        &staging_root,
+    )
+    .unwrap();
+    let applied = execute_shared_apply(
+        &plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: false,
+            }),
+            operation_id: "provider-create".to_string(),
+            timestamp_unix_seconds: 1_700_000_500,
+            current_context: plan.context.clone(),
+            history_root: history_root.clone(),
+            backup_root: backup_root.clone(),
+        },
+    );
+    assert_eq!(
+        applied.journal.status,
+        SharedApplyStatus::Success,
+        "{applied:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&destination.path).unwrap(),
+        staged.contents
+    );
+    assert!(
+        applied.journal.entries[0].backup_path.is_none(),
+        "a newly-created file has no previous bytes to back up"
+    );
+
+    let rollback_preview = preview_shared_rollback(
+        applied.journal_path.as_ref().unwrap(),
+        &configuration_path,
+        &backup_root,
+    );
+    assert!(rollback_preview.available);
+    let rollback = execute_shared_rollback(
+        &rollback_preview,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: rollback_preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "provider-create-rollback".to_string(),
+            timestamp_unix_seconds: 1_700_000_600,
+            history_root,
+            backup_root,
+        },
+    );
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(!destination.path.exists());
 }
