@@ -102,10 +102,10 @@ pub enum SharedAdapterWriteSupport {
 
 pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSupport {
     match adapter {
-        PreviewAdapter::RetroArch => SharedAdapterWriteSupport::ApplyAndRollback,
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin => {
-            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized
+        PreviewAdapter::RetroArch | PreviewAdapter::Dolphin => {
+            SharedAdapterWriteSupport::ApplyAndRollback
         }
+        PreviewAdapter::Pcsx2 => SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized,
     }
 }
 
@@ -2343,7 +2343,8 @@ mod tests {
         );
         assert_eq!(
             adapter_write_support(PreviewAdapter::Dolphin),
-            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized
+            SharedAdapterWriteSupport::ApplyAndRollback,
+            "Dolphin gained apply/rollback support in the GameCube/Gecko adapter milestone"
         );
         let fixture = Fixture::new("lock");
         fs::create_dir(fixture.destination_root()).unwrap();

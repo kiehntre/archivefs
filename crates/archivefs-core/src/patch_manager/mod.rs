@@ -33,6 +33,7 @@ mod cheat_rollback_result;
 mod cheat_sources;
 mod cht_document;
 mod destination_safety;
+mod dolphin_gecko_install_plan;
 mod dolphin_local;
 mod gecko_document;
 mod import_safety;
@@ -157,6 +158,14 @@ pub use destination_safety::{
     DestinationSafetyFailureReason, DestinationState, InspectedParent, InspectedParentState,
     SafeDestination, ValidatedDestinationRoot, assess_destination, construct_safe_destination,
     inspect_safe_destination, validate_destination_root,
+};
+pub use dolphin_gecko_install_plan::{
+    DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,
+    DolphinCandidateOutcome, DolphinCodeSelection, DolphinCodeSelectionEntry,
+    DolphinInstallPlanError, DolphinInstallPlanErrorKind, DolphinInstallPreview,
+    DolphinInstallPreviewRequest, GENERATED_INI_PROVENANCE, LoadedDolphinIni,
+    MAX_DOLPHIN_INI_BYTES, MAX_GENERATED_INI_BYTES, StagedDolphinIni, build_dolphin_candidate,
+    build_dolphin_install_preview, load_dolphin_ini, stage_dolphin_ini,
 };
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
