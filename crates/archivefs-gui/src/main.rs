@@ -7767,6 +7767,26 @@ impl eframe::App for ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_cheat_workflow();
+        if self.view == MainView::CheatsMods
+            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                workflow.adapter == CheatEmulatorAdapter::Dolphin
+                    && workflow.selected_dolphin_profile_id.is_some()
+                    && matches!(workflow.dolphin_inventory, CheatStepResource::NotLoaded)
+            })
+            && matches!(self.dolphin_profiles, DolphinProfilesState::Ready(_))
+        {
+            self.start_dolphin_inventory(context.clone());
+        }
+        if self.view == MainView::CheatsMods
+            && self.cheat_workflow.as_ref().is_some_and(|workflow| {
+                workflow.adapter == CheatEmulatorAdapter::Dolphin
+                    && matches!(workflow.dolphin_inventory, CheatStepResource::Ready(_))
+                    && workflow.dolphin_candidate_outcome.is_none()
+                    && ready_game_identity(workflow).is_some()
+            })
+        {
+            self.start_dolphin_candidate_match();
+        }
         if catalogue_status_load_needed(self.view, &self.catalogue_manager) {
             self.start_catalogue_status_load(context.clone());
         }
@@ -15498,6 +15518,43 @@ fn show_dolphin_workflow(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
+    widgets::section_header(
+        ui,
+        "Game identity",
+        Some("Read directly from the bounded GameCube/Wii disc header."),
+    );
+    widgets::card(ui, |ui| {
+        widgets::status_rows(
+            ui,
+            &[
+                (
+                    "Platform",
+                    workflow.platform.as_deref().unwrap_or("Unknown"),
+                    widgets::StatusTone::Info,
+                ),
+                (
+                    "Game ID",
+                    ready_game_identity(workflow)
+                        .and_then(GameIdentityReport::verified_dolphin_game_id)
+                        .unwrap_or("Waiting for verified identity"),
+                    if ready_game_identity(workflow)
+                        .and_then(GameIdentityReport::verified_dolphin_game_id)
+                        .is_some()
+                    {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Pending
+                    },
+                ),
+            ],
+        );
+        if let Some(revision) = ready_game_identity(workflow)
+            .and_then(GameIdentityReport::verified_dolphin_revision)
+        {
+            ui.label(format!("Revision: {revision}"));
+        }
+    });
+    ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
         "Stage 1 · Dolphin profile",
