@@ -23,7 +23,7 @@ of it to install one compatible cheat.
 
 The default page for these two adapters is now:
 
-1. Game title and platform (shown by the page header, above this section)
+1. Game title and platform, with a compact "Choose another game" action
 2. A plain-English status line
 3. A simplified list of compatible cheats/patches, with a checkbox per item
 4. An "Install selected" button
@@ -38,6 +38,11 @@ there, just moved behind a **Details** disclosure that is collapsed by
 default. Opening Details never triggers a new network request or changes
 any state; it only reveals what was already computed.
 
+The page-wide archive paths, mount/source context, diagnostics, planned-mod
+notice, and related activity are likewise collapsed under **Workflow
+diagnostics** for these two beginner routes. They remain available without
+pushing the primary controls below the initial small-laptop viewport.
+
 ## Automatic provider loading
 
 Dolphin and Xenia profile discovery, and the exact-match provider fetch
@@ -51,7 +56,8 @@ instead of requiring a manual "Fetch" click first:
   so re-rendering the page, or switching between the main view and
   Details, never re-issues a request.
 - A failed fetch is never retried automatically. The existing manual
-  Fetch/Refresh control is still there, now under Details.
+  Fetch/Refresh control is still there under Details, and the default view
+  offers one plain **Try again** action without exposing the transport error.
 - Every existing bound - the 24-hour cache freshness window, the 30-second
   rate-limit floor, request timeouts, response-size bounds, the offline
   cached-fallback behaviour, and source attribution - is unchanged; only
@@ -77,8 +83,9 @@ Selection order, applied whenever profile discovery completes:
 4. The only valid profile, if there's just one.
 5. Otherwise, if more than one valid profile exists, a chooser appears:
    *"ArchiveFS found N \<emulator\> profiles. Choose the one you use:"*
-   with one radio button per profile and its path. Confirming remembers
-   the choice for next time.
+   with one friendly radio choice per profile. Clicking the choice selects
+   and remembers it in the same non-destructive action; exact paths remain
+   available under Details.
 
 If a remembered profile stops being valid (its directory disappeared, or
 it no longer passes the same eligibility checks), ArchiveFS does not
@@ -140,7 +147,9 @@ installation** button, wired to the same rollback path described in
 `docs/RETROARCH_CHEAT_ROLLBACK.md` (shared across adapters). Undo remains
 exact: it either restores the prior file exactly or removes a
 newly-created one, verified the same way regardless of which view started
-the install.
+the install. The completed state replaces the pre-install checklist rather
+than displaying stale compatibility/installed controls beside the result;
+a successful rollback returns the workflow to its exact pre-install state.
 
 ## What did not change
 
