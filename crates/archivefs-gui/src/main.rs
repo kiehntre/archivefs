@@ -29,41 +29,40 @@ use archivefs_core::patch_manager::{
     CheatSourceProgressReporter, DolphinGameIniInventory, DolphinInstallPlanError,
     DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
     DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, GeckoProviderFetchOptions,
-    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
-    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
-    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState,
-    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots,
-    Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState, PreviewEligibility,
-    PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
-    PreviewSourceItem, PreviewState, ResolvedCheatDestination, RetroArchCheatLibraryInspection,
-    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
-    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
-    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
-    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile,
-    UNKNOWN_CODE_POLICY, XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateOutcome,
-    XeniaInstallPlanError, XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile,
-    XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, adapter_write_support,
-    build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
-    build_shared_preview, build_shared_transaction_plan, build_xenia_candidates,
-    build_xenia_install_preview, default_cheat_source_cache_root, default_shared_backup_root,
-    EmulatorProfileCandidate, EmulatorProfileSelection, RememberedEmulatorProfile,
-    default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
-    discover_retroarch_cheat_setup_profiles, discover_shared_apply_history,
-    discover_xenia_profiles, execute_shared_apply, execute_shared_rollback,
-    fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
-    generate_shared_operation_id, inspect_dolphin_profile, inspect_pcsx2_profile,
-    load_remembered_emulator_profiles_default, remembered_profile_for, select_emulator_profile,
-    inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
+    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
+    EmulatorProfileSelection, GeckoProviderFetchOptions, GeckoProviderFetchResult,
+    GeckoProviderFetchStatus, GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind,
+    ImportTrustState, LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination,
+    LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, RememberedEmulatorProfile,
+    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
+    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
+    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, XeniaCandidate,
+    XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
+    XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
+    XeniaProfileDiscoveryRoots, adapter_write_support, build_cheat_candidates,
+    build_cheat_install_preview, build_dolphin_install_preview, build_shared_preview,
+    build_shared_transaction_plan, build_xenia_candidates, build_xenia_install_preview,
+    default_cheat_source_cache_root, default_shared_backup_root, default_shared_history_root,
+    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    discover_shared_apply_history, discover_xenia_profiles, execute_shared_apply,
+    execute_shared_rollback, fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source,
+    fetch_xenia_provider_patches, generate_shared_operation_id, inspect_dolphin_profile,
+    inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
     load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_destination,
-    load_xenia_destination, match_dolphin_inventory, match_pcsx2_inventory,
-    match_strength_for_candidate, materialize_retroarch_shared_preview, preview_shared_rollback,
-    region_for_game_id, resolve_cheat_destination, stage_dolphin_provider_ini,
-    stage_generated_cheat_file, stage_xenia_patch_file,
+    load_remembered_emulator_profiles_default, load_xenia_destination, match_dolphin_inventory,
+    match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
+    preview_shared_rollback, region_for_game_id, remembered_profile_for, resolve_cheat_destination,
+    select_emulator_profile, stage_dolphin_provider_ini, stage_generated_cheat_file,
+    stage_xenia_patch_file,
 };
 use archivefs_core::patch_manager::{
     XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE, XENIA_UPSTREAM_REPOSITORY,
@@ -3098,7 +3097,8 @@ impl ArchiveFsApp {
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             xenia_profiles: XeniaProfilesState::NotScanned,
-            remembered_emulator_profiles: load_remembered_emulator_profiles_default().unwrap_or_default(),
+            remembered_emulator_profiles: load_remembered_emulator_profiles_default()
+                .unwrap_or_default(),
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -5010,6 +5010,8 @@ impl ArchiveFsApp {
             dolphin_destination_error: None,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
+            dolphin_details_open: false,
+            dolphin_show_exact_changes: false,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -5019,6 +5021,8 @@ impl ArchiveFsApp {
             xenia_destination_error: None,
             xenia_profile_selection: None,
             xenia_profile_choice: None,
+            xenia_details_open: false,
+            xenia_show_exact_changes: false,
             source_mode,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -7486,11 +7490,12 @@ impl ArchiveFsApp {
             Ok(()) => {
                 self.remembered_emulator_profiles
                     .retain(|profile| profile.adapter != adapter);
-                self.remembered_emulator_profiles.push(RememberedEmulatorProfile {
-                    adapter: adapter.to_string(),
-                    profile_id: profile_id.to_string(),
-                    root: root.to_path_buf(),
-                });
+                self.remembered_emulator_profiles
+                    .push(RememberedEmulatorProfile {
+                        adapter: adapter.to_string(),
+                        profile_id: profile_id.to_string(),
+                        root: root.to_path_buf(),
+                    });
             }
             Err(error) => {
                 let action = if adapter == "xenia" {
@@ -7505,6 +7510,93 @@ impl ArchiveFsApp {
                     format!("Could not remember the chosen {adapter} profile: {error}"),
                 ));
             }
+        }
+    }
+
+    /// Applies the profile chooser's highlighted candidate: selects it,
+    /// records the outcome as an explicit choice (so it stays selected on
+    /// the next scan even before persistence lands), and remembers it for
+    /// next time. Never called implicitly - only from the chooser's own
+    /// "Use selected profile" button.
+    fn confirm_dolphin_profile_choice(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(profile_id) = workflow.dolphin_profile_choice.clone() else {
+            return;
+        };
+        let root = match &self.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_id == profile_id)
+                .map(|profile| profile.configuration_path.clone()),
+            _ => None,
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.selected_dolphin_profile_id = Some(profile_id.clone());
+        workflow.dolphin_inventory_profile_id = None;
+        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: profile_id.clone(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::ExplicitChoice,
+        });
+        if let Some(root) = root {
+            self.persist_remembered_profile("dolphin", &profile_id, &root);
+        }
+    }
+
+    /// Xenia's counterpart to `confirm_dolphin_profile_choice`.
+    fn confirm_xenia_profile_choice(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let Some(profile_id) = workflow.xenia_profile_choice.clone() else {
+            return;
+        };
+        let root = match &self.xenia_profiles {
+            XeniaProfilesState::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_id == profile_id)
+                .map(|profile| profile.configuration_path.clone()),
+            XeniaProfilesState::NotScanned => None,
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.selected_xenia_profile_id = Some(profile_id.clone());
+        workflow.xenia_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: profile_id.clone(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::ExplicitChoice,
+        });
+        if let Some(root) = root {
+            self.persist_remembered_profile("xenia", &profile_id, &root);
+        }
+    }
+
+    /// The beginner "Install selected" button for Dolphin: builds the
+    /// install preview and immediately moves it into the review stage, so
+    /// the ordinary compatible-install path never needs a separate
+    /// technical Preview click before the beginner confirmation dialog
+    /// can appear. Both steps are synchronous local operations already
+    /// used by the technical Details flow - this only chains them.
+    fn start_beginner_install_dolphin(&mut self) {
+        self.start_dolphin_install_preview();
+        self.review_cheat_apply();
+        if let Some(workflow) = self.cheat_workflow.as_mut() {
+            workflow.dolphin_show_exact_changes = false;
+        }
+    }
+
+    /// Xenia's counterpart to `start_beginner_install_dolphin`.
+    fn start_beginner_install_xenia(&mut self) {
+        self.start_xenia_install_preview();
+        self.review_cheat_apply();
+        if let Some(workflow) = self.cheat_workflow.as_mut() {
+            workflow.xenia_show_exact_changes = false;
         }
     }
 
@@ -9098,6 +9190,48 @@ impl eframe::App for ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::BuildDolphinInstallPreview) => {
                             self.start_dolphin_install_preview();
+                        }
+                        Some(CheatWorkflowAction::ChooseDolphinProfile(profile_id)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.dolphin_profile_choice = Some(profile_id);
+                            }
+                        }
+                        Some(CheatWorkflowAction::ConfirmDolphinProfileChoice) => {
+                            self.confirm_dolphin_profile_choice();
+                        }
+                        Some(CheatWorkflowAction::ChooseXeniaProfile(profile_id)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.xenia_profile_choice = Some(profile_id);
+                            }
+                        }
+                        Some(CheatWorkflowAction::ConfirmXeniaProfileChoice) => {
+                            self.confirm_xenia_profile_choice();
+                        }
+                        Some(CheatWorkflowAction::InstallSelectedDolphin) => {
+                            self.start_beginner_install_dolphin();
+                        }
+                        Some(CheatWorkflowAction::InstallSelectedXenia) => {
+                            self.start_beginner_install_xenia();
+                        }
+                        Some(CheatWorkflowAction::ToggleDolphinShowExactChanges(show)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.dolphin_show_exact_changes = show;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ToggleXeniaShowExactChanges(show)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.xenia_show_exact_changes = show;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ToggleDolphinDetailsOpen(open)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.dolphin_details_open = open;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ToggleXeniaDetailsOpen(open)) => {
+                            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                                workflow.xenia_details_open = open;
+                            }
                         }
                         Some(CheatWorkflowAction::OpenApplyHistory) => {
                             self.shared_history_operation = self
@@ -14726,6 +14860,16 @@ struct CheatWorkflowState {
     /// The profile currently highlighted in the profile chooser dialog,
     /// pending the user's explicit "Use selected profile" confirmation.
     dolphin_profile_choice: Option<String>,
+    /// Whether the beginner page's "Details" disclosure is expanded.
+    /// Owned here (not egui's own collapsing-header memory) so it is
+    /// trivially set from a test fixture and so it can be reset
+    /// deliberately whenever the workflow state it discloses changes.
+    /// Collapsed (`false`) by default.
+    dolphin_details_open: bool,
+    /// Whether the beginner install confirmation's "Show exact changes"
+    /// disclosure is expanded. Resets to `false` whenever a fresh
+    /// confirmation begins (see `start_beginner_install_dolphin`).
+    dolphin_show_exact_changes: bool,
     selected_xenia_profile_id: Option<String>,
     /// An explicit Xenia Canary directory typed by the user - the only
     /// way ArchiveFS ever learns of a Xenia install, since it has no
@@ -14745,6 +14889,10 @@ struct CheatWorkflowState {
     /// The profile currently highlighted in the profile chooser dialog,
     /// pending the user's explicit "Use selected profile" confirmation.
     xenia_profile_choice: Option<String>,
+    /// Xenia's counterpart to `dolphin_details_open`.
+    xenia_details_open: bool,
+    /// Xenia's counterpart to `dolphin_show_exact_changes`.
+    xenia_show_exact_changes: bool,
     /// Independent source mode. Changing it never changes the archive,
     /// profile, destination, or any fetched result retained by another mode.
     source_mode: CheatSourceMode,
@@ -15357,6 +15505,139 @@ fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'st
     }
 }
 
+/// The beginner page's plain-English status - one of the exact statuses
+/// the milestone specifies. Every adapter maps its own technical state
+/// into this same small vocabulary so a first-time user never has to
+/// learn provider/profile/identity terminology just to tell whether
+/// ArchiveFS found anything yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BeginnerCheatStatus {
+    FindingCompatibleCheats,
+    CheatsFound {
+        compatible_count: usize,
+    },
+    NoCompatibleCheatsFound,
+    EmulatorSetupNeeded,
+    /// Multiple valid profiles were found; the profile chooser (rendered
+    /// separately) is asking the user to pick one.
+    ChooseEmulatorProfile,
+    CouldNotCheckForCheats {
+        detail: String,
+    },
+    UsingSavedResultsWhileOffline,
+}
+
+impl BeginnerCheatStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::FindingCompatibleCheats => "Finding compatible cheats".to_string(),
+            Self::CheatsFound { compatible_count } => {
+                let noun = if *compatible_count == 1 {
+                    "compatible enhancement"
+                } else {
+                    "compatible enhancements"
+                };
+                format!("{compatible_count} {noun} found")
+            }
+            Self::NoCompatibleCheatsFound => "No compatible cheats found".to_string(),
+            Self::EmulatorSetupNeeded => "Emulator setup needed".to_string(),
+            Self::ChooseEmulatorProfile => "Choose an emulator profile".to_string(),
+            Self::CouldNotCheckForCheats { .. } => "Could not check for cheats".to_string(),
+            Self::UsingSavedResultsWhileOffline => "Using saved results while offline".to_string(),
+        }
+    }
+
+    fn tone(&self) -> widgets::StatusTone {
+        match self {
+            Self::FindingCompatibleCheats
+            | Self::EmulatorSetupNeeded
+            | Self::ChooseEmulatorProfile => widgets::StatusTone::Pending,
+            Self::CheatsFound { .. } => widgets::StatusTone::Success,
+            Self::NoCompatibleCheatsFound | Self::UsingSavedResultsWhileOffline => {
+                widgets::StatusTone::Warning
+            }
+            Self::CouldNotCheckForCheats { .. } => widgets::StatusTone::Blocked,
+        }
+    }
+}
+
+/// Computes the beginner status for Dolphin from the same state the
+/// technical Details view already reads - no separate tracking, so the
+/// two views can never disagree about what actually happened.
+fn dolphin_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus {
+    match &workflow.dolphin_profile_selection {
+        None | Some(EmulatorProfileSelection::SetupNeeded) => {
+            return BeginnerCheatStatus::EmulatorSetupNeeded;
+        }
+        Some(EmulatorProfileSelection::NeedsChoice { .. }) => {
+            return BeginnerCheatStatus::ChooseEmulatorProfile;
+        }
+        Some(EmulatorProfileSelection::Auto { .. }) => {}
+    }
+    match &workflow.dolphin_provider {
+        CheatStepResource::NotLoaded | CheatStepResource::Loading { .. } => {
+            BeginnerCheatStatus::FindingCompatibleCheats
+        }
+        CheatStepResource::Failed(message) => BeginnerCheatStatus::CouldNotCheckForCheats {
+            detail: message.clone(),
+        },
+        CheatStepResource::Ready(fetch) => {
+            if fetch.status == GeckoProviderFetchStatus::StaleCacheFallback {
+                return BeginnerCheatStatus::UsingSavedResultsWhileOffline;
+            }
+            let compatible_count = workflow
+                .dolphin_provider_selection
+                .as_ref()
+                .map(|state| state.selection.selectable_count())
+                .unwrap_or(0);
+            if compatible_count == 0 {
+                BeginnerCheatStatus::NoCompatibleCheatsFound
+            } else {
+                BeginnerCheatStatus::CheatsFound { compatible_count }
+            }
+        }
+    }
+}
+
+/// Xenia's counterpart to `dolphin_beginner_status`.
+fn xenia_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus {
+    match &workflow.xenia_profile_selection {
+        None | Some(EmulatorProfileSelection::SetupNeeded) => {
+            return BeginnerCheatStatus::EmulatorSetupNeeded;
+        }
+        Some(EmulatorProfileSelection::NeedsChoice { .. }) => {
+            return BeginnerCheatStatus::ChooseEmulatorProfile;
+        }
+        Some(EmulatorProfileSelection::Auto { .. }) => {}
+    }
+    match &workflow.xenia_provider {
+        CheatStepResource::NotLoaded | CheatStepResource::Loading { .. } => {
+            BeginnerCheatStatus::FindingCompatibleCheats
+        }
+        CheatStepResource::Failed(message) => BeginnerCheatStatus::CouldNotCheckForCheats {
+            detail: message.clone(),
+        },
+        CheatStepResource::Ready(fetch) => {
+            if fetch.status == XeniaProviderFetchStatus::StaleCacheFallback {
+                return BeginnerCheatStatus::UsingSavedResultsWhileOffline;
+            }
+            let compatible_count = workflow
+                .xenia_selection
+                .as_ref()
+                .filter(|state| {
+                    state.selection.compatibility != XeniaCandidateCompatibility::Incompatible
+                })
+                .map(|state| state.selection.selectable_count())
+                .unwrap_or(0);
+            if compatible_count == 0 {
+                BeginnerCheatStatus::NoCompatibleCheatsFound
+            } else {
+                BeginnerCheatStatus::CheatsFound { compatible_count }
+            }
+        }
+    }
+}
+
 fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
     warnings
         .iter()
@@ -15430,6 +15711,7 @@ fn show_cheat_warnings_summary(
 }
 
 /// What the cheat workflow panel asks `update` to do.
+#[derive(Clone)]
 enum CheatWorkflowAction {
     ChooseArchive,
     OpenLibrary,
@@ -15503,6 +15785,22 @@ enum CheatWorkflowAction {
     SelectAllXeniaPatches,
     ClearAllXeniaPatches,
     BuildXeniaInstallPreview,
+    /// The beginner profile chooser: highlights one candidate profile,
+    /// pending the explicit "Use selected profile" confirmation below.
+    ChooseDolphinProfile(String),
+    /// Confirms the highlighted chooser candidate and remembers it.
+    ConfirmDolphinProfileChoice,
+    ChooseXeniaProfile(String),
+    ConfirmXeniaProfileChoice,
+    /// One click: builds the install preview and moves straight to the
+    /// review stage, so the beginner "Install selected" button never
+    /// requires a separate technical Preview step first.
+    InstallSelectedDolphin,
+    InstallSelectedXenia,
+    ToggleDolphinShowExactChanges(bool),
+    ToggleXeniaShowExactChanges(bool),
+    ToggleDolphinDetailsOpen(bool),
+    ToggleXeniaDetailsOpen(bool),
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -16376,7 +16674,372 @@ fn show_pcsx2_workflow(
     action
 }
 
+/// The beginner-facing entry point: a plain-English status, a simplified
+/// compatible-candidate checklist, one-click install, and Undo, with
+/// every technical control from the previous numbered-stage page moved
+/// into a collapsed-by-default "Details" disclosure below. Nothing here
+/// is a new safety mechanism - it only reads and drives the same
+/// workflow state and dispatch actions `show_dolphin_workflow_details`
+/// already used.
 fn show_dolphin_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = show_dolphin_beginner_summary(ui, workflow, profiles);
+    ui.add_space(theme::SECTION_GAP);
+    let details_response = egui::CollapsingHeader::new("Details")
+        .id_salt("dolphin_workflow_details")
+        .open(Some(workflow.dolphin_details_open))
+        .show(ui, |ui| {
+            show_dolphin_workflow_details(ui, workflow, profiles, clipboard)
+        });
+    if details_response.header_response.clicked() {
+        action = Some(CheatWorkflowAction::ToggleDolphinDetailsOpen(
+            !workflow.dolphin_details_open,
+        ))
+        .or(action);
+    }
+    if let Some(Some(details_action)) = details_response.body_returned {
+        action = Some(details_action).or(action);
+    }
+    action
+}
+
+/// Renders the plain-English status, the compatible-candidate checklist,
+/// the profile chooser (when one is needed), the one-click "Install
+/// selected" flow, and the installed/Undo state. Everything it reads
+/// (`dolphin_profile_selection`, `dolphin_provider`,
+/// `dolphin_provider_selection`, `transaction`) is exactly what the
+/// technical Details view already reads - this is a presentation layer,
+/// not a second source of truth.
+fn show_dolphin_beginner_summary(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let status = dolphin_beginner_status(workflow);
+    widgets::status_badge(ui, status.label(), status.tone());
+    match &status {
+        BeginnerCheatStatus::CouldNotCheckForCheats { detail } => {
+            ui.label(detail);
+        }
+        BeginnerCheatStatus::EmulatorSetupNeeded => {
+            ui.label(
+                "ArchiveFS could not find a Dolphin profile to use yet. Open Details to type the Dolphin directory (portable/AppImage installs are not found automatically).",
+            );
+        }
+        BeginnerCheatStatus::FindingCompatibleCheats => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+            });
+        }
+        _ => {}
+    }
+    if status == BeginnerCheatStatus::ChooseEmulatorProfile
+        && let DolphinProfilesState::Ready(discovery) = profiles
+    {
+        ui.add_space(theme::SECTION_GAP);
+        return show_dolphin_profile_chooser(ui, workflow, discovery).or(action);
+    }
+    let Some(state) = workflow.dolphin_provider_selection.clone() else {
+        return action;
+    };
+    let visible_indices: Vec<usize> = state
+        .selection
+        .entries
+        .iter()
+        .filter(|entry| entry.selectable)
+        .map(|entry| entry.index)
+        .collect();
+    if visible_indices.len() > 1 {
+        ui.horizontal(|ui| {
+            let selected_count = state.selection.selected_count();
+            if widgets::action_button(
+                ui,
+                "Select all compatible",
+                widgets::ActionStyle::Secondary,
+                selected_count < visible_indices.len(),
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::SelectAllDolphinCodes);
+            }
+            if widgets::action_button(
+                ui,
+                "Clear selection",
+                widgets::ActionStyle::Quiet,
+                selected_count > 0,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ClearAllDolphinCodes);
+            }
+        });
+    }
+    for entry in state
+        .selection
+        .entries
+        .iter()
+        .filter(|entry| entry.selectable)
+    {
+        widgets::card(ui, |ui| {
+            let mut selected = entry.selected;
+            ui.horizontal_wrapped(|ui| {
+                if ui.checkbox(&mut selected, &entry.name).changed() {
+                    action = Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
+                        index: entry.index,
+                        selected,
+                    });
+                }
+                if entry.uncertain_revision {
+                    widgets::status_badge(ui, "Probably compatible", widgets::StatusTone::Warning);
+                } else {
+                    widgets::status_badge(ui, "Compatible", widgets::StatusTone::Success);
+                }
+                if entry.already_present && entry.already_enabled {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Info);
+                }
+            });
+            for note in &entry.notes {
+                ui.label(note);
+            }
+        });
+    }
+    let selected_entries: Vec<_> = state
+        .selection
+        .entries
+        .iter()
+        .filter(|entry| entry.selected)
+        .collect();
+    let has_pending_change = selected_entries
+        .iter()
+        .any(|entry| !(entry.already_present && entry.already_enabled));
+    ui.add_space(theme::SECTION_GAP);
+    match &mut workflow.transaction {
+        CheatTransactionState::Idle => {
+            if !selected_entries.is_empty() && !has_pending_change {
+                ui.label("Already installed - no change to apply.");
+                let _ = widgets::action_button(
+                    ui,
+                    "Install selected",
+                    widgets::ActionStyle::Primary,
+                    false,
+                );
+            } else if widgets::action_button(
+                ui,
+                "Install selected",
+                widgets::ActionStyle::Primary,
+                !selected_entries.is_empty() && has_pending_change,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::InstallSelectedDolphin);
+            }
+        }
+        CheatTransactionState::Review {
+            plan,
+            replacement_approved,
+            ..
+        } => {
+            action = show_beginner_install_confirm(
+                ui,
+                "Dolphin",
+                plan,
+                replacement_approved,
+                workflow.dolphin_show_exact_changes,
+                CheatWorkflowAction::ToggleDolphinShowExactChanges(
+                    !workflow.dolphin_show_exact_changes,
+                ),
+                CheatWorkflowAction::ConfirmApply,
+                CheatWorkflowAction::CancelApply,
+            )
+            .or(action);
+        }
+        CheatTransactionState::Applying { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Installing…");
+            });
+        }
+        CheatTransactionState::Result { result, .. } => {
+            action = show_beginner_install_result(ui, result).or(action);
+        }
+    }
+    action
+}
+
+/// The profile chooser: shown only while `select_emulator_profile` has
+/// found more than one valid Dolphin profile and nothing has been
+/// remembered or explicitly chosen yet. One concise choice, remembered
+/// for next time - never shown again for this emulator once a choice is
+/// confirmed and nothing invalidates it.
+fn show_dolphin_profile_chooser(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    discovery: &DolphinProfileDiscovery,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let eligible: Vec<&DolphinProfile> = discovery.profiles.iter().filter(|p| p.eligible).collect();
+    widgets::card(ui, |ui| {
+        ui.strong(format!(
+            "ArchiveFS found {} Dolphin profiles.",
+            eligible.len()
+        ));
+        ui.label("Choose the one you use:");
+        for profile in &eligible {
+            let selected =
+                workflow.dolphin_profile_choice.as_deref() == Some(profile.profile_id.as_str());
+            if ui
+                .radio(
+                    selected,
+                    dolphin_installation_label(profile.installation_type),
+                )
+                .clicked()
+            {
+                action = Some(CheatWorkflowAction::ChooseDolphinProfile(
+                    profile.profile_id.clone(),
+                ));
+            }
+            ui.weak(profile.configuration_path.display().to_string());
+        }
+        if widgets::action_button(
+            ui,
+            "Use selected profile",
+            widgets::ActionStyle::Primary,
+            workflow.dolphin_profile_choice.is_some(),
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::ConfirmDolphinProfileChoice);
+        }
+    });
+    action
+}
+
+/// The beginner confirmation dialog shown once "Install selected" has
+/// built and moved to the review stage - shared verbatim by Dolphin and
+/// Xenia since both use the same adapter-agnostic `SharedTransactionPlan`.
+/// `replacement_approved` and `show_exact_changes` are both owned by the
+/// caller's `CheatWorkflowState`, not duplicated here.
+#[allow(clippy::too_many_arguments)]
+fn show_beginner_install_confirm(
+    ui: &mut egui::Ui,
+    emulator_name: &str,
+    plan: &SharedTransactionPlan,
+    replacement_approved: &mut bool,
+    show_exact_changes: bool,
+    toggle_show_exact_changes: CheatWorkflowAction,
+    confirm_action: CheatWorkflowAction,
+    cancel_action: CheatWorkflowAction,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let replacement_required = plan.entries.iter().any(|entry| {
+        entry.proposed_action == archivefs_core::patch_manager::PreviewProposedAction::Replace
+    });
+    widgets::card(ui, |ui| {
+        let count = plan.entries.len();
+        let noun = if count == 1 {
+            "enhancement"
+        } else {
+            "enhancements"
+        };
+        ui.strong(format!("Install {count} {noun} in {emulator_name}?"));
+        ui.label(
+            "ArchiveFS will back up the existing settings and you can undo this change later.",
+        );
+        if replacement_required {
+            ui.checkbox(
+                replacement_approved,
+                "I approve replacing the exact different file shown under Show exact changes",
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Install",
+                widgets::ActionStyle::Primary,
+                !replacement_required || *replacement_approved,
+            )
+            .clicked()
+            {
+                action = Some(confirm_action.clone());
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                action = Some(cancel_action.clone());
+            }
+            if widgets::action_button(ui, "Show exact changes", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                action = Some(toggle_show_exact_changes.clone());
+            }
+        });
+        if show_exact_changes {
+            ui.separator();
+            widgets::copyable_value(ui, "Plan ID", &plan.plan_id);
+            for entry in &plan.entries {
+                ui.label(format!("Action: {:?}", entry.proposed_action));
+                ui.label(format!("Source: {}", entry.source_path.display));
+                ui.label(format!(
+                    "Destination: {}/{}",
+                    entry.destination_root.display, entry.destination_relative_path.display
+                ));
+                widgets::copyable_value(ui, "Source SHA-256", &entry.source_digest);
+            }
+        }
+    });
+    action
+}
+
+/// The beginner "installed"/Undo state shown once a beginner install has
+/// been applied - shared by Dolphin and Xenia for the same reason as
+/// `show_beginner_install_confirm`.
+fn show_beginner_install_result(
+    ui: &mut egui::Ui,
+    result: &SharedApplyResult,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::card(ui, |ui| {
+        match result.journal.status {
+            SharedApplyStatus::Success => {
+                widgets::status_badge(ui, "Installed successfully", widgets::StatusTone::Success);
+            }
+            SharedApplyStatus::PartialFailure => {
+                widgets::status_badge(
+                    ui,
+                    "Installed with some problems",
+                    widgets::StatusTone::Warning,
+                );
+            }
+            SharedApplyStatus::Failed => {
+                widgets::status_badge(ui, "Install failed", widgets::StatusTone::Blocked);
+            }
+            SharedApplyStatus::DryRun => {
+                widgets::status_badge(ui, "Dry run complete", widgets::StatusTone::Info);
+            }
+        }
+        let rollback_available = result.journal_path.is_some()
+            && matches!(
+                result.journal.status,
+                SharedApplyStatus::Success | SharedApplyStatus::PartialFailure
+            );
+        if widgets::action_button(
+            ui,
+            "Undo installation",
+            widgets::ActionStyle::Destructive,
+            rollback_available,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::RollbackInstall);
+        }
+    });
+    action
+}
+
+fn show_dolphin_workflow_details(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
     profiles: &DolphinProfilesState,
@@ -16936,9 +17599,278 @@ fn xenia_profile_candidates(discovery: &XeniaProfileDiscovery) -> Vec<EmulatorPr
         .collect()
 }
 
+/// If exactly one candidate document was returned for this Title ID,
+/// silently selects it - Xenia's provider dataset can legitimately have
+/// several files per Title ID (different Title Update/module-hash
+/// variants), so choosing between them is a real technical decision the
+/// technical Details view still exposes explicitly via
+/// `show_xenia_candidate_picker`/`show_xenia_external_provider`. This
+/// only saves that step for the common case beginners actually hit: one
+/// matching file. Never overrides a choice already made (including
+/// `None` explicitly restored by "Choose a different file").
+fn xenia_auto_select_single_candidate(workflow: &mut CheatWorkflowState) {
+    if workflow.xenia_selected_candidate_index.is_some() {
+        return;
+    }
+    let media_id =
+        ready_game_identity(workflow).and_then(GameIdentityReport::verified_xex_media_id);
+    let CheatStepResource::Ready(fetch) = &workflow.xenia_provider else {
+        return;
+    };
+    let outcome = build_xenia_candidates(
+        &fetch.result,
+        Some(fetch.result.title_id.as_str()),
+        media_id,
+    );
+    if outcome.candidates.len() == 1 {
+        workflow.xenia_selected_candidate_index = Some(0);
+    }
+}
+
+/// Beginner counterpart of `dolphin_beginner_status`/
+/// `show_dolphin_beginner_summary` - see those for the shared design.
+fn show_xenia_beginner_summary(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &XeniaProfilesState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let status = xenia_beginner_status(workflow);
+    widgets::status_badge(ui, status.label(), status.tone());
+    match &status {
+        BeginnerCheatStatus::CouldNotCheckForCheats { detail } => {
+            ui.label(detail);
+        }
+        BeginnerCheatStatus::EmulatorSetupNeeded => {
+            ui.label(
+                "ArchiveFS could not find a Xenia Canary installation to use yet. Open Details to type the Xenia Canary directory.",
+            );
+        }
+        BeginnerCheatStatus::FindingCompatibleCheats => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+            });
+        }
+        _ => {}
+    }
+    if status == BeginnerCheatStatus::ChooseEmulatorProfile
+        && let XeniaProfilesState::Ready(discovery) = profiles
+    {
+        ui.add_space(theme::SECTION_GAP);
+        return show_xenia_profile_chooser(ui, workflow, discovery).or(action);
+    }
+    xenia_auto_select_single_candidate(workflow);
+    let Some(state) = workflow.xenia_selection.clone() else {
+        return action;
+    };
+    if state.selection.compatibility == XeniaCandidateCompatibility::PartiallyVerified {
+        widgets::banner(
+            ui,
+            "More information needed",
+            "This patch matches the game, but ArchiveFS cannot confirm the exact executable version.",
+            widgets::StatusTone::Warning,
+        );
+        let mut acknowledged = state.selection.partial_verification_acknowledged;
+        if ui
+            .checkbox(
+                &mut acknowledged,
+                "I understand this patch may target a different executable version.",
+            )
+            .changed()
+        {
+            action = Some(CheatWorkflowAction::AcknowledgeXeniaPartialVerification(
+                acknowledged,
+            ));
+        }
+    }
+    let visible_count = state
+        .selection
+        .entries
+        .iter()
+        .filter(|entry| entry.selectable)
+        .count();
+    if visible_count > 1 {
+        ui.horizontal(|ui| {
+            let selected_count = state.selection.selected_count();
+            if widgets::action_button(
+                ui,
+                "Select all compatible",
+                widgets::ActionStyle::Secondary,
+                selected_count < visible_count,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::SelectAllXeniaPatches);
+            }
+            if widgets::action_button(
+                ui,
+                "Clear selection",
+                widgets::ActionStyle::Quiet,
+                selected_count > 0,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ClearAllXeniaPatches);
+            }
+        });
+    }
+    for entry in state
+        .selection
+        .entries
+        .iter()
+        .filter(|entry| entry.selectable)
+    {
+        widgets::card(ui, |ui| {
+            let mut selected = entry.selected;
+            ui.horizontal_wrapped(|ui| {
+                if ui.checkbox(&mut selected, &entry.name).changed() {
+                    action = Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
+                        index: entry.index,
+                        selected,
+                    });
+                }
+                match state.selection.compatibility {
+                    XeniaCandidateCompatibility::ExactCompatible => {
+                        widgets::status_badge(ui, "Compatible", widgets::StatusTone::Success);
+                    }
+                    XeniaCandidateCompatibility::PartiallyVerified => {
+                        widgets::status_badge(
+                            ui,
+                            "Probably compatible",
+                            widgets::StatusTone::Warning,
+                        );
+                    }
+                    XeniaCandidateCompatibility::Incompatible => {}
+                }
+                if entry.already_enabled {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Info);
+                }
+            });
+            if !entry.description.is_empty() {
+                ui.label(&entry.description);
+            }
+        });
+    }
+    ui.add_space(theme::SECTION_GAP);
+    match &mut workflow.transaction {
+        CheatTransactionState::Idle => {
+            if widgets::action_button(
+                ui,
+                "Install selected",
+                widgets::ActionStyle::Primary,
+                state.selection.can_apply(),
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::InstallSelectedXenia);
+            }
+            if state.selection.selected_count() > 0 && !state.selection.can_apply() {
+                ui.label(
+                    "Acknowledge the warning above before installing this partially verified patch.",
+                );
+            }
+        }
+        CheatTransactionState::Review {
+            plan,
+            replacement_approved,
+            ..
+        } => {
+            action = show_beginner_install_confirm(
+                ui,
+                "Xenia",
+                plan,
+                replacement_approved,
+                workflow.xenia_show_exact_changes,
+                CheatWorkflowAction::ToggleXeniaShowExactChanges(
+                    !workflow.xenia_show_exact_changes,
+                ),
+                CheatWorkflowAction::ConfirmApply,
+                CheatWorkflowAction::CancelApply,
+            )
+            .or(action);
+        }
+        CheatTransactionState::Applying { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Installing…");
+            });
+        }
+        CheatTransactionState::Result { result, .. } => {
+            action = show_beginner_install_result(ui, result).or(action);
+        }
+    }
+    action
+}
+
+/// Xenia's counterpart to `show_dolphin_profile_chooser`.
+fn show_xenia_profile_chooser(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    discovery: &XeniaProfileDiscovery,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let eligible: Vec<&XeniaProfile> = discovery.profiles.iter().filter(|p| p.eligible).collect();
+    widgets::card(ui, |ui| {
+        ui.strong(format!(
+            "ArchiveFS found {} Xenia Canary installations.",
+            eligible.len()
+        ));
+        ui.label("Choose the one you use:");
+        for profile in &eligible {
+            let selected =
+                workflow.xenia_profile_choice.as_deref() == Some(profile.profile_id.as_str());
+            if ui
+                .radio(selected, profile.configuration_path.display().to_string())
+                .clicked()
+            {
+                action = Some(CheatWorkflowAction::ChooseXeniaProfile(
+                    profile.profile_id.clone(),
+                ));
+            }
+        }
+        if widgets::action_button(
+            ui,
+            "Use selected profile",
+            widgets::ActionStyle::Primary,
+            workflow.xenia_profile_choice.is_some(),
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::ConfirmXeniaProfileChoice);
+        }
+    });
+    action
+}
+
 /// Route to Xbox 360/Xenia only: this page never shows Dolphin or
 /// RetroArch controls, matching every other adapter's dedicated workflow.
 fn show_xenia_workflow(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    profiles: &XeniaProfilesState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatWorkflowAction> {
+    let mut action = show_xenia_beginner_summary(ui, workflow, profiles);
+    ui.add_space(theme::SECTION_GAP);
+    let details_response = egui::CollapsingHeader::new("Details")
+        .id_salt("xenia_workflow_details")
+        .open(Some(workflow.xenia_details_open))
+        .show(ui, |ui| {
+            show_xenia_workflow_details(ui, workflow, profiles, clipboard)
+        });
+    if details_response.header_response.clicked() {
+        action = Some(CheatWorkflowAction::ToggleXeniaDetailsOpen(
+            !workflow.xenia_details_open,
+        ))
+        .or(action);
+    }
+    if let Some(Some(details_action)) = details_response.body_returned {
+        action = Some(details_action).or(action);
+    }
+    action
+}
+
+fn show_xenia_workflow_details(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
     profiles: &XeniaProfilesState,
@@ -20678,7 +21610,9 @@ fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str
 /// Explicit` is the only kind that came from a user-typed directory
 /// (portable/AppImage installs), which is exactly what the beginner
 /// selection rules mean by "portable".
-fn dolphin_profile_candidates(discovery: &DolphinProfileDiscovery) -> Vec<EmulatorProfileCandidate> {
+fn dolphin_profile_candidates(
+    discovery: &DolphinProfileDiscovery,
+) -> Vec<EmulatorProfileCandidate> {
     discovery
         .profiles
         .iter()
@@ -27778,6 +28712,8 @@ mod tests {
             dolphin_destination_error: None,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
+            dolphin_details_open: false,
+            dolphin_show_exact_changes: false,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -27787,6 +28723,8 @@ mod tests {
             xenia_destination_error: None,
             xenia_profile_selection: None,
             xenia_profile_choice: None,
+            xenia_details_open: false,
+            xenia_show_exact_changes: false,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -27914,7 +28852,8 @@ mod tests {
         assert!(matches!(
             workflow.dolphin_profile_selection,
             Some(EmulatorProfileSelection::Auto {
-                reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+                reason:
+                    archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
                 ..
             })
         ));
@@ -27924,11 +28863,12 @@ mod tests {
     fn poll_dolphin_profiles_prefers_remembered_profile_over_discovery_order() {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
-        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
-            adapter: "dolphin".to_string(),
-            profile_id: "second".to_string(),
-            root: PathBuf::from("/isolated/second"),
-        });
+        app.remembered_emulator_profiles
+            .push(RememberedEmulatorProfile {
+                adapter: "dolphin".to_string(),
+                profile_id: "second".to_string(),
+                root: PathBuf::from("/isolated/second"),
+            });
         drive_dolphin_profile_scan(
             &mut app,
             vec![
@@ -27948,7 +28888,7 @@ mod tests {
 
     #[test]
     fn poll_dolphin_profiles_requires_a_choice_with_multiple_valid_profiles_and_nothing_remembered()
-     {
+    {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
         drive_dolphin_profile_scan(
@@ -27970,11 +28910,12 @@ mod tests {
     fn poll_dolphin_profiles_with_a_stale_remembered_profile_shows_setup_needed() {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
-        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
-            adapter: "dolphin".to_string(),
-            profile_id: "vanished".to_string(),
-            root: PathBuf::from("/isolated/vanished"),
-        });
+        app.remembered_emulator_profiles
+            .push(RememberedEmulatorProfile {
+                adapter: "dolphin".to_string(),
+                profile_id: "vanished".to_string(),
+                root: PathBuf::from("/isolated/vanished"),
+            });
         drive_dolphin_profile_scan(&mut app, vec![dolphin_profile_fixture()]);
         let workflow = app.cheat_workflow.as_ref().unwrap();
         assert_eq!(workflow.selected_dolphin_profile_id, None);
@@ -28013,11 +28954,12 @@ mod tests {
             workflow.adapter = CheatEmulatorAdapter::Dolphin;
             workflow.dolphin_explicit_root = "/typed/by/user".to_string();
         }
-        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
-            adapter: "dolphin".to_string(),
-            profile_id: "remembered".to_string(),
-            root: PathBuf::from("/remembered/root"),
-        });
+        app.remembered_emulator_profiles
+            .push(RememberedEmulatorProfile {
+                adapter: "dolphin".to_string(),
+                profile_id: "remembered".to_string(),
+                root: PathBuf::from("/remembered/root"),
+            });
         app.seed_explicit_root_from_remembered_profile("dolphin");
         assert_eq!(
             app.cheat_workflow.as_ref().unwrap().dolphin_explicit_root,
@@ -28029,11 +28971,12 @@ mod tests {
     fn seeding_explicit_root_from_a_remembered_profile_fills_an_empty_field() {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Xenia;
-        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
-            adapter: "xenia".to_string(),
-            profile_id: "remembered".to_string(),
-            root: PathBuf::from("/remembered/xenia-root"),
-        });
+        app.remembered_emulator_profiles
+            .push(RememberedEmulatorProfile {
+                adapter: "xenia".to_string(),
+                profile_id: "remembered".to_string(),
+                root: PathBuf::from("/remembered/xenia-root"),
+            });
         app.seed_explicit_root_from_remembered_profile("xenia");
         assert_eq!(
             app.cheat_workflow.as_ref().unwrap().xenia_explicit_root,
@@ -28093,6 +29036,7 @@ mod tests {
         let workflow = app.cheat_workflow.as_mut().unwrap();
         workflow.platform = Some("GameCube".to_string());
         workflow.adapter = CheatEmulatorAdapter::Dolphin;
+        workflow.dolphin_details_open = true;
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -28248,6 +29192,7 @@ mod tests {
         workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
         workflow.dolphin_inventory_profile_id = Some("dolphin-native-test".to_string());
         workflow.dolphin_inventory = CheatStepResource::Ready(empty_dolphin_inventory());
+        workflow.dolphin_details_open = true;
         let profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
             profiles: vec![dolphin_profile_fixture()],
             warnings: Vec::new(),
@@ -28467,7 +29412,8 @@ $Instant Growth [Nayr]\n";
 
     #[test]
     fn dolphin_provider_auto_fetch_is_needed_once_identity_is_ready_and_nothing_requested_yet() {
-        let app = dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        let app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
         assert!(dolphin_provider_auto_fetch_needed(
             app.cheat_workflow.as_ref().unwrap()
         ));
@@ -28508,7 +29454,8 @@ $Instant Growth [Nayr]\n";
 
     #[test]
     fn xenia_provider_auto_fetch_is_needed_once_identity_is_ready_and_nothing_requested_yet() {
-        let app = xenia_workflow_with_matched_identity(Path::new("/isolated/xenia-test"), "415607D2");
+        let app =
+            xenia_workflow_with_matched_identity(Path::new("/isolated/xenia-test"), "415607D2");
         assert!(xenia_provider_auto_fetch_needed(
             app.cheat_workflow.as_ref().unwrap()
         ));
@@ -28542,9 +29489,8 @@ $Instant Growth [Nayr]\n";
         assert!(dolphin_provider_auto_fetch_needed(
             app.cheat_workflow.as_ref().unwrap()
         ));
-        app.cheat_workflow.as_mut().unwrap().dolphin_provider = CheatStepResource::Failed(
-            "network unavailable".to_string(),
-        );
+        app.cheat_workflow.as_mut().unwrap().dolphin_provider =
+            CheatStepResource::Failed("network unavailable".to_string());
         for _ in 0..5 {
             app.poll_cheat_workflow(&egui::Context::default());
         }
@@ -28591,6 +29537,7 @@ $Instant Growth [Nayr]\n";
         std::fs::create_dir_all(&directory).unwrap();
         let mut app = xenia_workflow_with_matched_identity(&directory, "415607D2");
         let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.xenia_details_open = true;
         let xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
             profiles: vec![xenia_profile_fixture(&directory)],
             warnings: Vec::new(),
@@ -28808,6 +29755,7 @@ $Instant Growth [Nayr]\n";
         std::fs::create_dir_all(&temp).unwrap();
         let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
         install_provider_fixture(&mut app, &temp);
+        app.cheat_workflow.as_mut().unwrap().dolphin_details_open = true;
         let mut clipboard = InMemoryClipboard::default();
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -28914,6 +29862,7 @@ $Instant Growth [Nayr]\n";
         std::fs::create_dir_all(&temp).unwrap();
         let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
         app.cheat_workflow.as_mut().unwrap().platform = Some("Wii".to_string());
+        app.cheat_workflow.as_mut().unwrap().dolphin_details_open = true;
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -30930,6 +31879,8 @@ $Instant Growth [Nayr]\n";
             dolphin_destination_error: None,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
+            dolphin_details_open: false,
+            dolphin_show_exact_changes: false,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -30939,6 +31890,8 @@ $Instant Growth [Nayr]\n";
             xenia_destination_error: None,
             xenia_profile_selection: None,
             xenia_profile_choice: None,
+            xenia_details_open: false,
+            xenia_show_exact_changes: false,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -44425,6 +45378,8 @@ $Instant Growth [Nayr]\n";
             dolphin_destination_error: None,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
+            dolphin_details_open: false,
+            dolphin_show_exact_changes: false,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -44434,6 +45389,8 @@ $Instant Growth [Nayr]\n";
             xenia_destination_error: None,
             xenia_profile_selection: None,
             xenia_profile_choice: None,
+            xenia_details_open: false,
+            xenia_show_exact_changes: false,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,

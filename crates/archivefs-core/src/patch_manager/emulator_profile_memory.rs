@@ -71,7 +71,12 @@ pub fn remember_emulator_profile_default(
     profile_id: &str,
     root: &Path,
 ) -> Result<()> {
-    remember_emulator_profile_to(default_emulator_profile_memory_path()?, adapter, profile_id, root)
+    remember_emulator_profile_to(
+        default_emulator_profile_memory_path()?,
+        adapter,
+        profile_id,
+        root,
+    )
 }
 
 pub fn remember_emulator_profile_to(
@@ -252,7 +257,9 @@ pub enum EmulatorProfileSelection {
     /// tie-break resolved it - the beginner UI must show one concise
     /// chooser. Carries every discovered candidate (including ineligible
     /// ones) so the caller can still render diagnostics under Details.
-    NeedsChoice { candidates: Vec<EmulatorProfileCandidate> },
+    NeedsChoice {
+        candidates: Vec<EmulatorProfileCandidate>,
+    },
     /// Either nothing was discovered, or a remembered profile no longer
     /// matches anything discovered - the beginner UI must show a plain
     /// setup-needed state and ask the user to choose again, never fall
@@ -433,7 +440,10 @@ mod tests {
 
     #[test]
     fn ineligible_candidates_are_ignored_for_auto_selection() {
-        let discovered = vec![candidate("blocked", false, false), candidate("ok", true, false)];
+        let discovered = vec![
+            candidate("blocked", false, false),
+            candidate("ok", true, false),
+        ];
         let selection = select_emulator_profile(&discovered, None, None);
         assert_eq!(
             selection,
@@ -451,8 +461,7 @@ mod tests {
 
         remember_emulator_profile_to(&path, "dolphin", "portable-1", Path::new("/portable/User"))
             .unwrap();
-        remember_emulator_profile_to(&path, "xenia", "canary-1", Path::new("/xenia/root"))
-            .unwrap();
+        remember_emulator_profile_to(&path, "xenia", "canary-1", Path::new("/xenia/root")).unwrap();
 
         let profiles = load_remembered_emulator_profiles_from(&path).unwrap();
         assert_eq!(profiles.len(), 2);
@@ -461,17 +470,26 @@ mod tests {
             PathBuf::from("/portable/User")
         );
         assert_eq!(
-            remembered_profile_for(&profiles, "xenia").unwrap().profile_id,
+            remembered_profile_for(&profiles, "xenia")
+                .unwrap()
+                .profile_id,
             "canary-1"
         );
 
         // Re-remembering the same adapter upserts, not duplicates.
-        remember_emulator_profile_to(&path, "dolphin", "standard-1", Path::new("/std/dolphin-emu"))
-            .unwrap();
+        remember_emulator_profile_to(
+            &path,
+            "dolphin",
+            "standard-1",
+            Path::new("/std/dolphin-emu"),
+        )
+        .unwrap();
         let profiles = load_remembered_emulator_profiles_from(&path).unwrap();
         assert_eq!(profiles.len(), 2);
         assert_eq!(
-            remembered_profile_for(&profiles, "dolphin").unwrap().profile_id,
+            remembered_profile_for(&profiles, "dolphin")
+                .unwrap()
+                .profile_id,
             "standard-1"
         );
     }
