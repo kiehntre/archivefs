@@ -33,6 +33,7 @@ mod cheat_rollback_result;
 mod cheat_sources;
 mod cht_document;
 mod destination_safety;
+mod dolphin_cheat_catalogue;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
@@ -164,6 +165,17 @@ pub use destination_safety::{
     DestinationSafetyFailureReason, DestinationState, InspectedParent, InspectedParentState,
     SafeDestination, ValidatedDestinationRoot, assess_destination, construct_safe_destination,
     inspect_safe_destination, validate_destination_root,
+};
+pub use dolphin_cheat_catalogue::{
+    DOLPHIN_CATALOGUE_ATTRIBUTION, DOLPHIN_CATALOGUE_LICENSE, DOLPHIN_CATALOGUE_MAX_DOWNLOAD_BYTES,
+    DOLPHIN_CATALOGUE_PROVIDER_ID, DOLPHIN_CATALOGUE_REPOSITORY, DOLPHIN_CATALOGUE_SCHEMA_VERSION,
+    DolphinCatalogue, DolphinCatalogueCode, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueGame,
+    DolphinCatalogueLoad, DolphinCatalogueLookup, DolphinCatalogueMetadata,
+    DolphinCatalogueUpdateCheck, DolphinCatalogueUpdateState, check_dolphin_catalogue_update,
+    check_dolphin_catalogue_update_with_transport, default_dolphin_catalogue_cache_root,
+    fetch_dolphin_catalogue, fetch_dolphin_catalogue_with_transport, load_dolphin_catalogue,
+    load_dolphin_catalogue_update_state, lookup_dolphin_catalogue, remove_dolphin_catalogue,
 };
 pub use dolphin_gecko_install_plan::{
     DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,
