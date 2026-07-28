@@ -45,23 +45,31 @@ pushing the primary controls below the initial small-laptop viewport.
 
 ## Automatic provider loading
 
-Dolphin and Xenia profile discovery, and the exact-match provider fetch
-(Dolphin's upstream Gecko codes / Xenia's `xenia-canary/game-patches`
-patches), now start automatically once the game's identity is verified,
-instead of requiring a manual "Fetch" click first:
+Dolphin and Xenia profile discovery, and the exact-match provider lookup
+(Dolphin's Gecko codes / Xenia's `xenia-canary/game-patches` patches), now
+start automatically once the game's identity is verified, instead of
+requiring a manual "Fetch" click first:
 
 - A valid cached result is used immediately.
-- A missing or stale result triggers exactly one background fetch - the
-  trigger is a one-shot gate (`NotLoaded` → `Loading` → `Ready`/`Failed`),
-  so re-rendering the page, or switching between the main view and
-  Details, never re-issues a request.
+- **Dolphin**: the automatic step is now local-only, never a network
+  request. It tries, in order, the local
+  [Dolphin cheat catalogue](DOLPHIN_CHEAT_CATALOGUE.md) (if downloaded),
+  then a validated cached single-game result. If neither has anything for
+  this exact Game ID, the page shows an honest "no compatible cheats found"
+  state - it does not spin indefinitely waiting for a fetch that never
+  starts. An explicit network fetch remains available under Details.
+- **Xenia**: unchanged - a missing or stale result triggers exactly one
+  background fetch. The trigger is a one-shot gate (`NotLoaded` → `Loading`
+  → `Ready`/`Failed`), so re-rendering the page, or switching between the
+  main view and Details, never re-issues a request.
 - A failed fetch is never retried automatically. The existing manual
   Fetch/Refresh control is still there under Details, and the default view
   offers one plain **Try again** action without exposing the transport error.
-- Every existing bound - the 24-hour cache freshness window, the 30-second
-  rate-limit floor, request timeouts, response-size bounds, the offline
-  cached-fallback behaviour, and source attribution - is unchanged; only
-  when the fetch is *triggered* changed, not how it behaves once running.
+- Every existing bound - cache freshness windows, rate-limit floors, request
+  timeouts, response-size bounds, the offline cached-fallback behaviour, and
+  source attribution - is unchanged; only when a Dolphin *network* fetch is
+  triggered changed (explicit only, never automatic), not how any of this
+  behaves once running.
 
 ## Remembered emulator profile
 
