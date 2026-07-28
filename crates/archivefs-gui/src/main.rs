@@ -26,9 +26,12 @@ use archivefs_core::patch_manager::{
     CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation, CheatSourceError,
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DolphinGameIniInventory, DolphinInstallPlanError,
-    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    CheatSourceProgressReporter, DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
+    DolphinCatalogueUpdateCheck, DolphinGameIniInventory,
+    DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
+    DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
+    DolphinProfileDiscoveryRoots, DolphinProfileScope,
     DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
     EmulatorProfileSelection, GeckoProviderFetchOptions, GeckoProviderFetchResult,
     GeckoProviderFetchStatus, GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind,
@@ -51,18 +54,22 @@ use archivefs_core::patch_manager::{
     XeniaProfileDiscoveryRoots, adapter_write_support, build_cheat_candidates,
     build_cheat_install_preview, build_dolphin_install_preview, build_shared_preview,
     build_shared_transaction_plan, build_xenia_candidates, build_xenia_install_preview,
-    default_cheat_source_cache_root, default_shared_backup_root, default_shared_history_root,
-    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    check_dolphin_catalogue_update_with_transport, default_cheat_source_cache_root,
+    default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
+    default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
     discover_shared_apply_history, discover_xenia_profiles, execute_shared_apply,
-    execute_shared_rollback, fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source,
-    fetch_xenia_provider_patches, generate_shared_operation_id, inspect_dolphin_profile,
-    inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
-    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_destination,
+    execute_shared_rollback, fetch_dolphin_catalogue_with_transport, fetch_dolphin_upstream_gecko,
+    fetch_retroarch_cheat_source, fetch_xenia_provider_patches, generate_shared_operation_id,
+    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
+    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
+    load_dolphin_catalogue, load_dolphin_catalogue_update_state, load_dolphin_destination,
     load_remembered_emulator_profiles_default, load_xenia_destination, match_dolphin_inventory,
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
-    preview_shared_rollback, region_for_game_id, remembered_profile_for, resolve_cheat_destination,
-    select_emulator_profile, stage_dolphin_provider_ini, stage_generated_cheat_file,
-    stage_xenia_patch_file,
+    preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport, region_for_game_id,
+    remembered_profile_for, remove_dolphin_catalogue, resolve_cheat_destination,
+    resolve_dolphin_gecko_lookup, select_emulator_profile, stage_dolphin_provider_ini,
+    stage_generated_cheat_file, stage_xenia_patch_file,
 };
 use archivefs_core::patch_manager::{
     XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE, XENIA_UPSTREAM_REPOSITORY,
@@ -298,12 +305,16 @@ enum ActivityAction {
     /// read-only preview/inspection step leading up to it, so History &
     /// Logs can tell "previewed" apart from "actually installed".
     CheatInstall,
+    /// Dolphin cheat catalogue download/update/rebuild/removal - distinct
+    /// from `DolphinGeckoCandidateMatch`, which covers per-game provider
+    /// lookups (local or network), not the catalogue itself.
+    DolphinCatalogueRetrieval,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 40] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 41] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -344,6 +355,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 40] = [
     ActivityAction::XeniaPatchCandidateMatch,
     ActivityAction::CheatPreview,
     ActivityAction::CheatInstall,
+    ActivityAction::DolphinCatalogueRetrieval,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -437,6 +449,7 @@ impl std::fmt::Display for ActivityAction {
             Self::XeniaPatchCandidateMatch => "Xenia patch candidate match",
             Self::CheatPreview => "Cheats & Mods preview",
             Self::CheatInstall => "Cheats & Mods install",
+            Self::DolphinCatalogueRetrieval => "Dolphin cheat catalogue retrieval",
         })
     }
 }
@@ -2992,6 +3005,21 @@ struct ArchiveFsApp {
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
     catalogue_generation: u64,
     catalogue_last_result: Option<Result<CheatSourceFetchResult, CheatSourceError>>,
+    /// The Dolphin cheat catalogue's own status card - Cheats & Mods only,
+    /// separate from the RetroArch `catalogue_*` fields above (different
+    /// cache root, different data shape, and it must be visible without
+    /// visiting Sources).
+    dolphin_catalogue_manager: DolphinCatalogueManagerState,
+    dolphin_catalogue_review: Option<DolphinCatalogueRetrievalKind>,
+    dolphin_catalogue_retrieval: Option<RunningDolphinCatalogueRetrieval>,
+    dolphin_catalogue_generation: u64,
+    dolphin_catalogue_last_result: Option<Result<DolphinCatalogueFetchResult, DolphinCatalogueError>>,
+    dolphin_catalogue_remove_confirm: bool,
+    /// `None` until the one automatic, quiet "Check for updates" this
+    /// session either completes or the user runs one manually - the
+    /// one-shot gate `dolphin_catalogue_update_check_needed` reads.
+    dolphin_catalogue_update_available: Option<bool>,
+    dolphin_catalogue_update_check: Option<Receiver<Result<DolphinCatalogueUpdateCheck, DolphinCatalogueError>>>,
     /// The "Add Folder" dialog's open/closed state and its own fields -
     /// see `SourcesAddDialogState`.
     sources_add_dialog: Option<SourcesAddDialogState>,
@@ -3160,6 +3188,14 @@ impl ArchiveFsApp {
             catalogue_retrieval: None,
             catalogue_generation: 0,
             catalogue_last_result: None,
+            dolphin_catalogue_manager: DolphinCatalogueManagerState::NotLoaded,
+            dolphin_catalogue_review: None,
+            dolphin_catalogue_retrieval: None,
+            dolphin_catalogue_generation: 0,
+            dolphin_catalogue_last_result: None,
+            dolphin_catalogue_remove_confirm: false,
+            dolphin_catalogue_update_available: None,
+            dolphin_catalogue_update_check: None,
             sources_add_dialog: None,
             sources_remove_dialog: None,
             library_views: load_library_view_configs_default().unwrap_or_default(),
@@ -4382,6 +4418,265 @@ impl ArchiveFsApp {
         self.start_catalogue_status_load(context.clone());
     }
 
+    fn start_dolphin_catalogue_status_load(&mut self, context: egui::Context) {
+        if matches!(self.dolphin_catalogue_manager, DolphinCatalogueManagerState::Loading(_)) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.dolphin_catalogue_manager = DolphinCatalogueManagerState::Loading(receiver);
+        thread::spawn(move || {
+            let result = default_dolphin_catalogue_cache_root().and_then(|root| {
+                let catalogue = match load_dolphin_catalogue(&root)? {
+                    DolphinCatalogueLoad::NotInstalled => None,
+                    DolphinCatalogueLoad::Ready(catalogue) => Some(*catalogue),
+                };
+                let last_check_unix_seconds =
+                    load_dolphin_catalogue_update_state(&root)?.last_check_unix_seconds;
+                Ok(DolphinCatalogueStatusSnapshot {
+                    catalogue,
+                    last_check_unix_seconds,
+                })
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn start_dolphin_catalogue_retrieval(&mut self, context: egui::Context) {
+        if self.dolphin_catalogue_retrieval.is_some() {
+            return;
+        }
+        let Some(kind) = self.dolphin_catalogue_review.take() else {
+            return;
+        };
+        self.dolphin_catalogue_generation = self.dolphin_catalogue_generation.wrapping_add(1);
+        let generation = self.dolphin_catalogue_generation;
+        let cancellation = CheatSourceCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinCatalogueRetrieval,
+            None,
+            ActivityOutcome::Started,
+            format!(
+                "Dolphin cheat catalogue {} started.",
+                dolphin_catalogue_retrieval_kind_verb(kind)
+            ),
+        ));
+        self.dolphin_catalogue_retrieval = Some(RunningDolphinCatalogueRetrieval {
+            generation,
+            kind,
+            cancellation,
+            receiver,
+            progress_receiver,
+            progress: None,
+            cancellation_requested: false,
+        });
+        let progress_context = context.clone();
+        let progress = CheatSourceProgressReporter::new(move |event| {
+            let _ = progress_sender.send(event);
+            progress_context.request_repaint();
+        });
+        thread::spawn(move || {
+            let result = default_dolphin_catalogue_cache_root().and_then(|cache_root| {
+                let options = DolphinCatalogueFetchOptions {
+                    cache_root,
+                    cancellation: Some(worker_cancellation),
+                    progress: Some(progress),
+                };
+                let transport = HttpsCheatSourceTransport::new();
+                match kind {
+                    DolphinCatalogueRetrievalKind::Download | DolphinCatalogueRetrievalKind::Update => {
+                        fetch_dolphin_catalogue_with_transport(&options, &transport)
+                    }
+                    DolphinCatalogueRetrievalKind::Rebuild => {
+                        rebuild_dolphin_catalogue_index_with_transport(&options, &transport)
+                    }
+                }
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn start_dolphin_catalogue_update_check(&mut self, context: egui::Context) {
+        if self.dolphin_catalogue_update_check.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.dolphin_catalogue_update_check = Some(receiver);
+        thread::spawn(move || {
+            let result = default_dolphin_catalogue_cache_root().and_then(|root| {
+                check_dolphin_catalogue_update_with_transport(&root, &HttpsCheatSourceTransport::new())
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// The single dispatch point for `DolphinCatalogueManagerAction` -
+    /// mirrors `handle_catalogue_manager_action`'s Review-then-Confirm
+    /// two-step and "no automatic network access" guarantee.
+    fn handle_dolphin_catalogue_manager_action(
+        &mut self,
+        context: &egui::Context,
+        action: DolphinCatalogueManagerAction,
+    ) {
+        match action {
+            DolphinCatalogueManagerAction::Refresh => {
+                self.start_dolphin_catalogue_status_load(context.clone());
+            }
+            DolphinCatalogueManagerAction::Review(kind) => {
+                self.dolphin_catalogue_review = Some(kind);
+            }
+            DolphinCatalogueManagerAction::Confirm => {
+                self.start_dolphin_catalogue_retrieval(context.clone());
+            }
+            DolphinCatalogueManagerAction::CancelReview => {
+                self.dolphin_catalogue_review = None;
+            }
+            DolphinCatalogueManagerAction::CancelRunning => {
+                if let Some(running) = self.dolphin_catalogue_retrieval.as_mut() {
+                    running.cancellation.cancel();
+                    running.cancellation_requested = true;
+                }
+            }
+            DolphinCatalogueManagerAction::CheckForUpdates => {
+                self.start_dolphin_catalogue_update_check(context.clone());
+            }
+            DolphinCatalogueManagerAction::RequestRemove => {
+                self.dolphin_catalogue_remove_confirm = true;
+            }
+            DolphinCatalogueManagerAction::CancelRemove => {
+                self.dolphin_catalogue_remove_confirm = false;
+            }
+            DolphinCatalogueManagerAction::ConfirmRemove => {
+                self.dolphin_catalogue_remove_confirm = false;
+                let outcome = default_dolphin_catalogue_cache_root()
+                    .and_then(|root| remove_dolphin_catalogue(&root));
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::DolphinCatalogueRetrieval,
+                    None,
+                    match &outcome {
+                        Ok(()) => ActivityOutcome::Completed,
+                        Err(_) => ActivityOutcome::Failed,
+                    },
+                    match &outcome {
+                        Ok(()) => {
+                            "Dolphin cheat catalogue removed. Installed Dolphin codes and profiles were not touched."
+                                .to_string()
+                        }
+                        Err(error) => format!("Dolphin cheat catalogue removal failed: {error}"),
+                    },
+                ));
+                self.dolphin_catalogue_update_available = None;
+                self.start_dolphin_catalogue_status_load(context.clone());
+            }
+        }
+    }
+
+    fn poll_dolphin_catalogue_manager(&mut self, context: &egui::Context) {
+        if let DolphinCatalogueManagerState::Loading(receiver) = &self.dolphin_catalogue_manager {
+            match receiver.try_recv() {
+                Ok(Ok(snapshot)) => {
+                    self.dolphin_catalogue_manager =
+                        DolphinCatalogueManagerState::Ready(Box::new(snapshot));
+                }
+                Ok(Err(error)) => {
+                    self.dolphin_catalogue_manager = DolphinCatalogueManagerState::Failed(error);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.dolphin_catalogue_manager = DolphinCatalogueManagerState::Failed(
+                        DolphinCatalogueError {
+                            kind: DolphinCatalogueErrorKind::CacheUnavailable,
+                            detail: "catalogue status worker stopped unexpectedly".to_string(),
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(receiver) = &self.dolphin_catalogue_update_check {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.dolphin_catalogue_update_available =
+                        Some(result.as_ref().is_ok_and(|check| check.update_available));
+                    self.dolphin_catalogue_update_check = None;
+                    self.start_dolphin_catalogue_status_load(context.clone());
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.dolphin_catalogue_update_available = Some(false);
+                    self.dolphin_catalogue_update_check = None;
+                }
+            }
+        }
+        if let Some(running) = self.dolphin_catalogue_retrieval.as_mut() {
+            for progress in running.progress_receiver.try_iter() {
+                running.progress = Some(progress);
+            }
+        }
+        let result = self.dolphin_catalogue_retrieval.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.generation, result))
+        });
+        let Some((generation, result)) = result else {
+            return;
+        };
+        self.dolphin_catalogue_retrieval = None;
+        if generation != self.dolphin_catalogue_generation {
+            return;
+        }
+        match &result {
+            Ok(fetch) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::DolphinCatalogueRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "Dolphin cheat catalogue activated at commit {}: {} games, {} usable Gecko codes ({} GameSettings files inspected, {} skipped).",
+                        fetch.catalogue.metadata.resolved_commit,
+                        fetch.catalogue.games.len(),
+                        fetch.catalogue.metadata.total_usable_gecko_entries,
+                        fetch.catalogue.metadata.game_settings_files_inspected,
+                        fetch.catalogue.metadata.malformed_or_skipped_files
+                    ),
+                ));
+                // A freshly downloaded/updated catalogue may now answer a
+                // lookup that previously came up empty; let the next
+                // selection re-check local sources instead of keeping a
+                // stale "nothing found" verdict pinned from before this
+                // catalogue existed.
+                if let Some(workflow) = self.cheat_workflow.as_mut()
+                    && workflow.adapter == CheatEmulatorAdapter::Dolphin
+                    && matches!(workflow.dolphin_provider, CheatStepResource::NotLoaded)
+                {
+                    workflow.dolphin_local_lookup = DolphinLocalLookupState::NotAttempted;
+                }
+            }
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::DolphinCatalogueRetrieval,
+                    None,
+                    if error.kind == DolphinCatalogueErrorKind::Cancelled {
+                        ActivityOutcome::Skipped
+                    } else {
+                        ActivityOutcome::Failed
+                    },
+                    format!("Dolphin cheat catalogue retrieval failed: {error}. Existing catalogue, if any, retained."),
+                ));
+            }
+        }
+        self.dolphin_catalogue_last_result = Some(result);
+        self.dolphin_catalogue_update_available = None;
+        self.dolphin_catalogue_manager = DolphinCatalogueManagerState::NotLoaded;
+        self.start_dolphin_catalogue_status_load(context.clone());
+    }
+
     /// Whether a new Library Views action may start - the same "one
     /// writer at a time" convention `source_action_available` uses
     /// (Preview/Apply reads the same database a scan writes to).
@@ -5031,6 +5326,7 @@ impl ArchiveFsApp {
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_local_lookup: DolphinLocalLookupState::NotAttempted,
             dolphin_profile_selection,
             dolphin_profile_choice: None,
             dolphin_details_open: false,
@@ -5480,6 +5776,129 @@ impl ArchiveFsApp {
             let _ = sender.send(result);
             context.request_repaint();
         });
+    }
+
+    /// The synchronous, network-free counterpart to
+    /// `start_dolphin_provider_fetch`: tries the local full catalogue
+    /// first, then a validated cached single-game result. Never spawns a
+    /// thread and never issues a network request - per the Dolphin cheat
+    /// catalogue design, an explicit fetch (Details > Refresh) is the only
+    /// way to reach the network once the local sources have nothing.
+    /// Returns `true` if it populated `dolphin_provider`.
+    fn try_resolve_dolphin_provider_from_local_sources(
+        &mut self,
+        dolphin_profile_paths: &HashMap<String, PathBuf>,
+    ) -> bool {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return false;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Dolphin
+            || !platform_is_gamecube(workflow.platform.as_deref())
+            || !matches!(workflow.dolphin_provider, CheatStepResource::NotLoaded)
+        {
+            return false;
+        }
+        let Some(identity) = ready_game_identity(workflow) else {
+            return false;
+        };
+        let Some(game_id) = identity.verified_dolphin_game_id().map(str::to_string) else {
+            return false;
+        };
+        let Some(revision) = identity.verified_dolphin_revision() else {
+            return false;
+        };
+        let Some(region) = region_for_game_id(&game_id) else {
+            return false;
+        };
+        let (Ok(catalogue_root), Ok(provider_root)) = (
+            default_dolphin_catalogue_cache_root(),
+            default_gecko_provider_cache_root(),
+        ) else {
+            return false;
+        };
+        let outcome =
+            resolve_dolphin_gecko_lookup(&catalogue_root, &provider_root, &game_id, &region, revision);
+        let (fetch, local_state) = match outcome {
+            Ok(DolphinGeckoLookupResult::Found(result)) => (
+                Some(GeckoProviderFetchResult {
+                    result,
+                    status: GeckoProviderFetchStatus::Catalogue,
+                    refresh_error: None,
+                }),
+                DolphinLocalLookupState::NotAttempted,
+            ),
+            Ok(
+                DolphinGeckoLookupResult::NoCatalogueInstalled { cached: Some(result) }
+                | DolphinGeckoLookupResult::NotInCatalogue { cached: Some(result) }
+                | DolphinGeckoLookupResult::RegionMismatch { cached: Some(result) }
+                | DolphinGeckoLookupResult::CatalogueEntryHasNoUsableCodes {
+                    cached: Some(result),
+                    ..
+                },
+            ) => (
+                Some(GeckoProviderFetchResult {
+                    result,
+                    status: GeckoProviderFetchStatus::FreshCache,
+                    refresh_error: None,
+                }),
+                DolphinLocalLookupState::NotAttempted,
+            ),
+            Ok(DolphinGeckoLookupResult::NoCatalogueInstalled { cached: None }) => {
+                (None, DolphinLocalLookupState::NoCatalogueInstalled)
+            }
+            Ok(DolphinGeckoLookupResult::NotInCatalogue { cached: None }) => {
+                (None, DolphinLocalLookupState::NotInCatalogue)
+            }
+            Ok(DolphinGeckoLookupResult::RegionMismatch { cached: None }) => {
+                (None, DolphinLocalLookupState::RegionMismatch)
+            }
+            Ok(DolphinGeckoLookupResult::CatalogueEntryHasNoUsableCodes {
+                warnings,
+                cached: None,
+            }) => (None, DolphinLocalLookupState::NoUsableCodes { warnings }),
+            Err(_) => (None, DolphinLocalLookupState::NotAttempted),
+        };
+
+        let Some(fetch) = fetch else {
+            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                workflow.dolphin_local_lookup = local_state;
+            }
+            return false;
+        };
+
+        let key = DolphinProviderRequestKey {
+            archive_path: workflow.archive_path.clone(),
+            game_id,
+            revision,
+        };
+        let (selection, destination_error) = build_dolphin_provider_selection(
+            dolphin_profile_paths,
+            workflow.selected_dolphin_profile_id.as_deref(),
+            &fetch,
+        );
+        let archive_path = workflow.archive_path.clone();
+        let message = format!(
+            "Local Dolphin cheat source returned {} exact-ID code(s) for {} ({}).",
+            fetch.result.entries.len(),
+            fetch.result.game_id,
+            dolphin_provider_fetch_status_label(fetch.status)
+        );
+
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return false;
+        };
+        workflow.dolphin_provider_request = Some(key);
+        workflow.dolphin_destination_error = destination_error;
+        workflow.dolphin_provider_selection = selection;
+        workflow.dolphin_provider = CheatStepResource::Ready(fetch);
+        workflow.dolphin_local_lookup = DolphinLocalLookupState::NotAttempted;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DolphinGeckoCandidateMatch,
+            Some(archive_path),
+            ActivityOutcome::Completed,
+            message,
+        ));
+        true
     }
 
     /// Dolphin Stage 5: stages the surgically edited GameSettings file and
@@ -6789,37 +7208,13 @@ impl ArchiveFsApp {
                                 && key.revision == fetch.result.revision
                         })
                     {
-                        let selection = workflow
-                            .selected_dolphin_profile_id
-                            .as_ref()
-                            .and_then(|profile_id| dolphin_profile_paths.get(profile_id))
-                            .map(|configuration_path| {
-                                load_dolphin_destination(configuration_path, &fetch.result.game_id)
-                            });
-                        workflow.dolphin_destination_error = None;
-                        workflow.dolphin_provider_selection = match selection {
-                            Some(Ok(destination)) => {
-                                let codes = DolphinProviderCodeSelection::from_provider(
-                                    &fetch.result,
-                                    &destination,
-                                );
-                                Some(DolphinProviderSelectionState {
-                                    destination,
-                                    selection: codes,
-                                })
-                            }
-                            Some(Err(error)) => {
-                                workflow.dolphin_destination_error = Some(error.to_string());
-                                None
-                            }
-                            None => {
-                                workflow.dolphin_destination_error = Some(
-                                    "Choose an eligible Dolphin profile before selecting provider codes."
-                                        .to_string(),
-                                );
-                                None
-                            }
-                        };
+                        let (selection, destination_error) = build_dolphin_provider_selection(
+                            &dolphin_profile_paths,
+                            workflow.selected_dolphin_profile_id.as_deref(),
+                            &fetch,
+                        );
+                        workflow.dolphin_destination_error = destination_error;
+                        workflow.dolphin_provider_selection = selection;
                         preview_history_entry = Some(HistoryEntry::new(
                             ActivityAction::DolphinGeckoCandidateMatch,
                             Some(workflow.archive_path.clone()),
@@ -7311,23 +7706,29 @@ impl ArchiveFsApp {
         if let Some(entry) = preview_history_entry {
             self.history.record(entry);
         }
+        // Dolphin: try the local catalogue/cache first, synchronously and
+        // read-only - never gated behind `cfg!(test)` since it never spawns
+        // a thread or touches the network, only ArchiveFS's own cache
+        // files (which simply won't exist under `cargo test`, so this is a
+        // fast no-op there exactly like every other "no catalogue" case).
+        // Per the Dolphin cheat catalogue design, if that finds nothing,
+        // no automatic network request follows - only an explicit fetch
+        // (Details > Refresh) reaches the network.
+        if need_dolphin_provider_fetch {
+            self.try_resolve_dolphin_provider_from_local_sources(&dolphin_profile_paths);
+        }
         // The real background fetch is skipped under `cargo test`: an
         // automatic trigger firing from a plain identity-ready + provider
         // "not loaded" fixture would otherwise spawn a real network
         // thread (`ureq`) from ordinary unit tests, which never happened
         // before this was automatic (no existing test called
-        // `start_dolphin_provider_fetch`/`start_xenia_provider_fetch`
-        // directly - they always assert against a fixture already in a
-        // `Ready`/`Failed`/`Loading` state). `need_dolphin_provider_fetch`/
-        // `need_xenia_provider_fetch` themselves are ordinary booleans and
-        // stay fully covered by direct unit tests on `CheatWorkflowState`.
-        if !cfg!(test) {
-            if need_dolphin_provider_fetch {
-                self.start_dolphin_provider_fetch(context.clone(), false);
-            }
-            if need_xenia_provider_fetch {
-                self.start_xenia_provider_fetch(context.clone(), false);
-            }
+        // `start_xenia_provider_fetch` directly - it always asserts
+        // against a fixture already in a `Ready`/`Failed`/`Loading`
+        // state). `need_xenia_provider_fetch` itself is an ordinary
+        // boolean and stays fully covered by direct unit tests on
+        // `CheatWorkflowState`.
+        if !cfg!(test) && need_xenia_provider_fetch {
+            self.start_xenia_provider_fetch(context.clone(), false);
         }
     }
 
@@ -8564,6 +8965,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_alias_action(context);
         self.poll_source_action(context);
         self.poll_catalogue_manager(context);
+        self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
         self.poll_archive_inspection();
         self.poll_missing_removal(context);
@@ -8586,6 +8988,23 @@ impl eframe::App for ArchiveFsApp {
         }
         if catalogue_status_load_needed(self.view, &self.catalogue_manager) {
             self.start_catalogue_status_load(context.clone());
+        }
+        if dolphin_catalogue_status_load_needed(self.view, &self.dolphin_catalogue_manager) {
+            self.start_dolphin_catalogue_status_load(context.clone());
+        }
+        // The one quiet, automatic "Check for updates" per session: only
+        // once a catalogue is confirmed installed, and only once ever
+        // (`dolphin_catalogue_update_available` starts `None` and this is
+        // the only place that can set it besides an explicit click).
+        if self.view == MainView::CheatsMods
+            && self.dolphin_catalogue_update_available.is_none()
+            && self.dolphin_catalogue_update_check.is_none()
+            && matches!(
+                &self.dolphin_catalogue_manager,
+                DolphinCatalogueManagerState::Ready(snapshot) if snapshot.catalogue.is_some()
+            )
+        {
+            self.start_dolphin_catalogue_update_check(context.clone());
         }
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
@@ -9021,10 +9440,34 @@ impl eframe::App for ArchiveFsApp {
                     let retroarch_route = self.cheat_workflow.as_ref().is_some_and(|workflow| {
                         workflow.adapter == CheatEmulatorAdapter::RetroArch
                     });
-                    let (action, catalogue_action) = egui::ScrollArea::vertical()
+                    let dolphin_route = self
+                        .cheat_workflow
+                        .as_ref()
+                        .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin);
+                    let now_unix_seconds = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_secs());
+                    let (action, catalogue_action, dolphin_catalogue_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            let dolphin_catalogue_action = dolphin_route.then(|| {
+                                let action = show_dolphin_catalogue_manager(
+                                    ui,
+                                    &self.dolphin_catalogue_manager,
+                                    self.dolphin_catalogue_retrieval.as_ref(),
+                                    self.dolphin_catalogue_last_result.as_ref(),
+                                    DolphinCatalogueCardContext {
+                                        review: self.dolphin_catalogue_review,
+                                        update_available: self.dolphin_catalogue_update_available,
+                                        remove_confirm: self.dolphin_catalogue_remove_confirm,
+                                        now_unix_seconds,
+                                    },
+                                    &mut self.clipboard,
+                                );
+                                ui.add_space(theme::SECTION_GAP);
+                                action
+                            }).flatten();
                             let action = show_cheats_mods_page(
                                 ui,
                                 self.cheat_workflow.as_mut(),
@@ -9056,7 +9499,7 @@ impl eframe::App for ArchiveFsApp {
                                     &mut self.clipboard,
                                 )
                             }).flatten();
-                            (action, catalogue_action)
+                            (action, catalogue_action, dolphin_catalogue_action)
                         })
                         .inner;
                     let picker_rows = live
@@ -9070,6 +9513,9 @@ impl eframe::App for ArchiveFsApp {
                         .unwrap_or_default();
                     if let Some(catalogue_action) = catalogue_action {
                         self.handle_catalogue_manager_action(context, catalogue_action);
+                    }
+                    if let Some(dolphin_catalogue_action) = dolphin_catalogue_action {
+                        self.handle_dolphin_catalogue_manager_action(context, dolphin_catalogue_action);
                     }
                     match action {
                         Some(CheatWorkflowAction::ChooseArchive) => {
@@ -12293,6 +12739,376 @@ fn format_transfer_bytes(bytes: u64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------
+// Dolphin cheat catalogue management card (Cheats & Mods)
+// ---------------------------------------------------------------------
+
+/// A snapshot cheap enough to hold in `App` state: the parsed catalogue (if
+/// any) plus the last update-check timestamp, loaded together by one
+/// background read so the card never shows one without the other.
+struct DolphinCatalogueStatusSnapshot {
+    catalogue: Option<DolphinCatalogue>,
+    last_check_unix_seconds: Option<u64>,
+}
+
+enum DolphinCatalogueManagerState {
+    NotLoaded,
+    Loading(Receiver<Result<DolphinCatalogueStatusSnapshot, DolphinCatalogueError>>),
+    Ready(Box<DolphinCatalogueStatusSnapshot>),
+    Failed(DolphinCatalogueError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DolphinCatalogueRetrievalKind {
+    Download,
+    Update,
+    /// Re-parses the archive already pinned to the active commit, without
+    /// checking upstream for a newer one.
+    Rebuild,
+}
+
+struct RunningDolphinCatalogueRetrieval {
+    generation: u64,
+    kind: DolphinCatalogueRetrievalKind,
+    cancellation: CheatSourceCancellation,
+    receiver: Receiver<Result<DolphinCatalogueFetchResult, DolphinCatalogueError>>,
+    progress_receiver: Receiver<CheatSourceProgress>,
+    progress: Option<CheatSourceProgress>,
+    cancellation_requested: bool,
+}
+
+enum DolphinCatalogueManagerAction {
+    Refresh,
+    Review(DolphinCatalogueRetrievalKind),
+    Confirm,
+    CancelReview,
+    CancelRunning,
+    CheckForUpdates,
+    RequestRemove,
+    ConfirmRemove,
+    CancelRemove,
+}
+
+fn dolphin_catalogue_retrieval_kind_verb(kind: DolphinCatalogueRetrievalKind) -> &'static str {
+    match kind {
+        DolphinCatalogueRetrievalKind::Download => "download",
+        DolphinCatalogueRetrievalKind::Update => "update",
+        DolphinCatalogueRetrievalKind::Rebuild => "rebuild",
+    }
+}
+
+/// Renders the beginner-facing Dolphin cheat catalogue card described in
+/// the Dolphin cheat catalogue design: no-catalogue prompt, downloading
+/// progress, ready summary, update-available affordance, and an honest
+/// failure banner that never exposes raw transport errors at this level
+/// (those live under `widgets::technical_details`).
+/// Groups `show_dolphin_catalogue_manager`'s small "current moment" values
+/// (as opposed to the state/running/result data it also needs) so the
+/// function stays under the usual argument-count limit.
+struct DolphinCatalogueCardContext {
+    review: Option<DolphinCatalogueRetrievalKind>,
+    update_available: Option<bool>,
+    remove_confirm: bool,
+    now_unix_seconds: u64,
+}
+
+fn show_dolphin_catalogue_manager(
+    ui: &mut egui::Ui,
+    state: &DolphinCatalogueManagerState,
+    running: Option<&RunningDolphinCatalogueRetrieval>,
+    last_result: Option<&Result<DolphinCatalogueFetchResult, DolphinCatalogueError>>,
+    context: DolphinCatalogueCardContext,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<DolphinCatalogueManagerAction> {
+    let DolphinCatalogueCardContext {
+        review,
+        update_available,
+        remove_confirm,
+        now_unix_seconds,
+    } = context;
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Dolphin cheat catalogue",
+        Some(
+            "A locally cached index of Gecko cheat definitions from the official Dolphin upstream project - downloaded once, searched instantly offline afterwards.",
+        ),
+    );
+    let idle = running.is_none() && review.is_none() && !remove_confirm;
+    match state {
+        DolphinCatalogueManagerState::NotLoaded | DolphinCatalogueManagerState::Loading(_) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking Dolphin cheat catalogue status…");
+            });
+        }
+        DolphinCatalogueManagerState::Failed(error) => {
+            widgets::banner(
+                ui,
+                "Catalogue status unavailable",
+                &error.to_string(),
+                widgets::StatusTone::Blocked,
+            );
+            if widgets::action_button(ui, "Retry", widgets::ActionStyle::Secondary, true).clicked() {
+                action = Some(DolphinCatalogueManagerAction::Refresh);
+            }
+        }
+        DolphinCatalogueManagerState::Ready(snapshot) => {
+            widgets::card(ui, |ui| {
+                match &snapshot.catalogue {
+                    None => {
+                        widgets::status_strip(
+                            ui,
+                            &[("Dolphin cheat catalogue not downloaded", widgets::StatusTone::Pending)],
+                        );
+                        if widgets::action_button(ui, "Download catalogue", widgets::ActionStyle::Primary, idle)
+                            .clicked()
+                        {
+                            action = Some(DolphinCatalogueManagerAction::Review(
+                                DolphinCatalogueRetrievalKind::Download,
+                            ));
+                        }
+                    }
+                    Some(catalogue) => {
+                        let stale = catalogue.metadata.is_stale(now_unix_seconds);
+                        let show_update = stale || update_available == Some(true);
+                        let tone = if show_update {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Success
+                        };
+                        widgets::status_strip(
+                            ui,
+                            &[(
+                                if show_update { "Update available" } else { "Dolphin catalogue ready" },
+                                tone,
+                            )],
+                        );
+                        ui.label(format!(
+                            "{} games · {} cheats",
+                            catalogue.games.len(),
+                            catalogue.metadata.total_usable_gecko_entries
+                        ));
+                        ui.label(format!(
+                            "Updated {}",
+                            format_unix_timestamp_utc(catalogue.metadata.fetched_at_unix_seconds as i64)
+                        ));
+                        if catalogue.metadata.malformed_or_skipped_files > 0 {
+                            ui.label(format!(
+                                "{} upstream file(s) had no usable Gecko codes.",
+                                catalogue.metadata.malformed_or_skipped_files
+                            ));
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if widgets::action_button(ui, "Update catalogue", widgets::ActionStyle::Primary, idle)
+                                .clicked()
+                            {
+                                action = Some(DolphinCatalogueManagerAction::Review(
+                                    DolphinCatalogueRetrievalKind::Update,
+                                ));
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Check for updates",
+                                widgets::ActionStyle::Secondary,
+                                idle,
+                            )
+                            .clicked()
+                            {
+                                action = Some(DolphinCatalogueManagerAction::CheckForUpdates);
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Rebuild local index",
+                                widgets::ActionStyle::Secondary,
+                                idle,
+                            )
+                            .clicked()
+                            {
+                                action = Some(DolphinCatalogueManagerAction::Review(
+                                    DolphinCatalogueRetrievalKind::Rebuild,
+                                ));
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Remove downloaded catalogue",
+                                widgets::ActionStyle::Secondary,
+                                idle,
+                            )
+                            .clicked()
+                            {
+                                action = Some(DolphinCatalogueManagerAction::RequestRemove);
+                            }
+                        });
+                        if !catalogue.metadata.warnings.is_empty() {
+                            show_cheat_warnings_summary(
+                                ui,
+                                &catalogue.metadata.warnings,
+                                ("dolphin_catalogue_warnings", &catalogue.metadata.resolved_commit),
+                                clipboard,
+                            );
+                        }
+                        widgets::technical_details(
+                            ui,
+                            ("dolphin_catalogue_technical_details", &catalogue.metadata.resolved_commit),
+                            |ui| {
+                                widgets::copyable_value(ui, "Repository", &catalogue.metadata.canonical_repository_url);
+                                widgets::copyable_value(ui, "Resolved commit", &catalogue.metadata.resolved_commit);
+                                widgets::copyable_value(ui, "Source archive", &catalogue.metadata.source_archive_url);
+                                widgets::copyable_value(ui, "Archive SHA-256", &catalogue.metadata.archive_sha256);
+                                ui.label(format!("Downloaded: {}", format_transfer_bytes(catalogue.metadata.downloaded_bytes)));
+                                ui.label(format!(
+                                    "GameSettings files inspected: {}",
+                                    catalogue.metadata.game_settings_files_inspected
+                                ));
+                                ui.label(format!(
+                                    "Non-matching files skipped (wildcard names, non-GameSettings paths): {}",
+                                    catalogue.metadata.non_matching_files_skipped
+                                ));
+                                ui.label(format!("Licence: {}", catalogue.metadata.license));
+                                ui.label(catalogue.metadata.attribution.clone());
+                                if let Some(timestamp) = snapshot.last_check_unix_seconds {
+                                    ui.label(format!(
+                                        "Last update check: {}",
+                                        format_unix_timestamp_utc(timestamp as i64)
+                                    ));
+                                }
+                            },
+                        );
+                    }
+                }
+            });
+        }
+    }
+    if let Some(running) = running {
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if running.cancellation_requested {
+                    "Cancellation requested; the active catalogue will remain unchanged."
+                } else {
+                    match running.kind {
+                        DolphinCatalogueRetrievalKind::Download => "Downloading Dolphin cheat catalogue…",
+                        DolphinCatalogueRetrievalKind::Update => "Updating Dolphin cheat catalogue…",
+                        DolphinCatalogueRetrievalKind::Rebuild => "Rebuilding the local Dolphin cheat index…",
+                    }
+                });
+            });
+            if let Some(progress) = &running.progress {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        catalogue_progress_label(progress.phase),
+                        if progress.phase == CheatSourceProgressPhase::Retrying {
+                            widgets::StatusTone::Warning
+                        } else {
+                            widgets::StatusTone::Info
+                        },
+                    );
+                });
+                if progress.phase == CheatSourceProgressPhase::Downloading {
+                    let received = format_transfer_bytes(progress.bytes_received);
+                    ui.label(format!("Received {received}."));
+                }
+            }
+            if widgets::action_button(
+                ui,
+                "Cancel",
+                widgets::ActionStyle::Secondary,
+                !running.cancellation_requested,
+            )
+            .clicked()
+            {
+                action = Some(DolphinCatalogueManagerAction::CancelRunning);
+            }
+        });
+    }
+    if let Some(result) = last_result {
+        match result {
+            Ok(fetch) => widgets::banner(
+                ui,
+                "Dolphin catalogue ready",
+                &format!(
+                    "{} games · {} cheats. Updated {}.",
+                    fetch.catalogue.games.len(),
+                    fetch.catalogue.metadata.total_usable_gecko_entries,
+                    format_unix_timestamp_utc(fetch.catalogue.metadata.fetched_at_unix_seconds as i64)
+                ),
+                widgets::StatusTone::Success,
+            ),
+            Err(error) => widgets::failure_summary(
+                ui,
+                "dolphin_catalogue_result_error",
+                if error.kind == DolphinCatalogueErrorKind::Cancelled {
+                    "Catalogue download cancelled"
+                } else {
+                    "Could not update the catalogue"
+                },
+                Some("Your existing catalogue is still available."),
+                &error.to_string(),
+            ),
+        }
+    }
+    if let Some(kind) = review {
+        let mut open = true;
+        egui::Window::new(format!(
+            "{}{} the Dolphin cheat catalogue?",
+            dolphin_catalogue_retrieval_kind_verb(kind)[..1].to_uppercase(),
+            &dolphin_catalogue_retrieval_kind_verb(kind)[1..]
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            ui.label("Network access begins only after you confirm this exact request.");
+            if let Ok(root) = default_dolphin_catalogue_cache_root() {
+                ui.label(format!("Managed destination: {}", root.display()));
+            }
+            ui.label("This only affects ArchiveFS's own catalogue cache. Your Dolphin profile and installed codes are never touched by this action.");
+            ui.horizontal(|ui| {
+                if ui.button("Confirm").clicked() {
+                    action = Some(DolphinCatalogueManagerAction::Confirm);
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(DolphinCatalogueManagerAction::CancelReview);
+                }
+            });
+        });
+        if !open {
+            action = Some(DolphinCatalogueManagerAction::CancelReview);
+        }
+    }
+    if remove_confirm {
+        let mut open = true;
+        egui::Window::new("Remove downloaded catalogue?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label("This removes only ArchiveFS's own catalogue cache.");
+                ui.label("It never removes installed Dolphin codes and never alters your Dolphin User/GameSettings files.");
+                ui.horizontal(|ui| {
+                    if ui.button("Remove").clicked() {
+                        action = Some(DolphinCatalogueManagerAction::ConfirmRemove);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(DolphinCatalogueManagerAction::CancelRemove);
+                    }
+                });
+            });
+        if !open {
+            action = Some(DolphinCatalogueManagerAction::CancelRemove);
+        }
+    }
+    action
+}
+
+/// One-shot gate mirroring `catalogue_status_load_needed`: load the status
+/// snapshot the first time the Cheats & Mods Dolphin workflow needs it.
+fn dolphin_catalogue_status_load_needed(view: MainView, state: &DolphinCatalogueManagerState) -> bool {
+    view == MainView::CheatsMods && matches!(state, DolphinCatalogueManagerState::NotLoaded)
+}
+
 /// The cheat-database readiness summary the Sources Overview shows -
 /// derived entirely from state `show_retroarch_catalogue_manager` (the
 /// card rendered lower on the page) already owns, never a second,
@@ -14851,6 +15667,23 @@ fn show_history_logs_page(
     }
     action
 }
+/// What `try_resolve_dolphin_provider_from_local_sources` found, kept
+/// distinct from `dolphin_provider` itself because `NotLoaded` alone can no
+/// longer distinguish "hasn't looked yet" from "looked locally and found
+/// nothing" now that a fruitless local lookup does not fall through to an
+/// automatic network request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum DolphinLocalLookupState {
+    #[default]
+    NotAttempted,
+    NoCatalogueInstalled,
+    NotInCatalogue,
+    RegionMismatch,
+    NoUsableCodes {
+        warnings: Vec<String>,
+    },
+}
+
 struct CheatWorkflowState {
     /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
     /// .path` identity the rest of the app uses, never a filename.
@@ -14894,6 +15727,14 @@ struct CheatWorkflowState {
     dolphin_provider: CheatStepResource<GeckoProviderFetchResult>,
     dolphin_provider_selection: Option<DolphinProviderSelectionState>,
     dolphin_destination_error: Option<String>,
+    /// What the network-free local lookup (catalogue, then cached
+    /// single-game result) found when it found nothing usable to show in
+    /// `dolphin_provider` - lets the beginner view distinguish "still
+    /// looking" (`NotAttempted`, `dolphin_provider` stays `NotLoaded`
+    /// briefly) from "looked locally and there is genuinely nothing here"
+    /// (any other variant, `dolphin_provider` stays `NotLoaded`
+    /// indefinitely since no automatic network request follows).
+    dolphin_local_lookup: DolphinLocalLookupState,
     /// The most recent automatic-selection outcome for the Dolphin
     /// profile - drives the beginner view's "using X automatically"
     /// confirmation, the "choose one of N profiles" chooser, or the
@@ -15539,12 +16380,49 @@ fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
     }
 }
 
+/// Builds the destination-bound code selection for a ready Dolphin
+/// provider result - shared by the background-fetch completion handler and
+/// `try_resolve_dolphin_provider_from_local_sources`, so both paths land
+/// on exactly the same selection/error behavior regardless of whether the
+/// result came from a network fetch or a purely local lookup.
+fn build_dolphin_provider_selection(
+    dolphin_profile_paths: &HashMap<String, PathBuf>,
+    selected_dolphin_profile_id: Option<&str>,
+    fetch: &GeckoProviderFetchResult,
+) -> (Option<DolphinProviderSelectionState>, Option<String>) {
+    let selection = selected_dolphin_profile_id
+        .and_then(|profile_id| dolphin_profile_paths.get(profile_id))
+        .map(|configuration_path| {
+            load_dolphin_destination(configuration_path, &fetch.result.game_id)
+        });
+    match selection {
+        Some(Ok(destination)) => {
+            let codes = DolphinProviderCodeSelection::from_provider(&fetch.result, &destination);
+            (
+                Some(DolphinProviderSelectionState {
+                    destination,
+                    selection: codes,
+                }),
+                None,
+            )
+        }
+        Some(Err(error)) => (None, Some(error.to_string())),
+        None => (
+            None,
+            Some(
+                "Choose an eligible Dolphin profile before selecting provider codes.".to_string(),
+            ),
+        ),
+    }
+}
+
 fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'static str {
     match status {
         GeckoProviderFetchStatus::Downloaded => "downloaded",
         GeckoProviderFetchStatus::FreshCache => "fresh cache",
         GeckoProviderFetchStatus::RateLimitedCache => "rate-limited cache",
         GeckoProviderFetchStatus::StaleCacheFallback => "stale cache fallback",
+        GeckoProviderFetchStatus::Catalogue => "local Dolphin cheat catalogue",
     }
 }
 
@@ -15618,9 +16496,15 @@ fn dolphin_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus
         Some(EmulatorProfileSelection::Auto { .. }) => {}
     }
     match &workflow.dolphin_provider {
-        CheatStepResource::NotLoaded | CheatStepResource::Loading { .. } => {
-            BeginnerCheatStatus::FindingCompatibleCheats
-        }
+        CheatStepResource::NotLoaded => match workflow.dolphin_local_lookup {
+            DolphinLocalLookupState::NotAttempted => BeginnerCheatStatus::FindingCompatibleCheats,
+            // The local catalogue/cache lookup already ran and found
+            // nothing; the Dolphin catalogue card explains why and offers
+            // the fix, so this stays the same honest "nothing found"
+            // wording rather than a spinner that would never resolve.
+            _ => BeginnerCheatStatus::NoCompatibleCheatsFound,
+        },
+        CheatStepResource::Loading { .. } => BeginnerCheatStatus::FindingCompatibleCheats,
         CheatStepResource::Failed(message) => BeginnerCheatStatus::CouldNotCheckForCheats {
             detail: message.clone(),
         },
@@ -28882,6 +29766,7 @@ mod tests {
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_local_lookup: DolphinLocalLookupState::NotAttempted,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
             dolphin_details_open: false,
@@ -32726,6 +33611,7 @@ $Instant Growth [Nayr]\n";
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_local_lookup: DolphinLocalLookupState::NotAttempted,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
             dolphin_details_open: false,
@@ -33249,6 +34135,14 @@ $Instant Growth [Nayr]\n";
             catalogue_retrieval: None,
             catalogue_generation: 0,
             catalogue_last_result: None,
+            dolphin_catalogue_manager: DolphinCatalogueManagerState::NotLoaded,
+            dolphin_catalogue_review: None,
+            dolphin_catalogue_retrieval: None,
+            dolphin_catalogue_generation: 0,
+            dolphin_catalogue_last_result: None,
+            dolphin_catalogue_remove_confirm: false,
+            dolphin_catalogue_update_available: None,
+            dolphin_catalogue_update_check: None,
             sources_add_dialog: None,
             sources_remove_dialog: None,
             // Deliberately `Vec::new()`, never `load_library_view_configs_default()`,
@@ -46225,6 +47119,7 @@ $Instant Growth [Nayr]\n";
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_local_lookup: DolphinLocalLookupState::NotAttempted,
             dolphin_profile_selection: None,
             dolphin_profile_choice: None,
             dolphin_details_open: false,

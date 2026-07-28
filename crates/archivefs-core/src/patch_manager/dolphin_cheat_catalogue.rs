@@ -38,7 +38,7 @@ use zip::ZipArchive;
 
 use super::cheat_cache_lock::LockedCheatCache;
 use super::cheat_sources::{
-    CHEAT_SOURCE_REDIRECT_LIMIT, CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS, CheatSourceCancellation,
+    CHEAT_SOURCE_REDIRECT_LIMIT, CheatSourceCancellation,
     CheatSourceError, CheatSourceHttpResponse, CheatSourceProgress, CheatSourceProgressPhase,
     CheatSourceProgressReporter, CheatSourceTransferContext, CheatSourceTransport,
     HttpsCheatSourceTransport, atomic_write_json, prepare_cache_root, secure_create,
@@ -520,6 +520,34 @@ pub fn fetch_dolphin_catalogue_with_transport(
     options: &DolphinCatalogueFetchOptions,
     transport: &dyn CheatSourceTransport,
 ) -> Result<DolphinCatalogueFetchResult, DolphinCatalogueError> {
+    fetch_dolphin_catalogue_at_with_transport(options, transport, None)
+}
+
+/// Re-downloads and re-parses the archive for the Game ID index's *current*
+/// pinned commit, without resolving `master` again - i.e. "Rebuild local
+/// index" rather than "Update". Fails clearly if no catalogue is installed
+/// yet, since there is no pinned commit to rebuild against.
+pub fn rebuild_dolphin_catalogue_index_with_transport(
+    options: &DolphinCatalogueFetchOptions,
+    transport: &dyn CheatSourceTransport,
+) -> Result<DolphinCatalogueFetchResult, DolphinCatalogueError> {
+    let current_commit = match load_dolphin_catalogue(&options.cache_root)? {
+        DolphinCatalogueLoad::Ready(catalogue) => catalogue.metadata.resolved_commit,
+        DolphinCatalogueLoad::NotInstalled => {
+            return Err(catalogue_error(
+                DolphinCatalogueErrorKind::CacheInvalid,
+                "no catalogue is installed, so there is no pinned commit to rebuild against; use Download instead",
+            ));
+        }
+    };
+    fetch_dolphin_catalogue_at_with_transport(options, transport, Some(current_commit))
+}
+
+fn fetch_dolphin_catalogue_at_with_transport(
+    options: &DolphinCatalogueFetchOptions,
+    transport: &dyn CheatSourceTransport,
+    pinned_commit: Option<String>,
+) -> Result<DolphinCatalogueFetchResult, DolphinCatalogueError> {
     if !options.cache_root.exists() {
         prepare_cache_root(&options.cache_root).map_err(from_cache_error)?;
     }
@@ -528,7 +556,15 @@ pub fn fetch_dolphin_catalogue_with_transport(
     check_cancelled(options)?;
 
     report(options, CheatSourceProgressPhase::ResolvingRevision, 0, None);
-    let resolved = resolve_upstream_commit(transport, options.cancellation.as_ref(), transfer_started)?;
+    let resolved = match pinned_commit {
+        Some(commit_id) => ResolvedCommit {
+            archive_url: format!(
+                "https://{DOLPHIN_CATALOGUE_DOWNLOAD_HOST}/{DOLPHIN_CATALOGUE_REPOSITORY}/zip/{commit_id}"
+            ),
+            commit_id,
+        },
+        None => resolve_upstream_commit(transport, options.cancellation.as_ref(), transfer_started)?,
+    };
 
     report(options, CheatSourceProgressPhase::Connecting, 0, None);
     let temporary_archive = locked.root().join(format!(
@@ -760,11 +796,7 @@ fn download_archive_with_retries(
                     None,
                 );
                 last_error = Some(error);
-                if RETRY_DELAY_SECONDS > 0 {
-                    std::thread::sleep(Duration::from_secs(
-                        RETRY_DELAY_SECONDS.min(CHEAT_SOURCE_RETRY_AFTER_LIMIT_SECONDS),
-                    ));
-                }
+                std::thread::sleep(Duration::from_secs(RETRY_DELAY_SECONDS));
             }
         }
     }

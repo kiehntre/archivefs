@@ -517,6 +517,73 @@ fn gecko_lookup_prefers_catalogue_then_falls_back_to_cached_single_game_then_nei
     }
 }
 
+#[test]
+fn rebuild_index_reuses_the_pinned_commit_without_resolving_master_again() {
+    let cache = CacheFixture::new("rebuild");
+    let archive = zip_with_entries(&[(
+        &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
+        GAFE01.as_bytes(),
+    )]);
+    fetch_dolphin_catalogue_with_transport(&options(&cache.0), &FakeTransport::new(COMMIT, archive))
+        .expect("initial catalogue install");
+
+    struct RebuildOnlyTransport(Vec<u8>);
+    impl CheatSourceTransport for RebuildOnlyTransport {
+        fn get(
+            &self,
+            url: &str,
+            _maximum_bytes: u64,
+            destination: &mut dyn Write,
+            _context: CheatSourceTransferContext<'_>,
+        ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
+            assert!(
+                !url.contains("api.github.com"),
+                "rebuild must not resolve the moving master reference"
+            );
+            destination.write_all(&self.0).expect("fixture write");
+            Ok(CheatSourceHttpResponse {
+                status: 200,
+                content_type: None,
+                content_encoding: None,
+                content_length: Some(self.0.len() as u64),
+                location: None,
+                etag: None,
+                last_modified: None,
+                downloaded_bytes: self.0.len() as u64,
+                retry_after_seconds: None,
+            })
+        }
+    }
+    let updated_archive = zip_with_entries(&[
+        (
+            &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
+            GAFE01.as_bytes(),
+        ),
+        (
+            &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GALE01.ini"),
+            NO_GECKO_INI.as_bytes(),
+        ),
+    ]);
+    let result = rebuild_dolphin_catalogue_index_with_transport(
+        &options(&cache.0),
+        &RebuildOnlyTransport(updated_archive),
+    )
+    .expect("rebuild succeeds against the pinned commit");
+    assert_eq!(result.catalogue.metadata.resolved_commit, COMMIT);
+    assert_eq!(result.catalogue.games.len(), 2);
+}
+
+#[test]
+fn rebuild_index_without_an_installed_catalogue_fails_clearly() {
+    let cache = CacheFixture::new("rebuild-missing");
+    let error = rebuild_dolphin_catalogue_index_with_transport(
+        &options(&cache.0),
+        &FakeTransport::new(COMMIT, Vec::new()),
+    )
+    .expect_err("rebuild without a catalogue must fail");
+    assert_eq!(error.kind, DolphinCatalogueErrorKind::CacheInvalid);
+}
+
 struct SingleGameFakeTransport(Vec<u8>);
 impl CheatSourceTransport for SingleGameFakeTransport {
     fn get(

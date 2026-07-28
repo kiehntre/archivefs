@@ -386,6 +386,10 @@ pub enum GeckoProviderFetchStatus {
     FreshCache,
     RateLimitedCache,
     StaleCacheFallback,
+    /// Answered entirely from the local Dolphin cheat catalogue - no
+    /// network request, not even a cache-freshness check against a remote
+    /// server. See `dolphin_cheat_catalogue::resolve_dolphin_gecko_lookup`.
+    Catalogue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -177,7 +177,8 @@ pub use dolphin_cheat_catalogue::{
     default_dolphin_catalogue_cache_root, fetch_dolphin_catalogue,
     fetch_dolphin_catalogue_with_transport, gecko_provider_result_from_catalogue_entry,
     load_dolphin_catalogue, load_dolphin_catalogue_update_state, lookup_dolphin_catalogue,
-    remove_dolphin_catalogue, resolve_dolphin_gecko_lookup,
+    rebuild_dolphin_catalogue_index_with_transport, remove_dolphin_catalogue,
+    resolve_dolphin_gecko_lookup,
 };
 pub use dolphin_gecko_install_plan::{
     DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,
