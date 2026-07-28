@@ -51,11 +51,13 @@ use archivefs_core::patch_manager::{
     build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
     build_shared_preview, build_shared_transaction_plan, build_xenia_candidates,
     build_xenia_install_preview, default_cheat_source_cache_root, default_shared_backup_root,
+    EmulatorProfileCandidate, EmulatorProfileSelection, RememberedEmulatorProfile,
     default_shared_history_root, discover_dolphin_profiles, discover_pcsx2_profiles,
     discover_retroarch_cheat_setup_profiles, discover_shared_apply_history,
     discover_xenia_profiles, execute_shared_apply, execute_shared_rollback,
     fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
     generate_shared_operation_id, inspect_dolphin_profile, inspect_pcsx2_profile,
+    load_remembered_emulator_profiles_default, remembered_profile_for, select_emulator_profile,
     inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
     load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_destination,
     load_xenia_destination, match_dolphin_inventory, match_pcsx2_inventory,
@@ -2878,6 +2880,11 @@ struct ArchiveFsApp {
     dolphin_profiles: DolphinProfilesState,
     /// Explicit-directory-only Xenia Canary profile discovery.
     xenia_profiles: XeniaProfilesState,
+    /// Per-emulator remembered profile choices, loaded once at startup
+    /// from `~/.config/archivefs/emulator_profiles.toml`. Kept in memory
+    /// and updated in place whenever a new choice is persisted, so this
+    /// never needs to be reloaded from disk during the session.
+    remembered_emulator_profiles: Vec<RememberedEmulatorProfile>,
     /// The full-page Cheats & Mods workspace's current archive and
     /// trusted-catalogue state. It survives ordinary page navigation so
     /// returning to the same exact archive does not discard a completed
@@ -3091,6 +3098,7 @@ impl ArchiveFsApp {
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             xenia_profiles: XeniaProfilesState::NotScanned,
+            remembered_emulator_profiles: load_remembered_emulator_profiles_default().unwrap_or_default(),
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -5000,6 +5008,8 @@ impl ArchiveFsApp {
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_profile_selection: None,
+            dolphin_profile_choice: None,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -5007,6 +5017,8 @@ impl ArchiveFsApp {
             xenia_selected_candidate_index: None,
             xenia_selection: None,
             xenia_destination_error: None,
+            xenia_profile_selection: None,
+            xenia_profile_choice: None,
             source_mode,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -5048,12 +5060,52 @@ impl ArchiveFsApp {
             .cheat_workflow
             .as_ref()
             .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin)
-            && matches!(
+        {
+            self.seed_explicit_root_from_remembered_profile("dolphin");
+            if matches!(
                 self.dolphin_profiles,
                 DolphinProfilesState::NotScanned | DolphinProfilesState::Error(_)
-            )
+            ) {
+                self.start_dolphin_profile_scan(context.clone());
+            }
+        }
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia)
         {
-            self.start_dolphin_profile_scan(context.clone());
+            self.seed_explicit_root_from_remembered_profile("xenia");
+            if matches!(self.xenia_profiles, XeniaProfilesState::NotScanned) {
+                self.start_xenia_profile_scan();
+            }
+        }
+    }
+
+    /// Seeds the workflow's explicit-root text field from the remembered
+    /// profile for `adapter`, but only when the field is still empty -
+    /// never overwrites anything the user has already typed this
+    /// session. This is what lets a remembered portable Dolphin install
+    /// or a remembered Xenia Canary directory be rediscovered
+    /// automatically without asking again, since neither adapter has a
+    /// single standard path ArchiveFS can otherwise find on its own.
+    fn seed_explicit_root_from_remembered_profile(&mut self, adapter: &str) {
+        let Some(root) = self.remembered_profile_root(adapter) else {
+            return;
+        };
+        let Some(root) = root.to_str().map(str::to_string) else {
+            return;
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        match adapter {
+            "dolphin" if workflow.dolphin_explicit_root.trim().is_empty() => {
+                workflow.dolphin_explicit_root = root;
+            }
+            "xenia" if workflow.xenia_explicit_root.trim().is_empty() => {
+                workflow.xenia_explicit_root = root;
+            }
+            _ => {}
         }
     }
 
@@ -5560,7 +5612,47 @@ impl ArchiveFsApp {
                     .count()
             ),
         ));
+        let eligible = eligible_xenia_profile_ids(&discovery);
+        let candidates = xenia_profile_candidates(&discovery);
+        let remembered = self.remembered_profile_id("xenia");
+        let mut to_persist: Option<(String, PathBuf)> = None;
+        if let Some(workflow) = self.cheat_workflow.as_mut()
+            && workflow.adapter == CheatEmulatorAdapter::Xenia
+        {
+            let session_explicit = workflow.xenia_profile_choice.clone();
+            let selection = select_emulator_profile(
+                &candidates,
+                remembered.as_deref(),
+                session_explicit.as_deref(),
+            );
+            let install_in_progress = !matches!(workflow.transaction, CheatTransactionState::Idle);
+            if let EmulatorProfileSelection::Auto { profile_id, .. } = &selection
+                && !install_in_progress
+                && workflow.selected_xenia_profile_id.as_deref() != Some(profile_id.as_str())
+            {
+                workflow.selected_xenia_profile_id = Some(profile_id.clone());
+                if let Some(root) = candidates
+                    .iter()
+                    .find(|candidate| candidate.profile_id == *profile_id)
+                    .map(|candidate| candidate.root.clone())
+                {
+                    to_persist = Some((profile_id.clone(), root));
+                }
+            } else if !matches!(selection, EmulatorProfileSelection::Auto { .. })
+                && !install_in_progress
+                && workflow
+                    .selected_xenia_profile_id
+                    .as_ref()
+                    .is_none_or(|selected| !eligible.contains(&selected.as_str()))
+            {
+                workflow.selected_xenia_profile_id = None;
+            }
+            workflow.xenia_profile_selection = Some(selection);
+        }
         self.xenia_profiles = XeniaProfilesState::Ready(discovery);
+        if let Some((profile_id, root)) = to_persist {
+            self.persist_remembered_profile("xenia", &profile_id, &root);
+        }
     }
 
     fn start_xenia_provider_fetch(&mut self, context: egui::Context, force_refresh: bool) {
@@ -7320,6 +7412,76 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Looks up the remembered profile id for an adapter key (`"dolphin"`
+    /// or `"xenia"`), if any.
+    fn remembered_profile_id(&self, adapter: &str) -> Option<String> {
+        remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+            .map(|profile| profile.profile_id.clone())
+    }
+
+    /// Looks up the remembered profile's root directory for an adapter
+    /// key - used to seed the explicit-root text field so a remembered
+    /// portable/explicit profile is rediscovered without the user typing
+    /// it again every session.
+    fn remembered_profile_root(&self, adapter: &str) -> Option<PathBuf> {
+        remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+            .map(|profile| profile.root.clone())
+    }
+
+    /// Persists `profile_id`/`root` as the remembered profile for
+    /// `adapter`, updating the in-memory cache immediately so the rest of
+    /// the session sees it without a reload. The write is a small local
+    /// file (atomic rename) - failures are non-fatal and only recorded in
+    /// the Activity Log, never surfaced as a blocking error, since the
+    /// session-level selection already succeeded regardless of whether it
+    /// could be remembered for next time.
+    fn persist_remembered_profile(&mut self, adapter: &str, profile_id: &str, root: &Path) {
+        let already_current = remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+            .is_some_and(|profile| profile.profile_id == profile_id && profile.root == root);
+        if already_current {
+            return;
+        }
+        // The real on-disk write is skipped under `cargo test`: it would
+        // otherwise write to the developer's actual
+        // `~/.config/archivefs/emulator_profiles.toml` every time a test
+        // drives profile discovery to a resolved selection, exactly the
+        // kind of real-filesystem side effect the rest of this test suite
+        // never has (config-mutating core functions are only ever called
+        // from the real app entry point, never from GUI unit tests). The
+        // in-memory cache is still updated unconditionally, so selection
+        // and chooser behavior remain fully testable.
+        #[cfg(not(test))]
+        let write_result = archivefs_core::patch_manager::remember_emulator_profile_default(
+            adapter, profile_id, root,
+        );
+        #[cfg(test)]
+        let write_result: Result<(), ArchiveFsError> = Ok(());
+        match write_result {
+            Ok(()) => {
+                self.remembered_emulator_profiles
+                    .retain(|profile| profile.adapter != adapter);
+                self.remembered_emulator_profiles.push(RememberedEmulatorProfile {
+                    adapter: adapter.to_string(),
+                    profile_id: profile_id.to_string(),
+                    root: root.to_path_buf(),
+                });
+            }
+            Err(error) => {
+                let action = if adapter == "xenia" {
+                    ActivityAction::XeniaProfileScan
+                } else {
+                    ActivityAction::DolphinProfileScan
+                };
+                self.history.record(HistoryEntry::new(
+                    action,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("Could not remember the chosen {adapter} profile: {error}"),
+                ));
+            }
+        }
+    }
+
     fn start_dolphin_profile_scan(&mut self, context: egui::Context) {
         let (sender, receiver) = mpsc::channel();
         self.history.record(HistoryEntry::new(
@@ -7365,19 +7527,54 @@ impl ArchiveFsApp {
                             eligible.len()
                         ),
                     ));
+                    let candidates = dolphin_profile_candidates(&discovery);
+                    let remembered = self.remembered_profile_id("dolphin");
+                    let mut to_persist: Option<(String, PathBuf)> = None;
                     if let Some(workflow) = self.cheat_workflow.as_mut()
                         && workflow.adapter == CheatEmulatorAdapter::Dolphin
-                        && workflow
-                            .selected_dolphin_profile_id
-                            .as_ref()
-                            .is_none_or(|selected| !eligible.contains(&selected.as_str()))
                     {
-                        workflow.selected_dolphin_profile_id =
-                            (eligible.len() == 1).then(|| eligible[0].to_string());
-                        workflow.dolphin_inventory_profile_id = None;
-                        workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                        let session_explicit = workflow.dolphin_profile_choice.clone();
+                        let selection = select_emulator_profile(
+                            &candidates,
+                            remembered.as_deref(),
+                            session_explicit.as_deref(),
+                        );
+                        // Rule: never silently switch the profile bound to
+                        // an install already reviewed/applied this session.
+                        let install_in_progress =
+                            !matches!(workflow.transaction, CheatTransactionState::Idle);
+                        if let EmulatorProfileSelection::Auto { profile_id, .. } = &selection
+                            && !install_in_progress
+                            && workflow.selected_dolphin_profile_id.as_deref()
+                                != Some(profile_id.as_str())
+                        {
+                            workflow.selected_dolphin_profile_id = Some(profile_id.clone());
+                            workflow.dolphin_inventory_profile_id = None;
+                            workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                            if let Some(root) = candidates
+                                .iter()
+                                .find(|candidate| candidate.profile_id == *profile_id)
+                                .map(|candidate| candidate.root.clone())
+                            {
+                                to_persist = Some((profile_id.clone(), root));
+                            }
+                        } else if !matches!(selection, EmulatorProfileSelection::Auto { .. })
+                            && !install_in_progress
+                            && workflow
+                                .selected_dolphin_profile_id
+                                .as_ref()
+                                .is_none_or(|selected| !eligible.contains(&selected.as_str()))
+                        {
+                            workflow.selected_dolphin_profile_id = None;
+                            workflow.dolphin_inventory_profile_id = None;
+                            workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                        }
+                        workflow.dolphin_profile_selection = Some(selection);
                     }
                     self.dolphin_profiles = DolphinProfilesState::Ready(discovery);
+                    if let Some((profile_id, root)) = to_persist {
+                        self.persist_remembered_profile("dolphin", &profile_id, &root);
+                    }
                 }
                 Ok(Err(message)) => {
                     self.history.record(HistoryEntry::new(
@@ -14494,6 +14691,15 @@ struct CheatWorkflowState {
     dolphin_provider: CheatStepResource<GeckoProviderFetchResult>,
     dolphin_provider_selection: Option<DolphinProviderSelectionState>,
     dolphin_destination_error: Option<String>,
+    /// The most recent automatic-selection outcome for the Dolphin
+    /// profile - drives the beginner view's "using X automatically"
+    /// confirmation, the "choose one of N profiles" chooser, or the
+    /// setup-needed state. Recomputed whenever `dolphin_profiles`
+    /// changes; never recomputed merely because the page re-renders.
+    dolphin_profile_selection: Option<EmulatorProfileSelection>,
+    /// The profile currently highlighted in the profile chooser dialog,
+    /// pending the user's explicit "Use selected profile" confirmation.
+    dolphin_profile_choice: Option<String>,
     selected_xenia_profile_id: Option<String>,
     /// An explicit Xenia Canary directory typed by the user - the only
     /// way ArchiveFS ever learns of a Xenia install, since it has no
@@ -14507,6 +14713,12 @@ struct CheatWorkflowState {
     xenia_selected_candidate_index: Option<usize>,
     xenia_selection: Option<XeniaSelectionState>,
     xenia_destination_error: Option<String>,
+    /// The most recent automatic-selection outcome for the Xenia Canary
+    /// profile - same role as `dolphin_profile_selection`.
+    xenia_profile_selection: Option<EmulatorProfileSelection>,
+    /// The profile currently highlighted in the profile chooser dialog,
+    /// pending the user's explicit "Use selected profile" confirmation.
+    xenia_profile_choice: Option<String>,
     /// Independent source mode. Changing it never changes the archive,
     /// profile, destination, or any fetched result retained by another mode.
     source_mode: CheatSourceMode,
@@ -16655,6 +16867,25 @@ fn eligible_xenia_profile_ids(discovery: &XeniaProfileDiscovery) -> Vec<&str> {
         .iter()
         .filter(|profile| profile.eligible)
         .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+/// Maps Xenia's own discovery result into the adapter-agnostic shape
+/// `select_emulator_profile` understands. Every Xenia profile ArchiveFS
+/// can discover is already an explicit, caller-supplied directory (there
+/// is no single native Xenia Canary path to guess), so none of them are
+/// singled out as "the portable one" - `is_portable` is left `false` for
+/// all of them and the tie-break never fires for this adapter.
+fn xenia_profile_candidates(discovery: &XeniaProfileDiscovery) -> Vec<EmulatorProfileCandidate> {
+    discovery
+        .profiles
+        .iter()
+        .map(|profile| EmulatorProfileCandidate {
+            profile_id: profile.profile_id.clone(),
+            root: profile.configuration_path.clone(),
+            eligible: profile.eligible,
+            is_portable: false,
+        })
         .collect()
 }
 
@@ -20392,6 +20623,24 @@ fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str
         .iter()
         .filter(|profile| profile.eligible)
         .map(|profile| profile.profile_id.as_str())
+        .collect()
+}
+
+/// Maps Dolphin's own discovery result into the adapter-agnostic shape
+/// `select_emulator_profile` understands. `installation_type ==
+/// Explicit` is the only kind that came from a user-typed directory
+/// (portable/AppImage installs), which is exactly what the beginner
+/// selection rules mean by "portable".
+fn dolphin_profile_candidates(discovery: &DolphinProfileDiscovery) -> Vec<EmulatorProfileCandidate> {
+    discovery
+        .profiles
+        .iter()
+        .map(|profile| EmulatorProfileCandidate {
+            profile_id: profile.profile_id.clone(),
+            root: profile.configuration_path.clone(),
+            eligible: profile.eligible,
+            is_portable: profile.installation_type == DolphinInstallationType::Explicit,
+        })
         .collect()
 }
 
@@ -27480,6 +27729,8 @@ mod tests {
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_profile_selection: None,
+            dolphin_profile_choice: None,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -27487,6 +27738,8 @@ mod tests {
             xenia_selected_candidate_index: None,
             xenia_selection: None,
             xenia_destination_error: None,
+            xenia_profile_selection: None,
+            xenia_profile_choice: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -27572,6 +27825,173 @@ mod tests {
             bytes_inspected: 0,
             complete: true,
         }
+    }
+
+    fn dolphin_profile_fixture_with(id: &str, portable: bool) -> DolphinProfile {
+        let mut profile = dolphin_profile_fixture();
+        profile.profile_id = id.to_string();
+        profile.installation_type = if portable {
+            DolphinInstallationType::Explicit
+        } else {
+            DolphinInstallationType::Native
+        };
+        profile.configuration_path = PathBuf::from(format!("/isolated/{id}"));
+        profile
+    }
+
+    /// Drives `poll_dolphin_profiles` to completion with a synthetic
+    /// discovery result, exactly like a real background scan finishing -
+    /// without touching the filesystem.
+    fn drive_dolphin_profile_scan(app: &mut ArchiveFsApp, profiles: Vec<DolphinProfile>) {
+        let (sender, receiver) = mpsc::channel();
+        app.dolphin_profiles = DolphinProfilesState::Scanning { receiver };
+        let discovery = DolphinProfileDiscovery {
+            profiles,
+            warnings: Vec::new(),
+            complete: true,
+        };
+        sender.send(Ok(discovery)).unwrap();
+        app.poll_dolphin_profiles();
+    }
+
+    #[test]
+    fn poll_dolphin_profiles_auto_selects_the_only_eligible_profile() {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
+        drive_dolphin_profile_scan(&mut app, vec![dolphin_profile_fixture()]);
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(
+            workflow.selected_dolphin_profile_id.as_deref(),
+            Some("dolphin-native-test")
+        );
+        assert!(matches!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::Auto {
+                reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn poll_dolphin_profiles_prefers_remembered_profile_over_discovery_order() {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
+        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
+            adapter: "dolphin".to_string(),
+            profile_id: "second".to_string(),
+            root: PathBuf::from("/isolated/second"),
+        });
+        drive_dolphin_profile_scan(
+            &mut app,
+            vec![
+                dolphin_profile_fixture_with("first", false),
+                dolphin_profile_fixture_with("second", false),
+            ],
+        );
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .selected_dolphin_profile_id
+                .as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn poll_dolphin_profiles_requires_a_choice_with_multiple_valid_profiles_and_nothing_remembered()
+     {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
+        drive_dolphin_profile_scan(
+            &mut app,
+            vec![
+                dolphin_profile_fixture_with("first", false),
+                dolphin_profile_fixture_with("second", false),
+            ],
+        );
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.selected_dolphin_profile_id, None);
+        assert!(matches!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::NeedsChoice { .. })
+        ));
+    }
+
+    #[test]
+    fn poll_dolphin_profiles_with_a_stale_remembered_profile_shows_setup_needed() {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
+        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
+            adapter: "dolphin".to_string(),
+            profile_id: "vanished".to_string(),
+            root: PathBuf::from("/isolated/vanished"),
+        });
+        drive_dolphin_profile_scan(&mut app, vec![dolphin_profile_fixture()]);
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.selected_dolphin_profile_id, None);
+        assert_eq!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::SetupNeeded)
+        );
+    }
+
+    #[test]
+    fn poll_dolphin_profiles_prefers_the_single_portable_profile_among_several_valid_ones() {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
+        drive_dolphin_profile_scan(
+            &mut app,
+            vec![
+                dolphin_profile_fixture_with("standard", false),
+                dolphin_profile_fixture_with("portable", true),
+            ],
+        );
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .selected_dolphin_profile_id
+                .as_deref(),
+            Some("portable")
+        );
+    }
+
+    #[test]
+    fn seeding_explicit_root_never_overwrites_a_value_the_user_already_typed() {
+        let mut app = app_with_cheats_mods_context();
+        {
+            let workflow = app.cheat_workflow.as_mut().unwrap();
+            workflow.adapter = CheatEmulatorAdapter::Dolphin;
+            workflow.dolphin_explicit_root = "/typed/by/user".to_string();
+        }
+        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
+            adapter: "dolphin".to_string(),
+            profile_id: "remembered".to_string(),
+            root: PathBuf::from("/remembered/root"),
+        });
+        app.seed_explicit_root_from_remembered_profile("dolphin");
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().dolphin_explicit_root,
+            "/typed/by/user"
+        );
+    }
+
+    #[test]
+    fn seeding_explicit_root_from_a_remembered_profile_fills_an_empty_field() {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Xenia;
+        app.remembered_emulator_profiles.push(RememberedEmulatorProfile {
+            adapter: "xenia".to_string(),
+            profile_id: "remembered".to_string(),
+            root: PathBuf::from("/remembered/xenia-root"),
+        });
+        app.seed_explicit_root_from_remembered_profile("xenia");
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().xenia_explicit_root,
+            "/remembered/xenia-root"
+        );
     }
 
     #[test]
@@ -30372,6 +30792,8 @@ $Instant Growth [Nayr]\n";
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_profile_selection: None,
+            dolphin_profile_choice: None,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -30379,6 +30801,8 @@ $Instant Growth [Nayr]\n";
             xenia_selected_candidate_index: None,
             xenia_selection: None,
             xenia_destination_error: None,
+            xenia_profile_selection: None,
+            xenia_profile_choice: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
@@ -30822,6 +31246,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             xenia_profiles: XeniaProfilesState::NotScanned,
+            remembered_emulator_profiles: Vec::new(),
             cheat_workflow: None,
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
@@ -43862,6 +44287,8 @@ $Instant Growth [Nayr]\n";
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
             dolphin_destination_error: None,
+            dolphin_profile_selection: None,
+            dolphin_profile_choice: None,
             selected_xenia_profile_id: None,
             xenia_explicit_root: String::new(),
             xenia_provider_request: None,
@@ -43869,6 +44296,8 @@ $Instant Growth [Nayr]\n";
             xenia_selected_candidate_index: None,
             xenia_selection: None,
             xenia_destination_error: None,
+            xenia_profile_selection: None,
+            xenia_profile_choice: None,
             source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
             existing_library_profile_id: None,
             existing_library: CheatStepResource::NotLoaded,
