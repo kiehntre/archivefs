@@ -38,8 +38,7 @@ impl Drop for CacheFixture {
 
 const GAFE01: &str = "# GAFE01 - Animal Crossing\n\n[Gecko]\n$16:9 Widescreen\n040037A0 3C608000\n040037A4 C38337AC\n";
 const NO_GECKO_INI: &str = "# GALE01 - Super Smash Bros. Melee\n\n[Core]\nCPUThread = True\n";
-const MALFORMED_INI: &str =
-    "# GAFE02 - Bad File\n\n[Gecko]\n$Bad\nnot code\n$Same\n040037A0 3C608000\n$Same\n040037A4 C38337AC\n";
+const MALFORMED_INI: &str = "# GAFE02 - Bad File\n\n[Gecko]\n$Bad\nnot code\n$Same\n040037A0 3C608000\n$Same\n040037A4 C38337AC\n";
 
 fn zip_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let cursor = Cursor::new(Vec::new());
@@ -58,7 +57,9 @@ fn dir_entry_zip(entries: &[(&str, &[u8])], directory: &str) -> Vec<u8> {
     let cursor = Cursor::new(Vec::new());
     let mut writer = ZipWriter::new(cursor);
     let dir_options = SimpleFileOptions::default().unix_permissions(0o040755);
-    writer.add_directory(directory, dir_options).expect("add_directory");
+    writer
+        .add_directory(directory, dir_options)
+        .expect("add_directory");
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o100644);
@@ -264,8 +265,11 @@ fn interrupted_and_failed_updates_preserve_the_previous_catalogue() {
         &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
         GAFE01.as_bytes(),
     )]);
-    fetch_dolphin_catalogue_with_transport(&options(&cache.0), &FakeTransport::new(COMMIT, archive))
-        .expect("initial catalogue install");
+    fetch_dolphin_catalogue_with_transport(
+        &options(&cache.0),
+        &FakeTransport::new(COMMIT, archive),
+    )
+    .expect("initial catalogue install");
 
     let failure = FailingTransport("overall_timeout");
     let error = fetch_dolphin_catalogue_with_transport(&options(&cache.0), &failure)
@@ -331,8 +335,11 @@ fn removing_the_catalogue_only_touches_archivefs_cache_files() {
         &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
         GAFE01.as_bytes(),
     )]);
-    fetch_dolphin_catalogue_with_transport(&options(&cache.0), &FakeTransport::new(COMMIT, archive))
-        .expect("catalogue install");
+    fetch_dolphin_catalogue_with_transport(
+        &options(&cache.0),
+        &FakeTransport::new(COMMIT, archive),
+    )
+    .expect("catalogue install");
     assert!(cache.0.join("catalogue.json").exists());
 
     remove_dolphin_catalogue(&cache.0).expect("removal succeeds");
@@ -350,8 +357,11 @@ fn update_check_reports_availability_without_downloading_the_archive() {
         &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
         GAFE01.as_bytes(),
     )]);
-    fetch_dolphin_catalogue_with_transport(&options(&cache.0), &FakeTransport::new(COMMIT, archive))
-        .expect("catalogue install");
+    fetch_dolphin_catalogue_with_transport(
+        &options(&cache.0),
+        &FakeTransport::new(COMMIT, archive),
+    )
+    .expect("catalogue install");
 
     let same_commit_transport = FakeTransport::new(COMMIT, Vec::new());
     let check = check_dolphin_catalogue_update_with_transport(&cache.0, &same_commit_transport)
@@ -524,8 +534,11 @@ fn rebuild_index_reuses_the_pinned_commit_without_resolving_master_again() {
         &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
         GAFE01.as_bytes(),
     )]);
-    fetch_dolphin_catalogue_with_transport(&options(&cache.0), &FakeTransport::new(COMMIT, archive))
-        .expect("initial catalogue install");
+    fetch_dolphin_catalogue_with_transport(
+        &options(&cache.0),
+        &FakeTransport::new(COMMIT, archive),
+    )
+    .expect("initial catalogue install");
 
     struct RebuildOnlyTransport(Vec<u8>);
     impl CheatSourceTransport for RebuildOnlyTransport {

@@ -26,23 +26,23 @@ use archivefs_core::patch_manager::{
     CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation, CheatSourceError,
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
-    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
-    DolphinCatalogueUpdateCheck, DolphinGameIniInventory,
+    CheatSourceProgressReporter, DolphinCatalogue, DolphinCatalogueError,
+    DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult,
+    DolphinCatalogueLoad, DolphinCatalogueUpdateCheck, DolphinGameIniInventory,
     DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
-    DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
-    EmulatorProfileSelection, GeckoProviderFetchOptions, GeckoProviderFetchResult,
-    GeckoProviderFetchStatus, GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind,
-    ImportTrustState, LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination,
-    LocalSafetyScanningState, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewSourceItem, PreviewState, RememberedEmulatorProfile,
-    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
+    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
+    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
+    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectoryState,
+    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots,
+    Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState, PreviewEligibility,
+    PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
+    PreviewSourceItem, PreviewState, RememberedEmulatorProfile, ResolvedCheatDestination,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
@@ -80,9 +80,10 @@ mod ui;
 
 #[cfg(test)]
 use archivefs_core::patch_manager::{
-    GeckoProviderEntry, GeckoProviderResult, GeckoRegion, GeckoRevisionApplicability,
-    Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind, XeniaInstallationType,
-    XeniaProfileScope, XeniaProviderDocument, XeniaProviderResult,
+    DOLPHIN_CATALOGUE_REPOSITORY, DOLPHIN_CATALOGUE_SCHEMA_VERSION, DolphinCatalogueGame,
+    DolphinCatalogueMetadata, GeckoProviderEntry, GeckoProviderResult, GeckoRegion,
+    GeckoRevisionApplicability, Pcsx2PatchDirectory, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+    XeniaInstallationType, XeniaProfileScope, XeniaProviderDocument, XeniaProviderResult,
 };
 
 use archivefs_core::{
@@ -3013,13 +3014,15 @@ struct ArchiveFsApp {
     dolphin_catalogue_review: Option<DolphinCatalogueRetrievalKind>,
     dolphin_catalogue_retrieval: Option<RunningDolphinCatalogueRetrieval>,
     dolphin_catalogue_generation: u64,
-    dolphin_catalogue_last_result: Option<Result<DolphinCatalogueFetchResult, DolphinCatalogueError>>,
+    dolphin_catalogue_last_result:
+        Option<Result<DolphinCatalogueFetchResult, DolphinCatalogueError>>,
     dolphin_catalogue_remove_confirm: bool,
     /// `None` until the one automatic, quiet "Check for updates" this
     /// session either completes or the user runs one manually - the
     /// one-shot gate `dolphin_catalogue_update_check_needed` reads.
     dolphin_catalogue_update_available: Option<bool>,
-    dolphin_catalogue_update_check: Option<Receiver<Result<DolphinCatalogueUpdateCheck, DolphinCatalogueError>>>,
+    dolphin_catalogue_update_check:
+        Option<Receiver<Result<DolphinCatalogueUpdateCheck, DolphinCatalogueError>>>,
     /// The "Add Folder" dialog's open/closed state and its own fields -
     /// see `SourcesAddDialogState`.
     sources_add_dialog: Option<SourcesAddDialogState>,
@@ -4419,7 +4422,10 @@ impl ArchiveFsApp {
     }
 
     fn start_dolphin_catalogue_status_load(&mut self, context: egui::Context) {
-        if matches!(self.dolphin_catalogue_manager, DolphinCatalogueManagerState::Loading(_)) {
+        if matches!(
+            self.dolphin_catalogue_manager,
+            DolphinCatalogueManagerState::Loading(_)
+        ) {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -4487,7 +4493,8 @@ impl ArchiveFsApp {
                 };
                 let transport = HttpsCheatSourceTransport::new();
                 match kind {
-                    DolphinCatalogueRetrievalKind::Download | DolphinCatalogueRetrievalKind::Update => {
+                    DolphinCatalogueRetrievalKind::Download
+                    | DolphinCatalogueRetrievalKind::Update => {
                         fetch_dolphin_catalogue_with_transport(&options, &transport)
                     }
                     DolphinCatalogueRetrievalKind::Rebuild => {
@@ -4508,7 +4515,10 @@ impl ArchiveFsApp {
         self.dolphin_catalogue_update_check = Some(receiver);
         thread::spawn(move || {
             let result = default_dolphin_catalogue_cache_root().and_then(|root| {
-                check_dolphin_catalogue_update_with_transport(&root, &HttpsCheatSourceTransport::new())
+                check_dolphin_catalogue_update_with_transport(
+                    &root,
+                    &HttpsCheatSourceTransport::new(),
+                )
             });
             let _ = sender.send(result);
             context.request_repaint();
@@ -4588,12 +4598,11 @@ impl ArchiveFsApp {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.dolphin_catalogue_manager = DolphinCatalogueManagerState::Failed(
-                        DolphinCatalogueError {
+                    self.dolphin_catalogue_manager =
+                        DolphinCatalogueManagerState::Failed(DolphinCatalogueError {
                             kind: DolphinCatalogueErrorKind::CacheUnavailable,
                             detail: "catalogue status worker stopped unexpectedly".to_string(),
-                        },
-                    );
+                        });
                 }
             }
         }
@@ -4617,13 +4626,16 @@ impl ArchiveFsApp {
                 running.progress = Some(progress);
             }
         }
-        let result = self.dolphin_catalogue_retrieval.as_ref().and_then(|running| {
-            running
-                .receiver
-                .try_recv()
-                .ok()
-                .map(|result| (running.generation, result))
-        });
+        let result = self
+            .dolphin_catalogue_retrieval
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.generation, result))
+            });
         let Some((generation, result)) = result else {
             return;
         };
@@ -5816,8 +5828,13 @@ impl ArchiveFsApp {
         ) else {
             return false;
         };
-        let outcome =
-            resolve_dolphin_gecko_lookup(&catalogue_root, &provider_root, &game_id, &region, revision);
+        let outcome = resolve_dolphin_gecko_lookup(
+            &catalogue_root,
+            &provider_root,
+            &game_id,
+            &region,
+            revision,
+        );
         let (fetch, local_state) = match outcome {
             Ok(DolphinGeckoLookupResult::Found(result)) => (
                 Some(GeckoProviderFetchResult {
@@ -5828,9 +5845,15 @@ impl ArchiveFsApp {
                 DolphinLocalLookupState::NotAttempted,
             ),
             Ok(
-                DolphinGeckoLookupResult::NoCatalogueInstalled { cached: Some(result) }
-                | DolphinGeckoLookupResult::NotInCatalogue { cached: Some(result) }
-                | DolphinGeckoLookupResult::RegionMismatch { cached: Some(result) }
+                DolphinGeckoLookupResult::NoCatalogueInstalled {
+                    cached: Some(result),
+                }
+                | DolphinGeckoLookupResult::NotInCatalogue {
+                    cached: Some(result),
+                }
+                | DolphinGeckoLookupResult::RegionMismatch {
+                    cached: Some(result),
+                }
                 | DolphinGeckoLookupResult::CatalogueEntryHasNoUsableCodes {
                     cached: Some(result),
                     ..
@@ -12849,133 +12872,176 @@ fn show_dolphin_catalogue_manager(
                 &error.to_string(),
                 widgets::StatusTone::Blocked,
             );
-            if widgets::action_button(ui, "Retry", widgets::ActionStyle::Secondary, true).clicked() {
+            if widgets::action_button(ui, "Retry", widgets::ActionStyle::Secondary, true).clicked()
+            {
                 action = Some(DolphinCatalogueManagerAction::Refresh);
             }
         }
         DolphinCatalogueManagerState::Ready(snapshot) => {
-            widgets::card(ui, |ui| {
-                match &snapshot.catalogue {
-                    None => {
-                        widgets::status_strip(
+            widgets::card(ui, |ui| match &snapshot.catalogue {
+                None => {
+                    widgets::status_strip(
+                        ui,
+                        &[(
+                            "Dolphin cheat catalogue not downloaded",
+                            widgets::StatusTone::Pending,
+                        )],
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Download catalogue",
+                        widgets::ActionStyle::Primary,
+                        idle,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DolphinCatalogueManagerAction::Review(
+                            DolphinCatalogueRetrievalKind::Download,
+                        ));
+                    }
+                }
+                Some(catalogue) => {
+                    let stale = catalogue.metadata.is_stale(now_unix_seconds);
+                    let show_update = stale || update_available == Some(true);
+                    let tone = if show_update {
+                        widgets::StatusTone::Warning
+                    } else {
+                        widgets::StatusTone::Success
+                    };
+                    widgets::status_strip(
+                        ui,
+                        &[(
+                            if show_update {
+                                "Update available"
+                            } else {
+                                "Dolphin catalogue ready"
+                            },
+                            tone,
+                        )],
+                    );
+                    ui.label(format!(
+                        "{} games · {} cheats",
+                        catalogue.games.len(),
+                        catalogue.metadata.total_usable_gecko_entries
+                    ));
+                    ui.label(format!(
+                        "Updated {}",
+                        format_unix_timestamp_utc(
+                            catalogue.metadata.fetched_at_unix_seconds as i64
+                        )
+                    ));
+                    if catalogue.metadata.malformed_or_skipped_files > 0 {
+                        ui.label(format!(
+                            "{} upstream file(s) had no usable Gecko codes.",
+                            catalogue.metadata.malformed_or_skipped_files
+                        ));
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if widgets::action_button(
                             ui,
-                            &[("Dolphin cheat catalogue not downloaded", widgets::StatusTone::Pending)],
-                        );
-                        if widgets::action_button(ui, "Download catalogue", widgets::ActionStyle::Primary, idle)
-                            .clicked()
+                            "Update catalogue",
+                            widgets::ActionStyle::Primary,
+                            idle,
+                        )
+                        .clicked()
                         {
                             action = Some(DolphinCatalogueManagerAction::Review(
-                                DolphinCatalogueRetrievalKind::Download,
+                                DolphinCatalogueRetrievalKind::Update,
                             ));
                         }
-                    }
-                    Some(catalogue) => {
-                        let stale = catalogue.metadata.is_stale(now_unix_seconds);
-                        let show_update = stale || update_available == Some(true);
-                        let tone = if show_update {
-                            widgets::StatusTone::Warning
-                        } else {
-                            widgets::StatusTone::Success
-                        };
-                        widgets::status_strip(
+                        if widgets::action_button(
                             ui,
-                            &[(
-                                if show_update { "Update available" } else { "Dolphin catalogue ready" },
-                                tone,
-                            )],
+                            "Check for updates",
+                            widgets::ActionStyle::Secondary,
+                            idle,
+                        )
+                        .clicked()
+                        {
+                            action = Some(DolphinCatalogueManagerAction::CheckForUpdates);
+                        }
+                        if widgets::action_button(
+                            ui,
+                            "Rebuild local index",
+                            widgets::ActionStyle::Secondary,
+                            idle,
+                        )
+                        .clicked()
+                        {
+                            action = Some(DolphinCatalogueManagerAction::Review(
+                                DolphinCatalogueRetrievalKind::Rebuild,
+                            ));
+                        }
+                        if widgets::action_button(
+                            ui,
+                            "Remove downloaded catalogue",
+                            widgets::ActionStyle::Secondary,
+                            idle,
+                        )
+                        .clicked()
+                        {
+                            action = Some(DolphinCatalogueManagerAction::RequestRemove);
+                        }
+                    });
+                    if !catalogue.metadata.warnings.is_empty() {
+                        show_cheat_warnings_summary(
+                            ui,
+                            &catalogue.metadata.warnings,
+                            (
+                                "dolphin_catalogue_warnings",
+                                &catalogue.metadata.resolved_commit,
+                            ),
+                            clipboard,
                         );
-                        ui.label(format!(
-                            "{} games · {} cheats",
-                            catalogue.games.len(),
-                            catalogue.metadata.total_usable_gecko_entries
-                        ));
-                        ui.label(format!(
-                            "Updated {}",
-                            format_unix_timestamp_utc(catalogue.metadata.fetched_at_unix_seconds as i64)
-                        ));
-                        if catalogue.metadata.malformed_or_skipped_files > 0 {
-                            ui.label(format!(
-                                "{} upstream file(s) had no usable Gecko codes.",
-                                catalogue.metadata.malformed_or_skipped_files
-                            ));
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            if widgets::action_button(ui, "Update catalogue", widgets::ActionStyle::Primary, idle)
-                                .clicked()
-                            {
-                                action = Some(DolphinCatalogueManagerAction::Review(
-                                    DolphinCatalogueRetrievalKind::Update,
-                                ));
-                            }
-                            if widgets::action_button(
+                    }
+                    widgets::technical_details(
+                        ui,
+                        (
+                            "dolphin_catalogue_technical_details",
+                            &catalogue.metadata.resolved_commit,
+                        ),
+                        |ui| {
+                            widgets::copyable_value(
                                 ui,
-                                "Check for updates",
-                                widgets::ActionStyle::Secondary,
-                                idle,
-                            )
-                            .clicked()
-                            {
-                                action = Some(DolphinCatalogueManagerAction::CheckForUpdates);
-                            }
-                            if widgets::action_button(
-                                ui,
-                                "Rebuild local index",
-                                widgets::ActionStyle::Secondary,
-                                idle,
-                            )
-                            .clicked()
-                            {
-                                action = Some(DolphinCatalogueManagerAction::Review(
-                                    DolphinCatalogueRetrievalKind::Rebuild,
-                                ));
-                            }
-                            if widgets::action_button(
-                                ui,
-                                "Remove downloaded catalogue",
-                                widgets::ActionStyle::Secondary,
-                                idle,
-                            )
-                            .clicked()
-                            {
-                                action = Some(DolphinCatalogueManagerAction::RequestRemove);
-                            }
-                        });
-                        if !catalogue.metadata.warnings.is_empty() {
-                            show_cheat_warnings_summary(
-                                ui,
-                                &catalogue.metadata.warnings,
-                                ("dolphin_catalogue_warnings", &catalogue.metadata.resolved_commit),
-                                clipboard,
+                                "Repository",
+                                &catalogue.metadata.canonical_repository_url,
                             );
-                        }
-                        widgets::technical_details(
-                            ui,
-                            ("dolphin_catalogue_technical_details", &catalogue.metadata.resolved_commit),
-                            |ui| {
-                                widgets::copyable_value(ui, "Repository", &catalogue.metadata.canonical_repository_url);
-                                widgets::copyable_value(ui, "Resolved commit", &catalogue.metadata.resolved_commit);
-                                widgets::copyable_value(ui, "Source archive", &catalogue.metadata.source_archive_url);
-                                widgets::copyable_value(ui, "Archive SHA-256", &catalogue.metadata.archive_sha256);
-                                ui.label(format!("Downloaded: {}", format_transfer_bytes(catalogue.metadata.downloaded_bytes)));
-                                ui.label(format!(
-                                    "GameSettings files inspected: {}",
-                                    catalogue.metadata.game_settings_files_inspected
-                                ));
-                                ui.label(format!(
+                            widgets::copyable_value(
+                                ui,
+                                "Resolved commit",
+                                &catalogue.metadata.resolved_commit,
+                            );
+                            widgets::copyable_value(
+                                ui,
+                                "Source archive",
+                                &catalogue.metadata.source_archive_url,
+                            );
+                            widgets::copyable_value(
+                                ui,
+                                "Archive SHA-256",
+                                &catalogue.metadata.archive_sha256,
+                            );
+                            ui.label(format!(
+                                "Downloaded: {}",
+                                format_transfer_bytes(catalogue.metadata.downloaded_bytes)
+                            ));
+                            ui.label(format!(
+                                "GameSettings files inspected: {}",
+                                catalogue.metadata.game_settings_files_inspected
+                            ));
+                            ui.label(format!(
                                     "Non-matching files skipped (wildcard names, non-GameSettings paths): {}",
                                     catalogue.metadata.non_matching_files_skipped
                                 ));
-                                ui.label(format!("Licence: {}", catalogue.metadata.license));
-                                ui.label(catalogue.metadata.attribution.clone());
-                                if let Some(timestamp) = snapshot.last_check_unix_seconds {
-                                    ui.label(format!(
-                                        "Last update check: {}",
-                                        format_unix_timestamp_utc(timestamp as i64)
-                                    ));
-                                }
-                            },
-                        );
-                    }
+                            ui.label(format!("Licence: {}", catalogue.metadata.license));
+                            ui.label(catalogue.metadata.attribution.clone());
+                            if let Some(timestamp) = snapshot.last_check_unix_seconds {
+                                ui.label(format!(
+                                    "Last update check: {}",
+                                    format_unix_timestamp_utc(timestamp as i64)
+                                ));
+                            }
+                        },
+                    );
                 }
             });
         }
@@ -12988,9 +13054,15 @@ fn show_dolphin_catalogue_manager(
                     "Cancellation requested; the active catalogue will remain unchanged."
                 } else {
                     match running.kind {
-                        DolphinCatalogueRetrievalKind::Download => "Downloading Dolphin cheat catalogue…",
-                        DolphinCatalogueRetrievalKind::Update => "Updating Dolphin cheat catalogue…",
-                        DolphinCatalogueRetrievalKind::Rebuild => "Rebuilding the local Dolphin cheat index…",
+                        DolphinCatalogueRetrievalKind::Download => {
+                            "Downloading Dolphin cheat catalogue…"
+                        }
+                        DolphinCatalogueRetrievalKind::Update => {
+                            "Updating Dolphin cheat catalogue…"
+                        }
+                        DolphinCatalogueRetrievalKind::Rebuild => {
+                            "Rebuilding the local Dolphin cheat index…"
+                        }
                     }
                 });
             });
@@ -13032,7 +13104,9 @@ fn show_dolphin_catalogue_manager(
                     "{} games · {} cheats. Updated {}.",
                     fetch.catalogue.games.len(),
                     fetch.catalogue.metadata.total_usable_gecko_entries,
-                    format_unix_timestamp_utc(fetch.catalogue.metadata.fetched_at_unix_seconds as i64)
+                    format_unix_timestamp_utc(
+                        fetch.catalogue.metadata.fetched_at_unix_seconds as i64
+                    )
                 ),
                 widgets::StatusTone::Success,
             ),
@@ -13105,7 +13179,10 @@ fn show_dolphin_catalogue_manager(
 
 /// One-shot gate mirroring `catalogue_status_load_needed`: load the status
 /// snapshot the first time the Cheats & Mods Dolphin workflow needs it.
-fn dolphin_catalogue_status_load_needed(view: MainView, state: &DolphinCatalogueManagerState) -> bool {
+fn dolphin_catalogue_status_load_needed(
+    view: MainView,
+    state: &DolphinCatalogueManagerState,
+) -> bool {
     view == MainView::CheatsMods && matches!(state, DolphinCatalogueManagerState::NotLoaded)
 }
 
@@ -16409,9 +16486,7 @@ fn build_dolphin_provider_selection(
         Some(Err(error)) => (None, Some(error.to_string())),
         None => (
             None,
-            Some(
-                "Choose an eligible Dolphin profile before selecting provider codes.".to_string(),
-            ),
+            Some("Choose an eligible Dolphin profile before selecting provider codes.".to_string()),
         ),
     }
 }
@@ -37846,6 +37921,270 @@ $Instant Growth [Nayr]\n";
         app.handle_catalogue_manager_action(&context, CatalogueManagerAction::CancelReview);
         assert!(app.catalogue_review.is_none());
         assert!(app.catalogue_retrieval.is_none());
+    }
+
+    fn dolphin_catalogue_fixture(fetched_at_unix_seconds: u64) -> DolphinCatalogue {
+        DolphinCatalogue {
+            metadata: DolphinCatalogueMetadata {
+                schema_version: DOLPHIN_CATALOGUE_SCHEMA_VERSION,
+                repository: DOLPHIN_CATALOGUE_REPOSITORY.to_string(),
+                canonical_repository_url: "https://github.com/dolphin-emu/dolphin".to_string(),
+                resolved_commit: "d742aa8b4c4d052f7dceaa39022b1fe3996f1781".to_string(),
+                source_archive_url:
+                    "https://codeload.github.com/dolphin-emu/dolphin/zip/d742aa8b4c4d052f7dceaa39022b1fe3996f1781"
+                        .to_string(),
+                license: "GPL-2.0-or-later".to_string(),
+                license_url: "https://github.com/dolphin-emu/dolphin/blob/master/COPYING".to_string(),
+                attribution: "Gecko definitions from the Dolphin Emulator upstream Data/Sys/GameSettings dataset."
+                    .to_string(),
+                fetched_at_unix_seconds,
+                archive_sha256: "0".repeat(64),
+                downloaded_bytes: 21_269_178,
+                archive_entry_count: 7_122,
+                game_settings_files_inspected: 1_875,
+                games_with_usable_gecko: 1,
+                total_usable_gecko_entries: 1,
+                malformed_or_skipped_files: 0,
+                non_matching_files_skipped: 0,
+                warnings: Vec::new(),
+            },
+            games: vec![DolphinCatalogueGame {
+                game_id: "GAFE01".to_string(),
+                title: Some("Animal Crossing".to_string()),
+                region: GeckoRegion::Usa,
+                source_relative_path: "Data/Sys/GameSettings/GAFE01.ini".to_string(),
+                codes: vec![],
+                file_warnings: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn dolphin_catalogue_status_load_needed_covers_cheats_mods_only() {
+        assert!(dolphin_catalogue_status_load_needed(
+            MainView::CheatsMods,
+            &DolphinCatalogueManagerState::NotLoaded
+        ));
+        for view in [
+            MainView::Library,
+            MainView::Sources,
+            MainView::Selected,
+            MainView::Mount,
+        ] {
+            assert!(
+                !dolphin_catalogue_status_load_needed(
+                    view,
+                    &DolphinCatalogueManagerState::NotLoaded
+                ),
+                "{view:?} has no Dolphin catalogue UI and must not trigger a load"
+            );
+        }
+        assert!(!dolphin_catalogue_status_load_needed(
+            MainView::CheatsMods,
+            &DolphinCatalogueManagerState::Ready(Box::new(DolphinCatalogueStatusSnapshot {
+                catalogue: None,
+                last_check_unix_seconds: None,
+            }))
+        ));
+    }
+
+    #[test]
+    fn dolphin_catalogue_card_shows_the_no_catalogue_prompt_when_nothing_is_downloaded() {
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_dolphin_catalogue_manager(
+                    ui,
+                    &DolphinCatalogueManagerState::Ready(Box::new(
+                        DolphinCatalogueStatusSnapshot {
+                            catalogue: None,
+                            last_check_unix_seconds: None,
+                        },
+                    )),
+                    None,
+                    None,
+                    DolphinCatalogueCardContext {
+                        review: None,
+                        update_available: None,
+                        remove_confirm: false,
+                        now_unix_seconds: 1_700_000_000,
+                    },
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Dolphin cheat catalogue not downloaded"
+        ));
+        assert!(rendered_text_contains(&output, "Download catalogue"));
+        assert!(!rendered_text_contains(&output, "Update catalogue"));
+    }
+
+    #[test]
+    fn dolphin_catalogue_card_shows_ready_summary_and_flags_an_available_update() {
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let catalogue = dolphin_catalogue_fixture(1_700_000_000);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_dolphin_catalogue_manager(
+                    ui,
+                    &DolphinCatalogueManagerState::Ready(Box::new(
+                        DolphinCatalogueStatusSnapshot {
+                            catalogue: Some(catalogue.clone()),
+                            last_check_unix_seconds: Some(1_700_000_000),
+                        },
+                    )),
+                    None,
+                    None,
+                    DolphinCatalogueCardContext {
+                        review: None,
+                        update_available: None,
+                        remove_confirm: false,
+                        now_unix_seconds: 1_700_000_000,
+                    },
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Dolphin catalogue ready"));
+        assert!(rendered_text_contains(&output, "1 games"));
+        assert!(rendered_text_contains(&output, "1 cheats"));
+        assert!(!rendered_text_contains(&output, "Update available"));
+
+        // Flagged by an explicit "Check for updates" result, even though
+        // the catalogue is not old enough to be stale on its own.
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_dolphin_catalogue_manager(
+                    ui,
+                    &DolphinCatalogueManagerState::Ready(Box::new(
+                        DolphinCatalogueStatusSnapshot {
+                            catalogue: Some(catalogue.clone()),
+                            last_check_unix_seconds: Some(1_700_000_000),
+                        },
+                    )),
+                    None,
+                    None,
+                    DolphinCatalogueCardContext {
+                        review: None,
+                        update_available: Some(true),
+                        remove_confirm: false,
+                        now_unix_seconds: 1_700_000_000,
+                    },
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Update available"));
+    }
+
+    #[test]
+    fn handle_dolphin_catalogue_manager_action_review_then_confirm_requires_both_steps() {
+        let mut app = app_for_operation_tests();
+        assert!(app.dolphin_catalogue_review.is_none());
+        assert!(app.dolphin_catalogue_retrieval.is_none());
+        let context = egui::Context::default();
+
+        app.handle_dolphin_catalogue_manager_action(
+            &context,
+            DolphinCatalogueManagerAction::Review(DolphinCatalogueRetrievalKind::Download),
+        );
+        assert!(
+            app.dolphin_catalogue_retrieval.is_none(),
+            "reviewing a download must never itself start network access"
+        );
+        assert_eq!(
+            app.dolphin_catalogue_review,
+            Some(DolphinCatalogueRetrievalKind::Download)
+        );
+
+        app.handle_dolphin_catalogue_manager_action(
+            &context,
+            DolphinCatalogueManagerAction::Confirm,
+        );
+        assert!(
+            app.dolphin_catalogue_retrieval.is_some(),
+            "confirming the reviewed action starts the retrieval"
+        );
+        assert!(
+            app.dolphin_catalogue_review.is_none(),
+            "the review is consumed once confirmed"
+        );
+    }
+
+    #[test]
+    fn handle_dolphin_catalogue_manager_action_cancel_review_clears_it_without_starting_retrieval()
+    {
+        let mut app = app_for_operation_tests();
+        let context = egui::Context::default();
+        app.handle_dolphin_catalogue_manager_action(
+            &context,
+            DolphinCatalogueManagerAction::Review(DolphinCatalogueRetrievalKind::Update),
+        );
+        app.handle_dolphin_catalogue_manager_action(
+            &context,
+            DolphinCatalogueManagerAction::CancelReview,
+        );
+        assert!(app.dolphin_catalogue_review.is_none());
+        assert!(app.dolphin_catalogue_retrieval.is_none());
+    }
+
+    #[test]
+    fn handle_dolphin_catalogue_manager_action_remove_requires_explicit_confirmation() {
+        let mut app = app_for_operation_tests();
+        let context = egui::Context::default();
+        assert!(!app.dolphin_catalogue_remove_confirm);
+
+        app.handle_dolphin_catalogue_manager_action(
+            &context,
+            DolphinCatalogueManagerAction::RequestRemove,
+        );
+        assert!(
+            app.dolphin_catalogue_remove_confirm,
+            "removal must require a confirmation dialog before anything happens"
+        );
+
+        app.handle_dolphin_catalogue_manager_action(
+            &context,
+            DolphinCatalogueManagerAction::CancelRemove,
+        );
+        assert!(!app.dolphin_catalogue_remove_confirm);
+    }
+
+    #[test]
+    fn dolphin_local_lookup_state_defaults_to_not_attempted_on_a_fresh_workflow() {
+        let app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        assert_eq!(
+            app.cheat_workflow.as_ref().unwrap().dolphin_local_lookup,
+            DolphinLocalLookupState::NotAttempted
+        );
+    }
+
+    #[test]
+    fn dolphin_beginner_status_distinguishes_still_looking_from_nothing_found_locally() {
+        let mut app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "profile".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::ExplicitChoice,
+        });
+        // Nothing attempted yet: still the "finding compatible cheats" spinner.
+        assert_eq!(
+            dolphin_beginner_status(workflow),
+            BeginnerCheatStatus::FindingCompatibleCheats
+        );
+        // The local catalogue/cache lookup ran and found nothing: an honest
+        // "nothing found" state, not a spinner that would never resolve.
+        workflow.dolphin_local_lookup = DolphinLocalLookupState::NoCatalogueInstalled;
+        assert_eq!(
+            dolphin_beginner_status(workflow),
+            BeginnerCheatStatus::NoCompatibleCheatsFound
+        );
     }
 
     #[test]

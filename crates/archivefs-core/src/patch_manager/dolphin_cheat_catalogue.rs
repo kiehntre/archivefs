@@ -38,8 +38,8 @@ use zip::ZipArchive;
 
 use super::cheat_cache_lock::LockedCheatCache;
 use super::cheat_sources::{
-    CHEAT_SOURCE_REDIRECT_LIMIT, CheatSourceCancellation,
-    CheatSourceError, CheatSourceHttpResponse, CheatSourceProgress, CheatSourceProgressPhase,
+    CHEAT_SOURCE_REDIRECT_LIMIT, CheatSourceCancellation, CheatSourceError,
+    CheatSourceHttpResponse, CheatSourceProgress, CheatSourceProgressPhase,
     CheatSourceProgressReporter, CheatSourceTransferContext, CheatSourceTransport,
     HttpsCheatSourceTransport, atomic_write_json, prepare_cache_root, secure_create,
     validate_archive_entry_name, validate_cache_path_for_read, validate_downloaded_size,
@@ -226,8 +226,12 @@ fn catalogue_error(
 
 fn from_cache_error(error: CheatSourceError) -> DolphinCatalogueError {
     let kind = match error.stage {
-        super::cheat_sources::CheatSourceErrorStage::Cache => DolphinCatalogueErrorKind::CacheUnsafe,
-        super::cheat_sources::CheatSourceErrorStage::Extraction => DolphinCatalogueErrorKind::Archive,
+        super::cheat_sources::CheatSourceErrorStage::Cache => {
+            DolphinCatalogueErrorKind::CacheUnsafe
+        }
+        super::cheat_sources::CheatSourceErrorStage::Extraction => {
+            DolphinCatalogueErrorKind::Archive
+        }
         super::cheat_sources::CheatSourceErrorStage::Download => {
             DolphinCatalogueErrorKind::DownloadTooLarge
         }
@@ -343,7 +347,10 @@ fn reject_symlink_or_non_file(path: &Path) -> Result<(), DolphinCatalogueError> 
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(catalogue_error(
             DolphinCatalogueErrorKind::CacheUnsafe,
-            format!("Dolphin catalogue path is not a regular file: {}", path.display()),
+            format!(
+                "Dolphin catalogue path is not a regular file: {}",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -368,7 +375,10 @@ pub fn remove_dolphin_catalogue(cache_root: &Path) -> Result<(), DolphinCatalogu
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(catalogue_error(
                     DolphinCatalogueErrorKind::CacheUnsafe,
-                    format!("refusing to remove unexpected cache entry: {}", path.display()),
+                    format!(
+                        "refusing to remove unexpected cache entry: {}",
+                        path.display()
+                    ),
                 ));
             }
             Ok(_) => fs::remove_file(&path).map_err(|error| {
@@ -551,11 +561,17 @@ fn fetch_dolphin_catalogue_at_with_transport(
     if !options.cache_root.exists() {
         prepare_cache_root(&options.cache_root).map_err(from_cache_error)?;
     }
-    let locked = LockedCheatCache::acquire_required(&options.cache_root).map_err(from_cache_error)?;
+    let locked =
+        LockedCheatCache::acquire_required(&options.cache_root).map_err(from_cache_error)?;
     let transfer_started = Instant::now();
     check_cancelled(options)?;
 
-    report(options, CheatSourceProgressPhase::ResolvingRevision, 0, None);
+    report(
+        options,
+        CheatSourceProgressPhase::ResolvingRevision,
+        0,
+        None,
+    );
     let resolved = match pinned_commit {
         Some(commit_id) => ResolvedCommit {
             archive_url: format!(
@@ -563,7 +579,9 @@ fn fetch_dolphin_catalogue_at_with_transport(
             ),
             commit_id,
         },
-        None => resolve_upstream_commit(transport, options.cancellation.as_ref(), transfer_started)?,
+        None => {
+            resolve_upstream_commit(transport, options.cancellation.as_ref(), transfer_started)?
+        }
     };
 
     report(options, CheatSourceProgressPhase::Connecting, 0, None);
@@ -595,7 +613,10 @@ fn fetch_dolphin_catalogue_at_with_transport(
     let mut games: Vec<DolphinCatalogueGame> = extraction.games.into_values().collect();
     games.sort_by(|a, b| a.game_id.cmp(&b.game_id));
     let games_with_usable_gecko = games.iter().filter(|game| game.has_usable_gecko()).count();
-    let total_usable_gecko_entries: usize = games.iter().map(DolphinCatalogueGame::usable_gecko_count).sum();
+    let total_usable_gecko_entries: usize = games
+        .iter()
+        .map(DolphinCatalogueGame::usable_gecko_count)
+        .sum();
 
     let metadata = DolphinCatalogueMetadata {
         schema_version: DOLPHIN_CATALOGUE_SCHEMA_VERSION,
@@ -700,7 +721,10 @@ fn resolve_upstream_commit(
     cancellation: Option<&CheatSourceCancellation>,
     transfer_started: Instant,
 ) -> Result<ResolvedCommit, DolphinCatalogueError> {
-    validate_permitted_host_matches(DOLPHIN_CATALOGUE_REVISION_URL, DOLPHIN_CATALOGUE_REVISION_HOST)?;
+    validate_permitted_host_matches(
+        DOLPHIN_CATALOGUE_REVISION_URL,
+        DOLPHIN_CATALOGUE_REVISION_HOST,
+    )?;
     let mut bytes = Vec::new();
     let response = transport
         .get(
@@ -734,8 +758,9 @@ fn resolve_upstream_commit(
         ));
     }
     let commit_id = revision.sha.to_ascii_lowercase();
-    let archive_url =
-        format!("https://{DOLPHIN_CATALOGUE_DOWNLOAD_HOST}/{DOLPHIN_CATALOGUE_REPOSITORY}/zip/{commit_id}");
+    let archive_url = format!(
+        "https://{DOLPHIN_CATALOGUE_DOWNLOAD_HOST}/{DOLPHIN_CATALOGUE_REPOSITORY}/zip/{commit_id}"
+    );
     Ok(ResolvedCommit {
         commit_id,
         archive_url,
@@ -772,7 +797,14 @@ fn download_archive_with_retries(
     for attempt in 1..=RETRY_ATTEMPTS {
         check_cancelled(options)?;
         let mut file = secure_create(destination_path).map_err(from_cache_error)?;
-        let result = download_with_redirects(transport, initial_url, &mut file, options, attempt, transfer_started);
+        let result = download_with_redirects(
+            transport,
+            initial_url,
+            &mut file,
+            options,
+            attempt,
+            transfer_started,
+        );
         drop(file);
         match result {
             Ok(response) => {
@@ -789,19 +821,17 @@ fn download_archive_with_retries(
                 if !retryable || attempt == RETRY_ATTEMPTS {
                     return Err(error);
                 }
-                report(
-                    options,
-                    CheatSourceProgressPhase::Retrying,
-                    attempt,
-                    None,
-                );
+                report(options, CheatSourceProgressPhase::Retrying, attempt, None);
                 last_error = Some(error);
                 std::thread::sleep(Duration::from_secs(RETRY_DELAY_SECONDS));
             }
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        catalogue_error(DolphinCatalogueErrorKind::Network, "Dolphin catalogue download failed")
+        catalogue_error(
+            DolphinCatalogueErrorKind::Network,
+            "Dolphin catalogue download failed",
+        )
     }))
 }
 
@@ -863,11 +893,17 @@ fn download_with_redirects(
         if !(200..300).contains(&response.status) {
             return Err(catalogue_error(
                 DolphinCatalogueErrorKind::HttpStatus,
-                format!("Dolphin catalogue archive request returned HTTP {}", response.status),
+                format!(
+                    "Dolphin catalogue archive request returned HTTP {}",
+                    response.status
+                ),
             ));
         }
-        validate_downloaded_size(response.downloaded_bytes, DOLPHIN_CATALOGUE_MAX_DOWNLOAD_BYTES)
-            .map_err(from_cache_error)?;
+        validate_downloaded_size(
+            response.downloaded_bytes,
+            DOLPHIN_CATALOGUE_MAX_DOWNLOAD_BYTES,
+        )
+        .map_err(from_cache_error)?;
         return Ok(response);
     }
     unreachable!()
@@ -877,7 +913,9 @@ fn validate_permitted_host(url: &str) -> Result<(), DolphinCatalogueError> {
     let parsed = url::Url::parse(url)
         .map_err(|error| catalogue_error(DolphinCatalogueErrorKind::Network, error.to_string()))?;
     let host = parsed.host_str().unwrap_or_default();
-    if parsed.scheme() != "https" || (host != DOLPHIN_CATALOGUE_DOWNLOAD_HOST && host != "github.com") {
+    if parsed.scheme() != "https"
+        || (host != DOLPHIN_CATALOGUE_DOWNLOAD_HOST && host != "github.com")
+    {
         return Err(catalogue_error(
             DolphinCatalogueErrorKind::Network,
             format!("unexpected host for the Dolphin catalogue archive: {host}"),
@@ -886,7 +924,10 @@ fn validate_permitted_host(url: &str) -> Result<(), DolphinCatalogueError> {
     Ok(())
 }
 
-fn validate_permitted_host_matches(url: &str, expected_host: &str) -> Result<(), DolphinCatalogueError> {
+fn validate_permitted_host_matches(
+    url: &str,
+    expected_host: &str,
+) -> Result<(), DolphinCatalogueError> {
     let parsed = url::Url::parse(url)
         .map_err(|error| catalogue_error(DolphinCatalogueErrorKind::Network, error.to_string()))?;
     let host = parsed.host_str().unwrap_or_default();
@@ -1085,7 +1126,10 @@ fn extract_and_parse_game_settings(
 /// paths, the rest of the repository) is left unread.
 fn matches_game_settings_ini(normalized: &str) -> Option<String> {
     let components: Vec<&str> = normalized.split('/').collect();
-    if components.len() != 5 || components[1] != "Data" || components[2] != "Sys" || components[3] != "GameSettings"
+    if components.len() != 5
+        || components[1] != "Data"
+        || components[2] != "Sys"
+        || components[3] != "GameSettings"
     {
         return None;
     }
@@ -1123,7 +1167,11 @@ fn parse_catalogue_game(
             .iter()
             .map(|warning| warning.detail.clone())
             .collect();
-        let duplicate_name = duplicate_names.get(code.name.as_str()).copied().unwrap_or(0) > 1;
+        let duplicate_name = duplicate_names
+            .get(code.name.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1;
         if duplicate_name {
             parse_warnings.push(format!(
                 "duplicate Gecko name {:?} is ambiguous and cannot be installed safely",
@@ -1180,7 +1228,9 @@ fn extract_title(text: &str, expected_game_id: &str) -> Option<String> {
         .map_or((declaration, None), |(game_id, title)| {
             (game_id.trim(), Some(title.trim().to_string()))
         });
-    (declared_game_id == expected_game_id).then_some(title).flatten()
+    (declared_game_id == expected_game_id)
+        .then_some(title)
+        .flatten()
 }
 
 // ---------------------------------------------------------------------
@@ -1202,7 +1252,11 @@ pub fn gecko_provider_result_from_catalogue_entry(
         .codes
         .iter()
         .map(|code| GeckoProviderEntry {
-            provider_entry_id: stable_catalogue_entry_id(&game.game_id, &code.name, &code.code_lines),
+            provider_entry_id: stable_catalogue_entry_id(
+                &game.game_id,
+                &code.name,
+                &code.code_lines,
+            ),
             name: code.name.clone(),
             code_lines: code.code_lines.clone(),
             notes: code.notes.clone(),
@@ -1291,20 +1345,28 @@ pub fn resolve_dolphin_gecko_lookup(
         },
     );
     match load_dolphin_catalogue(catalogue_cache_root)? {
-        DolphinCatalogueLoad::NotInstalled => Ok(DolphinGeckoLookupResult::NoCatalogueInstalled { cached }),
-        DolphinCatalogueLoad::Ready(catalogue) => match lookup_dolphin_catalogue(&catalogue, game_id, region) {
-            DolphinCatalogueLookup::NotFound => Ok(DolphinGeckoLookupResult::NotInCatalogue { cached }),
-            DolphinCatalogueLookup::RegionMismatch => Ok(DolphinGeckoLookupResult::RegionMismatch { cached }),
-            DolphinCatalogueLookup::NoUsableGecko { warnings } => {
-                Ok(DolphinGeckoLookupResult::CatalogueEntryHasNoUsableCodes {
-                    warnings: warnings.to_vec(),
-                    cached,
-                })
+        DolphinCatalogueLoad::NotInstalled => {
+            Ok(DolphinGeckoLookupResult::NoCatalogueInstalled { cached })
+        }
+        DolphinCatalogueLoad::Ready(catalogue) => {
+            match lookup_dolphin_catalogue(&catalogue, game_id, region) {
+                DolphinCatalogueLookup::NotFound => {
+                    Ok(DolphinGeckoLookupResult::NotInCatalogue { cached })
+                }
+                DolphinCatalogueLookup::RegionMismatch => {
+                    Ok(DolphinGeckoLookupResult::RegionMismatch { cached })
+                }
+                DolphinCatalogueLookup::NoUsableGecko { warnings } => {
+                    Ok(DolphinGeckoLookupResult::CatalogueEntryHasNoUsableCodes {
+                        warnings: warnings.to_vec(),
+                        cached,
+                    })
+                }
+                DolphinCatalogueLookup::Found(game) => Ok(DolphinGeckoLookupResult::Found(
+                    gecko_provider_result_from_catalogue_entry(game, &catalogue.metadata, revision),
+                )),
             }
-            DolphinCatalogueLookup::Found(game) => Ok(DolphinGeckoLookupResult::Found(
-                gecko_provider_result_from_catalogue_entry(game, &catalogue.metadata, revision),
-            )),
-        },
+        }
     }
 }
 
