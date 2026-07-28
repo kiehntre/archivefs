@@ -17660,6 +17660,7 @@ fn show_xenia_beginner_summary(
         return show_xenia_profile_chooser(ui, workflow, discovery).or(action);
     }
     xenia_auto_select_single_candidate(workflow);
+    ensure_xenia_selection_state(workflow, profiles);
     let Some(state) = workflow.xenia_selection.clone() else {
         return action;
     };
@@ -26958,8 +26959,9 @@ mod tests {
     use archivefs_core::patch_manager::{
         CHEAT_SOURCE_RESULT_SCHEMA_VERSION, CheatSourceManifest,
         RETROARCH_CHEAT_SETUP_SCHEMA_VERSION, RetroArchCheatSetupProfile,
-        RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState,
-        trusted_retroarch_cheat_sources,
+        RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState, SharedApplyContext,
+        SharedApplyEntry, SharedApplyJournal, SharedApplyOutcome, SharedPlanEntry,
+        SharedTransactionPath, SharedTransactionStage, trusted_retroarch_cheat_sources,
     };
     use archivefs_core::{
         Archive, ArchiveHealth, ArchiveMetadata, DoctorCheck, LibraryViewPlanCounts, MountPlan,
@@ -29577,6 +29579,138 @@ $Instant Growth [Nayr]\n";
         }
     }
 
+    fn xenia_workflow_ready_for_beginner_install(directory: &Path) -> ArchiveFsApp {
+        let mut app = xenia_workflow_with_matched_identity(directory, "415607D2");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.xenia_provider = CheatStepResource::Ready(quake4_provider_fetch());
+        workflow.xenia_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "xenia-explicit-test".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+        });
+        app.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+            profiles: vec![xenia_profile_fixture(directory)],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        app
+    }
+
+    fn render_xenia_workflow(app: &mut ArchiveFsApp) -> egui::FullOutput {
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let workflow = app.cheat_workflow.as_mut().unwrap();
+                let _ = show_xenia_workflow(ui, workflow, &app.xenia_profiles, &mut clipboard);
+            });
+        })
+    }
+
+    #[test]
+    fn partially_verified_xenia_candidate_shows_one_warning_in_the_beginner_view() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-xenia-warning-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_ready_for_beginner_install(&directory);
+        let output = render_xenia_workflow(&mut app);
+        assert!(
+            rendered_text_contains(
+                &output,
+                "This patch matches the game, but ArchiveFS cannot confirm the exact executable version."
+            ),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(
+                &output,
+                "I understand this patch may target a different executable version."
+            ),
+            "rendering mismatch"
+        );
+        assert_eq!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .xenia_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .compatibility,
+            XeniaCandidateCompatibility::PartiallyVerified
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn partially_verified_xenia_candidate_requires_one_acknowledgement_before_install() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-xenia-ack-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_ready_for_beginner_install(&directory);
+        // Render once so `xenia_auto_select_single_candidate` (called from
+        // the beginner summary) builds `xenia_selection` for this single
+        // matching document, then select the one patch.
+        let _ = render_xenia_workflow(&mut app);
+        app.update_xenia_patch_selection(|selection| {
+            selection.set_selected(0, true);
+        });
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(
+            !workflow
+                .xenia_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .can_apply()
+        );
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+
+        // Acknowledging flips `can_apply()` on the same selection state
+        // the beginner "Install selected" button already reads - no
+        // second, differently-shaped acknowledgement anywhere else.
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow
+            .xenia_selection
+            .as_mut()
+            .unwrap()
+            .selection
+            .partial_verification_acknowledged = true;
+        assert!(
+            workflow
+                .xenia_selection
+                .as_ref()
+                .unwrap()
+                .selection
+                .can_apply()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn xenia_details_is_collapsed_by_default_on_the_beginner_page() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-xenia-details-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut app = xenia_workflow_ready_for_beginner_install(&directory);
+        assert!(!app.cheat_workflow.as_ref().unwrap().xenia_details_open);
+        let output = render_xenia_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output, "Details"),
+            "rendering mismatch"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Stage 2 · External Xenia patch provider"),
+            "technical stage text leaked outside the collapsed Details section"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn xenia_candidate_picker_shows_compatibility_and_requires_explicit_choice() {
         let directory = std::env::temp_dir().join(format!(
@@ -29743,6 +29877,315 @@ $Instant Growth [Nayr]\n";
             destination,
             selection,
         });
+    }
+
+    /// Everything the beginner Dolphin view needs to show the compatible
+    /// checklist and offer "Install selected" - the exact "select the
+    /// game, compatible cheats appear automatically" state the milestone
+    /// describes with its Animal Crossing/16:9 Widescreen example.
+    fn dolphin_workflow_ready_for_beginner_install(temp: &Path) -> ArchiveFsApp {
+        let mut app = dolphin_workflow_with_matched_identity(temp, "GAFE01");
+        install_provider_fixture(&mut app, temp);
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "dolphin-native-test".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+        });
+        app
+    }
+
+    fn render_dolphin_workflow(app: &mut ArchiveFsApp) -> egui::FullOutput {
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let workflow = app.cheat_workflow.as_mut().unwrap();
+                let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+            });
+        })
+    }
+
+    /// A minimal but fully valid successful `SharedApplyResult` fixture -
+    /// only the fields the beginner Result view reads
+    /// (`journal.status`, `journal_path`) need real content; everything
+    /// else just needs to be a well-typed, self-consistent value.
+    fn successful_shared_apply_result() -> SharedApplyResult {
+        let archive_path = SharedTransactionPath::from_path(Path::new("/roms/a.zip"));
+        let destination_root = SharedTransactionPath::from_path(Path::new("/dolphin/GameSettings"));
+        let source_path = SharedTransactionPath::from_path(Path::new("/staging/GAFE01.ini"));
+        let destination_relative_path = SharedTransactionPath::from_path(Path::new("GAFE01.ini"));
+        let context = SharedApplyContext {
+            adapter: PreviewAdapter::Dolphin,
+            selected_archive: archive_path.clone(),
+            verified_game_identity: "GAFE01".to_string(),
+            profile_id: "dolphin-native-test".to_string(),
+            source_mode: "ArchiveFS trusted catalogue".to_string(),
+        };
+        let plan_entry = SharedPlanEntry {
+            adapter: PreviewAdapter::Dolphin,
+            selected_archive: archive_path,
+            verified_game_identity: "GAFE01".to_string(),
+            source_path: source_path.clone(),
+            source_digest: "a".repeat(64),
+            destination_root: destination_root.clone(),
+            destination_relative_path,
+            destination_pre_state: PreviewDestinationState::Missing,
+            destination_pre_digest: None,
+            proposed_action: archivefs_core::patch_manager::PreviewProposedAction::Install,
+            backup_required: false,
+            parent_creation_approved: true,
+        };
+        let entry = SharedApplyEntry {
+            plan_entry,
+            destination_existed_before_apply: Some(false),
+            destination_parent_existed_before_apply: Some(true),
+            observed_source_digest: Some("a".repeat(64)),
+            observed_destination_digest: None,
+            backup_path: None,
+            backup_digest: None,
+            temporary_path: None,
+            final_destination_digest: Some("a".repeat(64)),
+            created_directories: Vec::new(),
+            replacement_approved: false,
+            verification_succeeded: true,
+            outcome: SharedApplyOutcome::InstalledNew,
+            stages: vec![SharedTransactionStage::Success],
+            warnings: Vec::new(),
+            failures: Vec::new(),
+        };
+        let journal = SharedApplyJournal {
+            schema_version: 1,
+            operation_id: "op-beginner-test".to_string(),
+            plan_id: "plan-beginner-test".to_string(),
+            timestamp_unix_seconds: 0,
+            context,
+            approved_source_root: source_path,
+            destination_root,
+            dry_run: false,
+            entries: vec![entry],
+            status: SharedApplyStatus::Success,
+            rollback_operation_id: None,
+        };
+        SharedApplyResult {
+            journal,
+            journal_path: Some(PathBuf::from("/history/op-beginner-test.json")),
+            journal_failure: None,
+        }
+    }
+
+    #[test]
+    fn compatible_candidate_appears_in_the_beginner_main_list_by_default() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-list-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+        let output = render_dolphin_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output, "16:9 Widescreen"),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output, "compatible enhancement found"),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output, "Install selected"),
+            "rendering mismatch"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn technical_preview_is_not_mandatory_for_a_one_click_install() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-oneclick-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+        // Nothing is selected by default beyond the fixture's own already
+        // enabled entries - toggle the widescreen code on directly, the
+        // same mutation the beginner checklist's checkbox would perform.
+        app.update_dolphin_code_selection(|selection| {
+            selection.set_selected(0, true);
+        });
+        assert!(!app.cheat_workflow.as_ref().unwrap().dolphin_details_open);
+        // One click: no manual "Preview the installed file" step first.
+        app.start_beginner_install_dolphin();
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(
+            matches!(workflow.transaction, CheatTransactionState::Review { .. }),
+            "expected the beginner install to reach the review stage directly"
+        );
+        let output = render_dolphin_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output, "Install 1 enhancement in Dolphin?"),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output, "back up the existing settings"),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output, "Show exact changes"),
+            "rendering mismatch"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn show_exact_changes_remains_accessible_from_the_confirmation_dialog() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-exact-changes-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+        app.update_dolphin_code_selection(|selection| {
+            selection.set_selected(0, true);
+        });
+        app.start_beginner_install_dolphin();
+        let output_before = render_dolphin_workflow(&mut app);
+        assert!(
+            !rendered_text_contains(&output_before, "Plan ID"),
+            "rendering mismatch"
+        );
+        app.cheat_workflow
+            .as_mut()
+            .unwrap()
+            .dolphin_show_exact_changes = true;
+        let output_after = render_dolphin_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output_after, "Plan ID"),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output_after, "Source SHA-256"),
+            "rendering mismatch"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn undo_appears_after_a_successful_beginner_install_result() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-undo-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.transaction = CheatTransactionState::Result {
+            key: cheat_preview_key(workflow),
+            result: successful_shared_apply_result(),
+        };
+        let output = render_dolphin_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output, "Installed successfully"),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output, "Undo installation"),
+            "rendering mismatch"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn details_is_collapsed_by_default_on_the_beginner_dolphin_page() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-details-collapsed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+        assert!(!app.cheat_workflow.as_ref().unwrap().dolphin_details_open);
+        let output = render_dolphin_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output, "Details"),
+            "rendering mismatch"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Stage 2 · External Gecko provider"),
+            "technical stage text leaked outside the collapsed Details section"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn choosing_a_dolphin_profile_in_the_chooser_remembers_it_and_reaches_auto_selected_state() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-chooser-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let second = temp.join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        let profile_a = DolphinProfile {
+            profile_id: "profile-a".to_string(),
+            configuration_path: temp.clone(),
+            ..dolphin_profile_fixture()
+        };
+        let profile_b = DolphinProfile {
+            profile_id: "profile-b".to_string(),
+            configuration_path: second.clone(),
+            ..dolphin_profile_fixture()
+        };
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.selected_dolphin_profile_id = None;
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::NeedsChoice {
+            candidates: vec![
+                EmulatorProfileCandidate {
+                    profile_id: "profile-a".to_string(),
+                    root: temp.clone(),
+                    eligible: true,
+                    is_portable: false,
+                },
+                EmulatorProfileCandidate {
+                    profile_id: "profile-b".to_string(),
+                    root: second.clone(),
+                    eligible: true,
+                    is_portable: false,
+                },
+            ],
+        });
+        app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![profile_a, profile_b],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let output = render_dolphin_workflow(&mut app);
+        assert!(
+            rendered_text_contains(&output, "ArchiveFS found 2 Dolphin profiles."),
+            "rendering mismatch"
+        );
+        assert!(
+            rendered_text_contains(&output, "Use selected profile"),
+            "rendering mismatch"
+        );
+
+        app.cheat_workflow.as_mut().unwrap().dolphin_profile_choice = Some("profile-b".to_string());
+        app.confirm_dolphin_profile_choice();
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(
+            workflow.selected_dolphin_profile_id.as_deref(),
+            Some("profile-b")
+        );
+        assert!(matches!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::Auto { .. })
+        ));
+        assert_eq!(
+            remembered_profile_for(&app.remembered_emulator_profiles, "dolphin")
+                .unwrap()
+                .profile_id,
+            "profile-b"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
