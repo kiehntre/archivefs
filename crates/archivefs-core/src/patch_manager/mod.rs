@@ -36,6 +36,7 @@ mod destination_safety;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
+mod emulator_profile_memory;
 mod gecko_document;
 mod import_safety;
 mod matching;
@@ -196,6 +197,14 @@ pub use dolphin_local::{
     DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
     DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
     inspect_dolphin_profile, match_dolphin_inventory,
+};
+pub use emulator_profile_memory::{
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    RememberedEmulatorProfile, default_emulator_profile_memory_path,
+    forget_emulator_profile_at, forget_emulator_profile_default,
+    load_remembered_emulator_profiles_default, load_remembered_emulator_profiles_from,
+    remember_emulator_profile_default, remember_emulator_profile_to, remembered_profile_for,
+    select_emulator_profile,
 };
 pub use gecko_document::{
     DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
