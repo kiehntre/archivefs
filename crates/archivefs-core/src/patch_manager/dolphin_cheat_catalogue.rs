@@ -45,7 +45,10 @@ use super::cheat_sources::{
     validate_archive_entry_name, validate_cache_path_for_read, validate_downloaded_size,
     validate_entry_count, validate_unix_entry_mode,
 };
-use super::dolphin_gecko_provider::{GeckoRegion, GeckoRevisionApplicability, region_for_game_id};
+use super::dolphin_gecko_provider::{
+    GeckoProviderEntry, GeckoProviderQuery, GeckoProviderResult, GeckoRegion,
+    GeckoRevisionApplicability, peek_cached_gecko_result, region_for_game_id,
+};
 use super::gecko_document::parse_dolphin_ini;
 
 pub const DOLPHIN_CATALOGUE_SCHEMA_VERSION: u32 = 1;
@@ -259,7 +262,7 @@ pub enum DolphinCatalogueLoad {
     /// No catalogue has ever been downloaded.
     NotInstalled,
     /// A catalogue exists and parsed successfully.
-    Ready(DolphinCatalogue),
+    Ready(Box<DolphinCatalogue>),
 }
 
 /// Loads the active catalogue from disk, if any. This is a single JSON
@@ -296,7 +299,7 @@ pub fn load_dolphin_catalogue(
             "Dolphin catalogue schema version is not supported",
         ));
     }
-    Ok(DolphinCatalogueLoad::Ready(catalogue))
+    Ok(DolphinCatalogueLoad::Ready(Box::new(catalogue)))
 }
 
 pub fn load_dolphin_catalogue_update_state(
@@ -392,8 +395,6 @@ pub fn remove_dolphin_catalogue(cache_root: &Path) -> Result<(), DolphinCatalogu
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DolphinCatalogueLookup<'a> {
-    /// No catalogue has been downloaded yet.
-    NoCatalogue,
     /// The catalogue has no entry for this exact Game ID.
     NotFound,
     /// The Game ID's declared region does not match the requested region.
@@ -1148,6 +1149,131 @@ fn extract_title(text: &str, expected_game_id: &str) -> Option<String> {
             (game_id.trim(), Some(title.trim().to_string()))
         });
     (declared_game_id == expected_game_id).then_some(title).flatten()
+}
+
+// ---------------------------------------------------------------------
+// Integration with the existing Dolphin Gecko provider / install flow
+// ---------------------------------------------------------------------
+
+/// Converts one indexed catalogue game into exactly the same
+/// [`GeckoProviderResult`] shape the single-game upstream provider already
+/// produces, so every downstream consumer (compatibility labels, selection,
+/// install staging, "Show exact changes") works unchanged regardless of
+/// which source supplied the data.
+#[must_use]
+pub fn gecko_provider_result_from_catalogue_entry(
+    game: &DolphinCatalogueGame,
+    metadata: &DolphinCatalogueMetadata,
+    revision: u16,
+) -> GeckoProviderResult {
+    let entries = game
+        .codes
+        .iter()
+        .map(|code| GeckoProviderEntry {
+            provider_entry_id: stable_catalogue_entry_id(&game.game_id, &code.name, &code.code_lines),
+            name: code.name.clone(),
+            code_lines: code.code_lines.clone(),
+            notes: code.notes.clone(),
+            region: game.region.clone(),
+            revision_applicability: code.revision_applicability,
+            parse_warnings: code.parse_warnings.clone(),
+            safe_to_offer: code.safe_to_offer,
+        })
+        .collect();
+    GeckoProviderResult {
+        provider_id: DOLPHIN_CATALOGUE_PROVIDER_ID.to_string(),
+        provider_display_name: "Dolphin cheat catalogue".to_string(),
+        source_identity: format!("{}@{}", metadata.repository, metadata.resolved_commit),
+        retrieved_at_unix_seconds: metadata.fetched_at_unix_seconds,
+        game_id: game.game_id.clone(),
+        title: game.title.clone(),
+        region: game.region.clone(),
+        revision,
+        entries,
+        warnings: game.file_warnings.clone(),
+        attribution: metadata.attribution.clone(),
+        license: metadata.license.clone(),
+    }
+}
+
+fn stable_catalogue_entry_id(game_id: &str, name: &str, lines: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DOLPHIN_CATALOGUE_PROVIDER_ID.as_bytes());
+    hasher.update([0]);
+    hasher.update(game_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(name.as_bytes());
+    for line in lines {
+        hasher.update([0]);
+        hasher.update(line.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Every state the beginner Dolphin cheat workflow must distinguish, per
+/// game selection, without ever issuing a network request. `cached` is the
+/// fallback path (2) - a previously fetched, still-parseable single-game
+/// result, read straight from disk - populated whenever available so the
+/// caller can offer it even when the catalogue itself has nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DolphinGeckoLookupResult {
+    /// Fallback path (1) is empty because no catalogue has been downloaded.
+    NoCatalogueInstalled { cached: Option<GeckoProviderResult> },
+    /// The catalogue is installed but has no file for this exact Game ID.
+    NotInCatalogue { cached: Option<GeckoProviderResult> },
+    /// The catalogue's file matched, but declares a different region.
+    RegionMismatch { cached: Option<GeckoProviderResult> },
+    /// The catalogue's file matched, but had no usable Gecko codes.
+    CatalogueEntryHasNoUsableCodes {
+        warnings: Vec<String>,
+        cached: Option<GeckoProviderResult>,
+    },
+    /// Fallback path (1), the local full catalogue, produced a usable
+    /// result - this is the normal, no-network case.
+    Found(GeckoProviderResult),
+}
+
+/// The GUI's single, network-free entry point for "what do we already know
+/// about this GameCube game's Gecko codes" - called on every game
+/// selection. Priority order: (1) the local full catalogue, (2) a validated
+/// cached single-game result. Never issues a network request; an explicit
+/// per-game fetch (path 3) remains a separate, user-triggered action under
+/// Details.
+pub fn resolve_dolphin_gecko_lookup(
+    catalogue_cache_root: &Path,
+    provider_cache_root: &Path,
+    game_id: &str,
+    region: &GeckoRegion,
+    revision: u16,
+) -> Result<DolphinGeckoLookupResult, DolphinCatalogueError> {
+    let cached = peek_cached_gecko_result(
+        provider_cache_root,
+        &GeckoProviderQuery {
+            game_id: game_id.to_string(),
+            region: region.clone(),
+            revision,
+        },
+    );
+    match load_dolphin_catalogue(catalogue_cache_root)? {
+        DolphinCatalogueLoad::NotInstalled => Ok(DolphinGeckoLookupResult::NoCatalogueInstalled { cached }),
+        DolphinCatalogueLoad::Ready(catalogue) => match lookup_dolphin_catalogue(&catalogue, game_id, region) {
+            DolphinCatalogueLookup::NotFound => Ok(DolphinGeckoLookupResult::NotInCatalogue { cached }),
+            DolphinCatalogueLookup::RegionMismatch => Ok(DolphinGeckoLookupResult::RegionMismatch { cached }),
+            DolphinCatalogueLookup::NoUsableGecko { warnings } => {
+                Ok(DolphinGeckoLookupResult::CatalogueEntryHasNoUsableCodes {
+                    warnings: warnings.to_vec(),
+                    cached,
+                })
+            }
+            DolphinCatalogueLookup::Found(game) => Ok(DolphinGeckoLookupResult::Found(
+                gecko_provider_result_from_catalogue_entry(game, &catalogue.metadata, revision),
+            )),
+        },
+    }
 }
 
 #[cfg(test)]

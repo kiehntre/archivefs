@@ -7,7 +7,10 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use super::*;
-use crate::patch_manager::{CheatSourceError, CheatSourceErrorStage, CheatSourceHttpResponse};
+use crate::patch_manager::{
+    CheatSourceError, CheatSourceErrorStage, CheatSourceHttpResponse,
+    fetch_dolphin_upstream_gecko_with_transport,
+};
 
 static CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -429,4 +432,111 @@ fn nested_directory_entries_before_gamesettings_do_not_confuse_extraction() {
     )
     .expect("catalogue fetch succeeds with directory entries present");
     assert_eq!(result.catalogue.games.len(), 1);
+}
+
+#[test]
+fn gecko_lookup_prefers_catalogue_then_falls_back_to_cached_single_game_then_neither() {
+    let catalogue_cache = CacheFixture::new("lookup-catalogue");
+    let provider_cache = CacheFixture::new("lookup-provider");
+
+    // No catalogue, no cached single-game result: nothing to show, but the
+    // caller can still distinguish "no catalogue" from every other case.
+    let outcome = resolve_dolphin_gecko_lookup(
+        &catalogue_cache.0,
+        &provider_cache.0,
+        "GAFE01",
+        &GeckoRegion::Usa,
+        0,
+    )
+    .expect("lookup does not error without a catalogue");
+    assert_eq!(
+        outcome,
+        DolphinGeckoLookupResult::NoCatalogueInstalled { cached: None }
+    );
+
+    // A validated cached single-game result becomes the fallback once no
+    // catalogue is installed.
+    let provider_query = GeckoProviderQuery {
+        game_id: "GAFE01".to_string(),
+        region: GeckoRegion::Usa,
+        revision: 0,
+    };
+    let provider_options = crate::patch_manager::GeckoProviderFetchOptions {
+        cache_root: provider_cache.0.clone(),
+        force_refresh: false,
+        now_unix_seconds: 1_700_000_000,
+    };
+    // Populate the provider's own cache the same way a prior explicit
+    // per-game fetch would have.
+    fetch_dolphin_upstream_gecko_with_transport(
+        &provider_query,
+        &provider_options,
+        &SingleGameFakeTransport(GAFE01.as_bytes().to_vec()),
+    )
+    .expect("seed the single-game provider cache");
+
+    let outcome = resolve_dolphin_gecko_lookup(
+        &catalogue_cache.0,
+        &provider_cache.0,
+        "GAFE01",
+        &GeckoRegion::Usa,
+        0,
+    )
+    .expect("lookup does not error");
+    assert!(matches!(
+        outcome,
+        DolphinGeckoLookupResult::NoCatalogueInstalled { cached: Some(_) }
+    ));
+
+    // Once a catalogue is installed and has this Game ID, it takes priority
+    // over the cached single-game result.
+    let archive = zip_with_entries(&[(
+        &format!("dolphin-{COMMIT}/Data/Sys/GameSettings/GAFE01.ini"),
+        GAFE01.as_bytes(),
+    )]);
+    fetch_dolphin_catalogue_with_transport(
+        &options(&catalogue_cache.0),
+        &FakeTransport::new(COMMIT, archive),
+    )
+    .expect("catalogue install");
+
+    let outcome = resolve_dolphin_gecko_lookup(
+        &catalogue_cache.0,
+        &provider_cache.0,
+        "GAFE01",
+        &GeckoRegion::Usa,
+        0,
+    )
+    .expect("lookup does not error");
+    match outcome {
+        DolphinGeckoLookupResult::Found(result) => {
+            assert_eq!(result.provider_id, DOLPHIN_CATALOGUE_PROVIDER_ID);
+            assert_eq!(result.entries.len(), 1);
+        }
+        other => panic!("expected the catalogue result to take priority, got {other:?}"),
+    }
+}
+
+struct SingleGameFakeTransport(Vec<u8>);
+impl CheatSourceTransport for SingleGameFakeTransport {
+    fn get(
+        &self,
+        _url: &str,
+        _maximum_bytes: u64,
+        destination: &mut dyn Write,
+        _context: CheatSourceTransferContext<'_>,
+    ) -> Result<CheatSourceHttpResponse, CheatSourceError> {
+        destination.write_all(&self.0).expect("fixture write");
+        Ok(CheatSourceHttpResponse {
+            status: 200,
+            content_type: None,
+            content_encoding: None,
+            content_length: Some(self.0.len() as u64),
+            location: None,
+            etag: None,
+            last_modified: None,
+            downloaded_bytes: self.0.len() as u64,
+            retry_after_seconds: None,
+        })
+    }
 }

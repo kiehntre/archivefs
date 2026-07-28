@@ -172,10 +172,12 @@ pub use dolphin_cheat_catalogue::{
     DolphinCatalogue, DolphinCatalogueCode, DolphinCatalogueError, DolphinCatalogueErrorKind,
     DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueGame,
     DolphinCatalogueLoad, DolphinCatalogueLookup, DolphinCatalogueMetadata,
-    DolphinCatalogueUpdateCheck, DolphinCatalogueUpdateState, check_dolphin_catalogue_update,
-    check_dolphin_catalogue_update_with_transport, default_dolphin_catalogue_cache_root,
-    fetch_dolphin_catalogue, fetch_dolphin_catalogue_with_transport, load_dolphin_catalogue,
-    load_dolphin_catalogue_update_state, lookup_dolphin_catalogue, remove_dolphin_catalogue,
+    DolphinCatalogueUpdateCheck, DolphinCatalogueUpdateState, DolphinGeckoLookupResult,
+    check_dolphin_catalogue_update, check_dolphin_catalogue_update_with_transport,
+    default_dolphin_catalogue_cache_root, fetch_dolphin_catalogue,
+    fetch_dolphin_catalogue_with_transport, gecko_provider_result_from_catalogue_entry,
+    load_dolphin_catalogue, load_dolphin_catalogue_update_state, lookup_dolphin_catalogue,
+    remove_dolphin_catalogue, resolve_dolphin_gecko_lookup,
 };
 pub use dolphin_gecko_install_plan::{
     DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,
@@ -196,8 +198,8 @@ pub use dolphin_gecko_provider::{
     GeckoProviderFetchError, GeckoProviderFetchErrorKind, GeckoProviderFetchOptions,
     GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery, GeckoProviderResult,
     GeckoRegion, GeckoRevisionApplicability, default_gecko_provider_cache_root,
-    fetch_dolphin_upstream_gecko, fetch_dolphin_upstream_gecko_with_transport, region_for_game_id,
-    revision_applicability,
+    fetch_dolphin_upstream_gecko, fetch_dolphin_upstream_gecko_with_transport,
+    peek_cached_gecko_result, region_for_game_id, revision_applicability,
 };
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,

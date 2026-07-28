@@ -451,6 +451,21 @@ pub fn default_gecko_provider_cache_root() -> Result<PathBuf, GeckoProviderFetch
         .join("gecko-provider-cache"))
 }
 
+/// Reads a validated cached single-game result, if one exists, without ever
+/// touching the network - not even the rate-limit-aware refresh path
+/// `fetch_dolphin_upstream_gecko` takes. Used as the fallback source when no
+/// full catalogue is installed or the catalogue has no entry for this exact
+/// game: showing a previously fetched result is preferable to an automatic
+/// network request on every game selection.
+#[must_use]
+pub fn peek_cached_gecko_result(
+    cache_root: &Path,
+    query: &GeckoProviderQuery,
+) -> Option<GeckoProviderResult> {
+    let path = cache_path(cache_root, query).ok()?;
+    load_cache(&path, query).ok().flatten()
+}
+
 pub fn fetch_dolphin_upstream_gecko(
     query: &GeckoProviderQuery,
     options: &GeckoProviderFetchOptions,
