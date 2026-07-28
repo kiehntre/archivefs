@@ -279,16 +279,15 @@ pub fn select_emulator_profile(
         };
     }
 
-    if let Some(explicit_id) = session_explicit {
-        if let Some(candidate) = discovered
+    if let Some(explicit_id) = session_explicit
+        && let Some(candidate) = discovered
             .iter()
             .find(|c| c.profile_id == explicit_id && c.eligible)
-        {
-            return EmulatorProfileSelection::Auto {
-                profile_id: candidate.profile_id.clone(),
-                reason: EmulatorProfileSelectReason::ExplicitChoice,
-            };
-        }
+    {
+        return EmulatorProfileSelection::Auto {
+            profile_id: candidate.profile_id.clone(),
+            reason: EmulatorProfileSelectReason::ExplicitChoice,
+        };
     }
 
     let eligible: Vec<&EmulatorProfileCandidate> =

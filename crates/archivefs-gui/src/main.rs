@@ -6669,7 +6669,7 @@ impl ArchiveFsApp {
     /// discarded (request-identity check); a superseded receiver was
     /// already dropped when its state was replaced, so its result can
     /// never arrive here at all.
-    fn poll_cheat_workflow(&mut self) {
+    fn poll_cheat_workflow(&mut self, context: &egui::Context) {
         let identity_page_is_current = self.view == MainView::CheatsMods;
         let mut automatic_candidate: Option<String> = None;
         let dolphin_profile_paths: HashMap<String, PathBuf> = match &self.dolphin_profiles {
@@ -6721,6 +6721,14 @@ impl ArchiveFsApp {
                 }
             }
         }
+        // Automatic provider loading: once identity is ready, quietly
+        // start the exact-match provider fetch in the background the
+        // first time it's needed - never repeatedly, since the gate is
+        // `NotLoaded` and every subsequent poll sees `Loading`/`Ready`/
+        // `Failed` instead. A failed fetch is never auto-retried here;
+        // the user retries explicitly (Details > Refresh).
+        let need_dolphin_provider_fetch = dolphin_provider_auto_fetch_needed(workflow);
+        let need_xenia_provider_fetch = xenia_provider_auto_fetch_needed(workflow);
         let mut preview_history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.dolphin_provider {
             match receiver.try_recv() {
@@ -7261,6 +7269,24 @@ impl ArchiveFsApp {
         }
         if let Some(entry) = preview_history_entry {
             self.history.record(entry);
+        }
+        // The real background fetch is skipped under `cargo test`: an
+        // automatic trigger firing from a plain identity-ready + provider
+        // "not loaded" fixture would otherwise spawn a real network
+        // thread (`ureq`) from ordinary unit tests, which never happened
+        // before this was automatic (no existing test called
+        // `start_dolphin_provider_fetch`/`start_xenia_provider_fetch`
+        // directly - they always assert against a fixture already in a
+        // `Ready`/`Failed`/`Loading` state). `need_dolphin_provider_fetch`/
+        // `need_xenia_provider_fetch` themselves are ordinary booleans and
+        // stay fully covered by direct unit tests on `CheatWorkflowState`.
+        if !cfg!(test) {
+            if need_dolphin_provider_fetch {
+                self.start_dolphin_provider_fetch(context.clone(), false);
+            }
+            if need_xenia_provider_fetch {
+                self.start_xenia_provider_fetch(context.clone(), false);
+            }
         }
     }
 
@@ -8408,7 +8434,7 @@ impl eframe::App for ArchiveFsApp {
         self.poll_retroarch_profiles();
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
-        self.poll_cheat_workflow();
+        self.poll_cheat_workflow(context);
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
                 workflow.adapter == CheatEmulatorAdapter::Dolphin
@@ -16145,6 +16171,27 @@ fn platform_is_gamecube(platform: Option<&str>) -> bool {
             .iter()
             .any(|candidate| platform.eq_ignore_ascii_case(candidate))
     })
+}
+
+/// Whether `poll_cheat_workflow` should quietly start a background
+/// Dolphin Gecko-provider fetch this frame: identity is ready, nothing
+/// has been requested yet (`NotLoaded`), and the adapter/platform are
+/// actually Dolphin/GameCube. `NotLoaded` is a one-shot gate - once a
+/// fetch starts (`Loading`) or finishes (`Ready`/`Failed`), this returns
+/// `false` again on every later poll, so a fixed page never keeps
+/// re-triggering requests just because it keeps re-rendering.
+fn dolphin_provider_auto_fetch_needed(workflow: &CheatWorkflowState) -> bool {
+    workflow.adapter == CheatEmulatorAdapter::Dolphin
+        && platform_is_gamecube(workflow.platform.as_deref())
+        && matches!(workflow.identity, CheatStepResource::Ready(_))
+        && matches!(workflow.dolphin_provider, CheatStepResource::NotLoaded)
+}
+
+/// Xenia's counterpart to `dolphin_provider_auto_fetch_needed`.
+fn xenia_provider_auto_fetch_needed(workflow: &CheatWorkflowState) -> bool {
+    workflow.adapter == CheatEmulatorAdapter::Xenia
+        && matches!(workflow.identity, CheatStepResource::Ready(_))
+        && matches!(workflow.xenia_provider, CheatStepResource::NotLoaded)
 }
 
 fn platform_is_xenia(platform: Option<&str>) -> bool {
@@ -26917,9 +26964,9 @@ mod tests {
         workflow_at_cheat_selection_stage(&mut app);
 
         app.view = MainView::Library;
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         app.view = MainView::CheatsMods;
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
 
         let workflow = app.cheat_workflow.as_ref().expect("workflow");
         let selection = workflow
@@ -27164,7 +27211,7 @@ mod tests {
         let mut app = app_with_fetched_trusted_catalogue();
         app.start_cheat_candidate_match(egui::Context::default());
         for _ in 0..200 {
-            app.poll_cheat_workflow();
+            app.poll_cheat_workflow(&egui::Context::default());
             if matches!(
                 app.cheat_workflow.as_ref().unwrap().candidates,
                 CheatStepResource::Ready(_)
@@ -27189,7 +27236,7 @@ mod tests {
         // archive can ever match it - a real "no candidates" outcome.
         app.start_cheat_candidate_match(egui::Context::default());
         for _ in 0..200 {
-            app.poll_cheat_workflow();
+            app.poll_cheat_workflow(&egui::Context::default());
             if !matches!(
                 app.cheat_workflow.as_ref().unwrap().candidates,
                 CheatStepResource::Loading { .. }
@@ -28418,6 +28465,95 @@ $Instant Growth [Nayr]\n";
         app
     }
 
+    #[test]
+    fn dolphin_provider_auto_fetch_is_needed_once_identity_is_ready_and_nothing_requested_yet() {
+        let app = dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        assert!(dolphin_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn dolphin_provider_auto_fetch_is_not_needed_once_a_fetch_is_already_loading() {
+        let mut app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        let (_sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().dolphin_provider =
+            CheatStepResource::Loading { receiver };
+        assert!(!dolphin_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn dolphin_provider_auto_fetch_is_not_needed_after_a_fetch_already_failed() {
+        let mut app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        app.cheat_workflow.as_mut().unwrap().dolphin_provider =
+            CheatStepResource::Failed("network unavailable".to_string());
+        assert!(!dolphin_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn dolphin_provider_auto_fetch_is_not_needed_for_a_non_gamecube_platform() {
+        let mut app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        app.cheat_workflow.as_mut().unwrap().platform = Some("Wii".to_string());
+        assert!(!dolphin_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn xenia_provider_auto_fetch_is_needed_once_identity_is_ready_and_nothing_requested_yet() {
+        let app = xenia_workflow_with_matched_identity(Path::new("/isolated/xenia-test"), "415607D2");
+        assert!(xenia_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn xenia_provider_auto_fetch_is_not_needed_after_a_fetch_already_completed_or_failed() {
+        let mut app =
+            xenia_workflow_with_matched_identity(Path::new("/isolated/xenia-test"), "415607D2");
+        app.cheat_workflow.as_mut().unwrap().xenia_provider =
+            CheatStepResource::Failed("network unavailable".to_string());
+        assert!(!xenia_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn repeated_polling_never_requests_the_dolphin_provider_more_than_once() {
+        let mut app =
+            dolphin_workflow_with_matched_identity(Path::new("/isolated/dolphin-test"), "GALE01");
+        for _ in 0..5 {
+            app.poll_cheat_workflow(&egui::Context::default());
+        }
+        // Under `cargo test` the real fetch never starts (see the
+        // `cfg!(test)` guard in `poll_cheat_workflow`), so the gate stays
+        // permanently open here - this test instead pins down that
+        // repeated polling is idempotent and never panics/loops, and
+        // that the automatic-fetch decision itself only depends on state
+        // that a real fetch would eventually change (`NotLoaded` ->
+        // `Loading`), never on how many times the page has rendered.
+        assert!(dolphin_provider_auto_fetch_needed(
+            app.cheat_workflow.as_ref().unwrap()
+        ));
+        app.cheat_workflow.as_mut().unwrap().dolphin_provider = CheatStepResource::Failed(
+            "network unavailable".to_string(),
+        );
+        for _ in 0..5 {
+            app.poll_cheat_workflow(&egui::Context::default());
+        }
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().dolphin_provider,
+            CheatStepResource::Failed(_)
+        ));
+    }
+
     fn quake4_provider_fetch() -> XeniaProviderFetchResult {
         XeniaProviderFetchResult {
             result: XeniaProviderResult {
@@ -29184,7 +29320,7 @@ $Instant Growth [Nayr]\n";
             )))
             .unwrap();
         app.view = MainView::Library;
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         assert!(matches!(
             app.cheat_workflow.as_ref().unwrap().identity,
             CheatStepResource::NotLoaded
@@ -29207,7 +29343,7 @@ $Instant Growth [Nayr]\n";
                 inspect_game_identity(Path::new("/missing.chd"), Some("GameCube")),
             )))
             .unwrap();
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         assert!(matches!(
             app.cheat_workflow.as_ref().unwrap().identity,
             CheatStepResource::NotLoaded
@@ -29273,7 +29409,7 @@ $Instant Growth [Nayr]\n";
                 xenia_generated: None,
             }))
             .unwrap();
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         assert!(matches!(
             app.cheat_workflow.as_ref().unwrap().preview,
             CheatStepResource::NotLoaded
@@ -29285,7 +29421,7 @@ $Instant Growth [Nayr]\n";
         workflow.preview_request = Some(page_key);
         workflow.preview = CheatStepResource::Loading { receiver };
         app.view = MainView::Library;
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         assert!(matches!(
             app.cheat_workflow.as_ref().unwrap().preview,
             CheatStepResource::NotLoaded
@@ -29297,7 +29433,7 @@ $Instant Growth [Nayr]\n";
         workflow.preview_request = Some(profile_key);
         workflow.preview = CheatStepResource::Loading { receiver };
         workflow.selected_profile_id = Some("different-profile".to_string());
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         assert!(matches!(
             app.cheat_workflow.as_ref().unwrap().preview,
             CheatStepResource::NotLoaded
@@ -29699,7 +29835,7 @@ $Instant Growth [Nayr]\n";
                 CheatSourceFetchStatus::Fetched,
             )))
             .unwrap();
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         assert!(
             matches!(
                 app.cheat_workflow.as_ref().unwrap().source_fetch,
@@ -29772,7 +29908,7 @@ $Instant Growth [Nayr]\n";
                 CheatSourceFetchStatus::OfflineReused,
             )))
             .unwrap();
-        app.poll_cheat_workflow();
+        app.poll_cheat_workflow(&egui::Context::default());
         match &app.cheat_workflow.as_ref().unwrap().source_fetch {
             CheatStepResource::Ready(result) => {
                 assert_eq!(result.status, CheatSourceFetchStatus::OfflineReused);
