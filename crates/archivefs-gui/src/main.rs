@@ -76,6 +76,7 @@ use archivefs_core::patch_manager::{
     XeniaPatchesDirectoryState, XeniaProviderFetchOptions, XeniaProviderFetchResult,
     XeniaProviderFetchStatus,
 };
+pub mod bulk_confirmation;
 pub mod game_presentation;
 pub mod status_wording;
 mod ui;
