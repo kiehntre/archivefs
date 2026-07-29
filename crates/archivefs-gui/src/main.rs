@@ -29833,7 +29833,7 @@ fn show_gamer_view(
     // library. A fixed shelf height also means `available_height` below
     // is captured after a *known* amount of space is consumed, not a
     // wrapping row count that varies with window width.
-    const PLATFORM_SHELF_HEIGHT: f32 = 96.0;
+    const PLATFORM_SHELF_HEIGHT: f32 = 150.0;
     let platform_card_width = gamer_platform_card_width(ui.available_width());
     let mut shelf_artwork = PlatformShelfArtwork {
         directory: artwork_directory,
@@ -29938,7 +29938,7 @@ fn show_gamer_view(
                     ui.add_space(theme::SECTION_GAP);
                     ui.weak(guidance);
                 } else {
-                    let row_height = (ui.spacing().interact_size.y * 1.8).max(46.0);
+                    let row_height = (ui.spacing().interact_size.y * 2.4).max(64.0);
                     egui::ScrollArea::vertical()
                         .id_salt("gamer_view_game_list")
                         .max_height(ui.available_height())
@@ -29983,10 +29983,10 @@ fn show_gamer_view(
                                     artwork_directory,
                                     GameRowArtworkPaint {
                                         center: egui::pos2(
-                                            response.rect.left() + 23.0,
+                                            response.rect.left() + 33.0,
                                             response.rect.center().y,
                                         ),
-                                        size: 38.0,
+                                        size: 56.0,
                                         title: &gamer_display_title(record),
                                         platform_asset,
                                         unknown_platform: row.unknown_platform,
@@ -29994,7 +29994,7 @@ fn show_gamer_view(
                                 );
                                 ui.painter().text(
                                     egui::pos2(
-                                        response.rect.left() + 48.0,
+                                        response.rect.left() + 68.0,
                                         response.rect.center().y,
                                     ),
                                     egui::Align2::LEFT_CENTER,
@@ -30882,14 +30882,14 @@ fn paint_game_row_artwork(
     )
 }
 
-const PLATFORM_CARD_MIN_WIDTH: f32 = 96.0;
-const PLATFORM_CARD_MAX_WIDTH: f32 = 124.0;
+const PLATFORM_CARD_MIN_WIDTH: f32 = 132.0;
+const PLATFORM_CARD_MAX_WIDTH: f32 = 164.0;
 
 /// Cards grow modestly with desktop width, but never shrink below a
 /// readable minimum or consume so much room that horizontal browsing
 /// becomes awkward. The shelf itself remains a single scrolling row.
 fn gamer_platform_card_width(viewport_width: f32) -> f32 {
-    (viewport_width * 0.105).clamp(PLATFORM_CARD_MIN_WIDTH, PLATFORM_CARD_MAX_WIDTH)
+    (viewport_width * 0.14).clamp(PLATFORM_CARD_MIN_WIDTH, PLATFORM_CARD_MAX_WIDTH)
 }
 
 /// Keep the count on its own visible line. Long platform names use the
@@ -30928,7 +30928,7 @@ fn show_platform_shelf_item(
     card_width: f32,
     artwork: &mut PlatformShelfArtwork<'_>,
 ) -> egui::Response {
-    const ARTWORK_SIZE: f32 = 60.0;
+    const ARTWORK_SIZE: f32 = 108.0;
     // Dedicated assets already name the exact platform; a category
     // fallback additionally names *what kind of thing* the glyph is
     // meant to evoke, so a screen-reader user gets the same context a
@@ -30942,7 +30942,7 @@ fn show_platform_shelf_item(
     let response = ui
         .add(
             egui::Button::new("")
-                .min_size(egui::vec2(card_width, 88.0))
+                .min_size(egui::vec2(card_width, 142.0))
                 .selected(selected),
         )
         .on_hover_text(accessible_name.clone());
@@ -30951,7 +30951,7 @@ fn show_platform_shelf_item(
     // expose a way to set the accessible name in this egui version
     // without a full custom widget, so the hover text above doubles as
     // that label, matching "accessible labels for visuals."
-    let artwork_center = response.rect.center() - egui::vec2(0.0, 12.0);
+    let artwork_center = response.rect.center() - egui::vec2(0.0, 15.0);
     let color = if selected {
         ui.visuals().selection.stroke.color
     } else {
@@ -30974,7 +30974,7 @@ fn show_platform_shelf_item(
             fallback_asset_id,
         },
     );
-    let text_pos = response.rect.center() + egui::vec2(0.0, 30.0);
+    let text_pos = response.rect.center() + egui::vec2(0.0, 59.0);
     let truncated_label = compact_platform_label(label, card_width);
     ui.painter().text(
         text_pos,

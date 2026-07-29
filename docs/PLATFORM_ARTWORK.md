@@ -160,9 +160,9 @@ Unknown.
 The shelf remains one horizontally scrolling row. Cards retain responsive
 96–124 logical-pixel widths, platform name, count, selected state, standard
 button keyboard focus/activation, full-name tooltip/accessibility label, and
-1024×600 behavior. Hardware illustrations are aspect-fitted at 60 logical
-pixels in an 88-pixel card, centred with transparent padding preserved. Compact
-game rows use a recognisable 38-pixel thumbnail in a 46-pixel row.
+1024×600 behavior. Hardware illustrations are aspect-fitted at 108 logical
+pixels in a 142-pixel card, centred with transparent padding preserved. Compact
+game rows use a recognisable 56-pixel thumbnail in a 64-pixel row.
 
 Tests cover the complete registry and alias table, case normalization,
 related-platform separation, category and Unknown fallbacks, custom override

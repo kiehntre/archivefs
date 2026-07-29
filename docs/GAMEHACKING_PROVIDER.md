@@ -36,6 +36,9 @@ preserved; a different destination file is never replaced without confirmation.
 - public `robots.txt` is checked before provider page retrieval;
 - game pages and native exports are cached below the private ArchiveFS data
   directory; Refresh deliberately replaces the relevant cache entries;
+- response bodies are cached byte-for-byte. HTML uses the declared HTTP
+  charset when recognised and otherwise uses safe lossy UTF-8 decoding, so a
+  legacy Windows-1252 title cannot make the complete index unusable;
 - leaving or changing the selected-game workflow drops the worker receiver, so
   stale results cannot become installable.
 

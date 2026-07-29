@@ -26,9 +26,12 @@ guessing at intent, dates, or scope.
   source-tree files and decoded textures are cached.
 - The one-row responsive platform shelf, filtering, selected/focus states,
   labels, counts, tooltips, and narrow-window behavior remain unchanged.
-- Platform hardware illustrations are now prominent in 88-pixel cards, and
-  compact game rows again show cached artwork: local per-game PNG, platform
-  artwork, then Unknown.
+- Platform hardware illustrations are now prominent, and compact game rows
+  again show cached artwork: local per-game PNG, platform artwork, then
+  Unknown.
+- Increased hardware illustrations to 108 pixels in 142-pixel cards and game
+  thumbnails to 56 pixels in compact 64-pixel rows after manual readability
+  testing, without cropping or stretching transparent PNGs.
 
 ### Cheats & Mods
 
@@ -42,6 +45,9 @@ guessing at intent, dates, or scope.
   journal, and Undo transaction flow. No crawler, automatic fetch, PNACH
   conversion, ROM modification, or user-file overwrite without confirmation
   was added.
+- GameHacking HTML no longer requires strict UTF-8: declared HTTP charsets are
+  honoured and other pages use safe lossy decoding while original response
+  bytes remain unchanged in the cache.
 
 ### Documentation
 

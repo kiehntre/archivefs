@@ -179,13 +179,19 @@ pub fn gamehacking_cache_root() -> Result<PathBuf, GameHackingError> {
 }
 
 trait GameHackingTransport {
-    fn get(&self, url: &str, maximum_bytes: usize) -> Result<Vec<u8>, GameHackingError>;
+    fn get(&self, url: &str, maximum_bytes: usize) -> Result<ProviderResponse, GameHackingError>;
     fn post_form(
         &self,
         url: &str,
         form: &[(&str, String)],
         maximum_bytes: usize,
-    ) -> Result<Vec<u8>, GameHackingError>;
+    ) -> Result<ProviderResponse, GameHackingError>;
+}
+
+#[derive(Debug, Clone)]
+struct ProviderResponse {
+    bytes: Vec<u8>,
+    charset: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +218,7 @@ impl UreqGameHackingTransport {
     fn read_response(
         mut response: http::Response<ureq::Body>,
         maximum_bytes: usize,
-    ) -> Result<Vec<u8>, GameHackingError> {
+    ) -> Result<ProviderResponse, GameHackingError> {
         let status = response.status().as_u16();
         if status == 403 || status == 401 {
             return Err(error(
@@ -238,6 +244,11 @@ impl UreqGameHackingTransport {
                 format!("GameHacking.org returned HTTP {status}"),
             ));
         }
+        let charset = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(charset_from_content_type);
         let mut bytes = Vec::new();
         response
             .body_mut()
@@ -256,12 +267,12 @@ impl UreqGameHackingTransport {
                 "GameHacking.org response exceeded the bounded size limit",
             ));
         }
-        Ok(bytes)
+        Ok(ProviderResponse { bytes, charset })
     }
 }
 
 impl GameHackingTransport for UreqGameHackingTransport {
-    fn get(&self, url: &str, maximum_bytes: usize) -> Result<Vec<u8>, GameHackingError> {
+    fn get(&self, url: &str, maximum_bytes: usize) -> Result<ProviderResponse, GameHackingError> {
         validate_provider_url(url)?;
         let response = self
             .agent
@@ -279,7 +290,7 @@ impl GameHackingTransport for UreqGameHackingTransport {
         url: &str,
         form: &[(&str, String)],
         maximum_bytes: usize,
-    ) -> Result<Vec<u8>, GameHackingError> {
+    ) -> Result<ProviderResponse, GameHackingError> {
         validate_provider_url(url)?;
         let response = self
             .agent
@@ -314,6 +325,15 @@ fn classify_transport_error(failure: ureq::Error) -> GameHackingError {
         GameHackingErrorKind::TemporaryFailure,
         format!("GameHacking.org request failed: {failure}"),
     )
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['\'', '"']).to_ascii_lowercase())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -358,7 +378,7 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             |transport| transport.get(self.adapter.index_url(), MAX_INDEX_BYTES),
         )?;
         let title_key = normalized_title(&identity.title);
-        let links = parse_game_links(&index)?;
+        let links = parse_game_links(&index.bytes, index.charset.as_deref())?;
         let candidates: Vec<GameLink> = links
             .into_iter()
             .filter(|link| normalized_title(&link.title) == title_key)
@@ -379,7 +399,12 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                 self.cached_request(&cache_name, &url, MAX_PAGE_BYTES, options, |transport| {
                     transport.get(&url, MAX_PAGE_BYTES)
                 })?;
-            let game = parse_gamehacking_game_page(link.game_id, &url, &page)?;
+            let game = parse_gamehacking_game_page_with_charset(
+                link.game_id,
+                &url,
+                &page.bytes,
+                page.charset.as_deref(),
+            )?;
             match exact_identity_match(identity, &game) {
                 Ok(()) => {
                     return Ok(GameHackingMatch {
@@ -434,7 +459,7 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             options,
             |transport| transport.post_form(EXPORT_URL, &form, MAX_EXPORT_BYTES),
         )?;
-        parse_gamehacking_pnach(game, &bytes)
+        parse_gamehacking_pnach(game, &bytes.bytes)
     }
 
     pub fn catalogue(
@@ -483,14 +508,17 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         maximum_bytes: usize,
         options: &GameHackingFetchOptions,
         request: F,
-    ) -> Result<Vec<u8>, GameHackingError>
+    ) -> Result<ProviderResponse, GameHackingError>
     where
-        F: Fn(&UreqGameHackingTransport) -> Result<Vec<u8>, GameHackingError>,
+        F: Fn(&UreqGameHackingTransport) -> Result<ProviderResponse, GameHackingError>,
     {
         prepare_cache(&options.cache_root)?;
         let path = options.cache_root.join(file_name);
         if !options.force_refresh && path.is_file() {
-            return bounded_read(&path, maximum_bytes);
+            return Ok(ProviderResponse {
+                bytes: bounded_read(&path, maximum_bytes)?,
+                charset: read_cached_charset(&path)?,
+            });
         }
         let mut last_error = None;
         for attempt in 0..MAX_RETRIES {
@@ -499,10 +527,14 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                 cancellable_delay(options, options.delay.saturating_mul(1_u32 << attempt))?;
             }
             match request(&self.transport) {
-                Ok(bytes) => {
-                    atomic_write(&path, &bytes)?;
+                Ok(response) => {
+                    atomic_write(&path, &response.bytes)?;
+                    atomic_write(
+                        &charset_cache_path(&path),
+                        response.charset.as_deref().unwrap_or_default().as_bytes(),
+                    )?;
                     touch_request_marker(&options.cache_root)?;
-                    return Ok(bytes);
+                    return Ok(response);
                 }
                 Err(failure)
                     if matches!(
@@ -532,14 +564,9 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             self.cached_request("robots.txt", ROBOTS_URL, 256 * 1024, options, |transport| {
                 transport.get(ROBOTS_URL, 256 * 1024)
             })?;
-        let text = std::str::from_utf8(&robots).map_err(|_| {
-            error(
-                GameHackingErrorKind::InvalidResponse,
-                "GameHacking.org robots.txt is not UTF-8",
-            )
-        })?;
+        let text = decode_provider_text(&robots.bytes, robots.charset.as_deref());
         for path in paths {
-            if robots_disallows_archivefs(text, path) {
+            if robots_disallows_archivefs(&text, path) {
                 return Err(error(
                     GameHackingErrorKind::AccessDenied,
                     format!("GameHacking.org robots.txt does not allow access to {path}"),
@@ -671,14 +698,21 @@ fn normalize_identity_token(value: &str) -> String {
         .collect()
 }
 
-fn parse_game_links(bytes: &[u8]) -> Result<Vec<GameLink>, GameHackingError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        error(
-            GameHackingErrorKind::InvalidResponse,
-            "GameHacking.org index is not UTF-8",
-        )
-    })?;
-    let document = Html::parse_document(text);
+fn decode_provider_text<'a>(bytes: &'a [u8], charset: Option<&str>) -> std::borrow::Cow<'a, str> {
+    if let Some(encoding) =
+        charset.and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()))
+    {
+        return encoding.decode(bytes).0;
+    }
+    String::from_utf8_lossy(bytes)
+}
+
+fn parse_game_links(
+    bytes: &[u8],
+    charset: Option<&str>,
+) -> Result<Vec<GameLink>, GameHackingError> {
+    let text = decode_provider_text(bytes, charset);
+    let document = Html::parse_document(&text);
     let selector = Selector::parse("a[href^='/game/']").expect("static selector");
     let mut seen = BTreeSet::new();
     let mut links = Vec::new();
@@ -710,13 +744,17 @@ pub fn parse_gamehacking_game_page(
     source_url: &str,
     bytes: &[u8],
 ) -> Result<GameHackingGame, GameHackingError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        error(
-            GameHackingErrorKind::InvalidResponse,
-            "GameHacking.org game page is not UTF-8",
-        )
-    })?;
-    let document = Html::parse_document(text);
+    parse_gamehacking_game_page_with_charset(game_id, source_url, bytes, None)
+}
+
+fn parse_gamehacking_game_page_with_charset(
+    game_id: u64,
+    source_url: &str,
+    bytes: &[u8],
+    charset: Option<&str>,
+) -> Result<GameHackingGame, GameHackingError> {
+    let text = decode_provider_text(bytes, charset);
+    let document = Html::parse_document(&text);
     let heading = Selector::parse("h1, h2.game-title, .game-title").expect("static selector");
     let title = document
         .select(&heading)
@@ -873,6 +911,30 @@ fn bounded_read(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, GameHackin
     })
 }
 
+fn charset_cache_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("response");
+    path.with_file_name(format!("{file_name}.charset"))
+}
+
+fn read_cached_charset(path: &Path) -> Result<Option<String>, GameHackingError> {
+    let path = charset_cache_path(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = bounded_read(&path, 128)?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| {
+        error(
+            GameHackingErrorKind::CacheUnavailable,
+            "cached provider charset metadata is invalid",
+        )
+    })?;
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), GameHackingError> {
     let temporary = path.with_extension(format!("partial-{}", std::process::id()));
     let result = (|| -> std::io::Result<()> {
@@ -995,10 +1057,35 @@ mod tests {
     fn title_index_deduplicates_game_ids() {
         let links = parse_game_links(
             br#"<a href="/game/42">Example Game</a><a href="/game/42">Duplicate</a>"#,
+            None,
         )
         .unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].game_id, 42);
+    }
+
+    #[test]
+    fn windows_1252_index_with_invalid_utf8_still_parses_game_links() {
+        let mut fixture = b"<a href=\"/game/77\">Example ".to_vec();
+        fixture.push(0x96);
+        fixture.extend_from_slice(b" Game</a>");
+        assert!(std::str::from_utf8(&fixture).is_err());
+        let links = parse_game_links(&fixture, Some("windows-1252")).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].game_id, 77);
+        assert_eq!(links[0].title, "Example – Game");
+
+        let lossy = parse_game_links(&fixture, None).unwrap();
+        assert_eq!(lossy[0].game_id, 77);
+    }
+
+    #[test]
+    fn http_charset_parameter_is_read_case_insensitively() {
+        assert_eq!(
+            charset_from_content_type("text/html; Charset=Windows-1252"),
+            Some("windows-1252".to_string())
+        );
+        assert_eq!(charset_from_content_type("text/html"), None);
     }
 
     #[test]
