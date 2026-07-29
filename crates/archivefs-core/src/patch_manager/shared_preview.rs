@@ -1527,7 +1527,14 @@ mod tests {
             PreviewDestinationState::Symlink
         );
         fs::remove_file(&destination).unwrap();
-        let _listener = UnixListener::bind(&destination).unwrap();
+        let _listener = match UnixListener::bind(&destination) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("Unix socket creation is not permitted in this test environment");
+                return;
+            }
+            Err(error) => panic!("failed to create special-file fixture: {error}"),
+        };
         let special_report = build_shared_preview(&request).unwrap();
         assert_eq!(
             special_report.entries[0].destination_state,

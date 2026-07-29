@@ -1,5 +1,9 @@
 # GUI Simplification
 
+> Historical implementation record: this document describes the GUI state at
+> the time of that simplification pass. Later v0.7 Dolphin/Xenia and
+> platform-first work supersedes its release-status claims.
+
 This document tracks the GUI-simplification work done on the
 `sonnet-gui-simplification` branch, why it was scoped the way it was, and
 what a future, larger pass would still need to do.

@@ -1651,7 +1651,15 @@ mod tests {
         )
         .unwrap();
         let socket_path = profile_root.join("cheats/socket.pnach");
-        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let _listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("Unix socket creation is not permitted in this test environment");
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            Err(error) => panic!("failed to create special-file fixture: {error}"),
+        };
         let inventory = inspect_pcsx2_profile(&eligible_profile(&profile_root)).unwrap();
         assert!(inventory.files.is_empty());
         assert!(

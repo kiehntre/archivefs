@@ -533,8 +533,20 @@ impl OperationHistory {
     }
 }
 
+fn gui_version_line() -> String {
+    format!("archivefs-gui {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> eframe::Result<()> {
-    if std::env::args().any(|arg| arg == "--clipboard-check") {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", gui_version_line());
+        return Ok(());
+    }
+    if arguments.iter().any(|arg| arg == "--clipboard-check") {
         run_clipboard_check();
         return Ok(());
     }
@@ -18601,9 +18613,9 @@ fn show_dolphin_external_provider(
     let mut action = None;
     widgets::section_header(
         ui,
-        "Stage 2 · External Gecko provider",
+        "Stage 2 · Find matching cheats",
         Some(
-            "ArchiveFS looks up the exact GameCube ID in Dolphin's upstream GameSettings dataset. The provider discovers codes; the Dolphin adapter installs selected definitions.",
+            "ArchiveFS looks up the exact GameCube ID in Dolphin's upstream GameSettings dataset.",
         ),
     );
     widgets::card(ui, |ui| {
@@ -18627,7 +18639,7 @@ fn show_dolphin_external_provider(
     if !platform_is_gamecube(workflow.platform.as_deref()) {
         widgets::banner(
             ui,
-            "External provider unavailable for this platform",
+            "Cheats are not available for this game yet",
             "This milestone supports exact-ID external Gecko retrieval for GameCube only. Existing Wii GameSettings inspection remains read-only.",
             widgets::StatusTone::Pending,
         );
@@ -18669,7 +18681,7 @@ fn show_dolphin_external_provider(
         CheatStepResource::Failed(message) => {
             widgets::banner(
                 ui,
-                "Provider retrieval failed",
+                "Could not load matching cheats",
                 message,
                 widgets::StatusTone::Blocked,
             );
@@ -19362,7 +19374,7 @@ fn show_xenia_profile_card(
             ui.label(warning);
         }
         for blocker in &profile.blockers {
-            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+            ui.label(&blocker.detail);
         }
     });
 }
@@ -19441,9 +19453,9 @@ fn show_xenia_external_provider(
     let mut action = None;
     widgets::section_header(
         ui,
-        "Stage 2 · External Xenia patch provider",
+        "Stage 2 · Find matching patches",
         Some(
-            "ArchiveFS looks up the exact Title ID in the xenia-canary/game-patches upstream dataset. The provider retrieves and normalises patches; the Xenia adapter installs selected definitions.",
+            "ArchiveFS looks up the exact Title ID in the xenia-canary/game-patches upstream dataset.",
         ),
     );
     widgets::card(ui, |ui| {
@@ -19493,7 +19505,7 @@ fn show_xenia_external_provider(
         CheatStepResource::Failed(message) => {
             widgets::banner(
                 ui,
-                "Provider retrieval failed",
+                "Could not load matching patches",
                 message,
                 widgets::StatusTone::Blocked,
             );
@@ -19599,7 +19611,7 @@ fn show_xenia_candidate_picker(
     if let Some(reason) = outcome.blocked_reason {
         widgets::banner(
             ui,
-            "No candidate available",
+            "No matching patches found",
             reason.message(),
             widgets::StatusTone::Pending,
         );
@@ -19608,7 +19620,7 @@ fn show_xenia_candidate_picker(
     if outcome.candidates.is_empty() {
         widgets::banner(
             ui,
-            "No files for this Title ID",
+            "No matching patches found",
             "The provider returned no patch files declaring this exact Title ID.",
             widgets::StatusTone::Pending,
         );
@@ -19689,7 +19701,7 @@ fn show_xenia_patch_picker(
     if state.selection.compatibility == XeniaCandidateCompatibility::PartiallyVerified {
         widgets::banner(
             ui,
-            "Partially verified candidate",
+            "Exact game version could not be confirmed",
             "This file's module hash cannot be computed or verified by ArchiveFS. Acknowledge explicitly before any patch from it can be applied.",
             widgets::StatusTone::Warning,
         );
@@ -20582,9 +20594,10 @@ fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str, widgets::S
         Pcsx2MatchState::InvalidVerifiedGameCrc => {
             ("Invalid verified CRC", widgets::StatusTone::Blocked)
         }
-        Pcsx2MatchState::IdentityExtractionDeferred => {
-            ("Identity extraction deferred", widgets::StatusTone::Pending)
-        }
+        Pcsx2MatchState::IdentityExtractionDeferred => (
+            "Exact game version could not be confirmed",
+            widgets::StatusTone::Pending,
+        ),
     }
 }
 
@@ -20971,14 +20984,14 @@ fn show_shared_game_identity(
 ) {
     widgets::section_header(
         ui,
-        "Shared game identity",
+        "Game recognition",
         Some("Bounded local disc metadata; candidates are never promoted to verified values."),
     );
     match &workflow.identity {
         CheatStepResource::NotLoaded => widgets::banner(
             ui,
-            "Identity unavailable",
-            "The current archive, adapter, page, or platform context changed. Reopen or reselect the adapter to inspect it.",
+            "Game version not confirmed",
+            "Choose the game again to inspect its version.",
             widgets::StatusTone::Pending,
         ),
         CheatStepResource::Loading { .. } => {
@@ -20989,7 +21002,7 @@ fn show_shared_game_identity(
         }
         CheatStepResource::Failed(message) => widgets::banner(
             ui,
-            "Identity inspection failed",
+            "Could not recognise the game",
             message,
             widgets::StatusTone::Blocked,
         ),
@@ -21095,7 +21108,7 @@ fn show_shared_game_identity(
                 CheatEmulatorAdapter::Unsupported => None,
             };
             widgets::card(ui, |ui| {
-                ui.strong("Exact adapter match result");
+                ui.strong("Exact game match");
                 if let Some((label, tone, reason)) = adapter_match {
                     ui.horizontal_wrapped(|ui| {
                         widgets::status_badge(ui, label, tone);
@@ -21104,7 +21117,7 @@ fn show_shared_game_identity(
                 } else {
                     widgets::status_badge(
                         ui,
-                        "Adapter inventory not loaded",
+                        "Game files have not been checked yet",
                         widgets::StatusTone::Pending,
                     );
                 }
@@ -28459,6 +28472,14 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
+    fn gui_version_line_matches_the_workspace_package_version() {
+        assert_eq!(
+            gui_version_line(),
+            format!("archivefs-gui {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
     fn presentation_status_classification_is_consistent() {
         assert_eq!(
             profile_presentation_tone(true),
@@ -30733,9 +30754,8 @@ mod tests {
             );
         }
 
-        // PCSX2 and Dolphin have no shared preview/install pipeline at all
-        // (read-only inspection only) - the preview step must not render a
-        // permanently-empty "Preview waiting" card for them.
+        // These workflows do not use RetroArch's generic shared-preview card;
+        // they must not render a permanently-empty "Preview waiting" card.
         for (platform, adapter) in [
             ("PS2", CheatEmulatorAdapter::Pcsx2),
             ("GameCube", CheatEmulatorAdapter::Dolphin),
@@ -30795,7 +30815,7 @@ mod tests {
         });
         for expected in [
             "Stage 1 · Dolphin profile",
-            "Stage 2 · External Gecko provider",
+            "Stage 2 · Find matching cheats",
             "Dolphin upstream GameSettings",
             "Existing Dolphin-managed files",
             "Uploaded · No",
@@ -31199,7 +31219,7 @@ $Instant Growth [Nayr]\n";
             "Title ID",
             "415607D2",
             "Stage 1 · Xenia Canary profile",
-            "Stage 2 · External Xenia patch provider",
+            "Stage 2 · Find matching patches",
             "xenia-canary/game-patches",
             "Fetch patches",
         ] {
@@ -31347,7 +31367,7 @@ $Instant Growth [Nayr]\n";
             "rendering mismatch"
         );
         assert!(
-            !rendered_text_contains(&output, "Stage 2 · External Xenia patch provider"),
+            !rendered_text_contains(&output, "Stage 2 · Find matching patches"),
             "technical stage text leaked outside the collapsed Details section"
         );
         let _ = std::fs::remove_dir_all(&directory);
@@ -31463,7 +31483,7 @@ $Instant Growth [Nayr]\n";
         });
         assert!(rendered_text_contains(
             &output,
-            "Partially verified candidate"
+            "Exact game version could not be confirmed"
         ));
         assert!(rendered_text_contains(
             &output,
@@ -31854,7 +31874,7 @@ $Instant Growth [Nayr]\n";
             "rendering mismatch"
         );
         assert!(
-            !rendered_text_contains(&output, "Stage 2 · External Gecko provider"),
+            !rendered_text_contains(&output, "Stage 2 · Find matching cheats"),
             "technical stage text leaked outside the collapsed Details section"
         );
         let _ = std::fs::remove_dir_all(&temp);
@@ -31987,7 +32007,7 @@ $Instant Growth [Nayr]\n";
             });
         });
         for expected in [
-            "External Gecko provider",
+            "Find matching cheats",
             "GAFE01",
             "Animal Crossing",
             "16:9 Widescreen",
@@ -33550,6 +33570,56 @@ $Instant Growth [Nayr]\n";
             ..CheatArchivePickerState::default()
         };
         assert_eq!(cheat_picker_visible_indices(&rows, &picker), vec![0, 1]);
+    }
+
+    #[test]
+    fn ten_thousand_row_platform_and_chooser_smoke_stays_bounded() {
+        let rows = (0..10_000)
+            .map(|index| {
+                let platform = if index % 5 == 0 {
+                    "GameCube"
+                } else if index % 7 == 0 {
+                    "Unknown"
+                } else {
+                    "Xbox 360"
+                };
+                let mut row = row_with_fields(
+                    &format!("/fixture/{platform}/Game {index}.rvz"),
+                    platform,
+                    "Ready to mount",
+                    &format!("/fixture/{platform}/Game {index}.rvz"),
+                    "",
+                );
+                row.unknown_platform = platform == "Unknown";
+                row
+            })
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let gamecube = LibraryRowFilters {
+            platform: Some("GameCube".to_string()),
+            ..LibraryRowFilters::default()
+        };
+        let gamecube_count = rows.iter().filter(|row| gamecube.matches(row)).count();
+        let unknown = LibraryRowFilters {
+            platform: Some("Unknown".to_string()),
+            ..LibraryRowFilters::default()
+        };
+        let unknown_count = rows.iter().filter(|row| unknown.matches(row)).count();
+        let picker = CheatArchivePickerState {
+            platform_filter: Some("GameCube".to_string()),
+            ..CheatArchivePickerState::default()
+        };
+        let chooser_count = cheat_picker_visible_indices(&rows, &picker).len();
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "10k GUI smoke: GameCube={gamecube_count}, Unknown={unknown_count}, chooser={chooser_count}, elapsed={elapsed:?}"
+        );
+        assert_eq!(gamecube_count, 2_000);
+        assert_eq!(unknown_count, 1_143);
+        assert_eq!(chooser_count, 2_000);
+        assert!(elapsed < std::time::Duration::from_secs(5));
     }
 
     #[test]

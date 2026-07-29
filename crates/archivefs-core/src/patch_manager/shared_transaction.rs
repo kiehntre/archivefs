@@ -1,7 +1,8 @@
 //! Bounded shared apply, journal, history, and rollback pipeline.
 //!
 //! Writes are available only for an explicitly confirmed, exact plan produced
-//! from the shared preview. PCSX2 and Dolphin intentionally remain preview-only
+//! from the shared preview. PCSX2 remains preview-only; Dolphin and Xenia use
+//! their verified transaction paths
 //! until they expose an independent, adapter-approved materialized source.
 
 use std::collections::BTreeSet;

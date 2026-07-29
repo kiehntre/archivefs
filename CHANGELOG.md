@@ -11,11 +11,44 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.6.0-alpha (unreleased)
+## v0.7.0-alpha (unreleased)
 
-Work merged since the `v0.5.0-alpha` tag, in preparation for release as
-`v0.6.0-alpha`. The workspace version in `Cargo.toml` has not been bumped and
-no tag has been created yet. See
+The current integration candidate. It adds direct game images as first-class
+library entries, central platform aliases and source-level platform assignment,
+shared platform-first Library/Mount/Cheats navigation, and Xenia Canary plus
+Dolphin catalogue/install workflows. No tag has been created; manual QA and
+release-artifact validation remain required.
+
+### Added
+
+- Direct read-only discovery for GameCube/Wii `.iso`, `.gcm`, `.gcz`, `.rvz`,
+  `.wbfs`, and `.ciso`, preserving visibility when exact identity is unavailable.
+- Canonical platform resolution and persistent source-level assignments with
+  explicit preview and safe reclassification.
+- Xenia Canary patch lookup and confirmed installation/rollback.
+
+### Changed
+
+- Platform selection is shared by Library, Mount, and Cheats & Mods.
+- Dolphin Gecko definitions can be installed and rolled back through the
+  verified transaction engine.
+- Beginner-facing cheat and patch states use plain language; diagnostics remain
+  available under Details.
+
+### Known limitations
+
+- PCSX2 remains read-only.
+- RVZ identity inspection is bounded and requires a readable direct header;
+  malformed or unsupported layouts remain visible with an honest terminal
+  status instead of being hidden or left loading.
+- A database opened by this build is migrated forward to schema 5. Older builds
+  reject that schema, so application downgrade requires a pre-upgrade database
+  copy; in-place downgrade is not supported.
+
+## v0.6.0-alpha (development baseline; not tagged)
+
+Historical development baseline merged after `v0.5.0-alpha`; it was not tagged
+before the v0.7 integration work began. See
 [`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md) for
 a narrative overview and
 [`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the

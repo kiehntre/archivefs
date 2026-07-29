@@ -3697,6 +3697,44 @@ mod tests {
             .unwrap_or_else(|| panic!("no persisted archive with relative_path {relative_path}"))
     }
 
+    fn create_representative_older_database(path: &Path, schema_version: usize) {
+        assert!(matches!(schema_version, 3 | 4));
+        let mut connection = open_connection(path).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..schema_version]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_folders \
+                 (id, path, first_seen_at, last_seen_in_config_at) \
+                 VALUES (1, ?1, 'old', 'old')",
+                [b"/example/roms".as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO archives \
+                 (id, source_folder_id, relative_path, absolute_path_cached, file_name_cached, \
+                  archive_kind, display_name, normalized_name, last_known_health, first_seen_at, \
+                  last_seen_at, created_at, updated_at) \
+                 VALUES (1, 1, ?1, ?2, ?3, 'rvz', 'ZooCube', 'zoocube', 'Present', \
+                         'old', 'old', 'old', 'old')",
+                params![
+                    b"ZooCube.rvz".as_slice(),
+                    b"/example/roms/ZooCube.rvz".as_slice(),
+                    b"ZooCube.rvz".as_slice()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO platform_assignments \
+                 (archive_id, platform, source, confidence, is_current, assigned_at) \
+                 VALUES (1, 'GameCube', 'manual', 'exact', 1, 'old')",
+                [],
+            )
+            .unwrap();
+        connection.close().unwrap();
+    }
+
     // -----------------------------------------------------------------
     // Unknown-platform classification (`persisted_archive_has_unknown_platform`).
     // -----------------------------------------------------------------
@@ -4006,6 +4044,75 @@ mod tests {
         );
 
         second.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v05_schema_upgrades_additively_and_preserves_manual_platform() {
+        let root = temp_dir("v05-upgrade");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 3);
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].archive_kind, "rvz");
+        assert_eq!(archives[0].platform.as_deref(), Some("GameCube"));
+        assert_eq!(archives[0].platform_source.as_deref(), Some("manual"));
+        let sources = database.list_source_folders().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].assigned_platform, None);
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v06_schema_upgrades_additively_and_preserves_manual_platform() {
+        let root = temp_dir("v06-upgrade");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 4);
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        let archive = &database.load_archives().unwrap()[0];
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(archive.platform_source.as_deref(), Some("manual"));
+        assert_eq!(
+            database.list_source_folders().unwrap()[0].assigned_platform,
+            None
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_schema_contains_no_cheat_catalogue_journal_or_backup_tables() {
+        let root = temp_dir("library-schema-boundary");
+        let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let mut statement = database
+            .connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "archive_scan_observations",
+                "archives",
+                "platform_aliases",
+                "platform_assignments",
+                "scan_runs",
+                "schema_migrations",
+                "source_folders",
+            ]
+        );
+        drop(statement);
+        database.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 

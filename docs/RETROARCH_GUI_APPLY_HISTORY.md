@@ -2,7 +2,8 @@
 
 ArchiveFS can connect an eligible RetroArch trusted-catalogue match to the
 shared transaction engine. This is a narrow cheat-file workflow, not a general
-mod installer. PCSX2 and Dolphin remain preview-only.
+mod installer. PCSX2 remains preview-only. Dolphin and Xenia have separate,
+verified transaction paths documented with their own workflows.
 
 ## Materialized source and eligibility
 

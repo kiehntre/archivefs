@@ -1,5 +1,8 @@
 # ArchiveFS Patch & Cheat Manager Design
 
+> Historical Phase 1 design record. Its implementation-status statements are
+> preserved for provenance and do not describe the current v0.7 workspace.
+
 ## Status and Scope
 
 This document defines the future architecture and records the current Phase 1 implementation boundary. It does not authorize a database migration or any change to ArchiveFS mount behavior.

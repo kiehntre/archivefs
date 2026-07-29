@@ -81,8 +81,8 @@ collection. Manually verify:
 4. GameCube shows both Animal Crossing and ZooCube.
 5. The Cheats & Mods chooser shows both items and starts on GameCube for
    Dolphin.
-6. ZooCube states that exact RVZ Game ID extraction is unavailable instead of
-   disappearing.
+6. ZooCube reports the bounded RVZ identity result honestly; an unreadable or
+   unsupported layout remains visible and reaches a terminal state.
 7. At normal desktop size and 1024×600, counters remain horizontal and at
    least two complete archive rows are immediately visible with no bottom
    overlay.

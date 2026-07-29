@@ -114,7 +114,12 @@ jobs:
         run: echo "No additional apt packages required to build archivefs-gui; see workflow comments for why."
 
       - name: Build release binaries
-        run: cargo build --workspace --release --locked
+        run: |
+          # Rust panic locations otherwise retain the absolute checkout and
+          # Cargo registry paths. Remap the runner home to a stable neutral
+          # prefix so release binaries do not disclose build-machine paths.
+          export RUSTFLAGS="--remap-path-prefix=${HOME}=/build-home ${RUSTFLAGS:-}"
+          cargo build --workspace --release --locked
 
       - name: Assemble release bundle
         run: |
@@ -154,7 +159,12 @@ jobs:
           done
           shopt -u nullglob
 
-          tar -czf "${BUNDLE}.tar.gz" "$BUNDLE"
+          chmod 755 "$BUNDLE" "$BUNDLE/${BIN_CLI}" "$BUNDLE/${BIN_GUI}" "$BUNDLE/install.sh"
+          find "$BUNDLE" -maxdepth 1 -type f \
+            ! -name "$BIN_CLI" ! -name "$BIN_GUI" ! -name install.sh \
+            -exec chmod 644 {} +
+
+          tar --owner=0 --group=0 --numeric-owner -czf "${BUNDLE}.tar.gz" "$BUNDLE"
 
       - name: Generate checksums
         run: |

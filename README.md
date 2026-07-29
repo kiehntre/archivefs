@@ -15,27 +15,12 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** `v0.5.0-alpha` is tagged and released - a hardening
-release (mount lifecycle postcondition checks, transactional catalogue
-refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
-GUI and a first-class Cheats & Mods workspace spanning **three read-only
-emulator adapters**: RetroArch, PCSX2, and Dolphin. `v0.6.0-alpha` is
-**prepared but not yet tagged**, adding a shared verified game identity
-system, a shared read-only preview/conflict model, a shared safe
-apply/backup/journal/rollback foundation, a working RetroArch GUI
-apply/history/rollback flow, RetroArch trusted-catalogue download and
-management, Recently Found, Mega Drive loose-ROM recognition, and a reviewed
-Dolphin Gecko provider/install path. PCSX2 remains preview-only; adapter expansion is paused after Dolphin for
-now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
-[`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md)
-for what's actually new and what remains unavailable, and
-[`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the
-manual acceptance checklist. The workspace version in `Cargo.toml` now
-reads `0.6.0-alpha` in preparation for tagging, but **no `v0.6.0-alpha` Git
-tag exists yet** - a real manual QA pass on Nobara against
-`docs/MANUAL_QA_v0.6.0-alpha.md` is the sole remaining blocker; see
-[`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) for the current
-go/no-go checklist.
+**Release status:** `v0.5.0-alpha` is the latest tagged release. The current
+workspace is the untagged `v0.7.0-alpha` integration candidate. It adds direct
+game-image discovery, shared platform-first navigation and source platform
+assignment, plus explicit Dolphin Gecko and Xenia Canary patch workflows.
+RetroArch, Dolphin, and Xenia use confirmed transaction paths; PCSX2 remains
+read-only. Manual QA and the release gate must pass before a tag is created.
 
 ## Principles
 
@@ -61,7 +46,10 @@ user-facing version at
 
 ## What ArchiveFS does today
 
-- Safely scans absolute, non-symlinked configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping symlink/special-file entries and obvious split-archive continuation parts, with bounded traversal).
+- Safely scans absolute, non-symlinked configured source folders for supported
+  archives (`.zip`, `.7z`, `.rar`) and supported direct game images, including
+  GameCube/Wii `.iso`, `.gcm`, `.gcz`, `.rvz`, `.wbfs`, and `.ciso`. Scanning
+  is bounded and read-only; images are never mounted, converted, or modified.
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
 - Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. Catalogue reports and previews use an explicit read-only open; `database-check` additionally distinguishes hot-header evidence, zeroed/truncated non-hot journals, malformed headers, and recovery-required read-only failures without creating, migrating, repairing, or checkpointing anything.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
@@ -162,9 +150,9 @@ user-facing version at
   remains a separate step from installation. PCSX2 remains preview-only;
   Dolphin's explicit Gecko flow can create or update one exact GameSettings
   INI and roll it back.
-- No broad multi-emulator support yet - PCSX2, RetroArch, and Dolphin are the
-  only emulators with any patch/cheat preview or inventory today, and none is
-  launched or configured by these read-only workflows.
+- No broad multi-emulator support yet - PCSX2, RetroArch, Dolphin, and Xenia
+  are the only emulators with patch/cheat workflows today, and ArchiveFS never
+  launches an emulator.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
@@ -272,8 +260,11 @@ There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pa
   facilities (`/proc/self/mountinfo`, FUSE-style mount tools, `inotify` via
   the `notify` crate). macOS and Windows are not supported.
 - **Archive formats:** `.zip`, `.7z`, and `.rar` (with split-RAR
-  continuation-part skipping). No other archive formats are currently
-  detected or mounted.
+  continuation-part skipping).
+- **Direct game images:** `.iso`, `.gcm`, `.gcz`, `.rvz`, `.wbfs`, and
+  `.ciso` for GameCube/Wii, plus the existing platform-specific loose-image
+  formats. Direct images are library items; archive mounting remains limited
+  to the archive formats above.
 - **Mount backend:** `ratarmount` only, invoked as an external tool - not
   bundled, must be installed and on `PATH` separately.
 - **Desktop GUI:** requires a running X11 or Wayland session; there is no
@@ -551,8 +542,8 @@ Platforms:
 - [Duplicate detector](docs/duplicate-detector.md)
 - [Security model](docs/security.md)
 - [JSON API](docs/json-api.md)
-- [v0.6.0-alpha release notes (in preparation, not yet released)](docs/RELEASE_NOTES_v0.6.0-alpha.md)
-- [v0.6.0-alpha manual QA plan](docs/MANUAL_QA_v0.6.0-alpha.md)
+- [Historical untagged v0.6 development notes](docs/RELEASE_NOTES_v0.6.0-alpha.md)
+- [Historical v0.6 manual QA plan](docs/MANUAL_QA_v0.6.0-alpha.md)
 - [v0.5.0-alpha release notes](docs/RELEASE_NOTES_v0.5.0-alpha.md)
 - [v0.5.0-alpha manual QA plan](docs/MANUAL_QA_v0.5.0-alpha.md)
 - [Adapter support matrix](docs/ADAPTER_SUPPORT_MATRIX.md)
