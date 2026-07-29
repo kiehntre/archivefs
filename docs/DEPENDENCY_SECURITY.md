@@ -104,6 +104,21 @@ X11 startup, Wayland startup when available, Gamer View, search, platform
 cards, local PNG artwork, file dialogs, clipboard copy/paste, Advanced View,
 PCSX2 recognition, and rendering stability using the exact release binary.
 
+### Manual QA result
+
+The exact verified release artifact was extracted under `/tmp` and launched
+through the user's Sunshine X display. The user confirmed that X11 startup,
+Gamer View, search filtering, platform cards, built-in artwork fallback, the
+file dialog, clipboard copy/paste, Advanced View and return navigation, PCSX2
+profile recognition, and general rendering/stability all passed.
+
+The user's custom-artwork preference was empty and no local `gamecube.png` was
+available, so a valid custom PNG could not be rendered during this manual run.
+The safe built-in fallback was confirmed manually, while valid/malformed/cache
+PNG behavior remains covered by the focused GUI tests. Native Wayland startup
+was unavailable in the Sunshine session, which exposed only X display `:0`.
+Neither limitation is reported as a manual pass.
+
 ## Remaining limitations
 
 - The egui compatibility entry points are deprecated and should be migrated in
