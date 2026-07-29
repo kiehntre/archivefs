@@ -256,6 +256,7 @@ mod tests {
 
     fn identity() -> Pcsx2GameIdentity {
         Pcsx2GameIdentity {
+            archive_path: std::path::PathBuf::from("/games/game.iso"),
             title: "Game".to_string(),
             region: Some("NTSC-U".to_string()),
             serial: Some("SLUS-20312".to_string()),

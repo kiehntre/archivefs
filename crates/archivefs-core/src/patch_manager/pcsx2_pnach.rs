@@ -162,14 +162,12 @@ pub fn parse_pnach_document(bytes: &[u8]) -> Result<PnachDocument, PnachDocument
                 ));
             }
             open = Some((id.to_string(), line_number));
-        } else if trimmed == BLOCK_END {
-            if open.take().is_none() {
-                return Err(error(
-                    PnachDocumentErrorKind::MalformedManagedBlock,
-                    Some(line_number),
-                    "managed block end has no matching start",
-                ));
-            }
+        } else if trimmed == BLOCK_END && open.take().is_none() {
+            return Err(error(
+                PnachDocumentErrorKind::MalformedManagedBlock,
+                Some(line_number),
+                "managed block end has no matching start",
+            ));
         }
     }
     if let Some((_, line)) = open {
