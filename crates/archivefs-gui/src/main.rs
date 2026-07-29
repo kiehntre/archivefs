@@ -9738,6 +9738,20 @@ impl eframe::App for ArchiveFsApp {
                 }
 
                 if self.view == MainView::CheatsMods {
+                    // Manual QA finding: opening Cheats & Mods from
+                    // Gamer View's selected-game panel had no obvious way
+                    // back - only this page's own "Open Library" button,
+                    // deep in its content, which isn't a substitute for a
+                    // clear, always-visible "back to games" affordance in
+                    // the mode whose entire premise is "no navigation
+                    // puzzle." Advanced View is unaffected: it still
+                    // reaches this page only through the sidebar and
+                    // already has its own established navigation.
+                    if self.ui_mode == GuiMode::GamerView
+                        && ui.button("\u{2190} Back to games").clicked()
+                    {
+                        self.view = MainView::Library;
+                    }
                     let live = match &self.state {
                         LoadState::Ready(data) => Some(data.as_ref()),
                         LoadState::Loading { previous, .. } => previous.as_deref(),
@@ -31246,6 +31260,86 @@ mod tests {
                  exactly like the named-platform and Unknown chips"
             );
         }
+    }
+
+    #[test]
+    fn cheats_mods_opened_from_gamer_view_has_an_obvious_back_to_games_button() {
+        // Manual QA finding: no obvious way back from Cheats & Mods when
+        // it's opened from Gamer View's selected-game panel.
+        let mut app = app_with_cheats_mods_context();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::CheatsMods;
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let output = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+        assert!(
+            rendered_text_contains(&output, "Back to games"),
+            "Gamer View's Cheats & Mods must show an obvious back-to-games button"
+        );
+
+        let Some(center) = find_exact_text_center(&output, "\u{2190} Back to games") else {
+            panic!("back button not found for click simulation");
+        };
+        let click_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(click_input, |ctx| app.update(ctx, &mut frame));
+        assert_eq!(
+            app.view,
+            MainView::Library,
+            "clicking Back to games must return to the Gamer View game list"
+        );
+    }
+
+    #[test]
+    fn advanced_view_cheats_mods_has_no_back_to_games_button() {
+        // The button is Gamer-View-only - Advanced View already has its
+        // own established sidebar navigation and must not gain a new,
+        // redundant control.
+        let mut app = app_with_cheats_mods_context();
+        app.ui_mode = GuiMode::AdvancedView;
+        app.view = MainView::CheatsMods;
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+        assert!(!rendered_text_contains(&output, "Back to games"));
     }
 
     #[test]
