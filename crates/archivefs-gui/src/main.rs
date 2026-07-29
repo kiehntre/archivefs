@@ -13574,20 +13574,28 @@ fn show_sources_page(
                                         if let Some(current) = &view.assigned_platform {
                                             ui.label(format!("Current: {current}"));
                                         }
-                                        for platform in
-                                            ["GameCube", "Xbox360", "PS2", "PS3", "Xbox"]
-                                        {
-                                            if ui
-                                                .add_enabled(!busy, egui::Button::new(platform))
-                                                .clicked()
-                                            {
-                                                action = Some(SourcesPageAction::AssignPlatform {
-                                                    path: view.path.clone(),
-                                                    platform: platform.to_string(),
-                                                });
-                                                ui.close();
-                                            }
-                                        }
+                                        egui::ScrollArea::vertical()
+                                            .id_salt(("sources_assign_platform_menu", &view.path))
+                                            .max_height(240.0)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for platform in canonical_platform_names() {
+                                                    if ui
+                                                        .add_enabled(
+                                                            !busy,
+                                                            egui::Button::new(platform),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        action =
+                                                            Some(SourcesPageAction::AssignPlatform {
+                                                                path: view.path.clone(),
+                                                                platform: platform.to_string(),
+                                                            });
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
                                         ui.small("Incompatible direct images remain Unknown.");
                                     });
                                 },
@@ -15000,34 +15008,37 @@ fn show_mount_page(
     prune_mount_queue(queue, &data.records);
     let attempted = queued_pending_paths(queue, &data.records);
 
-    let platform_options = ["GameCube", "Xbox360", "PS2", "PS3", "Xbox", "Unknown"];
-    egui::ScrollArea::horizontal()
-        .id_salt("mount_platform_strip")
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(platform.is_none(), "All").clicked() {
-                    *platform = None;
-                }
-                for candidate in platform_options {
-                    let count = data
-                        .records
-                        .iter()
-                        .filter(|record| {
-                            record.identity.platform.as_deref().unwrap_or("Unknown") == candidate
-                        })
-                        .count();
-                    if ui
-                        .selectable_label(
-                            platform.as_deref() == Some(candidate),
-                            format!("{candidate} ({count})"),
-                        )
-                        .clicked()
-                    {
-                        *platform = Some(candidate.to_string());
-                    }
-                }
-            });
-        });
+    let platform_counts = detected_platform_counts(
+        data.records
+            .iter()
+            .map(|record| record.identity.platform.as_deref()),
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui.selectable_label(platform.is_none(), "All").clicked() {
+            *platform = None;
+        }
+        for (candidate, count) in &platform_counts.named {
+            if ui
+                .selectable_label(
+                    platform.as_deref() == Some(candidate.as_str()),
+                    format!("{candidate} ({count})"),
+                )
+                .clicked()
+            {
+                *platform = Some(candidate.clone());
+            }
+        }
+        if platform_counts.unknown > 0
+            && ui
+                .selectable_label(
+                    platform.as_deref() == Some("Unknown"),
+                    format!("Unknown ({})", platform_counts.unknown),
+                )
+                .clicked()
+        {
+            *platform = Some("Unknown".to_string());
+        }
+    });
 
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -16746,12 +16757,6 @@ enum BeginnerCheatStatus {
     IdentityUnavailable {
         detail: String,
     },
-    /// The archive's platform is recognised, but ArchiveFS has no cheat
-    /// adapter for it yet - distinct from `NoCompatibleCheatsFound` (which
-    /// means the adapter ran and genuinely found nothing) and from Unknown.
-    PlatformNotYetSupported {
-        platform: String,
-    },
 }
 
 impl BeginnerCheatStatus {
@@ -16772,9 +16777,6 @@ impl BeginnerCheatStatus {
             Self::CouldNotCheckForCheats { .. } => "Could not check for cheats".to_string(),
             Self::UsingSavedResultsWhileOffline => "Using saved results while offline".to_string(),
             Self::IdentityUnavailable { .. } => "Exact Game ID unavailable".to_string(),
-            Self::PlatformNotYetSupported { platform } => {
-                format!("{platform} recognised - cheat support not available yet")
-            }
         }
     }
 
@@ -16790,7 +16792,6 @@ impl BeginnerCheatStatus {
             Self::CouldNotCheckForCheats { .. } | Self::IdentityUnavailable { .. } => {
                 widgets::StatusTone::Blocked
             }
-            Self::PlatformNotYetSupported { .. } => widgets::StatusTone::Info,
         }
     }
 }
@@ -17713,6 +17714,40 @@ fn platform_is_dolphin(platform: Option<&str>) -> bool {
             .iter()
             .any(|candidate| platform.eq_ignore_ascii_case(candidate))
     })
+}
+
+/// Every distinct platform actually present with a non-zero count, sorted
+/// alphabetically, plus a separate `Unknown` count - the shared "All /
+/// <platform> (count) / Unknown" data behind the platform strip on
+/// Library and Mount. Derived purely from live per-archive platform
+/// strings (never a fixed list), so a canonical platform the registry
+/// recognises but that has zero archives never clutters the strip, and a
+/// platform with real archives is never hidden just because ArchiveFS has
+/// no cheat adapter for it. `None` (no assigned platform) counts as
+/// Unknown, matching `persisted_archive_has_unknown_platform`.
+struct DetectedPlatformCounts {
+    named: Vec<(String, usize)>,
+    unknown: usize,
+}
+
+fn detected_platform_counts<'a>(
+    platforms: impl Iterator<Item = Option<&'a str>>,
+) -> DetectedPlatformCounts {
+    let mut counts: std::collections::BTreeMap<&'a str, usize> = std::collections::BTreeMap::new();
+    let mut unknown = 0_usize;
+    for platform in platforms {
+        match platform {
+            Some(platform) => *counts.entry(platform).or_default() += 1,
+            None => unknown += 1,
+        }
+    }
+    DetectedPlatformCounts {
+        named: counts
+            .into_iter()
+            .map(|(platform, count)| (platform.to_string(), count))
+            .collect(),
+        unknown,
+    }
 }
 
 fn platform_is_gamecube(platform: Option<&str>) -> bool {
@@ -22262,9 +22297,15 @@ fn show_cheats_mods_page(
             CheatEmulatorAdapter::Unsupported => {
                 widgets::banner(
                     ui,
-                    "Unsupported platform",
-                    "ArchiveFS has no Cheats & Mods adapter for this archive's platform. Assign a supported platform in Library if the catalogue metadata is wrong.",
-                    widgets::StatusTone::Warning,
+                    &match workflow.platform.as_deref() {
+                        Some(platform) => format!("{platform} recognised"),
+                        None => "Platform not recognised".to_string(),
+                    },
+                    match workflow.platform.as_deref() {
+                        Some(_) => "This platform is recognised, but cheat support is not available yet. Assign a different platform in Library if this is wrong.",
+                        None => "ArchiveFS could not determine this archive's platform, so no Cheats & Mods adapter can be chosen. Assign a platform in Library if you know it.",
+                    },
+                    widgets::StatusTone::Info,
                 );
             }
         }
@@ -25180,47 +25221,53 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
-    let platform_options = ["GameCube", "Xbox360", "PS2", "PS3", "Xbox", "Unknown"];
-    egui::ScrollArea::horizontal()
-        .id_salt("library_platform_strip")
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let all_selected = library_filters.platform.is_none();
-                if ui
-                    .selectable_label(all_selected, format!("All ({})", merged_rows.len()))
-                    .clicked()
-                    && !all_selected
-                {
-                    library_filters.platform = None;
-                    *selected_archive = None;
-                    filtered_rows.take();
-                }
-                for platform in platform_options {
-                    let count = merged_rows
-                        .iter()
-                        .filter(|row| {
-                            if platform == "Unknown" {
-                                row.unknown_platform
-                            } else {
-                                !row.unknown_platform && row.platform == platform
-                            }
-                        })
-                        .count();
-                    let selected = library_filters.platform.as_deref() == Some(platform);
-                    if ui
-                        .selectable_label(selected, format!("{platform} ({count})"))
-                        .clicked()
-                        && !selected
-                    {
-                        library_filters.platform = Some(platform.to_string());
-                        *selected_archive = None;
-                        selected_archives.clear();
-                        filtered_rows.take();
-                    }
-                }
-            });
-        });
+    let platform_counts = detected_platform_counts(
+        merged_rows
+            .iter()
+            .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+    );
+    // Wrapping, not a fixed-width strip or a horizontal scroll area: a
+    // real library can detect dozens of distinct platforms, and every one
+    // of them with a non-zero count must stay reachable without scrolling
+    // past visible controls (unlike the previous fixed six-tab list).
+    ui.horizontal_wrapped(|ui| {
+        let all_selected = library_filters.platform.is_none();
+        if ui
+            .selectable_label(all_selected, format!("All ({})", merged_rows.len()))
+            .clicked()
+            && !all_selected
+        {
+            library_filters.platform = None;
+            *selected_archive = None;
+            filtered_rows.take();
+        }
+        for (platform, count) in &platform_counts.named {
+            let selected = library_filters.platform.as_deref() == Some(platform.as_str());
+            if ui
+                .selectable_label(selected, format!("{platform} ({count})"))
+                .clicked()
+                && !selected
+            {
+                library_filters.platform = Some(platform.clone());
+                *selected_archive = None;
+                selected_archives.clear();
+                filtered_rows.take();
+            }
+        }
+        if platform_counts.unknown > 0 {
+            let selected = library_filters.platform.as_deref() == Some("Unknown");
+            if ui
+                .selectable_label(selected, format!("Unknown ({})", platform_counts.unknown))
+                .clicked()
+                && !selected
+            {
+                library_filters.platform = Some("Unknown".to_string());
+                *selected_archive = None;
+                selected_archives.clear();
+                filtered_rows.take();
+            }
+        }
+    });
     ui.add_space(4.0);
     // Natural-height summary: it may grow only with content visible now;
     // no persisted panel height can starve the result table on a later
