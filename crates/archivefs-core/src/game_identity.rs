@@ -34,6 +34,33 @@ const GAMECUBE_MAGIC_OFFSET: usize = 0x1c;
 const WII_MAGIC: [u8; 4] = [0x5d, 0x1c, 0x9e, 0xa3];
 const GAMECUBE_MAGIC: [u8; 4] = [0xc2, 0x33, 0x9f, 0x3d];
 
+/// WIA/RVZ file format, per `docs/WiaAndRvz.md` in the Dolphin repository:
+/// `wia_file_head_t` (0x48 bytes, offset 0x0) is followed immediately by
+/// `wia_disc_t` (offset 0x48), whose first four `u32` fields
+/// (`disc_type`, `compression`, `compr_level`, `chunk_size`) precede an
+/// uncompressed `u8 dhead[0x80]` field holding the first 0x80 bytes of the
+/// original disc image - the same bytes `inspect_dolphin_header` already
+/// reads from offset 0 of a direct ISO. All WIA/RVZ integers are big
+/// endian. Only these bounded, always-uncompressed header bytes are ever
+/// read; the compressed disc body is never touched.
+const RVZ_MAGIC: [u8; 4] = *b"RVZ\x01";
+const WIA_DISC_TYPE_OFFSET: u64 = 0x48;
+const WIA_DHEAD_OFFSET: u64 = 0x58;
+const WIA_DISC_TYPE_GAMECUBE: u32 = 1;
+const WIA_DISC_TYPE_WII: u32 = 2;
+
+/// The uncompressed, sparse-block GameCube/Wii `.ciso` format used by
+/// several backup/dumping tools (distinct from the unrelated PSP "CISO"
+/// compressed format). Layout confirmed against Dolphin's `CISOBlob.cpp`
+/// reader: a fixed 0x8000-byte header (4-byte magic, `u32` little-endian
+/// block size, then a `0x7FF8`-byte block-presence map, one byte per
+/// possible block), followed by only the *present* blocks stored back to
+/// back in original order - no compression, so the disc header block, if
+/// present, can be located and read directly.
+const CISO_MAGIC: [u8; 4] = *b"CISO";
+const CISO_HEADER_SIZE: u64 = 0x8000;
+const CISO_MAP_OFFSET: u64 = 8;
+
 /// Xbox 360 XEX2 module header - see `xex2_header` in Xenia's
 /// `xex2_info.h`. Only the unencrypted, uncompressed header is ever read;
 /// the compressed/encrypted module body is never touched.
@@ -179,6 +206,12 @@ pub enum IdentityImageFormat {
     LooseCartridgeRom,
     Xex,
     ZipContainingXex,
+    /// WIA/RVZ (`.rvz`) - identity is read from the documented uncompressed
+    /// `wia_disc_t.dhead` header field, never from the compressed disc body.
+    Rvz,
+    /// The uncompressed, sparse-block GameCube/Wii `.ciso` format (distinct
+    /// from PSP CISO) - identity is read from the first stored block only.
+    Ciso,
     Deferred,
     Unsupported,
 }
@@ -344,11 +377,17 @@ fn inspect_game_identity_with_platform_trust(
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
-        "iso" if platform != IdentityPlatform::Xbox360 => inspect_direct_iso(&mut report),
+        "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => inspect_direct_iso(&mut report),
         "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report),
         "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report),
         "zip" => inspect_zip_iso(&mut report),
-        "chd" | "cso" | "rvz" | "wbfs" | "7z" | "rar" => {
+        "rvz" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
+            inspect_rvz(&mut report);
+        }
+        "ciso" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
+            inspect_ciso(&mut report);
+        }
+        "chd" | "cso" | "rvz" | "wbfs" | "ciso" | "gcz" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
             add_unavailable(
                 &mut report,
@@ -359,7 +398,7 @@ fn inspect_game_identity_with_platform_trust(
         _ => add_unavailable(
             &mut report,
             IdentityStatus::Unsupported,
-            "only direct ISO, a single ISO inside ZIP, direct XEX, and a single XEX inside ZIP are supported",
+            "only direct ISO/GCM, RVZ and CISO for GameCube/Wii, a single ISO inside ZIP, direct XEX, and a single XEX inside ZIP are supported",
         ),
     }
     report
@@ -1066,7 +1105,7 @@ fn inspect_iso_source(
 ) {
     match report.platform {
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
-            inspect_dolphin_header(report, source, member_path, member_index)
+            inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
         IdentityPlatform::PlayStation2 => {
             inspect_ps2_iso(report, source, member_path, member_index)
@@ -1078,14 +1117,19 @@ fn inspect_iso_source(
     }
 }
 
+/// `header_offset` is the absolute byte offset of the 0x20-byte Dolphin
+/// disc header within `source` - `0` for a direct ISO/GCM or a ZIP-member
+/// ISO, or the format-specific location of an embedded copy of those same
+/// bytes (e.g. RVZ's `wia_disc_t.dhead`, CISO's first stored block).
 fn inspect_dolphin_header(
     report: &mut GameIdentityReport,
     source: &mut dyn ByteSource,
     member_path: Option<Vec<u8>>,
     member_index: Option<usize>,
+    header_offset: u64,
 ) {
     let mut header = [0_u8; DOLPHIN_HEADER_BYTES];
-    if let Err(error) = source.read_exact_at(0, &mut header) {
+    if let Err(error) = source.read_exact_at(header_offset, &mut header) {
         let status = if error.kind() == io::ErrorKind::UnexpectedEof {
             IdentityStatus::Invalid
         } else {
@@ -1203,6 +1247,170 @@ fn inspect_dolphin_header(
         "raw region code byte; no locale name inferred",
     );
     report.complete = true;
+}
+
+/// RVZ (and WIA-layout-compatible) direct identity: reads only the fixed,
+/// documented, always-uncompressed header region - never the compressed
+/// disc body. See the `RVZ_MAGIC`/`WIA_*` constants for the exact layout
+/// and source. A magic or `disc_type` mismatch is reported as `Invalid`
+/// ("malformed format" in the beginner-facing states this maps to); a
+/// missing/unrecognised inner disc magic (checked by
+/// `inspect_dolphin_header` itself) is reported the same way.
+fn inspect_rvz(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::Rvz;
+    let file = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut source = FileSource {
+        file,
+        len,
+        bytes_read: 0,
+    };
+    let mut magic = [0_u8; 4];
+    if source.read_exact_at(0, &mut magic).is_err() {
+        add_unavailable(report, IdentityStatus::Invalid, "RVZ file header is truncated");
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    if magic != RVZ_MAGIC {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "RVZ magic bytes do not match the documented wia_file_head_t header",
+        );
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    let mut disc_type_bytes = [0_u8; 4];
+    if source
+        .read_exact_at(WIA_DISC_TYPE_OFFSET, &mut disc_type_bytes)
+        .is_err()
+    {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "RVZ wia_disc_t header is truncated",
+        );
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    let disc_type = u32::from_be_bytes(disc_type_bytes);
+    let expected_disc_type = match report.platform {
+        IdentityPlatform::GameCube => WIA_DISC_TYPE_GAMECUBE,
+        IdentityPlatform::Wii => WIA_DISC_TYPE_WII,
+        _ => 0,
+    };
+    if disc_type != expected_disc_type {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "RVZ wia_disc_t.disc_type does not match the expected platform",
+        );
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    inspect_dolphin_header(report, &mut source, None, None, WIA_DHEAD_OFFSET);
+    report.bytes_read = source.bytes_read();
+}
+
+/// GameCube/Wii `.ciso` direct identity: reads only the fixed 0x8000-byte
+/// header (magic, block size, block-presence map) plus, if present, the
+/// first stored block - the disc header block is never compressed in this
+/// format, so no decompression is required. See the `CISO_*` constants for
+/// the exact layout and source.
+fn inspect_ciso(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::Ciso;
+    let file = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut source = FileSource {
+        file,
+        len,
+        bytes_read: 0,
+    };
+    let mut magic = [0_u8; 4];
+    if source.read_exact_at(0, &mut magic).is_err() {
+        add_unavailable(report, IdentityStatus::Invalid, "CISO file header is truncated");
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    if magic != CISO_MAGIC {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "CISO magic bytes do not match the documented CISO header",
+        );
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    let mut block_size_bytes = [0_u8; 4];
+    if source.read_exact_at(4, &mut block_size_bytes).is_err() {
+        add_unavailable(report, IdentityStatus::Invalid, "CISO header is truncated");
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    let block_size = u32::from_le_bytes(block_size_bytes);
+    if (block_size as u64) < DOLPHIN_HEADER_BYTES as u64 {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "CISO block size is smaller than the disc header",
+        );
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    let mut first_map_byte = [0_u8; 1];
+    if source
+        .read_exact_at(CISO_MAP_OFFSET, &mut first_map_byte)
+        .is_err()
+    {
+        add_unavailable(report, IdentityStatus::Invalid, "CISO block map is truncated");
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    if first_map_byte[0] != 1 {
+        push_with_source(
+            report,
+            IdentityKind::DolphinGameId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "CISO block-presence map, block 0",
+            "the disc-header block is not stored in this CISO image",
+        );
+        report.bytes_read = source.bytes_read();
+        return;
+    }
+    // Block 0, if present, is always the first block physically stored
+    // (the map's running "used" count starts at 0), so its data begins
+    // immediately after the fixed-size header - no need to scan the rest
+    // of the map to locate it.
+    inspect_dolphin_header(report, &mut source, None, None, CISO_HEADER_SIZE);
+    report.bytes_read = source.bytes_read();
 }
 
 fn inspect_ps2_iso(
@@ -2214,6 +2422,158 @@ mod tests {
         assert_eq!(report.bytes_read, DOLPHIN_HEADER_BYTES as u64);
         assert_eq!(report.archive_members_inspected, 1);
         assert_eq!(report.nested_container_depth, 1);
+    }
+
+    #[test]
+    fn direct_gcm_is_verified_exactly_like_direct_iso() {
+        let directory = FixtureDir::new("gcm");
+        let path = write_fixture(
+            &directory,
+            "Army Men - RTS (USA).gcm",
+            &dolphin_fixture(IdentityPlatform::GameCube, b"GA2E7D", 0),
+        );
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        assert_eq!(report.verified_dolphin_game_id(), Some("GA2E7D"));
+        assert_eq!(report.bytes_read, DOLPHIN_HEADER_BYTES as u64);
+        assert!(report.complete);
+    }
+
+    fn rvz_fixture(disc_type: u32, dhead: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; (WIA_DHEAD_OFFSET as usize) + 0x80];
+        bytes[..4].copy_from_slice(&RVZ_MAGIC);
+        bytes[WIA_DISC_TYPE_OFFSET as usize..][..4].copy_from_slice(&disc_type.to_be_bytes());
+        let dhead_start = WIA_DHEAD_OFFSET as usize;
+        bytes[dhead_start..dhead_start + dhead.len()].copy_from_slice(dhead);
+        bytes
+    }
+
+    #[test]
+    fn rvz_recovers_exact_game_id_from_the_uncompressed_header() {
+        let directory = FixtureDir::new("rvz");
+        let dhead = dolphin_fixture(IdentityPlatform::GameCube, b"GZ2E01", 1);
+        let path = write_fixture(
+            &directory,
+            "ZooCube (USA).rvz",
+            &rvz_fixture(WIA_DISC_TYPE_GAMECUBE, &dhead),
+        );
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        assert_eq!(report.format, IdentityImageFormat::Rvz);
+        assert_eq!(report.verified_dolphin_game_id(), Some("GZ2E01"));
+        assert_eq!(report.verified_dolphin_revision(), Some(1));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn rvz_with_wrong_magic_or_disc_type_is_invalid_not_stuck() {
+        let directory = FixtureDir::new("rvz-bad");
+        let dhead = dolphin_fixture(IdentityPlatform::GameCube, b"GZ2E01", 1);
+
+        let mut bad_magic = rvz_fixture(WIA_DISC_TYPE_GAMECUBE, &dhead);
+        bad_magic[..4].copy_from_slice(b"ZZZZ");
+        let path = write_fixture(&directory, "bad-magic.rvz", &bad_magic);
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        assert_eq!(report.verified_dolphin_game_id(), None);
+        assert!(report.complete || !report.evidence.is_empty());
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+
+        // disc_type says Wii while the catalogue platform hint says GameCube.
+        let wrong_type = rvz_fixture(WIA_DISC_TYPE_WII, &dhead);
+        let path = write_fixture(&directory, "wrong-type.rvz", &wrong_type);
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        assert_eq!(report.verified_dolphin_game_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn rvz_never_leaves_identity_pending() {
+        let directory = FixtureDir::new("rvz-final");
+        let dhead = dolphin_fixture(IdentityPlatform::GameCube, b"GZ2E01", 1);
+        let path = write_fixture(
+            &directory,
+            "final-state.rvz",
+            &rvz_fixture(WIA_DISC_TYPE_GAMECUBE, &dhead),
+        );
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        // Every evidence item reaches a terminal status - none is `Deferred`
+        // for an RVZ file that was actually decoded.
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|item| item.status != IdentityStatus::Deferred)
+        );
+    }
+
+    fn ciso_fixture(block_size: u32, block0_present: bool, dhead: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; CISO_HEADER_SIZE as usize + block_size as usize];
+        bytes[..4].copy_from_slice(&CISO_MAGIC);
+        bytes[4..8].copy_from_slice(&block_size.to_le_bytes());
+        if block0_present {
+            bytes[CISO_MAP_OFFSET as usize] = 1;
+            let data_start = CISO_HEADER_SIZE as usize;
+            bytes[data_start..data_start + dhead.len()].copy_from_slice(dhead);
+        }
+        bytes
+    }
+
+    #[test]
+    fn ciso_recovers_exact_game_id_from_the_first_stored_block() {
+        let directory = FixtureDir::new("ciso");
+        let dhead = dolphin_fixture(IdentityPlatform::GameCube, b"GC3E01", 0);
+        let path = write_fixture(
+            &directory,
+            "disc.ciso",
+            &ciso_fixture(2048, true, &dhead),
+        );
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        assert_eq!(report.format, IdentityImageFormat::Ciso);
+        assert_eq!(report.verified_dolphin_game_id(), Some("GC3E01"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn ciso_missing_first_block_reports_missing_not_stuck() {
+        let directory = FixtureDir::new("ciso-missing");
+        let dhead = dolphin_fixture(IdentityPlatform::GameCube, b"GC3E01", 0);
+        let path = write_fixture(
+            &directory,
+            "sparse.ciso",
+            &ciso_fixture(2048, false, &dhead),
+        );
+        let report = inspect_game_identity(&path, Some("GameCube"));
+        assert_eq!(report.verified_dolphin_game_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Missing)
+        );
+    }
+
+    #[test]
+    fn gcz_and_wbfs_remain_honestly_deferred_not_unsupported() {
+        let directory = FixtureDir::new("gcz-wbfs");
+        for extension in ["gcz", "wbfs"] {
+            let path = write_fixture(&directory, &format!("disc.{extension}"), b"whatever");
+            let report = inspect_game_identity(&path, Some("GameCube"));
+            assert_eq!(report.format, IdentityImageFormat::Deferred);
+            assert!(
+                report
+                    .evidence
+                    .iter()
+                    .any(|item| item.status == IdentityStatus::Deferred)
+            );
+        }
     }
 
     #[test]
