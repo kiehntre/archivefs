@@ -3191,6 +3191,15 @@ struct ArchiveFsApp {
     confirm_bulk_platform_action: Option<(Vec<PathBuf>, BulkPlatformActionKind)>,
     focus_bulk_platform_cancel: bool,
     bulk_platform_action_typed_count: String,
+    /// docs/PLATFORM_ARTWORK.md's custom-override directory - `None`
+    /// means built-in artwork only. Persisted independently (see
+    /// `load_custom_platform_artwork_directory`/
+    /// `save_custom_platform_artwork_directory`).
+    custom_platform_artwork_directory: Option<PathBuf>,
+    /// The Settings page's in-progress text-field value for the above -
+    /// never persisted directly; only what's confirmed via "Use this
+    /// directory" is.
+    custom_platform_artwork_directory_text: String,
 }
 
 impl ArchiveFsApp {
@@ -3333,6 +3342,10 @@ impl ArchiveFsApp {
             confirm_bulk_platform_action: None,
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
+            custom_platform_artwork_directory: load_custom_platform_artwork_directory(),
+            custom_platform_artwork_directory_text: load_custom_platform_artwork_directory()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -10291,6 +10304,8 @@ impl eframe::App for ArchiveFsApp {
                         mount_root,
                         busy,
                         &mut self.clipboard,
+                        &mut self.custom_platform_artwork_directory,
+                        &mut self.custom_platform_artwork_directory_text,
                     );
                     match action {
                         Some(SettingsPageAction::OpenConfigFolder) => {
@@ -10305,6 +10320,11 @@ impl eframe::App for ArchiveFsApp {
                         }
                         Some(SettingsPageAction::RescanRetroArchProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Some(SettingsPageAction::CustomArtworkDirectoryChanged) => {
+                            save_custom_platform_artwork_directory(
+                                self.custom_platform_artwork_directory.as_deref(),
+                            );
                         }
                         None => {}
                     }
@@ -23508,8 +23528,14 @@ enum SettingsPageAction {
     ValidateConfiguration,
     OpenDiagnostics,
     RescanRetroArchProfiles,
+    /// The custom platform artwork directory field changed (set or
+    /// cleared) - persist it. Never touched on any frame the field
+    /// wasn't actually edited, matching "persist only on an explicit
+    /// mode change" (the same rule `GuiMode` already follows).
+    CustomArtworkDirectoryChanged,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_settings_page(
     ui: &mut egui::Ui,
     database_state: &DatabaseState,
@@ -23518,6 +23544,8 @@ fn show_settings_page(
     mount_root: Option<&Path>,
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
+    custom_artwork_directory: &mut Option<PathBuf>,
+    custom_artwork_directory_text: &mut String,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
     widgets::page_header(
@@ -23780,7 +23808,66 @@ fn show_settings_page(
     });
 
     ui.add_space(theme::SECTION_GAP);
-    widgets::section_header(ui, "5. Intentionally unavailable", None);
+    widgets::section_header(
+        ui,
+        "5. Platform artwork",
+        Some(
+            "ArchiveFS ships its own original, offline platform artwork - no image is ever \
+             downloaded. Optionally point at a folder of your own SVG files, named by canonical \
+             platform identifier (e.g. gamecube.svg); a missing file always falls back to the \
+             built-in artwork. See docs/PLATFORM_ARTWORK.md.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Custom artwork directory:");
+            ui.text_edit_singleline(custom_artwork_directory_text);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Use this directory").clicked()
+                && !custom_artwork_directory_text.trim().is_empty()
+            {
+                *custom_artwork_directory =
+                    Some(PathBuf::from(custom_artwork_directory_text.trim()));
+                action = Some(SettingsPageAction::CustomArtworkDirectoryChanged);
+            }
+            if ui
+                .add_enabled(
+                    custom_artwork_directory.is_some(),
+                    egui::Button::new("Use built-in only"),
+                )
+                .clicked()
+            {
+                *custom_artwork_directory = None;
+                custom_artwork_directory_text.clear();
+                action = Some(SettingsPageAction::CustomArtworkDirectoryChanged);
+            }
+        });
+        match custom_artwork_directory {
+            Some(directory) => {
+                let gamecube_resolved =
+                    custom_platform_artwork_path(Some(directory), "gamecube").is_some();
+                ui.horizontal(|ui| {
+                    paint_platform_glyph(ui, "gamecube", 28.0);
+                    ui.label(format!(
+                        "Currently: {}. Example check (gamecube.svg): {}.",
+                        directory.display(),
+                        if gamecube_resolved {
+                            "found - would be used"
+                        } else {
+                            "not found - built-in artwork will be used"
+                        }
+                    ));
+                });
+            }
+            None => {
+                ui.weak("Currently: built-in artwork only.");
+            }
+        }
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "6. Intentionally unavailable", None);
     widgets::banner(
         ui,
         "Deferred",
@@ -28968,6 +29055,46 @@ fn save_gui_mode(mode: GuiMode) {
     let _ = std::fs::write(path, gui_mode_file_contents(mode));
 }
 
+/// The custom platform artwork directory preference - its own small file,
+/// following the exact same precedent as `gui_mode_config_path` (and, in
+/// turn, `~/.config/archivefs/emulator_profiles.toml`): a dedicated file
+/// per preference rather than a shared one, so one preference's write
+/// can never race or corrupt another's.
+fn platform_artwork_directory_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("archivefs")
+            .join("platform_artwork_directory.txt"),
+    )
+}
+
+/// A missing file, or one containing only whitespace, means "no custom
+/// directory configured" - not an error.
+fn load_custom_platform_artwork_directory() -> Option<PathBuf> {
+    let path = platform_artwork_directory_config_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Best-effort, matching `save_gui_mode`: a failure to persist never
+/// blocks the in-memory setting from taking effect for the rest of the
+/// session.
+fn save_custom_platform_artwork_directory(directory: Option<&Path>) {
+    let Some(path) = platform_artwork_directory_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let contents = directory
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_default();
+    let _ = std::fs::write(path, contents);
+}
+
 /// Gamer View's plain-language primary-action state for a selected game -
 /// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
 /// `MountState` variant name (finding #4); Advanced View keeps the
@@ -29171,50 +29298,68 @@ fn show_gamer_view(
             .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
     );
 
-    // Platform chips are a single full-width strip *above* the two-column
-    // split, not squeezed into the narrower left column - this both
-    // reduces how often they wrap onto extra lines (manual QA finding:
-    // "reduce the vertical space used by platform chips") and, just as
-    // important, means `available_height` below is captured *after* the
-    // chips' actual height is known and consumed, not guessed.
-    ui.horizontal_wrapped(|ui| {
-        let all_selected = library_filters.platform.is_none();
-        if ui
-            .selectable_label(all_selected, format!("All ({})", data.rows.len()))
-            .clicked()
-            && !all_selected
-        {
-            library_filters.platform = None;
-            // Consistent with Advanced View's Library platform strip
-            // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk
-            // #3): every platform-selection change clears the
-            // current focus rather than risking a stale
-            // selected-game panel for a game no longer in view.
-            archive_context.clear_selection();
-        }
-        for (platform, count) in &platform_counts.named {
-            let selected = library_filters.platform.as_deref() == Some(platform.as_str());
-            if ui
-                .selectable_label(selected, format!("{platform} ({count})"))
+    // The visual platform picker (milestone: "Gamer View Visual Platform
+    // Picker and Library Layout Polish"): a single-row, horizontally
+    // scrollable shelf, never wrapping onto multiple lines regardless of
+    // how many platforms are present - "must not consume most of the
+    // vertical height" is true unconditionally, not just for a typical
+    // library. A fixed shelf height also means `available_height` below
+    // is captured after a *known* amount of space is consumed, not a
+    // wrapping row count that varies with window width.
+    const PLATFORM_SHELF_HEIGHT: f32 = 76.0;
+    egui::ScrollArea::horizontal()
+        .id_salt("gamer_view_platform_shelf")
+        .max_height(PLATFORM_SHELF_HEIGHT)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let all_selected = library_filters.platform.is_none();
+                if show_platform_shelf_item(
+                    ui,
+                    all_selected,
+                    PlatformAssetCategory::Console.asset_id(),
+                    "All",
+                    data.rows.len(),
+                )
                 .clicked()
-                && !selected
-            {
-                library_filters.platform = Some(platform.clone());
-                archive_context.clear_selection();
-            }
-        }
-        if platform_counts.unknown > 0 {
-            let selected = library_filters.platform.as_deref() == Some("Unknown");
-            if ui
-                .selectable_label(selected, format!("Unknown ({})", platform_counts.unknown))
-                .clicked()
-                && !selected
-            {
-                library_filters.platform = Some("Unknown".to_string());
-                archive_context.clear_selection();
-            }
-        }
-    });
+                    && !all_selected
+                {
+                    library_filters.platform = None;
+                    // Consistent with Advanced View's Library platform strip
+                    // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk
+                    // #3): every platform-selection change clears the
+                    // current focus rather than risking a stale
+                    // selected-game panel for a game no longer in view.
+                    archive_context.clear_selection();
+                }
+                for (platform, count) in &platform_counts.named {
+                    let selected = library_filters.platform.as_deref() == Some(platform.as_str());
+                    let asset_id = platform_asset_id(platform, false);
+                    if show_platform_shelf_item(ui, selected, asset_id, platform, *count).clicked()
+                        && !selected
+                    {
+                        library_filters.platform = Some(platform.clone());
+                        archive_context.clear_selection();
+                    }
+                }
+                if platform_counts.unknown > 0 {
+                    let selected = library_filters.platform.as_deref() == Some("Unknown");
+                    if show_platform_shelf_item(
+                        ui,
+                        selected,
+                        PlatformAssetCategory::Unknown.asset_id(),
+                        "Unknown",
+                        platform_counts.unknown,
+                    )
+                    .clicked()
+                        && !selected
+                    {
+                        library_filters.platform = Some("Unknown".to_string());
+                        archive_context.clear_selection();
+                    }
+                }
+            });
+        });
     ui.add_space(theme::SECTION_GAP);
 
     // Captured once, here, after the chips above have consumed their
@@ -29235,9 +29380,20 @@ fn show_gamer_view(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 if visible.is_empty() {
-                    ui.weak("No games match your search.");
+                    // Distinguish *why* nothing is showing - a truthful,
+                    // specific empty state rather than one generic
+                    // message for every cause.
+                    let guidance = if data.rows.is_empty() {
+                        "No games are in your library yet."
+                    } else if !search_text.is_empty() {
+                        "No games match your search."
+                    } else {
+                        "No games match the selected platform."
+                    };
+                    ui.add_space(theme::SECTION_GAP);
+                    ui.weak(guidance);
                 } else {
-                    let row_height = ui.spacing().interact_size.y.max(24.0);
+                    let row_height = (ui.spacing().interact_size.y * 1.6).max(30.0);
                     egui::ScrollArea::vertical()
                         .id_salt("gamer_view_game_list")
                         .max_height(ui.available_height())
@@ -29257,7 +29413,34 @@ fn show_gamer_view(
                                     gamer_display_title(record),
                                     row.platform
                                 );
-                                if ui.selectable_label(selected, label).clicked() {
+                                // Stronger selected-row emphasis (manual QA
+                                // finding): bold text plus an explicit
+                                // selection-colored stroke drawn around
+                                // `selectable_label`'s own rect, layered on
+                                // top of - not replacing - its existing
+                                // keyboard focus, Tab order, and
+                                // Enter/Space activation (a plain
+                                // `Sense::click()` label would lose all of
+                                // that, which the accessibility
+                                // requirements below depend on).
+                                let text = if selected {
+                                    egui::RichText::new(&label).strong()
+                                } else {
+                                    egui::RichText::new(&label)
+                                };
+                                let response = ui.selectable_label(selected, text);
+                                if selected {
+                                    ui.painter().rect_stroke(
+                                        response.rect,
+                                        4.0,
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            ui.visuals().selection.stroke.color,
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if response.clicked() {
                                     archive_context.select_only(row.path.clone());
                                     *screen = GamerViewScreen::GameList;
                                 }
@@ -29276,26 +29459,44 @@ fn show_gamer_view(
                 widgets::section_header(ui, "Selected game", None);
                 match selected_record(&data.records, archive_context.focused.as_deref()) {
                     None => {
-                        ui.weak("Select a game to see what you can do with it.");
+                        // Clear, specific empty-state guidance (manual QA
+                        // finding) rather than a bare label.
+                        ui.add_space(theme::SECTION_GAP);
+                        ui.weak("No game selected.");
+                        ui.label("Choose a game from the list on the left to see what you can do with it.");
                     }
                     Some(record) => {
                         let archive_path = record.mount_plan.archive.path.clone();
-                        ui.strong(gamer_display_title(record));
-                        ui.label(format!(
-                            "{} \u{b7} {}",
-                            record
-                                .metadata
-                                .platform
-                                .as_deref()
-                                .or(record.identity.platform.as_deref())
-                                .unwrap_or("Unknown"),
-                            archive_kind_name(record.mount_plan.archive.kind)
-                        ));
+                        ui.heading(gamer_display_title(record));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} \u{b7} {}",
+                                record
+                                    .metadata
+                                    .platform
+                                    .as_deref()
+                                    .or(record.identity.platform.as_deref())
+                                    .unwrap_or("Unknown"),
+                                archive_kind_name(record.mount_plan.archive.kind)
+                            ))
+                            .color(theme::muted(ui)),
+                        );
                         ui.add_space(theme::SECTION_GAP);
 
+                        // Primary action: the one obvious, full-width,
+                        // visually prominent button for what this game
+                        // needs right now (manual QA finding: "the primary
+                        // action is obvious").
                         match gamer_primary_action(record.mount_state) {
                             GamerPrimaryAction::Mount => {
-                                if ui.add_enabled(!busy, egui::Button::new("Mount")).clicked() {
+                                if widgets::action_button(
+                                    ui,
+                                    "Mount",
+                                    widgets::ActionStyle::Primary,
+                                    !busy,
+                                )
+                                .clicked()
+                                {
                                     action = Some(GamerViewAction::Operation(OperationRequest {
                                         action: ArchiveAction::Mount,
                                         archive_path: archive_path.clone(),
@@ -29304,9 +29505,13 @@ fn show_gamer_view(
                                 }
                             }
                             GamerPrimaryAction::Unmount => {
-                                if ui
-                                    .add_enabled(!busy, egui::Button::new("Unmount"))
-                                    .clicked()
+                                if widgets::action_button(
+                                    ui,
+                                    "Unmount",
+                                    widgets::ActionStyle::Primary,
+                                    !busy,
+                                )
+                                .clicked()
                                 {
                                     action = Some(GamerViewAction::Operation(OperationRequest {
                                         action: ArchiveAction::Unmount,
@@ -29327,24 +29532,62 @@ fn show_gamer_view(
                             ui.weak(reason);
                         }
                         ui.add_space(theme::SECTION_GAP);
+                        ui.separator();
+                        ui.add_space(theme::SECTION_GAP);
 
-                        if ui.button("Cheats & Mods").clicked() {
-                            action = Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
-                        }
-                        if ui.button("Details").clicked() {
-                            *screen = GamerViewScreen::Details;
-                        }
-                        let folder = archive_path.parent().filter(|folder| folder.is_dir());
-                        if let Some(folder) = folder
-                            && ui.button("Open location").clicked()
-                        {
-                            action =
-                                Some(GamerViewAction::CopyLocation(folder.display().to_string()));
-                        }
-                        if gamer_undo_available(cheat_workflow, Some(archive_path.as_path()))
-                            && ui.button("Undo last change").clicked()
-                        {
-                            action = Some(GamerViewAction::Undo);
+                        // Secondary actions: visually separated from the
+                        // primary action by the divider above, grouped
+                        // together as one row (manual QA finding:
+                        // "secondary actions clearly separated").
+                        ui.horizontal_wrapped(|ui| {
+                            if widgets::action_button(
+                                ui,
+                                "Cheats & Mods",
+                                widgets::ActionStyle::Secondary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action =
+                                    Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Details",
+                                widgets::ActionStyle::Secondary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                *screen = GamerViewScreen::Details;
+                            }
+                            let folder = archive_path.parent().filter(|folder| folder.is_dir());
+                            if let Some(folder) = folder
+                                && widgets::action_button(
+                                    ui,
+                                    "Open location",
+                                    widgets::ActionStyle::Secondary,
+                                    true,
+                                )
+                                .clicked()
+                            {
+                                action = Some(GamerViewAction::CopyLocation(
+                                    folder.display().to_string(),
+                                ));
+                            }
+                        });
+                        if gamer_undo_available(cheat_workflow, Some(archive_path.as_path())) {
+                            ui.add_space(theme::SECTION_GAP);
+                            if widgets::action_button(
+                                ui,
+                                "Undo last change",
+                                widgets::ActionStyle::Quiet,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(GamerViewAction::Undo);
+                            }
                         }
                     }
                 }
@@ -29353,6 +29596,331 @@ fn show_gamer_view(
     });
 
     action
+}
+
+// =====================================================================
+// Platform artwork registry - see docs/PLATFORM_ARTWORK.md.
+//
+// Entirely offline: every mapping here is a static, compile-time table
+// (no network access, no download, no runtime fetch of any kind - see
+// docs/PLATFORM_ARTWORK.md's "no-network guarantee"). Built-in artwork
+// lives in `crates/archivefs-gui/assets/platforms/*.svg`, an original
+// ArchiveFS silhouette set (see that directory's own files for the
+// per-asset attribution comment, and the manifest table in
+// docs/PLATFORM_ARTWORK.md for the authoritative licensing record).
+//
+// Rendering in this milestone draws a small native vector glyph (egui
+// Shapes, not a rasterized SVG) keyed by the same asset identifier this
+// registry resolves - see `paint_platform_glyph`. Wiring true SVG
+// rasterization (needed for a custom override directory's artwork to
+// visually differ from the built-in glyph, not just be detected as
+// present) is an explicitly deferred follow-up - see the milestone's
+// final report for why, and `custom_platform_artwork_path` below for
+// exactly what *is* real today: genuine file-presence-based fallback
+// resolution, not a stub.
+// =====================================================================
+
+/// The category fallback set (docs/PLATFORM_ARTWORK.md): used whenever a
+/// platform has no dedicated asset of its own. Deliberately small and
+/// closed - "do not block the feature on creating a unique image for
+/// every obscure platform."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformAssetCategory {
+    Console,
+    Handheld,
+    Computer,
+    Arcade,
+    OpticalDisc,
+    Cartridge,
+    Unknown,
+}
+
+impl PlatformAssetCategory {
+    fn asset_id(self) -> &'static str {
+        match self {
+            Self::Console => "console",
+            Self::Handheld => "handheld",
+            Self::Computer => "computer",
+            Self::Arcade => "arcade",
+            Self::OpticalDisc => "optical-disc",
+            Self::Cartridge => "cartridge",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Plain-language name, for the accessible label a screen reader
+    /// announces alongside (never instead of) the visual glyph - "platform
+    /// artwork must never be the only way to identify a platform."
+    fn accessible_label(self) -> &'static str {
+        match self {
+            Self::Console => "console",
+            Self::Handheld => "handheld device",
+            Self::Computer => "computer",
+            Self::Arcade => "arcade cabinet",
+            Self::OpticalDisc => "optical-disc system",
+            Self::Cartridge => "cartridge system",
+            Self::Unknown => "unrecognised platform",
+        }
+    }
+}
+
+/// Every canonical platform name this build knows a *category* for -
+/// deliberately not exhaustive (an unmapped platform simply falls back to
+/// `Unknown`, which is a correct, honest answer, not a bug). Matches
+/// against `canonical_platform_names()`'s exact spellings
+/// (archivefs-core's `FOLDER_PLATFORM_ALIASES` table) case-insensitively,
+/// so a filter/search-derived platform string with different casing still
+/// resolves correctly.
+fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
+    // Canonical names contain spaces and hyphens ("Game Boy Advance",
+    // "Sharp X68000", "TurboGrafx-16") - normalized away here so every
+    // match key below is a single lowercase word, exactly mirroring
+    // `platform_asset_id`'s own normalization for its dedicated-asset
+    // lookup.
+    let normalized = platform.to_lowercase().replace([' ', '-'], "");
+    match normalized.as_str() {
+        "gamecube" | "wii" | "wiiu" | "switch" | "n64" | "nes" | "snes" | "megadrive"
+        | "mastersystem" | "gamegear" | "saturn" | "dreamcast" | "psx" | "ps2" | "ps3" | "xbox"
+        | "xbox360" | "segacd" | "sega32x" | "3do" | "colecovision" | "intellivision"
+        | "neogeo" | "neogeo64" => PlatformAssetCategory::Console,
+        "gameboy" | "gameboycolor" | "gameboyadvance" | "nintendods" | "nintendo3ds" | "psp"
+        | "playstationvita" | "atarilynx" | "neogeopocket" | "neogeopocketcolor" | "wonderswan"
+        | "wonderswancolor" | "ngage" => PlatformAssetCategory::Handheld,
+        "pc" | "dos" | "scummvm" | "amiga" | "atarist" | "commodore64" | "zxspectrum"
+        | "acornarchimedes" | "sharpx68000" | "necpc8801" | "necpc9801" | "msx" | "msx2" => {
+            PlatformAssetCategory::Computer
+        }
+        "arcade" => PlatformAssetCategory::Arcade,
+        "amigacd32" => PlatformAssetCategory::OpticalDisc,
+        "atari2600" | "atari5200" | "atari7800" | "atarijaguar" | "vectrex" | "turbografx16"
+        | "pcengine" => PlatformAssetCategory::Cartridge,
+        _ => PlatformAssetCategory::Unknown,
+    }
+}
+
+/// The asset identifier to look up artwork for - either a dedicated
+/// platform-specific asset (`gamecube`/`playstation2`/`xbox` today) or a
+/// category fallback id. `unknown_platform: true` (the row's own honest
+/// "we don't know this platform" flag, not a lookup miss) always maps to
+/// the Unknown fallback directly, without running the category
+/// heuristic on a meaningless empty string.
+fn platform_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
+    if unknown_platform {
+        return PlatformAssetCategory::Unknown.asset_id();
+    }
+    let normalized = platform.to_lowercase().replace([' ', '-'], "");
+    match normalized.as_str() {
+        "gamecube" => "gamecube",
+        "ps2" | "playstation2" => "playstation2",
+        "xbox" | "xbox360" => "xbox",
+        _ => platform_asset_category(platform).asset_id(),
+    }
+}
+
+/// Resolves the file a custom artwork directory would provide for
+/// `asset_id`, if the user has configured one and that exact file exists
+/// (real, checked filesystem I/O, not a stub). Returns `None` (fall back
+/// to the built-in asset) if no directory is configured, or the file
+/// doesn't exist, matching "ArchiveFS should reference these files
+/// directly and fall back to built-in artwork when missing." Never
+/// copies the file into ArchiveFS's own storage.
+fn custom_platform_artwork_path(directory: Option<&Path>, asset_id: &str) -> Option<PathBuf> {
+    let directory = directory?;
+    let candidate = directory.join(format!("{asset_id}.svg"));
+    candidate.is_file().then_some(candidate)
+}
+
+/// Draws a small original vector glyph for `asset_id` directly with
+/// egui's own painter - see this section's header comment for why this
+/// milestone renders this way rather than rasterizing the on-disk SVG
+/// files. Falls back to the Unknown glyph for any id it doesn't
+/// recognise, so a damaged or unrecognised custom-override asset id
+/// never renders as nothing at all (decision: "missing or damaged assets
+/// fail gracefully to the fallback icon").
+fn paint_platform_glyph(ui: &mut egui::Ui, asset_id: &str, size: f32) -> egui::Response {
+    let (response, painter) = ui.allocate_painter(egui::vec2(size, size), egui::Sense::hover());
+    let color = ui.visuals().text_color().gamma_multiply(0.8);
+    paint_platform_glyph_at(&painter, response.rect.center(), size, color, asset_id);
+    response
+}
+
+/// The allocation-free core of `paint_platform_glyph`, so a caller that
+/// already owns a rect (e.g. drawn inside an existing `Button`'s bounds,
+/// as `show_platform_shelf_item` does) never has to allocate a second,
+/// unwanted region just to get a glyph drawn.
+fn paint_platform_glyph_at(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    color: egui::Color32,
+    asset_id: &str,
+) {
+    let stroke = egui::Stroke::new((size * 0.06).max(1.5), color);
+    let r = size * 0.42;
+    match asset_id {
+        "gamecube" => {
+            painter.circle_stroke(center, r, stroke);
+            painter.line_segment(
+                [center - egui::vec2(0.0, r), center + egui::vec2(0.0, r)],
+                stroke,
+            );
+        }
+        "playstation2" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(size * 0.4, size * 0.8)),
+                egui::CornerRadius::same((size * 0.08) as u8),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        "xbox" => {
+            painter.circle_stroke(center, r, stroke);
+            let d = r * 0.7;
+            painter.line_segment(
+                [center - egui::vec2(d, d), center + egui::vec2(d, d)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + egui::vec2(-d, d), center + egui::vec2(d, -d)],
+                stroke,
+            );
+        }
+        "handheld" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(size * 0.55, size * 0.85)),
+                egui::CornerRadius::same((size * 0.1) as u8),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            painter.circle_filled(
+                center + egui::vec2(0.0, size * 0.2),
+                size * 0.05,
+                stroke.color,
+            );
+        }
+        "computer" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(
+                    center - egui::vec2(0.0, size * 0.08),
+                    egui::vec2(size * 0.75, size * 0.5),
+                ),
+                egui::CornerRadius::same((size * 0.05) as u8),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-size * 0.2, size * 0.42),
+                    center + egui::vec2(size * 0.2, size * 0.42),
+                ],
+                stroke,
+            );
+        }
+        "arcade" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(size * 0.55, size * 0.8)),
+                egui::CornerRadius::same((size * 0.04) as u8),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            painter.circle_filled(
+                center + egui::vec2(0.0, size * 0.15),
+                size * 0.05,
+                stroke.color,
+            );
+        }
+        "optical-disc" => {
+            painter.circle_stroke(center, r, stroke);
+            painter.circle_stroke(center, r * 0.3, stroke);
+        }
+        "cartridge" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(size * 0.5, size * 0.7)),
+                egui::CornerRadius::same((size * 0.05) as u8),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        _ => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(size * 0.75, size * 0.5)),
+                egui::CornerRadius::same((size * 0.1) as u8),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            if asset_id == "unknown" {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "?",
+                    egui::FontId::proportional(size * 0.4),
+                    stroke.color,
+                );
+            }
+        }
+    }
+}
+
+/// One card in the platform shelf: a `Button` (for its built-in Tab
+/// focus, Enter/Space activation, visible focus ring, hover, and
+/// `.selected` highlight - none of that is reinvented here) with the
+/// platform's vector glyph and name/count painted into its bounds, plus
+/// an accessible label naming the platform in plain language ("platform
+/// artwork must never be the only way to identify a platform").
+fn show_platform_shelf_item(
+    ui: &mut egui::Ui,
+    selected: bool,
+    asset_id: &str,
+    label: &str,
+    count: usize,
+) -> egui::Response {
+    const SHELF_ITEM_WIDTH: f32 = 84.0;
+    const GLYPH_SIZE: f32 = 32.0;
+    // Dedicated assets already name the exact platform; a category
+    // fallback additionally names *what kind of thing* the glyph is
+    // meant to evoke, so a screen-reader user gets the same context a
+    // sighted user reads from a recognisable shape.
+    let accessible_name = if matches!(asset_id, "gamecube" | "playstation2" | "xbox" | "unknown") {
+        format!("{label}, {count} games")
+    } else {
+        let category = platform_asset_category(label).accessible_label();
+        format!("{label} ({category}), {count} games")
+    };
+    let response = ui
+        .add(
+            egui::Button::new("")
+                .min_size(egui::vec2(SHELF_ITEM_WIDTH, 68.0))
+                .selected(selected),
+        )
+        .on_hover_text(accessible_name.clone());
+    // AccessKit's exposed name for a widget with no text label defaults
+    // to whatever hover text/label is attached - `egui::Response` doesn't
+    // expose a way to set the accessible name in this egui version
+    // without a full custom widget, so the hover text above doubles as
+    // that label, matching "accessible labels for visuals."
+    let glyph_center = response.rect.center() - egui::vec2(0.0, 12.0);
+    let color = if selected {
+        ui.visuals().selection.stroke.color
+    } else {
+        ui.visuals().text_color().gamma_multiply(0.8)
+    };
+    paint_platform_glyph_at(ui.painter(), glyph_center, GLYPH_SIZE, color, asset_id);
+    let text_pos = response.rect.center() + egui::vec2(0.0, 18.0);
+    let truncated_label = if label.chars().count() > 11 {
+        let mut short: String = label.chars().take(10).collect();
+        short.push('\u{2026}');
+        short
+    } else {
+        label.to_string()
+    };
+    ui.painter().text(
+        text_pos,
+        egui::Align2::CENTER_CENTER,
+        format!("{truncated_label}\n{count}"),
+        egui::FontId::proportional(10.0),
+        ui.visuals().text_color(),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -30444,6 +31012,142 @@ mod tests {
             matches!(app.shared_rollback, SharedRollbackState::Idle),
             "Advanced View's existing reset-on-navigate-away behaviour must be unchanged"
         );
+    }
+
+    #[test]
+    fn platform_asset_id_resolves_dedicated_assets_case_insensitively() {
+        assert_eq!(platform_asset_id("GameCube", false), "gamecube");
+        assert_eq!(platform_asset_id("gamecube", false), "gamecube");
+        assert_eq!(platform_asset_id("PS2", false), "playstation2");
+        assert_eq!(platform_asset_id("Xbox", false), "xbox");
+        assert_eq!(platform_asset_id("Xbox360", false), "xbox");
+    }
+
+    #[test]
+    fn platform_asset_id_falls_back_to_category_for_unmapped_specific_platforms() {
+        // SNES has no dedicated asset - it must resolve to the Console
+        // category fallback, not to Unknown (it's a perfectly well-known
+        // platform, just without its own dedicated artwork yet - "do not
+        // block the feature on creating a unique image for every obscure
+        // platform").
+        assert_eq!(platform_asset_id("SNES", false), "console");
+        assert_eq!(platform_asset_id("Game Boy Advance", false), "handheld");
+        assert_eq!(platform_asset_id("PC", false), "computer");
+        assert_eq!(platform_asset_id("Arcade", false), "arcade");
+    }
+
+    #[test]
+    fn platform_asset_id_uses_unknown_fallback_for_a_genuinely_unrecognised_platform() {
+        // A platform name archivefs-core has never heard of at all -
+        // distinct from `unknown_platform: true` (the row's own "no
+        // platform detected" flag), both must resolve to the same
+        // Unknown asset.
+        assert_eq!(platform_asset_id("SomeMadeUpPlatform", false), "unknown");
+        assert_eq!(platform_asset_id("", true), "unknown");
+        assert_eq!(platform_asset_id("Anything", true), "unknown");
+    }
+
+    #[test]
+    fn platform_asset_id_handles_long_platform_names_without_panicking() {
+        let long_name = "A".repeat(500);
+        // Must not panic and must resolve to a real, valid asset id.
+        let resolved = platform_asset_id(&long_name, false);
+        assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn custom_platform_artwork_path_falls_back_to_none_when_missing_or_unconfigured() {
+        assert_eq!(custom_platform_artwork_path(None, "gamecube"), None);
+
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-artwork-test-missing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        assert_eq!(
+            custom_platform_artwork_path(Some(&temp), "gamecube"),
+            None,
+            "a directory with no matching file must fall back to None (built-in artwork)"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn custom_platform_artwork_path_resolves_a_real_present_file() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-artwork-test-present-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let asset_path = temp.join("gamecube.svg");
+        std::fs::write(&asset_path, "<svg></svg>").unwrap();
+
+        assert_eq!(
+            custom_platform_artwork_path(Some(&temp), "gamecube"),
+            Some(asset_path.clone()),
+            "an existing file must be resolved, never copied elsewhere"
+        );
+        // Never copied into any ArchiveFS-owned location - the resolved
+        // path is the user's own file, unchanged.
+        assert!(asset_path.exists());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn platform_asset_category_accessible_labels_are_all_distinct_and_non_empty() {
+        let categories = [
+            PlatformAssetCategory::Console,
+            PlatformAssetCategory::Handheld,
+            PlatformAssetCategory::Computer,
+            PlatformAssetCategory::Arcade,
+            PlatformAssetCategory::OpticalDisc,
+            PlatformAssetCategory::Cartridge,
+            PlatformAssetCategory::Unknown,
+        ];
+        let mut labels: Vec<&str> = categories.iter().map(|c| c.accessible_label()).collect();
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            categories.len(),
+            "labels must all be distinct"
+        );
+    }
+
+    #[test]
+    fn gamer_view_platform_shelf_shows_all_named_and_unknown_items_with_counts() {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = vec![
+            record("/roms/a.zip", MountState::Pending),
+            record("/roms/b.zip", MountState::Pending),
+        ];
+        records[0].metadata.platform = Some("GameCube".to_string());
+        records[1].metadata.platform = None;
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+        for expected in ["All", "GameCube", "Unknown"] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "expected the platform shelf to show {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -35940,6 +36644,10 @@ $Instant Growth [Nayr]\n";
             confirm_bulk_platform_action: None,
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
+            // Hermetic literal default, matching every other field in
+            // this test-only constructor - never a real disk read.
+            custom_platform_artwork_directory: None,
+            custom_platform_artwork_directory_text: String::new(),
         }
     }
 
