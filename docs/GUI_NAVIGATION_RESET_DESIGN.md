@@ -537,3 +537,37 @@ here:
 11. No new Backups-summary or Technical-logs viewer screens are added in
     this milestone. Existing (non-GUI) access to both is preserved
     unchanged; dedicated viewers are deferred (§3.1, §3.2, §7).
+
+## 10. Implementation follow-up: visual platform picker (post-approval)
+
+Implemented on `feature/gui-navigation-reset` after this design was
+approved, in a separate "Gamer View Visual Platform Picker and Library
+Layout Polish" milestone - see `docs/PLATFORM_ARTWORK.md` for the full
+artwork policy, asset manifest, and licensing record. Summary of what
+changed relative to §2.1's original sketch:
+
+- The plain text platform chips (§2.1's ASCII mockup) became a
+  single-row, horizontally scrollable "shelf": each item shows a small
+  original vector glyph, the platform name, and its game count, with a
+  clear selected state. All/Unknown are included with suitable generic
+  glyphs. The shelf has a fixed height and never wraps onto multiple
+  lines, regardless of how many platforms are present.
+- Clicking a shelf item updates `library_filters.platform` exactly as
+  the text chips did, and clears stale focused/multi-selection exactly
+  as before (§9 decision 3's fix) - no new selection model was
+  introduced.
+- The game list and selected-game panel layout was hardened after manual
+  QA found the list was only showing 2-3 rows regardless of window size:
+  the list now explicitly reserves the page's full remaining height
+  (via `allocate_ui_with_layout`, the same technique `ui_layout::page`
+  itself uses) rather than relying on ambiguous height inheritance
+  through nested containers, and scrolls independently while the
+  selected-game panel stays fixed alongside it.
+- The selected-game action panel now visually separates the primary
+  action (Mount/Unmount, full-width, `ActionStyle::Primary`) from
+  secondary actions (Cheats & Mods/Details/Open location, grouped in one
+  row) and Undo (shown last, `ActionStyle::Quiet`), with clearer
+  empty-state and empty-search/empty-platform guidance.
+- No artwork is fetched over the network, ever - see
+  `docs/PLATFORM_ARTWORK.md`'s no-network guarantee. `Cargo.lock` is
+  unchanged by this milestone; no new dependency was added.
