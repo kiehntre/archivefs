@@ -78,6 +78,7 @@ use archivefs_core::patch_manager::{
 };
 pub mod bulk_confirmation;
 pub mod game_presentation;
+pub mod selection_guard;
 pub mod status_wording;
 mod ui;
 pub mod view_mode;
