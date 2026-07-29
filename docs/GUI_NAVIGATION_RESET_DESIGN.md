@@ -583,3 +583,22 @@ changed relative to §2.1's original sketch:
   files retain the built-in vector glyph. The existing resolved `image`
   crate is now a direct dependency with only PNG decoding enabled; its
   `MIT OR Apache-2.0` licence is compatible with ArchiveFS.
+
+### Platform Artwork Pack v1 follow-up
+
+The `feature/platform-artwork-pack-v1` milestone keeps the shelf and all
+navigation behavior above intact while replacing temporary exact-platform
+abstract glyphs with supplied original/generated PNG hardware illustrations.
+The 17 approved PNGs are compiled into the GUI with `include_bytes!`; they do
+not depend on repository paths after installation and add no network or
+external-tool path.
+
+Resolution is: valid user custom PNG, exact bundled hardware PNG, existing
+category glyph, then Unknown. Exact case-insensitive aliases are resolved
+before category inference, with narrow mappings that keep Wii U distinct from
+Wii and Xbox 360 distinct from original Xbox. Decoded custom and bundled
+textures are cached rather than reparsed per frame, and malformed data falls
+through safely. The existing SVGs remain canonical category/fallback and
+licensing references. The authoritative filename/alias table, inspection
+record, bundle size, provenance statement, and offline guarantee are in
+`docs/PLATFORM_ARTWORK.md`.

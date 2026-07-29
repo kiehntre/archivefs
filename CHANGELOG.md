@@ -11,12 +11,34 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
+## Unreleased
+
+### Gamer View
+
+- Platform Artwork Pack v1 replaces temporary exact-platform abstract glyphs
+  with 17 original/generated PNG hardware illustrations embedded in the GUI
+  executable. Exact, case-insensitive aliases cover Acorn Archimedes, Amiga,
+  Dreamcast, Game Boy, GameCube, Mega Drive/Genesis, Nintendo 64, PlayStation
+  1/2/3, Saturn, SNES/Super Famicom, Switch, Wii, Wii U, Xbox, and Xbox 360.
+- Artwork resolution is now valid custom local PNG, exact bundled PNG,
+  category glyph, then Unknown. Custom safety limits and precedence are
+  unchanged; bundled images require neither network access nor installed
+  source-tree files and decoded textures are cached.
+- The one-row responsive platform shelf, filtering, selected/focus states,
+  labels, counts, tooltips, and narrow-window behavior remain unchanged.
+
+### Documentation
+
+- Expanded the platform artwork manifest with every bundled filename, alias,
+  encoded size, alpha/padding inspection, runtime format, offline guarantee,
+  provenance statement, fallback behavior, and rejection record.
+
 ## v0.7.0-alpha (unreleased)
 
 See [`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the
 full narrative release notes, installation instructions, and manual QA
-summary. This entry groups the same changes by area. No tag has been
-created yet; this is a release candidate under final validation.
+summary. This entry groups the same changes by area. The published annotated
+tag peels to source commit `908c00da23303216cd28563a00b4ec835bc87207`.
 
 ### Gamer View
 
