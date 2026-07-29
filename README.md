@@ -16,11 +16,20 @@ replacement. See [Current limitations](#current-limitations) and
 explicit list of what it deliberately does not do.
 
 **Release status:** `v0.5.0-alpha` is the latest tagged release. The current
-workspace is the untagged `v0.7.0-alpha` integration candidate. It adds direct
+workspace is the untagged `v0.7.0-alpha` release candidate. It adds a
+default Gamer View (a single-screen, platform-first game list and
+selected-game action panel) alongside the existing Advanced View, direct
 game-image discovery, shared platform-first navigation and source platform
-assignment, plus explicit Dolphin Gecko and Xenia Canary patch workflows.
-RetroArch, Dolphin, and Xenia use confirmed transaction paths; PCSX2 remains
-read-only. Manual QA and the release gate must pass before a tag is created.
+assignment, a visual platform-artwork picker, and explicit Dolphin Gecko and
+Xenia Canary patch workflows. RetroArch, Dolphin, and Xenia use confirmed
+transaction paths with backup/rollback/Undo; PCSX2 now also has a
+transaction-backed install/Undo path, but no approved downloadable
+ordinary-cheat catalogue is bundled for it yet. A read-only
+`cheat-provider-coverage` audit command reports Dolphin/RetroArch catalogue
+coverage for a bounded, exact game selection. See
+[`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the full
+release notes. Manual QA and the release gate must pass before a tag is
+created.
 
 ## Principles
 
