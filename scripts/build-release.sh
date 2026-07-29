@@ -128,7 +128,6 @@ tar \
     --owner=0 \
     --group=0 \
     --numeric-owner \
-    --pax-option=delete=atime,delete=ctime \
     -C "$TEMP_ROOT" \
     -cf - "$BUNDLE_NAME" |
     gzip -n -9 >"$ARTIFACT"
