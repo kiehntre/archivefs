@@ -11,7 +11,7 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.7.0-alpha (release candidate)
+## v0.7.0-alpha (unreleased)
 
 See [`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the
 full narrative release notes, installation instructions, and manual QA
