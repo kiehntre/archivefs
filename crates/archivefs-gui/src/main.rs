@@ -29679,15 +29679,10 @@ fn show_gamer_view(
 // Entirely offline: every mapping here is a static, compile-time table
 // (no network access, no download, no runtime fetch of any kind - see
 // docs/PLATFORM_ARTWORK.md's "no-network guarantee"). Built-in artwork
-// lives in `crates/archivefs-gui/assets/platforms/*.svg`, an original
-// ArchiveFS silhouette set (see that directory's own files for the
-// per-asset attribution comment, and the manifest table in
-// docs/PLATFORM_ARTWORK.md for the authoritative licensing record).
-//
-// Built-in artwork remains the small native egui vector glyph keyed by
-// this registry. An explicitly configured local PNG can replace that
-// glyph through the bounded cache below. SVG remains an inspectable source
-// asset for the built-ins, but is never parsed at runtime.
+// includes exact hardware PNGs compiled into the executable plus the
+// original ArchiveFS SVG/native-glyph fallback set. An explicitly
+// configured local PNG remains highest priority. SVG remains an
+// inspectable source asset for fallbacks, but is never parsed at runtime.
 // =====================================================================
 
 /// The category fallback set (docs/PLATFORM_ARTWORK.md): used whenever a
@@ -29768,9 +29763,38 @@ fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
     }
 }
 
-/// The asset identifier to look up artwork for - either a dedicated
-/// platform-specific asset (`gamecube`/`playstation2`/`xbox` today) or a
-/// category fallback id. `unknown_platform: true` (the row's own honest
+/// Exact, deliberately narrow aliases for Platform Artwork Pack v1.
+/// Normalization is case-insensitive and ignores only spaces and hyphens;
+/// it does not perform substring or fuzzy matching.
+fn exact_platform_asset_id(platform: &str) -> Option<&'static str> {
+    let normalized = platform.to_lowercase().replace([' ', '-'], "");
+    match normalized.as_str() {
+        "acornarchimedes" | "archimedes" => Some("acornarchimedes"),
+        "amiga" | "commodoreamiga" => Some("amiga"),
+        "dreamcast" | "segadreamcast" => Some("dreamcast"),
+        "gameboy" | "nintendogameboy" => Some("gameboy"),
+        "gamecube" | "nintendogamecube" => Some("gamecube"),
+        "megadrive" | "segamegadrive" | "genesis" | "segagenesis" => Some("megadrive"),
+        "nintendo64" | "n64" => Some("n64"),
+        "playstation" | "playstation1" | "ps1" | "psx" => Some("playstation"),
+        "playstation2" | "ps2" => Some("playstation2"),
+        "playstation3" | "ps3" => Some("playstation3"),
+        "saturn" | "segasaturn" => Some("saturn"),
+        "supernintendo" | "supernintendoentertainmentsystem" | "snes" | "superfamicom" => {
+            Some("snes")
+        }
+        "nintendoswitch" | "switch" => Some("switch"),
+        "nintendowii" | "wii" => Some("wii"),
+        "nintendowiiu" | "wiiu" => Some("wiiu"),
+        "xbox" | "originalxbox" => Some("xbox"),
+        "xbox360" | "x360" => Some("xbox360"),
+        _ => None,
+    }
+}
+
+/// The asset identifier to look up artwork for - either an exact bundled
+/// platform PNG id or a category fallback id. `unknown_platform: true`
+/// (the row's own honest
 /// "we don't know this platform" flag, not a lookup miss) always maps to
 /// the Unknown fallback directly, without running the category
 /// heuristic on a meaningless empty string.
@@ -29778,13 +29802,92 @@ fn platform_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
     if unknown_platform {
         return PlatformAssetCategory::Unknown.asset_id();
     }
-    let normalized = platform.to_lowercase().replace([' ', '-'], "");
-    match normalized.as_str() {
-        "gamecube" => "gamecube",
-        "ps2" | "playstation2" => "playstation2",
-        "xbox" | "xbox360" => "xbox",
-        _ => platform_asset_category(platform).asset_id(),
-    }
+    exact_platform_asset_id(platform)
+        .unwrap_or_else(|| platform_asset_category(platform).asset_id())
+}
+
+#[derive(Clone, Copy)]
+struct BundledPlatformArtwork {
+    asset_id: &'static str,
+    png: &'static [u8],
+}
+
+const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
+    BundledPlatformArtwork {
+        asset_id: "acornarchimedes",
+        png: include_bytes!("../assets/platforms/acornarchimedes.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "amiga",
+        png: include_bytes!("../assets/platforms/amiga.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "dreamcast",
+        png: include_bytes!("../assets/platforms/dreamcast.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "gameboy",
+        png: include_bytes!("../assets/platforms/gameboy.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "gamecube",
+        png: include_bytes!("../assets/platforms/gamecube.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "megadrive",
+        png: include_bytes!("../assets/platforms/megadrive.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "n64",
+        png: include_bytes!("../assets/platforms/n64.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "playstation",
+        png: include_bytes!("../assets/platforms/playstation.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "playstation2",
+        png: include_bytes!("../assets/platforms/playstation2.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "playstation3",
+        png: include_bytes!("../assets/platforms/playstation3.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "saturn",
+        png: include_bytes!("../assets/platforms/saturn.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "snes",
+        png: include_bytes!("../assets/platforms/snes.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "switch",
+        png: include_bytes!("../assets/platforms/switch.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "wii",
+        png: include_bytes!("../assets/platforms/wii.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "wiiu",
+        png: include_bytes!("../assets/platforms/wiiu.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "xbox",
+        png: include_bytes!("../assets/platforms/xbox.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "xbox360",
+        png: include_bytes!("../assets/platforms/xbox360.png"),
+    },
+];
+
+fn bundled_platform_artwork(asset_id: &str) -> Option<BundledPlatformArtwork> {
+    BUNDLED_PLATFORM_ARTWORK
+        .iter()
+        .copied()
+        .find(|artwork| artwork.asset_id == asset_id)
 }
 
 const MAX_CUSTOM_ARTWORK_FILE_BYTES: u64 = 1024 * 1024;
@@ -29820,20 +29923,22 @@ struct CachedPlatformArtwork {
 struct PlatformArtworkCache {
     directory: Option<PathBuf>,
     entries: HashMap<String, CachedPlatformArtwork>,
+    bundled_entries: HashMap<&'static str, Option<egui::TextureHandle>>,
 }
 
 impl PlatformArtworkCache {
     fn clear(&mut self) {
         self.entries.clear();
+        self.bundled_entries.clear();
         self.directory = None;
     }
 
-    fn texture_id(
+    fn custom_texture(
         &mut self,
         context: &egui::Context,
         directory: Option<&Path>,
         asset_id: &str,
-    ) -> Option<egui::TextureId> {
+    ) -> Option<PlatformArtworkTexture> {
         if self.directory.as_deref() != directory {
             self.entries.clear();
             self.directory = directory.map(Path::to_path_buf);
@@ -29849,7 +29954,7 @@ impl PlatformArtworkCache {
         if let Some(cached) = self.entries.get(asset_id)
             && cached.fingerprint == fingerprint
         {
-            return cached.texture.as_ref().map(egui::TextureHandle::id);
+            return cached.texture.as_ref().map(PlatformArtworkTexture::from);
         }
 
         let texture = decode_custom_platform_artwork(&fingerprint.path)
@@ -29861,7 +29966,7 @@ impl PlatformArtworkCache {
                     egui::TextureOptions::LINEAR,
                 )
             });
-        let texture_id = texture.as_ref().map(egui::TextureHandle::id);
+        let texture_info = texture.as_ref().map(PlatformArtworkTexture::from);
         self.entries.insert(
             asset_id.to_string(),
             CachedPlatformArtwork {
@@ -29869,7 +29974,45 @@ impl PlatformArtworkCache {
                 texture,
             },
         );
-        texture_id
+        texture_info
+    }
+
+    fn bundled_texture(
+        &mut self,
+        context: &egui::Context,
+        asset_id: &str,
+    ) -> Option<PlatformArtworkTexture> {
+        let bundled = bundled_platform_artwork(asset_id)?;
+        let texture = self
+            .bundled_entries
+            .entry(bundled.asset_id)
+            .or_insert_with(|| {
+                decode_bundled_platform_artwork(bundled.png)
+                    .ok()
+                    .map(|image| {
+                        context.load_texture(
+                            format!("archivefs-bundled-platform-{}", bundled.asset_id),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        )
+                    })
+            });
+        texture.as_ref().map(PlatformArtworkTexture::from)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlatformArtworkTexture {
+    id: egui::TextureId,
+    size: egui::Vec2,
+}
+
+impl From<&egui::TextureHandle> for PlatformArtworkTexture {
+    fn from(texture: &egui::TextureHandle) -> Self {
+        Self {
+            id: texture.id(),
+            size: texture.size_vec2(),
+        }
     }
 }
 
@@ -29932,6 +30075,37 @@ fn decode_custom_platform_artwork(path: &Path) -> Result<egui::ColorImage, Custo
     }
     let file = std::fs::File::open(path).map_err(|_| CustomArtworkLoadError::Metadata)?;
     let mut decoder = image::codecs::png::PngDecoder::new(std::io::BufReader::new(file))
+        .map_err(|_| CustomArtworkLoadError::Malformed)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_CUSTOM_ARTWORK_DIMENSION);
+    limits.max_image_height = Some(MAX_CUSTOM_ARTWORK_DIMENSION);
+    limits.max_alloc = Some(MAX_CUSTOM_ARTWORK_DECODE_BYTES);
+    decoder
+        .set_limits(limits)
+        .map_err(|_| CustomArtworkLoadError::Oversized)?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err(CustomArtworkLoadError::Malformed);
+    }
+    let rgba = image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| CustomArtworkLoadError::Malformed)?
+        .into_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width as usize, height as usize],
+        rgba.as_raw(),
+    ))
+}
+
+/// Decode immutable bytes compiled into the executable. This deliberately
+/// accepts no path, so installed builds cannot depend on the source tree.
+/// A corrupt embedded image is cached as a failure and the caller paints
+/// the category glyph instead.
+fn decode_bundled_platform_artwork(
+    png: &'static [u8],
+) -> Result<egui::ColorImage, CustomArtworkLoadError> {
+    use image::ImageDecoder as _;
+
+    let mut decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(png))
         .map_err(|_| CustomArtworkLoadError::Malformed)?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_CUSTOM_ARTWORK_DIMENSION);
@@ -30082,27 +30256,58 @@ fn paint_platform_glyph_at(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformArtworkSource {
+    Custom,
+    Bundled,
+    Glyph,
+}
+
+fn fitted_artwork_rect(center: egui::Pos2, size: f32, texture_size: egui::Vec2) -> egui::Rect {
+    let scale = size / texture_size.x.max(texture_size.y).max(1.0);
+    egui::Rect::from_center_size(center, texture_size * scale)
+}
+
+fn paint_texture(ui: &egui::Ui, texture: PlatformArtworkTexture, center: egui::Pos2, size: f32) {
+    ui.painter().image(
+        texture.id,
+        fitted_artwork_rect(center, size, texture.size),
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+struct PlatformArtworkPaint<'a> {
+    center: egui::Pos2,
+    size: f32,
+    color: egui::Color32,
+    asset_id: &'a str,
+    fallback_asset_id: &'a str,
+}
+
 fn paint_platform_artwork_at(
     ui: &egui::Ui,
     artwork_cache: &mut PlatformArtworkCache,
     artwork_directory: Option<&Path>,
-    center: egui::Pos2,
-    size: f32,
-    color: egui::Color32,
-    asset_id: &str,
-) -> bool {
-    if let Some(texture_id) = artwork_cache.texture_id(ui.ctx(), artwork_directory, asset_id) {
-        ui.painter().image(
-            texture_id,
-            egui::Rect::from_center_size(center, egui::vec2(size, size)),
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
-        true
-    } else {
-        paint_platform_glyph_at(ui.painter(), center, size, color, asset_id);
-        false
+    paint: PlatformArtworkPaint<'_>,
+) -> PlatformArtworkSource {
+    if let Some(texture) = artwork_cache.custom_texture(ui.ctx(), artwork_directory, paint.asset_id)
+    {
+        paint_texture(ui, texture, paint.center, paint.size);
+        return PlatformArtworkSource::Custom;
     }
+    if let Some(texture) = artwork_cache.bundled_texture(ui.ctx(), paint.asset_id) {
+        paint_texture(ui, texture, paint.center, paint.size);
+        return PlatformArtworkSource::Bundled;
+    }
+    paint_platform_glyph_at(
+        ui.painter(),
+        paint.center,
+        paint.size,
+        paint.color,
+        paint.fallback_asset_id,
+    );
+    PlatformArtworkSource::Glyph
 }
 
 const PLATFORM_CARD_MIN_WIDTH: f32 = 96.0;
@@ -30151,12 +30356,12 @@ fn show_platform_shelf_item(
     card_width: f32,
     artwork: &mut PlatformShelfArtwork<'_>,
 ) -> egui::Response {
-    const GLYPH_SIZE: f32 = 32.0;
+    const ARTWORK_SIZE: f32 = 44.0;
     // Dedicated assets already name the exact platform; a category
     // fallback additionally names *what kind of thing* the glyph is
     // meant to evoke, so a screen-reader user gets the same context a
     // sighted user reads from a recognisable shape.
-    let accessible_name = if matches!(asset_id, "gamecube" | "playstation2" | "xbox" | "unknown") {
+    let accessible_name = if bundled_platform_artwork(asset_id).is_some() || asset_id == "unknown" {
         format!("{label}, {count} games")
     } else {
         let category = platform_asset_category(label).accessible_label();
@@ -30174,20 +30379,28 @@ fn show_platform_shelf_item(
     // expose a way to set the accessible name in this egui version
     // without a full custom widget, so the hover text above doubles as
     // that label, matching "accessible labels for visuals."
-    let glyph_center = response.rect.center() - egui::vec2(0.0, 12.0);
+    let artwork_center = response.rect.center() - egui::vec2(0.0, 11.0);
     let color = if selected {
         ui.visuals().selection.stroke.color
     } else {
         ui.visuals().text_color().gamma_multiply(0.8)
     };
+    let fallback_asset_id = match asset_id {
+        "console" | "handheld" | "computer" | "arcade" | "optical-disc" | "cartridge"
+        | "unknown" => asset_id,
+        _ => platform_asset_category(label).asset_id(),
+    };
     paint_platform_artwork_at(
         ui,
         artwork.cache,
         artwork.directory,
-        glyph_center,
-        GLYPH_SIZE,
-        color,
-        asset_id,
+        PlatformArtworkPaint {
+            center: artwork_center,
+            size: ARTWORK_SIZE,
+            color,
+            asset_id,
+            fallback_asset_id,
+        },
     );
     let text_pos = response.rect.center() + egui::vec2(0.0, 18.0);
     let truncated_label = compact_platform_label(label, card_width);
@@ -31291,22 +31504,73 @@ mod tests {
     }
 
     #[test]
-    fn platform_asset_id_resolves_dedicated_assets_case_insensitively() {
-        assert_eq!(platform_asset_id("GameCube", false), "gamecube");
-        assert_eq!(platform_asset_id("gamecube", false), "gamecube");
-        assert_eq!(platform_asset_id("PS2", false), "playstation2");
-        assert_eq!(platform_asset_id("Xbox", false), "xbox");
-        assert_eq!(platform_asset_id("Xbox360", false), "xbox");
+    fn platform_artwork_pack_v1_resolves_every_exact_alias() {
+        let aliases = [
+            ("Acorn Archimedes", "acornarchimedes"),
+            ("Archimedes", "acornarchimedes"),
+            ("Amiga", "amiga"),
+            ("Commodore Amiga", "amiga"),
+            ("Dreamcast", "dreamcast"),
+            ("Sega Dreamcast", "dreamcast"),
+            ("Game Boy", "gameboy"),
+            ("Nintendo Game Boy", "gameboy"),
+            ("GameCube", "gamecube"),
+            ("Nintendo GameCube", "gamecube"),
+            ("Nintendo Game Cube", "gamecube"),
+            ("Mega Drive", "megadrive"),
+            ("Sega Mega Drive", "megadrive"),
+            ("Genesis", "megadrive"),
+            ("Sega Genesis", "megadrive"),
+            ("Nintendo 64", "n64"),
+            ("N64", "n64"),
+            ("PlayStation", "playstation"),
+            ("PlayStation 1", "playstation"),
+            ("PS1", "playstation"),
+            ("PSX", "playstation"),
+            ("PlayStation 2", "playstation2"),
+            ("PS2", "playstation2"),
+            ("PlayStation 3", "playstation3"),
+            ("PS3", "playstation3"),
+            ("Saturn", "saturn"),
+            ("Sega Saturn", "saturn"),
+            ("Super Nintendo", "snes"),
+            ("Super Nintendo Entertainment System", "snes"),
+            ("SNES", "snes"),
+            ("Super Famicom", "snes"),
+            ("Nintendo Switch", "switch"),
+            ("Switch", "switch"),
+            ("Nintendo Wii", "wii"),
+            ("Wii", "wii"),
+            ("Nintendo Wii U", "wiiu"),
+            ("Wii U", "wiiu"),
+            ("WiiU", "wiiu"),
+            ("Xbox", "xbox"),
+            ("Original Xbox", "xbox"),
+            ("Xbox 360", "xbox360"),
+            ("X360", "xbox360"),
+        ];
+        for (alias, expected) in aliases {
+            assert_eq!(platform_asset_id(alias, false), expected, "alias {alias}");
+            assert!(
+                bundled_platform_artwork(expected).is_some(),
+                "alias {alias} resolves to missing bundled id {expected}"
+            );
+            assert_eq!(
+                platform_asset_id(&alias.to_ascii_uppercase(), false),
+                expected,
+                "case-normalized alias {alias}"
+            );
+        }
     }
 
     #[test]
     fn platform_asset_id_falls_back_to_category_for_unmapped_specific_platforms() {
-        // SNES has no dedicated asset - it must resolve to the Console
+        // NES has no dedicated asset - it must resolve to the Console
         // category fallback, not to Unknown (it's a perfectly well-known
         // platform, just without its own dedicated artwork yet - "do not
         // block the feature on creating a unique image for every obscure
         // platform").
-        assert_eq!(platform_asset_id("SNES", false), "console");
+        assert_eq!(platform_asset_id("NES", false), "console");
         assert_eq!(platform_asset_id("Game Boy Advance", false), "handheld");
         assert_eq!(platform_asset_id("PC", false), "computer");
         assert_eq!(platform_asset_id("Arcade", false), "arcade");
@@ -31321,6 +31585,50 @@ mod tests {
         assert_eq!(platform_asset_id("SomeMadeUpPlatform", false), "unknown");
         assert_eq!(platform_asset_id("", true), "unknown");
         assert_eq!(platform_asset_id("Anything", true), "unknown");
+    }
+
+    #[test]
+    fn exact_aliases_do_not_collapse_related_platforms() {
+        assert_eq!(platform_asset_id("PSX", false), "playstation");
+        assert_eq!(platform_asset_id("Wii U", false), "wiiu");
+        assert_ne!(
+            platform_asset_id("Wii U", false),
+            platform_asset_id("Wii", false)
+        );
+        assert_eq!(platform_asset_id("Xbox 360", false), "xbox360");
+        assert_ne!(
+            platform_asset_id("Xbox 360", false),
+            platform_asset_id("Xbox", false)
+        );
+        assert_eq!(platform_asset_id("Mega Drive", false), "megadrive");
+        assert_eq!(platform_asset_id("Genesis", false), "megadrive");
+    }
+
+    #[test]
+    fn bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths() {
+        assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 17);
+        let mut ids: Vec<_> = BUNDLED_PLATFORM_ARTWORK
+            .iter()
+            .map(|artwork| artwork.asset_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), BUNDLED_PLATFORM_ARTWORK.len());
+        for artwork in BUNDLED_PLATFORM_ARTWORK {
+            assert!(artwork.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let decoded = decode_bundled_platform_artwork(artwork.png)
+                .unwrap_or_else(|error| panic!("{} failed to decode: {error:?}", artwork.asset_id));
+            assert_eq!(decoded.size, [1024, 1024]);
+        }
+        assert!(bundled_platform_artwork("missing-platform").is_none());
+    }
+
+    #[test]
+    fn malformed_bundled_bytes_fail_safely() {
+        assert_eq!(
+            decode_bundled_platform_artwork(b"not a png"),
+            Err(CustomArtworkLoadError::Malformed)
+        );
     }
 
     #[test]
@@ -31348,6 +31656,19 @@ mod tests {
             "1024-wide Gamer View should use the available room without crowding cards"
         );
         assert_eq!(gamer_platform_card_width(1920.0), PLATFORM_CARD_MAX_WIDTH);
+    }
+
+    #[test]
+    fn platform_artwork_aspect_fit_centres_without_stretching_or_cropping() {
+        let landscape = fitted_artwork_rect(egui::pos2(50.0, 40.0), 44.0, egui::vec2(200.0, 100.0));
+        assert_eq!(landscape.center(), egui::pos2(50.0, 40.0));
+        assert_eq!(landscape.width(), 44.0);
+        assert_eq!(landscape.height(), 22.0);
+
+        let portrait = fitted_artwork_rect(egui::pos2(50.0, 40.0), 44.0, egui::vec2(50.0, 100.0));
+        assert_eq!(portrait.center(), egui::pos2(50.0, 40.0));
+        assert_eq!(portrait.width(), 22.0);
+        assert_eq!(portrait.height(), 44.0);
     }
 
     #[test]
@@ -31456,7 +31777,10 @@ mod tests {
 
         let context = egui::Context::default();
         let mut cache = PlatformArtworkCache::default();
-        assert_eq!(cache.texture_id(&context, Some(&temp), "gamecube"), None);
+        assert_eq!(
+            cache.custom_texture(&context, Some(&temp), "gamecube"),
+            None
+        );
         assert!(cache.entries.contains_key("gamecube"));
         assert!(cache.entries["gamecube"].texture.is_none());
         let _ = std::fs::remove_dir_all(&temp);
@@ -31499,7 +31823,7 @@ mod tests {
         let context = egui::Context::default();
         let mut cache = PlatformArtworkCache::default();
         let first_texture = cache
-            .texture_id(&context, Some(&temp), "gamecube")
+            .custom_texture(&context, Some(&temp), "gamecube")
             .expect("valid first texture");
         let first_fingerprint = cache.entries["gamecube"].fingerprint.clone();
 
@@ -31511,7 +31835,7 @@ mod tests {
         )
         .unwrap();
         let second_texture = cache
-            .texture_id(&context, Some(&temp), "gamecube")
+            .custom_texture(&context, Some(&temp), "gamecube")
             .expect("valid replacement texture");
         assert_ne!(first_texture, second_texture);
         assert_ne!(cache.entries["gamecube"].fingerprint, first_fingerprint);
@@ -31525,32 +31849,52 @@ mod tests {
         std::fs::write(temp.join("xbox.png"), b"broken").unwrap();
         let context = egui::Context::default();
         let mut cache = PlatformArtworkCache::default();
-        let mut custom_painted = false;
-        let mut fallback_painted = true;
+        let mut custom_source = PlatformArtworkSource::Glyph;
+        let mut malformed_source = PlatformArtworkSource::Glyph;
+        let mut missing_mapping_source = PlatformArtworkSource::Custom;
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                custom_painted = paint_platform_artwork_at(
+                custom_source = paint_platform_artwork_at(
                     ui,
                     &mut cache,
                     Some(&temp),
-                    egui::pos2(20.0, 20.0),
-                    16.0,
-                    egui::Color32::WHITE,
-                    "gamecube",
+                    PlatformArtworkPaint {
+                        center: egui::pos2(20.0, 20.0),
+                        size: 16.0,
+                        color: egui::Color32::WHITE,
+                        asset_id: "gamecube",
+                        fallback_asset_id: "console",
+                    },
                 );
-                fallback_painted = paint_platform_artwork_at(
+                malformed_source = paint_platform_artwork_at(
                     ui,
                     &mut cache,
                     Some(&temp),
-                    egui::pos2(50.0, 20.0),
-                    16.0,
-                    egui::Color32::WHITE,
-                    "xbox",
+                    PlatformArtworkPaint {
+                        center: egui::pos2(50.0, 20.0),
+                        size: 16.0,
+                        color: egui::Color32::WHITE,
+                        asset_id: "xbox",
+                        fallback_asset_id: "console",
+                    },
+                );
+                missing_mapping_source = paint_platform_artwork_at(
+                    ui,
+                    &mut cache,
+                    Some(&temp),
+                    PlatformArtworkPaint {
+                        center: egui::pos2(80.0, 20.0),
+                        size: 16.0,
+                        color: egui::Color32::WHITE,
+                        asset_id: "console",
+                        fallback_asset_id: "console",
+                    },
                 );
             });
         });
-        assert!(custom_painted);
-        assert!(!fallback_painted);
+        assert_eq!(custom_source, PlatformArtworkSource::Custom);
+        assert_eq!(malformed_source, PlatformArtworkSource::Bundled);
+        assert_eq!(missing_mapping_source, PlatformArtworkSource::Glyph);
         let _ = std::fs::remove_dir_all(&temp);
     }
 
