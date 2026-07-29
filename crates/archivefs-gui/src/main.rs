@@ -29171,164 +29171,185 @@ fn show_gamer_view(
             .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
     );
 
-    ui.horizontal(|ui| {
-        let available_width = ui.available_width();
-        ui.vertical(|ui| {
-            ui.set_width((available_width * 0.6).max(280.0));
-            ui.horizontal_wrapped(|ui| {
-                let all_selected = library_filters.platform.is_none();
-                if ui
-                    .selectable_label(all_selected, format!("All ({})", data.rows.len()))
-                    .clicked()
-                    && !all_selected
-                {
-                    library_filters.platform = None;
-                    // Consistent with Advanced View's Library platform strip
-                    // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk
-                    // #3): every platform-selection change clears the
-                    // current focus rather than risking a stale
-                    // selected-game panel for a game no longer in view.
-                    archive_context.clear_selection();
-                }
-                for (platform, count) in &platform_counts.named {
-                    let selected = library_filters.platform.as_deref() == Some(platform.as_str());
-                    if ui
-                        .selectable_label(selected, format!("{platform} ({count})"))
-                        .clicked()
-                        && !selected
-                    {
-                        library_filters.platform = Some(platform.clone());
-                        archive_context.clear_selection();
-                    }
-                }
-                if platform_counts.unknown > 0 {
-                    let selected = library_filters.platform.as_deref() == Some("Unknown");
-                    if ui
-                        .selectable_label(
-                            selected,
-                            format!("Unknown ({})", platform_counts.unknown),
-                        )
-                        .clicked()
-                        && !selected
-                    {
-                        library_filters.platform = Some("Unknown".to_string());
-                        archive_context.clear_selection();
-                    }
-                }
-            });
-            ui.add_space(theme::SECTION_GAP);
-
-            if visible.is_empty() {
-                ui.weak("No games match your search.");
-            } else {
-                let row_height = ui.spacing().interact_size.y.max(24.0);
-                let body_height = ui.available_height().max(row_height);
-                egui::ScrollArea::vertical()
-                    .id_salt("gamer_view_game_list")
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_height, visible.len(), |ui, row_range| {
-                        for visible_index in row_range {
-                            let index = visible[visible_index];
-                            let record = &data.records[index];
-                            let row = &data.rows[index];
-                            let selected =
-                                archive_context.focused.as_deref() == Some(row.path.as_path());
-                            let state_label = gamer_primary_action_short_label(
-                                &gamer_primary_action(record.mount_state),
-                            );
-                            let label = format!(
-                                "{} \u{2014} {} \u{b7} {state_label}",
-                                gamer_display_title(record),
-                                row.platform
-                            );
-                            if ui.selectable_label(selected, label).clicked() {
-                                archive_context.select_only(row.path.clone());
-                                *screen = GamerViewScreen::GameList;
-                            }
-                        }
-                    });
+    // Platform chips are a single full-width strip *above* the two-column
+    // split, not squeezed into the narrower left column - this both
+    // reduces how often they wrap onto extra lines (manual QA finding:
+    // "reduce the vertical space used by platform chips") and, just as
+    // important, means `available_height` below is captured *after* the
+    // chips' actual height is known and consumed, not guessed.
+    ui.horizontal_wrapped(|ui| {
+        let all_selected = library_filters.platform.is_none();
+        if ui
+            .selectable_label(all_selected, format!("All ({})", data.rows.len()))
+            .clicked()
+            && !all_selected
+        {
+            library_filters.platform = None;
+            // Consistent with Advanced View's Library platform strip
+            // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk
+            // #3): every platform-selection change clears the
+            // current focus rather than risking a stale
+            // selected-game panel for a game no longer in view.
+            archive_context.clear_selection();
+        }
+        for (platform, count) in &platform_counts.named {
+            let selected = library_filters.platform.as_deref() == Some(platform.as_str());
+            if ui
+                .selectable_label(selected, format!("{platform} ({count})"))
+                .clicked()
+                && !selected
+            {
+                library_filters.platform = Some(platform.clone());
+                archive_context.clear_selection();
             }
-        });
+        }
+        if platform_counts.unknown > 0 {
+            let selected = library_filters.platform.as_deref() == Some("Unknown");
+            if ui
+                .selectable_label(selected, format!("Unknown ({})", platform_counts.unknown))
+                .clicked()
+                && !selected
+            {
+                library_filters.platform = Some("Unknown".to_string());
+                archive_context.clear_selection();
+            }
+        }
+    });
+    ui.add_space(theme::SECTION_GAP);
+
+    // Captured once, here, after the chips above have consumed their
+    // actual height - and given explicitly to both columns below via
+    // `allocate_ui_with_layout`, the same technique `ui_layout::page`
+    // itself uses to guarantee a child gets the full height it was
+    // promised rather than an ambiguous inherited one (manual QA finding:
+    // the list must use all remaining height, with no large empty area
+    // left below it).
+    let available_width = ui.available_width();
+    let available_height = ui.available_height();
+    let list_width = (available_width * 0.6).max(280.0);
+    let panel_width = (available_width - list_width - 24.0).max(220.0);
+
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(list_width, available_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                if visible.is_empty() {
+                    ui.weak("No games match your search.");
+                } else {
+                    let row_height = ui.spacing().interact_size.y.max(24.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("gamer_view_game_list")
+                        .max_height(ui.available_height())
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, visible.len(), |ui, row_range| {
+                            for visible_index in row_range {
+                                let index = visible[visible_index];
+                                let record = &data.records[index];
+                                let row = &data.rows[index];
+                                let selected =
+                                    archive_context.focused.as_deref() == Some(row.path.as_path());
+                                let state_label = gamer_primary_action_short_label(
+                                    &gamer_primary_action(record.mount_state),
+                                );
+                                let label = format!(
+                                    "{} \u{2014} {} \u{b7} {state_label}",
+                                    gamer_display_title(record),
+                                    row.platform
+                                );
+                                if ui.selectable_label(selected, label).clicked() {
+                                    archive_context.select_only(row.path.clone());
+                                    *screen = GamerViewScreen::GameList;
+                                }
+                            }
+                        });
+                }
+            },
+        );
 
         ui.separator();
 
-        ui.vertical(|ui| {
-            widgets::section_header(ui, "Selected game", None);
-            match selected_record(&data.records, archive_context.focused.as_deref()) {
-                None => {
-                    ui.weak("Select a game to see what you can do with it.");
-                }
-                Some(record) => {
-                    let archive_path = record.mount_plan.archive.path.clone();
-                    ui.strong(gamer_display_title(record));
-                    ui.label(format!(
-                        "{} \u{b7} {}",
-                        record
-                            .metadata
-                            .platform
-                            .as_deref()
-                            .or(record.identity.platform.as_deref())
-                            .unwrap_or("Unknown"),
-                        archive_kind_name(record.mount_plan.archive.kind)
-                    ));
-                    ui.add_space(theme::SECTION_GAP);
+        ui.allocate_ui_with_layout(
+            egui::vec2(panel_width, available_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                widgets::section_header(ui, "Selected game", None);
+                match selected_record(&data.records, archive_context.focused.as_deref()) {
+                    None => {
+                        ui.weak("Select a game to see what you can do with it.");
+                    }
+                    Some(record) => {
+                        let archive_path = record.mount_plan.archive.path.clone();
+                        ui.strong(gamer_display_title(record));
+                        ui.label(format!(
+                            "{} \u{b7} {}",
+                            record
+                                .metadata
+                                .platform
+                                .as_deref()
+                                .or(record.identity.platform.as_deref())
+                                .unwrap_or("Unknown"),
+                            archive_kind_name(record.mount_plan.archive.kind)
+                        ));
+                        ui.add_space(theme::SECTION_GAP);
 
-                    match gamer_primary_action(record.mount_state) {
-                        GamerPrimaryAction::Mount => {
-                            if ui.add_enabled(!busy, egui::Button::new("Mount")).clicked() {
-                                action = Some(GamerViewAction::Operation(OperationRequest {
-                                    action: ArchiveAction::Mount,
-                                    archive_path: archive_path.clone(),
-                                    cleanup_after_unmount,
-                                }));
+                        match gamer_primary_action(record.mount_state) {
+                            GamerPrimaryAction::Mount => {
+                                if ui.add_enabled(!busy, egui::Button::new("Mount")).clicked() {
+                                    action = Some(GamerViewAction::Operation(OperationRequest {
+                                        action: ArchiveAction::Mount,
+                                        archive_path: archive_path.clone(),
+                                        cleanup_after_unmount,
+                                    }));
+                                }
+                            }
+                            GamerPrimaryAction::Unmount => {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("Unmount"))
+                                    .clicked()
+                                {
+                                    action = Some(GamerViewAction::Operation(OperationRequest {
+                                        action: ArchiveAction::Unmount,
+                                        archive_path: archive_path.clone(),
+                                        cleanup_after_unmount,
+                                    }));
+                                }
+                                ui.weak("Currently mounted.");
+                            }
+                            GamerPrimaryAction::NoMountingNeeded => {
+                                ui.weak("No mounting needed \u{2014} ready for your emulator.");
+                            }
+                            GamerPrimaryAction::Blocked(reason) => {
+                                ui.colored_label(ui.visuals().warn_fg_color, reason);
                             }
                         }
-                        GamerPrimaryAction::Unmount => {
-                            if ui
-                                .add_enabled(!busy, egui::Button::new("Unmount"))
-                                .clicked()
-                            {
-                                action = Some(GamerViewAction::Operation(OperationRequest {
-                                    action: ArchiveAction::Unmount,
-                                    archive_path: archive_path.clone(),
-                                    cleanup_after_unmount,
-                                }));
-                            }
-                            ui.weak("Currently mounted.");
+                        if let Some(reason) = block_reason {
+                            ui.weak(reason);
                         }
-                        GamerPrimaryAction::NoMountingNeeded => {
-                            ui.weak("No mounting needed \u{2014} ready for your emulator.");
-                        }
-                        GamerPrimaryAction::Blocked(reason) => {
-                            ui.colored_label(ui.visuals().warn_fg_color, reason);
-                        }
-                    }
-                    if let Some(reason) = block_reason {
-                        ui.weak(reason);
-                    }
-                    ui.add_space(theme::SECTION_GAP);
+                        ui.add_space(theme::SECTION_GAP);
 
-                    if ui.button("Cheats & Mods").clicked() {
-                        action = Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
-                    }
-                    if ui.button("Details").clicked() {
-                        *screen = GamerViewScreen::Details;
-                    }
-                    let folder = archive_path.parent().filter(|folder| folder.is_dir());
-                    if let Some(folder) = folder
-                        && ui.button("Open location").clicked()
-                    {
-                        action = Some(GamerViewAction::CopyLocation(folder.display().to_string()));
-                    }
-                    if gamer_undo_available(cheat_workflow, Some(archive_path.as_path()))
-                        && ui.button("Undo last change").clicked()
-                    {
-                        action = Some(GamerViewAction::Undo);
+                        if ui.button("Cheats & Mods").clicked() {
+                            action = Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
+                        }
+                        if ui.button("Details").clicked() {
+                            *screen = GamerViewScreen::Details;
+                        }
+                        let folder = archive_path.parent().filter(|folder| folder.is_dir());
+                        if let Some(folder) = folder
+                            && ui.button("Open location").clicked()
+                        {
+                            action =
+                                Some(GamerViewAction::CopyLocation(folder.display().to_string()));
+                        }
+                        if gamer_undo_available(cheat_workflow, Some(archive_path.as_path()))
+                            && ui.button("Undo last change").clicked()
+                        {
+                            action = Some(GamerViewAction::Undo);
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
     });
 
     action
@@ -44724,6 +44745,54 @@ $Instant Growth [Nayr]\n";
                 "{size:?} must show at least {minimum_rows} complete Library rows, showed {visible}; first row rendered={}, geometry={:?}",
                 rendered_text_contains(&output, &paths[0]),
                 find_exact_text_position_and_clip(&output, &paths[0])
+            );
+        }
+    }
+
+    #[test]
+    fn gamer_view_game_list_uses_the_remaining_height_not_two_or_three_rows() {
+        // Manual QA layout finding: the Gamer View game list only showed
+        // ~2-3 rows regardless of window size, with a large unused area
+        // below it. The list must use all remaining height, be
+        // independently scrollable, and keep the selected-game panel
+        // fixed - mirroring the same desktop/1024x600 thresholds already
+        // proven for Advanced View's Library table
+        // (`library_renders_multiple_complete_rows_at_desktop_and_small_viewports`).
+        for (size, minimum_rows) in [
+            (egui::vec2(1920.0, 1080.0), 6_usize),
+            (egui::vec2(1024.0, 600.0), 2_usize),
+        ] {
+            let mut app = app_for_operation_tests();
+            app.ui_mode = GuiMode::GamerView;
+            app.view = MainView::Library;
+            let mut labels = Vec::new();
+            let records: Vec<ArchiveRecord> = (0..30)
+                .map(|index| {
+                    let path = format!("/roms/gamer-row-{index:02}.zip");
+                    let mut rec = record(&path, MountState::Pending);
+                    let title = format!("Game {index:02}");
+                    rec.metadata.title = Some(title.clone());
+                    rec.metadata.platform = Some("GameCube".to_string());
+                    labels.push(format!("{title} \u{2014} GameCube \u{b7} Ready to mount"));
+                    rec
+                })
+                .collect();
+            app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+
+            let ctx = egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
+            use eframe::App as _;
+            let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+            let visible = fully_visible_exact_text_count(&output, &labels);
+            assert!(
+                visible >= minimum_rows,
+                "{size:?} must show at least {minimum_rows} complete Gamer View game rows, \
+                 showed {visible}"
             );
         }
     }
