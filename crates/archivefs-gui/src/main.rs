@@ -9395,11 +9395,12 @@ impl eframe::App for ArchiveFsApp {
             // Decision 6 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): reached
             // through a small gear menu, not a permanent top-level control.
             egui::TopBottomPanel::top("gamer_top_bar").show(context, |ui| {
+                let search_width = gamer_search_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .hint_text("Search games...")
-                            .desired_width(240.0),
+                            .desired_width(search_width),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if loading || busy {
@@ -29022,6 +29023,20 @@ enum GamerViewScreen {
     Details,
 }
 
+const GAMER_SEARCH_MIN_WIDTH: f32 = 320.0;
+const GAMER_SEARCH_MAX_WIDTH: f32 = 760.0;
+const GAMER_TOP_BAR_CONTROL_RESERVE: f32 = 64.0;
+
+/// Gives search the top bar's main share while reserving enough room for
+/// the settings menu (and the busy spinner when present). The final `min`
+/// keeps unusually small windows from pushing that control off-screen.
+fn gamer_search_width(available_width: f32) -> f32 {
+    let available_for_search = (available_width - GAMER_TOP_BAR_CONTROL_RESERVE).max(0.0);
+    available_for_search
+        .clamp(GAMER_SEARCH_MIN_WIDTH, GAMER_SEARCH_MAX_WIDTH)
+        .min(available_for_search)
+}
+
 /// A dedicated on-disk preference file, following the same precedent the
 /// design (§1.1) points to: `~/.config/archivefs/emulator_profiles.toml`
 /// is its own small file rather than a new `Config`/`config.toml` field,
@@ -29326,6 +29341,7 @@ fn show_gamer_view(
     // is captured after a *known* amount of space is consumed, not a
     // wrapping row count that varies with window width.
     const PLATFORM_SHELF_HEIGHT: f32 = 76.0;
+    let platform_card_width = gamer_platform_card_width(ui.available_width());
     egui::ScrollArea::horizontal()
         .id_salt("gamer_view_platform_shelf")
         .max_height(PLATFORM_SHELF_HEIGHT)
@@ -29339,6 +29355,7 @@ fn show_gamer_view(
                     PlatformAssetCategory::Console.asset_id(),
                     "All",
                     data.rows.len(),
+                    platform_card_width,
                 )
                 .clicked()
                     && !all_selected
@@ -29354,7 +29371,15 @@ fn show_gamer_view(
                 for (platform, count) in &platform_counts.named {
                     let selected = library_filters.platform.as_deref() == Some(platform.as_str());
                     let asset_id = platform_asset_id(platform, false);
-                    if show_platform_shelf_item(ui, selected, asset_id, platform, *count).clicked()
+                    if show_platform_shelf_item(
+                        ui,
+                        selected,
+                        asset_id,
+                        platform,
+                        *count,
+                        platform_card_width,
+                    )
+                    .clicked()
                         && !selected
                     {
                         library_filters.platform = Some(platform.clone());
@@ -29369,6 +29394,7 @@ fn show_gamer_view(
                         PlatformAssetCategory::Unknown.asset_id(),
                         "Unknown",
                         platform_counts.unknown,
+                        platform_card_width,
                     )
                     .clicked()
                         && !selected
@@ -29880,6 +29906,32 @@ fn paint_platform_glyph_at(
     }
 }
 
+const PLATFORM_CARD_MIN_WIDTH: f32 = 96.0;
+const PLATFORM_CARD_MAX_WIDTH: f32 = 124.0;
+
+/// Cards grow modestly with desktop width, but never shrink below a
+/// readable minimum or consume so much room that horizontal browsing
+/// becomes awkward. The shelf itself remains a single scrolling row.
+fn gamer_platform_card_width(viewport_width: f32) -> f32 {
+    (viewport_width * 0.105).clamp(PLATFORM_CARD_MIN_WIDTH, PLATFORM_CARD_MAX_WIDTH)
+}
+
+/// Keep the count on its own visible line. Long platform names use the
+/// full-name hover/accessibility label and a width-aware compact form in
+/// the card rather than forcing the shelf taller.
+fn compact_platform_label(label: &str, card_width: f32) -> String {
+    let character_limit = ((card_width - 16.0) / 6.5).floor().clamp(10.0, 16.0) as usize;
+    if label.chars().count() <= character_limit {
+        return label.to_string();
+    }
+    let mut compact: String = label
+        .chars()
+        .take(character_limit.saturating_sub(1))
+        .collect();
+    compact.push('\u{2026}');
+    compact
+}
+
 /// One card in the platform shelf: a `Button` (for its built-in Tab
 /// focus, Enter/Space activation, visible focus ring, hover, and
 /// `.selected` highlight - none of that is reinvented here) with the
@@ -29892,8 +29944,8 @@ fn show_platform_shelf_item(
     asset_id: &str,
     label: &str,
     count: usize,
+    card_width: f32,
 ) -> egui::Response {
-    const SHELF_ITEM_WIDTH: f32 = 84.0;
     const GLYPH_SIZE: f32 = 32.0;
     // Dedicated assets already name the exact platform; a category
     // fallback additionally names *what kind of thing* the glyph is
@@ -29908,7 +29960,7 @@ fn show_platform_shelf_item(
     let response = ui
         .add(
             egui::Button::new("")
-                .min_size(egui::vec2(SHELF_ITEM_WIDTH, 68.0))
+                .min_size(egui::vec2(card_width, 68.0))
                 .selected(selected),
         )
         .on_hover_text(accessible_name.clone());
@@ -29925,13 +29977,7 @@ fn show_platform_shelf_item(
     };
     paint_platform_glyph_at(ui.painter(), glyph_center, GLYPH_SIZE, color, asset_id);
     let text_pos = response.rect.center() + egui::vec2(0.0, 18.0);
-    let truncated_label = if label.chars().count() > 11 {
-        let mut short: String = label.chars().take(10).collect();
-        short.push('\u{2026}');
-        short
-    } else {
-        label.to_string()
-    };
+    let truncated_label = compact_platform_label(label, card_width);
     ui.painter().text(
         text_pos,
         egui::Align2::CENTER_CENTER,
@@ -31072,6 +31118,46 @@ mod tests {
         // Must not panic and must resolve to a real, valid asset id.
         let resolved = platform_asset_id(&long_name, false);
         assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn gamer_search_uses_the_top_bar_without_displacing_settings() {
+        assert_eq!(gamer_search_width(1024.0), GAMER_SEARCH_MAX_WIDTH);
+        assert_eq!(gamer_search_width(1600.0), GAMER_SEARCH_MAX_WIDTH);
+        assert_eq!(gamer_search_width(400.0), 336.0);
+        assert!(400.0 - gamer_search_width(400.0) >= GAMER_TOP_BAR_CONTROL_RESERVE);
+        assert_eq!(gamer_search_width(40.0), 0.0);
+    }
+
+    #[test]
+    fn gamer_platform_cards_have_readable_responsive_bounds() {
+        assert_eq!(gamer_platform_card_width(600.0), PLATFORM_CARD_MIN_WIDTH);
+        assert!(
+            gamer_platform_card_width(1024.0) > PLATFORM_CARD_MIN_WIDTH,
+            "1024-wide Gamer View should use the available room without crowding cards"
+        );
+        assert_eq!(gamer_platform_card_width(1920.0), PLATFORM_CARD_MAX_WIDTH);
+    }
+
+    #[test]
+    fn platform_card_labels_truncate_by_width_and_preserve_core_categories() {
+        assert_eq!(
+            compact_platform_label("All", PLATFORM_CARD_MIN_WIDTH),
+            "All"
+        );
+        assert_eq!(
+            compact_platform_label("Unknown", PLATFORM_CARD_MIN_WIDTH),
+            "Unknown"
+        );
+        let compact =
+            compact_platform_label("A Very Long Platform Display Name", PLATFORM_CARD_MIN_WIDTH);
+        assert!(compact.ends_with('\u{2026}'));
+        assert!(compact.chars().count() <= 12);
+        assert_eq!(
+            compact_platform_label("PlayStation Vita", PLATFORM_CARD_MAX_WIDTH),
+            "PlayStation Vita",
+            "wider cards should retain useful names instead of applying a fixed early cutoff"
+        );
     }
 
     #[test]
