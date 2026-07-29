@@ -82,6 +82,16 @@ export SOURCE_DATE_EPOCH
 export LC_ALL=C
 export TZ=UTC
 
+BUILD_ARGS=(build --workspace --release --locked)
+if [[ -n "$TARGET_DIR" ]]; then
+    if [[ "$TARGET_DIR" != /* ]]; then
+        TARGET_DIR="$PWD/$TARGET_DIR"
+    fi
+    mkdir -p "$TARGET_DIR"
+    TARGET_DIR="$(CDPATH= cd -- "$TARGET_DIR" && pwd -P)"
+    export CARGO_TARGET_DIR="$TARGET_DIR"
+fi
+
 RUST_REMAP=""
 if [[ -n "${HOME:-}" ]]; then
     RUST_REMAP+=" --remap-path-prefix=$HOME=/build/home"
@@ -95,18 +105,13 @@ fi
 # rustc uses the last applicable remap for nested prefixes. Keep the exact
 # repository mapping last so it wins over the broader HOME mapping.
 RUST_REMAP+=" --remap-path-prefix=$REPO_ROOT=/build/source"
-RUST_REMAP="${RUST_REMAP# }"
-export RUSTFLAGS="$RUST_REMAP${RUSTFLAGS:+ $RUSTFLAGS}"
-
-BUILD_ARGS=(build --workspace --release --locked)
 if [[ -n "$TARGET_DIR" ]]; then
-    if [[ "$TARGET_DIR" != /* ]]; then
-        TARGET_DIR="$PWD/$TARGET_DIR"
-    fi
-    mkdir -p "$TARGET_DIR"
-    TARGET_DIR="$(CDPATH= cd -- "$TARGET_DIR" && pwd -P)"
-    export CARGO_TARGET_DIR="$TARGET_DIR"
+    # Generated graphics bindings use include! and otherwise retain the clean
+    # build's unique Cargo target directory in the GUI binary.
+    RUST_REMAP+=" --remap-path-prefix=$TARGET_DIR=/build/target"
 fi
+RUST_REMAP="${RUST_REMAP# }"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$RUST_REMAP"
 
 release_note "building ArchiveFS v$VERSION with cargo --release --locked"
 (cd "$REPO_ROOT" && cargo "${BUILD_ARGS[@]}")
