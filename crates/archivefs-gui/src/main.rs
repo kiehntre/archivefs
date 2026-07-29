@@ -38276,6 +38276,71 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn detected_platform_counts_reflects_only_platforms_actually_present() {
+        let platforms = [
+            Some("GameCube"),
+            Some("Sharp X68000"),
+            Some("GameCube"),
+            None,
+            Some("Virtual Boy"),
+            None,
+        ];
+        let summary = detected_platform_counts(platforms.into_iter());
+        assert_eq!(
+            summary.named,
+            vec![
+                ("GameCube".to_string(), 2),
+                ("Sharp X68000".to_string(), 1),
+                ("Virtual Boy".to_string(), 1),
+            ],
+            "every non-zero platform must appear, sorted, with its real count"
+        );
+        assert_eq!(summary.unknown, 2);
+
+        // A canonical platform the registry recognises but that has zero
+        // archives must never appear (no fixed list is consulted here).
+        assert!(
+            !summary
+                .named
+                .iter()
+                .any(|(platform, _)| platform == "PS3"),
+        );
+    }
+
+    #[test]
+    fn unsupported_platform_banner_names_the_recognised_platform_not_generic_text() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("Sharp X68000".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Unsupported;
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheats_mods_page(
+                    ui,
+                    app.cheat_workflow.as_mut(),
+                    &app.retroarch_profiles,
+                    &app.pcsx2_profiles,
+                    &app.dolphin_profiles,
+                    &app.xenia_profiles,
+                    None,
+                    None,
+                    &app.history,
+                    false,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Sharp X68000 recognised"));
+        assert!(rendered_text_contains(&output, "cheat support is not available yet"));
+        assert!(
+            !rendered_text_contains(&output, "no Cheats & Mods adapter for this archive"),
+            "the generic, unnamed message must be gone"
+        );
+    }
+
+    #[test]
     fn unknown_platform_banner_is_visible_only_when_the_filter_is_active_and_there_is_something_to_explain()
      {
         let mut filters = LibraryRowFilters::default();
