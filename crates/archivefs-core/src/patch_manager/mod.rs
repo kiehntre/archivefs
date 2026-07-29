@@ -21,6 +21,7 @@ mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
 mod cheat_catalogue;
+mod cheat_coverage;
 mod cheat_history;
 mod cheat_install_plan;
 mod cheat_install_result;
@@ -96,6 +97,12 @@ pub use cheat_catalogue::{
     JsonManifestSource, MAX_CATALOGUE_EXCLUDED_ENTRIES, MAX_CATALOGUE_EXCLUSION_EXAMPLES,
     RetroarchChtDirectorySource, build_cheat_availability_report, load_cheat_catalogue_snapshot,
     match_cheat_game_record, matching_excluded_entry,
+};
+pub use cheat_coverage::{
+    CHEAT_PROVIDER_COVERAGE_FORMAT_VERSION, CheatCoverageEntry, CheatCoverageSummary,
+    CheatProviderCoverageReport, CoverageGameIdentity, CoverageProvider, CoverageRejection,
+    CoverageRejectionCategory, DolphinCodeFormat, ProviderCoverageProvenance,
+    build_cheat_provider_coverage_report, classify_dolphin_code_section,
 };
 pub use cheat_history::{
     CHEAT_HISTORY_RESULT_SCHEMA_VERSION, CheatBackupAssessment, CheatDestinationAssessment,
