@@ -16689,9 +16689,9 @@ fn dolphin_identity_unavailable_detail(report: &GameIdentityReport) -> String {
         Some(IdentityStatus::Deferred) => format!(
             "{format_label} is recognised as a GameCube/Wii image, but ArchiveFS cannot yet read an exact Game ID from it without decompressing the full image. Cheats cannot be matched safely without one."
         ),
-        Some(IdentityStatus::Missing) => format!(
-            "{format_label} is recognised, but the disc-header block is not present in it."
-        ),
+        Some(IdentityStatus::Missing) => {
+            format!("{format_label} is recognised, but the disc-header block is not present in it.")
+        }
         Some(IdentityStatus::Unsupported) | None => format!(
             "{format_label} is recognised as a GameCube/Wii game, but exact identity extraction is not supported for it yet."
         ),
@@ -22302,8 +22302,12 @@ fn show_cheats_mods_page(
                         None => "Platform not recognised".to_string(),
                     },
                     match workflow.platform.as_deref() {
-                        Some(_) => "This platform is recognised, but cheat support is not available yet. Assign a different platform in Library if this is wrong.",
-                        None => "ArchiveFS could not determine this archive's platform, so no Cheats & Mods adapter can be chosen. Assign a platform in Library if you know it.",
+                        Some(_) => {
+                            "This platform is recognised, but cheat support is not available yet. Assign a different platform in Library if this is wrong."
+                        }
+                        None => {
+                            "ArchiveFS could not determine this archive's platform, so no Cheats & Mods adapter can be chosen. Assign a platform in Library if you know it."
+                        }
                     },
                     widgets::StatusTone::Info,
                 );
@@ -38299,12 +38303,7 @@ $Instant Growth [Nayr]\n";
 
         // A canonical platform the registry recognises but that has zero
         // archives must never appear (no fixed list is consulted here).
-        assert!(
-            !summary
-                .named
-                .iter()
-                .any(|(platform, _)| platform == "PS3"),
-        );
+        assert!(!summary.named.iter().any(|(platform, _)| platform == "PS3"),);
     }
 
     #[test]
@@ -38333,7 +38332,10 @@ $Instant Growth [Nayr]\n";
             });
         });
         assert!(rendered_text_contains(&output, "Sharp X68000 recognised"));
-        assert!(rendered_text_contains(&output, "cheat support is not available yet"));
+        assert!(rendered_text_contains(
+            &output,
+            "cheat support is not available yet"
+        ));
         assert!(
             !rendered_text_contains(&output, "no Cheats & Mods adapter for this archive"),
             "the generic, unnamed message must be gone"

@@ -10108,10 +10108,7 @@ mod tests {
             detect_platform(format!("{root}/mame/Game.zip"), root),
             Some("Arcade".to_string())
         );
-        assert_eq!(
-            platform_preferred_emulator_for_alias("mame"),
-            Some("MAME")
-        );
+        assert_eq!(platform_preferred_emulator_for_alias("mame"), Some("MAME"));
         // Arcade itself (no specific emulator implied by the folder name)
         // has no preferred-emulator evidence, which is not an error.
         assert_eq!(platform_preferred_emulator_for_alias("arcade"), None);

@@ -1279,7 +1279,11 @@ fn inspect_rvz(report: &mut GameIdentityReport) {
     };
     let mut magic = [0_u8; 4];
     if source.read_exact_at(0, &mut magic).is_err() {
-        add_unavailable(report, IdentityStatus::Invalid, "RVZ file header is truncated");
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "RVZ file header is truncated",
+        );
         report.bytes_read = source.bytes_read();
         return;
     }
@@ -1352,7 +1356,11 @@ fn inspect_ciso(report: &mut GameIdentityReport) {
     };
     let mut magic = [0_u8; 4];
     if source.read_exact_at(0, &mut magic).is_err() {
-        add_unavailable(report, IdentityStatus::Invalid, "CISO file header is truncated");
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "CISO file header is truncated",
+        );
         report.bytes_read = source.bytes_read();
         return;
     }
@@ -1386,7 +1394,11 @@ fn inspect_ciso(report: &mut GameIdentityReport) {
         .read_exact_at(CISO_MAP_OFFSET, &mut first_map_byte)
         .is_err()
     {
-        add_unavailable(report, IdentityStatus::Invalid, "CISO block map is truncated");
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "CISO block map is truncated",
+        );
         report.bytes_read = source.bytes_read();
         return;
     }
@@ -2530,11 +2542,7 @@ mod tests {
     fn ciso_recovers_exact_game_id_from_the_first_stored_block() {
         let directory = FixtureDir::new("ciso");
         let dhead = dolphin_fixture(IdentityPlatform::GameCube, b"GC3E01", 0);
-        let path = write_fixture(
-            &directory,
-            "disc.ciso",
-            &ciso_fixture(2048, true, &dhead),
-        );
+        let path = write_fixture(&directory, "disc.ciso", &ciso_fixture(2048, true, &dhead));
         let report = inspect_game_identity(&path, Some("GameCube"));
         assert_eq!(report.format, IdentityImageFormat::Ciso);
         assert_eq!(report.verified_dolphin_game_id(), Some("GC3E01"));
