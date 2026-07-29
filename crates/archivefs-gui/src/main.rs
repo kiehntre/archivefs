@@ -960,6 +960,31 @@ fn mount_all_available(pending_count: usize, busy: bool) -> bool {
     pending_count > 0 && !busy
 }
 
+/// Renders the ">25 items" typed-count input when required (decisions
+/// 1-3, docs/GUI_NAVIGATION_RESET_DESIGN.md §9) and returns whether the
+/// confirm button should be enabled - the one shared gate every bulk
+/// confirmation dialog in the app calls, so the threshold and comparison
+/// can never drift between them.
+fn show_bulk_action_typed_count_gate(
+    ui: &mut egui::Ui,
+    count: usize,
+    typed: &mut String,
+    otherwise_available: bool,
+) -> bool {
+    if bulk_action_requires_typed_count(count) {
+        ui.label(format!(
+            "This affects more than {BULK_ACTION_TYPED_CONFIRMATION_THRESHOLD} items. Type the \
+             exact count ({count}) to confirm."
+        ));
+        ui.add(
+            egui::TextEdit::singleline(typed)
+                .desired_width(80.0)
+                .hint_text(count.to_string()),
+        );
+    }
+    bulk_action_confirm_enabled(count, typed, otherwise_available)
+}
+
 fn pending_mount_items(records: &[ArchiveRecord]) -> Vec<MountAllItem> {
     records
         .iter()
@@ -1077,6 +1102,38 @@ struct RunningMountAll {
     receiver: Receiver<MountAllEvent>,
     stop: Arc<AtomicBool>,
     progress: MountAllProgress,
+}
+
+/// Decisions 1-3 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): every bulk
+/// action shows a preview and exact item count; 1-25 items use a normal
+/// confirmation; more than this threshold requires typing the exact
+/// count. One shared threshold and one shared comparison function - every
+/// bulk-action confirmation dialog in the app (Mount All, Unmount All,
+/// Mount Queue, Mount Selected, bulk platform assignment, missing-entry
+/// removal) calls these two functions rather than each re-implementing
+/// its own gate, so the rule cannot drift between call sites.
+const BULK_ACTION_TYPED_CONFIRMATION_THRESHOLD: usize = 25;
+
+fn bulk_action_requires_typed_count(count: usize) -> bool {
+    count > BULK_ACTION_TYPED_CONFIRMATION_THRESHOLD
+}
+
+/// Exact match only - no leading/trailing whitespace tolerance beyond a
+/// plain `trim`, no partial/prefix match, no sign, no thousands
+/// separator. A count that hasn't been typed, or was typed wrong, must
+/// never satisfy this.
+fn bulk_action_typed_count_matches(typed: &str, count: usize) -> bool {
+    let trimmed = typed.trim();
+    !trimmed.is_empty() && trimmed == count.to_string()
+}
+
+/// Whether a bulk-action confirmation's primary button should be enabled:
+/// the ordinary busy/eligibility gate, *and*, only once the count exceeds
+/// the threshold, an exact typed match.
+fn bulk_action_confirm_enabled(count: usize, typed: &str, otherwise_available: bool) -> bool {
+    otherwise_available
+        && (!bulk_action_requires_typed_count(count)
+            || bulk_action_typed_count_matches(typed, count))
 }
 
 #[derive(Clone)]
@@ -3110,6 +3167,30 @@ struct ArchiveFsApp {
     /// report instead of re-inspecting from scratch.
     archive_inspector: Option<ArchiveInspectorState>,
     archive_inspector_generation: RefreshGeneration,
+    /// docs/GUI_NAVIGATION_RESET_DESIGN.md's mode switch - a view-layer
+    /// concept only, persisted independently of every other field (see
+    /// `load_gui_mode`/`save_gui_mode`).
+    ui_mode: GuiMode,
+    /// Which of Gamer View's two screens is showing - never persisted.
+    gamer_view_screen: GamerViewScreen,
+    /// The typed count for Mount All's >25-item confirmation gate - see
+    /// `bulk_action_confirm_enabled`. Cleared whenever the dialog closes.
+    mount_all_typed_count: String,
+    unmount_all_typed_count: String,
+    missing_removal_typed_count: String,
+    /// Row-context-menu "Mount selected" (audit finding: this previously
+    /// dispatched with no confirmation at all, unlike "Unmount selected").
+    /// The exact paths are re-derived fresh from the live snapshot at
+    /// confirm time, never trusted from when the dialog opened.
+    confirm_mount_selected: Option<Vec<PathBuf>>,
+    focus_mount_selected_cancel: bool,
+    mount_selected_typed_count: String,
+    /// Bulk platform assignment/clear (audit finding: this previously
+    /// dispatched instantly with no confirmation at all, from both the
+    /// selection action bar and the row context menu).
+    confirm_bulk_platform_action: Option<(Vec<PathBuf>, BulkPlatformActionKind)>,
+    focus_bulk_platform_cancel: bool,
+    bulk_platform_action_typed_count: String,
 }
 
 impl ArchiveFsApp {
@@ -3241,6 +3322,17 @@ impl ArchiveFsApp {
             library_column_widths: LibraryColumnWidths::default(),
             archive_inspector: None,
             archive_inspector_generation: RefreshGeneration::INITIAL,
+            ui_mode: load_gui_mode(),
+            gamer_view_screen: GamerViewScreen::default(),
+            mount_all_typed_count: String::new(),
+            unmount_all_typed_count: String::new(),
+            missing_removal_typed_count: String::new(),
+            confirm_mount_selected: None,
+            focus_mount_selected_cancel: false,
+            mount_selected_typed_count: String::new(),
+            confirm_bulk_platform_action: None,
+            focus_bulk_platform_cancel: false,
+            bulk_platform_action_typed_count: String::new(),
         }
     }
 
@@ -7494,7 +7586,18 @@ impl ArchiveFsApp {
             | CheatTransactionState::Result { key, .. } => key != &current_transaction_key,
             CheatTransactionState::Idle => false,
         };
-        if !identity_page_is_current || transaction_is_stale {
+        // docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #1: an
+        // `Applying` transaction's receiver must never be dropped merely
+        // because the Cheats & Mods page isn't the one currently rendered
+        // (Gamer View's action panel and a Gamer/Advanced mode switch both
+        // legitimately leave this page without the transaction being done).
+        // Only a genuinely stale transaction (a different archive/adapter/
+        // profile/key than what's now selected) is reset while in flight -
+        // that reset is a correctness rule, not a page-visibility one, and
+        // is unchanged here.
+        let transaction_in_flight =
+            matches!(workflow.transaction, CheatTransactionState::Applying { .. });
+        if (!identity_page_is_current && !transaction_in_flight) || transaction_is_stale {
             workflow.transaction = CheatTransactionState::Idle;
         } else if let CheatTransactionState::Applying { key, receiver } = &workflow.transaction {
             let key = key.clone();
@@ -9010,7 +9113,16 @@ impl eframe::App for ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.reconcile_library_tab();
         self.poll_shared_history();
+        // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
+        // mandatory risk #2) drives this exact same `shared_rollback` state
+        // machine while `self.view` stays `Library` (Gamer View never sets
+        // `MainView::HistoryLogs`) - so this Advanced-View-only cleanup rule
+        // must not fire while in Gamer View, or a rollback preview/review
+        // started from Gamer View would be reset to `Idle` before the user
+        // ever sees it. Advanced View's own behaviour (reset on leaving
+        // History & Logs) is completely unchanged.
         if self.view != MainView::HistoryLogs
+            && self.ui_mode != GuiMode::GamerView
             && matches!(
                 self.shared_rollback,
                 SharedRollbackState::Previewing { .. } | SharedRollbackState::Review { .. }
@@ -9133,120 +9245,159 @@ impl eframe::App for ArchiveFsApp {
 
         let has_database = self.database_state.snapshot().is_some();
 
-        egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(main_view_title(self.view)).strong());
-                ui.separator();
-                ui.menu_button("File", |ui| {
-                    if ui.button("Quit").clicked() {
-                        context.send_viewport_cmd(egui::ViewportCommand::Close);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Library", |ui| {
-                    if ui
-                        .add_enabled(!loading && !busy, egui::Button::new("Scan library"))
-                        .clicked()
-                    {
-                        self.start_database_action(context.clone(), true);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Refresh database status"))
-                        .clicked()
-                    {
-                        self.start_database_action(context.clone(), false);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Select all visible").clicked() {
-                        self.select_all_visible_requested = true;
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.archive_context.selected.is_empty(),
-                            egui::Button::new("Clear selection"),
-                        )
-                        .clicked()
-                    {
-                        self.archive_context.clear_selection();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            !loading && !busy,
-                            egui::Button::new("Refresh Live Snapshot"),
-                        )
-                        .clicked()
-                    {
-                        self.refresh(context);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Sources", |ui| {
-                    if ui.button("Open Sources page").clicked() {
-                        self.view = MainView::Sources;
-                        self.tools_overlay = ToolsOverlay::None;
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Tools", |ui| {
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Diagnostics"))
-                        .clicked()
-                    {
-                        self.tools_overlay = ToolsOverlay::Diagnostics;
-                        self.refresh_diagnostics(context);
-                        ui.close();
-                    }
-                    if ui.button("Doctor checks").clicked() {
-                        self.tools_overlay = ToolsOverlay::DoctorChecks;
-                        ui.close();
-                    }
-                    if ui.button("Platform Aliases").clicked() {
-                        self.tools_overlay = ToolsOverlay::PlatformAliases;
-                        ui.close();
-                    }
-                    if ui.button("Database Status").clicked() {
-                        self.tools_overlay = ToolsOverlay::DatabaseStatus;
-                        ui.close();
-                    }
-                    ui.separator();
-                    let activity_label = if self.show_activity {
-                        "Hide Activity"
-                    } else {
-                        "Show Activity"
-                    };
-                    if ui.button(activity_label).clicked() {
-                        self.show_activity = !self.show_activity;
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About ArchiveFS").clicked() {
-                        self.show_about = true;
-                        ui.close();
-                    }
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if loading || busy {
-                        ui.spinner();
-                    }
-                });
-            });
-        });
-
         let mut navigation_request = None;
-        egui::SidePanel::left("app_navigation")
-            .resizable(false)
-            .exact_width(218.0)
-            .show(context, |ui| {
-                ui.add_space(14.0);
-                navigation_request = show_primary_navigation(ui, self.view, has_database);
+        if self.ui_mode == GuiMode::AdvancedView {
+            egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(main_view_title(self.view)).strong());
+                    ui.separator();
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Quit").clicked() {
+                            context.send_viewport_cmd(egui::ViewportCommand::Close);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Library", |ui| {
+                        if ui
+                            .add_enabled(!loading && !busy, egui::Button::new("Scan library"))
+                            .clicked()
+                        {
+                            self.start_database_action(context.clone(), true);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Refresh database status"))
+                            .clicked()
+                        {
+                            self.start_database_action(context.clone(), false);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Select all visible").clicked() {
+                            self.select_all_visible_requested = true;
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.archive_context.selected.is_empty(),
+                                egui::Button::new("Clear selection"),
+                            )
+                            .clicked()
+                        {
+                            self.archive_context.clear_selection();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                !loading && !busy,
+                                egui::Button::new("Refresh Live Snapshot"),
+                            )
+                            .clicked()
+                        {
+                            self.refresh(context);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Sources", |ui| {
+                        if ui.button("Open Sources page").clicked() {
+                            self.view = MainView::Sources;
+                            self.tools_overlay = ToolsOverlay::None;
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Tools", |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Diagnostics"))
+                            .clicked()
+                        {
+                            self.tools_overlay = ToolsOverlay::Diagnostics;
+                            self.refresh_diagnostics(context);
+                            ui.close();
+                        }
+                        if ui.button("Doctor checks").clicked() {
+                            self.tools_overlay = ToolsOverlay::DoctorChecks;
+                            ui.close();
+                        }
+                        if ui.button("Platform Aliases").clicked() {
+                            self.tools_overlay = ToolsOverlay::PlatformAliases;
+                            ui.close();
+                        }
+                        if ui.button("Database Status").clicked() {
+                            self.tools_overlay = ToolsOverlay::DatabaseStatus;
+                            ui.close();
+                        }
+                        ui.separator();
+                        let activity_label = if self.show_activity {
+                            "Hide Activity"
+                        } else {
+                            "Show Activity"
+                        };
+                        if ui.button(activity_label).clicked() {
+                            self.show_activity = !self.show_activity;
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("About ArchiveFS").clicked() {
+                            self.show_about = true;
+                            ui.close();
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if loading || busy {
+                            ui.spinner();
+                        }
+                        // Decision 7 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9):
+                        // a clear, always-visible way back - never gear-hidden,
+                        // never buried.
+                        if ui
+                            .button("Return to Gamer View")
+                            .on_hover_text("Switch back to the simple, one-screen view.")
+                            .clicked()
+                        {
+                            self.ui_mode = GuiMode::GamerView;
+                            self.view = MainView::Library;
+                            self.tools_overlay = ToolsOverlay::None;
+                            save_gui_mode(self.ui_mode);
+                        }
+                    });
+                });
             });
+
+            egui::SidePanel::left("app_navigation")
+                .resizable(false)
+                .exact_width(218.0)
+                .show(context, |ui| {
+                    ui.add_space(14.0);
+                    navigation_request = show_primary_navigation(ui, self.view, has_database);
+                });
+        } else {
+            // Decision 6 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): reached
+            // through a small gear menu, not a permanent top-level control.
+            egui::TopBottomPanel::top("gamer_top_bar").show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("Search games...")
+                            .desired_width(240.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if loading || busy {
+                            ui.spinner();
+                        }
+                        ui.menu_button("\u{2699}", |ui| {
+                            if ui.button("Advanced View").clicked() {
+                                self.ui_mode = GuiMode::AdvancedView;
+                                save_gui_mode(self.ui_mode);
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+            });
+        }
         if let Some(clicked) = navigation_request {
             if clicked == MainView::CheatsMods {
                 // `reconcile_cheats_mods_context`, called below every frame
@@ -9267,12 +9418,14 @@ impl eframe::App for ArchiveFsApp {
             }
         }
 
-        if let Some(ActivityPanelAction::ShowRelatedArchive(path)) = show_activity_panel(
-            context,
-            &mut self.history,
-            &mut self.show_activity,
-            &mut self.clipboard,
-        ) {
+        if self.ui_mode == GuiMode::AdvancedView
+            && let Some(ActivityPanelAction::ShowRelatedArchive(path)) = show_activity_panel(
+                context,
+                &mut self.history,
+                &mut self.show_activity,
+                &mut self.clipboard,
+            )
+        {
             self.navigate_to_library_tab(LibraryTab::Archives);
             self.archive_context.select_only(path);
         }
@@ -9379,6 +9532,72 @@ impl eframe::App for ArchiveFsApp {
                             }
                         }
                         ToolsOverlay::None => unreachable!(),
+                    }
+                    return;
+                }
+
+                // docs/GUI_NAVIGATION_RESET_DESIGN.md: Gamer View is one
+                // screen (`self.view` stays at its default, `Library`,
+                // the whole time it's active) plus the existing,
+                // unmodified Cheats & Mods page when opened from the
+                // selected-game action panel below. Every other
+                // `MainView` destination is Advanced-View-only and
+                // unreachable while `ui_mode` is `GamerView`, since
+                // nothing in this mode's UI ever sets `self.view` to one.
+                if self.ui_mode == GuiMode::GamerView && self.view != MainView::CheatsMods {
+                    let data = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        LoadState::Loading { previous, .. } => previous.as_deref(),
+                        LoadState::Error(_) => None,
+                    };
+                    let gamer_action = show_gamer_view(
+                        ui,
+                        data,
+                        GamerViewViewState {
+                            filter: &self.filter,
+                            library_filters: &mut self.library_filters,
+                            archive_context: &mut self.archive_context,
+                            screen: &mut self.gamer_view_screen,
+                            busy: archive_actions_blocked,
+                            block_reason: archive_action_block_reason,
+                            cleanup_after_unmount: self.cleanup_after_unmount,
+                            cheat_workflow: self.cheat_workflow.as_ref(),
+                            feedback: self.feedback.as_ref(),
+                        },
+                    );
+                    match gamer_action {
+                        Some(GamerViewAction::Operation(request)) => {
+                            requested_action = Some(AppOperationRequest::Archive(request));
+                        }
+                        Some(GamerViewAction::OpenCheatsMods(archive_path)) => {
+                            requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
+                        }
+                        Some(GamerViewAction::CopyLocation(folder)) => {
+                            match self.clipboard.set_text(folder) {
+                                Ok(()) => {
+                                    self.feedback = Some(ActionFeedback {
+                                        succeeded: true,
+                                        message: "Copied the game's folder location to the clipboard.".to_string(),
+                                        cleanup: None,
+                                        warning: None,
+                                        more_information: None,
+                                    });
+                                }
+                                Err(error) => {
+                                    self.feedback = Some(ActionFeedback {
+                                        succeeded: false,
+                                        message: format!("Could not copy to the clipboard: {error}"),
+                                        cleanup: None,
+                                        warning: None,
+                                        more_information: None,
+                                    });
+                                }
+                            }
+                        }
+                        Some(GamerViewAction::Undo) => {
+                            self.start_cheat_install_rollback(context.clone());
+                        }
+                        None => {}
                     }
                     return;
                 }
@@ -10358,11 +10577,21 @@ impl eframe::App for ArchiveFsApp {
                                 confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
                                 confirm_mount_all: &mut self.confirm_mount_all,
                                 focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
+                                mount_all_typed_count: &mut self.mount_all_typed_count,
                                 confirm_unmount_all: &mut self.confirm_unmount_all,
                                 focus_unmount_all_cancel: &mut self.focus_unmount_all_cancel,
+                                unmount_all_typed_count: &mut self.unmount_all_typed_count,
                                 confirm_unmount_selected: &mut self.confirm_unmount_selected,
                                 focus_unmount_selected_cancel: &mut self
                                     .focus_unmount_selected_cancel,
+                                confirm_mount_selected: &mut self.confirm_mount_selected,
+                                focus_mount_selected_cancel: &mut self.focus_mount_selected_cancel,
+                                mount_selected_typed_count: &mut self.mount_selected_typed_count,
+                                confirm_bulk_platform_action: &mut self
+                                    .confirm_bulk_platform_action,
+                                focus_bulk_platform_cancel: &mut self.focus_bulk_platform_cancel,
+                                bulk_platform_action_typed_count: &mut self
+                                    .bulk_platform_action_typed_count,
                                 focus_lazy_cancel: &mut self.focus_lazy_cancel,
                                 focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
                                 lazy_unmount_offers: &self.lazy_unmount_offers,
@@ -10383,6 +10612,7 @@ impl eframe::App for ArchiveFsApp {
                                 missing_removal_available,
                                 missing_removal_busy: self.missing_removal.is_some(),
                                 confirm_remove_missing: &mut self.confirm_remove_missing,
+                                missing_removal_typed_count: &mut self.missing_removal_typed_count,
                                 sort_field: &mut self.sort_field,
                                 sort_ascending: &mut self.sort_ascending,
                                 library_scroll_offset: &mut self.library_scroll_offset,
@@ -15454,28 +15684,17 @@ fn show_active_mounts_recent_activity(ui: &mut egui::Ui, history: &OperationHist
     }
 }
 
-fn show_history_logs_page(
+/// The shared rollback preview/review/confirm/apply/result card, reused
+/// verbatim (extracted, not duplicated - see
+/// docs/GUI_NAVIGATION_RESET_DESIGN.md's Undo requirement) by both
+/// History & Logs and Gamer View's "Undo last change" so there is exactly
+/// one rendering of this state machine, not a second copy that could
+/// drift from it.
+fn show_shared_rollback_card(
     ui: &mut egui::Ui,
-    shared_history: &SharedHistoryState,
     rollback: &mut SharedRollbackState,
-    selected_operation: Option<&str>,
-    history: &mut OperationHistory,
-    filters: &mut HistoryLogFilters,
-    clipboard: &mut dyn ClipboardBackend,
 ) -> Option<HistoryPageAction> {
     let mut action = None;
-    widgets::page_header(
-        ui,
-        "History & Logs",
-        "Filter, inspect, copy, or export operations from this application session.",
-    );
-    widgets::section_header(
-        ui,
-        "Recovery",
-        Some(
-            "Roll back the most recent set of destructive, journal-tracked operations if something went wrong.",
-        ),
-    );
     widgets::card(ui, |ui| match rollback {
         SharedRollbackState::Idle => {
             ui.label("Rollback always begins with a fresh read-only preview and a separate confirmation.");
@@ -15562,6 +15781,34 @@ fn show_history_logs_page(
             }
         }
     });
+    action
+}
+
+fn show_history_logs_page(
+    ui: &mut egui::Ui,
+    shared_history: &SharedHistoryState,
+    rollback: &mut SharedRollbackState,
+    selected_operation: Option<&str>,
+    history: &mut OperationHistory,
+    filters: &mut HistoryLogFilters,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<HistoryPageAction> {
+    let mut action = None;
+    widgets::page_header(
+        ui,
+        "History & Logs",
+        "Filter, inspect, copy, or export operations from this application session.",
+    );
+    widgets::section_header(
+        ui,
+        "Recovery",
+        Some(
+            "Roll back the most recent set of destructive, journal-tracked operations if something went wrong.",
+        ),
+    );
+    if let Some(rollback_action) = show_shared_rollback_card(ui, rollback) {
+        action = Some(rollback_action);
+    }
     widgets::section_header(
         ui,
         "Verified transaction journals",
@@ -25041,10 +25288,25 @@ struct LoadedViewState<'a> {
     confirm_lazy_unmount_final: &'a mut Option<PathBuf>,
     confirm_mount_all: &'a mut Option<MountAllConfirmation>,
     focus_mount_all_cancel: &'a mut bool,
+    mount_all_typed_count: &'a mut String,
     confirm_unmount_all: &'a mut Option<UnmountAllConfirmation>,
     focus_unmount_all_cancel: &'a mut bool,
+    unmount_all_typed_count: &'a mut String,
     confirm_unmount_selected: &'a mut Option<UnmountSelectedConfirmation>,
     focus_unmount_selected_cancel: &'a mut bool,
+    /// Row-context-menu "Mount selected" confirmation - previously
+    /// dispatched with no confirmation at all (asymmetric with "Unmount
+    /// selected", which already had one). The paths are re-derived fresh
+    /// from `data.records` at confirm time, never trusted stale.
+    confirm_mount_selected: &'a mut Option<Vec<PathBuf>>,
+    focus_mount_selected_cancel: &'a mut bool,
+    mount_selected_typed_count: &'a mut String,
+    /// Bulk platform assignment/clear confirmation - previously dispatched
+    /// instantly with no confirmation at all, from both the selection
+    /// action bar and the row context menu.
+    confirm_bulk_platform_action: &'a mut Option<(Vec<PathBuf>, BulkPlatformActionKind)>,
+    focus_bulk_platform_cancel: &'a mut bool,
+    bulk_platform_action_typed_count: &'a mut String,
     focus_lazy_cancel: &'a mut bool,
     focus_final_lazy_cancel: &'a mut bool,
     lazy_unmount_offers: &'a HashSet<PathBuf>,
@@ -25068,6 +25330,7 @@ struct LoadedViewState<'a> {
     missing_removal_available: bool,
     missing_removal_busy: bool,
     confirm_remove_missing: &'a mut Option<Vec<PathBuf>>,
+    missing_removal_typed_count: &'a mut String,
     sort_field: &'a mut Option<SortField>,
     sort_ascending: &'a mut bool,
     library_scroll_offset: &'a mut f32,
@@ -25160,10 +25423,18 @@ fn show_loaded_data(
         confirm_lazy_unmount_final,
         confirm_mount_all,
         focus_mount_all_cancel,
+        mount_all_typed_count,
         confirm_unmount_all,
         focus_unmount_all_cancel,
+        unmount_all_typed_count,
         confirm_unmount_selected,
         focus_unmount_selected_cancel,
+        confirm_mount_selected,
+        focus_mount_selected_cancel,
+        mount_selected_typed_count,
+        confirm_bulk_platform_action,
+        focus_bulk_platform_cancel,
+        bulk_platform_action_typed_count,
         focus_lazy_cancel,
         focus_final_lazy_cancel,
         lazy_unmount_offers,
@@ -25184,6 +25455,7 @@ fn show_loaded_data(
         missing_removal_available,
         missing_removal_busy,
         confirm_remove_missing,
+        missing_removal_typed_count,
         sort_field,
         sort_ascending,
         library_scroll_offset,
@@ -25256,6 +25528,12 @@ fn show_loaded_data(
         {
             library_filters.platform = None;
             *selected_archive = None;
+            // Consistent with the named-platform and Unknown branches below
+            // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #3): a
+            // platform-selection change must never leave a stale
+            // multi-selection behind just because this was the "All"
+            // branch specifically.
+            selected_archives.clear();
             filtered_rows.take();
         }
         for (platform, count) in &platform_counts.named {
@@ -25392,6 +25670,13 @@ fn show_loaded_data(
                 );
                 ui.label("A failure will be recorded, and later archives will still be attempted.");
                 ui.add_space(8.0);
+                let confirm_enabled = show_bulk_action_typed_count_gate(
+                    ui,
+                    pending_count,
+                    mount_all_typed_count,
+                    mount_all_available(pending_count, busy),
+                );
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let cancel = ui.add_enabled(
                         actions_available,
@@ -25409,18 +25694,22 @@ fn show_loaded_data(
                             "Mount All cancelled before starting.",
                         ));
                         *confirm_mount_all = None;
+                        mount_all_typed_count.clear();
                     }
                     if ui
-                        .add_enabled(
-                            mount_all_available(pending_count, busy),
-                            egui::Button::new("Mount All"),
-                        )
+                        .add_enabled(confirm_enabled, egui::Button::new("Mount All"))
                         .clicked()
                     {
+                        // Re-derived fresh from the live snapshot at the
+                        // moment of confirmation, never the possibly-stale
+                        // count the dialog opened with (decision 1's
+                        // "re-derive eligibility immediately before
+                        // execution").
                         requested_action = Some(AppOperationRequest::MountAll(
                             pending_mount_items(&data.records),
                         ));
                         *confirm_mount_all = None;
+                        mount_all_typed_count.clear();
                     }
                 });
             });
@@ -25445,6 +25734,13 @@ fn show_loaded_data(
                     if *cleanup_after_unmount { "enabled" } else { "disabled" }
                 ));
                 ui.add_space(8.0);
+                let confirm_enabled = show_bulk_action_typed_count_gate(
+                    ui,
+                    mounted_count,
+                    unmount_all_typed_count,
+                    mounted_count > 0 && !busy,
+                );
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let cancel = ui.add_enabled(
                         actions_available,
@@ -25462,9 +25758,10 @@ fn show_loaded_data(
                             "Unmount All cancelled before starting.",
                         ));
                         *confirm_unmount_all = None;
+                        unmount_all_typed_count.clear();
                     }
                     if ui
-                        .add_enabled(mounted_count > 0 && !busy, egui::Button::new("Unmount All"))
+                        .add_enabled(confirm_enabled, egui::Button::new("Unmount All"))
                         .clicked()
                     {
                         requested_action = Some(AppOperationRequest::UnmountAll {
@@ -25472,6 +25769,7 @@ fn show_loaded_data(
                             cleanup_after_unmount: *cleanup_after_unmount,
                         });
                         *confirm_unmount_all = None;
+                        unmount_all_typed_count.clear();
                     }
                 });
             });
@@ -25553,6 +25851,123 @@ fn show_loaded_data(
                             cleanup_after_unmount: *cleanup_after_unmount,
                         });
                         *confirm_unmount_selected = None;
+                    }
+                });
+            });
+    }
+
+    if let Some(paths) = confirm_mount_selected.clone() {
+        // Re-derived fresh every frame the dialog is open, not just at
+        // confirm time - so the count shown in the preview never
+        // disagrees with what "Mount selected" will actually do
+        // (decision 1's "re-derive eligibility immediately before
+        // execution").
+        let items = mount_all_items_for_paths(&data.records, &paths);
+        let count = items.len();
+        let actions_available = !busy;
+        egui::Window::new("Mount selected pending archives?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{count} of the {} selected archives are ready to mount under {}.",
+                    paths.len(),
+                    data.mount_root.display()
+                ));
+                ui.label(
+                    "Only those pending archives will be mounted; the rest of the selection is \
+                     not currently eligible and will not be touched.",
+                );
+                ui.add_space(8.0);
+                let confirm_enabled = show_bulk_action_typed_count_gate(
+                    ui,
+                    count,
+                    mount_selected_typed_count,
+                    actions_available && count > 0,
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.add_enabled(
+                        actions_available,
+                        egui::Button::new("Cancel").fill(ui.visuals().selection.bg_fill),
+                    );
+                    if *focus_mount_selected_cancel {
+                        cancel.request_focus();
+                        *focus_mount_selected_cancel = false;
+                    }
+                    if cancel.clicked() {
+                        history.record(HistoryEntry::new(
+                            ActivityAction::MountAll,
+                            None,
+                            ActivityOutcome::Cancelled,
+                            "Mount selected cancelled before starting.",
+                        ));
+                        *confirm_mount_selected = None;
+                        mount_selected_typed_count.clear();
+                    }
+                    if ui
+                        .add_enabled(confirm_enabled, egui::Button::new("Mount selected"))
+                        .clicked()
+                    {
+                        requested_action = Some(AppOperationRequest::MountAll(
+                            mount_all_items_for_paths(&data.records, &paths),
+                        ));
+                        *confirm_mount_selected = None;
+                        mount_selected_typed_count.clear();
+                    }
+                });
+            });
+    }
+
+    if let Some((archive_paths, kind)) = confirm_bulk_platform_action.clone() {
+        let count = archive_paths.len();
+        let actions_available = !bulk_platform_busy;
+        let description = match &kind {
+            BulkPlatformActionKind::Set(platform) => {
+                format!("Set the platform of {count} selected archives to {platform}.")
+            }
+            BulkPlatformActionKind::Clear => {
+                format!("Clear the manually assigned platform of {count} selected archives.")
+            }
+        };
+        egui::Window::new("Change platform for selected archives?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(description);
+                ui.add_space(8.0);
+                let confirm_enabled = show_bulk_action_typed_count_gate(
+                    ui,
+                    count,
+                    bulk_platform_action_typed_count,
+                    actions_available && count > 0,
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.add_enabled(
+                        actions_available,
+                        egui::Button::new("Cancel").fill(ui.visuals().selection.bg_fill),
+                    );
+                    if *focus_bulk_platform_cancel {
+                        cancel.request_focus();
+                        *focus_bulk_platform_cancel = false;
+                    }
+                    if cancel.clicked() {
+                        *confirm_bulk_platform_action = None;
+                        bulk_platform_action_typed_count.clear();
+                    }
+                    if ui
+                        .add_enabled(confirm_enabled, egui::Button::new("Confirm change"))
+                        .clicked()
+                    {
+                        requested_action = Some(AppOperationRequest::BulkPlatformAssignment {
+                            archive_paths: archive_paths.clone(),
+                            kind: kind.clone(),
+                        });
+                        *confirm_bulk_platform_action = None;
+                        bulk_platform_action_typed_count.clear();
                     }
                 });
             });
@@ -25788,10 +26203,13 @@ fn show_loaded_data(
         bulk_platform_choice,
         bulk_platform_busy,
     ) {
-        requested_action = Some(AppOperationRequest::BulkPlatformAssignment {
-            archive_paths: selected_archives.iter().cloned().collect(),
-            kind: action,
-        });
+        // Previously dispatched instantly with no confirmation at all -
+        // now gated the same way every other bulk action is (decisions
+        // 1-3), and shares the exact same confirmation state as the row
+        // context menu's "Set platform"/"Clear platform" so there is
+        // exactly one bulk-platform confirmation dialog, not two.
+        *confirm_bulk_platform_action = Some((selected_archives.iter().cloned().collect(), action));
+        *focus_bulk_platform_cancel = true;
     }
 
     widgets::card(ui, |ui| {
@@ -25946,13 +26364,21 @@ fn show_loaded_data(
                     .show(ui.ctx(), |ui| {
                         ui.label(missing_removal_confirmation_text(paths.len()));
                         ui.add_space(8.0);
+                        let confirm_enabled = show_bulk_action_typed_count_gate(
+                            ui,
+                            paths.len(),
+                            missing_removal_typed_count,
+                            missing_removal_available && still_valid,
+                        );
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
                                 *confirm_remove_missing = None;
+                                missing_removal_typed_count.clear();
                             }
                             if ui
                                 .add_enabled(
-                                    missing_removal_available && still_valid,
+                                    confirm_enabled,
                                     egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
                                 )
                                 .clicked()
@@ -25960,6 +26386,7 @@ fn show_loaded_data(
                                 requested_action =
                                     Some(AppOperationRequest::RemoveMissing(paths.clone()));
                                 *confirm_remove_missing = None;
+                                missing_removal_typed_count.clear();
                             }
                         });
                     });
@@ -26203,19 +26630,24 @@ fn show_loaded_data(
                         });
                     }
                     RowContextMenuAction::MountSelected(paths) => {
-                        requested_action = Some(AppOperationRequest::MountAll(
-                            mount_all_items_for_paths(&data.records, &paths),
-                        ));
+                        // Previously dispatched immediately with no
+                        // confirmation at all (asymmetric with "Unmount
+                        // selected" just below, which already had one) -
+                        // now gated the same way every other bulk action is
+                        // (decisions 1-3).
+                        *confirm_mount_selected = Some(paths);
+                        *focus_mount_selected_cancel = true;
                     }
                     RowContextMenuAction::UnmountSelected => {
                         *confirm_unmount_selected = Some(UnmountSelectedConfirmation);
                         *focus_unmount_selected_cancel = true;
                     }
                     RowContextMenuAction::BulkPlatform(archive_paths, kind) => {
-                        requested_action = Some(AppOperationRequest::BulkPlatformAssignment {
-                            archive_paths,
-                            kind,
-                        });
+                        // Previously dispatched instantly with no
+                        // confirmation at all - now gated the same way
+                        // every other bulk action is (decisions 1-3).
+                        *confirm_bulk_platform_action = Some((archive_paths, kind));
+                        *focus_bulk_platform_cancel = true;
                     }
                     RowContextMenuAction::CopyText(text) => {
                         let _ = clipboard.set_text(text);
@@ -28449,6 +28881,459 @@ fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<Vec<usize>>
     )
 }
 
+// =====================================================================
+// GUI Navigation Reset: Gamer View / Advanced View
+//
+// Implements docs/GUI_NAVIGATION_RESET_DESIGN.md. Mode is a view-layer
+// switch only: no change to archivefs-core, no change to any existing
+// `MainView` variant, render function, or adapter behaviour. Gamer View
+// reuses the same `ArchiveRecord`/`ArchiveRow`/`OperationRequest`/
+// `AppOperationRequest`/`CheatWorkflowState` types and the same
+// `start_operation`/`open_cheats_mods_workspace`/
+// `start_cheat_install_rollback` methods every existing page already
+// dispatches through - it never re-implements mount, cheat-install, or
+// rollback logic.
+// =====================================================================
+
+/// Decision 5 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): exactly these two
+/// modes, no alternate labels. `GamerView` is the unconditional default
+/// for a fresh profile/first launch (decision matches §1.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GuiMode {
+    #[default]
+    GamerView,
+    AdvancedView,
+}
+
+/// Which of Gamer View's two screens is currently showing - the
+/// one-screen game list (default) or the read-only Details view reached
+/// from the selected-game action panel. Never persisted; always starts
+/// on `GameList`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GamerViewScreen {
+    #[default]
+    GameList,
+    Details,
+}
+
+/// A dedicated on-disk preference file, following the same precedent the
+/// design (§1.1) points to: `~/.config/archivefs/emulator_profiles.toml`
+/// is its own small file rather than a new `Config`/`config.toml` field,
+/// specifically to avoid coupling unrelated persistence together. Mode is
+/// a GUI-layer-only concept (never read by `archivefs-core` or the CLI),
+/// so it lives in the GUI crate rather than in core.
+fn gui_mode_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("archivefs")
+            .join("gui_mode.txt"),
+    )
+}
+
+fn parse_gui_mode(contents: &str) -> GuiMode {
+    match contents.trim() {
+        "advanced" => GuiMode::AdvancedView,
+        _ => GuiMode::GamerView,
+    }
+}
+
+fn gui_mode_file_contents(mode: GuiMode) -> &'static str {
+    match mode {
+        GuiMode::GamerView => "gamer",
+        GuiMode::AdvancedView => "advanced",
+    }
+}
+
+/// A missing or unreadable file means "nothing chosen yet" - falls back
+/// to the unconditional default (`GamerView`), never an error.
+fn load_gui_mode() -> GuiMode {
+    gui_mode_config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|contents| parse_gui_mode(&contents))
+        .unwrap_or_default()
+}
+
+/// Best-effort: a failure to persist the chosen mode (e.g. a read-only
+/// home directory) never blocks the mode switch itself from taking
+/// effect for the rest of the session - it just won't survive a restart.
+fn save_gui_mode(mode: GuiMode) {
+    let Some(path) = gui_mode_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, gui_mode_file_contents(mode));
+}
+
+/// Gamer View's plain-language primary-action state for a selected game -
+/// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
+/// `MountState` variant name (finding #4); Advanced View keeps the
+/// precise names unchanged (`mount_validation_label`, `planned_action_label`,
+/// `MountState`'s own `Display` impl - none of those are touched here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GamerPrimaryAction {
+    Mount,
+    Unmount,
+    NoMountingNeeded,
+    Blocked(String),
+}
+
+fn gamer_primary_action(state: MountState) -> GamerPrimaryAction {
+    match state {
+        MountState::Pending => GamerPrimaryAction::Mount,
+        MountState::Mounted => GamerPrimaryAction::Unmount,
+        MountState::NotMountable => GamerPrimaryAction::NoMountingNeeded,
+        MountState::MountPathExists => GamerPrimaryAction::Blocked(
+            "A file already exists at this game's mount destination. Open Advanced View's \
+             Mount page to resolve this."
+                .to_string(),
+        ),
+    }
+}
+
+/// The short, list-row-sized counterpart of `gamer_primary_action` - one
+/// or two words, safe to append after a title/platform pair.
+fn gamer_primary_action_short_label(action: &GamerPrimaryAction) -> &'static str {
+    match action {
+        GamerPrimaryAction::Mount => "Ready to mount",
+        GamerPrimaryAction::Unmount => "Mounted",
+        GamerPrimaryAction::NoMountingNeeded => "Ready to play",
+        GamerPrimaryAction::Blocked(_) => "Needs attention",
+    }
+}
+
+/// Prefers the real, human title from metadata; falls back to the
+/// archive's filename (without extension) rather than ever showing a raw
+/// internal path as if it were a title.
+fn gamer_display_title(record: &ArchiveRecord) -> String {
+    record
+        .metadata
+        .title
+        .clone()
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| {
+            record
+                .mount_plan
+                .archive
+                .path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Unknown game")
+                .to_string()
+        })
+}
+
+/// Stage 3's exact rule: Undo is shown only when the selected game has a
+/// genuinely reversible operation recorded - never speculatively. This
+/// only gates *visibility*; the click still routes through
+/// `start_cheat_install_rollback`, which carries its own authoritative
+/// safety checks unchanged.
+fn gamer_undo_available(workflow: Option<&CheatWorkflowState>, selected: Option<&Path>) -> bool {
+    let (Some(workflow), Some(selected)) = (workflow, selected) else {
+        return false;
+    };
+    workflow.archive_path == selected
+        && matches!(workflow.transaction, CheatTransactionState::Result { .. })
+}
+
+enum GamerViewAction {
+    Operation(OperationRequest),
+    OpenCheatsMods(PathBuf),
+    /// The folder to copy to the clipboard - "Open location" (§2.1's
+    /// action visibility rules). No file-manager process is launched;
+    /// see the implementation summary for why (no such capability, and
+    /// no new external-process dependency, exists in this codebase today).
+    CopyLocation(String),
+    Undo,
+}
+
+struct GamerViewViewState<'a> {
+    filter: &'a str,
+    library_filters: &'a mut LibraryRowFilters,
+    archive_context: &'a mut ArchiveContext,
+    screen: &'a mut GamerViewScreen,
+    busy: bool,
+    block_reason: Option<&'static str>,
+    cleanup_after_unmount: bool,
+    cheat_workflow: Option<&'a CheatWorkflowState>,
+    feedback: Option<&'a ActionFeedback>,
+}
+
+/// The read-only Details screen (finding #2): identity/platform/metadata
+/// only - no mount/unmount/platform-assignment controls here. Those live
+/// exclusively on the action panel (Stage 3), so there is exactly one
+/// place a beginner ever clicks to change a game's state, not two
+/// slightly-different copies of the same buttons.
+fn show_gamer_details_panel(ui: &mut egui::Ui, record: &ArchiveRecord) {
+    widgets::section_header(ui, "Details", None);
+    egui::Grid::new("gamer_details_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            detail_row(
+                ui,
+                "Platform",
+                record
+                    .metadata
+                    .platform
+                    .as_deref()
+                    .or(record.identity.platform.as_deref())
+                    .unwrap_or("Unknown"),
+            );
+            detail_row(
+                ui,
+                "Format",
+                archive_kind_name(record.mount_plan.archive.kind),
+            );
+            detail_row(ui, "Size", &format_size(record.identity.size_bytes));
+            optional_detail_row(ui, "Title", record.metadata.title.as_deref());
+            optional_detail_row(ui, "Region", record.metadata.region.as_deref());
+            optional_detail_row(ui, "Version", record.metadata.version.as_deref());
+            optional_detail_row(ui, "Disc", record.metadata.disc.as_deref());
+            optional_detail_row(ui, "Publisher", record.metadata.publisher.as_deref());
+            optional_detail_row(ui, "Developer", record.metadata.developer.as_deref());
+            optional_detail_row(ui, "Genre", record.metadata.genre.as_deref());
+        });
+}
+
+/// Gamer View's one primary screen (Stage 2/3): search + platform chips +
+/// game list on the left, the selected-game action panel on the right -
+/// or, when `screen` is `Details`, the read-only Details view instead.
+/// Returns `None` while data is still loading (the caller shows its own
+/// loading state via `data: None`).
+fn show_gamer_view(
+    ui: &mut egui::Ui,
+    data: Option<&LoadedData>,
+    view_state: GamerViewViewState<'_>,
+) -> Option<GamerViewAction> {
+    let GamerViewViewState {
+        filter,
+        library_filters,
+        archive_context,
+        screen,
+        busy,
+        block_reason,
+        cleanup_after_unmount,
+        cheat_workflow,
+        feedback,
+    } = view_state;
+    let mut action = None;
+
+    if let Some(feedback) = feedback {
+        let color = if feedback.succeeded {
+            egui::Color32::from_rgb(70, 170, 90)
+        } else {
+            ui.visuals().error_fg_color
+        };
+        ui.colored_label(color, &feedback.message);
+        ui.add_space(4.0);
+    }
+
+    let Some(data) = data else {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Loading your games...");
+        });
+        return None;
+    };
+
+    if *screen == GamerViewScreen::Details {
+        if ui.button("\u{2190} Back to games").clicked() {
+            *screen = GamerViewScreen::GameList;
+        }
+        ui.add_space(theme::SECTION_GAP);
+        match selected_record(&data.records, archive_context.focused.as_deref()) {
+            Some(record) => show_gamer_details_panel(ui, record),
+            None => {
+                ui.label("Select a game to view its details.");
+            }
+        }
+        return None;
+    }
+
+    let search_text = filter.to_lowercase();
+    let visible: Vec<usize> = data
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            library_filters.matches(row)
+                && (search_text.is_empty() || row.search_text.contains(&search_text))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let platform_counts = detected_platform_counts(
+        data.rows
+            .iter()
+            .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+    );
+
+    ui.horizontal(|ui| {
+        let available_width = ui.available_width();
+        ui.vertical(|ui| {
+            ui.set_width((available_width * 0.6).max(280.0));
+            ui.horizontal_wrapped(|ui| {
+                let all_selected = library_filters.platform.is_none();
+                if ui
+                    .selectable_label(all_selected, format!("All ({})", data.rows.len()))
+                    .clicked()
+                    && !all_selected
+                {
+                    library_filters.platform = None;
+                    // Consistent with Advanced View's Library platform strip
+                    // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk
+                    // #3): every platform-selection change clears the
+                    // current focus rather than risking a stale
+                    // selected-game panel for a game no longer in view.
+                    archive_context.clear_selection();
+                }
+                for (platform, count) in &platform_counts.named {
+                    let selected = library_filters.platform.as_deref() == Some(platform.as_str());
+                    if ui
+                        .selectable_label(selected, format!("{platform} ({count})"))
+                        .clicked()
+                        && !selected
+                    {
+                        library_filters.platform = Some(platform.clone());
+                        archive_context.clear_selection();
+                    }
+                }
+                if platform_counts.unknown > 0 {
+                    let selected = library_filters.platform.as_deref() == Some("Unknown");
+                    if ui
+                        .selectable_label(
+                            selected,
+                            format!("Unknown ({})", platform_counts.unknown),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        library_filters.platform = Some("Unknown".to_string());
+                        archive_context.clear_selection();
+                    }
+                }
+            });
+            ui.add_space(theme::SECTION_GAP);
+
+            if visible.is_empty() {
+                ui.weak("No games match your search.");
+            } else {
+                let row_height = ui.spacing().interact_size.y.max(24.0);
+                let body_height = ui.available_height().max(row_height);
+                egui::ScrollArea::vertical()
+                    .id_salt("gamer_view_game_list")
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, visible.len(), |ui, row_range| {
+                        for visible_index in row_range {
+                            let index = visible[visible_index];
+                            let record = &data.records[index];
+                            let row = &data.rows[index];
+                            let selected =
+                                archive_context.focused.as_deref() == Some(row.path.as_path());
+                            let state_label = gamer_primary_action_short_label(
+                                &gamer_primary_action(record.mount_state),
+                            );
+                            let label = format!(
+                                "{} \u{2014} {} \u{b7} {state_label}",
+                                gamer_display_title(record),
+                                row.platform
+                            );
+                            if ui.selectable_label(selected, label).clicked() {
+                                archive_context.select_only(row.path.clone());
+                                *screen = GamerViewScreen::GameList;
+                            }
+                        }
+                    });
+            }
+        });
+
+        ui.separator();
+
+        ui.vertical(|ui| {
+            widgets::section_header(ui, "Selected game", None);
+            match selected_record(&data.records, archive_context.focused.as_deref()) {
+                None => {
+                    ui.weak("Select a game to see what you can do with it.");
+                }
+                Some(record) => {
+                    let archive_path = record.mount_plan.archive.path.clone();
+                    ui.strong(gamer_display_title(record));
+                    ui.label(format!(
+                        "{} \u{b7} {}",
+                        record
+                            .metadata
+                            .platform
+                            .as_deref()
+                            .or(record.identity.platform.as_deref())
+                            .unwrap_or("Unknown"),
+                        archive_kind_name(record.mount_plan.archive.kind)
+                    ));
+                    ui.add_space(theme::SECTION_GAP);
+
+                    match gamer_primary_action(record.mount_state) {
+                        GamerPrimaryAction::Mount => {
+                            if ui.add_enabled(!busy, egui::Button::new("Mount")).clicked() {
+                                action = Some(GamerViewAction::Operation(OperationRequest {
+                                    action: ArchiveAction::Mount,
+                                    archive_path: archive_path.clone(),
+                                    cleanup_after_unmount,
+                                }));
+                            }
+                        }
+                        GamerPrimaryAction::Unmount => {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Unmount"))
+                                .clicked()
+                            {
+                                action = Some(GamerViewAction::Operation(OperationRequest {
+                                    action: ArchiveAction::Unmount,
+                                    archive_path: archive_path.clone(),
+                                    cleanup_after_unmount,
+                                }));
+                            }
+                            ui.weak("Currently mounted.");
+                        }
+                        GamerPrimaryAction::NoMountingNeeded => {
+                            ui.weak("No mounting needed \u{2014} ready for your emulator.");
+                        }
+                        GamerPrimaryAction::Blocked(reason) => {
+                            ui.colored_label(ui.visuals().warn_fg_color, reason);
+                        }
+                    }
+                    if let Some(reason) = block_reason {
+                        ui.weak(reason);
+                    }
+                    ui.add_space(theme::SECTION_GAP);
+
+                    if ui.button("Cheats & Mods").clicked() {
+                        action = Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
+                    }
+                    if ui.button("Details").clicked() {
+                        *screen = GamerViewScreen::Details;
+                    }
+                    let folder = archive_path.parent().filter(|folder| folder.is_dir());
+                    if let Some(folder) = folder
+                        && ui.button("Open location").clicked()
+                    {
+                        action = Some(GamerViewAction::CopyLocation(folder.display().to_string()));
+                    }
+                    if gamer_undo_available(cheat_workflow, Some(archive_path.as_path()))
+                        && ui.button("Undo last change").clicked()
+                    {
+                        action = Some(GamerViewAction::Undo);
+                    }
+                }
+            }
+        });
+    });
+
+    action
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -29425,6 +30310,268 @@ mod tests {
     }
 
     #[test]
+    fn an_applying_transaction_survives_leaving_the_cheats_mods_page() {
+        // docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #1 (Codex
+        // audit): a Gamer View mode switch, or simply navigating back to
+        // the game list, must never drop the receiver of an in-flight
+        // install just because `MainView::CheatsMods` is no longer the
+        // rendered page.
+        let mut app = app_with_cheats_mods_context();
+        let key = cheat_preview_key(app.cheat_workflow.as_ref().unwrap());
+        let (_sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().transaction =
+            CheatTransactionState::Applying { key, receiver };
+
+        app.view = MainView::Library;
+        app.poll_cheat_workflow(&egui::Context::default());
+
+        assert!(
+            matches!(
+                app.cheat_workflow.as_ref().unwrap().transaction,
+                CheatTransactionState::Applying { .. }
+            ),
+            "an in-flight install must not be reset to Idle merely because \
+             the Cheats & Mods page isn't rendered right now"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_stale_applying_transaction_is_still_reset() {
+        // The correctness rule (different archive/adapter/profile/key)
+        // that `an_applying_transaction_survives_leaving_the_cheats_mods_page`
+        // must not accidentally disable: a transaction that no longer
+        // matches the current workflow key is still reset, regardless of
+        // which page is showing.
+        let mut app = app_with_cheats_mods_context();
+        let mut stale_key = cheat_preview_key(app.cheat_workflow.as_ref().unwrap());
+        stale_key.archive_path = PathBuf::from("/roms/a-different-archive-entirely.zip");
+        let (_sender, receiver) = mpsc::channel();
+        app.cheat_workflow.as_mut().unwrap().transaction = CheatTransactionState::Applying {
+            key: stale_key,
+            receiver,
+        };
+
+        app.view = MainView::CheatsMods;
+        app.poll_cheat_workflow(&egui::Context::default());
+
+        assert!(
+            matches!(
+                app.cheat_workflow.as_ref().unwrap().transaction,
+                CheatTransactionState::Idle
+            ),
+            "a stale transaction key must still be reset"
+        );
+    }
+
+    #[test]
+    fn gamer_view_rollback_preview_survives_a_real_update_frame() {
+        // docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #2 (Codex
+        // audit): Gamer View's "Undo last change" drives the exact same
+        // `shared_rollback` state machine History & Logs does, but Gamer
+        // View never sets `self.view = MainView::HistoryLogs`. The
+        // Advanced-View-only "leaving History & Logs resets rollback"
+        // rule must not fire while `ui_mode` is `GamerView`.
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let (_sender, receiver) = mpsc::channel();
+        app.shared_rollback = SharedRollbackState::Previewing { receiver };
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+        assert!(
+            matches!(app.shared_rollback, SharedRollbackState::Previewing { .. }),
+            "a rollback preview started from Gamer View must not be reset to \
+             Idle just because self.view isn't MainView::HistoryLogs"
+        );
+    }
+
+    #[test]
+    fn advanced_view_rollback_preview_is_still_reset_on_leaving_history_logs() {
+        // The exact opposite of the test above - Advanced View's existing
+        // behaviour (unchanged) must still reset a rollback preview when
+        // navigating away from History & Logs.
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::AdvancedView;
+        app.view = MainView::Library;
+        let (_sender, receiver) = mpsc::channel();
+        app.shared_rollback = SharedRollbackState::Previewing { receiver };
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+        assert!(
+            matches!(app.shared_rollback, SharedRollbackState::Idle),
+            "Advanced View's existing reset-on-navigate-away behaviour must be unchanged"
+        );
+    }
+
+    #[test]
+    fn bulk_action_gate_boundary_at_1_25_and_26_items() {
+        // Decisions 1-3 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9), and the
+        // Codex audit's explicit boundary requirement: 1 and 25 use a
+        // normal confirmation (no typed count needed); 26 requires typing
+        // the exact count.
+        assert!(!bulk_action_requires_typed_count(1));
+        assert!(!bulk_action_requires_typed_count(25));
+        assert!(bulk_action_requires_typed_count(26));
+
+        // At 1 and 25, confirmation is enabled with no typed input at all.
+        assert!(bulk_action_confirm_enabled(1, "", true));
+        assert!(bulk_action_confirm_enabled(25, "", true));
+        // At 26, empty/wrong/partial/signed/whitespace-only input must
+        // never enable confirmation.
+        assert!(!bulk_action_confirm_enabled(26, "", true));
+        assert!(!bulk_action_confirm_enabled(26, "2", true));
+        assert!(!bulk_action_confirm_enabled(26, "-26", true));
+        assert!(!bulk_action_confirm_enabled(26, "   ", true));
+        assert!(!bulk_action_confirm_enabled(26, "26.0", true));
+        // The exact count, with incidental surrounding whitespace tolerated.
+        assert!(bulk_action_confirm_enabled(26, "26", true));
+        assert!(bulk_action_confirm_enabled(26, "  26  ", true));
+        // The typed-count gate never overrides the ordinary
+        // busy/eligibility gate.
+        assert!(!bulk_action_confirm_enabled(26, "26", false));
+        assert!(!bulk_action_confirm_enabled(1, "", false));
+    }
+
+    #[test]
+    fn platform_all_selection_clears_multi_selection_consistently_with_named_and_unknown() {
+        // Codex audit mandatory risk #3 / decision consistency: the "All"
+        // platform chip previously cleared only `selected_archive`,
+        // leaving `selected_archives` (the multi-selection set)
+        // populated - inconsistent with the named-platform and Unknown
+        // chips, which already cleared both. Exercised through the real
+        // Library page (`show_loaded_data`), not a re-derivation of the
+        // fix.
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut a = record("/roms/a.zip", MountState::Pending);
+            a.metadata.platform = Some("GameCube".to_string());
+            data.records.push(a);
+        }
+        app.view = MainView::Library;
+        app.library_tab = LibraryTab::Archives;
+        app.ui_mode = GuiMode::AdvancedView;
+        app.library_filters.platform = Some("GameCube".to_string());
+        app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
+        app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let _ = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+        // Click the "All" chip via its real text position - the same
+        // real-click pattern the rest of this suite uses, not a direct
+        // field mutation.
+        let output = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+        if let Some(center) = find_exact_text_center(&output, "All (1)") {
+            let click_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(center),
+                    egui::Event::PointerButton {
+                        pos: center,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: center,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = ctx.run(click_input, |ctx| app.update(ctx, &mut frame));
+            assert!(
+                app.archive_context.selected.is_empty(),
+                "the multi-selection must be cleared by the All chip, \
+                 exactly like the named-platform and Unknown chips"
+            );
+        }
+    }
+
+    #[test]
+    fn gamer_view_shows_list_and_selected_game_actions_at_1024x600() {
+        // docs/GUI_NAVIGATION_RESET_DESIGN.md §11's 1024x600 risk list:
+        // Gamer View's compact game list and selected-game action panel
+        // must both be visible together at this exact viewport, with no
+        // sidebar consuming width (Gamer View never renders one).
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut a = record("/roms/a.zip", MountState::Pending);
+            a.metadata.title = Some("A Real Game Title".to_string());
+            a.metadata.platform = Some("GameCube".to_string());
+            data.records.push(a);
+        }
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        app.archive_context
+            .select_only(PathBuf::from("/roms/a.zip"));
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+        for expected in [
+            "Search games...",
+            "A Real Game Title",
+            "GameCube",
+            "Cheats & Mods",
+            "Details",
+            "Mount",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "expected {expected:?} to be visible in Gamer View at 1024x600"
+            );
+        }
+        // The Advanced-only sidebar/menu bar must be completely absent.
+        assert!(!rendered_text_contains(&output, "Active Mounts"));
+        assert!(!rendered_text_contains(&output, "Mount All"));
+    }
+
+    #[test]
     fn changing_the_archive_clears_the_candidate_and_selection() {
         let mut app = app_with_cheats_mods_context();
         workflow_at_cheat_selection_stage(&mut app);
@@ -29993,6 +31140,10 @@ mod tests {
     #[test]
     fn expanding_the_activity_panel_does_not_compress_its_content() {
         let mut app = app_for_operation_tests();
+        // The bottom activity panel is an Advanced View surface (Gamer
+        // View has its own, much simpler feedback line - see
+        // docs/GUI_NAVIGATION_RESET_DESIGN.md).
+        app.ui_mode = GuiMode::AdvancedView;
         for index in 0..8 {
             app.history.record(HistoryEntry::new(
                 ActivityAction::CheatPreview,
@@ -30071,6 +31222,9 @@ mod tests {
         ] {
             let mut app = app_for_operation_tests();
             app.view = view;
+            // Advanced View surface - see the equivalent comment on
+            // `expanding_the_activity_panel_does_not_compress_its_content`.
+            app.ui_mode = GuiMode::AdvancedView;
             for index in 0..8 {
                 app.history.record(HistoryEntry::new(
                     ActivityAction::CheatPreview,
@@ -30150,6 +31304,8 @@ mod tests {
     fn history_logs_final_entry_is_reachable_at_maximum_scroll() {
         let mut app = app_for_operation_tests();
         app.view = MainView::HistoryLogs;
+        // History & Logs is an Advanced View-only destination.
+        app.ui_mode = GuiMode::AdvancedView;
         // Leave headroom below HISTORY_LIMIT: entering this page triggers
         // its own "refreshing history" activity entries, which would
         // otherwise evict the oldest of a *full* 50-entry buffer before
@@ -34750,6 +35906,19 @@ $Instant Growth [Nayr]\n";
             library_column_widths: LibraryColumnWidths::default(),
             archive_inspector: None,
             archive_inspector_generation: RefreshGeneration::INITIAL,
+            // Hermetic literal default, matching every other field in
+            // this test-only constructor - never `load_gui_mode()`.
+            ui_mode: GuiMode::default(),
+            gamer_view_screen: GamerViewScreen::default(),
+            mount_all_typed_count: String::new(),
+            unmount_all_typed_count: String::new(),
+            missing_removal_typed_count: String::new(),
+            confirm_mount_selected: None,
+            focus_mount_selected_cancel: false,
+            mount_selected_typed_count: String::new(),
+            confirm_bulk_platform_action: None,
+            focus_bulk_platform_cancel: false,
+            bulk_platform_action_typed_count: String::new(),
         }
     }
 
@@ -40387,8 +41556,16 @@ $Instant Growth [Nayr]\n";
             let mut confirm_lazy_unmount_final = None;
             let mut confirm_mount_all = None;
             let mut focus_mount_all_cancel = false;
+            let mut mount_all_typed_count = String::new();
             let mut confirm_unmount_all = None;
             let mut focus_unmount_all_cancel = false;
+            let mut unmount_all_typed_count = String::new();
+            let mut confirm_mount_selected = None;
+            let mut focus_mount_selected_cancel = false;
+            let mut mount_selected_typed_count = String::new();
+            let mut confirm_bulk_platform_action = None;
+            let mut focus_bulk_platform_cancel = false;
+            let mut bulk_platform_action_typed_count = String::new();
             let mut focus_lazy_cancel = false;
             let mut focus_final_lazy_cancel = false;
             let lazy_unmount_offers = HashSet::new();
@@ -40397,6 +41574,7 @@ $Instant Growth [Nayr]\n";
             let mut platform_custom_text = String::new();
             let mut bulk_platform_choice = None;
             let mut confirm_remove_missing = None;
+            let mut missing_removal_typed_count = String::new();
             let mut clipboard = InMemoryClipboard::default();
             let mut select_all_visible_requested = false;
             let mut library_source_filter = None;
@@ -40422,10 +41600,18 @@ $Instant Growth [Nayr]\n";
                             confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
                             confirm_mount_all: &mut confirm_mount_all,
                             focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                            mount_all_typed_count: &mut mount_all_typed_count,
                             confirm_unmount_all: &mut confirm_unmount_all,
                             focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                            unmount_all_typed_count: &mut unmount_all_typed_count,
                             confirm_unmount_selected: &mut self.confirm_unmount_selected,
                             focus_unmount_selected_cancel: &mut self.focus_unmount_selected_cancel,
+                            confirm_mount_selected: &mut confirm_mount_selected,
+                            focus_mount_selected_cancel: &mut focus_mount_selected_cancel,
+                            mount_selected_typed_count: &mut mount_selected_typed_count,
+                            confirm_bulk_platform_action: &mut confirm_bulk_platform_action,
+                            focus_bulk_platform_cancel: &mut focus_bulk_platform_cancel,
+                            bulk_platform_action_typed_count: &mut bulk_platform_action_typed_count,
                             focus_lazy_cancel: &mut focus_lazy_cancel,
                             focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
                             lazy_unmount_offers: &lazy_unmount_offers,
@@ -40446,6 +41632,7 @@ $Instant Growth [Nayr]\n";
                             missing_removal_available: false,
                             missing_removal_busy: false,
                             confirm_remove_missing: &mut confirm_remove_missing,
+                            missing_removal_typed_count: &mut missing_removal_typed_count,
                             sort_field: &mut self.sort_field,
                             sort_ascending: &mut self.sort_ascending,
                             library_scroll_offset: &mut self.library_scroll_offset,
@@ -43504,6 +44691,12 @@ $Instant Growth [Nayr]\n";
         app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
         app.view = MainView::Library;
         app.library_tab = LibraryTab::Archives;
+        // This helper exists to test Advanced View's Library table
+        // rendering specifically (`show_loaded_data`'s full technical
+        // columns, sort, multi-selection) - not Gamer View's compact
+        // list. Every caller wants Advanced View's full `update()`
+        // dispatch to run.
+        app.ui_mode = GuiMode::AdvancedView;
         app.archive_context
             .select_only(PathBuf::from(paths[0].as_str()));
         (app, paths)
@@ -43618,10 +44811,18 @@ $Instant Growth [Nayr]\n";
         let mut confirm_lazy_unmount_final = None;
         let mut confirm_mount_all = None;
         let mut focus_mount_all_cancel = false;
+        let mut mount_all_typed_count = String::new();
         let mut confirm_unmount_all = None;
         let mut focus_unmount_all_cancel = false;
+        let mut unmount_all_typed_count = String::new();
         let mut confirm_unmount_selected = None;
         let mut focus_unmount_selected_cancel = false;
+        let mut confirm_mount_selected = None;
+        let mut focus_mount_selected_cancel = false;
+        let mut mount_selected_typed_count = String::new();
+        let mut confirm_bulk_platform_action = None;
+        let mut focus_bulk_platform_cancel = false;
+        let mut bulk_platform_action_typed_count = String::new();
         let mut focus_lazy_cancel = false;
         let mut focus_final_lazy_cancel = false;
         let lazy_unmount_offers = HashSet::new();
@@ -43633,6 +44834,7 @@ $Instant Growth [Nayr]\n";
         let mut platform_custom_text = String::new();
         let mut bulk_platform_choice = None;
         let mut confirm_remove_missing = None;
+        let mut missing_removal_typed_count = String::new();
         let mut sort_field = None;
         let mut sort_ascending = true;
         let mut library_scroll_offset = 0.0;
@@ -43664,10 +44866,18 @@ $Instant Growth [Nayr]\n";
                         confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
                         confirm_mount_all: &mut confirm_mount_all,
                         focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                        mount_all_typed_count: &mut mount_all_typed_count,
                         confirm_unmount_all: &mut confirm_unmount_all,
                         focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                        unmount_all_typed_count: &mut unmount_all_typed_count,
                         confirm_unmount_selected: &mut confirm_unmount_selected,
                         focus_unmount_selected_cancel: &mut focus_unmount_selected_cancel,
+                        confirm_mount_selected: &mut confirm_mount_selected,
+                        focus_mount_selected_cancel: &mut focus_mount_selected_cancel,
+                        mount_selected_typed_count: &mut mount_selected_typed_count,
+                        confirm_bulk_platform_action: &mut confirm_bulk_platform_action,
+                        focus_bulk_platform_cancel: &mut focus_bulk_platform_cancel,
+                        bulk_platform_action_typed_count: &mut bulk_platform_action_typed_count,
                         focus_lazy_cancel: &mut focus_lazy_cancel,
                         focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
                         lazy_unmount_offers: &lazy_unmount_offers,
@@ -43688,6 +44898,7 @@ $Instant Growth [Nayr]\n";
                         missing_removal_available: false,
                         missing_removal_busy: false,
                         confirm_remove_missing: &mut confirm_remove_missing,
+                        missing_removal_typed_count: &mut missing_removal_typed_count,
                         sort_field: &mut sort_field,
                         sort_ascending: &mut sort_ascending,
                         library_scroll_offset: &mut library_scroll_offset,
@@ -43779,10 +44990,18 @@ $Instant Growth [Nayr]\n";
         let mut confirm_lazy_unmount_final = None;
         let mut confirm_mount_all = None;
         let mut focus_mount_all_cancel = false;
+        let mut mount_all_typed_count = String::new();
         let mut confirm_unmount_all = None;
         let mut focus_unmount_all_cancel = false;
+        let mut unmount_all_typed_count = String::new();
         let mut confirm_unmount_selected = None;
         let mut focus_unmount_selected_cancel = false;
+        let mut confirm_mount_selected = None;
+        let mut focus_mount_selected_cancel = false;
+        let mut mount_selected_typed_count = String::new();
+        let mut confirm_bulk_platform_action = None;
+        let mut focus_bulk_platform_cancel = false;
+        let mut bulk_platform_action_typed_count = String::new();
         let mut focus_lazy_cancel = false;
         let mut focus_final_lazy_cancel = false;
         let lazy_unmount_offers = HashSet::new();
@@ -43794,6 +45013,7 @@ $Instant Growth [Nayr]\n";
         let mut platform_custom_text = String::new();
         let mut bulk_platform_choice = None;
         let mut confirm_remove_missing = None;
+        let mut missing_removal_typed_count = String::new();
         let mut sort_field = None;
         let mut sort_ascending = true;
         let mut library_scroll_offset = 0.0;
@@ -43822,10 +45042,18 @@ $Instant Growth [Nayr]\n";
                         confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
                         confirm_mount_all: &mut confirm_mount_all,
                         focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                        mount_all_typed_count: &mut mount_all_typed_count,
                         confirm_unmount_all: &mut confirm_unmount_all,
                         focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                        unmount_all_typed_count: &mut unmount_all_typed_count,
                         confirm_unmount_selected: &mut confirm_unmount_selected,
                         focus_unmount_selected_cancel: &mut focus_unmount_selected_cancel,
+                        confirm_mount_selected: &mut confirm_mount_selected,
+                        focus_mount_selected_cancel: &mut focus_mount_selected_cancel,
+                        mount_selected_typed_count: &mut mount_selected_typed_count,
+                        confirm_bulk_platform_action: &mut confirm_bulk_platform_action,
+                        focus_bulk_platform_cancel: &mut focus_bulk_platform_cancel,
+                        bulk_platform_action_typed_count: &mut bulk_platform_action_typed_count,
                         focus_lazy_cancel: &mut focus_lazy_cancel,
                         focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
                         lazy_unmount_offers: &lazy_unmount_offers,
@@ -43846,6 +45074,7 @@ $Instant Growth [Nayr]\n";
                         missing_removal_available: false,
                         missing_removal_busy: false,
                         confirm_remove_missing: &mut confirm_remove_missing,
+                        missing_removal_typed_count: &mut missing_removal_typed_count,
                         sort_field: &mut sort_field,
                         sort_ascending: &mut sort_ascending,
                         library_scroll_offset: &mut library_scroll_offset,
@@ -47743,10 +48972,18 @@ $Instant Growth [Nayr]\n";
         let mut confirm_lazy_unmount_final = None;
         let mut confirm_mount_all = None;
         let mut focus_mount_all_cancel = false;
+        let mut mount_all_typed_count = String::new();
         let mut confirm_unmount_all = Some(UnmountAllConfirmation);
         let mut focus_unmount_all_cancel = false;
+        let mut unmount_all_typed_count = String::new();
         let mut confirm_unmount_selected = None;
         let mut focus_unmount_selected_cancel = false;
+        let mut confirm_mount_selected = None;
+        let mut focus_mount_selected_cancel = false;
+        let mut mount_selected_typed_count = String::new();
+        let mut confirm_bulk_platform_action = None;
+        let mut focus_bulk_platform_cancel = false;
+        let mut bulk_platform_action_typed_count = String::new();
         let mut focus_lazy_cancel = false;
         let mut focus_final_lazy_cancel = false;
         let lazy_unmount_offers = HashSet::new();
@@ -47758,6 +48995,7 @@ $Instant Growth [Nayr]\n";
         let mut platform_custom_text = String::new();
         let mut bulk_platform_choice = None;
         let mut confirm_remove_missing = None;
+        let mut missing_removal_typed_count = String::new();
         let mut sort_field = None;
         let mut sort_ascending = true;
         let mut library_scroll_offset = 0.0;
@@ -47793,10 +49031,18 @@ $Instant Growth [Nayr]\n";
                         confirm_lazy_unmount_final: &mut confirm_lazy_unmount_final,
                         confirm_mount_all: &mut confirm_mount_all,
                         focus_mount_all_cancel: &mut focus_mount_all_cancel,
+                        mount_all_typed_count: &mut mount_all_typed_count,
                         confirm_unmount_all: &mut confirm_unmount_all,
                         focus_unmount_all_cancel: &mut focus_unmount_all_cancel,
+                        unmount_all_typed_count: &mut unmount_all_typed_count,
                         confirm_unmount_selected: &mut confirm_unmount_selected,
                         focus_unmount_selected_cancel: &mut focus_unmount_selected_cancel,
+                        confirm_mount_selected: &mut confirm_mount_selected,
+                        focus_mount_selected_cancel: &mut focus_mount_selected_cancel,
+                        mount_selected_typed_count: &mut mount_selected_typed_count,
+                        confirm_bulk_platform_action: &mut confirm_bulk_platform_action,
+                        focus_bulk_platform_cancel: &mut focus_bulk_platform_cancel,
+                        bulk_platform_action_typed_count: &mut bulk_platform_action_typed_count,
                         focus_lazy_cancel: &mut focus_lazy_cancel,
                         focus_final_lazy_cancel: &mut focus_final_lazy_cancel,
                         lazy_unmount_offers: &lazy_unmount_offers,
@@ -47817,6 +49063,7 @@ $Instant Growth [Nayr]\n";
                         missing_removal_available: false,
                         missing_removal_busy: false,
                         confirm_remove_missing: &mut confirm_remove_missing,
+                        missing_removal_typed_count: &mut missing_removal_typed_count,
                         sort_field: &mut sort_field,
                         sort_ascending: &mut sort_ascending,
                         library_scroll_offset: &mut library_scroll_offset,
