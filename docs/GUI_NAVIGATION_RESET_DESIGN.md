@@ -552,6 +552,14 @@ changed relative to §2.1's original sketch:
   clear selected state. All/Unknown are included with suitable generic
   glyphs. The shelf has a fixed height and never wraps onto multiple
   lines, regardless of how many platforms are present.
+- The finishing pass makes those cards viewport-responsive within a
+  96–124 logical-pixel range. Counts always remain visible; long names
+  use a single ellipsis only when necessary, while hover/accessibility
+  text retains the complete name. Horizontal scrolling remains the only
+  overflow mechanism, so the shelf never becomes a multi-row grid.
+- Gamer View search now receives the top bar's main share, up to 760
+  logical pixels, while reserving room for Settings and the busy spinner.
+  At 1024×600 it remains readable without displacing either control.
 - Clicking a shelf item updates `library_filters.platform` exactly as
   the text chips did, and clears stale focused/multi-selection exactly
   as before (§9 decision 3's fix) - no new selection model was
@@ -569,5 +577,9 @@ changed relative to §2.1's original sketch:
   row) and Undo (shown last, `ActionStyle::Quiet`), with clearer
   empty-state and empty-search/empty-platform guidance.
 - No artwork is fetched over the network, ever - see
-  `docs/PLATFORM_ARTWORK.md`'s no-network guarantee. `Cargo.lock` is
-  unchanged by this milestone; no new dependency was added.
+  `docs/PLATFORM_ARTWORK.md`'s no-network guarantee. Custom artwork is
+  rendered only from bounded local PNG files in the explicitly configured
+  directory. Missing, malformed, oversized, symlinked, or unsupported SVG
+  files retain the built-in vector glyph. The existing resolved `image`
+  crate is now a direct dependency with only PNG decoding enabled; its
+  `MIT OR Apache-2.0` licence is compatible with ArchiveFS.

@@ -1,7 +1,8 @@
 # Platform artwork
 
-Status: implemented as part of the "Gamer View Visual Platform Picker and
-Library Layout Polish" milestone (branch `feature/gui-navigation-reset`).
+Status: visual picker implemented on `feature/gui-navigation-reset`;
+responsive sizing and safe custom rendering completed on
+`feature/gamer-view-finishing-pass`.
 Covers Gamer View's visual platform picker - see
 `docs/GUI_NAVIGATION_RESET_DESIGN.md` for the surrounding navigation
 design this sits inside.
@@ -31,16 +32,13 @@ design this sits inside.
   platform is not a bug; it correctly and honestly falls back to a
   category, or to Unknown if even the category is unrecognised.
 
-## Asset format and location
+## Built-in asset format and rendering
 
 `crates/archivefs-gui/assets/platforms/*.svg` - one SVG file per asset,
 `<lowercase-asset-id>.svg`. Total bundle size: **4,303 bytes** (10 files,
 ~430 bytes average) - not embedded as Rust byte arrays; they exist as
-plain files in the repository for review, licensing clarity, and future
-tooling, and are not currently loaded into the running binary (see
-"Current rendering approach" below for exactly what *is* wired up today).
-
-## Rendering approach in this milestone
+plain files in the repository for review and licensing clarity. They are
+not parsed at runtime.
 
 Gamer View's platform shelf renders a small **native vector glyph** drawn
 directly with egui's own painter (`paint_platform_glyph`/
@@ -48,30 +46,24 @@ directly with egui's own painter (`paint_platform_glyph`/
 identifier the SVG files are named after - not a rasterized copy of the
 on-disk SVG content.
 
-This was a deliberate scope decision, not an oversight: this codebase has
-never rendered an image of any kind before this milestone, and wiring
-real SVG rasterization (e.g. via `egui_extras`'s `svg` feature, which
-pulls in `resvg`/`usvg`/`tiny-skia`) is a genuinely new rendering
-pipeline - a new dependency, texture-cache lifecycle, and error-handling
-surface - that was judged too large a risk to integrate and fully test
-within this milestone's scope, especially stacked on top of the
-navigation-shell and audit-fix work already landed on this branch. The
-on-disk SVG files remain the **canonical, authoritative artwork** (for
-licensing purposes, external tooling, and the eventual rasterization
-pass); the native-vector glyphs are a faithful, offline, zero-dependency
-stand-in that satisfies every functional requirement of this milestone
-(visual recognisability, category fallback, theme-awareness via
-`ui.visuals()`, graceful fallback for unrecognised ids) without the added
-risk.
+The on-disk SVG files remain the canonical built-in artwork source and
+licensing record. Runtime SVG parsing remains deferred because it would
+introduce an XML/vector rendering stack (`resvg`/`usvg`/`tiny-skia`) for
+content that is currently satisfied by the native fallback. Custom
+artwork uses the deliberately narrower PNG path described below.
 
-**What this means concretely for the custom-override directory below**:
-the *presence* of a custom asset file is genuinely detected and can
-change downstream behaviour (it is real, tested logic, not a stub) - but
-the glyph currently painted on screen is always the built-in native-vector
-one, regardless of whether a custom override file was found. Wiring true
-SVG rasterization so a custom file's actual artwork appears on screen is
-the direct, explicitly-flagged next step - see "Unresolved / follow-up"
-below.
+## Responsive shelf behaviour
+
+- The shelf is always one horizontal row and remains horizontally
+  scrollable; it never wraps or increases its fixed height.
+- Cards scale between 96 and 124 logical pixels according to the viewport.
+  They cannot collapse below the readable minimum or expand without bound.
+- The count always remains on its own line. A platform name that does not
+  fit is shortened once with an ellipsis; the hover text and accessible
+  name retain the complete platform name and count.
+- `All` and `Unknown` remain unabridged at the minimum card width.
+- Selection uses egui's selected button state and keyboard focus remains
+  the standard button focus ring.
 
 ## Fallback categories
 
@@ -110,14 +102,35 @@ is already generic over asset id.
 ## Custom artwork directory (Advanced View → Settings → "5. Platform
 artwork")
 
-An optional, session-configurable directory of the user's own SVG files,
+An optional, session-configurable directory of the user's own PNG files,
 named by canonical platform identifier in lowercase
-(`gamecube.svg`, `playstation2.svg`, `xbox.svg`, or a category id like
-`console.svg`). `custom_platform_artwork_path()` checks for the exact
-file's existence and resolves to it if present, falling back to the
-built-in asset if the directory isn't configured or the specific file is
-missing - genuine, tested filesystem logic (see "Rendering approach"
-above for what happens to a *found* custom file today).
+(`gamecube.png`, `playstation2.png`, `xbox.png`, or a category id like
+`console.png`). The full supported mapping is the asset-id column in the
+tables above: `console`, `handheld`, `computer`, `arcade`, `optical-disc`,
+`cartridge`, `unknown`, `gamecube`, `playstation2`, and `xbox`.
+
+The matching PNG's actual pixels are decoded and rendered in Gamer View.
+SVG custom files are not parsed and therefore fall back to the built-in
+glyph; this is intentional and is never presented as SVG support.
+
+Safety boundaries:
+
+- Files must be regular local files directly inside the configured
+  directory. Symlinks, invalid asset ids, missing files, and other file
+  types are rejected.
+- Maximum encoded file size: **1 MiB**.
+- Maximum dimensions: **1024×1024 pixels**; decoded allocation is bounded
+  to **4 MiB**.
+- Only PNG decoding is enabled. Malformed or unsupported content is not
+  partially rendered and cannot crash the interface.
+- Every rejection falls back to the original built-in vector glyph while
+  the platform's text name, count, focus, and keyboard activation remain.
+
+Successful textures and failed decode results are cached by asset id plus
+the configured directory, file length, and modification time. Changing
+the configured directory clears the cache immediately. Changing a file's
+length or modification time causes it to be decoded again on the next
+render; unchanged files are not reparsed per frame.
 
 - **Never copies the custom file anywhere.** ArchiveFS only ever
   references the path the user configured; nothing is written into
@@ -133,17 +146,21 @@ above for what happens to a *found* custom file today).
 
 ## No-network guarantee
 
-Grep-verifiable: no HTTP client, no download, no "check for updates"
-logic exists anywhere in the platform-artwork code path. `Cargo.lock` and
-`Cargo.toml` are unchanged by this milestone - no new dependency (network
-or otherwise) was added. Confirmed manually: launching the GUI and
-exercising the platform shelf produces no outbound network activity.
+Grep-verifiable: no HTTP client, URL loader, download, or "check for
+updates" logic exists anywhere in the platform-artwork code path. The
+decoder receives only bytes opened from the explicitly configured local
+directory. No automatic discovery or download is performed.
+
+`image` 0.25.10 is now a direct GUI dependency with only its `png` feature
+enabled. It was already present in the resolved dependency graph, adds no
+network capability, and is licensed `MIT OR Apache-2.0`, compatible with
+ArchiveFS. No SVG rendering dependencies were added.
 
 ## Storage impact
 
 10 SVG files, 4,303 bytes total on disk. None are currently compiled into
 the binary (the native-vector rendering path doesn't read them at
-runtime) - see "Rendering approach" above.
+runtime) - see "Built-in asset format and rendering" above.
 
 ## Asset manifest
 
@@ -183,16 +200,11 @@ decision must be recorded.
 
 ## Unresolved / follow-up
 
-- **True SVG rasterization is not wired up.** The on-disk SVG files are
-  the canonical artwork and a custom override's *presence* is correctly
-  detected, but the glyph actually painted on screen is always the
-  built-in native-vector one. A follow-up milestone should evaluate
-  `egui_extras`'s `svg` feature (or an equivalent) to render the real SVG
-  content - both built-in and custom - once that dependency addition can
-  be reviewed and tested on its own.
+- **True SVG rasterization is not wired up.** The on-disk SVG files remain
+  the canonical built-in source assets. Users who want custom artwork must
+  supply PNG files under the documented limits.
 - No automated visual/pixel-diff test exists for the glyphs themselves
   (deliberately - "do not create fragile screenshot-pixel tests unless
   the existing test approach supports them reliably," and it does not).
-  Coverage instead proves the *mapping* (platform → asset id) and the
-  *resolution logic* (custom-directory fallback), which is what's
-  actually load-bearing.
+  Coverage instead proves mapping, responsive bounds, safe decoding,
+  cache invalidation, texture use, and built-in fallback behaviour.
