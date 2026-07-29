@@ -57,6 +57,7 @@ pub struct Pcsx2CheatProviderCatalogue {
 #[serde(rename_all = "snake_case")]
 pub enum Pcsx2CandidateBlockedReason {
     ProviderUnverified,
+    RecordUnverified,
     IdentityIncomplete,
     InvalidCatalogueCrc,
     CrcMismatch,
@@ -74,6 +75,7 @@ impl Pcsx2CandidateBlockedReason {
     pub const fn plain_reason(self) -> &'static str {
         match self {
             Self::ProviderUnverified => "This cheat source has not been approved.",
+            Self::RecordUnverified => "This cheat record has not been verified.",
             Self::IdentityIncomplete => "The game CRC could not be verified.",
             Self::InvalidCatalogueCrc => "The cheat source has an invalid game CRC.",
             Self::CrcMismatch => "This cheat is for a different game CRC.",
@@ -170,6 +172,8 @@ fn classify(
 ) -> Pcsx2CheatCompatibility {
     let blocked = if catalogue.trust != Pcsx2ProviderTrust::Approved {
         Some(Pcsx2CandidateBlockedReason::ProviderUnverified)
+    } else if record.confidence == Pcsx2CheatConfidence::Unverified {
+        Some(Pcsx2CandidateBlockedReason::RecordUnverified)
     } else if duplicate {
         Some(Pcsx2CandidateBlockedReason::DuplicateRecordId)
     } else if record.category == Pcsx2CheatCategory::EncryptedUnsupported {
@@ -322,6 +326,24 @@ mod tests {
         let mut encrypted = record();
         encrypted.category = Pcsx2CheatCategory::EncryptedUnsupported;
         assert!(!build_pcsx2_cheat_candidates(&catalogue(encrypted), &identity())[0].selectable());
+    }
+
+    #[test]
+    fn unverified_provider_or_record_is_never_selectable() {
+        let mut unverified_source = catalogue(record());
+        unverified_source.trust = Pcsx2ProviderTrust::Unverified;
+        assert_eq!(
+            build_pcsx2_cheat_candidates(&unverified_source, &identity())[0].compatibility,
+            Pcsx2CheatCompatibility::Blocked(Pcsx2CandidateBlockedReason::ProviderUnverified)
+        );
+
+        let mut unverified_record = record();
+        unverified_record.confidence = Pcsx2CheatConfidence::Unverified;
+        assert_eq!(
+            build_pcsx2_cheat_candidates(&catalogue(unverified_record), &identity())[0]
+                .compatibility,
+            Pcsx2CheatCompatibility::Blocked(Pcsx2CandidateBlockedReason::RecordUnverified)
+        );
     }
 
     #[test]
