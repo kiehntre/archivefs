@@ -105,6 +105,23 @@ manual acceptance plan.
   confirmation writes nothing and leaves the previously active snapshot,
   if any, unchanged.
 
+### Fixed
+
+- **RetroArch catalogue parse-tolerance**: an individual malformed or
+  unsupported entry in a downloaded trusted catalogue no longer affects
+  validation of the whole snapshot. A catalogue that parses with a bounded
+  number of excluded entries is now reported as usable
+  (`CatalogueIndexState::UsablePartial`), with each excluded entry recorded
+  individually rather than failing the entire snapshot.
+- **Libretro catalogue archive size limits raised**: the per-entry limit is
+  now 256 MiB (up from 64 MiB) and the total expanded-archive limit is now
+  1 GiB (up from 256 MiB), matching the real size of the official
+  `libretro-database` catalogue.
+- **Stale Cheats & Mods "Stage 3" copy removed.** The GUI no longer shows
+  "Archive matching and cheat installation are not yet implemented in this
+  GUI workflow" anywhere - that copy predated RetroArch matching/apply and
+  was left over by mistake.
+
 ### Known limitations
 
 - PCSX2 and Dolphin remain **preview-only**: both have real verified
@@ -114,14 +131,6 @@ manual acceptance plan.
   anywhere in the GUI.
 - Mods remain planned and are not implemented; the Mods section of Cheats &
   Mods is a labelled placeholder, not a working feature.
-- **A currently open issue**: some individual malformed entries in a
-  downloaded RetroArch trusted catalogue can affect validation of the whole
-  snapshot rather than being cleanly isolated as non-actionable, and the
-  Cheats & Mods "Stage 3" copy in one place still reads "Archive matching
-  and cheat installation are not yet implemented in this GUI workflow" even
-  though RetroArch matching/apply now exist. Both are being actively fixed;
-  neither is resolved as of this entry. See `docs/V0.6_RELEASE_AUDIT.md` for
-  current status before relying on either behavior.
 - There is no cancellation once a shared-apply write has actually begun -
   only before it starts.
 - Cheats & Mods does not yet use the shared scrollable-page keyboard

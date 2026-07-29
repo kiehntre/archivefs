@@ -27,14 +27,19 @@ Each test lists an **action**, an **expected result**, and a blank
 - **On Nobara desktop** - a step outside the ArchiveFS window itself.
 - **In ArchiveFS GUI** - a step inside the running `archivefs-gui` window.
 
-**Before you start:** the RetroArch trusted-catalogue parse-tolerance
-issue described in `docs/V0.6_RELEASE_AUDIT.md` and `ROADMAP.md`'s
-"Current development" section is **still open** as of this plan. Section
-7's checks below are expected to reveal it if it's present in the build
-under test - do not treat a failure there as a new regression until you've
-checked whether it's this known, already-tracked issue.
+**Before you start:** the RetroArch trusted-catalogue parse-tolerance issue
+previously described here has been fixed on `main` (an individual
+malformed/unsupported entry no longer affects validation of the whole
+snapshot; see `CHANGELOG.md`'s `v0.6.0-alpha` "Fixed" section). Section 7's
+checks below should now pass cleanly against a real, live-fetched
+catalogue - a failure there is a genuine regression, not a known,
+already-tracked issue.
 
-Test with a small, disposable, non-important set of archives.
+Test with a small, disposable, non-important set of archives. Also confirm
+the primary Cheats & Mods controls (platform selector, archive list,
+Install/Apply button) remain visible and usable at a 1024x600 window
+size - ArchiveFS's documented minimum supported viewport - not just at a
+normal desktop size.
 
 ---
 
@@ -275,11 +280,11 @@ Sections 1, 4-27 above.
   apply) has no synthetic fixture in the current test suite; this needs a
   deliberately engineered manual exercise, not a routine QA pass.
 - Testing against the real, full-size official RetroArch catalogue at
-  scale (as opposed to a small synthetic or single-fetch test) is
-  possible today via step 8 above, but a large-scale tolerance stress test
-  against many thousands of real catalogue entries should wait until the
-  parse-tolerance issue in Section "Before you start" is fixed, since a
-  failure there is currently expected rather than diagnostic.
+  scale (as opposed to a small synthetic or single-fetch test) is possible
+  today via step 8 above. Now that the parse-tolerance fix has landed, a
+  large-scale test against the real catalogue's many thousands of entries
+  is meaningful diagnostic coverage, not an expected-failure exercise -
+  recommended as part of this QA pass rather than deferred.
 
 ## Sign-off
 

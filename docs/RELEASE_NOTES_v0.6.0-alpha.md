@@ -5,12 +5,11 @@ software. Nothing in this document should be read as a promise of
 stability, and the interfaces it describes may still change before a 1.0
 release.
 
-**This release has not shipped yet.** `Cargo.toml` still reads
-`0.5.0-alpha` and no `v0.6.0-alpha` Git tag exists. This document describes
-the current state of `origin/main` in preparation for that release, and
-will be finalized once the remaining items in
-[`docs/V0.6_RELEASE_AUDIT.md`](V0.6_RELEASE_AUDIT.md)'s go/no-go checklist
-are cleared.
+**This release has not shipped yet.** `Cargo.toml` now reads `0.6.0-alpha`
+in preparation for tagging, but no `v0.6.0-alpha` Git tag exists yet. This
+document describes the current state of `main` and will be finalized once
+the remaining item in [`docs/V0.6_RELEASE_AUDIT.md`](V0.6_RELEASE_AUDIT.md)'s
+go/no-go checklist - a real manual Nobara QA pass - is cleared.
 
 ## Headline features
 
@@ -45,6 +44,12 @@ are cleared.
 7. **Mega Drive/Genesis loose-ROM recognition**, gated on an exactly-named
    folder component so an unrelated `README.md` is never mistaken for a
    ROM. See [`docs/LIBRARY_SCAN_USABILITY.md`](LIBRARY_SCAN_USABILITY.md).
+8. **RetroArch catalogue parse-tolerance fix.** An individual malformed or
+   unsupported entry in a downloaded trusted catalogue no longer affects
+   validation of the whole snapshot; the catalogue archive size limits were
+   raised to match the real official catalogue (256 MiB per entry, 1 GiB
+   expanded); and stale "not yet implemented" Cheats & Mods copy left over
+   from before RetroArch apply shipped has been removed.
 
 ## Safety model
 
@@ -105,19 +110,6 @@ full matrix. In brief:
   Disable/Rollback control exists for either in the GUI.
 - Mods are planned and not implemented; the Mods section of Cheats & Mods
   is a labelled placeholder.
-- **An open issue, not yet fixed:** some individual malformed entries in a
-  downloaded RetroArch trusted catalogue can affect validation of the
-  whole snapshot rather than being cleanly isolated and reported as
-  non-actionable. A fix is in progress on a parallel branch and is **not**
-  part of `origin/main` as of this document.
-- **An open issue, not yet fixed:** the Cheats & Mods GUI still shows
-  stale "Archive matching and cheat installation are not yet implemented"
-  copy in one place, left over from before RetroArch apply shipped. A fix
-  is in progress and is **not** part of `origin/main` as of this document.
-- Libretro catalogue archive size-limit handling and "usable with
-  warnings" catalogue behavior (a snapshot that parses with retained
-  warnings but is otherwise safe to match against) are both being actively
-  worked on and are not yet merged.
 - There is no cancellation once a shared-apply write has actually begun.
 - Cheats & Mods does not yet use the shared scrollable-page keyboard
   wrapper (Page Up/Down/Home/End) that Settings, Doctor, About, Sources,
@@ -146,8 +138,8 @@ full matrix. In brief:
 
 - `cargo fmt --all -- --check`: clean.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- `cargo test --workspace`: 1,401+ tests passing as of this document (CLI
-  127, core 868+, GUI 406+; exact totals will be re-confirmed at tag time).
+- `cargo test --workspace`: 1,499 tests passing as of this document (CLI
+  127, core 907, GUI 465).
 - Full line-by-line verification of the shared apply/rollback/preview/
   identity safety properties against their documentation was performed as
   part of the release audit - see `docs/V0.6_RELEASE_AUDIT.md` Section on

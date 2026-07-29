@@ -20,8 +20,8 @@ release (mount lifecycle postcondition checks, transactional catalogue
 refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
 GUI and a first-class Cheats & Mods workspace spanning **three read-only
 emulator adapters**: RetroArch, PCSX2, and Dolphin. `v0.6.0-alpha` is
-currently in preparation on top of that, adding a shared verified game
-identity system, a shared read-only preview/conflict model, a shared safe
+**prepared but not yet tagged**, adding a shared verified game identity
+system, a shared read-only preview/conflict model, a shared safe
 apply/backup/journal/rollback foundation, a working RetroArch GUI
 apply/history/rollback flow, RetroArch trusted-catalogue download and
 management, Recently Found, and Mega Drive loose-ROM recognition. PCSX2 and
@@ -30,9 +30,12 @@ now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
 [`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md)
 for what's actually new and what remains unavailable, and
 [`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the
-manual acceptance checklist. `v0.6.0-alpha` has not been tagged yet - the
-workspace version in `Cargo.toml` still reads `0.5.0-alpha` until that
-release-checklist step happens.
+manual acceptance checklist. The workspace version in `Cargo.toml` now
+reads `0.6.0-alpha` in preparation for tagging, but **no `v0.6.0-alpha` Git
+tag exists yet** - a real manual QA pass on Nobara against
+`docs/MANUAL_QA_v0.6.0-alpha.md` is the sole remaining blocker; see
+[`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) for the current
+go/no-go checklist.
 
 ## Principles
 

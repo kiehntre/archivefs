@@ -176,23 +176,26 @@ These are implemented, tested, and in current use today:
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
 - Recently Found and Mega Drive/Genesis loose-ROM recognition; see
   [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
+- RetroArch catalogue parse-tolerance: an individual malformed or
+  unsupported catalogue entry no longer affects validation of the whole
+  snapshot (`CatalogueIndexState::UsablePartial`, bounded per-entry
+  exclusion reporting); the Libretro catalogue archive per-entry (256 MiB)
+  and expanded (1 GiB) size limits were raised to match the real official
+  catalogue; the stale "Archive matching and cheat installation are not yet
+  implemented" Cheats & Mods copy was removed.
 
 ## Current development
 
-Work in progress, being fixed on a parallel branch and **not yet merged
-into `main`** as of this writing - do not treat any of the following as
-resolved until it lands:
-
-- A currently open RetroArch catalogue-tolerance issue: some individual
-  malformed entries in a downloaded trusted catalogue can affect
-  validation of the whole snapshot rather than being cleanly isolated and
-  reported as non-actionable.
-- Stale "Archive matching and cheat installation are not yet implemented"
-  wording still shown in one place in the Cheats & Mods GUI, left over
-  from before the RetroArch GUI apply/history/rollback flow above shipped.
-- Libretro catalogue archive size-limit handling.
-- "Usable with warnings" catalogue behavior for a snapshot that parses
-  with some retained warnings but is otherwise safe to match against.
+No `v0.6.0-alpha` work is currently in progress on `main` beyond release
+preparation itself. The sole remaining item before a `v0.6.0-alpha` tag is
+a real manual QA pass on Nobara against
+[`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) - see
+[`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) for the current
+go/no-go checklist. Substantial additional adapter/platform work (Dolphin
+upstream cheat catalogue, Xenia Canary provider, GameCube direct-image
+identity, a full canonical platform registry) exists on unmerged
+development branches and is explicitly out of scope for `v0.6.0-alpha`;
+it is targeted at a later release.
 
 The shared `patch_manager` orchestration layer (platform filtering,
 ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
@@ -215,9 +218,10 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **RetroArch catalogue tolerance and live QA** - land the parse-tolerance
-   fix and stale-wording fix above, then run a real manual QA pass against
-   a live-fetched catalogue rather than synthetic fixtures alone.
+1. **`v0.6.0-alpha` manual QA and tag** - run a real manual QA pass on
+   Nobara against `docs/MANUAL_QA_v0.6.0-alpha.md`, including a
+   live-fetched RetroArch catalogue rather than synthetic fixtures alone,
+   then tag the release once it passes.
 2. **PCSX2 official `pcsx2_patches` provider** - a reviewed provider
    integration against the real upstream
    [`PCSX2/pcsx2_patches`](https://github.com/PCSX2/pcsx2_patches)
