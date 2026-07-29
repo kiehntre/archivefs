@@ -400,6 +400,24 @@ fn retroarch_entry(
         if let Some(hash) = &candidate.source_file_hash {
             *hashes.entry(hash.clone()).or_default() += 1;
         }
+        let region_mismatch = candidate
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == CheatCandidateEvidenceKind::RegionMismatch);
+        let revision_mismatch = candidate
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == CheatCandidateEvidenceKind::RevisionMismatch);
+        if region_mismatch || revision_mismatch {
+            entry.rejected_candidate_count += candidate.cheat_count.max(1);
+            if region_mismatch {
+                reject(&mut entry, CoverageRejectionCategory::RegionMismatch, 1);
+            }
+            if revision_mismatch {
+                reject(&mut entry, CoverageRejectionCategory::RevisionMismatch, 1);
+            }
+            continue;
+        }
         match candidate.classification {
             CheatCandidateClassification::VerifiedExact | CheatCandidateClassification::Strong => {
                 installable_records += 1;
@@ -723,6 +741,39 @@ mod tests {
                 .rejection_reasons
                 .iter()
                 .any(|reason| reason.category == CoverageRejectionCategory::PlatformMismatch)
+        );
+    }
+
+    #[test]
+    fn retroarch_region_mismatch_never_counts_as_coverage() {
+        let mut selected = game("Sonic", "MegaDrive");
+        selected.region = Some("USA".into());
+        let mut record = retro_record("Sonic", "MegaDrive", "aa");
+        record.source_region = Some("Europe".into());
+        let snapshot = retro_snapshot(vec![record]);
+        let report = build_cheat_provider_coverage_report(&[], None, &[selected], Some(&snapshot));
+        assert_eq!(report.games[0].compatible_cheat_count, 0);
+        assert!(
+            report.games[0]
+                .rejection_reasons
+                .iter()
+                .any(|reason| { reason.category == CoverageRejectionCategory::RegionMismatch })
+        );
+    }
+
+    #[test]
+    fn retroarch_revision_mismatch_never_counts_as_coverage() {
+        let selected = game("Sonic (Rev 1)", "MegaDrive");
+        let mut record = retro_record("Sonic", "MegaDrive", "aa");
+        record.source_revision = Some("2".into());
+        let snapshot = retro_snapshot(vec![record]);
+        let report = build_cheat_provider_coverage_report(&[], None, &[selected], Some(&snapshot));
+        assert_eq!(report.games[0].compatible_cheat_count, 0);
+        assert!(
+            report.games[0]
+                .rejection_reasons
+                .iter()
+                .any(|reason| { reason.category == CoverageRejectionCategory::RevisionMismatch })
         );
     }
 
