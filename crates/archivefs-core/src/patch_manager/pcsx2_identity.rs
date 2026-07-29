@@ -1,6 +1,6 @@
 //! PCSX2-facing identity and confirmed-profile foundations.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -23,6 +23,7 @@ pub enum Pcsx2IdentityState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Pcsx2GameIdentity {
+    pub archive_path: PathBuf,
     pub title: String,
     pub region: Option<String>,
     pub serial: Option<String>,
@@ -86,6 +87,7 @@ impl Pcsx2GameIdentity {
             .map(|item| format!("{}: {} ({})", item.kind, item.status, item.diagnostic))
             .collect();
         Self {
+            archive_path: report.archive_path.clone(),
             title,
             region: None,
             serial,
@@ -184,8 +186,6 @@ pub fn pcsx2_cheats_directory(profile: &Pcsx2Profile) -> Option<&Path> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::game_identity::{
         IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityProvenance,

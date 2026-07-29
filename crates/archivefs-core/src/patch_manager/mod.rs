@@ -43,6 +43,7 @@ mod import_safety;
 mod matching;
 mod pcsx2;
 mod pcsx2_identity;
+mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
@@ -241,6 +242,11 @@ pub use pcsx2::{
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
     pcsx2_cheats_directory,
+};
+pub use pcsx2_install_plan::{
+    Pcsx2InstallPlanError, Pcsx2InstallPlanErrorKind, Pcsx2InstallPreview,
+    Pcsx2InstallPreviewRequest, StagedPcsx2Pnach, build_pcsx2_install_preview,
+    load_existing_pcsx2_pnach, pcsx2_crc_filename, stage_pcsx2_pnach,
 };
 pub use pcsx2_local::{
     PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,

@@ -1,8 +1,8 @@
 //! Bounded shared apply, journal, history, and rollback pipeline.
 //!
 //! Writes are available only for an explicitly confirmed, exact plan produced
-//! from the shared preview. PCSX2 remains preview-only; Dolphin and Xenia use
-//! their verified transaction paths
+//! from the shared preview. PCSX2, Dolphin, and Xenia use their verified
+//! transaction paths
 //! until they expose an independent, adapter-approved materialized source.
 
 use std::collections::BTreeSet;
@@ -104,10 +104,10 @@ pub enum SharedAdapterWriteSupport {
 
 pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSupport {
     match adapter {
-        PreviewAdapter::RetroArch | PreviewAdapter::Dolphin | PreviewAdapter::Xenia => {
-            SharedAdapterWriteSupport::ApplyAndRollback
-        }
-        PreviewAdapter::Pcsx2 => SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized,
+        PreviewAdapter::RetroArch
+        | PreviewAdapter::Pcsx2
+        | PreviewAdapter::Dolphin
+        | PreviewAdapter::Xenia => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -953,7 +953,10 @@ fn apply_one(
         if !plan.parent_creation_approved
             || !matches!(
                 plan.adapter,
-                PreviewAdapter::RetroArch | PreviewAdapter::Dolphin | PreviewAdapter::Xenia
+                PreviewAdapter::RetroArch
+                    | PreviewAdapter::Pcsx2
+                    | PreviewAdapter::Dolphin
+                    | PreviewAdapter::Xenia
             )
         {
             return fail_result(
@@ -2482,7 +2485,7 @@ mod tests {
     fn unsupported_adapters_duplicate_paths_limits_and_lock_contention_fail_closed() {
         assert_eq!(
             adapter_write_support(PreviewAdapter::Pcsx2),
-            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized
+            SharedAdapterWriteSupport::ApplyAndRollback
         );
         assert_eq!(
             adapter_write_support(PreviewAdapter::Dolphin),
