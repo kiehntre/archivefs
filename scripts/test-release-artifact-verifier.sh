@@ -16,6 +16,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 ARCHIVE_NAME="$(basename -- "$VALID_ARTIFACT")"
+REPO_ROOT="$(release_repo_root)"
+VERSION="$(release_workspace_version "$REPO_ROOT")"
+BUNDLE_NAME="${ARCHIVE_NAME%.tar.gz}"
 
 write_checksum() {
     local archive=$1
@@ -36,36 +39,52 @@ cp "$VALID_ARTIFACT" "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME"
 printf '%064d  %s\n' 0 "$ARCHIVE_NAME" >"$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME.sha256"
 expect_failure bad-checksum "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME"
 
-python3 - "$VALID_ARTIFACT" "$TEMP_ROOT" "$ARCHIVE_NAME" <<'PY'
-import copy
+python3 - "$TEMP_ROOT" "$ARCHIVE_NAME" "$BUNDLE_NAME" "$VERSION" <<'PY'
 import io
 import pathlib
 import sys
 import tarfile
 
-source_path = pathlib.Path(sys.argv[1])
-root = pathlib.Path(sys.argv[2])
-archive_name = sys.argv[3]
+output_root = pathlib.Path(sys.argv[1])
+archive_name, bundle_name, version = sys.argv[2:]
 
-with tarfile.open(source_path, "r:gz") as source:
-    originals = []
-    for member in source.getmembers():
-        data = source.extractfile(member).read() if member.isfile() else None
-        originals.append((copy.copy(member), data))
+def base_members():
+    cli = f"#!/bin/sh\nprintf '%s\\n' 'archivefs-cli {version}'\n".encode()
+    gui = f"#!/bin/sh\nprintf '%s\\n' 'archivefs-gui {version}'\n".encode()
+    values = {
+        "archivefs-cli": (0o755, cli),
+        "archivefs-gui": (0o755, gui),
+        "install.sh": (0o755, b"#!/bin/sh\nexit 0\n"),
+        "README.md": (0o644, b"ArchiveFS release fixture\n"),
+        "CHANGELOG.md": (0o644, b"Release fixture\n"),
+        "LICENSE": (0o644, b"MIT fixture\n"),
+        "config.toml.example": (0o644, b"mount_dir = '/tmp/archivefs'\n"),
+    }
+    root_info = tarfile.TarInfo(bundle_name)
+    root_info.type = tarfile.DIRTYPE
+    root_info.mode = 0o755
+    root_info.uid = root_info.gid = 0
+    members = [(root_info, None)]
+    for name, (mode, data) in values.items():
+        info = tarfile.TarInfo(f"{bundle_name}/{name}")
+        info.mode = mode
+        info.uid = info.gid = 0
+        info.size = len(data)
+        members.append((info, data))
+    return members
 
 def write_case(name, mutation):
-    directory = root / name
+    directory = output_root / name
     directory.mkdir()
     output = directory / archive_name
-    members = [(copy.copy(member), data) for member, data in originals]
+    members = base_members()
     mutation(members)
     with tarfile.open(output, "w:gz") as target:
         for member, data in members:
             target.addfile(member, io.BytesIO(data) if data is not None else None)
 
 def unexpected(members):
-    root_name = members[0][0].name.split("/", 1)[0]
-    info = tarfile.TarInfo(f"{root_name}/unexpected.txt")
+    info = tarfile.TarInfo(f"{bundle_name}/unexpected.txt")
     info.mode = 0o644
     info.uid = info.gid = 0
     info.size = 10

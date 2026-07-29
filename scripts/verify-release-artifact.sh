@@ -163,7 +163,10 @@ patterns = [
     ("credential-bearing URL", re.compile(rb"https?://[^\s/:]+:[^\s/@]+@")),
     (
         "absolute build path",
-        re.compile(rb"/(?:home|Users|runner/work|workspace|builds)/[A-Za-z0-9._-]+/(?:[^\s\x00]+)"),
+        re.compile(
+            rb"(?<!/build)(?:/(?:home|Users)/[A-Za-z0-9_-]+/|/(?:runner/work|workspace|builds)/)"
+            rb"(?:[^\s\x00]+)"
+        ),
     ),
 ]
 allowed_prefixes = (b"/build/source", b"/build/home", b"/build/cargo", b"/build/rustup")

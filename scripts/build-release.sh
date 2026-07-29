@@ -82,16 +82,20 @@ export SOURCE_DATE_EPOCH
 export LC_ALL=C
 export TZ=UTC
 
-RUST_REMAP="--remap-path-prefix=$REPO_ROOT=/build/source"
+RUST_REMAP=""
+if [[ -n "${HOME:-}" ]]; then
+    RUST_REMAP+=" --remap-path-prefix=$HOME=/build/home"
+fi
 if [[ -n "${CARGO_HOME:-}" ]]; then
     RUST_REMAP+=" --remap-path-prefix=$CARGO_HOME=/build/cargo"
 fi
 if [[ -n "${RUSTUP_HOME:-}" ]]; then
     RUST_REMAP+=" --remap-path-prefix=$RUSTUP_HOME=/build/rustup"
 fi
-if [[ -n "${HOME:-}" ]]; then
-    RUST_REMAP+=" --remap-path-prefix=$HOME=/build/home"
-fi
+# rustc uses the last applicable remap for nested prefixes. Keep the exact
+# repository mapping last so it wins over the broader HOME mapping.
+RUST_REMAP+=" --remap-path-prefix=$REPO_ROOT=/build/source"
+RUST_REMAP="${RUST_REMAP# }"
 export RUSTFLAGS="$RUST_REMAP${RUSTFLAGS:+ $RUSTFLAGS}"
 
 BUILD_ARGS=(build --workspace --release --locked)
