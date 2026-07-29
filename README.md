@@ -24,8 +24,8 @@ emulator adapters**: RetroArch, PCSX2, and Dolphin. `v0.6.0-alpha` is
 system, a shared read-only preview/conflict model, a shared safe
 apply/backup/journal/rollback foundation, a working RetroArch GUI
 apply/history/rollback flow, RetroArch trusted-catalogue download and
-management, Recently Found, and Mega Drive loose-ROM recognition. PCSX2 and
-Dolphin remain preview-only; adapter expansion is paused after Dolphin for
+management, Recently Found, Mega Drive loose-ROM recognition, and a reviewed
+Dolphin Gecko provider/install path. PCSX2 remains preview-only; adapter expansion is paused after Dolphin for
 now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
 [`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md)
 for what's actually new and what remains unavailable, and
@@ -98,10 +98,13 @@ user-facing version at
   `cheats`, `cheats_ws`, and present `patches` PNACH files. A shared bounded
   ISO reader can derive a verified PS2 serial and, when the complete boot ELF
   fits its limit, PCSX2's executable CRC. GameCube and Wii
-  archives can use a similarly read-only Dolphin adapter to discover native or
-  Flatpak user directories and inspect bounded `GameSettings/*.ini` metadata.
-  Verified Dolphin Game IDs can establish exact INI matches. Neither adapter
-  inspects arbitrary local imports or installs content; see
+  archives can use the Dolphin adapter to discover native or Flatpak user
+  directories, inspect bounded `GameSettings/*.ini` metadata, and retrieve
+  exact-ID Gecko definitions from Dolphin's official upstream dataset.
+  Verified Dolphin Game IDs and revisions bind the provider lookup and exact
+  destination. PCSX2 does not install content; Dolphin can install selected
+  validated Gecko definitions after preview and confirmation. Neither adapter
+  inspects arbitrary local imports; see
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
   [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md),
   [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md), and
@@ -115,8 +118,8 @@ user-facing version at
   non-preselected approval before replacing different existing content),
   verify the write, and record a journal entry. History & Logs can open that
   exact operation and preview/confirm its rollback. ArchiveFS never
-  auto-applies, and PCSX2/Dolphin remain preview-only with no apply control
-  at all; see
+  auto-applies. PCSX2 remains preview-only. Dolphin uses the same transaction
+  engine for selected external Gecko definitions, including rollback; see
   [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md)
   and
   [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
@@ -156,8 +159,9 @@ user-facing version at
   and `retroarch-patch-preview` are preview only; guided cheat setup and the
   GUI's RetroArch apply flow both require explicit confirmation and never
   install or enable anything on their own; trusted catalogue retrieval
-  remains a separate step from installation. PCSX2 and Dolphin remain
-  preview-only in the GUI with no apply control at all.
+  remains a separate step from installation. PCSX2 remains preview-only;
+  Dolphin's explicit Gecko flow can create or update one exact GameSettings
+  INI and roll it back.
 - No broad multi-emulator support yet - PCSX2, RetroArch, and Dolphin are the
   only emulators with any patch/cheat preview or inventory today, and none is
   launched or configured by these read-only workflows.

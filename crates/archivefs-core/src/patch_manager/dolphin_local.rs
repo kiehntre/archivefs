@@ -1040,7 +1040,19 @@ pub fn match_dolphin_inventory(
         Some(revision) => game_matches
             .iter()
             .copied()
-            .filter(|f| f.revision_candidate == Some(revision))
+            .filter(|f| {
+                f.revision_candidate == Some(revision)
+                    // Every real GameSettings filename found on a real
+                    // Dolphin installation during this adapter's own audit
+                    // (e.g. "NACE01.ini", "PZLE01.ini") omits the "rN"
+                    // revision suffix entirely for the common, unmarked
+                    // case - Dolphin's own convention treats that as
+                    // revision 0, the same way ROM naming omits "(Rev 0)".
+                    // Without this, a verified revision-0 archive (the
+                    // overwhelming majority of real discs) could never
+                    // exact-match its own real, on-disk GameSettings file.
+                    || (revision == 0 && f.revision_candidate.is_none())
+            })
             .collect(),
         None => game_matches.clone(),
     };
@@ -1270,6 +1282,35 @@ mod tests {
         );
         assert_eq!(
             match_dolphin_inventory(&inventory, Some("GALE01"), Some(1)).state,
+            DolphinMatchState::RevisionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unsuffixed_filename_exact_matches_a_verified_revision_zero() {
+        // Every real GameSettings filename found on a real Dolphin
+        // installation (e.g. "NACE01.ini") omits the "rN" suffix entirely
+        // for the common, unmarked case - this is the overwhelming
+        // majority of real discs, so a verified revision-0 archive must
+        // exact-match its own real file, not report RevisionMismatch.
+        let root = fixture("revision-zero");
+        let profile = make_profile(&root.join("portable"));
+        fs::write(
+            profile.join("GameSettings/GAFE01.ini"),
+            b"[Gecko]\n$Code\nAABBCCDD 11223344\n",
+        )
+        .unwrap();
+        let inventory = inspect_dolphin_profile(&eligible(&profile)).unwrap();
+        assert_eq!(
+            match_dolphin_inventory(&inventory, Some("GAFE01"), Some(0)).state,
+            DolphinMatchState::ExactGameIdAndRevisionMatch
+        );
+        // A genuinely different, non-zero verified revision must still be
+        // rejected - the fix is specific to revision 0, not a blanket
+        // "no suffix always matches" rule.
+        assert_eq!(
+            match_dolphin_inventory(&inventory, Some("GAFE01"), Some(1)).state,
             DolphinMatchState::RevisionMismatch
         );
         fs::remove_dir_all(root).unwrap();

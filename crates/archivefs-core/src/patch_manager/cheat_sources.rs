@@ -204,7 +204,7 @@ impl CheatSourceProgressReporter {
         }
     }
 
-    fn report(&self, progress: CheatSourceProgress) {
+    pub(super) fn report(&self, progress: CheatSourceProgress) {
         let index = self.emitted.fetch_add(1, Ordering::AcqRel);
         if index < CHEAT_SOURCE_PROGRESS_EVENT_LIMIT {
             (self.callback)(progress);
@@ -1995,7 +1995,7 @@ fn download_with_redirects(
     unreachable!()
 }
 
-fn validate_downloaded_size(actual: u64, maximum: u64) -> Result<(), CheatSourceError> {
+pub(super) fn validate_downloaded_size(actual: u64, maximum: u64) -> Result<(), CheatSourceError> {
     if actual > maximum {
         Err(CheatSourceError::new(
             CheatSourceErrorStage::Download,
@@ -2007,7 +2007,7 @@ fn validate_downloaded_size(actual: u64, maximum: u64) -> Result<(), CheatSource
     }
 }
 
-fn validate_declared_download_size(
+pub(super) fn validate_declared_download_size(
     declared: Option<u64>,
     maximum: u64,
 ) -> Result<(), CheatSourceError> {
@@ -2162,7 +2162,7 @@ fn validate_extraction_sizes(
     Ok(())
 }
 
-fn validate_entry_count(count: usize) -> Result<(), CheatSourceError> {
+pub(super) fn validate_entry_count(count: usize) -> Result<(), CheatSourceError> {
     if count > CHEAT_SOURCE_ENTRY_LIMIT {
         Err(CheatSourceError::new(
             CheatSourceErrorStage::Extraction,
@@ -2174,7 +2174,7 @@ fn validate_entry_count(count: usize) -> Result<(), CheatSourceError> {
     }
 }
 
-fn validate_archive_entry_name(name: &str) -> Result<(), CheatSourceError> {
+pub(super) fn validate_archive_entry_name(name: &str) -> Result<(), CheatSourceError> {
     if name.is_empty()
         || name.as_bytes().contains(&0)
         || name.contains('\\')
@@ -2212,7 +2212,7 @@ fn validate_archive_entry_name(name: &str) -> Result<(), CheatSourceError> {
     Ok(())
 }
 
-fn validate_unix_entry_mode(mode: u32, name: &str) -> Result<(), CheatSourceError> {
+pub(super) fn validate_unix_entry_mode(mode: u32, name: &str) -> Result<(), CheatSourceError> {
     let kind = mode & 0o170000;
     if kind == 0 || kind == 0o040000 || kind == 0o100000 {
         Ok(())
@@ -2508,7 +2508,7 @@ fn now_nanos() -> u128 {
         .as_nanos()
 }
 
-fn prepare_cache_root(path: &Path) -> Result<(), CheatSourceError> {
+pub(super) fn prepare_cache_root(path: &Path) -> Result<(), CheatSourceError> {
     validate_cache_path_for_read(path)?;
     create_safe_directory(path)?;
     validate_cache_path_for_read(path)
@@ -2666,7 +2666,7 @@ pub(super) fn validate_catalogue_prefix(value: &str) -> Result<(), CheatSourceEr
     }
 }
 
-fn secure_create(path: &Path) -> Result<File, CheatSourceError> {
+pub(super) fn secure_create(path: &Path) -> Result<File, CheatSourceError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

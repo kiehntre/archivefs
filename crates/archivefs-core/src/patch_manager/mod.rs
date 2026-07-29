@@ -22,15 +22,23 @@
 mod adapter;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
+mod cheat_candidates;
 mod cheat_catalogue;
 mod cheat_history;
+mod cheat_install_plan;
 mod cheat_install_result;
 mod cheat_installer;
 mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
+mod cht_document;
 mod destination_safety;
+mod dolphin_cheat_catalogue;
+mod dolphin_gecko_install_plan;
+mod dolphin_gecko_provider;
 mod dolphin_local;
+mod emulator_profile_memory;
+mod gecko_document;
 mod import_safety;
 mod matching;
 mod pcsx2;
@@ -43,6 +51,10 @@ mod retroarch_inventory;
 mod retroarch_materialization;
 mod shared_preview;
 mod shared_transaction;
+mod xenia_install_plan;
+mod xenia_local;
+mod xenia_patch_document;
+mod xenia_provider;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -68,6 +80,12 @@ pub use cheat_cache_maintenance::{
     inventory_retroarch_cheat_snapshots, plan_retroarch_cheat_cache_prune,
     set_retroarch_cheat_snapshot_pin, verify_retroarch_cheat_snapshots,
 };
+pub use cheat_candidates::{
+    CheatCandidate, CheatCandidateArchive, CheatCandidateClassification, CheatCandidateEvidence,
+    CheatCandidateEvidenceKind, CheatCandidateList, CheatCandidateOptions,
+    MAX_CHEAT_CANDIDATE_EVIDENCE, MAX_CHEAT_CANDIDATE_RECORDS_SCANNED, MAX_CHEAT_CANDIDATES,
+    build_cheat_candidates,
+};
 pub use cheat_catalogue::{
     CHEAT_CATALOGUE_FORMAT_VERSION, CatalogueDiagnostic, CatalogueEntryExclusionKind,
     CatalogueExcludedEntry, CatalogueIndexState, CheatAvailabilityEntry, CheatAvailabilityReport,
@@ -84,6 +102,15 @@ pub use cheat_history::{
     CheatInspectionPath, CheatJournalInspection, CheatJournalInspectionError,
     CheatRollbackAvailability, CheatRollbackJournalMatch, discover_cheat_history,
     inspect_cheat_install_journal,
+};
+pub use cheat_install_plan::{
+    CheatDestinationNameSource, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPlanErrorKind, CheatInstallPreview, CheatInstallPreviewRequest,
+    CheatPlatformDirectorySource, CheatSelection, CheatSelectionEntry, GENERATED_FILE_PROVENANCE,
+    LoadedCandidate, MAX_CANDIDATE_FILE_BYTES, MAX_GENERATED_FILE_BYTES,
+    MAX_PLATFORM_DIRECTORY_CANDIDATES, ResolvedCheatDestination, StagedCheatFile,
+    build_cheat_install_preview, load_candidate_document, match_strength_for_candidate,
+    resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
     CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
@@ -126,11 +153,54 @@ pub use cheat_sources::{
     inspect_retroarch_cheat_source_snapshot, list_retroarch_cheat_sources,
     trusted_retroarch_cheat_sources,
 };
+pub use cht_document::{
+    ChtDocument, ChtDocumentWarning, ChtDocumentWarningKind, ChtEntry, ChtEntryWarning,
+    ChtEntryWarningKind, ChtInstallEntry, ChtParseError, ChtParseErrorKind,
+    MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_EXTRA_FIELDS_PER_ENTRY,
+    MAX_CHT_FIELD_BYTES, MAX_CHT_GLOBAL_FIELDS, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes,
+    parse_cht_text, render_cht_file,
+};
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,
     DestinationSafetyFailureReason, DestinationState, InspectedParent, InspectedParentState,
     SafeDestination, ValidatedDestinationRoot, assess_destination, construct_safe_destination,
     inspect_safe_destination, validate_destination_root,
+};
+pub use dolphin_cheat_catalogue::{
+    DOLPHIN_CATALOGUE_ATTRIBUTION, DOLPHIN_CATALOGUE_LICENSE, DOLPHIN_CATALOGUE_MAX_DOWNLOAD_BYTES,
+    DOLPHIN_CATALOGUE_PROVIDER_ID, DOLPHIN_CATALOGUE_REPOSITORY, DOLPHIN_CATALOGUE_SCHEMA_VERSION,
+    DolphinCatalogue, DolphinCatalogueCode, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueGame,
+    DolphinCatalogueLoad, DolphinCatalogueLookup, DolphinCatalogueMetadata,
+    DolphinCatalogueUpdateCheck, DolphinCatalogueUpdateState, DolphinGeckoLookupResult,
+    check_dolphin_catalogue_update, check_dolphin_catalogue_update_with_transport,
+    default_dolphin_catalogue_cache_root, fetch_dolphin_catalogue,
+    fetch_dolphin_catalogue_with_transport, gecko_provider_result_from_catalogue_entry,
+    load_dolphin_catalogue, load_dolphin_catalogue_update_state, lookup_dolphin_catalogue,
+    rebuild_dolphin_catalogue_index_with_transport, remove_dolphin_catalogue,
+    resolve_dolphin_gecko_lookup,
+};
+pub use dolphin_gecko_install_plan::{
+    DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,
+    DolphinCandidateOutcome, DolphinCodeSelection, DolphinCodeSelectionEntry,
+    DolphinInstallPlanError, DolphinInstallPlanErrorKind, DolphinInstallPreview,
+    DolphinInstallPreviewRequest, DolphinProviderCodeSelection, DolphinProviderCodeSelectionEntry,
+    GENERATED_INI_PROVENANCE, LoadedDolphinDestination, LoadedDolphinIni, MAX_DOLPHIN_INI_BYTES,
+    MAX_GENERATED_INI_BYTES, StagedDolphinIni, build_dolphin_candidate,
+    build_dolphin_install_preview, load_dolphin_destination, load_dolphin_ini, stage_dolphin_ini,
+    stage_dolphin_provider_ini,
+};
+pub use dolphin_gecko_provider::{
+    DOLPHIN_UPSTREAM_ATTRIBUTION, DOLPHIN_UPSTREAM_LICENSE, DOLPHIN_UPSTREAM_PROVIDER_ID,
+    DOLPHIN_UPSTREAM_PROVIDER_NAME, DOLPHIN_UPSTREAM_REPOSITORY, DolphinUpstreamGeckoProvider,
+    GECKO_PROVIDER_CACHE_FRESH_SECONDS, GECKO_PROVIDER_MAX_RESPONSE_BYTES,
+    GECKO_PROVIDER_MIN_REFRESH_SECONDS, GECKO_PROVIDER_TIMEOUT_SECONDS, GeckoApplicabilityDecision,
+    GeckoCodeProvider, GeckoProviderEntry, GeckoProviderError, GeckoProviderErrorKind,
+    GeckoProviderFetchError, GeckoProviderFetchErrorKind, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery, GeckoProviderResult,
+    GeckoRegion, GeckoRevisionApplicability, default_gecko_provider_cache_root,
+    fetch_dolphin_upstream_gecko, fetch_dolphin_upstream_gecko_with_transport,
+    peek_cached_gecko_result, region_for_game_id, revision_applicability,
 };
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
@@ -142,6 +212,19 @@ pub use dolphin_local::{
     DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
     DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
     inspect_dolphin_profile, match_dolphin_inventory,
+};
+pub use emulator_profile_memory::{
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    RememberedEmulatorProfile, default_emulator_profile_memory_path, forget_emulator_profile_at,
+    forget_emulator_profile_default, load_remembered_emulator_profiles_default,
+    load_remembered_emulator_profiles_from, remember_emulator_profile_default,
+    remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
+};
+pub use gecko_document::{
+    DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
+    GeckoCodeWarningKind, GeckoMergeError, MAX_GECKO_CODE_LINES, MAX_GECKO_CODES,
+    MAX_GECKO_LINE_BYTES, merge_external_gecko_codes, parse_dolphin_ini,
+    replace_gecko_enabled_section,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
@@ -222,6 +305,36 @@ pub use shared_transaction::{
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
+};
+pub use xenia_install_plan::{
+    LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,
+    StagedXeniaPatchFile, XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateEvidence,
+    XeniaCandidateOutcome, XeniaInstallPlanError, XeniaInstallPlanErrorKind, XeniaInstallPreview,
+    XeniaInstallPreviewRequest, XeniaOutcomeBlockedReason, XeniaPatchSelection,
+    XeniaPatchSelectionEntry, build_xenia_candidates, build_xenia_install_preview,
+    load_xenia_destination, stage_xenia_patch_file,
+};
+pub use xenia_local::{
+    XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaPatchesDirectoryState,
+    XeniaProfile, XeniaProfileBlocker, XeniaProfileBlockerKind, XeniaProfileDiscovery,
+    XeniaProfileDiscoveryRoots, XeniaProfileScope, discover_xenia_profiles,
+};
+pub use xenia_patch_document::{
+    MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,
+    MAX_PATCHES_PER_FILE, MAX_STRING_VALUE_BYTES, MAX_WRITES_PER_PATCH, XeniaDocumentWarning,
+    XeniaDocumentWarningKind, XeniaPatch, XeniaPatchDocument, XeniaPatchWarning,
+    XeniaPatchWarningKind, XeniaPatchWrite, XeniaWriteKind, XeniaWriteValue,
+    parse_xenia_patch_toml,
+};
+pub use xenia_provider::{
+    XENIA_PROVIDER_FILE_MAX_BYTES, XENIA_PROVIDER_ID, XENIA_PROVIDER_INDEX_FRESH_SECONDS,
+    XENIA_PROVIDER_INDEX_MAX_BYTES, XENIA_PROVIDER_MAX_INDEX_ENTRIES,
+    XENIA_PROVIDER_MAX_MATCHED_FILES, XENIA_PROVIDER_MIN_REFRESH_SECONDS, XENIA_PROVIDER_NAME,
+    XENIA_PROVIDER_TIMEOUT_SECONDS, XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE,
+    XENIA_UPSTREAM_REPOSITORY, XeniaProviderDocument, XeniaProviderFetchError,
+    XeniaProviderFetchErrorKind, XeniaProviderFetchOptions, XeniaProviderFetchResult,
+    XeniaProviderFetchStatus, XeniaProviderResult, default_xenia_provider_cache_root,
+    fetch_xenia_provider_patches, fetch_xenia_provider_patches_with_transport,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";
