@@ -21,6 +21,13 @@ release-artifact validation remain required.
 
 ### Added
 
+- A canonical, locally runnable release builder and independent artifact
+  verifier with deterministic archive metadata, privacy checks, malformed-
+  artifact rejection, version consistency, and two-build reproducibility proof.
+- Split pull-request CI gates for formatting, Clippy, workspace tests, locked
+  release builds, dependency/security audit, artifact verification, and
+  reproducibility. CI candidates are retained for 14 days and are not
+  published as releases.
 - Direct read-only discovery for GameCube/Wii `.iso`, `.gcm`, `.gcz`, `.rvz`,
   `.wbfs`, and `.ciso`, preserving visibility when exact identity is unavailable.
 - Canonical platform resolution and persistent source-level assignments with
