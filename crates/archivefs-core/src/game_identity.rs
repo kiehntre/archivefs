@@ -271,6 +271,10 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::Pcsx2ExecutableCrc)
     }
 
+    pub fn verified_ps2_serial(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::Ps2Serial)
+    }
+
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
         self.verified_value(IdentityKind::LooseRomSha256)
     }

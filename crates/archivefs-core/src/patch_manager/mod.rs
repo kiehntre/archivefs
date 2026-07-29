@@ -42,6 +42,7 @@ mod gecko_document;
 mod import_safety;
 mod matching;
 mod pcsx2;
+mod pcsx2_identity;
 mod pcsx2_local;
 mod retrieval;
 mod retroarch;
@@ -234,6 +235,10 @@ pub use import_safety::{
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
+};
+pub use pcsx2_identity::{
+    Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
+    pcsx2_cheats_directory,
 };
 pub use pcsx2_local::{
     PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
