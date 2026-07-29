@@ -1,9 +1,8 @@
 # Platform artwork
 
-Status: Platform Artwork Pack v1 is implemented on
-`feature/platform-artwork-pack-v1`. It adds exact hardware illustrations to
-the existing Gamer View platform shelf without changing its filtering,
-selection, scrolling, or fallback model.
+Status: Platform Artwork Pack v1 adds exact hardware illustrations to the
+existing Gamer View platform shelf without changing its filtering, selection,
+scrolling, or fallback model.
 
 ## Runtime policy
 
@@ -15,6 +14,11 @@ Artwork resolution is deterministic and strictly ordered:
 3. The existing category fallback native glyph: console, handheld, computer,
    arcade, optical-disc, or cartridge.
 4. The existing Unknown native glyph.
+
+Compact game-list rows use a related three-step chain: a valid custom
+`game-<normalised-title>.png`, the resolved platform artwork above, then the
+Unknown glyph. Game and platform textures share the bounded session cache, so
+scrolling does not reopen or decode files each frame.
 
 Exact aliases are tested before category inference. Matching is
 case-insensitive and normalization removes spaces and hyphens only. There is
@@ -156,8 +160,9 @@ Unknown.
 The shelf remains one horizontally scrolling row. Cards retain responsive
 96–124 logical-pixel widths, platform name, count, selected state, standard
 button keyboard focus/activation, full-name tooltip/accessibility label, and
-1024×600 behavior. The illustration is centred in the existing card with
-modest padding; card height is unchanged.
+1024×600 behavior. Hardware illustrations are aspect-fitted at 60 logical
+pixels in an 88-pixel card, centred with transparent padding preserved. Compact
+game rows use a recognisable 38-pixel thumbnail in a 46-pixel row.
 
 Tests cover the complete registry and alias table, case normalization,
 related-platform separation, category and Unknown fallbacks, custom override

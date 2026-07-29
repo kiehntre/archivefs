@@ -36,6 +36,9 @@ pub struct Pcsx2CheatProviderRecord {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub author: Option<String>,
+    pub source_game_id: Option<String>,
+    pub source_url: Option<String>,
     pub game_crc: String,
     pub serial_constraint: Option<String>,
     pub region_constraint: Option<String>,
@@ -111,6 +114,9 @@ pub struct Pcsx2CheatCandidate {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub author: Option<String>,
+    pub source_game_id: Option<String>,
+    pub source_url: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub source: String,
@@ -148,6 +154,9 @@ pub fn build_pcsx2_cheat_candidates(
                 id: record.id.clone(),
                 name: record.name.clone(),
                 description: record.description.clone(),
+                author: record.author.clone(),
+                source_game_id: record.source_game_id.clone(),
+                source_url: record.source_url.clone(),
                 provider_id: catalogue.provider_id.clone(),
                 provider_name: catalogue.provider_name.clone(),
                 source: catalogue.source.clone(),
@@ -246,7 +255,28 @@ pub fn selected_pcsx2_managed_cheats(
             Ok(ManagedPnachCheat {
                 id: candidate.id.clone(),
                 name: candidate.name.clone(),
-                description: candidate.description.clone(),
+                description: Some(
+                    [
+                        candidate.description.clone(),
+                        candidate
+                            .author
+                            .as_ref()
+                            .map(|author| format!("Author: {author}")),
+                        candidate
+                            .source_game_id
+                            .as_ref()
+                            .map(|game_id| format!("GameHacking game ID: {game_id}")),
+                        candidate
+                            .source_url
+                            .as_ref()
+                            .map(|source| format!("Source: {source}")),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                )
+                .filter(|description| !description.is_empty()),
                 patch_lines: candidate.patch_lines.clone(),
             })
         })
@@ -276,6 +306,9 @@ mod tests {
             id: "infinite-health".to_string(),
             name: "Infinite health".to_string(),
             description: None,
+            author: None,
+            source_game_id: None,
+            source_url: None,
             game_crc: "A1B2C3D4".to_string(),
             serial_constraint: Some("SLUS-20312".to_string()),
             region_constraint: Some("NTSC-U".to_string()),

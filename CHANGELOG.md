@@ -26,12 +26,30 @@ guessing at intent, dates, or scope.
   source-tree files and decoded textures are cached.
 - The one-row responsive platform shelf, filtering, selected/focus states,
   labels, counts, tooltips, and narrow-window behavior remain unchanged.
+- Platform hardware illustrations are now prominent in 88-pixel cards, and
+  compact game rows again show cached artwork: local per-game PNG, platform
+  artwork, then Unknown.
+
+### Cheats & Mods
+
+- Added the general GameHacking.org provider core with PS2/PCSX2 as its first
+  adapter. It checks one selected local-library game at a time, fails closed on
+  serial/CRC/region conflicts, caches public pages and native PNACH exports,
+  preserves author/description/source provenance, and rate-limits bounded
+  fixed-origin HTTPS requests.
+- Selected GameHacking.org cheats can be previewed and installed under the
+  verified local PCSX2 CRC through ArchiveFS's existing confirmation, backup,
+  journal, and Undo transaction flow. No crawler, automatic fetch, PNACH
+  conversion, ROM modification, or user-file overwrite without confirmation
+  was added.
 
 ### Documentation
 
 - Expanded the platform artwork manifest with every bundled filename, alias,
   encoded size, alpha/padding inspection, runtime format, offline guarantee,
   provenance statement, fallback behavior, and rejection record.
+- Added `docs/GAMEHACKING_PROVIDER.md` covering provider scope, identity gates,
+  caching, rate limiting, provenance, native export, and future adapters.
 
 ## v0.7.0-alpha (unreleased)
 

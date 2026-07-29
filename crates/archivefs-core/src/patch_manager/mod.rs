@@ -36,6 +36,7 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod emulator_profile_memory;
+mod gamehacking_provider;
 mod gecko_document;
 mod import_safety;
 mod matching;
@@ -227,6 +228,12 @@ pub use emulator_profile_memory::{
     forget_emulator_profile_default, load_remembered_emulator_profiles_default,
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
+};
+pub use gamehacking_provider::{
+    GAMEHACKING_PROVIDER_ID, GameHackingCheat, GameHackingError, GameHackingErrorKind,
+    GameHackingFetchOptions, GameHackingGame, GameHackingMatch, GameHackingMatchStatus,
+    GameHackingProvider, GameHackingSystemAdapter, Ps2GameHackingAdapter, gamehacking_cache_root,
+    parse_gamehacking_game_page, parse_gamehacking_pnach,
 };
 pub use gecko_document::{
     DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
