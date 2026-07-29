@@ -83,17 +83,27 @@ itself; see the generic gates above for that authority.
 
 ### Artifact gate (RC1 result)
 
-- [ ] `scripts/build-release.sh --output-dir target/release-candidate` -
-      _recorded after the documentation commit, below_
-- [ ] `scripts/verify-release-artifact.sh` - _pending_
-- [ ] `scripts/test-release-artifact-verifier.sh` (malformed-artifact
-      regression suite) - _pending_
-- [ ] `scripts/check-version-consistency.sh` (source, binaries, archive,
-      checksum) - _pending_
-- [ ] `scripts/compare-release-builds.sh` (two-build byte-for-byte
-      reproducibility) - _pending_
-- [ ] Archive size, extracted size, SHA-256, and exact artifact path
-      recorded - _pending_
+- [x] `scripts/build-release.sh --output-dir target/release-candidate` -
+      succeeded, self-verified
+- [x] `scripts/verify-release-artifact.sh` - structure, ownership, modes,
+      checksum, privacy, and both binary versions verified
+- [x] `scripts/test-release-artifact-verifier.sh` (malformed-artifact
+      regression suite) - bad-checksum, unexpected-member, traversal,
+      bad-mode, and privacy-leak fixtures all correctly rejected
+- [x] `scripts/check-version-consistency.sh` (source, binaries, archive,
+      checksum) - verified `0.7.0-alpha` throughout (this run also caught
+      and led to fixing a CHANGELOG heading regression - see the
+      Documentation gate below)
+- [x] `scripts/compare-release-builds.sh` (two-build byte-for-byte
+      reproducibility) - identical, matching SHA-256
+      `aa5582ade4433ec9f83dc5f21ca7095f448b96dc6a4b833d82d120acabcaf104`
+      across both independent isolated-target-dir builds
+- [x] Archive size **13,513,500 bytes**; extracted size **37,515,485
+      bytes**; canonical SHA-256
+      **1749d470102ecbdf49a624d5b8995d18219b455d2a1cffac87602c6e99a35469**;
+      artifact path
+      `target/release-candidate/archivefs-v0.7.0-alpha-x86_64-linux.tar.gz`
+      (not committed to Git - build output only)
 
 ### Documentation gate (RC1 result)
 
@@ -103,8 +113,13 @@ itself; see the generic gates above for that authority.
       Documentation, Known limitations), with no "full support"/"complete
       coverage"/"production ready" language
 - [x] `docs/releases/v0.7.0-alpha.md` created with all 16 required
-      sections; final checksum left as a placeholder pending the canonical
-      build below
+      sections; final checksum recorded once the canonical build below
+      passed verification
+- [x] `scripts/check-version-consistency.sh`'s own `## v$VERSION
+      (unreleased)` exact-heading requirement caught a heading change
+      ("(release candidate)") in the first draft of the CHANGELOG entry;
+      fixed in a follow-up commit and reverified before proceeding - see
+      commit `5425d58`
 - [x] Corrected a stale factual claim in `README.md`'s release-status
       paragraph (previously said "PCSX2 remains read-only," which is no
       longer accurate at the `archivefs-core` API level - the paragraph now
@@ -122,25 +137,49 @@ itself; see the generic gates above for that authority.
 
 ### Manual gate (RC1 result)
 
-- [ ] Extracted release-candidate CLI/GUI manually tested - _pending, see
-      below_
-- [ ] X11 manual QA - _pending_
-- [ ] Wayland manual limitation recorded honestly (not fabricated) -
-      _pending_
-- [ ] Dolphin manual proof (Animal Crossing/GAFE01) - _pending_
-- [ ] RetroArch manual proof (Arena and Lunar/GameGear) - _pending_
-- [ ] PCSX2 recognition proof (without install) - _pending_
-- [ ] PCSX2 catalogue limitation explicitly confirmed unchanged - _pending_
-- [ ] No live ROM, production profile, database, or configuration was
-      modified - _pending confirmation after manual QA_
+- [x] Extracted release-candidate CLI/GUI (not the working-tree binary)
+      manually tested by the user - full pass on GUI startup, Gamer View
+      default, search, platform cards/scrolling/tooltips, game selection,
+      Mount as primary action, Cheats & Mods + "Back to games", Dolphin and
+      RetroArch cheat-workflow availability, PCSX2 recognition, Advanced
+      View + Return to Gamer View, file dialog, clipboard copy/paste - no
+      crash, freeze, or rendering corruption
+- [x] X11 manual QA - passed (above)
+- [x] Wayland manual limitation recorded honestly - `WAYLAND_DISPLAY` was
+      unset/absent in the test environment for this RC1 run; only X11 was
+      manually exercised, exactly as recorded in the release notes
+- [x] Dolphin manual proof (Animal Crossing, GAFE01) - `cheat-provider-coverage`
+      against an isolated database copy reports 1 compatible cheat,
+      verified identity GAFE01, region USA, revision 0
+- [x] RetroArch manual proof (Arena and Lunar, both GameGear) - Arena: 6
+      compatible cheats, 2 rejected (weak evidence only); Lunar
+      translation entry: 0 compatible, rejected because multiple
+      candidates tied and none was selected silently - both exactly as
+      expected
+- [x] PCSX2 recognition proof (without install) - confirmed via manual GUI
+      QA above; the workflow still renders "installation unavailable"
+- [x] PCSX2 catalogue limitation explicitly confirmed unchanged - no
+      approved downloadable ordinary-cheat catalogue is bundled; unchanged
+      from the prior integration
+- [x] No live ROM, production profile, database, or configuration was
+      modified - the coverage spot check ran against a disposable `/tmp`
+      copy of `~/.local/share/archivefs`, deleted immediately after use;
+      the live `library.sqlite3`'s mtime was confirmed unchanged
+      (2026-07-29 01:02, well before this RC1 session) both before and
+      after
 
 ### Repository hygiene (RC1 result)
 
-- [ ] `git status --short`, `git diff --check`, `git ls-files -o
-      --exclude-standard`, and a tracked-file security scan all reviewed -
-      _pending, recorded after artifact build_
-- [ ] No tag created
-- [ ] No publication of any kind occurred
+- [x] `git status --short` clean before each commit; `git diff --check`
+      clean; `git ls-files -o --exclude-standard` empty (no stray
+      untracked files); `scripts/security-scan.sh` scanned 200 tracked
+      files, no credential-shaped secrets found; no `.log`/`.tmp`/`.bak`/
+      `.orig` files outside `target/`; no merge-conflict markers in any
+      tracked source/doc/config file; no ROM/BIOS/database/emulator-profile
+      file extensions and no `.tar.gz`/`.sha256` release artifacts are
+      tracked by Git
+- [x] No tag created
+- [x] No publication of any kind occurred
 
 ### Push
 
