@@ -76,9 +76,10 @@ use archivefs_core::patch_manager::{
     XeniaPatchesDirectoryState, XeniaProviderFetchOptions, XeniaProviderFetchResult,
     XeniaProviderFetchStatus,
 };
-mod status_wording;
+pub mod game_presentation;
+pub mod status_wording;
 mod ui;
-mod view_mode;
+pub mod view_mode;
 
 #[cfg(test)]
 use archivefs_core::patch_manager::{
