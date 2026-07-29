@@ -4814,12 +4814,81 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("microsoftmsx", "MSX"),
     ("microsoftmsx2", "MSX2"),
     ("atarilynxlynx", "Atari Lynx"),
+    // Platform recovery expansion: folder evidence observed in real
+    // libraries for systems that previously had no canonical platform at
+    // all (so every archive under them stayed Unknown regardless of how
+    // clear the folder name was). Same conservative rule as above - exact
+    // normalized whole-component match only, no bare single-word aliases
+    // broad enough to false-positive on an unrelated folder.
+    ("virtualboy", "Virtual Boy"),
+    ("vb", "Virtual Boy"),
+    ("nintendovirtualboy", "Virtual Boy"),
+    ("nintendo3ds", "Nintendo 3DS"),
+    ("n3ds", "Nintendo 3DS"),
+    ("new3ds", "Nintendo 3DS"),
+    ("sharpx68000", "Sharp X68000"),
+    ("x68000", "Sharp X68000"),
+    ("x68k", "Sharp X68000"),
+    ("necpc8801", "NEC PC-8801"),
+    ("pc8801", "NEC PC-8801"),
+    ("necpc9801", "NEC PC-9801"),
+    ("pc9801", "NEC PC-9801"),
+    ("pcenginecd", "PC Engine CD"),
+    ("turbografxcd", "PC Engine CD"),
+    ("tgcd", "PC Engine CD"),
+    // "zxs" is a common abbreviated folder name for ZX Spectrum
+    // collections; "sinclairzxspectrum" covers the fuller libretro-style
+    // name. Both fold to the same canonical platform as the existing
+    // "zxspectrum"/"spectrum" aliases above.
+    ("zxs", "ZX Spectrum"),
+    ("sinclairzxspectrum", "ZX Spectrum"),
+    // FBNeo/MAME/FBA are emulator/core names, not hardware - they all
+    // classify as the "Arcade" hardware platform. Deliberately not treated
+    // as their own canonical platform (see `platform_preferred_emulator`
+    // for where the specific-emulator evidence is instead recorded).
+    ("fbneo", "Arcade"),
+    ("finalburnneo", "Arcade"),
+    ("fba", "Arcade"),
+    ("commodore128", "Commodore 128"),
+    ("c128", "Commodore 128"),
+    ("vic20", "VIC-20"),
     // Deliberately absent: libretro database names whose systems this build
-    // has no canonical platform for at all (Virtual Boy, SG-1000, PC Engine
-    // CD, ...). Adding them here would silently invent a new canonical
-    // platform for the whole application, which is a much larger change than
-    // recognising an existing one under its libretro spelling.
+    // has no canonical platform for at all (SG-1000, ...). Adding them here
+    // would silently invent a new canonical platform for the whole
+    // application, which is a much larger change than recognising an
+    // existing one under its libretro spelling.
 ];
+
+/// Non-hardware "which emulator core" evidence for platforms whose folder
+/// name commonly identifies a specific emulator/core rather than the
+/// hardware itself (Arcade via FBNeo/MAME/FBA being the primary case).
+/// Kept separate from `FOLDER_PLATFORM_ALIASES` deliberately: the folder
+/// alias table's job is exactly one canonical *hardware* platform per
+/// folder name, never an emulator choice, so FBNeo is never promoted to
+/// its own canonical platform (`canonical_platform_names()` never returns
+/// "FBNeo" - the hardware label "Arcade" is always what a game.folder
+/// alias resolves to). This table answers a strictly narrower, additional
+/// question for the same normalized folder name.
+const FOLDER_PREFERRED_EMULATOR_ALIASES: &[(&str, &str)] = &[
+    ("fbneo", "FBNeo"),
+    ("finalburnneo", "FBNeo"),
+    ("fba", "FBNeo"),
+    ("mame", "MAME"),
+];
+
+/// The emulator/core a normalized folder name suggests, when the folder
+/// name itself names a specific emulator rather than only hardware (e.g. a
+/// `FBNeo`/`MAME` collection folder). Returns `None` when the folder name
+/// carries no such evidence - most platforms have no preferred-emulator
+/// folder convention at all, which is not an error.
+#[must_use]
+pub fn platform_preferred_emulator_for_alias(folder_hint: &str) -> Option<&'static str> {
+    let normalized = normalize_path_segment(folder_hint);
+    FOLDER_PREFERRED_EMULATOR_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+        .map(|(_, emulator)| *emulator)
+}
 
 /// Every canonical platform name this build recognises via the
 /// folder-alias system (`FOLDER_PLATFORM_ALIASES`), deduplicated and
@@ -9983,6 +10052,98 @@ mod tests {
     }
 
     #[test]
+    fn platform_recovery_expansion_aliases_detect_their_canonical_platform() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/virtualboy/Game.zip"), root),
+            Some("Virtual Boy".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Virtual Boy/Game.zip"), root),
+            Some("Virtual Boy".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/sharp-x68000/Sharp X68000/Game.zip"), root),
+            Some("Sharp X68000".to_string()),
+            "the nearer, more specific folder component must win"
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Sharp X68000/Game.zip"), root),
+            Some("Sharp X68000".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/pc-8801/NEC PC-8801/Game.zip"), root),
+            Some("NEC PC-8801".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801/Game.zip"), root),
+            Some("NEC PC-8801".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/zxs/Game.zip"), root),
+            Some("ZX Spectrum".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Sinclair ZX Spectrum/Game.zip"), root),
+            Some("ZX Spectrum".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Acorn Archimedes/Game.zip"), root),
+            Some("Acorn Archimedes".to_string())
+        );
+    }
+
+    #[test]
+    fn arcade_core_folder_names_classify_as_arcade_with_preferred_emulator_evidence() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/fbneo/Game.zip"), root),
+            Some("Arcade".to_string())
+        );
+        assert_eq!(
+            platform_preferred_emulator_for_alias("fbneo"),
+            Some("FBNeo")
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/mame/Game.zip"), root),
+            Some("Arcade".to_string())
+        );
+        assert_eq!(
+            platform_preferred_emulator_for_alias("mame"),
+            Some("MAME")
+        );
+        // Arcade itself (no specific emulator implied by the folder name)
+        // has no preferred-emulator evidence, which is not an error.
+        assert_eq!(platform_preferred_emulator_for_alias("arcade"), None);
+    }
+
+    #[test]
+    fn xbox_folder_never_becomes_xbox_360() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/xbox/Game.iso"), root),
+            Some("Xbox".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Xbox 360/Game.iso"), root),
+            Some("Xbox360".to_string())
+        );
+    }
+
+    #[test]
+    fn game_boy_folder_never_becomes_game_boy_advance() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/Game Boy/Game.gb"), root),
+            Some("Game Boy".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Game Boy Advance/Game.gba"), root),
+            Some("Game Boy Advance".to_string())
+        );
+    }
+
+    #[test]
     fn external_platform_hint_uses_the_shared_folder_alias_table() {
         assert_eq!(
             canonical_platform_for_alias("Atari - 2600"),
@@ -10107,15 +10268,14 @@ mod tests {
             detect_platform(format!("{root}/DS/Game.zip"), root),
             Some("Nintendo DS".to_string())
         );
-        // "Nintendo 3DS" must never collide with the new bare "ds"/"nds"
-        // aliases - `normalize_path_segment` keeps the "3", so
-        // "Nintendo 3DS" normalizes to "nintendo3ds", never "ds"/"nds"/
-        // "nintendods". Nintendo3DS itself is not a folder alias at all
-        // (only reachable via the existing filename/title heuristic), so
-        // this must stay Unknown from folder detection alone.
+        // "Nintendo 3DS" must never collide with the "ds"/"nds" aliases -
+        // `normalize_path_segment` keeps the "3", so "Nintendo 3DS"
+        // normalizes to "nintendo3ds", never "ds"/"nds"/"nintendods". It is
+        // now its own first-class folder alias (platform recovery
+        // expansion), distinct from Nintendo DS.
         assert_eq!(
             detect_platform(format!("{root}/Nintendo 3DS/Game.zip"), root),
-            None,
+            Some("Nintendo 3DS".to_string()),
             "\"Nintendo 3DS\" must not become Nintendo DS"
         );
         assert_eq!(
