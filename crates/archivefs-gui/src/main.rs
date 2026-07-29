@@ -100,9 +100,9 @@ use archivefs_core::{
     RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
     SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability, SourceFolderConfig,
     SourceFolderView, UnmountOneOutcome, add_library_view_default, add_source_folder_default,
-    apply_library_view_default, build_source_folder_views, canonical_platform_names,
-    catalogue_filename_duplicates, check_database_health, classify_archive_health,
-    cleanup_selected_mount_tree, create_configured_mount_root_default,
+    apply_library_view_default, assign_source_platform_default, build_source_folder_views,
+    canonical_platform_names, catalogue_filename_duplicates, check_database_health,
+    classify_archive_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path,
     edit_library_view_default, format_unix_timestamp_utc, inspect_archive, is_inspectable,
     latest_schema_version, lazy_unmount_one_archive_path_with_progress,
@@ -884,13 +884,16 @@ fn build_display_rows(
 /// "show everything") and multiple checked filters within the same group
 /// are OR'd, so checking both `present` and `missing` shows both rather
 /// than nothing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct LibraryRowFilters {
     present: bool,
     missing: bool,
     awaiting_validation: bool,
     known_platform: bool,
     unknown_platform: bool,
+    /// Session-wide platform-first selection shared with Mount and the
+    /// Cheats & Mods chooser. `Some("Unknown")` is diagnostic, not empty.
+    platform: Option<String>,
 }
 
 impl LibraryRowFilters {
@@ -900,6 +903,7 @@ impl LibraryRowFilters {
             || self.awaiting_validation
             || self.known_platform
             || self.unknown_platform
+            || self.platform.is_some()
     }
 
     fn matches(&self, row: &ArchiveRow) -> bool {
@@ -921,7 +925,15 @@ impl LibraryRowFilters {
             || (self.known_platform && !row.unknown_platform)
             || (self.unknown_platform && row.unknown_platform);
 
-        state_match && platform_match
+        let selected_platform_match = self.platform.as_deref().is_none_or(|wanted| {
+            if wanted == "Unknown" {
+                row.unknown_platform
+            } else {
+                !row.unknown_platform && row.platform == wanted
+            }
+        });
+
+        state_match && platform_match && selected_platform_match
     }
 }
 
@@ -2056,6 +2068,7 @@ enum SourceAction {
     SetEnabled { path: PathBuf, enabled: bool },
     ScanOne(PathBuf),
     ScanAll,
+    AssignPlatform { path: PathBuf, platform: String },
     Remove { path: PathBuf, keep_catalogue: bool },
 }
 
@@ -2069,6 +2082,10 @@ enum SourceActionOutcome {
     Added(SourceFolderConfig),
     SetEnabled(SetSourceFolderEnabledOutcome),
     Scanned(ScanPersistSummary),
+    PlatformAssigned {
+        platform: String,
+        scan: ScanPersistSummary,
+    },
     Removed(RemoveSourceFolderOutcome),
 }
 
@@ -6927,10 +6944,26 @@ impl ArchiveFsApp {
     }
 
     fn open_cheat_archive_picker(&mut self) {
+        let adapter_platform =
+            self.cheat_workflow
+                .as_ref()
+                .and_then(|workflow| match workflow.adapter {
+                    CheatEmulatorAdapter::Dolphin => workflow
+                        .platform
+                        .as_ref()
+                        .filter(|platform| matches!(platform.as_str(), "GameCube" | "Wii"))
+                        .cloned()
+                        .or_else(|| Some("GameCube".to_string())),
+                    CheatEmulatorAdapter::Xenia => Some("Xbox360".to_string()),
+                    CheatEmulatorAdapter::Pcsx2 => Some("PS2".to_string()),
+                    _ => self.library_filters.platform.clone(),
+                });
+        self.library_filters.platform = adapter_platform.clone();
         self.cheat_archive_picker = Some(CheatArchivePickerState::for_current(
             self.cheat_workflow
                 .as_ref()
                 .map(|workflow| workflow.archive_path.as_path()),
+            adapter_platform,
         ));
     }
 
@@ -9404,6 +9437,12 @@ impl eframe::App for ArchiveFsApp {
                             SourcesPageAction::RefreshStatus => {
                                 self.start_database_action(context.clone(), false);
                             }
+                            SourcesPageAction::AssignPlatform { path, platform } => {
+                                self.start_source_action(
+                                    context.clone(),
+                                    SourceAction::AssignPlatform { path, platform },
+                                );
+                            }
                             SourcesPageAction::SetEnabled { path, enabled } => {
                                 self.start_source_action(
                                     context.clone(),
@@ -9765,6 +9804,7 @@ impl eframe::App for ArchiveFsApp {
                             context,
                             picker,
                             &picker_rows,
+                            &mut self.library_filters.platform,
                             &mut self.clipboard,
                         )
                     });
@@ -9828,6 +9868,7 @@ impl eframe::App for ArchiveFsApp {
                         MountPageViewState {
                             queue: &mut self.mount_queue,
                             search: &mut self.mount_search,
+                            platform: &mut self.library_filters.platform,
                             confirm: &mut self.confirm_mount_queue,
                             busy: archive_actions_blocked,
                             block_reason: archive_action_block_reason,
@@ -10754,6 +10795,8 @@ fn platform_source_label(source: Option<&str>) -> &'static str {
     match source {
         Some(MANUAL_PLATFORM_SOURCE) => "Manual assignment",
         Some(CUSTOM_FOLDER_ALIAS_SOURCE) => "Custom folder alias",
+        Some("source_assignment") => "Source assignment",
+        Some("header_identity") => "Format/header identity",
         Some("folder_alias") => "Built-in folder alias",
         Some("heuristic-path-detector") => "Filename/path heuristic",
         Some(_) => "Automatic detection",
@@ -10772,6 +10815,13 @@ fn platform_provenance_lines(details: &PlatformProvenanceDetails) -> Vec<(&'stat
             platform_source_label(details.source.as_deref()).to_string(),
         ),
     ];
+    if details.platform.is_none() {
+        lines.push((
+            "Reason",
+            "No explicit override, header identity, source assignment, folder alias, or filename evidence matched."
+                .to_string(),
+        ));
+    }
 
     match (
         details.source.as_deref(),
@@ -12028,7 +12078,9 @@ fn source_action_log_category(action: &SourceAction) -> ActivityAction {
         SourceAction::Add(_) => ActivityAction::SourceAdded,
         SourceAction::SetEnabled { enabled: true, .. } => ActivityAction::SourceEnabled,
         SourceAction::SetEnabled { enabled: false, .. } => ActivityAction::SourceDisabled,
-        SourceAction::ScanOne(_) | SourceAction::ScanAll => ActivityAction::SourceScan,
+        SourceAction::ScanOne(_) | SourceAction::ScanAll | SourceAction::AssignPlatform { .. } => {
+            ActivityAction::SourceScan
+        }
         SourceAction::Remove { .. } => ActivityAction::SourceRemoved,
     }
 }
@@ -12038,6 +12090,7 @@ fn source_action_path(action: &SourceAction) -> Option<PathBuf> {
         SourceAction::Add(path)
         | SourceAction::SetEnabled { path, .. }
         | SourceAction::ScanOne(path)
+        | SourceAction::AssignPlatform { path, .. }
         | SourceAction::Remove { path, .. } => Some(path.clone()),
         SourceAction::ScanAll => None,
     }
@@ -12056,6 +12109,10 @@ fn source_action_started_message(action: &SourceAction) -> String {
         } => format!("Disabling source '{}'.", path.display()),
         SourceAction::ScanOne(path) => format!("Scanning source '{}'.", path.display()),
         SourceAction::ScanAll => "Scanning all enabled sources.".to_string(),
+        SourceAction::AssignPlatform { path, platform } => format!(
+            "Assigning {platform} to source '{}' and rescanning compatible entries.",
+            path.display()
+        ),
         SourceAction::Remove {
             path,
             keep_catalogue: true,
@@ -12107,6 +12164,11 @@ fn source_action_success_message(outcome: &SourceActionOutcome) -> String {
                 )
             }
         }
+        SourceActionOutcome::PlatformAssigned { platform, scan } => format!(
+            "Source assigned {platform}. Rescan found {} item(s); compatible Unknown entries were reclassified. {} incompatible item(s) remained visible and Unknown.",
+            scan.counts.archives_seen,
+            scan.platform_assignment_warnings.len()
+        ),
         SourceActionOutcome::Removed(outcome) => match outcome.catalogue_rows_removed {
             Some(count) => format!(
                 "Source removed: {}. {count} catalogue row(s) removed.",
@@ -12139,6 +12201,14 @@ fn run_source_action(action: &SourceAction) -> archivefs_core::Result<SourceActi
         }
         SourceAction::ScanAll => {
             scan_all_enabled_sources_default().map(SourceActionOutcome::Scanned)
+        }
+        SourceAction::AssignPlatform { path, platform } => {
+            assign_source_platform_default(path, platform).map(|scan| {
+                SourceActionOutcome::PlatformAssigned {
+                    platform: platform.clone(),
+                    scan,
+                }
+            })
         }
         SourceAction::Remove {
             path,
@@ -12378,6 +12448,10 @@ enum SourcesPageAction {
     ScanOne(PathBuf),
     ScanAll,
     RefreshStatus,
+    AssignPlatform {
+        path: PathBuf,
+        platform: String,
+    },
     SetEnabled {
         path: PathBuf,
         enabled: bool,
@@ -13483,7 +13557,7 @@ fn show_sources_page(
                                     }
                                     if widgets::action_button(
                                         ui,
-                                        "Scan",
+                                        "Scan / detect",
                                         widgets::ActionStyle::Secondary,
                                         !busy,
                                     )
@@ -13492,13 +13566,37 @@ fn show_sources_page(
                                         action =
                                             Some(SourcesPageAction::ScanOne(view.path.clone()));
                                     }
+                                    ui.menu_button("Assign platform", |ui| {
+                                        ui.label(format!(
+                                            "Preview: up to {} Unknown entries can be updated on rescan.",
+                                            view.unknown_archive_count
+                                        ));
+                                        if let Some(current) = &view.assigned_platform {
+                                            ui.label(format!("Current: {current}"));
+                                        }
+                                        for platform in
+                                            ["GameCube", "Xbox360", "PS2", "PS3", "Xbox"]
+                                        {
+                                            if ui
+                                                .add_enabled(!busy, egui::Button::new(platform))
+                                                .clicked()
+                                            {
+                                                action = Some(SourcesPageAction::AssignPlatform {
+                                                    path: view.path.clone(),
+                                                    platform: platform.to_string(),
+                                                });
+                                                ui.close();
+                                            }
+                                        }
+                                        ui.small("Incompatible direct images remain Unknown.");
+                                    });
                                 },
                             );
                         });
                     });
                     group_response.response.context_menu(|ui| {
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Scan source"))
+                            .add_enabled(!busy, egui::Button::new("Re-run platform detection"))
                             .clicked()
                         {
                             action = Some(SourcesPageAction::ScanOne(view.path.clone()));
@@ -14866,6 +14964,7 @@ fn show_selected_page(
 struct MountPageViewState<'a> {
     queue: &'a mut Vec<PathBuf>,
     search: &'a mut String,
+    platform: &'a mut Option<String>,
     confirm: &'a mut bool,
     busy: bool,
     block_reason: Option<&'a str>,
@@ -14879,6 +14978,7 @@ fn show_mount_page(
     let MountPageViewState {
         queue,
         search,
+        platform,
         confirm,
         busy,
         block_reason,
@@ -14899,6 +14999,35 @@ fn show_mount_page(
     };
     prune_mount_queue(queue, &data.records);
     let attempted = queued_pending_paths(queue, &data.records);
+
+    let platform_options = ["GameCube", "Xbox360", "PS2", "PS3", "Xbox", "Unknown"];
+    egui::ScrollArea::horizontal()
+        .id_salt("mount_platform_strip")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(platform.is_none(), "All").clicked() {
+                    *platform = None;
+                }
+                for candidate in platform_options {
+                    let count = data
+                        .records
+                        .iter()
+                        .filter(|record| {
+                            record.identity.platform.as_deref().unwrap_or("Unknown") == candidate
+                        })
+                        .count();
+                    if ui
+                        .selectable_label(
+                            platform.as_deref() == Some(candidate),
+                            format!("{candidate} ({count})"),
+                        )
+                        .clicked()
+                    {
+                        *platform = Some(candidate.to_string());
+                    }
+                }
+            });
+        });
 
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -14922,7 +15051,11 @@ fn show_mount_page(
     let visible: Vec<&ArchiveRecord> = data
         .records
         .iter()
-        .filter(|record| mount_row_matches(record, search))
+        .filter(|record| {
+            platform.as_deref().is_none_or(|wanted| {
+                record.identity.platform.as_deref().unwrap_or("Unknown") == wanted
+            }) && mount_row_matches(record, search)
+        })
         .collect();
 
     widgets::card(ui, |ui| {
@@ -16108,9 +16241,10 @@ struct CheatArchivePickerState {
 }
 
 impl CheatArchivePickerState {
-    fn for_current(current: Option<&Path>) -> Self {
+    fn for_current(current: Option<&Path>, platform_filter: Option<String>) -> Self {
         Self {
             candidate: current.map(Path::to_path_buf),
+            platform_filter,
             ..Self::default()
         }
     }
@@ -16193,6 +16327,7 @@ fn show_cheat_archive_picker(
     context: &egui::Context,
     picker: &mut CheatArchivePickerState,
     rows: &[ArchiveRow],
+    shared_platform: &mut Option<String>,
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<CheatArchivePickerAction> {
     let default_size = cheat_archive_picker_size(context.input(|input| input.screen_rect().size()));
@@ -16262,6 +16397,7 @@ fn show_cheat_archive_picker(
                         }
                     });
             });
+            *shared_platform = picker.platform_filter.clone();
 
             let visible = cheat_picker_visible_indices(rows, picker);
             if !search_has_focus && ui.input(|input| input.key_pressed(egui::Key::ArrowDown)) {
@@ -16333,6 +16469,22 @@ fn show_cheat_archive_picker(
                         && widgets::path_value(ui, "Source", source)
                     {
                         let _ = clipboard.set_text(source.display().to_string());
+                    }
+                    match row.path.extension().and_then(|value| value.to_str()) {
+                        Some(extension) if extension.eq_ignore_ascii_case("rvz") => {
+                            ui.label("Identity: RVZ is visible from platform evidence; exact Game ID extraction is not available yet.");
+                        }
+                        Some(extension)
+                            if ["iso", "gcm", "gcz", "wbfs", "ciso"]
+                                .iter()
+                                .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+                        {
+                            ui.label("Identity: exact disc identity is checked after selection; the item stays visible if inspection is unavailable.");
+                        }
+                        _ if row.unknown_platform => {
+                            ui.label("Unknown because no header identity, source assignment, folder alias, or filename evidence matched.");
+                        }
+                        _ => {}
                     }
                 });
             }
@@ -24921,6 +25073,48 @@ fn show_loaded_data(
     // itself) so the Source filter/owning-source display and the table
     // below always agree on exactly one merged row list.
     let merged_rows = build_display_rows(&data.records, &data.rows, cached);
+    let platform_options = ["GameCube", "Xbox360", "PS2", "PS3", "Xbox", "Unknown"];
+    egui::ScrollArea::horizontal()
+        .id_salt("library_platform_strip")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let all_selected = library_filters.platform.is_none();
+                if ui
+                    .selectable_label(all_selected, format!("All ({})", merged_rows.len()))
+                    .clicked()
+                    && !all_selected
+                {
+                    library_filters.platform = None;
+                    *selected_archive = None;
+                    filtered_rows.take();
+                }
+                for platform in platform_options {
+                    let count = merged_rows
+                        .iter()
+                        .filter(|row| {
+                            if platform == "Unknown" {
+                                row.unknown_platform
+                            } else {
+                                !row.unknown_platform && row.platform == platform
+                            }
+                        })
+                        .count();
+                    let selected = library_filters.platform.as_deref() == Some(platform);
+                    if ui
+                        .selectable_label(selected, format!("{platform} ({count})"))
+                        .clicked()
+                        && !selected
+                    {
+                        library_filters.platform = Some(platform.to_string());
+                        *selected_archive = None;
+                        selected_archives.clear();
+                        filtered_rows.take();
+                    }
+                }
+            });
+        });
+    ui.add_space(4.0);
     // Natural-height summary: it may grow only with content visible now;
     // no persisted panel height can starve the result table on a later
     // frame or after a window resize.
@@ -27977,6 +28171,7 @@ fn archive_kind_name(kind: ArchiveKind) -> &'static str {
         ArchiveKind::SevenZip => "7z",
         ArchiveKind::Rar => "RAR",
         ArchiveKind::MegaDriveRom => "Mega Drive ROM",
+        ArchiveKind::DirectGameImage => "Game image",
     }
 }
 
@@ -27996,6 +28191,10 @@ fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
+            // Never allow a horizontal container to crush a counter into
+            // one-character-wide vertical text. Narrow viewports scroll or
+            // wrap whole cards instead.
+            ui.set_min_width(96.0);
             ui.vertical_centered(|ui| {
                 ui.strong(value.to_string());
                 ui.small(label);
@@ -33110,6 +33309,36 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn gamecube_platform_model_keeps_zip_and_rvz_visible_in_library_and_cheat_picker() {
+        let rows = vec![
+            row_with_fields(
+                "/roms/gcn/Animal Crossing (USA).zip",
+                "GameCube",
+                "Ready to mount",
+                "/roms/gcn/Animal Crossing (USA).zip",
+                "/mount/Animal Crossing",
+            ),
+            row_with_fields(
+                "/roms/gcn/ZooCube (USA).rvz",
+                "GameCube",
+                "Not mountable",
+                "/roms/gcn/ZooCube (USA).rvz",
+                "",
+            ),
+        ];
+        let filters = LibraryRowFilters {
+            platform: Some("GameCube".to_string()),
+            ..LibraryRowFilters::default()
+        };
+        assert!(rows.iter().all(|row| filters.matches(row)));
+        let picker = CheatArchivePickerState {
+            platform_filter: Some("GameCube".to_string()),
+            ..CheatArchivePickerState::default()
+        };
+        assert_eq!(cheat_picker_visible_indices(&rows, &picker), vec![0, 1]);
+    }
+
+    #[test]
     fn explicit_cheat_archive_choice_changes_only_workspace_context() {
         let mut app = app_for_operation_tests();
         if let LoadState::Ready(data) = &mut app.state {
@@ -34558,6 +34787,8 @@ $Instant Growth [Nayr]\n";
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: None,
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }
     }
 
@@ -35246,6 +35477,7 @@ $Instant Growth [Nayr]\n";
                 source_folders_scanned: 2,
             },
             folder_errors: vec![(PathBuf::from("/offline"), "unavailable".to_string())],
+            platform_assignment_warnings: Vec::new(),
         };
 
         assert_eq!(
@@ -42934,7 +43166,7 @@ $Instant Growth [Nayr]\n";
     fn library_renders_multiple_complete_rows_at_desktop_and_small_viewports() {
         for (size, minimum_rows) in [
             (egui::vec2(1920.0, 1080.0), 6_usize),
-            (egui::vec2(1100.0, 700.0), 3_usize),
+            (egui::vec2(1024.0, 600.0), 2_usize),
         ] {
             let (mut app, paths) = library_app_with_test_rows(30);
             let ctx = egui::Context::default();
@@ -42954,6 +43186,40 @@ $Instant Growth [Nayr]\n";
                 find_exact_text_position_and_clip(&output, &paths[0])
             );
         }
+    }
+
+    #[test]
+    fn summary_counter_labels_never_collapse_into_vertical_text() {
+        fn text_row_count(shape: &egui::Shape, needle: &str) -> Option<usize> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle => {
+                    Some(text.galley.rows.len())
+                }
+                egui::Shape::Vec(nested) => nested
+                    .iter()
+                    .find_map(|shape| text_row_count(shape, needle)),
+                _ => None,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(120.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| summary_value(ui, "Total archives", 13_506));
+            });
+        });
+        let rows = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_row_count(&shape.shape, "Total archives"));
+        assert_eq!(rows, Some(1));
     }
 
     #[test]
@@ -43297,6 +43563,8 @@ $Instant Growth [Nayr]\n";
                 last_scan_at: Some("2026-07-01T00:00:00Z".to_string()),
                 last_successful_scan_at: Some("2026-07-01T00:00:00Z".to_string()),
                 last_archive_count: Some(1242),
+                assigned_platform: None,
+                unknown_archive_count: 0,
             },
             SourceFolderView {
                 path: PathBuf::from("/mnt/usbdrive/retro"),
@@ -43309,6 +43577,8 @@ $Instant Growth [Nayr]\n";
                 last_scan_at: Some("2026-07-02T00:00:00Z".to_string()),
                 last_successful_scan_at: Some("2026-06-01T00:00:00Z".to_string()),
                 last_archive_count: Some(87),
+                assigned_platform: None,
+                unknown_archive_count: 0,
             },
             SourceFolderView {
                 path: PathBuf::from("/mnt/nvme2/collections"),
@@ -43321,6 +43591,8 @@ $Instant Growth [Nayr]\n";
                 last_scan_at: None,
                 last_successful_scan_at: None,
                 last_archive_count: None,
+                assigned_platform: None,
+                unknown_archive_count: 0,
             },
         ]
     }
@@ -47362,6 +47634,7 @@ $Instant Growth [Nayr]\n";
                     MountPageViewState {
                         queue: &mut queue,
                         search: &mut search,
+                        platform: &mut None,
                         confirm: &mut confirm,
                         busy: false,
                         block_reason: None,
