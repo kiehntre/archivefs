@@ -9,17 +9,20 @@ use archivefs_core::emulator_environment::retroarch::{
     ProfileScope, ResolutionState, RetroArchEnvironmentReport, RetroArchProfile,
     discover_retroarch_environment,
 };
+use archivefs_core::game_identity::{IdentityKind, inspect_catalogued_game_identity};
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatBackupAssessment,
     CheatDestinationAssessment, CheatHistoryOptions, CheatHistoryReport, CheatInstallOptions,
     CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
-    CheatJournalInspectionError, CheatRollbackAvailability, CheatRollbackOptions,
-    CoreSelectionSource, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
-    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
-    discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
-    inspect_cheat_install_journal, load_catalogue_evidence_read_only,
-    load_cheat_catalogue_snapshot, preview_retroarch_patch_and_cheat_destinations,
+    CheatJournalInspectionError, CheatProviderCoverageReport, CheatRollbackAvailability,
+    CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
+    DolphinCatalogueLoad, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
+    RetroArchAdvisoryPlan, build_cheat_availability_report, build_cheat_provider_coverage_report,
+    default_dolphin_catalogue_cache_root, discover_cheat_history, execute_cheat_install_run,
+    execute_cheat_rollback_run, inspect_cheat_install_journal, load_catalogue_evidence_read_only,
+    load_cheat_catalogue_snapshot, load_dolphin_catalogue,
+    preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -327,6 +330,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_cheat_availability_report(&report));
+            }
+        }
+        "cheat-provider-coverage" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let archive_ids = extract_repeated_id_flags(&mut input_args)?;
+            let dolphin_cache_root =
+                extract_named_path_flag(&mut input_args, "--dolphin-cache-root")?;
+            let retroarch_catalogue_root =
+                extract_named_path_flag(&mut input_args, "--retroarch-catalogue")?;
+            if !input_args.is_empty() {
+                return Err(
+                    format!("cheat-provider-coverage does not accept {:?}", input_args).into(),
+                );
+            }
+            if archive_ids.is_empty() {
+                return Err(
+                    "cheat-provider-coverage requires at least one exact --id <archive-id>".into(),
+                );
+            }
+            if archive_ids.len() > 32 {
+                return Err(
+                    "cheat-provider-coverage accepts at most 32 archive IDs per bounded run".into(),
+                );
+            }
+            let report = run_cheat_provider_coverage(
+                &default_database_path()?,
+                &archive_ids,
+                dolphin_cache_root.as_deref(),
+                retroarch_catalogue_root.as_deref(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_cheat_provider_coverage(&report));
             }
         }
         "retroarch-cheat-install" => {
@@ -1397,6 +1435,194 @@ fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
         }
     }
     format_retroarch_artifact_inventory(&mut output, &plan.artifact_inventory);
+    output
+}
+
+fn run_cheat_provider_coverage(
+    database_path: &Path,
+    archive_ids: &[i64],
+    dolphin_cache_root: Option<&Path>,
+    retroarch_catalogue_root: Option<&Path>,
+) -> Result<CheatProviderCoverageReport, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err("the ArchiveFS library database does not exist; run library-scan first".into());
+    }
+    let database = Database::open_read_only(database_path)?;
+    let archives = database.load_archives()?;
+    database.close()?;
+
+    let mut selected = Vec::with_capacity(archive_ids.len());
+    for id in archive_ids {
+        let Some(archive) = archives.iter().find(|archive| archive.id == *id) else {
+            return Err(format!("archive id {id} is not present in the library catalogue").into());
+        };
+        if selected
+            .iter()
+            .any(|existing: &&archivefs_core::PersistedArchive| existing.id == *id)
+        {
+            continue;
+        }
+        selected.push(archive);
+    }
+
+    let mut dolphin_games = Vec::new();
+    let mut retroarch_games = Vec::new();
+    for archive in selected {
+        let platform = archive
+            .platform
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let identity =
+            inspect_catalogued_game_identity(&archive.absolute_path, archive.platform.as_deref());
+        let content_basename = archive
+            .absolute_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_string);
+        let mut coverage = CoverageGameIdentity {
+            archive_id: archive.id,
+            title: archive.display_name.clone(),
+            platform: platform.clone(),
+            identity_kind: None,
+            verified_identity: None,
+            region: None,
+            revision: None,
+            serial: identity.verified_ps2_serial().map(str::to_string),
+            content_hash: identity
+                .verified_pcsx2_crc()
+                .or_else(|| identity.verified_loose_rom_sha256())
+                .map(str::to_string),
+            content_basename,
+        };
+        if platform.eq_ignore_ascii_case("GameCube") || platform.eq_ignore_ascii_case("Wii") {
+            coverage.verified_identity = identity.verified_dolphin_game_id().map(str::to_string);
+            coverage.identity_kind = coverage
+                .verified_identity
+                .as_ref()
+                .map(|_| "dolphin_game_id".to_string());
+            coverage.revision = identity
+                .verified_dolphin_revision()
+                .map(|value| value.to_string());
+            coverage.region = coverage
+                .verified_identity
+                .as_deref()
+                .and_then(region_for_game_id)
+                .map(|region| region.display_name().to_string());
+            dolphin_games.push(coverage);
+        } else if platform.eq_ignore_ascii_case("PlayStation 2")
+            || platform.eq_ignore_ascii_case("Xbox 360")
+        {
+            return Err(format!(
+                "archive id {} routes to {}, which is outside this Dolphin/RetroArch audit",
+                archive.id, platform
+            )
+            .into());
+        } else {
+            if let Some(value) = coverage.content_hash.clone() {
+                coverage.verified_identity = Some(value);
+                coverage.identity_kind = Some(
+                    if identity
+                        .verified_value(IdentityKind::Pcsx2ExecutableCrc)
+                        .is_some()
+                    {
+                        "content_crc".to_string()
+                    } else {
+                        "content_sha256".to_string()
+                    },
+                );
+            } else if let Some(value) = coverage.serial.clone() {
+                coverage.verified_identity = Some(value);
+                coverage.identity_kind = Some("serial".to_string());
+            }
+            retroarch_games.push(coverage);
+        }
+    }
+
+    let dolphin_root = dolphin_cache_root
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(default_dolphin_catalogue_cache_root)?;
+    let dolphin_catalogue = match load_dolphin_catalogue(&dolphin_root)? {
+        DolphinCatalogueLoad::NotInstalled => None,
+        DolphinCatalogueLoad::Ready(catalogue) => Some(catalogue),
+    };
+    let filesystem = HostReadOnlyFilesystem;
+    let retroarch_catalogue = retroarch_catalogue_root
+        .map(|root| load_cheat_catalogue_snapshot(&filesystem, "local-provider", root));
+
+    Ok(build_cheat_provider_coverage_report(
+        &dolphin_games,
+        dolphin_catalogue.as_deref(),
+        &retroarch_games,
+        retroarch_catalogue.as_ref(),
+    ))
+}
+
+fn format_cheat_provider_coverage(report: &CheatProviderCoverageReport) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS Cheat Provider Coverage Audit").unwrap();
+    writeln!(
+        &mut output,
+        "Read-only bounded selection: yes | Games: {} | With compatible cheats: {} | Without: {}",
+        report.summary.games_inspected,
+        report.summary.games_with_compatible_cheats,
+        report.summary.games_without_compatible_cheats
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Compatible cheats: {} | Rejected candidates: {} | Duplicates: {} | Conflicts: {} | Unsupported formats: {}",
+        report.summary.compatible_cheats,
+        report.summary.rejected_candidates,
+        report.summary.duplicates,
+        report.summary.conflicts,
+        report.summary.unsupported_formats
+    )
+    .unwrap();
+    for game in &report.games {
+        writeln!(
+            &mut output,
+            "\n{} / {} — {} ({})",
+            game.emulator, game.provider_name, game.game_title, game.platform
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  verified identity: {}",
+            game.verified_identity.as_deref().unwrap_or("unavailable")
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  region: {} | revision: {}",
+            game.region.as_deref().unwrap_or("unavailable"),
+            game.revision.as_deref().unwrap_or("unavailable")
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  compatible cheats: {} | rejected: {} | duplicates: {} | conflicts: {} | unsupported: {}",
+            game.compatible_cheat_count,
+            game.rejected_candidate_count,
+            game.duplicate_count,
+            game.conflicting_entry_count,
+            game.unsupported_format_count
+        )
+        .unwrap();
+        for reason in &game.rejection_reasons {
+            writeln!(
+                &mut output,
+                "  rejected ({}): {}",
+                reason.count, reason.explanation
+            )
+            .unwrap();
+        }
+        if let Some(reason) = game.no_match_reason {
+            writeln!(&mut output, "  no match: {}", reason.explanation()).unwrap();
+        }
+    }
     output
 }
 
@@ -4072,6 +4298,9 @@ fn print_help() {
         "  retroarch-cheat-catalogue <local-path>  Discover, match, and preview staging destinations for an external cheat catalogue (read-only; --cheat-destination-root <path> overrides the destination root for isolated preview only)"
     );
     println!(
+        "  cheat-provider-coverage --id <archive-id>...  Audit existing Dolphin/RetroArch catalogue coverage for a bounded exact selection (read-only; --dolphin-cache-root/--retroarch-catalogue/--json accepted)"
+    );
+    println!(
         "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
     );
     println!(
@@ -4174,6 +4403,9 @@ fn print_help() {
     println!("  archivefs retroarch-patch-preview");
     println!("  archivefs retroarch-patch-preview --json");
     println!("  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue");
+    println!(
+        "  archivefs cheat-provider-coverage --id 12 --id 34 --retroarch-catalogue /path/to/cht --json"
+    );
     println!("  archivefs retroarch-cheat-catalogue /path/to/manifest.json --json");
     println!(
         "  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root"
@@ -7627,5 +7859,54 @@ mod tests {
         assert_eq!(json["ok"], false);
         assert_eq!(json["error"]["code"], "malformed_journal");
         assert!(json.get("inspection").is_none());
+    }
+
+    #[test]
+    fn cheat_provider_coverage_run_is_read_only_and_omits_private_paths() {
+        let root = temp_dir("cli-cheat-provider-coverage-read-only");
+        let source = root.join("MegaDrive");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let archive_path = write_archive_file(&source, "Sonic.md", b"fixture rom bytes");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "coverage-fixture").unwrap();
+        let database = Database::open_read_only(&database_path).unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+        database.close().unwrap();
+
+        let retroarch_root = root.join("provider");
+        std::fs::create_dir_all(retroarch_root.join("Sega - Mega Drive - Genesis")).unwrap();
+        let cheat_path = retroarch_root
+            .join("Sega - Mega Drive - Genesis")
+            .join("Sonic.cht");
+        std::fs::write(
+            &cheat_path,
+            b"cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"00FF\"\ncheat0_enable = false\n",
+        )
+        .unwrap();
+        let dolphin_cache = root.join("absent-dolphin-cache");
+
+        let archive_before = std::fs::read(&archive_path).unwrap();
+        let database_before = std::fs::read(&database_path).unwrap();
+        let cheat_before = std::fs::read(&cheat_path).unwrap();
+        let report = run_cheat_provider_coverage(
+            &database_path,
+            &[archive_id],
+            Some(&dolphin_cache),
+            Some(&retroarch_root),
+        )
+        .unwrap();
+
+        assert_eq!(report.summary.games_inspected, 1);
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_before);
+        assert_eq!(std::fs::read(&database_path).unwrap(), database_before);
+        assert_eq!(std::fs::read(&cheat_path).unwrap(), cheat_before);
+        assert!(!dolphin_cache.exists());
+        let human = format_cheat_provider_coverage(&report);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!human.contains(root.to_string_lossy().as_ref()));
+        assert!(!json.contains(root.to_string_lossy().as_ref()));
+        assert!(human.contains("Read-only bounded selection: yes"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
