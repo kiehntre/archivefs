@@ -1,3 +1,9 @@
+// egui 0.34 keeps the 0.32 panel/context entry points as compatibility
+// shims. Retaining them in this security-only dependency update avoids a
+// broad layout rewrite; the dedicated GUI migration can remove this once
+// its changed panel semantics are reviewed independently.
+#![allow(deprecated)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -9131,7 +9137,7 @@ impl Drop for ArchiveFsApp {
     }
 }
 
-impl eframe::App for ArchiveFsApp {
+impl ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.reconcile_library_tab();
         self.poll_shared_history();
@@ -10808,6 +10814,12 @@ impl eframe::App for ArchiveFsApp {
     }
 }
 
+impl eframe::App for ArchiveFsApp {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.update(ui.ctx(), frame);
+    }
+}
+
 fn start_load(
     context: egui::Context,
     generation: RefreshGeneration,
@@ -12082,7 +12094,7 @@ fn show_inspector_row(
     let pointer_x = response.hover_pos().map(|pos| pos.x);
     if let Some(full_text) =
         hovered_cell_full_text(pointer_x, rect.left(), &cells, widths, spacing, |text| {
-            ui.fonts(|fonts| {
+            ui.fonts_mut(|fonts| {
                 fonts
                     .layout_no_wrap(text.to_string(), font_id.clone(), color)
                     .size()
@@ -27047,7 +27059,7 @@ fn show_data_row(
     let pointer_x = response.hover_pos().map(|pos| pos.x);
     if let Some(full_text) =
         hovered_cell_full_text(pointer_x, rect.left(), cells, widths, spacing, |text| {
-            ui.fonts(|fonts| {
+            ui.fonts_mut(|fonts| {
                 fonts
                     .layout_no_wrap(text.to_string(), font_id.clone(), color)
                     .size()
@@ -28788,7 +28800,7 @@ fn show_text_edit_with_context_menu(
     let is_empty = text.is_empty();
     let text_edit = configure(egui::TextEdit::singleline(text));
     let output = text_edit.show(ui);
-    let response = output.response;
+    let response = output.response.response;
     let id = response.id;
     let has_selection = output.cursor_range.is_some_and(|range| !range.is_empty());
 
@@ -31241,7 +31253,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
 
         assert!(
@@ -31271,7 +31282,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
 
         assert!(
@@ -31590,7 +31600,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
 
         for expected in ["All", "GameCube", "Unknown"] {
@@ -31632,7 +31641,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let output = context.run(input, |context| app.update(context, &mut frame));
 
         assert!(rendered_text_contains(&output, "Selected Game Title"));
@@ -31706,7 +31714,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let _ = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
         // Click the "All" chip via its real text position - the same
         // real-click pattern the rest of this suite uses, not a direct
@@ -31761,7 +31768,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let output = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
         assert!(
             rendered_text_contains(&output, "Back to games"),
@@ -31819,7 +31825,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
         assert!(!rendered_text_contains(&output, "Back to games"));
     }
@@ -31851,7 +31856,6 @@ mod tests {
             )),
             ..Default::default()
         };
-        use eframe::App as _;
         let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
 
         for expected in [
@@ -32263,7 +32267,6 @@ mod tests {
         base_input: &egui::RawInput,
         screen: egui::Vec2,
     ) -> egui::FullOutput {
-        use eframe::App as _;
         let mut output = None;
         for _ in 0..40 {
             let scroll_input = egui::RawInput {
@@ -32272,6 +32275,7 @@ mod tests {
                     egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::vec2(0.0, -20.0),
+                        phase: egui::TouchPhase::Move,
                         modifiers: egui::Modifiers::default(),
                     },
                 ],
@@ -32346,7 +32350,6 @@ mod tests {
         base_input: &egui::RawInput,
         count: usize,
     ) {
-        use eframe::App as _;
         for _ in 0..count {
             let _ = ctx.run(base_input.clone(), |ctx| app.update(ctx, frame));
         }
@@ -32466,7 +32469,6 @@ mod tests {
         run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
 
         app.show_activity = true;
-        use eframe::App as _;
         let first_expanded_frame = ctx.run(base_input.clone(), |ctx| app.update(ctx, &mut frame));
 
         fn activity_content_span(output: &egui::FullOutput) -> (f32, f32) {
@@ -32543,7 +32545,6 @@ mod tests {
             };
             run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
             app.show_activity = true;
-            use eframe::App as _;
             let output = ctx.run(base_input, |ctx| app.update(ctx, &mut frame));
             assert!(
                 rendered_text_contains(&output, "Clear activity"),
@@ -44037,6 +44038,7 @@ $Instant Growth [Nayr]\n";
             events: vec![egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(-120.0, 0.0),
+                phase: egui::TouchPhase::Move,
                 modifiers: egui::Modifiers::default(),
             }],
             ..bounded_test_input()
@@ -46022,7 +46024,6 @@ $Instant Growth [Nayr]\n";
                 ..Default::default()
             };
             run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
-            use eframe::App as _;
             let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
             let visible = fully_visible_exact_text_count(&output, &paths);
             assert!(
@@ -46071,7 +46072,6 @@ $Instant Growth [Nayr]\n";
                 ..Default::default()
             };
             run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
-            use eframe::App as _;
             let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
             let visible = fully_visible_exact_text_count(&output, &labels);
             assert!(
@@ -46136,7 +46136,6 @@ $Instant Growth [Nayr]\n";
             ..Default::default()
         };
         run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
-        use eframe::App as _;
         let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
         assert!(rendered_text_contains(&output, "Clear activity"));
         assert!(
