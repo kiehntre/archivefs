@@ -3201,6 +3201,9 @@ struct ArchiveFsApp {
     /// `load_custom_platform_artwork_directory`/
     /// `save_custom_platform_artwork_directory`).
     custom_platform_artwork_directory: Option<PathBuf>,
+    /// Decoded local artwork and failed-decode fingerprints for this
+    /// session. It is invalidated by directory or file-metadata changes.
+    platform_artwork_cache: PlatformArtworkCache,
     /// The Settings page's in-progress text-field value for the above -
     /// never persisted directly; only what's confirmed via "Use this
     /// directory" is.
@@ -3348,6 +3351,7 @@ impl ArchiveFsApp {
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
             custom_platform_artwork_directory: load_custom_platform_artwork_directory(),
+            platform_artwork_cache: PlatformArtworkCache::default(),
             custom_platform_artwork_directory_text: load_custom_platform_artwork_directory()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
@@ -9582,6 +9586,8 @@ impl eframe::App for ArchiveFsApp {
                             cleanup_after_unmount: self.cleanup_after_unmount,
                             cheat_workflow: self.cheat_workflow.as_ref(),
                             feedback: self.feedback.as_ref(),
+                            artwork_directory: self.custom_platform_artwork_directory.as_deref(),
+                            artwork_cache: &mut self.platform_artwork_cache,
                         },
                     );
                     match gamer_action {
@@ -10342,6 +10348,7 @@ impl eframe::App for ArchiveFsApp {
                             self.start_retroarch_profile_scan(context.clone());
                         }
                         Some(SettingsPageAction::CustomArtworkDirectoryChanged) => {
+                            self.platform_artwork_cache.clear();
                             save_custom_platform_artwork_directory(
                                 self.custom_platform_artwork_directory.as_deref(),
                             );
@@ -23833,8 +23840,8 @@ fn show_settings_page(
         "5. Platform artwork",
         Some(
             "ArchiveFS ships its own original, offline platform artwork - no image is ever \
-             downloaded. Optionally point at a folder of your own SVG files, named by canonical \
-             platform identifier (e.g. gamecube.svg); a missing file always falls back to the \
+             downloaded. Optionally point at a folder of your own PNG files, named by canonical \
+             platform identifier (e.g. gamecube.png); a missing or invalid file falls back to the \
              built-in artwork. See docs/PLATFORM_ARTWORK.md.",
         ),
     );
@@ -23870,10 +23877,10 @@ fn show_settings_page(
                 ui.horizontal(|ui| {
                     paint_platform_glyph(ui, "gamecube", 28.0);
                     ui.label(format!(
-                        "Currently: {}. Example check (gamecube.svg): {}.",
+                        "Currently: {}. Example check (gamecube.png): {}.",
                         directory.display(),
                         if gamecube_resolved {
-                            "found - would be used"
+                            "found - used in Gamer View when valid"
                         } else {
                             "not found - built-in artwork will be used"
                         }
@@ -29221,6 +29228,8 @@ struct GamerViewViewState<'a> {
     cleanup_after_unmount: bool,
     cheat_workflow: Option<&'a CheatWorkflowState>,
     feedback: Option<&'a ActionFeedback>,
+    artwork_directory: Option<&'a Path>,
+    artwork_cache: &'a mut PlatformArtworkCache,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -29280,6 +29289,8 @@ fn show_gamer_view(
         cleanup_after_unmount,
         cheat_workflow,
         feedback,
+        artwork_directory,
+        artwork_cache,
     } = view_state;
     let mut action = None;
 
@@ -29342,6 +29353,10 @@ fn show_gamer_view(
     // wrapping row count that varies with window width.
     const PLATFORM_SHELF_HEIGHT: f32 = 76.0;
     let platform_card_width = gamer_platform_card_width(ui.available_width());
+    let mut shelf_artwork = PlatformShelfArtwork {
+        directory: artwork_directory,
+        cache: artwork_cache,
+    };
     egui::ScrollArea::horizontal()
         .id_salt("gamer_view_platform_shelf")
         .max_height(PLATFORM_SHELF_HEIGHT)
@@ -29356,6 +29371,7 @@ fn show_gamer_view(
                     "All",
                     data.rows.len(),
                     platform_card_width,
+                    &mut shelf_artwork,
                 )
                 .clicked()
                     && !all_selected
@@ -29378,6 +29394,7 @@ fn show_gamer_view(
                         platform,
                         *count,
                         platform_card_width,
+                        &mut shelf_artwork,
                     )
                     .clicked()
                         && !selected
@@ -29395,6 +29412,7 @@ fn show_gamer_view(
                         "Unknown",
                         platform_counts.unknown,
                         platform_card_width,
+                        &mut shelf_artwork,
                     )
                     .clicked()
                         && !selected
@@ -29654,15 +29672,10 @@ fn show_gamer_view(
 // per-asset attribution comment, and the manifest table in
 // docs/PLATFORM_ARTWORK.md for the authoritative licensing record).
 //
-// Rendering in this milestone draws a small native vector glyph (egui
-// Shapes, not a rasterized SVG) keyed by the same asset identifier this
-// registry resolves - see `paint_platform_glyph`. Wiring true SVG
-// rasterization (needed for a custom override directory's artwork to
-// visually differ from the built-in glyph, not just be detected as
-// present) is an explicitly deferred follow-up - see the milestone's
-// final report for why, and `custom_platform_artwork_path` below for
-// exactly what *is* real today: genuine file-presence-based fallback
-// resolution, not a stub.
+// Built-in artwork remains the small native egui vector glyph keyed by
+// this registry. An explicitly configured local PNG can replace that
+// glyph through the bounded cache below. SVG remains an inspectable source
+// asset for the built-ins, but is never parsed at runtime.
 // =====================================================================
 
 /// The category fallback set (docs/PLATFORM_ARTWORK.md): used whenever a
@@ -29762,23 +29775,174 @@ fn platform_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
     }
 }
 
-/// Resolves the file a custom artwork directory would provide for
-/// `asset_id`, if the user has configured one and that exact file exists
-/// (real, checked filesystem I/O, not a stub). Returns `None` (fall back
-/// to the built-in asset) if no directory is configured, or the file
-/// doesn't exist, matching "ArchiveFS should reference these files
-/// directly and fall back to built-in artwork when missing." Never
-/// copies the file into ArchiveFS's own storage.
-fn custom_platform_artwork_path(directory: Option<&Path>, asset_id: &str) -> Option<PathBuf> {
-    let directory = directory?;
-    let candidate = directory.join(format!("{asset_id}.svg"));
-    candidate.is_file().then_some(candidate)
+const MAX_CUSTOM_ARTWORK_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CUSTOM_ARTWORK_DIMENSION: u32 = 1024;
+const MAX_CUSTOM_ARTWORK_DECODE_BYTES: u64 =
+    MAX_CUSTOM_ARTWORK_DIMENSION as u64 * MAX_CUSTOM_ARTWORK_DIMENSION as u64 * 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlatformArtworkFingerprint {
+    path: PathBuf,
+    length: u64,
+    modified: SystemTime,
 }
 
-/// Draws a small original vector glyph for `asset_id` directly with
-/// egui's own painter - see this section's header comment for why this
-/// milestone renders this way rather than rasterizing the on-disk SVG
-/// files. Falls back to the Unknown glyph for any id it doesn't
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CustomArtworkLoadError {
+    Missing,
+    UnsupportedPath,
+    Metadata,
+    Oversized,
+    Malformed,
+}
+
+struct CachedPlatformArtwork {
+    fingerprint: PlatformArtworkFingerprint,
+    texture: Option<egui::TextureHandle>,
+}
+
+/// Session-local decoded texture cache. It holds no bytes from remote
+/// sources and performs no discovery: only the explicitly configured
+/// directory and the closed set of registry asset ids are considered.
+#[derive(Default)]
+struct PlatformArtworkCache {
+    directory: Option<PathBuf>,
+    entries: HashMap<String, CachedPlatformArtwork>,
+}
+
+impl PlatformArtworkCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.directory = None;
+    }
+
+    fn texture_id(
+        &mut self,
+        context: &egui::Context,
+        directory: Option<&Path>,
+        asset_id: &str,
+    ) -> Option<egui::TextureId> {
+        if self.directory.as_deref() != directory {
+            self.entries.clear();
+            self.directory = directory.map(Path::to_path_buf);
+        }
+
+        let fingerprint = match custom_platform_artwork_fingerprint(directory, asset_id) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                self.entries.remove(asset_id);
+                return None;
+            }
+        };
+        if let Some(cached) = self.entries.get(asset_id)
+            && cached.fingerprint == fingerprint
+        {
+            return cached.texture.as_ref().map(egui::TextureHandle::id);
+        }
+
+        let texture = decode_custom_platform_artwork(&fingerprint.path)
+            .ok()
+            .map(|image| {
+                context.load_texture(
+                    format!("archivefs-custom-platform-{asset_id}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+        let texture_id = texture.as_ref().map(egui::TextureHandle::id);
+        self.entries.insert(
+            asset_id.to_string(),
+            CachedPlatformArtwork {
+                fingerprint,
+                texture,
+            },
+        );
+        texture_id
+    }
+}
+
+fn valid_platform_asset_id(asset_id: &str) -> bool {
+    !asset_id.is_empty()
+        && asset_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Resolves one supported custom PNG by its exact registry asset id. SVG
+/// files are intentionally not accepted: rendering them safely would add
+/// an independent XML/vector parser stack, while the existing `image`
+/// dependency already provides bounded PNG decoding. Symlinks and other
+/// non-regular files are rejected so the configured directory is the only
+/// filesystem location this feature reads.
+fn custom_platform_artwork_path(directory: Option<&Path>, asset_id: &str) -> Option<PathBuf> {
+    if !valid_platform_asset_id(asset_id) {
+        return None;
+    }
+    let directory = directory?;
+    let candidate = directory.join(format!("{asset_id}.png"));
+    let metadata = candidate.symlink_metadata().ok()?;
+    (metadata.file_type().is_file() && !metadata.file_type().is_symlink()).then_some(candidate)
+}
+
+fn custom_platform_artwork_fingerprint(
+    directory: Option<&Path>,
+    asset_id: &str,
+) -> Result<PlatformArtworkFingerprint, CustomArtworkLoadError> {
+    let path =
+        custom_platform_artwork_path(directory, asset_id).ok_or(CustomArtworkLoadError::Missing)?;
+    let metadata = path
+        .metadata()
+        .map_err(|_| CustomArtworkLoadError::Metadata)?;
+    if metadata.len() > MAX_CUSTOM_ARTWORK_FILE_BYTES {
+        return Err(CustomArtworkLoadError::Oversized);
+    }
+    let modified = metadata
+        .modified()
+        .map_err(|_| CustomArtworkLoadError::Metadata)?;
+    Ok(PlatformArtworkFingerprint {
+        path,
+        length: metadata.len(),
+        modified,
+    })
+}
+
+fn decode_custom_platform_artwork(path: &Path) -> Result<egui::ColorImage, CustomArtworkLoadError> {
+    use image::ImageDecoder as _;
+
+    if path.extension().and_then(|extension| extension.to_str()) != Some("png") {
+        return Err(CustomArtworkLoadError::UnsupportedPath);
+    }
+    let metadata = path
+        .metadata()
+        .map_err(|_| CustomArtworkLoadError::Metadata)?;
+    if metadata.len() > MAX_CUSTOM_ARTWORK_FILE_BYTES {
+        return Err(CustomArtworkLoadError::Oversized);
+    }
+    let file = std::fs::File::open(path).map_err(|_| CustomArtworkLoadError::Metadata)?;
+    let mut decoder = image::codecs::png::PngDecoder::new(std::io::BufReader::new(file))
+        .map_err(|_| CustomArtworkLoadError::Malformed)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_CUSTOM_ARTWORK_DIMENSION);
+    limits.max_image_height = Some(MAX_CUSTOM_ARTWORK_DIMENSION);
+    limits.max_alloc = Some(MAX_CUSTOM_ARTWORK_DECODE_BYTES);
+    decoder
+        .set_limits(limits)
+        .map_err(|_| CustomArtworkLoadError::Oversized)?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err(CustomArtworkLoadError::Malformed);
+    }
+    let rgba = image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| CustomArtworkLoadError::Malformed)?
+        .into_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width as usize, height as usize],
+        rgba.as_raw(),
+    ))
+}
+
+/// Draws a small original vector fallback glyph for `asset_id` directly
+/// with egui's painter. Falls back to the Unknown glyph for any id it doesn't
 /// recognise, so a damaged or unrecognised custom-override asset id
 /// never renders as nothing at all (decision: "missing or damaged assets
 /// fail gracefully to the fallback icon").
@@ -29906,6 +30070,29 @@ fn paint_platform_glyph_at(
     }
 }
 
+fn paint_platform_artwork_at(
+    ui: &egui::Ui,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_directory: Option<&Path>,
+    center: egui::Pos2,
+    size: f32,
+    color: egui::Color32,
+    asset_id: &str,
+) -> bool {
+    if let Some(texture_id) = artwork_cache.texture_id(ui.ctx(), artwork_directory, asset_id) {
+        ui.painter().image(
+            texture_id,
+            egui::Rect::from_center_size(center, egui::vec2(size, size)),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        true
+    } else {
+        paint_platform_glyph_at(ui.painter(), center, size, color, asset_id);
+        false
+    }
+}
+
 const PLATFORM_CARD_MIN_WIDTH: f32 = 96.0;
 const PLATFORM_CARD_MAX_WIDTH: f32 = 124.0;
 
@@ -29938,6 +30125,11 @@ fn compact_platform_label(label: &str, card_width: f32) -> String {
 /// platform's vector glyph and name/count painted into its bounds, plus
 /// an accessible label naming the platform in plain language ("platform
 /// artwork must never be the only way to identify a platform").
+struct PlatformShelfArtwork<'a> {
+    directory: Option<&'a Path>,
+    cache: &'a mut PlatformArtworkCache,
+}
+
 fn show_platform_shelf_item(
     ui: &mut egui::Ui,
     selected: bool,
@@ -29945,6 +30137,7 @@ fn show_platform_shelf_item(
     label: &str,
     count: usize,
     card_width: f32,
+    artwork: &mut PlatformShelfArtwork<'_>,
 ) -> egui::Response {
     const GLYPH_SIZE: f32 = 32.0;
     // Dedicated assets already name the exact platform; a category
@@ -29975,7 +30168,15 @@ fn show_platform_shelf_item(
     } else {
         ui.visuals().text_color().gamma_multiply(0.8)
     };
-    paint_platform_glyph_at(ui.painter(), glyph_center, GLYPH_SIZE, color, asset_id);
+    paint_platform_artwork_at(
+        ui,
+        artwork.cache,
+        artwork.directory,
+        glyph_center,
+        GLYPH_SIZE,
+        color,
+        asset_id,
+    );
     let text_pos = response.rect.center() + egui::vec2(0.0, 18.0);
     let truncated_label = compact_platform_label(label, card_width);
     ui.painter().text(
@@ -31160,15 +31361,29 @@ mod tests {
         );
     }
 
+    fn artwork_test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-artwork-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn write_test_png(path: &Path, width: u32, height: u32, color: [u8; 4]) {
+        image::RgbaImage::from_pixel(width, height, image::Rgba(color))
+            .save(path)
+            .unwrap();
+    }
+
     #[test]
     fn custom_platform_artwork_path_falls_back_to_none_when_missing_or_unconfigured() {
         assert_eq!(custom_platform_artwork_path(None, "gamecube"), None);
-
-        let temp = std::env::temp_dir().join(format!(
-            "archivefs-gui-artwork-test-missing-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&temp).unwrap();
+        let temp = artwork_test_directory("missing");
         assert_eq!(
             custom_platform_artwork_path(Some(&temp), "gamecube"),
             None,
@@ -31178,23 +31393,154 @@ mod tests {
     }
 
     #[test]
-    fn custom_platform_artwork_path_resolves_a_real_present_file() {
-        let temp = std::env::temp_dir().join(format!(
-            "archivefs-gui-artwork-test-present-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&temp).unwrap();
-        let asset_path = temp.join("gamecube.svg");
-        std::fs::write(&asset_path, "<svg></svg>").unwrap();
+    fn custom_platform_artwork_filename_resolution_is_exact_and_png_only() {
+        let temp = artwork_test_directory("present");
+        let svg_path = temp.join("gamecube.svg");
+        std::fs::write(&svg_path, "<svg><script>bad()</script></svg>").unwrap();
+        assert_eq!(
+            custom_platform_artwork_path(Some(&temp), "gamecube"),
+            None,
+            "SVG is deliberately unsupported and must never be parsed"
+        );
+
+        let asset_path = temp.join("gamecube.png");
+        write_test_png(&asset_path, 2, 2, [255, 0, 0, 255]);
 
         assert_eq!(
             custom_platform_artwork_path(Some(&temp), "gamecube"),
             Some(asset_path.clone()),
             "an existing file must be resolved, never copied elsewhere"
         );
+        assert_eq!(
+            custom_platform_artwork_path(Some(&temp), "../gamecube"),
+            None,
+            "asset ids cannot escape the configured directory"
+        );
         // Never copied into any ArchiveFS-owned location - the resolved
         // path is the user's own file, unchanged.
         assert!(asset_path.exists());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_platform_artwork_rejects_symlinks() {
+        let temp = artwork_test_directory("symlink");
+        let outside = temp.with_extension("outside.png");
+        write_test_png(&outside, 1, 1, [0, 0, 0, 255]);
+        std::os::unix::fs::symlink(&outside, temp.join("gamecube.png")).unwrap();
+        assert_eq!(custom_platform_artwork_path(Some(&temp), "gamecube"), None);
+        let _ = std::fs::remove_dir_all(&temp);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn malformed_custom_artwork_is_cached_as_a_safe_fallback() {
+        let temp = artwork_test_directory("malformed");
+        let path = temp.join("gamecube.png");
+        std::fs::write(&path, b"not a png").unwrap();
+        assert_eq!(
+            decode_custom_platform_artwork(&path),
+            Err(CustomArtworkLoadError::Malformed)
+        );
+
+        let context = egui::Context::default();
+        let mut cache = PlatformArtworkCache::default();
+        assert_eq!(cache.texture_id(&context, Some(&temp), "gamecube"), None);
+        assert!(cache.entries.contains_key("gamecube"));
+        assert!(cache.entries["gamecube"].texture.is_none());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn oversized_custom_artwork_is_rejected_before_decode() {
+        let temp = artwork_test_directory("oversized");
+        let path = temp.join("gamecube.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_CUSTOM_ARTWORK_FILE_BYTES + 1).unwrap();
+        assert_eq!(
+            custom_platform_artwork_fingerprint(Some(&temp), "gamecube"),
+            Err(CustomArtworkLoadError::Oversized)
+        );
+        assert_eq!(
+            decode_custom_platform_artwork(&path),
+            Err(CustomArtworkLoadError::Oversized)
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn excessive_custom_artwork_dimensions_are_rejected() {
+        let temp = artwork_test_directory("dimensions");
+        let path = temp.join("gamecube.png");
+        write_test_png(&path, MAX_CUSTOM_ARTWORK_DIMENSION + 1, 1, [0, 0, 0, 255]);
+        assert_eq!(
+            decode_custom_platform_artwork(&path),
+            Err(CustomArtworkLoadError::Oversized)
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn custom_artwork_cache_invalidates_when_file_metadata_changes() {
+        let temp = artwork_test_directory("cache-invalidation");
+        let path = temp.join("gamecube.png");
+        write_test_png(&path, 2, 2, [255, 0, 0, 255]);
+        let context = egui::Context::default();
+        let mut cache = PlatformArtworkCache::default();
+        let first_texture = cache
+            .texture_id(&context, Some(&temp), "gamecube")
+            .expect("valid first texture");
+        let first_fingerprint = cache.entries["gamecube"].fingerprint.clone();
+
+        write_test_png(&path, 3, 2, [0, 0, 255, 255]);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(first_fingerprint.modified + std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        let second_texture = cache
+            .texture_id(&context, Some(&temp), "gamecube")
+            .expect("valid replacement texture");
+        assert_ne!(first_texture, second_texture);
+        assert_ne!(cache.entries["gamecube"].fingerprint, first_fingerprint);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn custom_artwork_paints_when_valid_and_uses_builtin_fallback_when_invalid() {
+        let temp = artwork_test_directory("render-fallback");
+        write_test_png(&temp.join("gamecube.png"), 2, 2, [0, 255, 0, 255]);
+        std::fs::write(temp.join("xbox.png"), b"broken").unwrap();
+        let context = egui::Context::default();
+        let mut cache = PlatformArtworkCache::default();
+        let mut custom_painted = false;
+        let mut fallback_painted = true;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                custom_painted = paint_platform_artwork_at(
+                    ui,
+                    &mut cache,
+                    Some(&temp),
+                    egui::pos2(20.0, 20.0),
+                    16.0,
+                    egui::Color32::WHITE,
+                    "gamecube",
+                );
+                fallback_painted = paint_platform_artwork_at(
+                    ui,
+                    &mut cache,
+                    Some(&temp),
+                    egui::pos2(50.0, 20.0),
+                    16.0,
+                    egui::Color32::WHITE,
+                    "xbox",
+                );
+            });
+        });
+        assert!(custom_painted);
+        assert!(!fallback_painted);
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -31253,6 +31599,51 @@ mod tests {
                 "expected the platform shelf to show {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
+        let temp = artwork_test_directory("state-preservation");
+        write_test_png(&temp.join("gamecube.png"), 2, 2, [80, 160, 220, 255]);
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let selected_path = PathBuf::from("/roms/selected-game.zip");
+        let mut selected = record(selected_path.to_str().unwrap(), MountState::Pending);
+        selected.metadata.title = Some("Selected Game Title".to_string());
+        selected.metadata.platform = Some("GameCube".to_string());
+        let mut hidden = record("/roms/hidden-game.zip", MountState::Pending);
+        hidden.metadata.title = Some("Filtered Out Title".to_string());
+        hidden.metadata.platform = Some("PS2".to_string());
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records(
+            "/mount",
+            vec![selected, hidden],
+        )));
+        app.library_filters.platform = Some("GameCube".to_string());
+        app.archive_context.select_only(selected_path.clone());
+        app.custom_platform_artwork_directory = Some(temp.clone());
+
+        let context = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        use eframe::App as _;
+        let output = context.run(input, |context| app.update(context, &mut frame));
+
+        assert!(rendered_text_contains(&output, "Selected Game Title"));
+        assert!(!rendered_text_contains(&output, "Filtered Out Title"));
+        assert_eq!(app.library_filters.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            app.archive_context.focused.as_deref(),
+            Some(selected_path.as_path())
+        );
+        assert!(app.platform_artwork_cache.entries.contains_key("gamecube"));
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -36832,6 +37223,7 @@ $Instant Growth [Nayr]\n";
             // Hermetic literal default, matching every other field in
             // this test-only constructor - never a real disk read.
             custom_platform_artwork_directory: None,
+            platform_artwork_cache: PlatformArtworkCache::default(),
             custom_platform_artwork_directory_text: String::new(),
         }
     }
