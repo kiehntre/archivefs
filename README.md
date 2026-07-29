@@ -77,6 +77,11 @@ user-facing version at
   `retroarch-cheat-source-inspect`. Fetching produces a bounded, validated,
   immutable local snapshot and never installs cheats. See
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- Audits existing Dolphin and RetroArch provider coverage with
+  `cheat-provider-coverage`: an exact-ID, at-most-32-game, read-only report
+  showing compatible/rejected counts, duplicates, conflicts, unsupported
+  formats, and honest no-match reasons without exposing local paths. See
+  [`docs/CHEAT_PROVIDER_COVERAGE.md`](docs/CHEAT_PROVIDER_COVERAGE.md).
 - Presents Cheats & Mods as a first-class GUI workspace while keeping profile,
   source trust, inspection, destination, and installation state distinct. Its
   in-page picker changes only workspace context; it can inventory an eligible
@@ -522,6 +527,7 @@ Platforms:
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
 - [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
 - [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
+- [Dolphin and RetroArch cheat-provider coverage](docs/CHEAT_PROVIDER_COVERAGE.md)
 - [Shared verified game identity](docs/SHARED_GAME_IDENTITY.md)
 - [Shared read-only Cheats & Mods preview](docs/SHARED_CHEAT_PREVIEW.md)
 - [Shared safe apply, journal, and rollback foundation](docs/SHARED_SAFE_APPLY_ROLLBACK.md)
