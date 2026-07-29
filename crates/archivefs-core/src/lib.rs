@@ -26,10 +26,10 @@ pub use database::{
     DatabaseHealthReport, DatabaseOpenOutcome, DatabaseSidecarFinding, DatabaseSidecarKind,
     MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, PersistedArchive, PlatformAlias,
     PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions,
-    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, SourceFolderRecord,
-    SourceScanStatus, check_database_health, default_database_path, diagnose_database,
-    format_unix_timestamp_utc, latest_schema_version, persisted_archive_has_unknown_platform,
-    scan_and_persist,
+    RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE, ScanPersistSummary, ScanRunCounts,
+    SourceFolderRecord, SourceScanStatus, check_database_health, default_database_path,
+    diagnose_database, format_unix_timestamp_utc, latest_schema_version,
+    persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 mod inspector;
@@ -2121,6 +2121,8 @@ pub struct SourceFolderView {
     pub last_scan_at: Option<String>,
     pub last_successful_scan_at: Option<String>,
     pub last_archive_count: Option<i64>,
+    pub assigned_platform: Option<String>,
+    pub unknown_archive_count: i64,
 }
 
 /// Joins the config's per-source list against the database's per-source
@@ -2152,6 +2154,8 @@ pub fn build_source_folder_views(
                 last_successful_scan_at: record
                     .and_then(|record| record.last_successful_scan_at.clone()),
                 last_archive_count: record.and_then(|record| record.last_archive_count),
+                assigned_platform: record.and_then(|record| record.assigned_platform.clone()),
+                unknown_archive_count: record.map_or(0, |record| record.unknown_archive_count),
             }
         })
         .collect()
@@ -2169,6 +2173,60 @@ pub fn list_source_folder_views_at(
     let database = Database::open_read_only(database_path)?;
     let records = database.list_source_folders()?;
     Ok(build_source_folder_views(&sources, &records))
+}
+
+/// Saves an explicit platform default for a configured source. The returned
+/// count is the number of currently visible Unknown rows that a subsequent
+/// rescan may safely recover; callers must show it before invoking this
+/// mutating action.
+pub fn preview_source_platform_assignment_at(database_path: &Path, target: &Path) -> Result<i64> {
+    let database = Database::open_or_create(database_path)?;
+    let record = database
+        .list_source_folders()?
+        .into_iter()
+        .find(|record| record.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "source folder {} is not registered",
+                target.display()
+            ))
+        })?;
+    Ok(record.unknown_archive_count)
+}
+
+pub fn assign_source_platform_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    platform: &str,
+    triggered_by: &str,
+) -> Result<ScanPersistSummary> {
+    let canonical = canonical_platform_for_alias(platform).ok_or_else(|| {
+        ArchiveFsError::Config(format!("unknown platform assignment '{platform}'"))
+    })?;
+    let sources = load_source_folder_configs_from(config_path)?;
+    if !sources.iter().any(|source| source.path == target) {
+        return Err(ArchiveFsError::Config(format!(
+            "source folder {} is not configured",
+            target.display()
+        )));
+    }
+    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let mut database = Database::open_or_create(database_path)?;
+    database.register_source_folders(&all_paths)?;
+    database.set_source_platform_assignment(target, Some(canonical))?;
+    drop(database);
+    scan_source_folder_at(config_path, database_path, target, triggered_by)
+}
+
+pub fn assign_source_platform_default(target: &Path, platform: &str) -> Result<ScanPersistSummary> {
+    assign_source_platform_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        platform,
+        "gui-assign-source-platform",
+    )
 }
 
 /// Adds `candidate` as a new, enabled source folder: validates it against
@@ -2664,6 +2722,9 @@ pub enum ArchiveKind {
     /// A loose Mega Drive/Genesis ROM. It is catalogued but deliberately
     /// marked unsupported for ArchiveFS's archive-mount backend.
     MegaDriveRom,
+    /// A supported game image that is catalogued directly rather than
+    /// requiring an archive wrapper. Scanning never mounts or modifies it.
+    DirectGameImage,
 }
 
 impl ArchiveKind {
@@ -2671,7 +2732,7 @@ impl ArchiveKind {
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
     pub fn is_mount_input(self) -> bool {
-        !matches!(self, Self::MegaDriveRom)
+        !matches!(self, Self::MegaDriveRom | Self::DirectGameImage)
     }
 }
 
@@ -2843,7 +2904,11 @@ impl MetadataProvider for FilenameMetadataProvider {
     fn metadata_for(&self, archive: &Archive) -> ArchiveMetadata {
         let mut metadata = ArchiveMetadata::empty();
         metadata.title = Some(archive_title(&archive.path));
-        metadata.platform = detect_platform(&archive.path, &archive.identity.source_root);
+        metadata.platform = archive
+            .identity
+            .platform
+            .clone()
+            .or_else(|| detect_platform(&archive.path, &archive.identity.source_root));
         metadata.region = archive.identity.region.clone();
         metadata
     }
@@ -2877,6 +2942,12 @@ impl Archive {
             kind,
             identity: {
                 let mut identity = ArchiveIdentity::from_path(path, source_root, metadata.as_ref());
+                if kind == ArchiveKind::DirectGameImage
+                    && let Some(platform) = detect_direct_image_header_platform(path)
+                {
+                    identity.platform = Some(platform.to_string());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
                 if kind == ArchiveKind::MegaDriveRom {
                     identity.platform = Some("MegaDrive".to_string());
                     identity
@@ -2914,6 +2985,11 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         Some(ArchiveKind::Rar)
     } else if filename.ends_with(".gen") || filename.ends_with(".smd") {
         Some(ArchiveKind::MegaDriveRom)
+    } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
+        .iter()
+        .any(|extension| filename.ends_with(extension))
+    {
+        Some(ArchiveKind::DirectGameImage)
     } else {
         None
     }
@@ -2939,6 +3015,26 @@ fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> 
 
 pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
     archive_kind(path).is_some()
+}
+
+/// Identifies only formats whose uncompressed disc header is directly
+/// available. Compressed RVZ/GCZ images deliberately remain visible without
+/// pretending that their exact identity was extracted.
+fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "iso" | "gcm") {
+        return None;
+    }
+    let mut header = [0_u8; 32];
+    let mut file = OpenOptions::new().read(true).open(path).ok()?;
+    file.read_exact(&mut header).ok()?;
+    if header[0x1c..0x20] == [0xc2, 0x33, 0x9f, 0x3d] {
+        Some("GameCube")
+    } else if header[0x18..0x1c] == [0x5d, 0x1c, 0x9e, 0xa3] {
+        Some("Wii")
+    } else {
+        None
+    }
 }
 
 pub fn should_skip_split_archive_part(path: impl AsRef<Path>) -> bool {
@@ -4382,12 +4478,12 @@ fn normalized_title(path: &Path) -> String {
 /// [`Database::assign_platform`](crate::database::Database::assign_platform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlatformProvenance {
-    /// The existing filename/title/known-path-segment heuristic below
-    /// (`detect_platform_from_known_heuristics`) - unchanged from before
-    /// this enum existed, and always tried first.
+    /// A bounded, read-only format/header check identified the platform.
+    HeaderIdentity,
+    /// Filename/title/known-path-segment evidence, used only after exact
+    /// folder-alias matching finds nothing.
     Heuristic,
-    /// The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), used only
-    /// as a fallback when the heuristic above finds nothing.
+    /// The generic exact folder alias map (`FOLDER_PLATFORM_ALIASES`).
     FolderAlias,
 }
 
@@ -4397,6 +4493,7 @@ impl PlatformProvenance {
     /// before this enum existed; `"folder_alias"` is new.
     pub fn as_source_str(self) -> &'static str {
         match self {
+            Self::HeaderIdentity => "header_identity",
             Self::Heuristic => "heuristic-path-detector",
             Self::FolderAlias => "folder_alias",
         }
@@ -4437,13 +4534,10 @@ pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) ->
 /// Detects a platform for `path` (an archive discovered under
 /// `source_root`), in priority order:
 ///
-/// 1. The existing filename/title/known-path-segment heuristic
-///    (`detect_platform_from_known_heuristics`) - unchanged, and always
-///    tried first, since it is generally more specific than a bare folder
-///    name.
-/// 2. The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), walking
+/// 1. The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), walking
 ///    from the archive's nearest containing directory up to (never beyond)
 ///    `source_root` - see `detect_platform_from_folder_alias`.
+/// 2. The filename/title/known-path-segment heuristic.
 /// 3. `None` if neither found a confident match.
 pub fn detect_platform_with_provenance(
     path: impl AsRef<Path>,
@@ -4456,9 +4550,7 @@ pub fn detect_platform_with_provenance(
 }
 
 /// Detects a platform with enough detail for a human-readable provenance
-/// explanation. This preserves [`detect_platform_with_provenance`]'s exact
-/// precedence and result while retaining the matched folder text for its
-/// built-in-alias fallback.
+/// explanation while retaining the matched folder text.
 pub fn detect_platform_with_details(
     path: impl AsRef<Path>,
     source_root: impl AsRef<Path>,
@@ -4466,21 +4558,23 @@ pub fn detect_platform_with_details(
     let path = path.as_ref();
     let source_root = source_root.as_ref();
 
-    if let Some(platform) = detect_platform_from_known_heuristics(path, source_root) {
+    if let Some((platform, matched_folder)) =
+        detect_platform_from_folder_alias_with_match(path, source_root)
+    {
         return Some(DetailedPlatformDetection {
-            platform,
-            provenance: PlatformProvenance::Heuristic,
-            matched_folder: None,
-        });
-    }
-
-    detect_platform_from_folder_alias_with_match(path, source_root).map(
-        |(platform, matched_folder)| DetailedPlatformDetection {
             platform: platform.to_string(),
             provenance: PlatformProvenance::FolderAlias,
             matched_folder: Some(matched_folder),
-        },
-    )
+        });
+    }
+
+    detect_platform_from_known_heuristics(path, source_root).map(|platform| {
+        DetailedPlatformDetection {
+            platform,
+            provenance: PlatformProvenance::Heuristic,
+            matched_folder: None,
+        }
+    })
 }
 
 /// The original `detect_platform` heuristic, unchanged: a small set of
@@ -4577,6 +4671,7 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("gamecube", "GameCube"),
     ("nintendogamecube", "GameCube"),
     ("gcn", "GameCube"),
+    ("gc", "GameCube"),
     ("ngc", "GameCube"),
     ("wii", "Wii"),
     ("nintendowii", "Wii"),
@@ -4615,8 +4710,10 @@ const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
     ("playstationportable", "PSP"),
     ("sonypsp", "PSP"),
     ("xbox", "Xbox"),
+    ("xboxoriginal", "Xbox"),
     ("microsoftxbox", "Xbox"),
     ("xbox360", "Xbox360"),
+    ("x360", "Xbox360"),
     ("microsoftxbox360", "Xbox360"),
     ("arcade", "Arcade"),
     ("mame", "Arcade"),
@@ -4777,15 +4874,36 @@ fn canonical_platform_for_alias_in<'a>(
 /// normalization, or `None` if it does not.
 fn folder_platform_alias(segment: &str) -> Option<&'static str> {
     canonical_platform_for_alias(segment)
+        .or_else(|| {
+            // Collection folders commonly append acquisition dates and regions,
+            // e.g. `Nintendo - GameCube (2018-08-25 ...) (America)`. Remove only
+            // parenthesized suffixes; matching remains exact after normalization.
+            let base = segment.split_once('(')?.0.trim_end();
+            canonical_platform_for_alias(base)
+        })
+        .or_else(|| {
+            let bytes = segment.as_bytes();
+            let date_start = (0..bytes.len().saturating_sub(9)).find(|&index| {
+                bytes[index..]
+                    .get(0..4)
+                    .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                    && bytes.get(index + 4) == Some(&b'-')
+                    && bytes[index + 5..]
+                        .get(0..2)
+                        .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                    && bytes.get(index + 7) == Some(&b'-')
+                    && bytes[index + 8..]
+                        .get(0..2)
+                        .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+            })?;
+            canonical_platform_for_alias(segment[..date_start].trim_end_matches([' ', '-', '_']))
+        })
 }
 
 /// Infers a platform from `path`'s folder structure alone, walking
 /// directory components from the archive's nearest containing folder
-/// upward to (but never beyond) `source_root` - the nearest matching
-/// folder wins. Only components strictly inside `source_root` ever
-/// participate: `source_root`'s own components (`/home/davedap/Archives`
-/// in the example from the platform-detection task) never do, and neither
-/// does anything outside `source_root` altogether. The archive's own
+/// upward to and including `source_root` - the nearest matching
+/// folder wins. Nothing outside `source_root` participates. The archive's own
 /// filename is excluded too - this only ever looks at directory names.
 ///
 /// Uses `to_string_lossy` on each component (matching
@@ -4801,11 +4919,19 @@ fn detect_platform_from_folder_alias_with_match(
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components.iter().rev().find_map(|component| {
-        let matched_folder = component.as_os_str().to_string_lossy();
-        folder_platform_alias(&matched_folder)
-            .map(|platform| (platform, matched_folder.into_owned()))
-    })
+    components
+        .iter()
+        .rev()
+        .find_map(|component| {
+            let matched_folder = component.as_os_str().to_string_lossy();
+            folder_platform_alias(&matched_folder)
+                .map(|platform| (platform, matched_folder.into_owned()))
+        })
+        .or_else(|| {
+            let matched_folder = source_root.file_name()?.to_string_lossy();
+            folder_platform_alias(&matched_folder)
+                .map(|platform| (platform, matched_folder.into_owned()))
+        })
 }
 
 fn normalize_path_segment(segment: &str) -> String {
@@ -4834,7 +4960,9 @@ fn archive_title(path: &Path) -> String {
         return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
     }
 
-    for extension in [".zip", ".7z", ".rar"] {
+    for extension in [
+        ".zip", ".7z", ".rar", ".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso",
+    ] {
         if lower.ends_with(extension) {
             return filename[..filename.len() - extension.len()].to_string();
         }
@@ -6934,6 +7062,86 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn direct_rvz_iso_and_zip_are_discovered_without_wrappers() {
+        let root = test_root("direct-game-images").join("gcn");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ZooCube (USA).rvz"), b"rvz fixture").unwrap();
+        fs::write(root.join("Disc.iso"), vec![0_u8; 64]).unwrap();
+        fs::write(root.join("Animal Crossing (USA).zip"), b"zip fixture").unwrap();
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+        };
+
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+        assert_eq!(discovery.archives.len(), 3);
+        assert_eq!(
+            discovery
+                .archives
+                .iter()
+                .filter(|archive| archive.kind == ArchiveKind::DirectGameImage)
+                .count(),
+            2
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| { archive.identity.platform.as_deref() == Some("GameCube") })
+        );
+        assert!(discovery.archives.iter().any(|archive| {
+            archive.path.ends_with("ZooCube (USA).rvz")
+                && archive.identity.platform_provenance == Some(PlatformProvenance::FolderAlias)
+        }));
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn dated_region_collection_root_normalizes_to_gamecube() {
+        let root = test_root("dated-gamecube-alias")
+            .join("Nintendo - GameCube (2018-08-25 20-44-48) (America)");
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("ZooCube (USA).rvz");
+        fs::write(&image, b"rvz fixture").unwrap();
+        let detection = detect_platform_with_details(&image, &root).unwrap();
+        assert_eq!(detection.platform, "GameCube");
+        assert_eq!(detection.provenance, PlatformProvenance::FolderAlias);
+        for alias in [
+            "Nintendo_GameCube 2018-08-25",
+            "NINTENDO - GAMECUBE (Europe)",
+            "g.c.n",
+        ] {
+            let alias_root = root.parent().unwrap().join(alias);
+            let candidate = alias_root.join("game.rvz");
+            assert_eq!(
+                detect_platform_with_details(&candidate, &alias_root).map(|value| value.platform),
+                Some("GameCube".to_string())
+            );
+        }
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn direct_iso_header_identity_beats_gamecube_folder_alias() {
+        let root = test_root("direct-header-precedence").join("gcn");
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("disc.iso");
+        let mut bytes = vec![0_u8; 64];
+        bytes[0x18..0x1c].copy_from_slice(&[0x5d, 0x1c, 0x9e, 0xa3]);
+        fs::write(&image, bytes).unwrap();
+        let archive = Archive::from_path_in_root(&image, &root).unwrap();
+        assert_eq!(archive.identity.platform.as_deref(), Some("Wii"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::HeaderIdentity)
+        );
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn mega_drive_scan_preserves_non_utf8_path_identity() {
@@ -6975,7 +7183,16 @@ mod tests {
         assert_eq!(archive_kind("game.zip"), Some(ArchiveKind::Zip));
         assert_eq!(archive_kind("game.7Z"), Some(ArchiveKind::SevenZip));
         assert_eq!(archive_kind("game.RAR"), Some(ArchiveKind::Rar));
-        assert_eq!(archive_kind("game.iso"), None);
+        for image in [
+            "game.iso",
+            "game.GCM",
+            "game.gcz",
+            "game.RVZ",
+            "game.wbfs",
+            "game.CISO",
+        ] {
+            assert_eq!(archive_kind(image), Some(ArchiveKind::DirectGameImage));
+        }
         assert_eq!(archive_kind("game.zip.tmp"), None);
     }
 
@@ -9306,7 +9523,7 @@ mod tests {
         assert_eq!(archive.identity.platform, Some("Xbox360".to_string()));
         assert_eq!(
             archive.identity.platform_provenance,
-            Some(PlatformProvenance::Heuristic)
+            Some(PlatformProvenance::FolderAlias)
         );
     }
 
@@ -9452,32 +9669,27 @@ mod tests {
             Some("MSX2".to_string())
         );
 
-        // A source root that is not itself under any alias-looking
-        // ancestor must not spuriously detect one either - sanity check
-        // that stripping the root is doing real work, not accidentally
-        // matching on the full absolute path.
+        // The configured source root itself is valid evidence.
         assert_eq!(
             detect_platform("/home/davedap/msx2/game.zip", "/home/davedap/msx2"),
-            None,
-            "the source root's own name must never itself count as a folder hint"
+            Some("MSX2".to_string())
+        );
+        // Alias-looking ancestors outside that root remain excluded.
+        assert_eq!(
+            detect_platform("/home/msx2/collection/game.zip", "/home/msx2/collection"),
+            None
         );
     }
 
     #[test]
-    fn filename_detection_remains_stronger_than_the_folder_fallback() {
-        // "/incoming/Fable (USA, Europe).7z" is inside an "incoming"
-        // folder with no platform hint, but the existing title heuristic
-        // still (correctly) detects Xbox - the folder fallback must never
-        // run at all when the heuristic already found something,
-        // regardless of what the folder path would have suggested.
+    fn exact_folder_alias_remains_stronger_than_filename_similarity() {
         assert_eq!(
             detect_platform(
                 "/home/davedap/Archives/psp/007 Legends.zip",
                 "/home/davedap/Archives"
             ),
-            Some("Xbox360".to_string()),
-            "the known-title heuristic for \"007 Legends\" must win over the \
-             \"psp\" folder alias"
+            Some("PSP".to_string()),
+            "an exact folder alias must outrank weaker title similarity"
         );
     }
 
@@ -9519,8 +9731,8 @@ mod tests {
     }
 
     #[test]
-    fn provenance_is_folder_alias_for_the_fallback_and_heuristic_for_the_existing_path() {
-        let heuristic = detect_platform_with_provenance("/roms/xbox360/Halo.zip", "/roms")
+    fn provenance_distinguishes_folder_alias_from_filename_heuristic() {
+        let heuristic = detect_platform_with_provenance("/roms/incoming/007 Legends.zip", "/roms")
             .expect("known heuristic should detect Xbox360");
         assert_eq!(heuristic.provenance, PlatformProvenance::Heuristic);
         assert_eq!(
@@ -11347,6 +11559,8 @@ mod tests {
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: Some(archive_count),
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }
     }
 
@@ -11408,6 +11622,8 @@ mod tests {
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: None,
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }];
 
         assert_eq!(

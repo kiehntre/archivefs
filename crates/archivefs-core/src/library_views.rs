@@ -1677,6 +1677,8 @@ mod tests {
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: None,
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }
     }
 
