@@ -16643,6 +16643,71 @@ fn build_dolphin_provider_selection(
     }
 }
 
+/// A short, non-technical name for a recognised disc image format, used
+/// only in the beginner-facing "exact Game ID unavailable" message. Full
+/// transport/parse diagnostics remain under Details, never here.
+fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
+    match format {
+        IdentityImageFormat::Iso => "This GameCube/Wii image",
+        IdentityImageFormat::ZipContainingIso => "This ZIP archive",
+        IdentityImageFormat::Rvz => "This RVZ file",
+        IdentityImageFormat::Ciso => "This CISO file",
+        IdentityImageFormat::Deferred => "This disc image format",
+        IdentityImageFormat::LooseCartridgeRom
+        | IdentityImageFormat::Xex
+        | IdentityImageFormat::ZipContainingXex
+        | IdentityImageFormat::Unsupported => "This file",
+    }
+}
+
+/// The beginner-facing detail line for `BeginnerCheatStatus::IdentityUnavailable` -
+/// derived entirely from the same `GameIdentityReport` Details already
+/// shows, so the two views can never disagree. Never fabricates identity
+/// from the filename and never suggests mounting will definitely help.
+fn dolphin_identity_unavailable_detail(report: &GameIdentityReport) -> String {
+    let format_label = dolphin_identity_format_label(report.format);
+    let status = report
+        .evidence
+        .iter()
+        .find(|item| item.kind == IdentityKind::DolphinGameId)
+        .map(|item| item.status);
+    match status {
+        Some(IdentityStatus::Invalid) => format!(
+            "{format_label} is recognised as a GameCube/Wii image, but its disc header could not be verified. The file may be malformed or use an unrecognised layout."
+        ),
+        Some(IdentityStatus::Deferred) => format!(
+            "{format_label} is recognised as a GameCube/Wii image, but ArchiveFS cannot yet read an exact Game ID from it without decompressing the full image. Cheats cannot be matched safely without one."
+        ),
+        Some(IdentityStatus::Missing) => format!(
+            "{format_label} is recognised, but the disc-header block is not present in it."
+        ),
+        Some(IdentityStatus::Unsupported) | None => format!(
+            "{format_label} is recognised as a GameCube/Wii game, but exact identity extraction is not supported for it yet."
+        ),
+        Some(_) => "Exact Game ID is not yet available for this file.".to_string(),
+    }
+}
+
+/// The Details "Game ID" row's three-way state - distinct from
+/// `BeginnerCheatStatus::IdentityUnavailable` only in that it does not
+/// require `dolphin_profile_selection` to be resolved first, matching what
+/// the row itself actually depends on.
+enum DolphinIdentityRowState<'a> {
+    Verified(&'a str),
+    Pending,
+    Unavailable,
+}
+
+fn dolphin_identity_row_state(workflow: &CheatWorkflowState) -> DolphinIdentityRowState<'_> {
+    match ready_game_identity(workflow) {
+        Some(report) => match report.verified_dolphin_game_id() {
+            Some(id) => DolphinIdentityRowState::Verified(id),
+            None => DolphinIdentityRowState::Unavailable,
+        },
+        None => DolphinIdentityRowState::Pending,
+    }
+}
+
 fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'static str {
     match status {
         GeckoProviderFetchStatus::Downloaded => "downloaded",
@@ -16673,6 +16738,20 @@ enum BeginnerCheatStatus {
         detail: String,
     },
     UsingSavedResultsWhileOffline,
+    /// Identity inspection reached a final result, but it never produced a
+    /// `Verified` exact game ID (malformed image, or a recognised format
+    /// ArchiveFS cannot yet decode without extracting the full image) -
+    /// a terminal state, never re-attempted automatically, so the page
+    /// never spins on "Finding compatible cheats" forever.
+    IdentityUnavailable {
+        detail: String,
+    },
+    /// The archive's platform is recognised, but ArchiveFS has no cheat
+    /// adapter for it yet - distinct from `NoCompatibleCheatsFound` (which
+    /// means the adapter ran and genuinely found nothing) and from Unknown.
+    PlatformNotYetSupported {
+        platform: String,
+    },
 }
 
 impl BeginnerCheatStatus {
@@ -16692,6 +16771,10 @@ impl BeginnerCheatStatus {
             Self::ChooseEmulatorProfile => "Choose an emulator profile".to_string(),
             Self::CouldNotCheckForCheats { .. } => "Could not check for cheats".to_string(),
             Self::UsingSavedResultsWhileOffline => "Using saved results while offline".to_string(),
+            Self::IdentityUnavailable { .. } => "Exact Game ID unavailable".to_string(),
+            Self::PlatformNotYetSupported { platform } => {
+                format!("{platform} recognised - cheat support not available yet")
+            }
         }
     }
 
@@ -16704,7 +16787,10 @@ impl BeginnerCheatStatus {
             Self::NoCompatibleCheatsFound | Self::UsingSavedResultsWhileOffline => {
                 widgets::StatusTone::Warning
             }
-            Self::CouldNotCheckForCheats { .. } => widgets::StatusTone::Blocked,
+            Self::CouldNotCheckForCheats { .. } | Self::IdentityUnavailable { .. } => {
+                widgets::StatusTone::Blocked
+            }
+            Self::PlatformNotYetSupported { .. } => widgets::StatusTone::Info,
         }
     }
 }
@@ -16721,6 +16807,21 @@ fn dolphin_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus
             return BeginnerCheatStatus::ChooseEmulatorProfile;
         }
         Some(EmulatorProfileSelection::Auto { .. }) => {}
+    }
+    // Identity has reached a final result but never produced a `Verified`
+    // exact game ID (malformed image, or a recognised format ArchiveFS
+    // cannot yet decode - see `dolphin_identity_unavailable_detail`).
+    // `start_dolphin_provider_fetch`/`try_resolve_dolphin_provider_from_local_sources`
+    // both require a verified game ID before doing anything, so without
+    // this check `dolphin_provider` would stay `NotLoaded` forever and the
+    // page would show "Finding compatible cheats" indefinitely instead of
+    // this honest terminal state.
+    if let Some(report) = ready_game_identity(workflow)
+        && report.verified_dolphin_game_id().is_none()
+    {
+        return BeginnerCheatStatus::IdentityUnavailable {
+            detail: dolphin_identity_unavailable_detail(report),
+        };
     }
     match &workflow.dolphin_provider {
         CheatStepResource::NotLoaded => match workflow.dolphin_local_lookup {
@@ -17632,7 +17733,9 @@ fn platform_is_gamecube(platform: Option<&str>) -> bool {
 fn dolphin_provider_auto_fetch_needed(workflow: &CheatWorkflowState) -> bool {
     workflow.adapter == CheatEmulatorAdapter::Dolphin
         && platform_is_gamecube(workflow.platform.as_deref())
-        && matches!(workflow.identity, CheatStepResource::Ready(_))
+        && ready_game_identity(workflow)
+            .and_then(GameIdentityReport::verified_dolphin_game_id)
+            .is_some()
         && matches!(workflow.dolphin_provider, CheatStepResource::NotLoaded)
 }
 
@@ -18229,16 +18332,15 @@ fn show_dolphin_workflow_details(
                 ),
                 (
                     "Game ID",
-                    ready_game_identity(workflow)
-                        .and_then(GameIdentityReport::verified_dolphin_game_id)
-                        .unwrap_or("Waiting for verified identity"),
-                    if ready_game_identity(workflow)
-                        .and_then(GameIdentityReport::verified_dolphin_game_id)
-                        .is_some()
-                    {
-                        widgets::StatusTone::Success
-                    } else {
-                        widgets::StatusTone::Pending
+                    match dolphin_identity_row_state(workflow) {
+                        DolphinIdentityRowState::Verified(id) => id,
+                        DolphinIdentityRowState::Pending => "Waiting for verified identity",
+                        DolphinIdentityRowState::Unavailable => "Exact Game ID unavailable",
+                    },
+                    match dolphin_identity_row_state(workflow) {
+                        DolphinIdentityRowState::Verified(_) => widgets::StatusTone::Success,
+                        DolphinIdentityRowState::Pending => widgets::StatusTone::Pending,
+                        DolphinIdentityRowState::Unavailable => widgets::StatusTone::Blocked,
                     },
                 ),
             ],
@@ -18247,6 +18349,11 @@ fn show_dolphin_workflow_details(
             ready_game_identity(workflow).and_then(GameIdentityReport::verified_dolphin_revision)
         {
             ui.label(format!("Revision: {revision}"));
+        }
+        if let Some(report) = ready_game_identity(workflow)
+            && report.verified_dolphin_game_id().is_none()
+        {
+            ui.label(dolphin_identity_unavailable_detail(report));
         }
     });
     ui.add_space(theme::SECTION_GAP);
@@ -30774,6 +30881,62 @@ $Instant Growth [Nayr]\n";
         workflow.identity =
             CheatStepResource::Ready((workflow.identity_request.clone().unwrap(), report));
         app
+    }
+
+    /// An RVZ-shaped identity result that reached a final state without
+    /// ever producing a `Verified` Game ID - the exact stuck-spinner
+    /// scenario `dolphin_beginner_status`/`dolphin_provider_auto_fetch_needed`
+    /// must resolve to a terminal, honest state instead of looping.
+    fn dolphin_workflow_with_deferred_identity(directory: &std::path::Path) -> ArchiveFsApp {
+        let mut app = dolphin_workflow_with_matched_identity(directory, "GZ2E01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "dolphin-native-test".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::ExplicitChoice,
+        });
+        let CheatStepResource::Ready((request, report)) = &workflow.identity else {
+            unreachable!("fixture always starts Ready");
+        };
+        let mut report = report.clone();
+        report.format = IdentityImageFormat::Rvz;
+        report.complete = false;
+        report.evidence = vec![archivefs_core::game_identity::IdentityEvidence {
+            kind: IdentityKind::DolphinGameId,
+            status: IdentityStatus::Deferred,
+            value: None,
+            confidence: archivefs_core::game_identity::IdentityConfidence::Unavailable,
+            provenance: archivefs_core::game_identity::IdentityProvenance {
+                archive_path: workflow.archive_path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "test fixture".to_string(),
+            },
+            diagnostic: "format has no existing safe bounded reader in ArchiveFS".to_string(),
+        }];
+        workflow.identity = CheatStepResource::Ready((request.clone(), report));
+        app
+    }
+
+    #[test]
+    fn deferred_rvz_identity_reaches_a_final_state_instead_of_spinning_forever() {
+        let directory = std::env::temp_dir().join("archivefs-rvz-stuck-spinner-test");
+        let app = dolphin_workflow_with_deferred_identity(&directory);
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+
+        assert!(
+            !dolphin_provider_auto_fetch_needed(workflow),
+            "a format ArchiveFS cannot decode must never trigger a provider fetch"
+        );
+        let status = dolphin_beginner_status(workflow);
+        assert!(
+            matches!(status, BeginnerCheatStatus::IdentityUnavailable { .. }),
+            "expected a terminal IdentityUnavailable status, got {status:?}"
+        );
+        assert_ne!(
+            status.label(),
+            "Finding compatible cheats",
+            "the page must not spin forever once identity reached a final unsupported state"
+        );
     }
 
     fn xenia_profile_fixture(directory: &std::path::Path) -> XeniaProfile {
