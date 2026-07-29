@@ -1,15 +1,12 @@
-//! Read-only Phase 1 PCSX2 patch metadata preview.
+//! Patch, cheat, preview, and shared transaction foundations.
 //!
-//! This module deliberately contains no artifact retrieval, PNACH parsing,
-//! destination inspection, write-capable plan, cache, manifest, or rollback
-//! API. Its only output is [`AdvisoryPatchPlan`].
-//!
-//! PCSX2-only logic (serial/CRC normalization, PNACH filename parsing,
-//! candidate conversion, hypothetical destination calculation) lives
-//! behind [`adapter::EmulatorAdapter`] in `pcsx2.rs`; this module owns the
-//! orchestration (fetch, catalogue read, candidate/game matching,
-//! plan/plan-ID assembly) that is still PCSX2-specific for this first
-//! adapter slice - see `docs/PATCH_CHEAT_MANAGER_DESIGN.md`.
+//! The original read-only PCSX2 metadata adapter remains available in
+//! `pcsx2.rs`. The install-capable PCSX2 path is deliberately separate:
+//! `pcsx2_identity`, `pcsx2_provider`, `pcsx2_pnach`, and
+//! `pcsx2_install_plan` turn an exact existing identity and approved provider
+//! record into a staged normal-cheats PNACH. The staged artifact then uses
+//! the same preview, confirmation, journal, backup, atomic apply, and rollback
+//! machinery as the other write-capable adapters.
 //!
 //! `retroarch` (added after PCSX2) is a second, independent preview: it
 //! does not implement `EmulatorAdapter` and does not produce an

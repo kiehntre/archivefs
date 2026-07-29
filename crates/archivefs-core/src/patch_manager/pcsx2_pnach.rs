@@ -70,7 +70,7 @@ impl PnachPatchLine {
             || !matches!(fields[1], "EE" | "IOP")
             || !is_hex(fields[2], 8, 8)
             || !matches!(fields[3], "byte" | "short" | "word" | "double" | "extended")
-            || !is_hex(fields[4], 1, 16)
+            || !valid_patch_value(fields[3], fields[4])
         {
             return Err(error(
                 PnachDocumentErrorKind::InvalidPatchLine,
@@ -93,6 +93,17 @@ impl PnachPatchLine {
     pub fn as_str(&self) -> &str {
         &self.rendered
     }
+}
+
+fn valid_patch_value(kind: &str, value: &str) -> bool {
+    let maximum = match kind {
+        "byte" => 2,
+        "short" => 4,
+        "word" | "extended" => 8,
+        "double" => 16,
+        _ => return false,
+    };
+    is_hex(value, 1, maximum)
 }
 
 fn is_hex(value: &str, minimum: usize, maximum: usize) -> bool {
@@ -306,6 +317,7 @@ mod tests {
         let patch = PnachPatchLine::parse("patch=1,EE,20abcdef,extended,00aa00bb").unwrap();
         assert_eq!(patch.as_str(), "patch=1,EE,20ABCDEF,extended,00AA00BB");
         assert!(PnachPatchLine::parse("patch=1,EE,not-hex,word,1").is_err());
+        assert!(PnachPatchLine::parse("patch=1,EE,20123456,byte,0001").is_err());
         assert!(PnachPatchLine::parse("encrypted=DEADBEEF").is_err());
     }
 
