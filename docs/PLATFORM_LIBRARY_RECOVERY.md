@@ -88,3 +88,40 @@ collection. Manually verify:
    overlay.
 8. The Unknown count decreases after the confirmed source assignment and
    rescan; any incompatible items are reported rather than silently assigned.
+
+## Follow-up: registry expansion and direct GameCube identity
+
+A second pass (see
+[`PLATFORM_REGISTRY_AND_DIRECT_IDENTITY.md`](PLATFORM_REGISTRY_AND_DIRECT_IDENTITY.md)
+for full detail) addressed two proven gaps left by the recovery above:
+
+1. **Thousands of Unknown entries with clear folder evidence.** The single
+   `FOLDER_PLATFORM_ALIASES` registry this document already established had
+   no canonical platform at all for Virtual Boy, Sharp X68000, NEC
+   PC-8801/PC-9801, Nintendo 3DS, PC Engine CD, ZX Spectrum's `zxs`
+   abbreviation, Commodore 128, or VIC-20 - so a folder named exactly
+   `virtualboy` or `sharp-x68000` still fell through to Unknown no matter how
+   clear the evidence was. These are now first-class aliases in the same one
+   table (never a second table), plus a separate, narrower
+   `FOLDER_PREFERRED_EMULATOR_ALIASES` table so `fbneo`/`mame`/`fba` folder
+   names classify as the `Arcade` *hardware* platform while still recording
+   which *emulator* the folder name implies.
+2. **RVZ (and other direct GameCube images) stuck at "Waiting for verified
+   identity".** Identity inspection was not actually hanging - it reached a
+   final `GameIdentityReport` for RVZ (`Deferred`) and for `.gcz`/`.ciso`
+   (previously `Unsupported` by omission, a bug fixed here) - but the
+   *downstream* Dolphin provider-fetch gate required a `Verified` Game ID
+   before it would ever leave `NotLoaded`, so the beginner status stayed on
+   "Finding compatible cheats" forever. RVZ and the GameCube/Wii `.ciso`
+   format now have real bounded direct-header identity readers (see the
+   companion document for the exact byte layout each uses), and the
+   workflow state machine now has a distinct terminal `IdentityUnavailable`
+   status for whatever remains undecodable (`.gcz`, `.wbfs`), so the page
+   never spins indefinitely regardless of whether a given format is
+   supported yet.
+
+Both fixes also unified the three previously-duplicated, hardcoded GUI
+platform lists (Sources "Assign platform", Mount filter, Library filter)
+into one live-data-driven strip, so a platform only ever appears when the
+registry recognises it *and* the library actually contains a non-zero count
+of it - see the companion document's "Full platform filtering" section.
