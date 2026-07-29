@@ -44,6 +44,7 @@ mod matching;
 mod pcsx2;
 mod pcsx2_identity;
 mod pcsx2_local;
+mod pcsx2_pnach;
 mod retrieval;
 mod retroarch;
 mod retroarch_cheat_library;
@@ -250,6 +251,11 @@ pub use pcsx2_local::{
     Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
     Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
     discover_pcsx2_profiles, inspect_pcsx2_profile, match_pcsx2_inventory,
+};
+pub use pcsx2_pnach::{
+    MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
+    PnachDocumentError, PnachDocumentErrorKind, PnachPatchLine, merge_managed_pnach_cheats,
+    parse_pnach_document,
 };
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
 pub use retroarch::{
