@@ -17,11 +17,12 @@ use archivefs_core::patch_manager::{
     CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
     CheatJournalInspectionError, CheatProviderCoverageReport, CheatRollbackAvailability,
     CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
-    DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingProvider, HttpsMetadataFetcher,
-    ProposedDestination, ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan,
-    build_cheat_availability_report, build_cheat_provider_coverage_report,
-    default_dolphin_catalogue_cache_root, discover_cheat_history, execute_cheat_install_run,
-    execute_cheat_rollback_run, inspect_cheat_install_journal, load_catalogue_evidence_read_only,
+    DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
+    GameHackingGameCubeProvider, GameHackingProvider, HttpsMetadataFetcher, ProposedDestination,
+    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
+    build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
+    discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
+    inspect_cheat_install_journal, load_catalogue_evidence_read_only,
     load_cheat_catalogue_snapshot, load_dolphin_catalogue,
     preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
@@ -301,6 +302,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!(
                     "GameHacking PS2 catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "gamehacking-gamecube-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let provider = GameHackingGameCubeProvider::default();
+            let result = provider.refresh_gamecube_index(&options, |progress| {
+                eprintln!(
+                    "GameHacking GameCube index: {}/{} pages · {} games · page {} {}",
+                    progress.pages_complete,
+                    progress.pages_total,
+                    progress.games_collected,
+                    progress
+                        .page_number
+                        .map(|page| page.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    if progress.downloaded {
+                        "downloaded"
+                    } else {
+                        "cached"
+                    }
+                );
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking GameCube catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
                     result.games,
                     result.pages_total,
                     result.pages_downloaded,
@@ -4343,6 +4393,9 @@ fn print_help() {
     println!(
         "  gamehacking-ps2-index-refresh  Resume the cached public PS2 index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
     );
+    println!(
+        "  gamehacking-gamecube-index-refresh  Resume the cached public GameCube index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
+    );
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
@@ -4452,6 +4505,7 @@ fn print_help() {
     println!("  archivefs pcsx2-patch-preview");
     println!("  archivefs pcsx2-patch-preview --json");
     println!("  archivefs gamehacking-ps2-index-refresh");
+    println!("  archivefs gamehacking-gamecube-index-refresh");
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");

@@ -39,31 +39,33 @@ use archivefs_core::patch_manager::{
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
     DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
-    GameHackingFetchOptions, GameHackingGame, GameHackingMatchCandidate, GameHackingMatchStatus,
-    GameHackingProvider, GeckoProviderFetchOptions, GeckoProviderFetchResult,
-    GeckoProviderFetchStatus, GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind,
-    ImportTrustState, LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination,
-    LocalSafetyScanningState, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
-    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
-    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
-    RememberedEmulatorProfile, ResolvedCheatDestination, RetroArchCheatLibraryInspection,
-    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
-    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
-    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
-    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile,
-    UNKNOWN_CODE_POLICY, XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateOutcome,
-    XeniaInstallPlanError, XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile,
-    XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, adapter_write_support,
-    build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
-    build_pcsx2_cheat_candidates, build_pcsx2_install_preview,
-    build_pcsx2_legacy_migration_preview, build_shared_preview, build_shared_transaction_plan,
-    build_xenia_candidates, build_xenia_install_preview,
+    GameCubeCodeFormat, GameCubeGameIdentity, GameHackingFetchOptions, GameHackingGame,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider,
+    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider,
+    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
+    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
+    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, RememberedEmulatorProfile,
+    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
+    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
+    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, XeniaCandidate,
+    XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
+    XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
+    XeniaProfileDiscoveryRoots, adapter_write_support, build_cheat_candidates,
+    build_cheat_install_preview, build_dolphin_install_preview, build_pcsx2_cheat_candidates,
+    build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
+    build_shared_transaction_plan, build_xenia_candidates, build_xenia_install_preview,
     check_dolphin_catalogue_update_with_transport, default_cheat_source_cache_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
@@ -5518,6 +5520,7 @@ impl ArchiveFsApp {
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -7379,6 +7382,146 @@ impl ArchiveFsApp {
         });
     }
 
+    /// GameCube-only, preview-only: matches against the cached catalogue
+    /// and, once matched, downloads only that one game's cheats. There is
+    /// no selection or install path here, unlike PCSX2's equivalent.
+    fn start_gamecube_gamehacking_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        if workflow.adapter != CheatEmulatorAdapter::Dolphin
+            || workflow.platform.as_deref() != Some("GameCube")
+            || matches!(
+                workflow.gamecube_gamehacking,
+                CheatStepResource::Loading { .. }
+            )
+        {
+            return;
+        }
+        let Some(identity) = gamecube_identity_for_workflow(workflow) else {
+            if let Some(workflow) = self.cheat_workflow.as_mut() {
+                workflow.gamecube_gamehacking = CheatStepResource::Failed(
+                    "ArchiveFS needs a verified local Dolphin Game ID before checking the cached GameHacking.org GameCube catalogue."
+                        .to_string(),
+                );
+            }
+            return;
+        };
+        let mut options = match GameHackingGameCubeFetchOptions::defaults() {
+            Ok(options) => options,
+            Err(failure) => {
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.gamecube_gamehacking = CheatStepResource::Failed(failure.to_string());
+                }
+                return;
+            }
+        };
+        options.force_refresh = force_refresh;
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.gamecube_gamehacking = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Checking one local GameCube game against GameHacking.org.",
+        ));
+        thread::spawn(move || {
+            let provider = GameHackingGameCubeProvider::default();
+            let result = (|| {
+                let matched = provider.match_game(&identity, &options)?;
+                let Some(game) = matched.game.clone() else {
+                    return Ok(GameCubeGameHackingState {
+                        status: matched.status,
+                        detail: matched.detail,
+                        game: None,
+                        match_candidates: matched.candidates,
+                        cheats: Vec::new(),
+                    });
+                };
+                let cheats = provider.fetch_cheats(&identity, &game, &options)?;
+                Ok(GameCubeGameHackingState {
+                    status: matched.status,
+                    detail: matched.detail,
+                    game: Some(game),
+                    match_candidates: Vec::new(),
+                    cheats,
+                })
+            })()
+            .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
+                failure.to_string()
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn confirm_gamecube_gamehacking_match(&mut self, context: egui::Context, game_id: u64) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let Some(identity) = gamecube_identity_for_workflow(workflow) else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &workflow.gamecube_gamehacking else {
+            return;
+        };
+        let Some(game) = state
+            .match_candidates
+            .iter()
+            .find(|candidate| candidate.game.game_id == game_id)
+            .map(|candidate| candidate.game.clone())
+        else {
+            return;
+        };
+        let options = match GameHackingGameCubeFetchOptions::defaults() {
+            Ok(options) => options,
+            Err(failure) => {
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.gamecube_gamehacking = CheatStepResource::Failed(failure.to_string());
+                }
+                return;
+            }
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.gamecube_gamehacking = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            format!("Downloading confirmed GameHacking.org game {game_id} GameCube export."),
+        ));
+        thread::spawn(move || {
+            let provider = GameHackingGameCubeProvider::default();
+            let result = (|| {
+                let cheats =
+                    provider.fetch_cheats_for_confirmed_candidate(&identity, &game, &options)?;
+                Ok(GameCubeGameHackingState {
+                    status: GameHackingGameCubeMatchStatus::Matched,
+                    detail: format!(
+                        "Using user-confirmed GameHacking.org match: {} (game {}).",
+                        game.title, game.game_id
+                    ),
+                    game: Some(game),
+                    match_candidates: Vec::new(),
+                    cheats,
+                })
+            })()
+            .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
+                failure.to_string()
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
     fn update_pcsx2_cheat_selection(&mut self, id: &str, selected: bool) {
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
@@ -7782,6 +7925,37 @@ impl ArchiveFsApp {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     workflow.pcsx2_gamehacking = CheatStepResource::Failed(
+                        "GameHacking.org worker stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+        if let CheatStepResource::Loading { receiver } = &workflow.gamecube_gamehacking {
+            match receiver.try_recv() {
+                Ok(Ok(state)) => {
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatSourceRetrieval,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Completed,
+                        format!(
+                            "GameHacking.org check completed with {} cheat(s).",
+                            state.cheats.len()
+                        ),
+                    ));
+                    workflow.gamecube_gamehacking = CheatStepResource::Ready(state);
+                }
+                Ok(Err(message)) => {
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatSourceRetrieval,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("GameHacking.org check failed: {message}"),
+                    ));
+                    workflow.gamecube_gamehacking = CheatStepResource::Failed(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.gamecube_gamehacking = CheatStepResource::Failed(
                         "GameHacking.org worker stopped unexpectedly.".to_string(),
                     );
                 }
@@ -10405,6 +10579,12 @@ impl ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::InstallSelectedPcsx2) => {
                             self.start_pcsx2_install_preview();
+                        }
+                        Some(CheatWorkflowAction::FetchGameCubeGameHacking { force_refresh }) => {
+                            self.start_gamecube_gamehacking_fetch(context.clone(), force_refresh);
+                        }
+                        Some(CheatWorkflowAction::ConfirmGameCubeGameHackingMatch { game_id }) => {
+                            self.confirm_gamecube_gamehacking_match(context.clone(), game_id);
                         }
                         Some(CheatWorkflowAction::RescanDolphinProfiles) => {
                             self.start_dolphin_profile_scan(context.clone());
@@ -16786,6 +16966,9 @@ struct CheatWorkflowState {
     pcsx2_inventory_profile_id: Option<String>,
     pcsx2_inventory: CheatStepResource<Pcsx2PnachInventory>,
     pcsx2_gamehacking: CheatStepResource<Pcsx2GameHackingState>,
+    /// GameCube-only, preview-only GameHacking.org coverage. No Wii yet,
+    /// and no install/apply path - see `GameCubeGameHackingState`.
+    gamecube_gamehacking: CheatStepResource<GameCubeGameHackingState>,
     selected_dolphin_profile_id: Option<String>,
     /// An optional additional Dolphin configuration directory to scan,
     /// typed by the user - covers portable/AppImage installs, which have
@@ -16972,6 +17155,17 @@ struct Pcsx2GameHackingState {
     match_candidates: Vec<GameHackingMatchCandidate>,
     candidates: Vec<Pcsx2CheatCandidate>,
     selection: Pcsx2CheatSelection,
+}
+
+/// GameCube-only, preview-only GameHacking.org coverage. Deliberately has
+/// no selection/install fields at all - this milestone never writes
+/// anything, unlike `Pcsx2GameHackingState`.
+struct GameCubeGameHackingState {
+    status: GameHackingGameCubeMatchStatus,
+    detail: String,
+    game: Option<GameHackingGameCubeGame>,
+    match_candidates: Vec<GameHackingGameCubeMatchCandidate>,
+    cheats: Vec<GameHackingGameCubeCheat>,
 }
 
 #[derive(Clone)]
@@ -17948,6 +18142,15 @@ enum CheatWorkflowAction {
     ToggleXeniaShowExactChanges(bool),
     ToggleDolphinDetailsOpen(bool),
     ToggleXeniaDetailsOpen(bool),
+    /// GameCube-only, preview-only GameHacking.org coverage: matches
+    /// against the cached catalogue and, once matched, downloads only
+    /// that one game's cheats. There is no install action here yet.
+    FetchGameCubeGameHacking {
+        force_refresh: bool,
+    },
+    ConfirmGameCubeGameHackingMatch {
+        game_id: u64,
+    },
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -18911,6 +19114,11 @@ fn show_dolphin_workflow(
     }
     if let Some(Some(details_action)) = details_response.body_returned {
         action = Some(details_action).or(action);
+    }
+    // GameCube only in this milestone - no Wii yet (see
+    // `show_gamecube_gamehacking`'s doc comment).
+    if workflow.platform.as_deref() == Some("GameCube") {
+        action = show_gamecube_gamehacking(ui, workflow).or(action);
     }
     action
 }
@@ -21671,6 +21879,169 @@ fn show_pcsx2_gamehacking(
     action
 }
 
+/// GameCube-only, preview-only GameHacking.org coverage: shows the matched
+/// title and GameHacking game ID, the exact match evidence, and named
+/// cheats with their author, notes, and identified code format. There is
+/// deliberately no install button in this milestone - no Wii, no
+/// selection, no write path at all.
+fn show_gamecube_gamehacking(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "GameHacking.org (GameCube)",
+        Some(
+            "Matches this local GameCube game against ArchiveFS's private complete index cache; only the selected game's cheats are downloaded. Preview only - nothing is written yet.",
+        ),
+    );
+    let identity_ready = gamecube_identity_for_workflow(workflow)
+        .is_some_and(|identity| identity.verified_game_id().is_some());
+    match &mut workflow.gamecube_gamehacking {
+        CheatStepResource::NotLoaded => {
+            widgets::status_badge(
+                ui,
+                if identity_ready {
+                    "Ready to check"
+                } else {
+                    "Game identity incomplete"
+                },
+                if identity_ready {
+                    widgets::StatusTone::Pending
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+            if widgets::action_button(
+                ui,
+                "Check GameHacking.org",
+                widgets::ActionStyle::Primary,
+                identity_ready,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchGameCubeGameHacking {
+                    force_refresh: false,
+                });
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking GameHacking.org for this game…");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Could not check GameHacking.org",
+                message,
+                widgets::StatusTone::Warning,
+            );
+            if widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchGameCubeGameHacking {
+                    force_refresh: false,
+                });
+            }
+        }
+        CheatStepResource::Ready(state) => {
+            widgets::status_badge(
+                ui,
+                match state.status {
+                    GameHackingGameCubeMatchStatus::Matched => "Game matched",
+                    GameHackingGameCubeMatchStatus::Candidates => "Confirm a candidate",
+                    GameHackingGameCubeMatchStatus::NoMatch => "No matching game",
+                    GameHackingGameCubeMatchStatus::IdentityConflict => "Game identity conflicted",
+                    GameHackingGameCubeMatchStatus::IdentityIncomplete => {
+                        "Game identity incomplete"
+                    }
+                },
+                if state.status == GameHackingGameCubeMatchStatus::Matched {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            ui.label(&state.detail);
+            for candidate in &state.match_candidates {
+                widgets::card(ui, |ui| {
+                    ui.strong(&candidate.game.title);
+                    ui.label(format!(
+                        "Game ID: {} · Region: {} · GameHacking game ID: {}",
+                        candidate
+                            .game
+                            .dolphin_game_id
+                            .as_deref()
+                            .unwrap_or("Unknown"),
+                        candidate.game.region.as_deref().unwrap_or("Unknown"),
+                        candidate.game.game_id
+                    ));
+                    ui.weak(format!("Match evidence: {}", candidate.strength.label()));
+                    if widgets::action_button(
+                        ui,
+                        "Use this match",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::ConfirmGameCubeGameHackingMatch {
+                            game_id: candidate.game.game_id,
+                        });
+                    }
+                });
+            }
+            if let Some(game) = &state.game {
+                ui.strong(&game.title);
+                ui.label(format!(
+                    "Game ID: {} · Region: {} · GameHacking game ID: {}",
+                    game.dolphin_game_id.as_deref().unwrap_or("Unknown"),
+                    game.region.as_deref().unwrap_or("Unknown"),
+                    game.game_id
+                ));
+                ui.weak(format!(
+                    "{} cheat{} · GameHacking game {}",
+                    state.cheats.len(),
+                    if state.cheats.len() == 1 { "" } else { "s" },
+                    game.game_id
+                ));
+            }
+            for cheat in &state.cheats {
+                widgets::card(ui, |ui| {
+                    ui.strong(&cheat.name);
+                    if let Some(author) = &cheat.author {
+                        ui.label(format!("Author: {author}"));
+                    }
+                    if let Some(description) = &cheat.description {
+                        ui.label(format!("Notes: {description}"));
+                    }
+                    ui.weak(format!(
+                        "Code format: {}",
+                        match cheat.code_format {
+                            GameCubeCodeFormat::ActionReplay => "Action Replay",
+                            GameCubeCodeFormat::Gecko => "Gecko",
+                            GameCubeCodeFormat::RawUnknown => "Raw (format not declared)",
+                            GameCubeCodeFormat::Unsupported => "Unsupported",
+                        }
+                    ));
+                });
+            }
+            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Quiet, identity_ready)
+                .clicked()
+            {
+                action = Some(CheatWorkflowAction::FetchGameCubeGameHacking {
+                    force_refresh: true,
+                });
+            }
+        }
+    }
+    action
+}
+
 fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static str {
     match kind {
         Pcsx2InstallationType::Native => "Native",
@@ -21766,6 +22137,14 @@ fn pcsx2_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<Pcsx2Gam
         identity.region = workflow.region.clone();
     }
     Some(identity)
+}
+
+fn gamecube_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<GameCubeGameIdentity> {
+    let report = ready_game_identity(workflow)?;
+    Some(GameCubeGameIdentity::from_report(
+        workflow.display_name.clone(),
+        report,
+    ))
 }
 
 fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
@@ -33995,6 +34374,7 @@ mod tests {
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -37081,6 +37461,121 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn gamecube_gamehacking_shows_matched_title_game_id_and_named_cheats_but_no_install_button() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-gamehacking-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking = CheatStepResource::Ready(GameCubeGameHackingState {
+            status: GameHackingGameCubeMatchStatus::Matched,
+            detail: "Matched from the local catalogue.".to_string(),
+            game: Some(GameHackingGameCubeGame {
+                game_id: 501,
+                title: "Test Racer".to_string(),
+                system: "GameCube".to_string(),
+                region: Some("USA".to_string()),
+                dolphin_game_id: Some("GTRE01".to_string()),
+                revision: None,
+                hash: None,
+                source_url: "https://gamehacking.org/game/501".to_string(),
+            }),
+            match_candidates: Vec::new(),
+            cheats: vec![GameHackingGameCubeCheat {
+                id: "gh-gc-501-1".to_string(),
+                name: "Infinite Boost".to_string(),
+                author: Some("Ada".to_string()),
+                description: Some("Boost never runs out.".to_string()),
+                code_format: GameCubeCodeFormat::ActionReplay,
+                code_lines: vec!["04001234 00000001".to_string()],
+                source_game_id: 501,
+                source_url: "https://gamehacking.org/game/501".to_string(),
+            }],
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        for expected in [
+            "Test Racer",
+            "GameHacking game 501",
+            "Infinite Boost",
+            "Author: Ada",
+            "Notes: Boost never runs out.",
+            "Code format: Action Replay",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!rendered_text_contains(&output, "Install selected"));
+        assert!(!rendered_text_contains(&output, "Install now"));
+    }
+
+    #[test]
+    fn gamecube_gamehacking_candidate_requires_explicit_confirmation() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-gamehacking-candidate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking = CheatStepResource::Ready(GameCubeGameHackingState {
+            status: GameHackingGameCubeMatchStatus::Candidates,
+            detail: "Only normalized-title candidates were found.".to_string(),
+            game: None,
+            match_candidates: vec![GameHackingGameCubeMatchCandidate {
+                game: GameHackingGameCubeGame {
+                    game_id: 501,
+                    title: "Test Racer".to_string(),
+                    system: "GameCube".to_string(),
+                    region: Some("USA".to_string()),
+                    dolphin_game_id: Some("ZZZZZZ".to_string()),
+                    revision: None,
+                    hash: None,
+                    source_url: "https://gamehacking.org/game/501".to_string(),
+                },
+                strength:
+                    archivefs_core::patch_manager::GameHackingGameCubeMatchStrength::NormalizedTitleAndRegion,
+                requires_user_confirmation: true,
+            }],
+            cheats: Vec::new(),
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        for expected in [
+            "Confirm a candidate",
+            "Test Racer",
+            "GameHacking game ID: 501",
+            "normalized title + compatible region",
+            "Use this match",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!rendered_text_contains(&output, "Install selected"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn ps2_archive_context_defaults_to_pcsx2_without_queue_or_mount_mutation() {
         let mut app = app_for_operation_tests();
         let mut ps2 = record("/roms/game.zip", MountState::Mounted);
@@ -38574,6 +39069,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -52596,6 +53092,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking: CheatStepResource::NotLoaded,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,

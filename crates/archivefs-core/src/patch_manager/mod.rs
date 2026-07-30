@@ -36,6 +36,7 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod emulator_profile_memory;
+mod gamehacking_gamecube_provider;
 mod gamehacking_provider;
 mod gecko_document;
 mod import_safety;
@@ -228,6 +229,17 @@ pub use emulator_profile_memory::{
     forget_emulator_profile_default, load_remembered_emulator_profiles_default,
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
+};
+pub use gamehacking_gamecube_provider::{
+    GAMEHACKING_GAMECUBE_PROVIDER_ID, GameCubeCodeFormat, GameCubeGameHackingAdapter,
+    GameCubeGameIdentity, GameCubeIdentityState, GameHackingGameCubeCatalogue,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeIndexPage, GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
+    GameHackingGameCubeIndexRefreshResult, GameHackingGameCubeMatch,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, load_gamecube_catalogue,
+    normalize_gamecube_game_id, parse_gamehacking_gamecube_export,
+    parse_gamehacking_gamecube_index_page,
 };
 pub use gamehacking_provider::{
     GAMEHACKING_PROVIDER_ID, GameHackingCheat, GameHackingError, GameHackingErrorKind,
