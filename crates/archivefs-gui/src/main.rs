@@ -39,15 +39,15 @@ use archivefs_core::patch_manager::{
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
     DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
-    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
-    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
-    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
-    GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider, GameHackingMatchCandidate,
-    GameHackingMatchStatus, GameHackingProvider, GeckoProviderFetchOptions,
-    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
-    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
-    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, GameHackingFetchOptions, GameHackingGame,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider,
+    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider,
+    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
+    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
     Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
     Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
     Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
@@ -5532,6 +5532,7 @@ impl ArchiveFsApp {
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking_blocked: false,
             selected_dolphin_profile_id,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -7337,9 +7338,11 @@ impl ArchiveFsApp {
                         match_candidates: matched.candidates,
                         candidates: Vec::new(),
                         selection: Pcsx2CheatSelection::default(),
+                        cached_fallback: false,
                     });
                 };
-                let cheats = provider.fetch_cheats(&identity, &game, &options)?;
+                let fetch = provider.fetch_cheats_with_status(&identity, &game, &options)?;
+                let cheats = fetch.data;
                 let catalogue = provider.catalogue(&identity, &game, &cheats)?;
                 let candidates = build_pcsx2_cheat_candidates(&catalogue, &identity);
                 Ok(Pcsx2GameHackingState {
@@ -7349,6 +7352,7 @@ impl ArchiveFsApp {
                     match_candidates: Vec::new(),
                     candidates,
                     selection: Pcsx2CheatSelection::default(),
+                    cached_fallback: fetch.cached_fallback,
                 })
             })()
             .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
@@ -7404,8 +7408,9 @@ impl ArchiveFsApp {
         thread::spawn(move || {
             let provider = GameHackingProvider::default();
             let result = (|| {
-                let cheats =
-                    provider.fetch_cheats_for_confirmed_candidate(&identity, &game, &options)?;
+                let fetch = provider
+                    .fetch_cheats_for_confirmed_candidate_with_status(&identity, &game, &options)?;
+                let cheats = fetch.data;
                 let catalogue =
                     provider.catalogue_for_confirmed_candidate(&identity, &game, &cheats)?;
                 let candidates = build_pcsx2_cheat_candidates(&catalogue, &identity);
@@ -7419,6 +7424,7 @@ impl ArchiveFsApp {
                     match_candidates: Vec::new(),
                     candidates,
                     selection: Pcsx2CheatSelection::default(),
+                    cached_fallback: fetch.cached_fallback,
                 })
             })()
             .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
@@ -7451,6 +7457,7 @@ impl ArchiveFsApp {
                     "ArchiveFS needs a verified local Dolphin Game ID before checking the cached GameHacking.org GameCube catalogue."
                         .to_string(),
                 );
+                workflow.gamecube_gamehacking_blocked = false;
             }
             return;
         };
@@ -7459,6 +7466,7 @@ impl ArchiveFsApp {
             Err(failure) => {
                 if let Some(workflow) = self.cheat_workflow.as_mut() {
                     workflow.gamecube_gamehacking = CheatStepResource::Failed(failure.to_string());
+                    workflow.gamecube_gamehacking_blocked = false;
                 }
                 return;
             }
@@ -7470,6 +7478,7 @@ impl ArchiveFsApp {
             return;
         };
         workflow.gamecube_gamehacking = CheatStepResource::Loading { receiver };
+        workflow.gamecube_gamehacking_blocked = false;
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
             Some(archive_path),
@@ -7488,9 +7497,11 @@ impl ArchiveFsApp {
                         match_candidates: matched.candidates,
                         selection: gamecube_gamehacking_selection_for(&[]),
                         cheats: Vec::new(),
+                        cached_fallback: false,
                     });
                 };
-                let cheats = provider.fetch_cheats(&identity, &game, &options)?;
+                let fetch = provider.fetch_cheats_with_status(&identity, &game, &options)?;
+                let cheats = fetch.data;
                 Ok(GameCubeGameHackingState {
                     status: matched.status,
                     detail: matched.detail,
@@ -7498,6 +7509,7 @@ impl ArchiveFsApp {
                     match_candidates: Vec::new(),
                     selection: gamecube_gamehacking_selection_for(&cheats),
                     cheats,
+                    cached_fallback: fetch.cached_fallback,
                 })
             })()
             .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
@@ -7531,6 +7543,7 @@ impl ArchiveFsApp {
             Err(failure) => {
                 if let Some(workflow) = self.cheat_workflow.as_mut() {
                     workflow.gamecube_gamehacking = CheatStepResource::Failed(failure.to_string());
+                    workflow.gamecube_gamehacking_blocked = false;
                 }
                 return;
             }
@@ -7541,6 +7554,7 @@ impl ArchiveFsApp {
             return;
         };
         workflow.gamecube_gamehacking = CheatStepResource::Loading { receiver };
+        workflow.gamecube_gamehacking_blocked = false;
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatSourceRetrieval,
             Some(archive_path),
@@ -7550,8 +7564,9 @@ impl ArchiveFsApp {
         thread::spawn(move || {
             let provider = GameHackingGameCubeProvider::default();
             let result = (|| {
-                let cheats =
-                    provider.fetch_cheats_for_confirmed_candidate(&identity, &game, &options)?;
+                let fetch = provider
+                    .fetch_cheats_for_confirmed_candidate_with_status(&identity, &game, &options)?;
+                let cheats = fetch.data;
                 Ok(GameCubeGameHackingState {
                     status: GameHackingGameCubeMatchStatus::Matched,
                     detail: format!(
@@ -7562,6 +7577,7 @@ impl ArchiveFsApp {
                     match_candidates: Vec::new(),
                     selection: gamecube_gamehacking_selection_for(&cheats),
                     cheats,
+                    cached_fallback: fetch.cached_fallback,
                 })
             })()
             .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
@@ -8278,6 +8294,7 @@ impl ArchiveFsApp {
                         ),
                     ));
                     workflow.gamecube_gamehacking = CheatStepResource::Ready(state);
+                    workflow.gamecube_gamehacking_blocked = false;
                 }
                 Ok(Err(message)) => {
                     preview_history_entry = Some(HistoryEntry::new(
@@ -8286,6 +8303,9 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         format!("GameHacking.org check failed: {message}"),
                     ));
+                    workflow.gamecube_gamehacking_blocked = message
+                        == GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE
+                        || message.starts_with("GameHacking.org blocked");
                     workflow.gamecube_gamehacking = CheatStepResource::Failed(message);
                 }
                 Err(TryRecvError::Empty) => {}
@@ -8293,6 +8313,7 @@ impl ArchiveFsApp {
                     workflow.gamecube_gamehacking = CheatStepResource::Failed(
                         "GameHacking.org worker stopped unexpectedly.".to_string(),
                     );
+                    workflow.gamecube_gamehacking_blocked = false;
                 }
             }
         }
@@ -17354,6 +17375,13 @@ struct CheatWorkflowState {
     /// GameCube-only, preview-only GameHacking.org coverage. No Wii yet,
     /// and no install/apply path - see `GameCubeGameHackingState`.
     gamecube_gamehacking: CheatStepResource<GameCubeGameHackingState>,
+    /// True exactly when the current `gamecube_gamehacking` `Failed` state
+    /// was classified as `GameHackingErrorKind::CloudflareBlocked` (see
+    /// `GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE`) rather than an ordinary
+    /// failure - drives the dedicated neutral/blocked banner and hides
+    /// Retry, since retrying immediately cannot help and core-side cooldown
+    /// gating already prevents hammering a blocked origin.
+    gamecube_gamehacking_blocked: bool,
     selected_dolphin_profile_id: Option<String>,
     /// An optional additional Dolphin configuration directory to scan,
     /// typed by the user - covers portable/AppImage installs, which have
@@ -17551,6 +17579,7 @@ struct Pcsx2GameHackingState {
     match_candidates: Vec<GameHackingMatchCandidate>,
     candidates: Vec<Pcsx2CheatCandidate>,
     selection: Pcsx2CheatSelection,
+    cached_fallback: bool,
 }
 
 /// GameCube-only GameHacking.org coverage: matched title, named cheats,
@@ -17565,6 +17594,7 @@ struct GameCubeGameHackingState {
     match_candidates: Vec<GameHackingGameCubeMatchCandidate>,
     cheats: Vec<GameHackingGameCubeCheat>,
     selection: GameCubeCheatSelection,
+    cached_fallback: bool,
 }
 
 fn gamecube_gamehacking_selection_for(
@@ -22201,6 +22231,14 @@ fn show_pcsx2_gamehacking(
             }
         }
         CheatStepResource::Ready(provider) => {
+            if provider.cached_fallback {
+                widgets::banner(
+                    ui,
+                    "Using cached GameHacking.org data",
+                    "GameHacking.org blocked this automated request. Cached data is being used and may be stale. Try again later.",
+                    widgets::StatusTone::Warning,
+                );
+            }
             let selectable_count = provider
                 .candidates
                 .iter()
@@ -22453,6 +22491,21 @@ fn show_gamecube_gamehacking(
                 ui.label("Checking GameHacking.org for this game…");
             });
         }
+        CheatStepResource::Failed(message) if workflow.gamecube_gamehacking_blocked => {
+            // A confirmed Cloudflare/anti-bot block, not a generic failure:
+            // retrying immediately cannot help (core-side cooldown gating
+            // already prevents hammering the origin again), so no Retry is
+            // offered here at all - matches
+            // `GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE` exactly, which is
+            // also why `message` itself is rendered verbatim rather than a
+            // separately-maintained copy of the wording.
+            widgets::banner(
+                ui,
+                "GameHacking.org access blocked",
+                message,
+                widgets::StatusTone::Warning,
+            );
+        }
         CheatStepResource::Failed(message) => {
             widgets::banner(
                 ui,
@@ -22469,6 +22522,14 @@ fn show_gamecube_gamehacking(
             }
         }
         CheatStepResource::Ready(state) => {
+            if state.cached_fallback {
+                widgets::banner(
+                    ui,
+                    "Using cached GameHacking.org data",
+                    "GameHacking.org blocked this automated request. Cached data is being used and may be stale. Try again later.",
+                    widgets::StatusTone::Warning,
+                );
+            }
             widgets::status_badge(
                 ui,
                 match state.status {
@@ -35123,6 +35184,7 @@ mod tests {
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking_blocked: false,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -35310,6 +35372,7 @@ mod tests {
             match_candidates: Vec::new(),
             candidates: vec![candidate],
             selection,
+            cached_fallback: false,
         });
         app
     }
@@ -38320,6 +38383,7 @@ $Instant Growth [Nayr]\n";
             }],
             candidates: Vec::new(),
             selection: Pcsx2CheatSelection::default(),
+            cached_fallback: false,
         });
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -38384,6 +38448,7 @@ $Instant Growth [Nayr]\n";
                 compatibility: archivefs_core::patch_manager::Pcsx2CheatCompatibility::Compatible,
             }],
                 selection: Pcsx2CheatSelection::default(),
+                cached_fallback: false,
             });
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -38450,6 +38515,7 @@ $Instant Growth [Nayr]\n";
                 source_game_id: 501,
                 source_url: "https://gamehacking.org/game/501".to_string(),
             }],
+            cached_fallback: false,
         });
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -38515,6 +38581,7 @@ $Instant Growth [Nayr]\n";
                 match_candidates: Vec::new(),
                 cheats: vec![cheat],
                 selection,
+                cached_fallback: false,
             });
 
         app.start_gamecube_gamehacking_install_preview_with_staging_root(directory.join("staging"));
@@ -38587,6 +38654,7 @@ $Instant Growth [Nayr]\n";
             }],
             selection: gamecube_gamehacking_selection_for(&[]),
             cheats: Vec::new(),
+            cached_fallback: false,
         });
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -38607,6 +38675,115 @@ $Instant Growth [Nayr]\n";
             );
         }
         assert!(!rendered_text_contains(&output, "Install selected"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn gamecube_gamehacking_shows_dedicated_blocked_state_without_retry() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-gamehacking-blocked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking =
+            CheatStepResource::Failed(GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE.to_string());
+        workflow.gamecube_gamehacking_blocked = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "GameHacking.org access blocked"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE
+        ));
+        assert_eq!(
+            count_exact_text_occurrences(&output, "Try again"),
+            0,
+            "a confirmed Cloudflare block must not offer a Retry button (the required wording itself legitimately ends in \"Try again later.\", so this checks the standalone button label, not a substring)"
+        );
+        assert!(!rendered_text_contains(
+            &output,
+            "Could not check GameHacking.org"
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn gamecube_gamehacking_marks_a_successful_cached_fallback_as_stale() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-gamehacking-cache-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking = CheatStepResource::Ready(GameCubeGameHackingState {
+            status: GameHackingGameCubeMatchStatus::NoMatch,
+            detail: "No match in the cached catalogue.".to_string(),
+            game: None,
+            match_candidates: Vec::new(),
+            cheats: Vec::new(),
+            selection: gamecube_gamehacking_selection_for(&[]),
+            cached_fallback: true,
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Using cached GameHacking.org data"
+        ));
+        assert!(rendered_text_contains(&output, "may be stale"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn gamecube_gamehacking_keeps_retry_for_an_ordinary_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-gamehacking-ordinary-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking = CheatStepResource::Failed(
+            "GameHacking.org is temporarily unavailable (HTTP 500)".to_string(),
+        );
+        workflow.gamecube_gamehacking_blocked = false;
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Could not check GameHacking.org"
+        ));
+        assert!(
+            rendered_text_contains(&output, "Try again"),
+            "a transient failure must still offer Retry"
+        );
+        assert!(!rendered_text_contains(
+            &output,
+            "GameHacking.org access blocked"
+        ));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -40108,6 +40285,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking_blocked: false,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -54132,6 +54310,7 @@ $Instant Growth [Nayr]\n";
             pcsx2_inventory: CheatStepResource::NotLoaded,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking_blocked: false,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,

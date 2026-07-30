@@ -254,13 +254,14 @@ pub use gamehacking_gamecube_provider::{
     parse_gamehacking_gamecube_export, parse_gamehacking_gamecube_index_page,
 };
 pub use gamehacking_provider::{
-    GAMEHACKING_PROVIDER_ID, GameHackingCheat, GameHackingError, GameHackingErrorKind,
-    GameHackingFetchOptions, GameHackingGame, GameHackingIndexPage, GameHackingIndexProgress,
-    GameHackingIndexRecord, GameHackingIndexRefreshResult, GameHackingMatch,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingMatchStrength,
-    GameHackingProvider, GameHackingPs2Catalogue, GameHackingSystemAdapter, Ps2GameHackingAdapter,
-    gamehacking_cache_root, load_ps2_catalogue, normalize_ps2_serial, parse_gamehacking_game_page,
-    parse_gamehacking_pnach, parse_gamehacking_ps2_index_page,
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GAMEHACKING_PROVIDER_ID, GameHackingCheat,
+    GameHackingError, GameHackingErrorKind, GameHackingFetchOptions, GameHackingFetchOutcome,
+    GameHackingGame, GameHackingIndexPage, GameHackingIndexProgress, GameHackingIndexRecord,
+    GameHackingIndexRefreshResult, GameHackingMatch, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingMatchStrength, GameHackingProvider, GameHackingPs2Catalogue,
+    GameHackingSystemAdapter, Ps2GameHackingAdapter, gamehacking_cache_root, load_ps2_catalogue,
+    normalize_ps2_serial, parse_gamehacking_game_page, parse_gamehacking_pnach,
+    parse_gamehacking_ps2_index_page,
 };
 pub use gecko_document::{
     DolphinCodeSectionKind, DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind,

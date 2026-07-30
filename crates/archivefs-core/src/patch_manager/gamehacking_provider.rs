@@ -37,6 +37,16 @@ const USER_AGENT: &str = concat!(
 const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXPORT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RETRIES: u8 = 3;
+const CLOUDFLARE_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const CLOUDFLARE_MARKER_FILE: &str = "cloudflare-blocked-at";
+
+/// The exact, stable wording shown to the user (GUI and CLI alike) whenever
+/// a GameHacking.org request - PS2 or GameCube - is classified as a
+/// Cloudflare (or similarly-shaped) bot challenge rather than an ordinary
+/// failure. Kept as one shared constant, rather than duplicated prose, so
+/// callers can detect this exact case by comparing against it instead of
+/// matching arbitrary error-message substrings.
+pub const GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE: &str = "GameHacking.org blocked this automated request. Cached data is being used where available. Try again later.";
 const PS2_CATALOGUE_SCHEMA_VERSION: u32 = 1;
 const PS2_CATALOGUE_FILE: &str = "ps2-catalogue.json";
 const PS2_INDEX_ROOT_CACHE_FILE: &str = "ps2-index-root.html";
@@ -50,7 +60,15 @@ pub enum GameHackingErrorKind {
     IdentityConflict,
     NoMatch,
     AccessDenied,
+    /// The provider answered with a Cloudflare (or similarly-shaped)
+    /// bot-challenge/interstitial response rather than real content -
+    /// either a 403 fronted by Cloudflare, or a "successful" HTTP 200 whose
+    /// body is a JS challenge page. Distinct from `AccessDenied` (an
+    /// ordinary, non-challenge access refusal) so callers never retry it
+    /// automatically and the GUI never shows it as a generic failure.
+    CloudflareBlocked,
     RateLimited,
+    NetworkFailure,
     TemporaryFailure,
     PermanentHttpFailure,
     InvalidResponse,
@@ -58,10 +76,76 @@ pub enum GameHackingErrorKind {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GameHackingHttpClassification {
+    Success,
+    CloudflareBlocked,
+    AccessDenied,
+    RateLimited,
+    ServerError,
+    OtherHttpError,
+}
+
+pub(crate) fn classify_gamehacking_http_response(
+    status: u16,
+    server: Option<&str>,
+    body: &[u8],
+) -> GameHackingHttpClassification {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let strong_challenge_marker = [
+        "cdn-cgi/challenge-platform",
+        "cf-chl-",
+        "_cf_chl_opt",
+        "cf-error-details",
+        "cf-browser-verification",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let cloudflare_interstitial = text.contains("cloudflare")
+        && [
+            "attention required",
+            "just a moment",
+            "checking your browser",
+            "cloudflare ray id",
+            "enable javascript and cookies to continue",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker));
+    let cloudflare_server = server.is_some_and(|value| {
+        value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("cloudflare"))
+    });
+
+    if status == 429 {
+        GameHackingHttpClassification::RateLimited
+    } else if strong_challenge_marker
+        || cloudflare_interstitial
+        || (status == 403 && cloudflare_server)
+    {
+        GameHackingHttpClassification::CloudflareBlocked
+    } else if status == 401 || status == 403 {
+        GameHackingHttpClassification::AccessDenied
+    } else if (500..600).contains(&status) {
+        GameHackingHttpClassification::ServerError
+    } else if (200..300).contains(&status) {
+        GameHackingHttpClassification::Success
+    } else {
+        GameHackingHttpClassification::OtherHttpError
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameHackingError {
     pub kind: GameHackingErrorKind,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameHackingFetchOutcome<T> {
+    pub data: T,
+    pub cached_fallback: bool,
+    pub retrieved_at_unix_seconds: Option<u64>,
 }
 
 impl std::fmt::Display for GameHackingError {
@@ -208,6 +292,7 @@ pub struct GameHackingIndexRefreshResult {
     pub pages_reused: usize,
     pub games: usize,
     pub retrieved_at_unix_seconds: u64,
+    pub cached_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +386,8 @@ trait GameHackingTransport {
 struct ProviderResponse {
     bytes: Vec<u8>,
     charset: Option<String>,
+    cached_fallback: bool,
+    retrieved_at_unix_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -329,30 +416,11 @@ impl UreqGameHackingTransport {
         maximum_bytes: usize,
     ) -> Result<ProviderResponse, GameHackingError> {
         let status = response.status().as_u16();
-        if status == 403 || status == 401 {
-            return Err(error(
-                GameHackingErrorKind::AccessDenied,
-                format!("GameHacking.org denied access (HTTP {status})"),
-            ));
-        }
-        if status == 429 {
-            return Err(error(
-                GameHackingErrorKind::RateLimited,
-                "GameHacking.org asked ArchiveFS to slow down (HTTP 429)",
-            ));
-        }
-        if (500..600).contains(&status) {
-            return Err(error(
-                GameHackingErrorKind::TemporaryFailure,
-                format!("GameHacking.org is temporarily unavailable (HTTP {status})"),
-            ));
-        }
-        if !(200..300).contains(&status) {
-            return Err(error(
-                GameHackingErrorKind::PermanentHttpFailure,
-                format!("GameHacking.org returned HTTP {status}"),
-            ));
-        }
+        let server = response
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let charset = response
             .headers()
             .get("content-type")
@@ -376,7 +444,45 @@ impl UreqGameHackingTransport {
                 "GameHacking.org response exceeded the bounded size limit",
             ));
         }
-        Ok(ProviderResponse { bytes, charset })
+        match classify_gamehacking_http_response(status, server.as_deref(), &bytes) {
+            GameHackingHttpClassification::Success => {}
+            GameHackingHttpClassification::CloudflareBlocked => {
+                return Err(error(
+                    GameHackingErrorKind::CloudflareBlocked,
+                    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
+                ));
+            }
+            GameHackingHttpClassification::AccessDenied => {
+                return Err(error(
+                    GameHackingErrorKind::AccessDenied,
+                    format!("GameHacking.org denied access (HTTP {status})"),
+                ));
+            }
+            GameHackingHttpClassification::RateLimited => {
+                return Err(error(
+                    GameHackingErrorKind::RateLimited,
+                    "GameHacking.org asked ArchiveFS to slow down (HTTP 429)",
+                ));
+            }
+            GameHackingHttpClassification::ServerError => {
+                return Err(error(
+                    GameHackingErrorKind::TemporaryFailure,
+                    format!("GameHacking.org is temporarily unavailable (HTTP {status})"),
+                ));
+            }
+            GameHackingHttpClassification::OtherHttpError => {
+                return Err(error(
+                    GameHackingErrorKind::PermanentHttpFailure,
+                    format!("GameHacking.org returned HTTP {status}"),
+                ));
+            }
+        }
+        Ok(ProviderResponse {
+            bytes,
+            charset,
+            cached_fallback: false,
+            retrieved_at_unix_seconds: None,
+        })
     }
 }
 
@@ -431,7 +537,7 @@ fn validate_provider_url(value: &str) -> Result<(), GameHackingError> {
 
 fn classify_transport_error(failure: ureq::Error) -> GameHackingError {
     error(
-        GameHackingErrorKind::TemporaryFailure,
+        GameHackingErrorKind::NetworkFailure,
         format!("GameHacking.org request failed: {failure}"),
     )
 }
@@ -538,9 +644,9 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         };
         let root_path = options.cache_root.join(root_cache_name);
         let root_was_cached = root_path.is_file();
-        let resume_options = GameHackingFetchOptions {
+        let root_options = GameHackingFetchOptions {
             cache_root: options.cache_root.clone(),
-            force_refresh: false,
+            force_refresh: options.force_refresh,
             delay: Duration::from_secs(2),
             cancellation: options.cancellation.clone(),
         };
@@ -548,9 +654,14 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             root_cache_name,
             self.adapter.index_url(),
             MAX_INDEX_BYTES,
-            &resume_options,
+            &root_options,
             |transport| transport.get(self.adapter.index_url(), MAX_INDEX_BYTES),
         )?;
+        let cached_fallback = root.cached_fallback;
+        let resume_options = GameHackingFetchOptions {
+            force_refresh: false,
+            ..root_options
+        };
         let page_numbers = parse_ps2_index_page_numbers(&root.bytes, root.charset.as_deref())?;
         if page_numbers.len() > MAX_PS2_INDEX_PAGES {
             return Err(error(
@@ -655,6 +766,7 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             pages_reused: reused,
             games: catalogue.games.len(),
             retrieved_at_unix_seconds: retrieved_at,
+            cached_fallback,
         })
     }
 
@@ -664,6 +776,16 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         game: &GameHackingGame,
         options: &GameHackingFetchOptions,
     ) -> Result<Vec<GameHackingCheat>, GameHackingError> {
+        self.fetch_cheats_with_status(identity, game, options)
+            .map(|outcome| outcome.data)
+    }
+
+    pub fn fetch_cheats_with_status(
+        &self,
+        identity: &Pcsx2GameIdentity,
+        game: &GameHackingGame,
+        options: &GameHackingFetchOptions,
+    ) -> Result<GameHackingFetchOutcome<Vec<GameHackingCheat>>, GameHackingError> {
         self.check_robots(options, &["/inc/sub.exportCodes.php"])?;
         authorize_catalogue_match(identity, game, false)?;
         let filename = identity
@@ -687,7 +809,11 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             options,
             |transport| transport.post_form(EXPORT_URL, &form, MAX_EXPORT_BYTES),
         )?;
-        parse_gamehacking_pnach(game, &bytes.bytes)
+        Ok(GameHackingFetchOutcome {
+            data: parse_gamehacking_pnach(game, &bytes.bytes)?,
+            cached_fallback: bytes.cached_fallback,
+            retrieved_at_unix_seconds: bytes.retrieved_at_unix_seconds,
+        })
     }
 
     pub fn fetch_cheats_for_confirmed_candidate(
@@ -696,6 +822,16 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         game: &GameHackingGame,
         options: &GameHackingFetchOptions,
     ) -> Result<Vec<GameHackingCheat>, GameHackingError> {
+        self.fetch_cheats_for_confirmed_candidate_with_status(identity, game, options)
+            .map(|outcome| outcome.data)
+    }
+
+    pub fn fetch_cheats_for_confirmed_candidate_with_status(
+        &self,
+        identity: &Pcsx2GameIdentity,
+        game: &GameHackingGame,
+        options: &GameHackingFetchOptions,
+    ) -> Result<GameHackingFetchOutcome<Vec<GameHackingCheat>>, GameHackingError> {
         authorize_catalogue_match(identity, game, true)?;
         self.fetch_export(game, identity, options)
     }
@@ -705,7 +841,7 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         game: &GameHackingGame,
         identity: &Pcsx2GameIdentity,
         options: &GameHackingFetchOptions,
-    ) -> Result<Vec<GameHackingCheat>, GameHackingError> {
+    ) -> Result<GameHackingFetchOutcome<Vec<GameHackingCheat>>, GameHackingError> {
         self.check_robots(options, &["/inc/sub.exportCodes.php"])?;
         let filename = identity.serial.as_deref().unwrap_or(&identity.title);
         let form = [
@@ -724,7 +860,11 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             options,
             |transport| transport.post_form(EXPORT_URL, &form, MAX_EXPORT_BYTES),
         )?;
-        parse_gamehacking_pnach(game, &bytes.bytes)
+        Ok(GameHackingFetchOutcome {
+            data: parse_gamehacking_pnach(game, &bytes.bytes)?,
+            cached_fallback: bytes.cached_fallback,
+            retrieved_at_unix_seconds: bytes.retrieved_at_unix_seconds,
+        })
     }
 
     pub fn catalogue(
@@ -798,10 +938,37 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         prepare_cache(&options.cache_root)?;
         let path = options.cache_root.join(file_name);
         if !options.force_refresh && path.is_file() {
-            return Ok(ProviderResponse {
-                bytes: bounded_read(&path, maximum_bytes)?,
+            let bytes = bounded_read(&path, maximum_bytes)?;
+            if cached_bytes_are_cloudflare_challenge(&bytes) {
+                return Err(error(
+                    GameHackingErrorKind::CloudflareBlocked,
+                    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
+                ));
+            }
+            let response = ProviderResponse {
+                bytes,
                 charset: read_cached_charset(&path)?,
-            });
+                cached_fallback: false,
+                retrieved_at_unix_seconds: Some(cache_retrieved_at(&path)?),
+            };
+            let age =
+                unix_seconds_now().saturating_sub(response.retrieved_at_unix_seconds.unwrap_or(0));
+            log::info!(
+                "gamehacking request_url={} classification=cached cache_fallback=false cache_age_seconds={}",
+                _url,
+                age
+            );
+            return Ok(response);
+        }
+        if cloudflare_cooldown_remaining(&options.cache_root).is_some() {
+            if let Some(response) = cached_fallback_response(&path, maximum_bytes)? {
+                log_cached_fallback(_url, &path, &response);
+                return Ok(response);
+            }
+            return Err(error(
+                GameHackingErrorKind::CloudflareBlocked,
+                blocked_without_cache_message(file_name),
+            ));
         }
         let mut last_error = None;
         for attempt in 0..MAX_RETRIES {
@@ -821,7 +988,24 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                         unix_seconds_now().to_string().as_bytes(),
                     )?;
                     touch_request_marker(&options.cache_root)?;
+                    clear_cloudflare_marker(&options.cache_root);
+                    log::info!(
+                        "gamehacking request_url={} classification=success cache_fallback=false cache_write=completed",
+                        _url
+                    );
                     return Ok(response);
+                }
+                Err(failure) if failure.kind == GameHackingErrorKind::CloudflareBlocked => {
+                    mark_cloudflare_blocked(&options.cache_root)?;
+                    log::warn!(
+                        "gamehacking request_url={} status=blocked classification=cloudflare cache_write=skipped",
+                        _url
+                    );
+                    if let Some(response) = cached_fallback_response(&path, maximum_bytes)? {
+                        log_cached_fallback(_url, &path, &response);
+                        return Ok(response);
+                    }
+                    return Err(failure);
                 }
                 Err(failure)
                     if matches!(
@@ -829,9 +1013,22 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                         GameHackingErrorKind::RateLimited | GameHackingErrorKind::TemporaryFailure
                     ) =>
                 {
+                    log::warn!(
+                        "gamehacking request_url={} classification={:?} retry_attempt={}",
+                        _url,
+                        failure.kind,
+                        attempt + 1
+                    );
                     last_error = Some(failure);
                 }
-                Err(failure) => return Err(failure),
+                Err(failure) => {
+                    log::warn!(
+                        "gamehacking request_url={} classification={:?} cache_fallback=false",
+                        _url,
+                        failure.kind
+                    );
+                    return Err(failure);
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| {
@@ -1501,6 +1698,48 @@ fn cache_retrieved_at(path: &Path) -> Result<u64, GameHackingError> {
         })
 }
 
+fn cached_fallback_response(
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Option<ProviderResponse>, GameHackingError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = bounded_read(path, maximum_bytes)?;
+    if cached_bytes_are_cloudflare_challenge(&bytes) {
+        log::warn!(
+            "gamehacking cache_path={} classification=cloudflare cache_fallback=false cache_write=skipped",
+            path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(ProviderResponse {
+        bytes,
+        charset: read_cached_charset(path)?,
+        cached_fallback: true,
+        retrieved_at_unix_seconds: Some(cache_retrieved_at(path)?),
+    }))
+}
+
+fn log_cached_fallback(url: &str, path: &Path, response: &ProviderResponse) {
+    let retrieved_at = response.retrieved_at_unix_seconds.unwrap_or(0);
+    let age = unix_seconds_now().saturating_sub(retrieved_at);
+    log::warn!(
+        "gamehacking request_url={} classification=cloudflare cache_fallback=true cache_path={} cache_age_seconds={} cache_write=skipped",
+        url,
+        path.display(),
+        age
+    );
+}
+
+fn blocked_without_cache_message(file_name: &str) -> &'static str {
+    if file_name.starts_with("export-") {
+        "GameHacking.org blocked the live request and no cached cheat export is available."
+    } else {
+        GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE
+    }
+}
+
 fn bounded_read(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, GameHackingError> {
     let metadata = path.symlink_metadata().map_err(|failure| {
         error(
@@ -1585,6 +1824,50 @@ fn touch_request_marker(root: &Path) -> Result<(), GameHackingError> {
             format!("provider rate-limit marker could not be written: {failure}"),
         )
     })
+}
+
+/// True when previously-cached bytes are themselves a Cloudflare challenge
+/// page rather than real content. Guards a cache entry that predates this
+/// classifier - or was written by any other path that skipped it - from
+/// ever reaching an HTML/text parser: status 200 and no `server` header are
+/// assumed (an on-disk cache has neither), which only ever weakens
+/// detection to the body-marker checks, never to the status-plus-header
+/// check that only fires on a live 403.
+pub(crate) fn cached_bytes_are_cloudflare_challenge(bytes: &[u8]) -> bool {
+    classify_gamehacking_http_response(200, None, bytes)
+        == GameHackingHttpClassification::CloudflareBlocked
+}
+
+fn cloudflare_marker_path(cache_root: &Path) -> PathBuf {
+    cache_root.join(CLOUDFLARE_MARKER_FILE)
+}
+
+/// `Some(remaining)` while a prior Cloudflare block is still within its
+/// cooldown window - checked before every live request (even an explicit
+/// force-refresh) so a block is never immediately re-triggered by hammering
+/// an origin that has already signalled it is blocking ArchiveFS. `None`
+/// once the marker is absent, unreadable, or older than the cooldown.
+pub(crate) fn cloudflare_cooldown_remaining(cache_root: &Path) -> Option<Duration> {
+    let contents = fs::read_to_string(cloudflare_marker_path(cache_root)).ok()?;
+    let blocked_at = contents.trim().parse::<u64>().ok()?;
+    let elapsed = Duration::from_secs(unix_seconds_now().saturating_sub(blocked_at));
+    CLOUDFLARE_COOLDOWN
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+pub(crate) fn mark_cloudflare_blocked(cache_root: &Path) -> Result<(), GameHackingError> {
+    atomic_write(
+        &cloudflare_marker_path(cache_root),
+        unix_seconds_now().to_string().as_bytes(),
+    )
+}
+
+/// Clears the cooldown marker once a live request actually succeeds -
+/// otherwise a block that resolved sooner than the full cooldown window
+/// would keep being reported as blocked until it expired anyway.
+pub(crate) fn clear_cloudflare_marker(cache_root: &Path) {
+    let _ = fs::remove_file(cloudflare_marker_path(cache_root));
 }
 
 fn check_cancelled(options: &GameHackingFetchOptions) -> Result<(), GameHackingError> {
@@ -1947,6 +2230,143 @@ mod tests {
                 .unwrap_err()
                 .kind,
             GameHackingErrorKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_403_fronted_by_cloudflares_server_header_is_classified_as_blocked() {
+        assert_eq!(
+            classify_gamehacking_http_response(403, Some("cloudflare"), b""),
+            GameHackingHttpClassification::CloudflareBlocked
+        );
+    }
+
+    #[test]
+    fn an_ordinary_403_without_any_cloudflare_signal_is_access_denied_not_blocked() {
+        assert_eq!(
+            classify_gamehacking_http_response(403, None, b"Forbidden"),
+            GameHackingHttpClassification::AccessDenied
+        );
+        assert_eq!(
+            classify_gamehacking_http_response(403, Some("nginx"), b"Forbidden"),
+            GameHackingHttpClassification::AccessDenied
+        );
+    }
+
+    #[test]
+    fn a_cloudflare_challenge_page_served_with_an_ordinary_200_is_still_classified_as_blocked() {
+        let challenge_body = b"<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue<div>Cloudflare Ray ID: 89abc123</div></body></html>";
+        assert_eq!(
+            classify_gamehacking_http_response(200, None, challenge_body),
+            GameHackingHttpClassification::CloudflareBlocked
+        );
+    }
+
+    #[test]
+    fn ordinary_200_content_is_never_misclassified_as_a_cloudflare_challenge() {
+        assert_eq!(
+            classify_gamehacking_http_response(
+                200,
+                None,
+                b"<html><body>Real content</body></html>"
+            ),
+            GameHackingHttpClassification::Success
+        );
+    }
+
+    #[test]
+    fn rate_limit_and_server_failures_remain_distinct_from_cloudflare() {
+        assert_eq!(
+            classify_gamehacking_http_response(429, None, b"slow down"),
+            GameHackingHttpClassification::RateLimited
+        );
+        assert_eq!(
+            classify_gamehacking_http_response(500, None, b"origin error"),
+            GameHackingHttpClassification::ServerError
+        );
+    }
+
+    #[test]
+    fn blocked_refresh_uses_the_exact_ps2_cache_without_rewriting_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gamehacking-ps2-fallback-{}-{}",
+            std::process::id(),
+            unix_seconds_now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("export-42.pnach");
+        let original =
+            b"gametitle=Fixture\ncomment=Real cached export\npatch=1,EE,20123456,word,00000001\n";
+        fs::write(&path, original).unwrap();
+        fs::write(retrieved_cache_path(&path), b"123").unwrap();
+        let provider = GameHackingProvider::default();
+        let options = GameHackingFetchOptions {
+            cache_root: root.clone(),
+            force_refresh: true,
+            delay: Duration::from_millis(1),
+            cancellation: None,
+        };
+        let response = provider
+            .cached_request(
+                "export-42.pnach",
+                EXPORT_URL,
+                MAX_EXPORT_BYTES,
+                &options,
+                |_| {
+                    Err(error(
+                        GameHackingErrorKind::CloudflareBlocked,
+                        GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(response.cached_fallback);
+        assert_eq!(response.retrieved_at_unix_seconds, Some(123));
+        assert_eq!(response.bytes, original);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(retrieved_cache_path(&path)).unwrap(), b"123");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloudflare_cooldown_marker_gates_and_then_clears() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gamehacking-cloudflare-cooldown-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(cloudflare_cooldown_remaining(&root).is_none());
+        mark_cloudflare_blocked(&root).unwrap();
+        assert!(cloudflare_cooldown_remaining(&root).is_some());
+        clear_cloudflare_marker(&root);
+        assert!(cloudflare_cooldown_remaining(&root).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Pins the original bug this module fixes: a Cloudflare-fronted 403
+    /// (or a 200 masking a JS challenge) must never surface as a generic
+    /// "HTTP 500" / temporarily-unavailable message. A genuine 500, with no
+    /// Cloudflare signal at all, must still say exactly that.
+    #[test]
+    fn a_cloudflare_response_never_produces_a_misleading_500_style_message() {
+        let blocked = classify_gamehacking_http_response(403, Some("cloudflare"), b"");
+        assert_eq!(blocked, GameHackingHttpClassification::CloudflareBlocked);
+        assert_ne!(blocked, GameHackingHttpClassification::ServerError);
+
+        let challenge_body = b"<html><head><title>Just a moment...</title></head><body>Cloudflare Ray ID: 1</body></html>";
+        let challenge = classify_gamehacking_http_response(200, None, challenge_body);
+        assert_eq!(challenge, GameHackingHttpClassification::CloudflareBlocked);
+        assert_ne!(challenge, GameHackingHttpClassification::ServerError);
+
+        let genuine_server_error = classify_gamehacking_http_response(500, None, b"");
+        assert_eq!(
+            genuine_server_error,
+            GameHackingHttpClassification::ServerError,
+            "an actual 500 with no Cloudflare signal must still be reported as a server error"
         );
     }
 }
