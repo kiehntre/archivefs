@@ -260,6 +260,21 @@ pub struct GameHackingGameCubeCheat {
     pub source_url: String,
 }
 
+/// The result of inspecting one real game page's cheat-export form: what
+/// the CLI diagnostic command prints, and the only path by which
+/// `GameCubeGameHackingAdapter::system_id` is ever set - never guessed.
+#[derive(Debug, Clone, Serialize)]
+pub struct GameCubeSysIdDiagnostics {
+    pub game_id: u64,
+    pub title: String,
+    pub game_page_url: String,
+    pub export_form_action: String,
+    pub hidden_fields: Vec<(String, String)>,
+    /// `None` if the page's export form has no `sysID` hidden field, or
+    /// its value does not parse as a `u16`.
+    pub sys_id: Option<u16>,
+}
+
 /// A returned cheat's identified raw code format. Never inferred from the
 /// hex shape alone - only an explicit label in the exported text (an
 /// `Encryption:`/`Format:` field) promotes a cheat to `ActionReplay` or
@@ -360,7 +375,7 @@ pub struct GameHackingGameCubeIndexRecord {
 }
 
 impl GameHackingGameCubeIndexRecord {
-    fn as_game(&self) -> GameHackingGameCubeGame {
+    pub fn as_game(&self) -> GameHackingGameCubeGame {
         GameHackingGameCubeGame {
             game_id: self.game_id,
             title: self.title.clone(),
@@ -424,8 +439,7 @@ impl GameHackingGameCubeFetchOptions {
 }
 
 /// GameHacking.org's system adapter for GameCube. `system_id` is the
-/// numeric `sysID` form field required only for per-game cheat exports
-/// (see the module doc comment for why it is not yet confirmed).
+/// numeric `sysID` form field required only for per-game cheat exports.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GameCubeGameHackingAdapter;
 
@@ -434,18 +448,27 @@ impl GameCubeGameHackingAdapter {
         "GameCube"
     }
 
-    /// `None` until confirmed via a real request from an unrestricted
-    /// network. Catalogue crawling and matching never call this.
+    /// Confirmed by fetching a real game page's cheat-export form
+    /// (`gamehacking-gamecube-sysid-diagnostic`, see
+    /// `parse_gamecube_sysid_diagnostics`) and reading its hidden `sysID`
+    /// field directly - Luigi's Mansion (GameHacking game 54172)
+    /// confirmed `sysID = 13`. Never guessed.
     pub fn system_id(&self) -> Option<u16> {
-        None
+        Some(13)
     }
 
     pub fn index_url(&self) -> &'static str {
         GAMECUBE_INDEX_URL
     }
 
+    /// Confirmed from the same real export form's `format` `<select>`:
+    /// the only options are `Gecko` (.gct, a binary Dolphin container -
+    /// unusable for named-cheat text parsing), `Mednafen` (.cht), and
+    /// `Text` (.txt, "Plain Text"). `Text` is the only option whose
+    /// export is actually parseable readable text with names, so it is
+    /// the one this adapter requests.
     pub fn export_format(&self) -> &'static str {
-        "Dolphin"
+        "Text"
     }
 
     pub fn supports(&self, identity: &GameCubeGameIdentity) -> bool {
@@ -879,6 +902,62 @@ impl GameHackingGameCubeProvider {
         parse_gamehacking_gamecube_export(game, &bytes.bytes)
     }
 
+    /// Fetches one real game's page, purely to discover its cheat-export
+    /// form's action and hidden fields (the only way `sysID` is ever
+    /// confirmed - never guessed). Not part of the matching/preview flow.
+    fn fetch_game_page(
+        &self,
+        game: &GameHackingGameCubeGame,
+        options: &GameHackingGameCubeFetchOptions,
+    ) -> Result<Vec<u8>, GameHackingError> {
+        self.check_robots(options, &["/game/"])?;
+        validate_provider_url(&game.source_url)?;
+        let source_url = game.source_url.clone();
+        let cache_name = format!("game-{}.html", game.game_id);
+        let response = self.cached_request(&cache_name, MAX_INDEX_BYTES, options, |transport| {
+            transport.get(&source_url, MAX_INDEX_BYTES)
+        })?;
+        Ok(response.bytes)
+    }
+
+    /// Fetches one real game's page and parses its cheat-export form's
+    /// action and hidden fields, including `sysID` if present. This is
+    /// the CLI diagnostic command's entire implementation.
+    pub fn diagnose_export_form(
+        &self,
+        game: &GameHackingGameCubeGame,
+        options: &GameHackingGameCubeFetchOptions,
+    ) -> Result<GameCubeSysIdDiagnostics, GameHackingError> {
+        let bytes = self.fetch_game_page(game, options)?;
+        parse_gamecube_sysid_diagnostics(game.game_id, &game.title, &game.source_url, &bytes)
+    }
+
+    /// Diagnostic-only: fetches this exact catalogue game's cheat export
+    /// directly. There is no identity-match ambiguity to authorize
+    /// against here - the caller already chose this exact `game_id` from
+    /// the cached catalogue - so this bypasses
+    /// `authorize_gamecube_catalogue_match` entirely and is never used by
+    /// the real preview/match flow (see `fetch_cheats`/
+    /// `fetch_cheats_for_confirmed_candidate`, which both require it).
+    pub fn fetch_cheats_for_diagnostic(
+        &self,
+        game: &GameHackingGameCubeGame,
+        options: &GameHackingGameCubeFetchOptions,
+    ) -> Result<Vec<GameHackingGameCubeCheat>, GameHackingError> {
+        let identity = GameCubeGameIdentity {
+            archive_path: PathBuf::new(),
+            title: game.title.clone(),
+            dolphin_game_id: game.dolphin_game_id.clone(),
+            region: game.region.clone(),
+            revision: game.revision,
+            loose_rom_sha256: None,
+            state: GameCubeIdentityState::Verified,
+            evidence: Vec::new(),
+            plain_failure_reason: None,
+        };
+        self.fetch_export(game, &identity, options)
+    }
+
     fn cached_request<F>(
         &self,
         file_name: &str,
@@ -1286,8 +1365,82 @@ fn parse_revision_cell(value: &str) -> Option<u16> {
     rest.trim_start_matches('.').trim().parse::<u16>().ok()
 }
 
+// --- sysID diagnostics ----------------------------------------------------
+
+/// Parses a real game page's cheat-export `<form>` (identified by its
+/// `action` attribute referencing `sub.exportCodes.php`, the same
+/// endpoint the PS2 provider already posts to) and every `<input
+/// type="hidden">` inside it. The numeric GameCube `sysID` is read
+/// straight from that form - it is never guessed or derived any other
+/// way.
+pub fn parse_gamecube_sysid_diagnostics(
+    game_id: u64,
+    title: &str,
+    game_page_url: &str,
+    bytes: &[u8],
+) -> Result<GameCubeSysIdDiagnostics, GameHackingError> {
+    let text = decode_provider_text(bytes, None);
+    let document = Html::parse_document(&text);
+    let form_selector = Selector::parse("form").expect("static selector");
+    let input_selector = Selector::parse("input").expect("static selector");
+    let export_form = document.select(&form_selector).find(|form| {
+        form.value()
+            .attr("action")
+            .is_some_and(|action| action.to_ascii_lowercase().contains("exportcodes.php"))
+    });
+    let Some(export_form) = export_form else {
+        return Err(gamecube_error(
+            GameHackingErrorKind::InvalidResponse,
+            format!("GameHacking.org game page {game_id} has no cheat-export form"),
+        ));
+    };
+    let export_form_action = export_form
+        .value()
+        .attr("action")
+        .unwrap_or_default()
+        .to_string();
+    let hidden_fields: Vec<(String, String)> = export_form
+        .select(&input_selector)
+        .filter(|input| {
+            input
+                .value()
+                .attr("type")
+                .is_some_and(|input_type| input_type.eq_ignore_ascii_case("hidden"))
+        })
+        .filter_map(|input| {
+            let name = input.value().attr("name")?;
+            let value = input.value().attr("value").unwrap_or_default();
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    let sys_id = hidden_fields
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("sysID"))
+        .and_then(|(_, value)| value.trim().parse::<u16>().ok());
+    Ok(GameCubeSysIdDiagnostics {
+        game_id,
+        title: title.to_string(),
+        game_page_url: game_page_url.to_string(),
+        export_form_action,
+        hidden_fields,
+        sys_id,
+    })
+}
+
 // --- Cheat export parsing -----------------------------------------------
 
+/// The confirmed real "Text" export shape (`export_format() == "Text"`,
+/// verified live against GameHacking game 54172, Luigi's Mansion) is a
+/// two-line header (Dolphin Game ID, then `"<title> (<region>)"`), a
+/// blank line, then repeated cheat blocks of a `<name> [<author>]` title
+/// line (author may be empty: `[]`) followed by one or more code lines,
+/// separated by blank lines. There is no `[Category\Title]` bracket
+/// section syntax and no `Encryption:`/`author=` field in this format at
+/// all - those are kept as a secondary, unambiguously-distinguishable
+/// fallback (a `[Category\Title]` line starts with `[` as its very first
+/// character, which a `<name> [<author>]` line never does) in case a
+/// differently-shaped export is ever returned, never guessed from this
+/// format's actual shape.
 pub fn parse_gamehacking_gamecube_export(
     game: &GameHackingGameCubeGame,
     bytes: &[u8],
@@ -1298,9 +1451,27 @@ pub fn parse_gamehacking_gamecube_export(
             "GameHacking.org GameCube export is not UTF-8",
         )
     })?;
+    let mut lines = text.lines().peekable();
+    // The confirmed real header is exactly a bare Dolphin Game ID line
+    // followed by a "<title> (<region>)" line - skip both (plus one
+    // blank separator line, if present) only when the very first line
+    // actually normalizes as a Game ID. This is a specific, unambiguous
+    // signal, never a generic "skip until the first blank line"
+    // heuristic that could eat real cheat content in other export
+    // shapes (e.g. the bracket-section fixtures covered below).
+    if lines
+        .peek()
+        .is_some_and(|first| normalize_gamecube_game_id(first.trim()).is_some())
+    {
+        lines.next();
+        lines.next();
+        if lines.peek().is_some_and(|line| line.trim().is_empty()) {
+            lines.next();
+        }
+    }
     let mut cheats = Vec::new();
     let mut pending = PendingGameCubeCheat::default();
-    for raw in text.lines() {
+    for raw in lines {
         let line = raw.trim_end_matches('\r');
         let trimmed = line.trim();
         if let Some(section) = gamecube_section_title(trimmed) {
@@ -1334,14 +1505,23 @@ pub fn parse_gamehacking_gamecube_export(
             continue;
         }
         if trimmed.is_empty() {
-            if !pending.code_lines.is_empty() {
-                flush_pending_gamecube_cheat(game, &mut pending, &mut cheats);
+            flush_pending_gamecube_cheat(game, &mut pending, &mut cheats);
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if pending.name.is_none() {
+            // The confirmed real title-line shape: "<name> [<author>]",
+            // with an optionally empty author ("[]").
+            let (name, author) = parse_gamecube_title_and_author(trimmed);
+            pending.name = Some(name);
+            if pending.author.is_none() {
+                pending.author = author;
             }
             continue;
         }
-        if !trimmed.starts_with("//") {
-            pending.description.push(decode_html_text(trimmed));
-        }
+        pending.description.push(decode_html_text(trimmed));
     }
     flush_pending_gamecube_cheat(game, &mut pending, &mut cheats);
     if cheats.is_empty() {
@@ -1449,6 +1629,25 @@ fn gamecube_section_title(line: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" › "),
     )
+}
+
+/// Splits the confirmed real title-line shape `"<name> [<author>]"` into
+/// its name and (optionally empty) author. Requires the line to actually
+/// end with `]` and contain a matching `[`; otherwise the whole line is
+/// treated as the name with no author, rather than guessing a split
+/// point.
+fn parse_gamecube_title_and_author(line: &str) -> (String, Option<String>) {
+    if line.ends_with(']')
+        && let Some(open) = line.rfind('[')
+    {
+        let name = line[..open].trim();
+        let author = line[open + 1..line.len() - 1].trim();
+        return (
+            decode_html_text(name),
+            (!author.is_empty()).then(|| decode_html_text(author)),
+        );
+    }
+    (decode_html_text(line.trim()), None)
 }
 
 fn strip_assignment<'a>(value: &'a str, label: &str) -> Option<&'a str> {
@@ -1785,6 +1984,96 @@ mod tests {
             adapter.index_url(),
             "https://gamehacking.org/system/ngc/all"
         );
+    }
+
+    /// GameHacking.org's numeric GameCube sysID was confirmed by fetching
+    /// a real game page (Luigi's Mansion, GameHacking game 54172) and
+    /// reading its cheat-export form's hidden `sysID` field directly -
+    /// never guessed. Pinned exactly so a future edit can't silently
+    /// regress it back to an unconfirmed placeholder.
+    #[test]
+    fn gamecube_adapter_system_id_is_the_confirmed_value() {
+        let adapter = GameCubeGameHackingAdapter;
+        assert_eq!(adapter.system_id(), Some(13));
+    }
+
+    /// A sanitized excerpt of the real Luigi's Mansion (GameHacking game
+    /// 54172) game page, trimmed to the cheat-export form plus an
+    /// unrelated distractor form, proving the parser picks the form by
+    /// its `action` (referencing `sub.exportCodes.php`) and reads the
+    /// `sysID` hidden field directly rather than guessing it.
+    #[test]
+    fn sysid_diagnostics_parse_the_real_export_form_fixture() {
+        let html =
+            include_bytes!("../../tests/fixtures/gamehacking/gamecube-game-page-export-form.html");
+        let diagnostics = parse_gamecube_sysid_diagnostics(
+            54172,
+            "Luigi's Mansion",
+            "https://gamehacking.org/game/54172",
+            html,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.export_form_action, "/inc/sub.exportCodes.php");
+        assert_eq!(diagnostics.sys_id, Some(13));
+        assert!(
+            diagnostics
+                .hidden_fields
+                .iter()
+                .any(|(name, value)| name == "gamID" && value == "54172")
+        );
+        assert!(
+            diagnostics
+                .hidden_fields
+                .iter()
+                .any(|(name, value)| name == "download" && value == "true")
+        );
+        // The distractor search form's unrelated hidden field must never
+        // be picked up as if it belonged to the export form.
+        assert!(
+            !diagnostics
+                .hidden_fields
+                .iter()
+                .any(|(name, _)| name == "unrelated")
+        );
+    }
+
+    #[test]
+    fn sysid_diagnostics_error_when_no_export_form_is_present() {
+        let html = b"<html><body><form action=\"/search.php\"></form></body></html>";
+        let error = parse_gamecube_sysid_diagnostics(
+            1,
+            "No Form Game",
+            "https://gamehacking.org/game/1",
+            html,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, GameHackingErrorKind::InvalidResponse);
+    }
+
+    /// A sanitized real export (Luigi's Mansion, GameHacking game 54172,
+    /// `format=Text`), trimmed to its header plus four representative
+    /// cheats including one with an empty author (`[]`) and one whose
+    /// title contains a period. Proves named cheats, real authors, and
+    /// the header skip all work against genuine live data, not just a
+    /// hand-written approximation of the format.
+    #[test]
+    fn real_gamecube_text_export_fixture_parses_named_cheats_and_authors() {
+        let export = include_bytes!("../../tests/fixtures/gamehacking/gamecube-real-export.txt");
+        let fixture_game = game(54172, "GLME01", "USA", "Luigi's Mansion");
+        let cheats = parse_gamehacking_gamecube_export(&fixture_game, export).unwrap();
+        assert_eq!(cheats.len(), 4);
+        assert_eq!(cheats[0].name, "99 of Some Treasures");
+        assert_eq!(cheats[0].author.as_deref(), Some("Codejunkies"));
+        assert_eq!(cheats[0].code_lines.len(), 7);
+        assert_eq!(cheats[0].code_format, GameCubeCodeFormat::RawUnknown);
+        assert_eq!(cheats[1].name, "999 Cash");
+        assert_eq!(cheats[2].name, "End Boss Has No HP");
+        assert_eq!(cheats[2].code_lines, vec!["04126E6C 60000000".to_string()]);
+        assert_eq!(cheats[3].name, "Matrix Look");
+        assert_eq!(cheats[3].author.as_deref(), Some("Dosha"));
+        // "Note []" has no code lines at all and must be silently
+        // dropped, not counted as a fifth cheat with a blank name.
+        assert!(cheats.iter().all(|cheat| cheat.name != "Note"));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use archivefs_core::patch_manager::{
     build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
     discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
     inspect_cheat_install_journal, load_catalogue_evidence_read_only,
-    load_cheat_catalogue_snapshot, load_dolphin_catalogue,
+    load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
     preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
 use archivefs_core::{
@@ -357,6 +357,80 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     result.pages_reused,
                     result.catalogue_path.display()
                 );
+            }
+        }
+        "gamehacking-gamecube-sysid-diagnostic" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-gamecube-sysid-diagnostic requires --game-id <id>")?;
+            let verify_fetch = extract_flag(&mut input_args, "--verify-fetch");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-sysid-diagnostic does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let catalogue = load_gamecube_catalogue(&options.cache_root)?;
+            let record = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| {
+                    format!(
+                        "game {game_id} was not found in the cached GameCube catalogue; run gamehacking-gamecube-index-refresh first"
+                    )
+                })?;
+            let game = record.as_game();
+            let provider = GameHackingGameCubeProvider::default();
+            let diagnostics = provider.diagnose_export_form(&game, &options)?;
+            let cheats = if verify_fetch && diagnostics.sys_id.is_some() {
+                Some(provider.fetch_cheats_for_diagnostic(&game, &options)?)
+            } else {
+                None
+            };
+            if json {
+                #[derive(serde::Serialize)]
+                struct DiagnosticOutput<'a> {
+                    #[serde(flatten)]
+                    diagnostics: &'a archivefs_core::patch_manager::GameCubeSysIdDiagnostics,
+                    cheats:
+                        Option<&'a Vec<archivefs_core::patch_manager::GameHackingGameCubeCheat>>,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&DiagnosticOutput {
+                        diagnostics: &diagnostics,
+                        cheats: cheats.as_ref(),
+                    })?
+                );
+            } else {
+                println!("Game ID: {}", diagnostics.game_id);
+                println!("Title: {}", diagnostics.title);
+                println!("Game page URL: {}", diagnostics.game_page_url);
+                println!("Export form action: {}", diagnostics.export_form_action);
+                println!("Hidden fields:");
+                for (name, value) in &diagnostics.hidden_fields {
+                    println!("  {name} = {value}");
+                }
+                match diagnostics.sys_id {
+                    Some(sys_id) => println!("Confirmed sysID: {sys_id}"),
+                    None => println!(
+                        "Confirmed sysID: none found (no hidden sysID field, or it did not parse as a number)"
+                    ),
+                }
+                if let Some(cheats) = &cheats {
+                    println!("Verified fetch: {} named cheat(s) parsed", cheats.len());
+                    for cheat in cheats {
+                        println!("  - {} [{:?}]", cheat.name, cheat.code_format);
+                    }
+                }
             }
         }
         "retroarch-environment" => {
@@ -3753,6 +3827,32 @@ fn extract_named_path_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_u64_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}").into())
+}
+
 fn cheat_history_options(
     journal_root_override: Option<PathBuf>,
 ) -> Result<CheatHistoryOptions, Box<dyn std::error::Error>> {
@@ -4396,6 +4496,9 @@ fn print_help() {
     println!(
         "  gamehacking-gamecube-index-refresh  Resume the cached public GameCube index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
     );
+    println!(
+        "  gamehacking-gamecube-sysid-diagnostic --game-id <id>  Fetch one cached catalogue game's real page and print its cheat-export form action, hidden fields, and confirmed sysID (--cache-root/--json accepted)"
+    );
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
@@ -4506,6 +4609,7 @@ fn print_help() {
     println!("  archivefs pcsx2-patch-preview --json");
     println!("  archivefs gamehacking-ps2-index-refresh");
     println!("  archivefs gamehacking-gamecube-index-refresh");
+    println!("  archivefs gamehacking-gamecube-sysid-diagnostic --game-id 54172");
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");

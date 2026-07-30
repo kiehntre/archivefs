@@ -232,14 +232,14 @@ pub use emulator_profile_memory::{
 };
 pub use gamehacking_gamecube_provider::{
     GAMEHACKING_GAMECUBE_PROVIDER_ID, GameCubeCodeFormat, GameCubeGameHackingAdapter,
-    GameCubeGameIdentity, GameCubeIdentityState, GameHackingGameCubeCatalogue,
-    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
-    GameHackingGameCubeIndexPage, GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
-    GameHackingGameCubeIndexRefreshResult, GameHackingGameCubeMatch,
-    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameCubeGameIdentity, GameCubeIdentityState, GameCubeSysIdDiagnostics,
+    GameHackingGameCubeCatalogue, GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions,
+    GameHackingGameCubeGame, GameHackingGameCubeIndexPage, GameHackingGameCubeIndexProgress,
+    GameHackingGameCubeIndexRecord, GameHackingGameCubeIndexRefreshResult,
+    GameHackingGameCubeMatch, GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
     GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, load_gamecube_catalogue,
-    normalize_gamecube_game_id, parse_gamehacking_gamecube_export,
-    parse_gamehacking_gamecube_index_page,
+    normalize_gamecube_game_id, parse_gamecube_sysid_diagnostics,
+    parse_gamehacking_gamecube_export, parse_gamehacking_gamecube_index_page,
 };
 pub use gamehacking_provider::{
     GAMEHACKING_PROVIDER_ID, GameHackingCheat, GameHackingError, GameHackingErrorKind,
