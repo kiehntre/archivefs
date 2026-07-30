@@ -1099,20 +1099,44 @@ fn decode_provider_text<'a>(bytes: &'a [u8], charset: Option<&str>) -> std::borr
     String::from_utf8_lossy(bytes)
 }
 
+/// Extracts a page number from an `<a>` element's `href`, resolved
+/// against `BASE_URL` so both root-relative (`/system/ngc/all/3`) and
+/// fully-qualified (`https://gamehacking.org/system/ngc/all/3`) hrefs are
+/// recognised identically - the live pagination widget's range labels
+/// (`"00 - An"`, `"An - Ba"`, ... `"Ze - Zo"`) carry no page number at
+/// all, only the numeric href does, so page numbers are never inferred
+/// from anchor text. Rejects anything that isn't exactly
+/// `/system/ngc/all/<non-negative integer>` (an optional single trailing
+/// slash is tolerated): a different host, an unrelated `ngc` path (e.g.
+/// `/system/ngc/game/123`), a deeper path, or a non-numeric suffix all
+/// return `None` rather than a guessed value.
+fn gamecube_page_number_from_href(href: &str) -> Option<u32> {
+    let base = Url::parse(BASE_URL).ok()?;
+    let resolved = base.join(href).ok()?;
+    if resolved.host_str() != Some("gamehacking.org") {
+        return None;
+    }
+    let suffix = resolved.path().strip_prefix("/system/ngc/all/")?;
+    let suffix = suffix.trim_end_matches('/');
+    if suffix.is_empty() || suffix.contains('/') {
+        return None;
+    }
+    suffix.parse::<u32>().ok()
+}
+
 fn parse_gamecube_index_page_numbers(
     bytes: &[u8],
     charset: Option<&str>,
 ) -> Result<Vec<u32>, GameHackingError> {
     let text = decode_provider_text(bytes, charset);
     let document = Html::parse_document(&text);
-    let selector = Selector::parse("a[href^='/system/ngc/all/']").expect("static selector");
+    let selector = Selector::parse("a[href]").expect("static selector");
     let mut pages = BTreeSet::new();
     for node in document.select(&selector) {
         if let Some(page) = node
             .value()
             .attr("href")
-            .and_then(|href| href.trim_end_matches('/').rsplit('/').next())
-            .and_then(|page| page.parse::<u32>().ok())
+            .and_then(gamecube_page_number_from_href)
         {
             pages.insert(page);
         }
@@ -1123,6 +1147,15 @@ fn parse_gamecube_index_page_numbers(
             "GameHacking.org GameCube root index contained no numbered pages",
         ));
     }
+    // The document just parsed is the root page itself, i.e. page 0,
+    // whether or not its own pagination widget links back to the
+    // currently-displayed range (the live page's first range, "00 - An",
+    // is not always a link to itself). Inserted only after confirming at
+    // least one other real numbered link exists above, so a response
+    // with no real pagination links still fails loudly instead of
+    // silently reporting a single fabricated page. `BTreeSet` naturally
+    // deduplicates if `/system/ngc/all/0` was also linked explicitly.
+    pages.insert(0);
     let pages = pages.into_iter().collect::<Vec<_>>();
     let expected_len = u32::try_from(pages.len()).map_err(|_| {
         gamecube_error(
@@ -1897,14 +1930,99 @@ mod tests {
         );
     }
 
+    /// The live pagination widget's visible labels are alphabetic ranges
+    /// ("00 - An", "An - Ba", ... "Ze - Zo"), never a page number - only
+    /// the numeric hrefs (`/system/ngc/all/0`, `/system/ngc/all/1`, ...)
+    /// identify pages. Mirrors the real root page's shape closely enough
+    /// to catch a regression back to label-based parsing.
+    fn range_labelled_root_page_html(self_links_page_zero: bool) -> String {
+        // Real ranges are contiguous with no gaps; only the first
+        // ("00 - An") and last ("Ze - Zo") carry recognisable labels in
+        // this fixture, the rest use a generic label - the parser must
+        // not care either way, since it never reads anchor text at all.
+        let labels: [&str; 26] = [
+            "00 - An", "range 1", "range 2", "range 3", "range 4", "range 5", "range 6", "range 7",
+            "range 8", "range 9", "range 10", "range 11", "range 12", "range 13", "range 14",
+            "range 15", "range 16", "range 17", "range 18", "range 19", "range 20", "range 21",
+            "range 22", "range 23", "range 24", "Ze - Zo",
+        ];
+        let mut html = String::from("<nav>");
+        for (page, label) in labels.iter().enumerate() {
+            if page == 0 && !self_links_page_zero {
+                html.push_str(&format!("<span class=\"current\">{label}</span>"));
+            } else {
+                html.push_str(&format!("<a href=\"/system/ngc/all/{page}\">{label}</a>"));
+            }
+        }
+        html.push_str("</nav>");
+        html
+    }
+
+    #[test]
+    fn href_based_page_discovery_ignores_range_labels() {
+        let html = range_labelled_root_page_html(true);
+        let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
+        assert_eq!(pages.first(), Some(&0));
+        assert_eq!(pages.last(), Some(&25));
+        assert!(pages.contains(&1));
+        assert!(pages.contains(&3));
+    }
+
+    #[test]
+    fn root_page_without_a_self_link_to_page_zero_still_yields_page_zero() {
+        // The real root page's first range ("00 - An") is the
+        // currently-displayed page and is not always a clickable link -
+        // page 0 must still be accepted without erroring or duplicating.
+        let html = range_labelled_root_page_html(false);
+        let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
+        assert_eq!(pages.first(), Some(&0));
+        assert_eq!(pages.iter().filter(|page| **page == 0).count(), 1);
+    }
+
+    #[test]
+    fn duplicate_page_zero_href_is_deduplicated_not_double_counted() {
+        let html = r#"<a href="/system/ngc/all/0">00 - An</a><a href="/system/ngc/all/0">00 - An</a><a href="/system/ngc/all/1">An - Ba</a>"#;
+        let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
+        assert_eq!(pages, vec![0, 1]);
+    }
+
+    #[test]
+    fn absolute_and_relative_hrefs_are_recognised_identically() {
+        let html = r#"<a href="/system/ngc/all/0">00 - An</a><a href="https://gamehacking.org/system/ngc/all/1">An - Ba</a><a href="/system/ngc/all/2">Ba - Bi</a>"#;
+        let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
+        assert_eq!(pages, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn unrelated_ngc_links_and_malformed_suffixes_are_rejected() {
+        let html = r#"<a href="/system/ngc/all/0">00 - An</a>
+<a href="/system/ngc/all/1">An - Ba</a>
+<a href="/system/ngc/game/501">Some Game</a>
+<a href="/system/ngc/all/abc">Not a page number</a>
+<a href="/system/ngc/all/1/extra">Deeper path</a>
+<a href="https://example.com/system/ngc/all/9">Wrong host</a>"#;
+        let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
+        assert_eq!(pages, vec![0, 1]);
+    }
+
     #[test]
     fn index_page_numbers_require_a_complete_zero_based_run() {
-        let html = r#"<a href="/system/ngc/all/0">0</a><a href="/system/ngc/all/1">1</a><a href="/system/ngc/all/2">2</a>"#;
+        let html = r#"<a href="/system/ngc/all/0">00 - An</a><a href="/system/ngc/all/1">An - Ba</a><a href="/system/ngc/all/2">Ba - Bi</a>"#;
         let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
         assert_eq!(pages, vec![0, 1, 2]);
 
-        let incomplete = r#"<a href="/system/ngc/all/0">0</a><a href="/system/ngc/all/2">2</a>"#;
+        let incomplete =
+            r#"<a href="/system/ngc/all/0">00 - An</a><a href="/system/ngc/all/2">Ba - Bi</a>"#;
         assert!(parse_gamecube_index_page_numbers(incomplete.as_bytes(), None).is_err());
+    }
+
+    #[test]
+    fn no_page_error_only_when_no_valid_hrefs_exist_at_all() {
+        let html =
+            r#"<a href="/other/page">Unrelated</a><a href="/system/ngc/game/501">Some Game</a>"#;
+        let error = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap_err();
+        assert_eq!(error.kind, GameHackingErrorKind::InvalidResponse);
+        assert!(error.detail.contains("no numbered pages"));
     }
 
     #[test]
