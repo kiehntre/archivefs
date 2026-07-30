@@ -1231,55 +1231,59 @@ pub fn parse_gamehacking_pnach(
         )
     })?;
     let mut cheats = Vec::new();
-    let mut comments = Vec::new();
-    let mut patches = Vec::new();
-    let flush = |comments: &mut Vec<String>,
-                 patches: &mut Vec<String>,
-                 cheats: &mut Vec<GameHackingCheat>| {
-        if patches.is_empty() {
-            return;
-        }
-        let mut author = None;
-        let mut description = Vec::new();
-        let mut name = None;
-        for comment in comments.drain(..) {
-            let trimmed = comment.trim();
-            if let Some(value) = strip_label(trimmed, "author") {
-                author = Some(value.to_string());
-            } else if let Some(value) = strip_label(trimmed, "description") {
-                description.push(value.to_string());
-            } else if name.is_none() && !trimmed.is_empty() {
-                name = Some(trimmed.to_string());
-            } else if !trimmed.is_empty() {
-                description.push(trimmed.to_string());
-            }
-        }
-        let index = cheats.len() + 1;
-        let name = name.unwrap_or_else(|| format!("Cheat {index}"));
-        cheats.push(GameHackingCheat {
-            id: format!("gh-{}-{index}", game.game_id),
-            name,
-            author,
-            description: (!description.is_empty()).then(|| description.join(" ")),
-            patch_lines: std::mem::take(patches),
-            source_game_id: game.game_id,
-            source_url: game.source_url.clone(),
-        });
-    };
+    let mut pending = PendingPnachCheat::default();
     for raw in text.lines() {
         let line = raw.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if let Some(section) = pnach_section_title(trimmed) {
+            flush_pending_pnach(game, &mut pending, &mut cheats);
+            pending.name = Some(section);
+            continue;
+        }
         if let Some(comment) = line.trim_start().strip_prefix("//") {
-            if !patches.is_empty() {
-                flush(&mut comments, &mut patches, &mut cheats);
+            if !pending.patch_lines.is_empty() {
+                flush_pending_pnach(game, &mut pending, &mut cheats);
             }
-            comments.push(comment.trim().to_string());
-        } else if line.trim_start().starts_with("patch=") {
-            patches.push(line.to_string());
-        } else if line.trim().is_empty() && !patches.is_empty() {
-            flush(&mut comments, &mut patches, &mut cheats);
+            pending.comments.push(comment.trim().to_string());
+            continue;
+        }
+        if let Some(value) = strip_assignment(trimmed, "author") {
+            pending.author = nonempty_decoded(value);
+            pending.reading_description = false;
+            continue;
+        }
+        if let Some(value) = strip_assignment(trimmed, "description") {
+            if let Some(value) = nonempty_decoded(value) {
+                pending.description.push(value);
+            }
+            pending.reading_description = true;
+            continue;
+        }
+        if let Some(value) =
+            strip_assignment(trimmed, "note").or_else(|| strip_assignment(trimmed, "notes"))
+        {
+            if let Some(value) = nonempty_decoded(value) {
+                pending.description.push(value);
+            }
+            pending.reading_description = true;
+            continue;
+        }
+        if line.trim_start().starts_with("patch=") {
+            pending.reading_description = false;
+            pending.patch_lines.push(line.to_string());
+            continue;
+        }
+        if trimmed.is_empty() {
+            if !pending.patch_lines.is_empty() {
+                flush_pending_pnach(game, &mut pending, &mut cheats);
+            }
+            continue;
+        }
+        if pending.reading_description && pending.patch_lines.is_empty() {
+            pending.description.push(decode_html_text(trimmed));
         }
     }
-    flush(&mut comments, &mut patches, &mut cheats);
+    flush_pending_pnach(game, &mut pending, &mut cheats);
     if cheats.is_empty() {
         return Err(error(
             GameHackingErrorKind::InvalidResponse,
@@ -1287,6 +1291,120 @@ pub fn parse_gamehacking_pnach(
         ));
     }
     Ok(cheats)
+}
+
+#[derive(Debug, Default)]
+struct PendingPnachCheat {
+    name: Option<String>,
+    author: Option<String>,
+    description: Vec<String>,
+    comments: Vec<String>,
+    patch_lines: Vec<String>,
+    reading_description: bool,
+}
+
+fn flush_pending_pnach(
+    game: &GameHackingGame,
+    pending: &mut PendingPnachCheat,
+    cheats: &mut Vec<GameHackingCheat>,
+) {
+    if pending.patch_lines.is_empty() {
+        *pending = PendingPnachCheat::default();
+        return;
+    }
+    for comment in std::mem::take(&mut pending.comments) {
+        let trimmed = comment.trim();
+        if let Some(value) = strip_label(trimmed, "author") {
+            pending.author = nonempty_decoded(value);
+        } else if let Some(value) = strip_label(trimmed, "description")
+            .or_else(|| strip_label(trimmed, "note"))
+            .or_else(|| strip_label(trimmed, "notes"))
+        {
+            if let Some(value) = nonempty_decoded(value) {
+                pending.description.push(value);
+            }
+        } else if pending.name.is_none() && trustworthy_cheat_comment(game, trimmed) {
+            pending.name = Some(decode_html_text(trimmed));
+        } else if !trimmed.is_empty() && !is_generated_pnach_comment(game, trimmed) {
+            pending.description.push(decode_html_text(trimmed));
+        }
+    }
+    let index = cheats.len() + 1;
+    let name = pending
+        .name
+        .take()
+        .unwrap_or_else(|| format!("Cheat {index}"));
+    cheats.push(GameHackingCheat {
+        id: format!("gh-{}-{index}", game.game_id),
+        name,
+        author: pending.author.take(),
+        description: normalized_description(std::mem::take(&mut pending.description)),
+        patch_lines: std::mem::take(&mut pending.patch_lines),
+        source_game_id: game.game_id,
+        source_url: game.source_url.clone(),
+    });
+    *pending = PendingPnachCheat::default();
+}
+
+fn pnach_section_title(line: &str) -> Option<String> {
+    let title = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(
+        title
+            .split('\\')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(decode_html_text)
+            .collect::<Vec<_>>()
+            .join(" › "),
+    )
+}
+
+fn strip_assignment<'a>(value: &'a str, label: &str) -> Option<&'a str> {
+    let (head, tail) = value.split_once('=')?;
+    head.trim()
+        .eq_ignore_ascii_case(label)
+        .then_some(tail.trim())
+}
+
+fn nonempty_decoded(value: &str) -> Option<String> {
+    let value = decode_html_text(value);
+    (!value.trim().is_empty()).then(|| value.trim().to_string())
+}
+
+fn decode_html_text(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let fragment = Html::parse_fragment(value);
+    fragment.root_element().text().collect::<String>()
+}
+
+fn normalized_description(lines: Vec<String>) -> Option<String> {
+    let mut normalized = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if !line.is_empty() {
+            normalized.push(line.to_string());
+        }
+    }
+    (!normalized.is_empty()).then(|| normalized.join("\n"))
+}
+
+fn trustworthy_cheat_comment(game: &GameHackingGame, comment: &str) -> bool {
+    !comment.is_empty() && !is_generated_pnach_comment(game, comment)
+}
+
+fn is_generated_pnach_comment(game: &GameHackingGame, comment: &str) -> bool {
+    let comment_lower = comment.to_ascii_lowercase();
+    let title_lower = game.title.to_ascii_lowercase();
+    comment_lower == title_lower
+        || comment_lower.starts_with(&format!("{title_lower} ("))
+        || comment
+            .to_ascii_lowercase()
+            .starts_with("file generated by gamehacking.org")
 }
 
 fn strip_label<'a>(value: &'a str, label: &str) -> Option<&'a str> {
@@ -1537,6 +1655,44 @@ mod tests {
             cheats[0].patch_lines[0],
             "patch=1,EE,20123456,word,00000001"
         );
+    }
+
+    #[test]
+    fn native_section_headers_keep_multiple_real_cheat_names_and_notes() {
+        let source = include_bytes!("../../tests/fixtures/gamehacking/named-export.pnach");
+        let cheats = parse_gamehacking_pnach(&game(), source).unwrap();
+        assert_eq!(cheats.len(), 3);
+        assert_eq!(cheats[0].name, "Player Codes › Infinite Health");
+        assert_eq!(cheats[0].author.as_deref(), Some("Ada"));
+        assert_eq!(
+            cheats[0].description.as_deref(),
+            Some("Health never decreases.")
+        );
+        assert_eq!(
+            cheats[1].name,
+            "Inventory › Unlock All Items [Save + Reload]"
+        );
+        assert_eq!(cheats[1].author.as_deref(), Some("Grace"));
+        assert_eq!(
+            cheats[1].description.as_deref(),
+            Some(
+                "Open the inventory after reloading.\nThis second line is retained as part of the notes."
+            )
+        );
+        assert_eq!(cheats[1].patch_lines.len(), 1);
+        assert_eq!(cheats[2].name, "Camera follows arrow [hold select]");
+        assert_eq!(
+            cheats[2].description.as_deref(),
+            Some("It's useful for exploring.")
+        );
+        assert!(cheats.iter().all(|cheat| !cheat.name.starts_with("Cheat ")));
+    }
+
+    #[test]
+    fn numbered_name_is_used_only_when_export_has_no_trustworthy_title() {
+        let cheats =
+            parse_gamehacking_pnach(&game(), b"patch=1,EE,20123456,word,00000001\n").unwrap();
+        assert_eq!(cheats[0].name, "Cheat 1");
     }
 
     #[test]

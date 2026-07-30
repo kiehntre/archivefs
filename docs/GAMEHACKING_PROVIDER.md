@@ -38,6 +38,13 @@ encrypted formats or reinterpret unknown lines. Only strict PCSX2 `patch=`
 lines enter the selectable install path.
 
 The GUI previews individual cheats with their names, authors, and descriptions.
+Native PCSX2 exports encode those names in `[category\title]` section headers,
+with `author=` and possibly multiline `description=` metadata before each
+block's `patch=` lines. ArchiveFS retains each section as a separate cheat,
+shows the readable category and title as its primary label, and uses `Cheat N`
+only when neither a section header nor a trustworthy PNACH comment provides a
+name.
+
 Selected entries are merged into a PNACH named for the verified local CRC. The
 existing shared transaction engine provides preview, explicit replacement
 confirmation, backup, journaled apply, and Undo. Existing user content is

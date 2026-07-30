@@ -35,6 +35,10 @@ guessing at intent, dates, or scope.
 
 ### Cheats & Mods
 
+- GameHacking native PCSX2 section headers, authors, and multiline
+  descriptions are now retained, so selectable entries show their real cheat
+  names and notes instead of generic `Cheat N` placeholders.
+
 - Replaced the incomplete single-page GameHacking PS2 lookup with a resumable,
   rate-limited local index catalogue covering every numbered public PS2 index
   page. Runtime matching now prioritizes normalized serial/CRC/region evidence;

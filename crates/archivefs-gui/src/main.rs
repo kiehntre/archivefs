@@ -21329,7 +21329,7 @@ fn show_pcsx2_gamehacking(
                         ui.label(format!("Author: {author}"));
                     }
                     if let Some(description) = &candidate.description {
-                        ui.label(description);
+                        ui.label(format!("Notes: {description}"));
                     }
                 });
             }
@@ -36240,6 +36240,68 @@ $Instant Growth [Nayr]\n";
                 "missing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn pcsx2_gamehacking_cheat_uses_real_name_as_primary_label() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.pcsx2_gamehacking =
+            CheatStepResource::Ready(Pcsx2GameHackingState {
+                status: GameHackingMatchStatus::Matched,
+                detail: "Matched from the local catalogue.".to_string(),
+                game: Some(GameHackingGame {
+                    game_id: 42,
+                    title: "Example Game".to_string(),
+                    system: "PlayStation 2".to_string(),
+                    region: Some("NTSC-U".to_string()),
+                    serial: Some("SLUS-12345".to_string()),
+                    crc: Some("A1B2C3D4".to_string()),
+                    source_url: "https://gamehacking.org/game/42".to_string(),
+                }),
+                match_candidates: Vec::new(),
+                candidates: vec![Pcsx2CheatCandidate {
+                id: "gh-42-1".to_string(),
+                name: "Player Codes › Infinite Health".to_string(),
+                description: Some("Health never decreases.".to_string()),
+                author: Some("Ada".to_string()),
+                source_game_id: Some("42".to_string()),
+                source_url: Some("https://gamehacking.org/game/42".to_string()),
+                provider_id: "gamehacking.org".to_string(),
+                provider_name: "GameHacking.org".to_string(),
+                source: "https://gamehacking.org/game/42".to_string(),
+                game_crc: "A1B2C3D4".to_string(),
+                serial_constraint: Some("SLUS-12345".to_string()),
+                region_constraint: Some("NTSC-U".to_string()),
+                patch_lines: vec![archivefs_core::patch_manager::PnachPatchLine::parse(
+                    "patch=1,EE,20123456,word,00000001",
+                )
+                .unwrap()],
+                confidence:
+                    archivefs_core::patch_manager::Pcsx2CheatConfidence::VerifiedCrcAndConstraints,
+                compatibility: archivefs_core::patch_manager::Pcsx2CheatCompatibility::Compatible,
+            }],
+                selection: Pcsx2CheatSelection::default(),
+            });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_gamehacking(ui, workflow);
+            });
+        });
+        for expected in [
+            "Player Codes › Infinite Health",
+            "Author: Ada",
+            "Notes: Health never decreases.",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!rendered_text_contains(&output, "Cheat 1"));
     }
 
     #[test]
