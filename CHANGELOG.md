@@ -35,6 +35,13 @@ guessing at intent, dates, or scope.
 
 ### Cheats & Mods
 
+- Replaced the incomplete single-page GameHacking PS2 lookup with a resumable,
+  rate-limited local index catalogue covering every numbered public PS2 index
+  page. Runtime matching now prioritizes normalized serial/CRC/region evidence;
+  title-only and ambiguous results are shown for explicit confirmation before
+  one native PCSX2 export is requested. Downloaded index/catalogue data remains
+  private cache data and is not shipped or committed.
+
 - Added the general GameHacking.org provider core with PS2/PCSX2 as its first
   adapter. It checks one selected local-library game at a time, fails closed on
   serial/CRC/region conflicts, caches public pages and native PNACH exports,

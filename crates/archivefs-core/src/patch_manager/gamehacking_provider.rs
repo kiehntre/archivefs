@@ -1,8 +1,9 @@
-//! Bounded, per-library-game access to GameHacking.org.
+//! Cached PS2 catalogue and per-library-game access to GameHacking.org.
 //!
 //! Retrieval, HTML parsing, identity matching, PNACH parsing, and installation
-//! remain separate. The provider never enumerates more than the one PS2 index
-//! needed to find title candidates and fetches candidate game pages serially.
+//! remain separate. The explicit index command walks only the numbered public
+//! PS2 table pages. Runtime matching is local, and only one selected game's
+//! PNACH is requested after an automatic match or user confirmation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -13,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::pcsx2::normalize_crc;
@@ -33,9 +35,13 @@ const USER_AGENT: &str = concat!(
     " (+https://github.com/davedap/archivefs; one-game-at-a-time cheat provider)"
 );
 const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EXPORT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RETRIES: u8 = 3;
+const PS2_CATALOGUE_SCHEMA_VERSION: u32 = 1;
+const PS2_CATALOGUE_FILE: &str = "ps2-catalogue.json";
+const PS2_INDEX_ROOT_CACHE_FILE: &str = "ps2-index-root.html";
+const LEGACY_PS2_INDEX_CACHE_FILE: &str = "ps2-index.html";
+const MAX_PS2_INDEX_PAGES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameHackingErrorKind {
@@ -98,6 +104,7 @@ pub struct GameHackingCheat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameHackingMatchStatus {
     Matched,
+    Candidates,
     NoMatch,
     IdentityConflict,
     IdentityIncomplete,
@@ -107,7 +114,109 @@ pub enum GameHackingMatchStatus {
 pub struct GameHackingMatch {
     pub status: GameHackingMatchStatus,
     pub game: Option<GameHackingGame>,
+    pub candidates: Vec<GameHackingMatchCandidate>,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GameHackingMatchStrength {
+    ExactSerialAndCrc,
+    ExactSerialAndRegion,
+    ExactCrc,
+    NormalizedTitle,
+}
+
+impl GameHackingMatchStrength {
+    fn priority(self) -> u8 {
+        match self {
+            Self::ExactSerialAndCrc => 1,
+            Self::ExactSerialAndRegion => 2,
+            Self::ExactCrc => 3,
+            Self::NormalizedTitle => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExactSerialAndCrc => "exact serial + CRC",
+            Self::ExactSerialAndRegion => "exact serial + compatible region",
+            Self::ExactCrc => "exact CRC",
+            Self::NormalizedTitle => "normalized title only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameHackingMatchCandidate {
+    pub game: GameHackingGame,
+    pub strength: GameHackingMatchStrength,
+    pub requires_user_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameHackingIndexPage {
+    pub page_number: u32,
+    pub source_url: String,
+    pub retrieved_at_unix_seconds: u64,
+    pub sha256: String,
+    pub game_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameHackingIndexRecord {
+    pub game_id: u64,
+    pub title: String,
+    pub serial: Option<String>,
+    pub region: Option<String>,
+    pub crc: Option<String>,
+    pub source_url: String,
+    pub index_source_url: String,
+    pub retrieved_at_unix_seconds: u64,
+}
+
+impl GameHackingIndexRecord {
+    fn as_game(&self) -> GameHackingGame {
+        GameHackingGame {
+            game_id: self.game_id,
+            title: self.title.clone(),
+            system: "PlayStation 2".to_string(),
+            region: self.region.clone(),
+            serial: self.serial.clone(),
+            crc: self.crc.clone(),
+            source_url: self.source_url.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameHackingPs2Catalogue {
+    pub schema_version: u32,
+    pub provider: String,
+    pub system: String,
+    pub source_url: String,
+    pub retrieved_at_unix_seconds: u64,
+    pub pages: Vec<GameHackingIndexPage>,
+    pub games: Vec<GameHackingIndexRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GameHackingIndexRefreshResult {
+    pub catalogue_path: PathBuf,
+    pub pages_total: usize,
+    pub pages_downloaded: usize,
+    pub pages_reused: usize,
+    pub games: usize,
+    pub retrieved_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameHackingIndexProgress {
+    pub pages_complete: usize,
+    pub pages_total: usize,
+    pub page_number: Option<u32>,
+    pub downloaded: bool,
+    pub games_collected: usize,
 }
 
 pub trait GameHackingSystemAdapter: Send + Sync {
@@ -139,7 +248,7 @@ impl GameHackingSystemAdapter for Ps2GameHackingAdapter {
     }
 
     fn supports(&self, identity: &Pcsx2GameIdentity) -> bool {
-        identity.verified_crc().is_some() && identity.serial.is_some() && identity.region.is_some()
+        identity.verified_crc().is_some()
     }
 }
 
@@ -336,12 +445,6 @@ fn charset_from_content_type(content_type: &str) -> Option<String> {
     })
 }
 
-#[derive(Debug, Clone)]
-struct GameLink {
-    game_id: u64,
-    title: String,
-}
-
 pub struct GameHackingProvider<A = Ps2GameHackingAdapter> {
     adapter: A,
     transport: UreqGameHackingTransport,
@@ -366,66 +469,192 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             return Ok(GameHackingMatch {
                 status: GameHackingMatchStatus::IdentityIncomplete,
                 game: None,
-                detail: "A verified PS2 serial, region, and PCSX2 CRC are required before checking GameHacking.org.".to_string(),
+                candidates: Vec::new(),
+                detail: "A verified local PCSX2 executable CRC is required before checking the cached GameHacking.org PS2 catalogue.".to_string(),
             });
         }
-        self.check_robots(options, &["/system/ps2/all", "/game/"])?;
-        let index = self.cached_request(
-            "ps2-index.html",
-            self.adapter.index_url(),
-            MAX_INDEX_BYTES,
-            options,
-            |transport| transport.get(self.adapter.index_url(), MAX_INDEX_BYTES),
-        )?;
-        let title_key = normalized_title(&identity.title);
-        let links = parse_game_links(&index.bytes, index.charset.as_deref())?;
-        let candidates: Vec<GameLink> = links
-            .into_iter()
-            .filter(|link| normalized_title(&link.title) == title_key)
-            .collect();
+        let catalogue = load_ps2_catalogue(&options.cache_root)?;
+        let mut candidates = match_ps2_catalogue(identity, &catalogue);
         if candidates.is_empty() {
             return Ok(GameHackingMatch {
                 status: GameHackingMatchStatus::NoMatch,
                 game: None,
-                detail: "No GameHacking.org title matched this local game.".to_string(),
+                candidates: Vec::new(),
+                detail: "No serial, CRC, or normalized-title match exists in the cached GameHacking.org PS2 catalogue.".to_string(),
             });
         }
-        let mut conflicts = Vec::new();
-        for link in candidates {
-            check_cancelled(options)?;
-            let url = format!("{BASE_URL}/game/{}", link.game_id);
-            let cache_name = format!("game-{}.html", link.game_id);
-            let page =
-                self.cached_request(&cache_name, &url, MAX_PAGE_BYTES, options, |transport| {
-                    transport.get(&url, MAX_PAGE_BYTES)
-                })?;
-            let game = parse_gamehacking_game_page_with_charset(
-                link.game_id,
-                &url,
-                &page.bytes,
-                page.charset.as_deref(),
-            )?;
-            match exact_identity_match(identity, &game) {
-                Ok(()) => {
-                    return Ok(GameHackingMatch {
-                        status: GameHackingMatchStatus::Matched,
-                        detail: format!(
-                            "Matched {} by serial, region, and verified CRC.",
-                            game.title
-                        ),
-                        game: Some(game),
-                    });
-                }
-                Err(detail) => conflicts.push(detail),
-            }
+        candidates.sort_by(|left, right| {
+            left.strength
+                .priority()
+                .cmp(&right.strength.priority())
+                .then_with(|| left.game.title.cmp(&right.game.title))
+                .then_with(|| left.game.game_id.cmp(&right.game.game_id))
+        });
+        let best_priority = candidates[0].strength.priority();
+        candidates.retain(|candidate| candidate.strength.priority() == best_priority);
+        if candidates.len() == 1 && !candidates[0].requires_user_confirmation {
+            let selected = candidates.remove(0);
+            return Ok(GameHackingMatch {
+                status: GameHackingMatchStatus::Matched,
+                detail: format!(
+                    "Matched {} by {} from the cached PS2 catalogue.",
+                    selected.game.title,
+                    selected.strength.label()
+                ),
+                game: Some(selected.game),
+                candidates: Vec::new(),
+            });
         }
         Ok(GameHackingMatch {
-            status: GameHackingMatchStatus::IdentityConflict,
+            status: GameHackingMatchStatus::Candidates,
             game: None,
-            detail: format!(
-                "Title matched, but identity conflicted: {}",
-                conflicts.join("; ")
-            ),
+            detail: if best_priority == GameHackingMatchStrength::NormalizedTitle.priority() {
+                "Only normalized-title candidates were found. Confirm the correct GameHacking.org game before downloading its PCSX2 export.".to_string()
+            } else {
+                "More than one equally strong identity match was found. Confirm the correct GameHacking.org game before downloading its PCSX2 export.".to_string()
+            },
+            candidates,
+        })
+    }
+
+    pub fn refresh_ps2_index<F>(
+        &self,
+        options: &GameHackingFetchOptions,
+        mut progress: F,
+    ) -> Result<GameHackingIndexRefreshResult, GameHackingError>
+    where
+        F: FnMut(GameHackingIndexProgress),
+    {
+        self.check_robots(options, &["/system/ps2/all"])?;
+        prepare_cache(&options.cache_root)?;
+        let preferred_root = options.cache_root.join(PS2_INDEX_ROOT_CACHE_FILE);
+        let legacy_root = options.cache_root.join(LEGACY_PS2_INDEX_CACHE_FILE);
+        let root_cache_name = if preferred_root.is_file() {
+            PS2_INDEX_ROOT_CACHE_FILE
+        } else if legacy_root.is_file() {
+            LEGACY_PS2_INDEX_CACHE_FILE
+        } else {
+            PS2_INDEX_ROOT_CACHE_FILE
+        };
+        let root_path = options.cache_root.join(root_cache_name);
+        let root_was_cached = root_path.is_file();
+        let resume_options = GameHackingFetchOptions {
+            cache_root: options.cache_root.clone(),
+            force_refresh: false,
+            delay: Duration::from_secs(2),
+            cancellation: options.cancellation.clone(),
+        };
+        let root = self.cached_request(
+            root_cache_name,
+            self.adapter.index_url(),
+            MAX_INDEX_BYTES,
+            &resume_options,
+            |transport| transport.get(self.adapter.index_url(), MAX_INDEX_BYTES),
+        )?;
+        let page_numbers = parse_ps2_index_page_numbers(&root.bytes, root.charset.as_deref())?;
+        if page_numbers.len() > MAX_PS2_INDEX_PAGES {
+            return Err(error(
+                GameHackingErrorKind::InvalidResponse,
+                "GameHacking.org PS2 index exceeded the page limit",
+            ));
+        }
+        let mut pages = Vec::with_capacity(page_numbers.len());
+        let mut games_by_id = BTreeMap::<u64, GameHackingIndexRecord>::new();
+        let mut downloaded = 0usize;
+        let mut reused = 0usize;
+        for (position, page_number) in page_numbers.iter().copied().enumerate() {
+            check_cancelled(&resume_options)?;
+            let url = format!("{}/{}", self.adapter.index_url(), page_number);
+            let cache_name = format!("ps2-index-page-{page_number}.html");
+            let cache_path = options.cache_root.join(&cache_name);
+            let (response, was_cached, retrieval_path, page_source_url) = if page_number == 0 {
+                (
+                    root.clone(),
+                    root_was_cached,
+                    root_path.clone(),
+                    self.adapter.index_url().to_string(),
+                )
+            } else {
+                let was_cached = cache_path.is_file();
+                let response = self.cached_request(
+                    &cache_name,
+                    &url,
+                    MAX_INDEX_BYTES,
+                    &resume_options,
+                    |transport| transport.get(&url, MAX_INDEX_BYTES),
+                )?;
+                (response, was_cached, cache_path, url.clone())
+            };
+            if was_cached {
+                reused += 1;
+            } else {
+                downloaded += 1;
+            }
+            let retrieved_at = cache_retrieved_at(&retrieval_path)?;
+            let mut page_games = parse_ps2_index_page(
+                &page_source_url,
+                retrieved_at,
+                &response.bytes,
+                response.charset.as_deref(),
+            )?;
+            page_games.sort_by_key(|game| game.game_id);
+            for game in &page_games {
+                games_by_id
+                    .entry(game.game_id)
+                    .or_insert_with(|| game.clone());
+            }
+            pages.push(GameHackingIndexPage {
+                page_number,
+                source_url: page_source_url,
+                retrieved_at_unix_seconds: retrieved_at,
+                sha256: sha256_hex(&response.bytes),
+                game_count: page_games.len(),
+            });
+            progress(GameHackingIndexProgress {
+                pages_complete: position + 1,
+                pages_total: page_numbers.len(),
+                page_number: Some(page_number),
+                downloaded: !was_cached,
+                games_collected: games_by_id.len(),
+            });
+        }
+        let mut games = games_by_id.into_values().collect::<Vec<_>>();
+        games.sort_by(|left, right| {
+            left.game_id
+                .cmp(&right.game_id)
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        pages.sort_by_key(|page| page.page_number);
+        let retrieved_at = pages
+            .iter()
+            .map(|page| page.retrieved_at_unix_seconds)
+            .max()
+            .unwrap_or_else(unix_seconds_now);
+        let catalogue = GameHackingPs2Catalogue {
+            schema_version: PS2_CATALOGUE_SCHEMA_VERSION,
+            provider: GAMEHACKING_PROVIDER_ID.to_string(),
+            system: self.adapter.system_name().to_string(),
+            source_url: self.adapter.index_url().to_string(),
+            retrieved_at_unix_seconds: retrieved_at,
+            pages,
+            games,
+        };
+        let catalogue_path = options.cache_root.join(PS2_CATALOGUE_FILE);
+        let mut bytes = serde_json::to_vec_pretty(&catalogue).map_err(|failure| {
+            error(
+                GameHackingErrorKind::CacheUnavailable,
+                format!("GameHacking.org catalogue could not be serialized: {failure}"),
+            )
+        })?;
+        bytes.push(b'\n');
+        atomic_write(&catalogue_path, &bytes)?;
+        Ok(GameHackingIndexRefreshResult {
+            catalogue_path,
+            pages_total: catalogue.pages.len(),
+            pages_downloaded: downloaded,
+            pages_reused: reused,
+            games: catalogue.games.len(),
+            retrieved_at_unix_seconds: retrieved_at,
         })
     }
 
@@ -436,13 +665,49 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         options: &GameHackingFetchOptions,
     ) -> Result<Vec<GameHackingCheat>, GameHackingError> {
         self.check_robots(options, &["/inc/sub.exportCodes.php"])?;
-        exact_identity_match(identity, game)
-            .map_err(|detail| error(GameHackingErrorKind::IdentityConflict, detail))?;
+        authorize_catalogue_match(identity, game, false)?;
         let filename = identity
             .serial
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(&identity.title);
+        let form = [
+            ("format", self.adapter.export_format().to_string()),
+            ("codID", String::new()),
+            ("filename", filename.to_string()),
+            ("sysID", self.adapter.system_id().to_string()),
+            ("gamID", game.game_id.to_string()),
+            ("download", "true".to_string()),
+        ];
+        let cache_name = format!("export-{}.pnach", game.game_id);
+        let bytes = self.cached_request(
+            &cache_name,
+            EXPORT_URL,
+            MAX_EXPORT_BYTES,
+            options,
+            |transport| transport.post_form(EXPORT_URL, &form, MAX_EXPORT_BYTES),
+        )?;
+        parse_gamehacking_pnach(game, &bytes.bytes)
+    }
+
+    pub fn fetch_cheats_for_confirmed_candidate(
+        &self,
+        identity: &Pcsx2GameIdentity,
+        game: &GameHackingGame,
+        options: &GameHackingFetchOptions,
+    ) -> Result<Vec<GameHackingCheat>, GameHackingError> {
+        authorize_catalogue_match(identity, game, true)?;
+        self.fetch_export(game, identity, options)
+    }
+
+    fn fetch_export(
+        &self,
+        game: &GameHackingGame,
+        identity: &Pcsx2GameIdentity,
+        options: &GameHackingFetchOptions,
+    ) -> Result<Vec<GameHackingCheat>, GameHackingError> {
+        self.check_robots(options, &["/inc/sub.exportCodes.php"])?;
+        let filename = identity.serial.as_deref().unwrap_or(&identity.title);
         let form = [
             ("format", self.adapter.export_format().to_string()),
             ("codID", String::new()),
@@ -468,8 +733,26 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
         game: &GameHackingGame,
         cheats: &[GameHackingCheat],
     ) -> Result<Pcsx2CheatProviderCatalogue, GameHackingError> {
-        exact_identity_match(identity, game)
-            .map_err(|detail| error(GameHackingErrorKind::IdentityConflict, detail))?;
+        authorize_catalogue_match(identity, game, false)?;
+        self.catalogue_from_authorized_game(identity, game, cheats)
+    }
+
+    pub fn catalogue_for_confirmed_candidate(
+        &self,
+        identity: &Pcsx2GameIdentity,
+        game: &GameHackingGame,
+        cheats: &[GameHackingCheat],
+    ) -> Result<Pcsx2CheatProviderCatalogue, GameHackingError> {
+        authorize_catalogue_match(identity, game, true)?;
+        self.catalogue_from_authorized_game(identity, game, cheats)
+    }
+
+    fn catalogue_from_authorized_game(
+        &self,
+        identity: &Pcsx2GameIdentity,
+        game: &GameHackingGame,
+        cheats: &[GameHackingCheat],
+    ) -> Result<Pcsx2CheatProviderCatalogue, GameHackingError> {
         let crc = identity.verified_crc().ok_or_else(|| {
             error(
                 GameHackingErrorKind::IdentityIncomplete,
@@ -491,8 +774,8 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                     source_game_id: Some(game.game_id.to_string()),
                     source_url: Some(cheat.source_url.clone()),
                     game_crc: crc.to_string(),
-                    serial_constraint: game.serial.clone(),
-                    region_constraint: game.region.clone(),
+                    serial_constraint: identity.serial.clone(),
+                    region_constraint: identity.region.clone(),
                     patch_lines: cheat.patch_lines.clone(),
                     category: Pcsx2CheatCategory::OrdinaryCheat,
                     confidence: Pcsx2CheatConfidence::VerifiedCrcAndConstraints,
@@ -532,6 +815,10 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                     atomic_write(
                         &charset_cache_path(&path),
                         response.charset.as_deref().unwrap_or_default().as_bytes(),
+                    )?;
+                    atomic_write(
+                        &retrieved_cache_path(&path),
+                        unix_seconds_now().to_string().as_bytes(),
                     )?;
                     touch_request_marker(&options.cache_root)?;
                     return Ok(response);
@@ -619,48 +906,84 @@ fn robots_disallows_archivefs(text: &str, path: &str) -> bool {
     strongest_rule.is_some_and(|(_, allowed)| !allowed)
 }
 
-fn exact_identity_match(
+fn authorize_catalogue_match(
     identity: &Pcsx2GameIdentity,
     game: &GameHackingGame,
-) -> Result<(), String> {
-    let local_crc = identity
-        .verified_crc()
-        .ok_or_else(|| "local CRC is not verified".to_string())?;
-    let local_serial = identity
-        .serial
-        .as_deref()
-        .ok_or_else(|| "local serial is not verified".to_string())?;
-    let remote_serial = game
-        .serial
-        .as_deref()
-        .ok_or_else(|| "provider page has no serial".to_string())?;
-    if normalize_identity_token(local_serial) != normalize_identity_token(remote_serial) {
-        return Err(format!(
-            "serial {remote_serial} does not match {local_serial}"
+    user_confirmed: bool,
+) -> Result<GameHackingMatchStrength, GameHackingError> {
+    let strength = classify_catalogue_match(identity, game).ok_or_else(|| {
+        error(
+            GameHackingErrorKind::IdentityConflict,
+            "selected GameHacking.org game no longer matches local serial, CRC, region, or title",
+        )
+    })?;
+    if strength == GameHackingMatchStrength::NormalizedTitle && !user_confirmed {
+        return Err(error(
+            GameHackingErrorKind::IdentityConflict,
+            "normalized-title-only GameHacking.org candidate requires explicit user confirmation",
         ));
     }
-    let remote_crc = game
-        .crc
-        .as_deref()
-        .and_then(normalize_crc)
-        .ok_or_else(|| "provider page has no valid CRC".to_string())?;
-    if remote_crc != local_crc {
-        return Err(format!("CRC {remote_crc} does not match {local_crc}"));
+    Ok(strength)
+}
+
+fn match_ps2_catalogue(
+    identity: &Pcsx2GameIdentity,
+    catalogue: &GameHackingPs2Catalogue,
+) -> Vec<GameHackingMatchCandidate> {
+    catalogue
+        .games
+        .iter()
+        .filter_map(|record| {
+            let game = record.as_game();
+            let strength = classify_catalogue_match(identity, &game)?;
+            Some(GameHackingMatchCandidate {
+                game,
+                strength,
+                requires_user_confirmation: strength == GameHackingMatchStrength::NormalizedTitle,
+            })
+        })
+        .collect()
+}
+
+fn classify_catalogue_match(
+    identity: &Pcsx2GameIdentity,
+    game: &GameHackingGame,
+) -> Option<GameHackingMatchStrength> {
+    let local_serial = identity.serial.as_deref().and_then(normalize_ps2_serial);
+    let remote_serial = game.serial.as_deref().and_then(normalize_ps2_serial);
+    let serial_matches = local_serial.is_some() && local_serial == remote_serial;
+    let local_crc = identity.verified_crc();
+    let remote_crc = game.crc.as_deref().and_then(normalize_crc);
+    let crc_matches = local_crc.is_some() && local_crc == remote_crc.as_deref();
+    if serial_matches && crc_matches {
+        return Some(GameHackingMatchStrength::ExactSerialAndCrc);
     }
-    let local_region = identity
+    let regions_match = identity
         .region
         .as_deref()
-        .ok_or_else(|| "local region is not verified".to_string())?;
-    let remote_region = game
-        .region
-        .as_deref()
-        .ok_or_else(|| "provider page has no region".to_string())?;
-    if region_family(local_region) != region_family(remote_region) {
-        return Err(format!(
-            "region {remote_region} does not match {local_region}"
-        ));
+        .zip(game.region.as_deref())
+        .is_some_and(|(local, remote)| region_family(local) == region_family(remote));
+    if serial_matches && regions_match {
+        return Some(GameHackingMatchStrength::ExactSerialAndRegion);
     }
-    Ok(())
+    if crc_matches {
+        return Some(GameHackingMatchStrength::ExactCrc);
+    }
+    (normalized_title(&identity.title) == normalized_title(&game.title))
+        .then_some(GameHackingMatchStrength::NormalizedTitle)
+}
+
+pub fn normalize_ps2_serial(value: &str) -> Option<String> {
+    let normalized = normalize_identity_token(value);
+    if normalized.len() != 9 {
+        return None;
+    }
+    let (prefix, digits) = normalized.split_at(4);
+    (prefix
+        .chars()
+        .all(|character| character.is_ascii_alphabetic())
+        && digits.chars().all(|character| character.is_ascii_digit()))
+    .then_some(normalized)
 }
 
 fn region_family(value: &str) -> String {
@@ -707,36 +1030,138 @@ fn decode_provider_text<'a>(bytes: &'a [u8], charset: Option<&str>) -> std::borr
     String::from_utf8_lossy(bytes)
 }
 
-fn parse_game_links(
+fn parse_ps2_index_page_numbers(
     bytes: &[u8],
     charset: Option<&str>,
-) -> Result<Vec<GameLink>, GameHackingError> {
+) -> Result<Vec<u32>, GameHackingError> {
     let text = decode_provider_text(bytes, charset);
     let document = Html::parse_document(&text);
-    let selector = Selector::parse("a[href^='/game/']").expect("static selector");
-    let mut seen = BTreeSet::new();
-    let mut links = Vec::new();
+    let selector = Selector::parse("a[href^='/system/ps2/all/']").expect("static selector");
+    let mut pages = BTreeSet::new();
     for node in document.select(&selector) {
-        let Some(id) = node
+        if let Some(page) = node
             .value()
             .attr("href")
-            .and_then(|href| href.trim_start_matches("/game/").split('/').next())
-            .and_then(|id| id.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let title = node.text().collect::<String>().trim().to_string();
-        if !title.is_empty() && seen.insert(id) {
-            links.push(GameLink { game_id: id, title });
+            .and_then(|href| href.trim_end_matches('/').rsplit('/').next())
+            .and_then(|page| page.parse::<u32>().ok())
+        {
+            pages.insert(page);
         }
     }
-    if links.is_empty() {
+    if pages.is_empty() {
         return Err(error(
             GameHackingErrorKind::InvalidResponse,
-            "GameHacking.org PS2 index contained no game links",
+            "GameHacking.org PS2 root index contained no numbered pages",
         ));
     }
-    Ok(links)
+    let pages = pages.into_iter().collect::<Vec<_>>();
+    let expected_len = u32::try_from(pages.len()).map_err(|_| {
+        error(
+            GameHackingErrorKind::InvalidResponse,
+            "GameHacking.org PS2 index page count is invalid",
+        )
+    })?;
+    if pages.first() != Some(&0) || pages.iter().copied().ne(0..expected_len) {
+        return Err(error(
+            GameHackingErrorKind::InvalidResponse,
+            "GameHacking.org PS2 index pagination is incomplete",
+        ));
+    }
+    Ok(pages)
+}
+
+pub fn parse_gamehacking_ps2_index_page(
+    source_url: &str,
+    retrieved_at_unix_seconds: u64,
+    bytes: &[u8],
+) -> Result<Vec<GameHackingIndexRecord>, GameHackingError> {
+    parse_ps2_index_page(source_url, retrieved_at_unix_seconds, bytes, None)
+}
+
+fn parse_ps2_index_page(
+    source_url: &str,
+    retrieved_at_unix_seconds: u64,
+    bytes: &[u8],
+    charset: Option<&str>,
+) -> Result<Vec<GameHackingIndexRecord>, GameHackingError> {
+    let text = decode_provider_text(bytes, charset);
+    let document = Html::parse_document(&text);
+    let row_selector = Selector::parse("tr").expect("static selector");
+    let cell_selector = Selector::parse("th, td").expect("static selector");
+    let game_selector = Selector::parse("a[href^='/game/']").expect("static selector");
+    let mut current_title = None::<String>;
+    let mut games = BTreeMap::<u64, GameHackingIndexRecord>::new();
+    for row in document.select(&row_selector) {
+        let cells = row
+            .select(&cell_selector)
+            .map(|cell| {
+                cell.text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        let game_link = row.select(&game_selector).find_map(|node| {
+            let href = node.value().attr("href")?;
+            let id = href
+                .trim_start_matches("/game/")
+                .split('/')
+                .next()?
+                .parse::<u64>()
+                .ok()?;
+            let label = node
+                .text()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some((id, href.to_string(), label))
+        });
+        let Some((game_id, href, link_label)) = game_link else {
+            if cells.len() == 1
+                && !cells[0].eq_ignore_ascii_case("Version")
+                && !cells[0].contains("Number of Codes")
+            {
+                current_title = Some(cells[0].clone());
+            }
+            continue;
+        };
+        let Some(title) = current_title.clone() else {
+            continue;
+        };
+        let serial = cells
+            .iter()
+            .find(|cell| normalize_ps2_serial(cell).is_some())
+            .cloned();
+        let crc = cells.iter().find_map(|cell| normalize_crc(cell));
+        let region = (!link_label.is_empty()).then_some(link_label);
+        let source = if href.starts_with("https://") {
+            href
+        } else {
+            format!("{BASE_URL}{href}")
+        };
+        games.entry(game_id).or_insert(GameHackingIndexRecord {
+            game_id,
+            title,
+            serial,
+            region,
+            crc,
+            source_url: source,
+            index_source_url: source_url.to_string(),
+            retrieved_at_unix_seconds,
+        });
+    }
+    if games.is_empty() {
+        return Err(error(
+            GameHackingErrorKind::InvalidResponse,
+            format!("GameHacking.org PS2 index page contained no game rows: {source_url}"),
+        ));
+    }
+    Ok(games.into_values().collect())
 }
 
 pub fn parse_gamehacking_game_page(
@@ -885,6 +1310,77 @@ fn prepare_cache(root: &Path) -> Result<(), GameHackingError> {
             format!("GameHacking.org cache could not be created: {failure}"),
         )
     })
+}
+
+pub fn load_ps2_catalogue(root: &Path) -> Result<GameHackingPs2Catalogue, GameHackingError> {
+    let path = root.join(PS2_CATALOGUE_FILE);
+    let bytes = bounded_read(&path, 32 * 1024 * 1024).map_err(|failure| {
+        error(
+            failure.kind,
+            format!(
+                "GameHacking.org PS2 catalogue is unavailable; run `archivefs-cli gamehacking-ps2-index-refresh` first: {}",
+                failure.detail
+            ),
+        )
+    })?;
+    let catalogue: GameHackingPs2Catalogue = serde_json::from_slice(&bytes).map_err(|failure| {
+        error(
+            GameHackingErrorKind::InvalidResponse,
+            format!("GameHacking.org PS2 catalogue is invalid: {failure}"),
+        )
+    })?;
+    if catalogue.schema_version != PS2_CATALOGUE_SCHEMA_VERSION
+        || catalogue.provider != GAMEHACKING_PROVIDER_ID
+        || !catalogue.system.eq_ignore_ascii_case("PlayStation 2")
+    {
+        return Err(error(
+            GameHackingErrorKind::InvalidResponse,
+            "GameHacking.org PS2 catalogue metadata is unsupported",
+        ));
+    }
+    Ok(catalogue)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn retrieved_cache_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.retrieved",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("cache")
+    ))
+}
+
+fn cache_retrieved_at(path: &Path) -> Result<u64, GameHackingError> {
+    let sidecar = retrieved_cache_path(path);
+    if sidecar.is_file() {
+        let bytes = bounded_read(&sidecar, 64)?;
+        if let Ok(value) = String::from_utf8_lossy(&bytes).trim().parse::<u64>() {
+            return Ok(value);
+        }
+    }
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .ok_or_else(|| {
+            error(
+                GameHackingErrorKind::CacheUnavailable,
+                format!("cached retrieval date is unavailable: {}", path.display()),
+            )
+        })
 }
 
 fn bounded_read(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, GameHackingError> {
@@ -1054,29 +1550,36 @@ mod tests {
     }
 
     #[test]
-    fn title_index_deduplicates_game_ids() {
-        let links = parse_game_links(
-            br#"<a href="/game/42">Example Game</a><a href="/game/42">Duplicate</a>"#,
+    fn numbered_index_pages_are_sorted_and_deduplicated() {
+        let pages = parse_ps2_index_page_numbers(
+            br#"<a href="/system/ps2/all/2">two</a>
+                <a href="/system/ps2/all/0">zero</a>
+                <a href="/system/ps2/all/1">one</a>
+                <a href="/system/ps2/all/2">duplicate</a>"#,
             None,
         )
         .unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].game_id, 42);
+        assert_eq!(pages, vec![0, 1, 2]);
     }
 
     #[test]
-    fn windows_1252_index_with_invalid_utf8_still_parses_game_links() {
-        let mut fixture = b"<a href=\"/game/77\">Example ".to_vec();
-        fixture.push(0x96);
-        fixture.extend_from_slice(b" Game</a>");
-        assert!(std::str::from_utf8(&fixture).is_err());
-        let links = parse_game_links(&fixture, Some("windows-1252")).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].game_id, 77);
-        assert_eq!(links[0].title, "Example – Game");
-
-        let lossy = parse_game_links(&fixture, None).unwrap();
-        assert_eq!(lossy[0].game_id, 77);
+    fn index_page_collects_title_serial_region_crc_and_source() {
+        let html = br#"<table><tbody>
+            <tr><td colspan="5">Example Game</td></tr>
+            <tr><td><a href="/game/42">(PAL-M5)</a></td><td>SLES_546.58</td><td>0K</td><td>A1B2C3D4</td><td>12</td></tr>
+            <tr><td><a href="/game/43">(NTSC-U)</a></td><td>SLUS-99999</td><td>0K</td><td></td><td>8</td></tr>
+        </tbody></table>"#;
+        let records =
+            parse_gamehacking_ps2_index_page("https://gamehacking.org/system/ps2/all/7", 123, html)
+                .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].title, "Example Game");
+        assert_eq!(records[0].serial.as_deref(), Some("SLES_546.58"));
+        assert_eq!(records[0].region.as_deref(), Some("(PAL-M5)"));
+        assert_eq!(records[0].crc.as_deref(), Some("A1B2C3D4"));
+        assert_eq!(records[0].source_url, "https://gamehacking.org/game/42");
+        assert_eq!(records[0].retrieved_at_unix_seconds, 123);
+        assert_eq!(records[1].crc, None);
     }
 
     #[test]
@@ -1086,6 +1589,24 @@ mod tests {
             Some("windows-1252".to_string())
         );
         assert_eq!(charset_from_content_type("text/html"), None);
+    }
+
+    #[test]
+    fn windows_1252_index_page_with_invalid_utf8_still_parses() {
+        let mut html = br#"<table><tbody><tr><td colspan="5">Example "#.to_vec();
+        html.push(0x96);
+        html.extend_from_slice(
+            br#" Game</td></tr><tr><td><a href="/game/77">(PAL)</a></td><td>SLES-54658</td><td>0K</td><td></td><td>2</td></tr></tbody></table>"#,
+        );
+        assert!(std::str::from_utf8(&html).is_err());
+        let records = parse_ps2_index_page(
+            "https://gamehacking.org/system/ps2/all/0",
+            123,
+            &html,
+            Some("windows-1252"),
+        )
+        .unwrap();
+        assert_eq!(records[0].title, "Example – Game");
     }
 
     #[test]
@@ -1108,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_identity_requires_serial_crc_and_nonconflicting_region() {
+    fn serial_variants_normalize_and_matching_uses_declared_priority() {
         use crate::patch_manager::Pcsx2IdentityState;
 
         let identity = Pcsx2GameIdentity {
@@ -1121,16 +1642,139 @@ mod tests {
             evidence: Vec::new(),
             plain_failure_reason: None,
         };
-        assert!(exact_identity_match(&identity, &game()).is_ok());
-        let mut conflict = game();
-        conflict.serial = Some("SLES-99999".to_string());
-        assert!(exact_identity_match(&identity, &conflict).is_err());
-        conflict = game();
-        conflict.crc = Some("FFFFFFFF".to_string());
-        assert!(exact_identity_match(&identity, &conflict).is_err());
-        conflict = game();
-        conflict.region = Some("PAL".to_string());
-        assert!(exact_identity_match(&identity, &conflict).is_err());
+        assert_eq!(
+            normalize_ps2_serial("SLES-54658").as_deref(),
+            Some("SLES54658")
+        );
+        assert_eq!(
+            normalize_ps2_serial("SLES_546.58").as_deref(),
+            Some("SLES54658")
+        );
+        assert_eq!(
+            normalize_ps2_serial("SLES54658").as_deref(),
+            Some("SLES54658")
+        );
+        assert_eq!(
+            classify_catalogue_match(&identity, &game()),
+            Some(GameHackingMatchStrength::ExactSerialAndCrc)
+        );
+        let mut crc_only = game();
+        crc_only.serial = Some("SLES-99999".to_string());
+        assert_eq!(
+            classify_catalogue_match(&identity, &crc_only),
+            Some(GameHackingMatchStrength::ExactCrc)
+        );
+        let mut serial_and_region = game();
+        serial_and_region.serial = Some("SLUS_123.45".to_string());
+        serial_and_region.crc = Some("FFFFFFFF".to_string());
+        assert_eq!(
+            classify_catalogue_match(&identity, &serial_and_region),
+            Some(GameHackingMatchStrength::ExactSerialAndRegion)
+        );
+        let mut title_only = game();
+        title_only.serial = Some("SLES-99999".to_string());
+        title_only.crc = Some("FFFFFFFF".to_string());
+        title_only.region = Some("PAL".to_string());
+        assert_eq!(
+            classify_catalogue_match(&identity, &title_only),
+            Some(GameHackingMatchStrength::NormalizedTitle)
+        );
+    }
+
+    #[test]
+    fn catalogue_matching_ranks_exact_identity_and_gates_titles() {
+        use crate::patch_manager::Pcsx2IdentityState;
+
+        let identity = Pcsx2GameIdentity {
+            archive_path: PathBuf::from("/games/example.iso"),
+            title: "Example Game".to_string(),
+            region: Some("NTSC-U".to_string()),
+            serial: Some("SLUS_123.45".to_string()),
+            executable_crc: Some("A1B2C3D4".to_string()),
+            state: Pcsx2IdentityState::Verified,
+            evidence: Vec::new(),
+            plain_failure_reason: None,
+        };
+        let record = |game: GameHackingGame| GameHackingIndexRecord {
+            game_id: game.game_id,
+            title: game.title,
+            serial: game.serial,
+            region: game.region,
+            crc: game.crc,
+            source_url: game.source_url,
+            index_source_url: PS2_INDEX_URL.to_string(),
+            retrieved_at_unix_seconds: 123,
+        };
+        let mut title_only = game();
+        title_only.game_id = 43;
+        title_only.serial = Some("SLES-99999".to_string());
+        title_only.crc = Some("FFFFFFFF".to_string());
+        let catalogue = GameHackingPs2Catalogue {
+            schema_version: PS2_CATALOGUE_SCHEMA_VERSION,
+            provider: GAMEHACKING_PROVIDER_ID.to_string(),
+            system: "PlayStation 2".to_string(),
+            source_url: PS2_INDEX_URL.to_string(),
+            retrieved_at_unix_seconds: 123,
+            pages: Vec::new(),
+            games: vec![record(title_only.clone()), record(game())],
+        };
+        let matches = match_ps2_catalogue(&identity, &catalogue);
+        assert!(matches.iter().any(|candidate| {
+            candidate.game.game_id == 42
+                && candidate.strength == GameHackingMatchStrength::ExactSerialAndCrc
+        }));
+        assert_eq!(
+            authorize_catalogue_match(&identity, &title_only, false)
+                .unwrap_err()
+                .kind,
+            GameHackingErrorKind::IdentityConflict
+        );
+        assert_eq!(
+            authorize_catalogue_match(&identity, &title_only, true).unwrap(),
+            GameHackingMatchStrength::NormalizedTitle
+        );
+    }
+
+    #[test]
+    fn cached_index_pages_resume_without_network_and_json_is_deterministic() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gamehacking-index-{}-{}",
+            std::process::id(),
+            unix_seconds_now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("robots.txt"), b"User-agent: *\nDisallow:\n").unwrap();
+        fs::write(
+            root.join(PS2_INDEX_ROOT_CACHE_FILE),
+            br#"<a href="/system/ps2/all/0">zero</a><a href="/system/ps2/all/1">one</a>
+                <table><tbody><tr><td colspan="5">Game 0</td></tr><tr><td><a href="/game/100">(PAL)</a></td><td>SLES-54650</td><td>0K</td><td></td><td>2</td></tr></tbody></table>"#,
+        )
+        .unwrap();
+        for page in 0..2 {
+            fs::write(
+                root.join(format!("ps2-index-page-{page}.html")),
+                format!(
+                    "<table><tbody><tr><td colspan=\"5\">Game {page}</td></tr><tr><td><a href=\"/game/{}\">(PAL)</a></td><td>SLES-5465{page}</td><td>0K</td><td></td><td>2</td></tr></tbody></table>",
+                    100 + page
+                ),
+            )
+            .unwrap();
+        }
+        let options = GameHackingFetchOptions {
+            cache_root: root.clone(),
+            force_refresh: false,
+            delay: Duration::ZERO,
+            cancellation: None,
+        };
+        let provider = GameHackingProvider::default();
+        let first = provider.refresh_ps2_index(&options, |_| {}).unwrap();
+        assert_eq!(first.pages_downloaded, 0);
+        assert_eq!(first.pages_reused, 2);
+        assert_eq!(first.games, 2);
+        let first_json = fs::read(&first.catalogue_path).unwrap();
+        let second = provider.refresh_ps2_index(&options, |_| {}).unwrap();
+        assert_eq!(first_json, fs::read(&second.catalogue_path).unwrap());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

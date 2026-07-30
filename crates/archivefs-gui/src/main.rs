@@ -39,30 +39,30 @@ use archivefs_core::patch_manager::{
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
     DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
-    GameHackingFetchOptions, GameHackingGame, GameHackingMatchStatus, GameHackingProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
-    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewSourceItem, PreviewState, RememberedEmulatorProfile,
-    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
-    RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
-    RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
-    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
-    StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, XeniaCandidate,
-    XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
-    XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, adapter_write_support, build_cheat_candidates,
-    build_cheat_install_preview, build_dolphin_install_preview, build_pcsx2_cheat_candidates,
-    build_pcsx2_install_preview, build_shared_preview, build_shared_transaction_plan,
-    build_xenia_candidates, build_xenia_install_preview,
+    GameHackingFetchOptions, GameHackingGame, GameHackingMatchCandidate, GameHackingMatchStatus,
+    GameHackingProvider, GeckoProviderFetchOptions, GeckoProviderFetchResult,
+    GeckoProviderFetchStatus, GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind,
+    ImportTrustState, LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination,
+    LocalSafetyScanningState, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
+    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
+    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
+    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
+    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
+    RememberedEmulatorProfile, ResolvedCheatDestination, RetroArchCheatLibraryInspection,
+    RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState,
+    RetroArchMaterializationError, RetroArchMaterializationErrorKind,
+    RetroArchMaterializationRequest, RetroArchMaterializedPreview, SharedAdapterWriteSupport,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
+    SharedHistoryReport, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
+    SharedTransactionPlan, StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile,
+    UNKNOWN_CODE_POLICY, XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateOutcome,
+    XeniaInstallPlanError, XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile,
+    XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, adapter_write_support,
+    build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
+    build_pcsx2_cheat_candidates, build_pcsx2_install_preview, build_shared_preview,
+    build_shared_transaction_plan, build_xenia_candidates, build_xenia_install_preview,
     check_dolphin_catalogue_update_with_transport, default_cheat_source_cache_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
@@ -7210,7 +7210,7 @@ impl ArchiveFsApp {
         let Some(identity) = pcsx2_identity_for_workflow(workflow) else {
             if let Some(workflow) = self.cheat_workflow.as_mut() {
                 workflow.pcsx2_gamehacking = CheatStepResource::Failed(
-                    "ArchiveFS needs a verified PS2 serial, region, and PCSX2 CRC before checking GameHacking.org."
+                    "ArchiveFS needs a verified local PCSX2 executable CRC before checking the cached GameHacking.org PS2 catalogue."
                         .to_string(),
                 );
             }
@@ -7250,6 +7250,7 @@ impl ArchiveFsApp {
                         status: matched.status,
                         detail: matched.detail,
                         game: None,
+                        match_candidates: matched.candidates,
                         candidates: Vec::new(),
                         selection: Pcsx2CheatSelection::default(),
                     });
@@ -7261,6 +7262,77 @@ impl ArchiveFsApp {
                     status: matched.status,
                     detail: matched.detail,
                     game: Some(game),
+                    match_candidates: Vec::new(),
+                    candidates,
+                    selection: Pcsx2CheatSelection::default(),
+                })
+            })()
+            .map_err(|failure: archivefs_core::patch_manager::GameHackingError| {
+                failure.to_string()
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn confirm_pcsx2_gamehacking_match(&mut self, context: egui::Context, game_id: u64) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let Some(identity) = pcsx2_identity_for_workflow(workflow) else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &workflow.pcsx2_gamehacking else {
+            return;
+        };
+        let Some(game) = state
+            .match_candidates
+            .iter()
+            .find(|candidate| candidate.game.game_id == game_id)
+            .map(|candidate| candidate.game.clone())
+        else {
+            return;
+        };
+        let options = match GameHackingFetchOptions::defaults() {
+            Ok(options) => options,
+            Err(failure) => {
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.pcsx2_gamehacking = CheatStepResource::Failed(failure.to_string());
+                }
+                return;
+            }
+        };
+        let archive_path = workflow.archive_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.pcsx2_gamehacking = CheatStepResource::Loading { receiver };
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            format!("Downloading confirmed GameHacking.org game {game_id} PCSX2 export."),
+        ));
+        thread::spawn(move || {
+            let provider = GameHackingProvider::default();
+            let result = (|| {
+                let cheats =
+                    provider.fetch_cheats_for_confirmed_candidate(&identity, &game, &options)?;
+                let catalogue =
+                    provider.catalogue_for_confirmed_candidate(&identity, &game, &cheats)?;
+                let candidates = build_pcsx2_cheat_candidates(&catalogue, &identity);
+                Ok(Pcsx2GameHackingState {
+                    status: GameHackingMatchStatus::Matched,
+                    detail: format!(
+                        "Using user-confirmed GameHacking.org match: {} (game {}).",
+                        game.title, game.game_id
+                    ),
+                    game: Some(game),
+                    match_candidates: Vec::new(),
                     candidates,
                     selection: Pcsx2CheatSelection::default(),
                 })
@@ -10118,6 +10190,9 @@ impl ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::FetchPcsx2GameHacking { force_refresh }) => {
                             self.start_pcsx2_gamehacking_fetch(context.clone(), force_refresh);
+                        }
+                        Some(CheatWorkflowAction::ConfirmPcsx2GameHackingMatch { game_id }) => {
+                            self.confirm_pcsx2_gamehacking_match(context.clone(), game_id);
                         }
                         Some(CheatWorkflowAction::TogglePcsx2CheatSelected { id, selected }) => {
                             self.update_pcsx2_cheat_selection(&id, selected);
@@ -16688,6 +16763,7 @@ struct Pcsx2GameHackingState {
     status: GameHackingMatchStatus,
     detail: String,
     game: Option<GameHackingGame>,
+    match_candidates: Vec<GameHackingMatchCandidate>,
     candidates: Vec<Pcsx2CheatCandidate>,
     selection: Pcsx2CheatSelection,
 }
@@ -17567,6 +17643,9 @@ enum CheatWorkflowAction {
     InspectPcsx2Profile,
     FetchPcsx2GameHacking {
         force_refresh: bool,
+    },
+    ConfirmPcsx2GameHackingMatch {
+        game_id: u64,
     },
     TogglePcsx2CheatSelected {
         id: String,
@@ -21112,12 +21191,11 @@ fn show_pcsx2_gamehacking(
         ui,
         "GameHacking.org",
         Some(
-            "Checks only this local PS2 game and keeps downloaded pages in ArchiveFS's private cache.",
+            "Matches this local PS2 game against ArchiveFS's private complete index cache; only the selected game's export is downloaded.",
         ),
     );
-    let identity_ready = pcsx2_identity_for_workflow(workflow).is_some_and(|identity| {
-        identity.verified_crc().is_some() && identity.serial.is_some() && identity.region.is_some()
-    });
+    let identity_ready = pcsx2_identity_for_workflow(workflow)
+        .is_some_and(|identity| identity.verified_crc().is_some());
     match &mut workflow.transaction {
         CheatTransactionState::Applying { .. } => {
             ui.horizontal(|ui| {
@@ -21190,6 +21268,7 @@ fn show_pcsx2_gamehacking(
                 ui,
                 match provider.status {
                     GameHackingMatchStatus::Matched => "Game matched",
+                    GameHackingMatchStatus::Candidates => "Confirm a candidate",
                     GameHackingMatchStatus::NoMatch => "No matching game",
                     GameHackingMatchStatus::IdentityConflict => "Game identity conflicted",
                     GameHackingMatchStatus::IdentityIncomplete => "Game identity incomplete",
@@ -21201,6 +21280,30 @@ fn show_pcsx2_gamehacking(
                 },
             );
             ui.label(&provider.detail);
+            for candidate in &provider.match_candidates {
+                widgets::card(ui, |ui| {
+                    ui.strong(&candidate.game.title);
+                    ui.label(format!(
+                        "Serial: {} · Region: {} · GameHacking game ID: {}",
+                        candidate.game.serial.as_deref().unwrap_or("Unknown"),
+                        candidate.game.region.as_deref().unwrap_or("Unknown"),
+                        candidate.game.game_id
+                    ));
+                    ui.weak(format!("Match evidence: {}", candidate.strength.label()));
+                    if widgets::action_button(
+                        ui,
+                        "Use this match",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::ConfirmPcsx2GameHackingMatch {
+                            game_id: candidate.game.game_id,
+                        });
+                    }
+                });
+            }
             if let Some(game) = &provider.game {
                 ui.weak(format!(
                     "{} compatible cheat{} · GameHacking game {}",
@@ -36088,6 +36191,54 @@ $Instant Growth [Nayr]\n";
         }
         for forbidden in ["Install now", "Apply patch", "Enable patch", "Delete file"] {
             assert!(!rendered_text_contains(&output, forbidden));
+        }
+    }
+
+    #[test]
+    fn pcsx2_gamehacking_title_candidate_shows_identity_before_confirmation() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        let game = GameHackingGame {
+            game_id: 138_153,
+            title: "Example Candidate".to_string(),
+            system: "PlayStation 2".to_string(),
+            region: Some("(PAL-M5)".to_string()),
+            serial: Some("SLES-54658".to_string()),
+            crc: None,
+            source_url: "https://gamehacking.org/game/138153".to_string(),
+        };
+        workflow.pcsx2_gamehacking = CheatStepResource::Ready(Pcsx2GameHackingState {
+            status: GameHackingMatchStatus::Candidates,
+            detail: "Confirm the correct game.".to_string(),
+            game: None,
+            match_candidates: vec![GameHackingMatchCandidate {
+                game,
+                strength: archivefs_core::patch_manager::GameHackingMatchStrength::NormalizedTitle,
+                requires_user_confirmation: true,
+            }],
+            candidates: Vec::new(),
+            selection: Pcsx2CheatSelection::default(),
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_gamehacking(ui, workflow);
+            });
+        });
+        for expected in [
+            "Confirm a candidate",
+            "Example Candidate",
+            "SLES-54658",
+            "(PAL-M5)",
+            "138153",
+            "Use this match",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
         }
     }
 

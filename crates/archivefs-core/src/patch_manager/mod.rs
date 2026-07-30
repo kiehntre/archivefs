@@ -231,9 +231,12 @@ pub use emulator_profile_memory::{
 };
 pub use gamehacking_provider::{
     GAMEHACKING_PROVIDER_ID, GameHackingCheat, GameHackingError, GameHackingErrorKind,
-    GameHackingFetchOptions, GameHackingGame, GameHackingMatch, GameHackingMatchStatus,
-    GameHackingProvider, GameHackingSystemAdapter, Ps2GameHackingAdapter, gamehacking_cache_root,
-    parse_gamehacking_game_page, parse_gamehacking_pnach,
+    GameHackingFetchOptions, GameHackingGame, GameHackingIndexPage, GameHackingIndexProgress,
+    GameHackingIndexRecord, GameHackingIndexRefreshResult, GameHackingMatch,
+    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingMatchStrength,
+    GameHackingProvider, GameHackingPs2Catalogue, GameHackingSystemAdapter, Ps2GameHackingAdapter,
+    gamehacking_cache_root, load_ps2_catalogue, normalize_ps2_serial, parse_gamehacking_game_page,
+    parse_gamehacking_pnach, parse_gamehacking_ps2_index_page,
 };
 pub use gecko_document::{
     DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
