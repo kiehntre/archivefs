@@ -39,13 +39,15 @@ use archivefs_core::patch_manager::{
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
     DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
-    GameCubeCodeFormat, GameCubeGameIdentity, GameHackingFetchOptions, GameHackingGame,
-    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
-    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
+    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
+    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
+    GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingProvider, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
     Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
     Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
     Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
@@ -59,11 +61,12 @@ use archivefs_core::patch_manager::{
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
     SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
     SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
-    StagedCheatFile, StagedDolphinIni, StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, XeniaCandidate,
-    XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
-    XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, adapter_write_support, build_cheat_candidates,
-    build_cheat_install_preview, build_dolphin_install_preview, build_pcsx2_cheat_candidates,
+    StagedCheatFile, StagedDolphinIni, StagedGameCubeCheat, StagedGameCubeIni,
+    StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, XeniaCandidate, XeniaCandidateCompatibility,
+    XeniaCandidateOutcome, XeniaInstallPlanError, XeniaInstallPreviewRequest, XeniaPatchSelection,
+    XeniaProfile, XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, adapter_write_support,
+    build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
+    build_gamecube_gamehacking_install_preview, build_pcsx2_cheat_candidates,
     build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
     build_shared_transaction_plan, build_xenia_candidates, build_xenia_install_preview,
     check_dolphin_catalogue_update_with_transport, default_cheat_source_cache_root,
@@ -78,10 +81,11 @@ use archivefs_core::patch_manager::{
     load_dolphin_catalogue, load_dolphin_catalogue_update_state, load_dolphin_destination,
     load_remembered_emulator_profiles_default, load_xenia_destination, match_dolphin_inventory,
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
-    preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport, region_for_game_id,
-    remembered_profile_for, remove_dolphin_catalogue, resolve_cheat_destination,
-    resolve_dolphin_gecko_lookup, select_emulator_profile, selected_pcsx2_managed_cheats,
-    stage_dolphin_provider_ini, stage_generated_cheat_file, stage_pcsx2_pnach,
+    parse_dolphin_ini, preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport,
+    region_for_game_id, remembered_profile_for, remove_dolphin_catalogue,
+    resolve_cheat_destination, resolve_dolphin_gecko_lookup, select_emulator_profile,
+    selected_pcsx2_managed_cheats, stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
+    stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
     stage_xenia_patch_file,
 };
 use archivefs_core::patch_manager::{
@@ -5727,6 +5731,7 @@ impl ArchiveFsApp {
                 dolphin_generated: None,
                 xenia_generated: None,
                 pcsx2_generated: None,
+                gamecube_gamehacking_generated: None,
             }));
             context.request_repaint();
         });
@@ -6218,6 +6223,7 @@ impl ArchiveFsApp {
                 }),
                 xenia_generated: None,
                 pcsx2_generated: None,
+                gamecube_gamehacking_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -6236,6 +6242,7 @@ impl ArchiveFsApp {
                     dolphin_generated: None,
                     xenia_generated: None,
                     pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
                 }
             }
         };
@@ -6499,6 +6506,7 @@ impl ArchiveFsApp {
                     staged,
                 }),
                 pcsx2_generated: None,
+                gamecube_gamehacking_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -6517,6 +6525,7 @@ impl ArchiveFsApp {
                     dolphin_generated: None,
                     xenia_generated: None,
                     pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
                 }
             }
         };
@@ -6665,6 +6674,7 @@ impl ArchiveFsApp {
                     dolphin_generated: None,
                     xenia_generated: None,
                     pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
                 },
                 Err(error) => CheatPreviewResponse {
                     key: worker_key,
@@ -6674,6 +6684,7 @@ impl ArchiveFsApp {
                     dolphin_generated: None,
                     xenia_generated: None,
                     pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
                 },
             };
             let _ = sender.send(Ok(message));
@@ -6774,6 +6785,12 @@ impl ArchiveFsApp {
             .or_else(|| {
                 response
                     .pcsx2_generated
+                    .as_ref()
+                    .map(|generated| generated.staging_root.clone())
+            })
+            .or_else(|| {
+                response
+                    .gamecube_gamehacking_generated
                     .as_ref()
                     .map(|generated| generated.staging_root.clone())
             })
@@ -7439,6 +7456,7 @@ impl ArchiveFsApp {
                         detail: matched.detail,
                         game: None,
                         match_candidates: matched.candidates,
+                        selection: gamecube_gamehacking_selection_for(&[]),
                         cheats: Vec::new(),
                     });
                 };
@@ -7448,6 +7466,7 @@ impl ArchiveFsApp {
                     detail: matched.detail,
                     game: Some(game),
                     match_candidates: Vec::new(),
+                    selection: gamecube_gamehacking_selection_for(&cheats),
                     cheats,
                 })
             })()
@@ -7511,6 +7530,7 @@ impl ArchiveFsApp {
                     ),
                     game: Some(game),
                     match_candidates: Vec::new(),
+                    selection: gamecube_gamehacking_selection_for(&cheats),
                     cheats,
                 })
             })()
@@ -7520,6 +7540,272 @@ impl ArchiveFsApp {
             let _ = sender.send(result);
             context.request_repaint();
         });
+    }
+
+    fn update_gamecube_gamehacking_cheat_selection(&mut self, index: usize, selected: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &mut workflow.gamecube_gamehacking else {
+            return;
+        };
+        state.selection.set_selected(index, selected);
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    /// Resolves the Dolphin profile's own configuration root the same way
+    /// `start_dolphin_install_preview` does - GameHacking.org GameCube
+    /// installs write into exactly the same profile.
+    fn gamecube_gamehacking_configuration_path(&self) -> Option<PathBuf> {
+        let workflow = self.cheat_workflow.as_ref()?;
+        let profile_id = workflow.selected_dolphin_profile_id.as_ref()?;
+        let DolphinProfilesState::Ready(discovery) = &self.dolphin_profiles else {
+            return None;
+        };
+        discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.eligible && &profile.profile_id == profile_id)
+            .map(|profile| profile.configuration_path.clone())
+    }
+
+    /// GameHacking.org GameCube Stage: stages the selected `ActionReplay`/
+    /// `Gecko` cheats into the real Dolphin GameSettings file (preserving
+    /// every other section byte-for-byte) and builds its shared install
+    /// preview. Synchronous for the same reason
+    /// `start_dolphin_install_preview` is - a single small local file.
+    fn start_gamecube_gamehacking_install_preview(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &workflow.gamecube_gamehacking else {
+            return;
+        };
+        let Some(game) = state.game.clone() else {
+            return;
+        };
+        let Some(game_id) = game.dolphin_game_id.clone() else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                "Install preview blocked: this GameHacking.org game has no verified Dolphin Game ID.",
+            ));
+            return;
+        };
+        let Some(configuration_path) = self.gamecube_gamehacking_configuration_path() else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                "Install preview blocked: the selected Dolphin profile is no longer eligible.",
+            ));
+            return;
+        };
+        let cheats = state.cheats.clone();
+        let selection = state.selection.clone();
+        let archive_path = workflow.archive_path.clone();
+        let key = cheat_preview_key(workflow);
+        let staging_root = match default_generated_gamecube_gamehacking_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    message,
+                ));
+                return;
+            }
+        };
+        let response = (|| {
+            let destination =
+                load_dolphin_destination(&configuration_path, &game_id).map_err(|failure| {
+                    GameCubeInstallPlanError {
+                        kind: GameCubeInstallPlanErrorKind::SelectionInvalid,
+                        cheat_name: None,
+                        detail: failure.to_string(),
+                    }
+                })?;
+            let staged = stage_gamecube_gamehacking_install(
+                &staging_root,
+                &format!("{game_id}.ini"),
+                &destination.document,
+                destination.existed,
+                &cheats,
+                &selection,
+            )?;
+            let preview = build_gamecube_gamehacking_install_preview(
+                &GameCubeGameHackingInstallPreviewRequest {
+                    selected_archive: archive_path.clone(),
+                    configuration_path: configuration_path.clone(),
+                    game_id: game_id.clone(),
+                    revision: None,
+                    staged: staged.clone(),
+                },
+            )?;
+            Ok::<_, GameCubeInstallPlanError>((preview, staged))
+        })();
+        let message = match response {
+            Ok((preview, staged)) => CheatPreviewResponse {
+                key: key.clone(),
+                outcome: CheatPreviewOutcome::Ready(preview.report),
+                materialized: None,
+                generated: None,
+                dolphin_generated: None,
+                xenia_generated: None,
+                pcsx2_generated: None,
+                gamecube_gamehacking_generated: Some(GeneratedGameCubeGameHackingInstall {
+                    staging_root,
+                    staged,
+                }),
+            },
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    format!("Install preview failed: {}", error.detail),
+                ));
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Failed(
+                        CheatPreviewFailure::GameCubeGameHackingInstallPlan(error),
+                    ),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
+                    pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
+                }
+            }
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Ready(message);
+        workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    /// GameHacking.org GameCube removal: stages removal of exactly the
+    /// selected, already-ArchiveFS-managed cheats from the real Dolphin
+    /// GameSettings file, reusing the same shared preview/apply/rollback
+    /// pipeline as install.
+    fn start_gamecube_gamehacking_removal_preview(&mut self) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &workflow.gamecube_gamehacking else {
+            return;
+        };
+        let Some(game) = state.game.clone() else {
+            return;
+        };
+        let Some(game_id) = game.dolphin_game_id.clone() else {
+            return;
+        };
+        let Some(configuration_path) = self.gamecube_gamehacking_configuration_path() else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                "Removal preview blocked: the selected Dolphin profile is no longer eligible.",
+            ));
+            return;
+        };
+        let remove_names: Vec<String> = state
+            .selection
+            .entries
+            .iter()
+            .filter(|entry| entry.selected && entry.already_managed)
+            .map(|entry| entry.dolphin_name.clone())
+            .collect();
+        let archive_path = workflow.archive_path.clone();
+        let key = cheat_preview_key(workflow);
+        let staging_root = match default_generated_gamecube_gamehacking_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    message,
+                ));
+                return;
+            }
+        };
+        let response = (|| {
+            let destination =
+                load_dolphin_destination(&configuration_path, &game_id).map_err(|failure| {
+                    GameCubeInstallPlanError {
+                        kind: GameCubeInstallPlanErrorKind::SelectionInvalid,
+                        cheat_name: None,
+                        detail: failure.to_string(),
+                    }
+                })?;
+            let staged = stage_gamecube_gamehacking_removal(
+                &staging_root,
+                &format!("{game_id}.ini"),
+                &destination.document,
+                destination.existed,
+                &remove_names,
+            )?;
+            let preview = build_gamecube_gamehacking_install_preview(
+                &GameCubeGameHackingInstallPreviewRequest {
+                    selected_archive: archive_path.clone(),
+                    configuration_path: configuration_path.clone(),
+                    game_id: game_id.clone(),
+                    revision: None,
+                    staged: staged.clone(),
+                },
+            )?;
+            Ok::<_, GameCubeInstallPlanError>((preview, staged))
+        })();
+        let message = match response {
+            Ok((preview, staged)) => CheatPreviewResponse {
+                key: key.clone(),
+                outcome: CheatPreviewOutcome::Ready(preview.report),
+                materialized: None,
+                generated: None,
+                dolphin_generated: None,
+                xenia_generated: None,
+                pcsx2_generated: None,
+                gamecube_gamehacking_generated: Some(GeneratedGameCubeGameHackingInstall {
+                    staging_root,
+                    staged,
+                }),
+            },
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    format!("Removal preview failed: {}", error.detail),
+                ));
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Failed(
+                        CheatPreviewFailure::GameCubeGameHackingInstallPlan(error),
+                    ),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
+                    pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
+                }
+            }
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Ready(message);
+        workflow.transaction = CheatTransactionState::Idle;
     }
 
     fn update_pcsx2_cheat_selection(&mut self, id: &str, selected: bool) {
@@ -7651,6 +7937,7 @@ impl ArchiveFsApp {
                         staging_root,
                         legacy_migration_report,
                     }),
+                    gamecube_gamehacking_generated: None,
                 }
             }
             Err(failure) => {
@@ -7679,6 +7966,7 @@ impl ArchiveFsApp {
                     dolphin_generated: None,
                     xenia_generated: None,
                     pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
                 }
             }
         };
@@ -10585,6 +10873,18 @@ impl ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::ConfirmGameCubeGameHackingMatch { game_id }) => {
                             self.confirm_gamecube_gamehacking_match(context.clone(), game_id);
+                        }
+                        Some(CheatWorkflowAction::ToggleGameCubeGameHackingCheatSelected {
+                            index,
+                            selected,
+                        }) => {
+                            self.update_gamecube_gamehacking_cheat_selection(index, selected);
+                        }
+                        Some(CheatWorkflowAction::InstallSelectedGameCubeGameHacking) => {
+                            self.start_gamecube_gamehacking_install_preview();
+                        }
+                        Some(CheatWorkflowAction::RemoveSelectedGameCubeGameHacking) => {
+                            self.start_gamecube_gamehacking_removal_preview();
                         }
                         Some(CheatWorkflowAction::RescanDolphinProfiles) => {
                             self.start_dolphin_profile_scan(context.clone());
@@ -17138,6 +17438,16 @@ struct GeneratedDolphinInstall {
     staged: StagedDolphinIni,
 }
 
+/// The GameHacking.org GameCube counterpart to `GeneratedDolphinInstall`:
+/// the staged, surgically edited GameSettings file for a selection of
+/// externally sourced `ActionReplay`/`Gecko` cheats, rather than the
+/// bundled Gecko catalogue.
+#[derive(Clone)]
+struct GeneratedGameCubeGameHackingInstall {
+    staging_root: PathBuf,
+    staged: StagedGameCubeIni,
+}
+
 /// The Xenia equivalent of `GeneratedDolphinInstall`: the exact chosen
 /// candidate document, staged as a real merged `.patch.toml`.
 #[derive(Clone)]
@@ -17157,15 +17467,24 @@ struct Pcsx2GameHackingState {
     selection: Pcsx2CheatSelection,
 }
 
-/// GameCube-only, preview-only GameHacking.org coverage. Deliberately has
-/// no selection/install fields at all - this milestone never writes
-/// anything, unlike `Pcsx2GameHackingState`.
+/// GameCube-only GameHacking.org coverage: matched title, named cheats,
+/// and - unlike the initial preview-only milestone - a selection of
+/// exactly which `ActionReplay`/`Gecko` cheats to install into the real
+/// Dolphin GameSettings file. `RawUnknown`/`Unsupported` cheats can never
+/// be selected (see `GameCubeCheatSelection::from_cheats`).
 struct GameCubeGameHackingState {
     status: GameHackingGameCubeMatchStatus,
     detail: String,
     game: Option<GameHackingGameCubeGame>,
     match_candidates: Vec<GameHackingGameCubeMatchCandidate>,
     cheats: Vec<GameHackingGameCubeCheat>,
+    selection: GameCubeCheatSelection,
+}
+
+fn gamecube_gamehacking_selection_for(
+    cheats: &[GameHackingGameCubeCheat],
+) -> GameCubeCheatSelection {
+    GameCubeCheatSelection::from_cheats(cheats, &parse_dolphin_ini(""))
 }
 
 #[derive(Clone)]
@@ -17219,6 +17538,9 @@ enum CheatPreviewFailure {
     XeniaInstallPlan(XeniaInstallPlanError),
     /// Generating, staging, or previewing a PCSX2 PNACH install failed.
     Pcsx2InstallPlan(Pcsx2InstallPlanError),
+    /// Generating, staging, or previewing a GameHacking.org GameCube
+    /// cheat install or removal failed.
+    GameCubeGameHackingInstallPlan(GameCubeInstallPlanError),
 }
 
 impl std::fmt::Display for CheatPreviewFailure {
@@ -17230,6 +17552,7 @@ impl std::fmt::Display for CheatPreviewFailure {
             Self::DolphinInstallPlan(error) => error.fmt(formatter),
             Self::XeniaInstallPlan(error) => error.fmt(formatter),
             Self::Pcsx2InstallPlan(error) => error.fmt(formatter),
+            Self::GameCubeGameHackingInstallPlan(error) => error.fmt(formatter),
         }
     }
 }
@@ -17247,6 +17570,8 @@ struct CheatPreviewResponse {
     xenia_generated: Option<GeneratedXeniaInstall>,
     /// Present only for the GameHacking.org PCSX2 install path.
     pcsx2_generated: Option<GeneratedPcsx2Install>,
+    /// Present only for the GameHacking.org GameCube install/removal path.
+    gamecube_gamehacking_generated: Option<GeneratedGameCubeGameHackingInstall>,
 }
 
 enum CheatPreviewWork {
@@ -18142,15 +18467,20 @@ enum CheatWorkflowAction {
     ToggleXeniaShowExactChanges(bool),
     ToggleDolphinDetailsOpen(bool),
     ToggleXeniaDetailsOpen(bool),
-    /// GameCube-only, preview-only GameHacking.org coverage: matches
-    /// against the cached catalogue and, once matched, downloads only
-    /// that one game's cheats. There is no install action here yet.
+    /// GameCube-only GameHacking.org coverage: matches against the cached
+    /// catalogue and, once matched, downloads only that one game's cheats.
     FetchGameCubeGameHacking {
         force_refresh: bool,
     },
     ConfirmGameCubeGameHackingMatch {
         game_id: u64,
     },
+    ToggleGameCubeGameHackingCheatSelected {
+        index: usize,
+        selected: bool,
+    },
+    InstallSelectedGameCubeGameHacking,
+    RemoveSelectedGameCubeGameHacking,
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -21879,11 +22209,12 @@ fn show_pcsx2_gamehacking(
     action
 }
 
-/// GameCube-only, preview-only GameHacking.org coverage: shows the matched
-/// title and GameHacking game ID, the exact match evidence, and named
-/// cheats with their author, notes, and identified code format. There is
-/// deliberately no install button in this milestone - no Wii, no
-/// selection, no write path at all.
+/// GameCube-only GameHacking.org coverage: shows the matched title and
+/// GameHacking game ID, the exact match evidence, and named cheats with
+/// their author, notes, and identified code format. Only `ActionReplay`
+/// and `Gecko` cheats are selectable and installable; `RawUnknown` and
+/// `Unsupported` cheats are always shown checkbox-free, preview-only (see
+/// `GameCubeCheatSelection::from_cheats`). No Wii yet.
 fn show_gamecube_gamehacking(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -21894,11 +22225,24 @@ fn show_gamecube_gamehacking(
         ui,
         "GameHacking.org (GameCube)",
         Some(
-            "Matches this local GameCube game against ArchiveFS's private complete index cache; only the selected game's cheats are downloaded. Preview only - nothing is written yet.",
+            "Matches this local GameCube game against ArchiveFS's private complete index cache; only the selected game's cheats are downloaded. Only Action Replay and Gecko cheats can be installed into the real Dolphin GameSettings file.",
         ),
     );
     let identity_ready = gamecube_identity_for_workflow(workflow)
         .is_some_and(|identity| identity.verified_game_id().is_some());
+    match &workflow.transaction {
+        CheatTransactionState::Applying { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Installing selected cheats…");
+            });
+            return action;
+        }
+        CheatTransactionState::Result { result, .. } => {
+            return show_beginner_install_result(ui, result);
+        }
+        CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+    }
     match &mut workflow.gamecube_gamehacking {
         CheatStepResource::NotLoaded => {
             widgets::status_badge(
@@ -22010,9 +22354,32 @@ fn show_gamecube_gamehacking(
                     game.game_id
                 ));
             }
-            for cheat in &state.cheats {
+            for (position, cheat) in state.cheats.iter().enumerate() {
+                let entry = state
+                    .selection
+                    .entries
+                    .iter()
+                    .find(|entry| entry.index == position)
+                    .cloned();
                 widgets::card(ui, |ui| {
-                    ui.strong(&cheat.name);
+                    if let Some(entry) = &entry
+                        && entry.selectable
+                    {
+                        let mut selected = entry.selected;
+                        if ui.checkbox(&mut selected, &cheat.name).changed() {
+                            action = Some(
+                                CheatWorkflowAction::ToggleGameCubeGameHackingCheatSelected {
+                                    index: entry.index,
+                                    selected,
+                                },
+                            );
+                        }
+                        if entry.already_managed {
+                            ui.weak("Already installed by ArchiveFS.");
+                        }
+                    } else {
+                        ui.strong(&cheat.name);
+                    }
                     if let Some(author) = &cheat.author {
                         ui.label(format!("Author: {author}"));
                     }
@@ -22028,16 +22395,158 @@ fn show_gamecube_gamehacking(
                             GameCubeCodeFormat::Unsupported => "Unsupported",
                         }
                     ));
+                    if entry.is_none_or(|entry| !entry.selectable) {
+                        ui.weak(
+                            "Preview only - ArchiveFS never installs a cheat whose Action Replay/Gecko format wasn't explicitly labelled by GameHacking.org.",
+                        );
+                    }
                 });
             }
-            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Quiet, identity_ready)
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Refresh",
+                    widgets::ActionStyle::Quiet,
+                    identity_ready,
+                )
                 .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchGameCubeGameHacking {
+                        force_refresh: true,
+                    });
+                }
+                if state.game.is_some()
+                    && matches!(workflow.transaction, CheatTransactionState::Idle)
+                    && widgets::action_button(
+                        ui,
+                        "Install selected",
+                        widgets::ActionStyle::Primary,
+                        state.selection.can_apply()
+                            && workflow.selected_dolphin_profile_id.is_some(),
+                    )
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::InstallSelectedGameCubeGameHacking);
+                }
+                let removable_count = state
+                    .selection
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.selected && entry.already_managed)
+                    .count();
+                if state.game.is_some()
+                    && matches!(workflow.transaction, CheatTransactionState::Idle)
+                    && widgets::action_button(
+                        ui,
+                        "Remove selected",
+                        widgets::ActionStyle::Secondary,
+                        removable_count > 0 && workflow.selected_dolphin_profile_id.is_some(),
+                    )
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::RemoveSelectedGameCubeGameHacking);
+                }
+            });
+            if let (CheatTransactionState::Idle, CheatStepResource::Ready(response)) =
+                (&workflow.transaction, &workflow.preview)
+                && workflow.preview_request.as_ref() == Some(&response.key)
+                && let CheatPreviewOutcome::Failed(failure) = &response.outcome
             {
-                action = Some(CheatWorkflowAction::FetchGameCubeGameHacking {
-                    force_refresh: true,
-                });
+                widgets::banner(
+                    ui,
+                    "Install failed",
+                    &failure.to_string(),
+                    widgets::StatusTone::Blocked,
+                );
             }
         }
+    }
+    let skipped_raw_unknown: Vec<String> = match &workflow.gamecube_gamehacking {
+        CheatStepResource::Ready(state) => state
+            .cheats
+            .iter()
+            .filter(|cheat| {
+                matches!(
+                    cheat.code_format,
+                    GameCubeCodeFormat::RawUnknown | GameCubeCodeFormat::Unsupported
+                )
+            })
+            .map(|cheat| cheat.name.clone())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let gamecube_gamehacking_affected: Vec<StagedGameCubeCheat> = match &workflow.preview {
+        CheatStepResource::Ready(response) => response
+            .gamecube_gamehacking_generated
+            .as_ref()
+            .map(|generated| generated.staged.affected.clone())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let review_is_gamecube_gamehacking = !gamecube_gamehacking_affected.is_empty()
+        || matches!(
+            &workflow.preview,
+            CheatStepResource::Ready(response) if response.gamecube_gamehacking_generated.is_some()
+        );
+    if review_is_gamecube_gamehacking
+        && let CheatTransactionState::Review {
+            plan,
+            replacement_approved,
+            ..
+        } = &mut workflow.transaction
+    {
+        widgets::card(ui, |ui| {
+            ui.strong("Install or remove the selected cheats?");
+            ui.label(
+                "ArchiveFS will write only to the [Gecko]/[ActionReplay] sections of this exact Dolphin GameSettings file, keep a backup, and make this change undoable.",
+            );
+            for entry in &plan.entries {
+                ui.label(format!(
+                    "Target file: {}/{}",
+                    entry.destination_root.display, entry.destination_relative_path.display
+                ));
+            }
+            for cheat in &gamecube_gamehacking_affected {
+                ui.label(format!(
+                    "{} → [{}]",
+                    cheat.name,
+                    match cheat.code_format {
+                        GameCubeCodeFormat::ActionReplay => "ActionReplay",
+                        GameCubeCodeFormat::Gecko => "Gecko",
+                        GameCubeCodeFormat::RawUnknown | GameCubeCodeFormat::Unsupported => "n/a",
+                    }
+                ));
+            }
+            if !skipped_raw_unknown.is_empty() {
+                ui.label(format!(
+                    "Skipped (preview-only, format not declared by GameHacking.org): {}",
+                    skipped_raw_unknown.join(", ")
+                ));
+            }
+            let replacement_required = plan.entries.iter().any(|entry| {
+                entry.proposed_action
+                    == archivefs_core::patch_manager::PreviewProposedAction::Replace
+            });
+            if replacement_required {
+                ui.checkbox(
+                    replacement_approved,
+                    "I approve replacing the existing file shown in the preview",
+                );
+            }
+            if widgets::action_button(
+                ui,
+                "Confirm",
+                widgets::ActionStyle::Primary,
+                !replacement_required || *replacement_approved,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ConfirmApply);
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                action = Some(CheatWorkflowAction::CancelApply);
+            }
+        });
     }
     action
 }
@@ -22312,6 +22821,20 @@ fn default_generated_dolphin_staging_root() -> Result<PathBuf, String> {
             root.parent()
                 .map(|parent| parent.join("generated-dolphin"))
                 .unwrap_or_else(|| root.join("generated-dolphin"))
+        })
+        .map_err(|error| format!("Staging root unavailable: {}", error.detail))
+}
+
+/// The private directory staged GameHacking.org GameCube installs are
+/// written into - kept separate from `generated-dolphin` (the bundled
+/// Dolphin Gecko catalogue's own staging root) so the two install
+/// sources' journal-visible staging paths are never confused.
+fn default_generated_gamecube_gamehacking_staging_root() -> Result<PathBuf, String> {
+    default_shared_backup_root()
+        .map(|root| {
+            root.parent()
+                .map(|parent| parent.join("generated-gamecube-gamehacking"))
+                .unwrap_or_else(|| root.join("generated-gamecube-gamehacking"))
         })
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
@@ -36873,6 +37396,7 @@ $Instant Growth [Nayr]\n";
             dolphin_generated: None,
             xenia_generated: None,
             pcsx2_generated: None,
+            gamecube_gamehacking_generated: None,
         });
 
         app.update_dolphin_code_selection(|selection| {
@@ -37148,6 +37672,7 @@ $Instant Growth [Nayr]\n";
                 dolphin_generated: None,
                 xenia_generated: None,
                 pcsx2_generated: None,
+                gamecube_gamehacking_generated: None,
             }))
             .unwrap();
         app.poll_cheat_workflow(&egui::Context::default());
@@ -37461,7 +37986,7 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
-    fn gamecube_gamehacking_shows_matched_title_game_id_and_named_cheats_but_no_install_button() {
+    fn gamecube_gamehacking_shows_matched_title_game_id_named_cheats_and_install_button() {
         let directory = std::env::temp_dir().join(format!(
             "archivefs-gui-gamecube-gamehacking-{}-{}",
             std::process::id(),
@@ -37486,6 +38011,16 @@ $Instant Growth [Nayr]\n";
                 source_url: "https://gamehacking.org/game/501".to_string(),
             }),
             match_candidates: Vec::new(),
+            selection: gamecube_gamehacking_selection_for(&[GameHackingGameCubeCheat {
+                id: "gh-gc-501-1".to_string(),
+                name: "Infinite Boost".to_string(),
+                author: Some("Ada".to_string()),
+                description: Some("Boost never runs out.".to_string()),
+                code_format: GameCubeCodeFormat::ActionReplay,
+                code_lines: vec!["04001234 00000001".to_string()],
+                source_game_id: 501,
+                source_url: "https://gamehacking.org/game/501".to_string(),
+            }]),
             cheats: vec![GameHackingGameCubeCheat {
                 id: "gh-gc-501-1".to_string(),
                 name: "Infinite Boost".to_string(),
@@ -37510,14 +38045,13 @@ $Instant Growth [Nayr]\n";
             "Author: Ada",
             "Notes: Boost never runs out.",
             "Code format: Action Replay",
+            "Install selected",
         ] {
             assert!(
                 rendered_text_contains(&output, expected),
                 "missing {expected}"
             );
         }
-        assert!(!rendered_text_contains(&output, "Install selected"));
-        assert!(!rendered_text_contains(&output, "Install now"));
     }
 
     #[test]
@@ -37551,6 +38085,7 @@ $Instant Growth [Nayr]\n";
                     archivefs_core::patch_manager::GameHackingGameCubeMatchStrength::NormalizedTitleAndRegion,
                 requires_user_confirmation: true,
             }],
+            selection: gamecube_gamehacking_selection_for(&[]),
             cheats: Vec::new(),
         });
         let ctx = egui::Context::default();
@@ -37803,6 +38338,7 @@ $Instant Growth [Nayr]\n";
             dolphin_generated: None,
             xenia_generated: None,
             pcsx2_generated: None,
+            gamecube_gamehacking_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -37838,6 +38374,7 @@ $Instant Growth [Nayr]\n";
             dolphin_generated: None,
             xenia_generated: None,
             pcsx2_generated: None,
+            gamecube_gamehacking_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();

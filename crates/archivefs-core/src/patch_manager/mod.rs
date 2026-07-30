@@ -36,6 +36,7 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod emulator_profile_memory;
+mod gamehacking_gamecube_install_plan;
 mod gamehacking_gamecube_provider;
 mod gamehacking_provider;
 mod gecko_document;
@@ -230,6 +231,14 @@ pub use emulator_profile_memory::{
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
 };
+pub use gamehacking_gamecube_install_plan::{
+    GameCubeCheatSelection, GameCubeCheatSelectionEntry, GameCubeGameHackingInstallPreview,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, MANAGED_SECTION_NAME,
+    MAX_GENERATED_INI_BYTES as GAMECUBE_GAMEHACKING_MAX_GENERATED_INI_BYTES, StagedGameCubeCheat,
+    StagedGameCubeIni, build_gamecube_gamehacking_install_preview, dolphin_code_name,
+    managed_names, stage_gamecube_gamehacking_install, stage_gamecube_gamehacking_removal,
+};
 pub use gamehacking_gamecube_provider::{
     GAMEHACKING_GAMECUBE_PROVIDER_ID, GameCubeCheatCodeDiagnostic, GameCubeCodeFormat,
     GameCubeGameHackingAdapter, GameCubeGameIdentity, GameCubeIdentityState,
@@ -253,10 +262,11 @@ pub use gamehacking_provider::{
     parse_gamehacking_pnach, parse_gamehacking_ps2_index_page,
 };
 pub use gecko_document::{
-    DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
-    GeckoCodeWarningKind, GeckoMergeError, MAX_GECKO_CODE_LINES, MAX_GECKO_CODES,
-    MAX_GECKO_LINE_BYTES, merge_external_gecko_codes, parse_dolphin_ini,
-    replace_gecko_enabled_section,
+    DolphinCodeSectionKind, DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind,
+    GeckoCode, GeckoCodeWarning, GeckoCodeWarningKind, GeckoMergeError, MAX_GECKO_CODE_LINES,
+    MAX_GECKO_CODES, MAX_GECKO_LINE_BYTES, merge_external_action_replay_codes,
+    merge_external_gecko_codes, parse_dolphin_ini, remove_named_codes,
+    replace_gecko_enabled_section, replace_named_section,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
