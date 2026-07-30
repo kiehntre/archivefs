@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use scraper::{Html, Selector};
+use scraper::{Element, Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -363,13 +363,22 @@ pub fn diagnose_gamecube_cheat_code_format(
         .collect();
     let classification_reason = match cheat.code_format {
         GameCubeCodeFormat::ActionReplay => {
-            "an explicit Encryption:/Format: label in the export declared Action Replay".to_string()
+            "an explicit label declared Action Replay - either an Encryption:/Format: \
+             field in the export text itself, or (far more commonly, since the Text \
+             export never carries one) the individual game page's own per-cheat label, \
+             matched to this cheat by its exact code body or by normalized title+author"
+                .to_string()
         }
         GameCubeCodeFormat::Gecko => {
-            "an explicit Encryption:/Format: label in the export declared Gecko".to_string()
+            "an explicit label declared Gecko - either an Encryption:/Format: field in \
+             the export text itself, or (far more commonly, since the Text export never \
+             carries one) the individual game page's own per-cheat label, matched to \
+             this cheat by its exact code body or by normalized title+author"
+                .to_string()
         }
         GameCubeCodeFormat::RawUnknown => {
-            "no explicit format label was present, and Dolphin's own source \
+            "no explicit format label was present (from the export text or a matched \
+             game-page entry), and Dolphin's own source \
              (ActionReplay.cpp / GeckoCode.cpp) confirms the identical raw code-line \
              shape has independently valid but different decodes under each engine's \
              own addressing scheme - never distinguishable from content alone"
@@ -1000,7 +1009,16 @@ impl GameHackingGameCubeProvider {
         let bytes = self.cached_request(&cache_name, MAX_EXPORT_BYTES, options, |transport| {
             transport.post_form(EXPORT_URL, &form, MAX_EXPORT_BYTES)
         })?;
-        parse_gamehacking_gamecube_export(game, &bytes.bytes)
+        let mut cheats = parse_gamehacking_gamecube_export(game, &bytes.bytes)?;
+        // Best-effort only: the flat Text export never carries a format
+        // label at all (see the module doc comment), but the individual
+        // game page does, per cheat. If the page can't be fetched for any
+        // reason, the export itself has already succeeded - cheats simply
+        // stay RawUnknown, exactly as if this enhancement didn't run.
+        if let Ok(page_bytes) = self.fetch_game_page(game, options) {
+            apply_gamecube_page_format_labels(&mut cheats, &page_bytes);
+        }
+        Ok(cheats)
     }
 
     /// Fetches one real game's page, purely to discover its cheat-export
@@ -1526,6 +1544,195 @@ pub fn parse_gamecube_sysid_diagnostics(
         hidden_fields,
         sys_id,
     })
+}
+
+// --- Game page format labels ---------------------------------------------
+
+/// One cheat entry as it appears on the individual GameHacking.org game
+/// page - unlike the flat Text export (which never carries a format
+/// label at all), the page visibly labels every entry `ARMax` (the
+/// GameCube/Wii Action Replay MAX format) or `Gecko`. A single game
+/// commonly mixes both across its cheats (confirmed live: Luigi's
+/// Mansion's 14 listed entries are 11 `ARMax` and 3 `Gecko`).
+///
+/// The page's own code text is *not* always the same encoding as the
+/// Text export's: for a `Gecko`-labelled entry it is the identical raw
+/// `XXXXXXXX YYYYYYYY` hex-pair lines (confirmed byte-for-byte equal to
+/// the Text export's own lines for the same cheat); for an
+/// `ARMax`-labelled entry it is the separately-encrypted AR-MAX text
+/// notation (`XXXX-XXXX-XXXXX`-shaped groups), not the raw hex at all.
+/// This is exactly why matching falls back to normalized title+author
+/// when the code body doesn't line up - see
+/// `apply_gamecube_page_format_labels`.
+struct GameCubePageCheat {
+    title: String,
+    author: Option<String>,
+    /// The label exactly as scraped (`"ARMax"`, `"Gecko"`, or whatever
+    /// else the page ever shows) - mapped to `GameCubeCodeFormat` only by
+    /// `map_gamecube_page_label`, never assumed here.
+    format_label: Option<String>,
+    /// Only populated for entries whose `<pre>` body looks like the same
+    /// `XXXXXXXX YYYYYYYY` raw hex-pair lines the Text export uses (an
+    /// ARMax entry's encrypted text never does) - used for the
+    /// higher-confidence exact code-body match.
+    code_lines: Vec<String>,
+}
+
+/// Scrapes every cheat entry from a real game page. Infallible and
+/// best-effort: an unexpected page shape simply yields zero entries
+/// (the export cheats then just stay `RawUnknown`, exactly as if this
+/// enhancement were never attempted) rather than failing the cheat fetch
+/// that already succeeded.
+fn parse_gamecube_game_page_cheats(bytes: &[u8]) -> Vec<GameCubePageCheat> {
+    let text = decode_provider_text(bytes, None);
+    let document = Html::parse_document(&text);
+    // `.codID` is the one class name the real page uses only for a
+    // cheat's own title/checkbox/author block - specific enough to
+    // anchor each entry without also matching the filter form, the game
+    // info table, or the export form.
+    let Ok(entry_selector) = Selector::parse(".codID") else {
+        return Vec::new();
+    };
+    let Ok(label_selector) = Selector::parse(".col-sm-3 small") else {
+        return Vec::new();
+    };
+    let Ok(code_selector) = Selector::parse(".col-sm-4.col-md-3 pre") else {
+        return Vec::new();
+    };
+    let Ok(label_element_selector) = Selector::parse("label") else {
+        return Vec::new();
+    };
+    let Ok(author_selector) = Selector::parse("a[href^='/hackers/']") else {
+        return Vec::new();
+    };
+    let mut cheats = Vec::new();
+    for entry in document.select(&entry_selector) {
+        let title = entry
+            .select(&label_element_selector)
+            .next()
+            .map(|label| {
+                label
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .map(|value| decode_html_text(&value));
+        let Some(title) = title.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let author = entry
+            .select(&author_selector)
+            .next()
+            .map(|node| node.text().collect::<String>().trim().to_string())
+            .map(|value| decode_html_text(&value))
+            .filter(|value| !value.is_empty());
+        // The label and code body live in sibling divs under the same
+        // `.row` as `.codID`, not inside `.codID` itself.
+        let Some(row) = entry.parent_element() else {
+            cheats.push(GameCubePageCheat {
+                title,
+                author,
+                format_label: None,
+                code_lines: Vec::new(),
+            });
+            continue;
+        };
+        let format_label = row
+            .select(&label_selector)
+            .next()
+            .map(|node| node.text().collect::<String>().trim().to_string())
+            .filter(|value| !value.is_empty());
+        let code_lines = row
+            .select(&code_selector)
+            .next()
+            .map(|pre| {
+                pre.text()
+                    .collect::<String>()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        cheats.push(GameCubePageCheat {
+            title,
+            author,
+            format_label,
+            code_lines,
+        });
+    }
+    cheats
+}
+
+/// Maps the page's own label text to a format - the only place a cheat
+/// is ever promoted out of `RawUnknown`. Anything not recognised exactly
+/// (including no label at all) maps to `None`, never a guess.
+fn map_gamecube_page_label(label: &str) -> Option<GameCubeCodeFormat> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "gecko" => Some(GameCubeCodeFormat::Gecko),
+        "armax" | "action replay" | "action replay max" => Some(GameCubeCodeFormat::ActionReplay),
+        _ => None,
+    }
+}
+
+/// Upgrades already-parsed export cheats from `RawUnknown` to
+/// `ActionReplay`/`Gecko` using only the individual game page's explicit
+/// per-cheat labels - the Text export itself never carries one. Matches
+/// each export cheat to at most one page entry, in priority order:
+///
+/// 1. An exact code-body match (the export cheat's own lines equal to a
+///    single page entry's raw hex lines) - the higher-confidence path,
+///    but only ever populated for `Gecko`-labelled page entries (an
+///    `ARMax` entry's on-page text is separately encrypted, never equal
+///    to the export's raw hex).
+/// 2. Otherwise, a normalized-title-and-author match against a single
+///    page entry.
+///
+/// If either step would match more than one page entry ambiguously, or
+/// no page entry at all, the cheat is left exactly as it was (never
+/// guessed). Returns how many cheats were actually upgraded.
+pub fn apply_gamecube_page_format_labels(
+    cheats: &mut [GameHackingGameCubeCheat],
+    page_bytes: &[u8],
+) -> usize {
+    let page_cheats = parse_gamecube_game_page_cheats(page_bytes);
+    let mut upgraded = 0;
+    for cheat in cheats.iter_mut() {
+        if cheat.code_format != GameCubeCodeFormat::RawUnknown {
+            continue;
+        }
+        let code_matches: Vec<&GameCubePageCheat> = page_cheats
+            .iter()
+            .filter(|page| !page.code_lines.is_empty() && page.code_lines == cheat.code_lines)
+            .collect();
+        let matched_label = if code_matches.len() == 1 {
+            code_matches[0].format_label.as_deref()
+        } else {
+            let title_norm = normalized_title(&cheat.name);
+            let author_norm = cheat.author.as_deref().map(normalized_title);
+            let title_matches: Vec<&GameCubePageCheat> = page_cheats
+                .iter()
+                .filter(|page| {
+                    normalized_title(&page.title) == title_norm
+                        && page.author.as_deref().map(normalized_title) == author_norm
+                })
+                .collect();
+            if title_matches.len() == 1 {
+                title_matches[0].format_label.as_deref()
+            } else {
+                None
+            }
+        };
+        if let Some(format) = matched_label.and_then(map_gamecube_page_label) {
+            cheat.code_format = format;
+            upgraded += 1;
+        }
+    }
+    upgraded
 }
 
 // --- Cheat export parsing -----------------------------------------------
@@ -2162,18 +2369,20 @@ mod tests {
         let export = include_bytes!("../../tests/fixtures/gamehacking/gamecube-real-export.txt");
         let fixture_game = game(54172, "GLME01", "USA", "Luigi's Mansion");
         let cheats = parse_gamehacking_gamecube_export(&fixture_game, export).unwrap();
-        assert_eq!(cheats.len(), 4);
+        assert_eq!(cheats.len(), 5);
         assert_eq!(cheats[0].name, "99 of Some Treasures");
         assert_eq!(cheats[0].author.as_deref(), Some("Codejunkies"));
         assert_eq!(cheats[0].code_lines.len(), 7);
         assert_eq!(cheats[0].code_format, GameCubeCodeFormat::RawUnknown);
         assert_eq!(cheats[1].name, "999 Cash");
-        assert_eq!(cheats[2].name, "End Boss Has No HP");
-        assert_eq!(cheats[2].code_lines, vec!["04126E6C 60000000".to_string()]);
-        assert_eq!(cheats[3].name, "Matrix Look");
-        assert_eq!(cheats[3].author.as_deref(), Some("Dosha"));
+        assert_eq!(cheats[2].name, "Element Modifier");
+        assert_eq!(cheats[2].code_lines.len(), 20);
+        assert_eq!(cheats[3].name, "End Boss Has No HP");
+        assert_eq!(cheats[3].code_lines, vec!["04126E6C 60000000".to_string()]);
+        assert_eq!(cheats[4].name, "Matrix Look");
+        assert_eq!(cheats[4].author.as_deref(), Some("Dosha"));
         // "Note []" has no code lines at all and must be silently
-        // dropped, not counted as a fifth cheat with a blank name.
+        // dropped, not counted as a sixth cheat with a blank name.
         assert!(cheats.iter().all(|cheat| cheat.name != "Note"));
     }
 
@@ -2242,6 +2451,138 @@ mod tests {
                 .contains("ActionReplay.cpp")
         );
         assert!(diagnostic.classification_reason.contains("GeckoCode.cpp"));
+    }
+
+    /// A sanitized real excerpt of Luigi's Mansion's own game page cheat
+    /// listing (GameHacking game 54172), containing a genuine mixture of
+    /// `ARMax` and `Gecko` labelled entries - proving the label vocabulary
+    /// really is per-cheat, not per-game, and that both values are
+    /// scraped correctly from the real markup shape (`.codID` block plus
+    /// sibling `.col-sm-3`/`.col-sm-4.col-md-3` divs under the same
+    /// `.row`).
+    #[test]
+    fn page_cheats_parse_a_real_mixture_of_armax_and_gecko_labels() {
+        let html =
+            include_bytes!("../../tests/fixtures/gamehacking/gamecube-game-page-mixed-labels.html");
+        let page_cheats = parse_gamecube_game_page_cheats(html);
+        assert!(page_cheats.len() >= 12, "{}", page_cheats.len());
+        let armax_count = page_cheats
+            .iter()
+            .filter(|cheat| cheat.format_label.as_deref() == Some("ARMax"))
+            .count();
+        let gecko_count = page_cheats
+            .iter()
+            .filter(|cheat| cheat.format_label.as_deref() == Some("Gecko"))
+            .count();
+        assert!(armax_count >= 9, "ARMax count: {armax_count}");
+        assert_eq!(gecko_count, 3, "Gecko count: {gecko_count}");
+        let element_modifier = page_cheats
+            .iter()
+            .find(|cheat| cheat.title == "Element Modifier")
+            .expect("Element Modifier present on the real page");
+        assert_eq!(element_modifier.author.as_deref(), Some("Link Master"));
+        assert_eq!(element_modifier.format_label.as_deref(), Some("Gecko"));
+        assert_eq!(element_modifier.code_lines.len(), 20);
+        assert_eq!(element_modifier.code_lines[0], "284CAFD0 00000008");
+        let treasures = page_cheats
+            .iter()
+            .find(|cheat| cheat.title == "99 of Some Treasures")
+            .expect("real ARMax-labelled entry present");
+        assert_eq!(treasures.format_label.as_deref(), Some("ARMax"));
+        // An ARMax entry's on-page code is separately-encrypted AR-MAX
+        // text, never the raw hex the Text export uses for the same
+        // cheat - confirmed here so the matcher's fallback to
+        // title+author (rather than code-body) for ActionReplay entries
+        // is exercised against real data, not an assumption.
+        assert_ne!(treasures.code_lines, vec!["040AE518 63180063".to_string()]);
+    }
+
+    #[test]
+    fn map_gamecube_page_label_only_recognises_the_confirmed_real_vocabulary() {
+        assert_eq!(
+            map_gamecube_page_label("Gecko"),
+            Some(GameCubeCodeFormat::Gecko)
+        );
+        assert_eq!(
+            map_gamecube_page_label("ARMax"),
+            Some(GameCubeCodeFormat::ActionReplay)
+        );
+        assert_eq!(
+            map_gamecube_page_label("armax"),
+            Some(GameCubeCodeFormat::ActionReplay)
+        );
+        assert_eq!(map_gamecube_page_label("Mednafen"), None);
+        assert_eq!(map_gamecube_page_label(""), None);
+    }
+
+    /// The end-to-end enhancement: real export cheats (initially all
+    /// `RawUnknown`, per `parse_gamehacking_gamecube_export`'s own
+    /// design) get upgraded using the real mixed-label page fixture -
+    /// `Element Modifier` via its exact code body (a Gecko entry, whose
+    /// on-page code equals the export's raw hex lines), and the ARMax
+    /// entries via normalized title+author (since their on-page code is
+    /// a different, encrypted encoding that can never equal the export's
+    /// raw hex).
+    #[test]
+    fn page_labels_upgrade_matching_export_cheats_by_code_body_or_title_and_author() {
+        let export = include_bytes!("../../tests/fixtures/gamehacking/gamecube-real-export.txt");
+        let fixture_game = game(54172, "GLME01", "USA", "Luigi's Mansion");
+        let mut cheats = parse_gamehacking_gamecube_export(&fixture_game, export).unwrap();
+        assert!(
+            cheats
+                .iter()
+                .all(|cheat| cheat.code_format == GameCubeCodeFormat::RawUnknown)
+        );
+        let page_html =
+            include_bytes!("../../tests/fixtures/gamehacking/gamecube-game-page-mixed-labels.html");
+        let upgraded = apply_gamecube_page_format_labels(&mut cheats, page_html);
+        assert_eq!(
+            upgraded, 5,
+            "all 5 export cheats have a matching page entry"
+        );
+        let by_name = |name: &str| cheats.iter().find(|cheat| cheat.name == name).unwrap();
+        assert_eq!(
+            by_name("Element Modifier").code_format,
+            GameCubeCodeFormat::Gecko,
+            "matched by exact code body"
+        );
+        assert_eq!(
+            by_name("99 of Some Treasures").code_format,
+            GameCubeCodeFormat::ActionReplay,
+            "matched by normalized title+author (ARMax on-page code never equals raw hex)"
+        );
+        assert_eq!(
+            by_name("999 Cash").code_format,
+            GameCubeCodeFormat::ActionReplay
+        );
+        assert_eq!(
+            by_name("End Boss Has No HP").code_format,
+            GameCubeCodeFormat::ActionReplay
+        );
+        assert_eq!(
+            by_name("Matrix Look").code_format,
+            GameCubeCodeFormat::ActionReplay
+        );
+    }
+
+    #[test]
+    fn unmatched_or_unlabelled_page_entries_never_change_the_classification() {
+        let fixture_game = game(999, "ZZZZZZ", "USA", "No Such Game");
+        let mut cheats = vec![GameHackingGameCubeCheat {
+            id: "gh-gc-999-1".to_string(),
+            name: "Not On The Page".to_string(),
+            author: None,
+            description: None,
+            code_format: GameCubeCodeFormat::RawUnknown,
+            code_lines: vec!["DEADBEEF 00000000".to_string()],
+            source_game_id: fixture_game.game_id,
+            source_url: fixture_game.source_url.clone(),
+        }];
+        let page_html =
+            include_bytes!("../../tests/fixtures/gamehacking/gamecube-game-page-mixed-labels.html");
+        let upgraded = apply_gamecube_page_format_labels(&mut cheats, page_html);
+        assert_eq!(upgraded, 0);
+        assert_eq!(cheats[0].code_format, GameCubeCodeFormat::RawUnknown);
     }
 
     #[test]

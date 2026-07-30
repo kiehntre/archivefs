@@ -239,9 +239,9 @@ pub use gamehacking_gamecube_provider::{
     GameHackingGameCubeIndexRefreshResult, GameHackingGameCubeMatch,
     GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
     GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
-    diagnose_gamecube_cheat_code_format, load_gamecube_catalogue, normalize_gamecube_game_id,
-    parse_gamecube_sysid_diagnostics, parse_gamehacking_gamecube_export,
-    parse_gamehacking_gamecube_index_page,
+    apply_gamecube_page_format_labels, diagnose_gamecube_cheat_code_format,
+    load_gamecube_catalogue, normalize_gamecube_game_id, parse_gamecube_sysid_diagnostics,
+    parse_gamehacking_gamecube_export, parse_gamehacking_gamecube_index_page,
 };
 pub use gamehacking_provider::{
     GAMEHACKING_PROVIDER_ID, GameHackingCheat, GameHackingError, GameHackingErrorKind,
