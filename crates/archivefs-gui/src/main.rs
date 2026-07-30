@@ -552,7 +552,40 @@ fn gui_version_line() -> String {
     format!("archivefs-gui {}", env!("CARGO_PKG_VERSION"))
 }
 
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}: {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
+
+/// Structured diagnostics for install/apply paths (selected cheat counts,
+/// resolved profiles, target paths, write/journal outcomes) go through the
+/// `log` facade rather than only the in-app history, so they are visible
+/// even when a failure never reaches a rendered banner. Level defaults to
+/// `info`; set `ARCHIVEFS_LOG` (e.g. `debug`) to see more.
+fn init_logging() {
+    let _ = log::set_logger(&LOGGER);
+    let level = std::env::var("ARCHIVEFS_LOG")
+        .ok()
+        .and_then(|value| value.parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(level);
+}
+
 fn main() -> eframe::Result<()> {
+    init_logging();
     let arguments = std::env::args().collect::<Vec<_>>();
     if arguments
         .iter()
@@ -7407,6 +7440,13 @@ impl ArchiveFsApp {
             std::process::id(),
             generate_shared_operation_id()
         ));
+        log::info!(
+            "pcsx2 install: {} cheat(s) selected, profile {:?} ({:?}), staging root {}",
+            selected.len(),
+            profile.profile_id,
+            profile.installation_type,
+            staging_root.display(),
+        );
         let key = cheat_preview_key(workflow);
         let response = (|| {
             let crc =
@@ -7427,26 +7467,52 @@ impl ArchiveFsApp {
             Ok::<_, Pcsx2InstallPlanError>((preview, staged))
         })();
         let message = match response {
-            Ok((preview, _staged)) => CheatPreviewResponse {
-                key: key.clone(),
-                outcome: CheatPreviewOutcome::Ready(preview.report),
-                materialized: None,
-                generated: None,
-                dolphin_generated: None,
-                xenia_generated: None,
-                pcsx2_generated: Some(GeneratedPcsx2Install { staging_root }),
-            },
-            Err(failure) => CheatPreviewResponse {
-                key: key.clone(),
-                outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::Pcsx2InstallPlan(
-                    failure,
-                )),
-                materialized: None,
-                generated: None,
-                dolphin_generated: None,
-                xenia_generated: None,
-                pcsx2_generated: None,
-            },
+            Ok((preview, staged)) => {
+                log::info!(
+                    "pcsx2 install: staged pnach for {} at {} ({} byte(s)); target {}",
+                    key.archive_path.display(),
+                    staged.path.display(),
+                    staged.contents.len(),
+                    staged.destination_path.display(),
+                );
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Ready(preview.report),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
+                    pcsx2_generated: Some(GeneratedPcsx2Install { staging_root }),
+                }
+            }
+            Err(failure) => {
+                log::warn!(
+                    "pcsx2 install: build-preview failed for {}: {:?} ({})",
+                    key.archive_path.display(),
+                    failure.kind,
+                    failure.detail,
+                );
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(key.archive_path.clone()),
+                    ActivityOutcome::Failed,
+                    format!(
+                        "PCSX2 cheat install could not be prepared: {}",
+                        failure.detail
+                    ),
+                ));
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Failed(CheatPreviewFailure::Pcsx2InstallPlan(
+                        failure,
+                    )),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
+                    pcsx2_generated: None,
+                }
+            }
         };
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
@@ -21388,6 +21454,18 @@ fn show_pcsx2_gamehacking(
                     action = Some(CheatWorkflowAction::InstallSelectedPcsx2);
                 }
             });
+            if let (CheatTransactionState::Idle, CheatStepResource::Ready(response)) =
+                (&workflow.transaction, &workflow.preview)
+                && workflow.preview_request.as_ref() == Some(&response.key)
+                && let CheatPreviewOutcome::Failed(failure) = &response.outcome
+            {
+                widgets::banner(
+                    ui,
+                    "Install failed",
+                    &failure.to_string(),
+                    widgets::StatusTone::Blocked,
+                );
+            }
         }
     }
     if let CheatTransactionState::Review {
@@ -33838,6 +33916,229 @@ mod tests {
             bytes_inspected: 0,
             complete: true,
         }
+    }
+
+    /// A workflow with a verified PS2 CRC/serial identity - the minimum
+    /// `pcsx2_identity_for_workflow` requires before an install preview will
+    /// even attempt to stage a PNACH - plus one selected GameHacking cheat
+    /// candidate, matching the real-world "Install selected" scenario.
+    fn pcsx2_workflow_with_verified_identity_and_selected_cheat(
+        profile: Pcsx2Profile,
+    ) -> ArchiveFsApp {
+        let mut app = app_with_cheats_mods_context();
+        let profile_id = profile.profile_id.clone();
+        app.pcsx2_profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![profile],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some(profile_id);
+        workflow.identity_request = Some(GameIdentityRequest {
+            archive_path: workflow.archive_path.clone(),
+            platform: workflow.platform.clone(),
+            adapter: CheatEmulatorAdapter::Pcsx2,
+        });
+        let report = GameIdentityReport {
+            archive_path: workflow.archive_path.clone(),
+            platform: archivefs_core::game_identity::IdentityPlatform::PlayStation2,
+            format: IdentityImageFormat::Iso,
+            evidence: vec![
+                archivefs_core::game_identity::IdentityEvidence {
+                    kind: IdentityKind::Pcsx2ExecutableCrc,
+                    status: IdentityStatus::Verified,
+                    value: Some("A1B2C3D4".to_string()),
+                    confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                    provenance: archivefs_core::game_identity::IdentityProvenance {
+                        archive_path: workflow.archive_path.clone(),
+                        member_path: None,
+                        member_index: None,
+                        method: "test fixture".to_string(),
+                    },
+                    diagnostic: "test fixture".to_string(),
+                },
+                archivefs_core::game_identity::IdentityEvidence {
+                    kind: IdentityKind::Ps2Serial,
+                    status: IdentityStatus::Verified,
+                    value: Some("SLUS-20312".to_string()),
+                    confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                    provenance: archivefs_core::game_identity::IdentityProvenance {
+                        archive_path: workflow.archive_path.clone(),
+                        member_path: None,
+                        member_index: None,
+                        method: "test fixture".to_string(),
+                    },
+                    diagnostic: "test fixture".to_string(),
+                },
+            ],
+            warnings: Vec::new(),
+            bytes_read: 512,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        };
+        workflow.identity =
+            CheatStepResource::Ready((workflow.identity_request.clone().unwrap(), report));
+        let candidate = Pcsx2CheatCandidate {
+            id: "gh-42-1".to_string(),
+            name: "Infinite health".to_string(),
+            description: Some("Health never decreases.".to_string()),
+            author: Some("Codejunkies".to_string()),
+            source_game_id: Some("42".to_string()),
+            source_url: Some("https://gamehacking.org/game/42".to_string()),
+            provider_id: "gamehacking.org".to_string(),
+            provider_name: "GameHacking.org".to_string(),
+            source: "https://gamehacking.org/game/42".to_string(),
+            game_crc: "A1B2C3D4".to_string(),
+            serial_constraint: Some("SLUS-20312".to_string()),
+            region_constraint: None,
+            patch_lines: vec![
+                archivefs_core::patch_manager::PnachPatchLine::parse(
+                    "patch=1,EE,20123456,word,00000001",
+                )
+                .unwrap(),
+            ],
+            confidence:
+                archivefs_core::patch_manager::Pcsx2CheatConfidence::VerifiedCrcAndConstraints,
+            compatibility: archivefs_core::patch_manager::Pcsx2CheatCompatibility::Compatible,
+        };
+        let mut selection = Pcsx2CheatSelection::default();
+        selection.selected_ids.insert(candidate.id.clone());
+        workflow.pcsx2_gamehacking = CheatStepResource::Ready(Pcsx2GameHackingState {
+            status: GameHackingMatchStatus::Matched,
+            detail: "Matched from the local catalogue.".to_string(),
+            game: Some(GameHackingGame {
+                game_id: 42,
+                title: "Fixture Game".to_string(),
+                system: "PlayStation 2".to_string(),
+                region: Some("NTSC-U".to_string()),
+                serial: Some("SLUS-20312".to_string()),
+                crc: Some("A1B2C3D4".to_string()),
+                source_url: "https://gamehacking.org/game/42".to_string(),
+            }),
+            match_candidates: Vec::new(),
+            candidates: vec![candidate],
+            selection,
+        });
+        app
+    }
+
+    #[test]
+    fn install_selected_pcsx2_surfaces_build_preview_failure_visibly_and_records_history() {
+        let mut profile = pcsx2_profile_fixture();
+        // No documented `cheats` category patch directory is safely usable:
+        // `stage_pcsx2_pnach` must fail with `ProfileUnavailable` before it
+        // ever touches disk, reproducing the reported bug where a failed
+        // build-preview left no PNACH, no journal, and no visible error.
+        profile.patch_directories = vec![Pcsx2PatchDirectory {
+            path: PathBuf::from("/isolated/PCSX2/cheats"),
+            category: Pcsx2PatchCategory::Cheats,
+            state: Pcsx2PatchDirectoryState::UnsafePath,
+            warning: Some("directory is a symlink and will not be followed".to_string()),
+            identity: None,
+        }];
+        let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+        assert_eq!(app.history.entries().count(), 0);
+
+        app.start_pcsx2_install_preview();
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let CheatStepResource::Ready(response) = &workflow.preview else {
+            panic!("expected a resolved preview response");
+        };
+        let CheatPreviewOutcome::Failed(CheatPreviewFailure::Pcsx2InstallPlan(failure)) =
+            &response.outcome
+        else {
+            panic!("expected a failed PCSX2 install plan");
+        };
+        assert_eq!(
+            failure.kind,
+            archivefs_core::patch_manager::Pcsx2InstallPlanErrorKind::ProfileUnavailable
+        );
+
+        // The failure must be visible in the activity history, not silently
+        // discarded.
+        let entries: Vec<_> = app.history.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, ActivityOutcome::Failed);
+        assert!(entries[0].message.contains("PCSX2"));
+
+        // And it must render as a banner in the GUI itself, not just the log.
+        let ArchiveFsApp {
+            cheat_workflow,
+            pcsx2_profiles,
+            ..
+        } = &mut app;
+        let workflow = cheat_workflow.as_mut().unwrap();
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, &mut clipboard);
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "Install failed"),
+            "no visible install-failure banner was rendered"
+        );
+    }
+
+    #[test]
+    fn install_selected_pcsx2_stages_the_selected_cheat_with_its_real_name_and_patch() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-pcsx2-install-selected-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let cheats_directory = directory.join("cheats");
+        let mut profile = pcsx2_profile_fixture();
+        profile.configuration_path = directory.clone();
+        profile.patch_directories = vec![Pcsx2PatchDirectory {
+            path: cheats_directory.clone(),
+            category: Pcsx2PatchCategory::Cheats,
+            state: Pcsx2PatchDirectoryState::Missing,
+            warning: None,
+            identity: None,
+        }];
+        let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+
+        app.start_pcsx2_install_preview();
+
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let CheatStepResource::Ready(response) = &workflow.preview else {
+            panic!("expected a resolved preview response");
+        };
+        let CheatPreviewOutcome::Ready(_) = &response.outcome else {
+            panic!("expected a successful preview");
+        };
+        let generated = response
+            .pcsx2_generated
+            .as_ref()
+            .expect("a successful PCSX2 preview stages a generated install");
+        let staged_path = generated.staging_root.join("A1B2C3D4.pnach");
+        let staged = std::fs::read_to_string(&staged_path)
+            .unwrap_or_else(|error| panic!("staged pnach at {staged_path:?} unreadable: {error}"));
+        assert!(staged.contains("// ArchiveFS managed block: gh-42-1"));
+        assert!(staged.contains("// Infinite health"));
+        assert!(staged.contains("Author: Codejunkies"));
+        assert!(staged.contains("patch=1,EE,20123456,word,00000001"));
+
+        // The confirmation card must be reachable once the preview succeeds.
+        assert!(matches!(
+            workflow.transaction,
+            CheatTransactionState::Review { .. }
+        ));
+
+        let staging_root = generated.staging_root.clone();
+        let _ = std::fs::remove_dir_all(&staging_root);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     fn dolphin_profile_fixture() -> DolphinProfile {

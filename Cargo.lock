@@ -125,6 +125,7 @@ dependencies = [
  "archivefs-core",
  "eframe",
  "image",
+ "log",
  "rfd",
 ]
 

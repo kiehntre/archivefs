@@ -716,6 +716,13 @@ pub fn execute_shared_apply(
     }
     drop(lock);
     journal.status = derive_status(&journal.entries, effective_dry_run);
+    log::info!(
+        "shared apply {}: {:?}, {} entr(y/ies), {} byte(s) written",
+        journal.operation_id,
+        journal.status,
+        journal.entries.len(),
+        written,
+    );
     if effective_dry_run {
         return SharedApplyResult {
             journal,
@@ -724,12 +731,25 @@ pub fn execute_shared_apply(
         };
     }
     match write_journal_once(&journal, &options.history_root) {
-        Ok(path) => SharedApplyResult {
-            journal,
-            journal_path: Some(path),
-            journal_failure: None,
-        },
+        Ok(path) => {
+            log::info!(
+                "shared apply {}: journal written to {}",
+                journal.operation_id,
+                path.display(),
+            );
+            SharedApplyResult {
+                journal,
+                journal_path: Some(path),
+                journal_failure: None,
+            }
+        }
         Err(error) => {
+            log::warn!(
+                "shared apply {}: journal write failed: {:?} ({})",
+                journal.operation_id,
+                error.kind,
+                error.detail,
+            );
             let any_write = journal.entries.iter().any(|entry| {
                 matches!(
                     entry.outcome,

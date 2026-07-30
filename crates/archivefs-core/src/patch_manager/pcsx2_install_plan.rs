@@ -169,6 +169,12 @@ pub fn stage_pcsx2_pnach(
     })?;
     let file_name = pcsx2_crc_filename(crc)?;
     let destination_path = cheats_directory.join(&file_name);
+    log::debug!(
+        "pcsx2 install plan: profile {} target {} ({} cheat(s) selected)",
+        profile.profile_id,
+        destination_path.display(),
+        selected.len(),
+    );
     let original = load_existing_pcsx2_pnach(&destination_path)?;
     let document = parse_pnach_document(&original).map_err(|failure| {
         error(

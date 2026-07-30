@@ -199,6 +199,58 @@ fn new_file_install_and_undo_remove_only_the_created_pnach() {
 }
 
 #[test]
+fn missing_target_file_is_created_atomically_with_a_journal() {
+    let fixture = Fixture::new("missing-target");
+    assert!(!fixture.destination().exists());
+    let result = install(&fixture, "missing-target", &[cheat("health", "20123456")]);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    let journal_path = result
+        .journal_path
+        .as_ref()
+        .expect("a successful install writes a journal");
+    assert!(journal_path.exists());
+    assert!(fixture.destination().exists());
+    // No stray temp/partial files were left in the destination directory.
+    let leftovers: Vec<_> = fs::read_dir(fixture.destination().parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().contains(".partial"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+}
+
+#[test]
+fn zero_byte_existing_target_is_treated_as_valid_empty_content_and_populated_safely() {
+    let fixture = Fixture::new("zero-byte-existing");
+    fs::create_dir(fixture.profile_root().join("cheats")).unwrap();
+    fs::write(fixture.destination(), b"").unwrap();
+    assert_eq!(fs::metadata(fixture.destination()).unwrap().len(), 0);
+    let result = install(
+        &fixture,
+        "zero-byte-existing",
+        &[cheat("health", "20123456")],
+    );
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "entries: {:#?}",
+        result.journal.entries
+    );
+    let installed = String::from_utf8(fs::read(fixture.destination()).unwrap()).unwrap();
+    assert!(installed.contains("// ArchiveFS managed block: health"));
+    assert!(installed.contains("patch=1,EE,20123456,word,00000001"));
+    assert_eq!(
+        undo(&fixture, &result, "undo-zero-byte-existing"),
+        SharedApplyStatus::Success
+    );
+    // Undo restores the file to its original (empty) content, not deletion,
+    // since the destination already existed before this operation.
+    assert!(fixture.destination().exists());
+    assert_eq!(fs::metadata(fixture.destination()).unwrap().len(), 0);
+}
+
+#[test]
 fn existing_file_install_preserves_content_and_undo_restores_exact_bytes() {
     let fixture = Fixture::new("existing");
     fs::create_dir(fixture.profile_root().join("cheats")).unwrap();
