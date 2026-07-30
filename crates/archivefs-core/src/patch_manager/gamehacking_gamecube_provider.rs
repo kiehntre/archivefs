@@ -279,6 +279,47 @@ pub struct GameCubeSysIdDiagnostics {
 /// hex shape alone - only an explicit label in the exported text (an
 /// `Encryption:`/`Format:` field) promotes a cheat to `ActionReplay` or
 /// `Gecko`; ArchiveFS never speculatively converts between the two.
+///
+/// ## Why the hex shape alone can never decide this (code-format audit)
+///
+/// Dolphin's own source (`Source/Core/Core/ActionReplay.cpp`,
+/// `GeckoCode.cpp`, upstream `dolphin-emu/dolphin`) was inspected as the
+/// authority, per the audit this type's design is based on:
+///
+/// - Dolphin's `GameSettings/<ID>.ini` distinguishes the two formats
+///   *only* by which INI section a code was declared under - `[Gecko]`
+///   or `[ActionReplay]` - never by inspecting a code's own bytes. Both
+///   sections use the identical `XXXXXXXX YYYYYYYY` hex-pair line shape
+///   (confirmed in `gecko_document.rs`'s own `GeckoCode`/
+///   `MalformedLine` check, which applies the same shape rule Dolphin
+///   itself expects).
+/// - `ActionReplay.cpp`'s `ARAddr` bit-packs the first word as
+///   `subtype:2 | type:3 | size:2 | gcaddr:25` and interprets *every*
+///   32-bit value fed to it under that scheme - there is no byte pattern
+///   AR's own decoder rejects outright. A first word like `0xC0000000`
+///   (which some GameCube cheat archives use for Gecko-specific
+///   conditional/loop constructs) decodes under AR's own bit layout to a
+///   *defined, non-error* AR subtype (`SUB_MASTER_CODE`) - the same bytes
+///   are not exclusively one format or the other; they are simply
+///   interpreted differently depending on which engine runs them.
+/// - `GeckoCode.cpp` never semantically decodes a Gecko code's opcode at
+///   all; Dolphin only copies the raw bytes into memory and installs a
+///   separate, non-Dolphin-source "codehandler" that interprets them on
+///   the (emulated) CPU at runtime. Dolphin's own codebase therefore
+///   contains zero opcode-based Gecko-vs-AR disambiguation logic to
+///   mirror here.
+///
+/// Sampling ten real GameHacking.org GameCube exports (Luigi's Mansion,
+/// Eternal Darkness, and eight more) found zero instances of an explicit
+/// `Encryption:`/`Format:` label anywhere - the live "Text" export format
+/// is consistently a flat, unlabeled `<name> [<author>]` + code-lines
+/// list. Given Dolphin itself cannot and does not distinguish the two
+/// formats from content, and the exact same bytes are independently
+/// valid (with different real effects) under each engine, classifying
+/// by opcode shape here would be an unsafe guess, not a deterministic
+/// read - exactly what this type must never do. `RawUnknown` is
+/// therefore the correct, final answer for this export format, not a
+/// placeholder awaiting a smarter classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameCubeCodeFormat {
@@ -288,6 +329,66 @@ pub enum GameCubeCodeFormat {
     RawUnknown,
     /// Present but does not parse as a well-formed GameCube code line.
     Unsupported,
+}
+
+/// One cheat's code-format audit detail - what
+/// `gamehacking-gamecube-code-format-audit` prints per cheat. Recomputed
+/// from an already-parsed `GameHackingGameCubeCheat`; never a second
+/// source of truth for the classification itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct GameCubeCheatCodeDiagnostic {
+    pub name: String,
+    pub author: Option<String>,
+    pub code_lines: Vec<String>,
+    pub line_count: usize,
+    /// The first two hex characters of each code line's first 32-bit
+    /// word. Shown for human review only - never itself used to decide
+    /// `code_format` (see `GameCubeCodeFormat`'s doc comment for why
+    /// that would be unsafe).
+    pub opcode_prefixes: Vec<String>,
+    pub code_format: GameCubeCodeFormat,
+    pub classification_reason: String,
+}
+
+/// Explains, in the same terms `GameCubeCodeFormat`'s doc comment
+/// documents, exactly why a cheat received its classification.
+pub fn diagnose_gamecube_cheat_code_format(
+    cheat: &GameHackingGameCubeCheat,
+) -> GameCubeCheatCodeDiagnostic {
+    let opcode_prefixes = cheat
+        .code_lines
+        .iter()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|token| token.get(0..2).unwrap_or(token).to_ascii_uppercase())
+        .collect();
+    let classification_reason = match cheat.code_format {
+        GameCubeCodeFormat::ActionReplay => {
+            "an explicit Encryption:/Format: label in the export declared Action Replay".to_string()
+        }
+        GameCubeCodeFormat::Gecko => {
+            "an explicit Encryption:/Format: label in the export declared Gecko".to_string()
+        }
+        GameCubeCodeFormat::RawUnknown => {
+            "no explicit format label was present, and Dolphin's own source \
+             (ActionReplay.cpp / GeckoCode.cpp) confirms the identical raw code-line \
+             shape has independently valid but different decodes under each engine's \
+             own addressing scheme - never distinguishable from content alone"
+                .to_string()
+        }
+        GameCubeCodeFormat::Unsupported => {
+            "one or more lines did not match the well-formed 8-hex/8-hex code line shape"
+                .to_string()
+        }
+    };
+    GameCubeCheatCodeDiagnostic {
+        name: cheat.name.clone(),
+        author: cheat.author.clone(),
+        code_lines: cheat.code_lines.clone(),
+        line_count: cheat.code_lines.len(),
+        opcode_prefixes,
+        code_format: cheat.code_format,
+        classification_reason,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2074,6 +2175,73 @@ mod tests {
         // "Note []" has no code lines at all and must be silently
         // dropped, not counted as a fifth cheat with a blank name.
         assert!(cheats.iter().all(|cheat| cheat.name != "Note"));
+    }
+
+    /// A second real, independently-fetched export (Eternal Darkness -
+    /// Sanity's Requiem, GameHacking game 54189) - proves the parser
+    /// isn't overfit to Luigi's Mansion's specific export. Every one of
+    /// its 16 real cheats has no explicit format label either, exactly
+    /// like Luigi's Mansion.
+    #[test]
+    fn real_eternal_darkness_export_fixture_parses_all_named_cheats_as_raw_unknown() {
+        let export =
+            include_bytes!("../../tests/fixtures/gamehacking/gamecube-eternal-darkness-export.txt");
+        let fixture_game = game(
+            54189,
+            "GEDE01",
+            "USA",
+            "Eternal Darkness - Sanity's Requiem",
+        );
+        let cheats = parse_gamehacking_gamecube_export(&fixture_game, export).unwrap();
+        assert_eq!(cheats.len(), 16);
+        assert!(
+            cheats
+                .iter()
+                .all(|cheat| cheat.code_format == GameCubeCodeFormat::RawUnknown),
+            "no real sampled export ever carries an explicit format label; every cheat here must stay RawUnknown"
+        );
+        let unlock_all = cheats
+            .iter()
+            .find(|cheat| cheat.name == "Unlock All Extras")
+            .expect("named cheat present");
+        assert_eq!(unlock_all.author.as_deref(), Some("donny2112"));
+        assert_eq!(unlock_all.code_lines.len(), 2);
+    }
+
+    /// A real export for a game with zero published cheats (Pokemon Box -
+    /// Ruby & Sapphire, GameHacking game 54198) - just the two-line
+    /// header and nothing else. Must fail the same "no recognisable
+    /// code lines" way a genuinely malformed export would, not panic or
+    /// silently report zero cheats as success.
+    #[test]
+    fn real_export_with_no_cheats_at_all_fails_loudly_not_silently() {
+        let export =
+            include_bytes!("../../tests/fixtures/gamehacking/gamecube-no-cheats-export.txt");
+        let fixture_game = game(54198, "GPXP01", "Europe", "Pokemon Box - Ruby & Sapphire");
+        let error = parse_gamehacking_gamecube_export(&fixture_game, export).unwrap_err();
+        assert_eq!(error.kind, GameHackingErrorKind::InvalidResponse);
+    }
+
+    /// The code-format audit's classification reasons must cite the
+    /// actual Dolphin-source-grounded justification, not merely repeat
+    /// the enum variant name - this is what
+    /// `gamehacking-gamecube-code-format-audit` prints per cheat.
+    #[test]
+    fn code_format_diagnostic_explains_why_raw_unknown_cheats_are_not_guessed() {
+        let export = include_bytes!("../../tests/fixtures/gamehacking/gamecube-real-export.txt");
+        let fixture_game = game(54172, "GLME01", "USA", "Luigi's Mansion");
+        let cheats = parse_gamehacking_gamecube_export(&fixture_game, export).unwrap();
+        let diagnostic = diagnose_gamecube_cheat_code_format(&cheats[0]);
+        assert_eq!(diagnostic.name, "99 of Some Treasures");
+        assert_eq!(diagnostic.line_count, 7);
+        assert_eq!(diagnostic.opcode_prefixes, vec!["04"; 7]);
+        assert_eq!(diagnostic.code_format, GameCubeCodeFormat::RawUnknown);
+        assert!(
+            diagnostic
+                .classification_reason
+                .contains("ActionReplay.cpp")
+        );
+        assert!(diagnostic.classification_reason.contains("GeckoCode.cpp"));
     }
 
     #[test]

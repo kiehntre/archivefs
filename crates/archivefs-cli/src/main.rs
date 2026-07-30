@@ -433,6 +433,61 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "gamehacking-gamecube-code-format-audit" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-gamecube-code-format-audit requires --game-id <id>")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-code-format-audit does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let catalogue = load_gamecube_catalogue(&options.cache_root)?;
+            let record = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| {
+                    format!(
+                        "game {game_id} was not found in the cached GameCube catalogue; run gamehacking-gamecube-index-refresh first"
+                    )
+                })?;
+            let game = record.as_game();
+            let provider = GameHackingGameCubeProvider::default();
+            let cheats = provider.fetch_cheats_for_diagnostic(&game, &options)?;
+            let diagnostics: Vec<_> = cheats
+                .iter()
+                .map(archivefs_core::patch_manager::diagnose_gamecube_cheat_code_format)
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+            } else {
+                println!("Game ID: {game_id}");
+                println!("Title: {}", game.title);
+                println!("Cheats: {}", diagnostics.len());
+                for cheat in &diagnostics {
+                    println!();
+                    println!("- {}", cheat.name);
+                    println!("  Author: {}", cheat.author.as_deref().unwrap_or("(none)"));
+                    println!("  Line count: {}", cheat.line_count);
+                    println!("  Opcode prefixes: {}", cheat.opcode_prefixes.join(", "));
+                    println!("  Classification: {:?}", cheat.code_format);
+                    println!("  Reason: {}", cheat.classification_reason);
+                    println!("  Raw lines:");
+                    for line in &cheat.code_lines {
+                        println!("    {line}");
+                    }
+                }
+            }
+        }
         "retroarch-environment" => {
             let mut input_args = args.collect::<Vec<_>>();
             let json = extract_flag(&mut input_args, "--json");
@@ -4499,6 +4554,9 @@ fn print_help() {
     println!(
         "  gamehacking-gamecube-sysid-diagnostic --game-id <id>  Fetch one cached catalogue game's real page and print its cheat-export form action, hidden fields, and confirmed sysID (--cache-root/--json accepted)"
     );
+    println!(
+        "  gamehacking-gamecube-code-format-audit --game-id <id>  Fetch one cached catalogue game's real cheat export and print, per cheat, its title/author/raw code lines/opcode prefixes/classification and why (--cache-root/--json accepted)"
+    );
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
@@ -4610,6 +4668,7 @@ fn print_help() {
     println!("  archivefs gamehacking-ps2-index-refresh");
     println!("  archivefs gamehacking-gamecube-index-refresh");
     println!("  archivefs gamehacking-gamecube-sysid-diagnostic --game-id 54172");
+    println!("  archivefs gamehacking-gamecube-code-format-audit --game-id 54172");
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");
