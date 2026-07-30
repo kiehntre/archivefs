@@ -5,10 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use archivefs_core::patch_manager::{
     ManagedPnachCheat, Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2InstallPreviewRequest,
     Pcsx2InstallationType, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
-    Pcsx2Profile, Pcsx2ProfileScope, PnachPatchLine, SharedApplyConfirmation, SharedApplyOptions,
-    SharedApplyResult, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
-    SharedRollbackOutcome, build_pcsx2_install_preview, build_shared_transaction_plan,
-    execute_shared_apply, execute_shared_rollback, preview_shared_rollback, stage_pcsx2_pnach,
+    Pcsx2Profile, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PnachPatchLine,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackOutcome,
+    build_pcsx2_install_preview, build_shared_transaction_plan, confirmed_pcsx2_profile,
+    discover_pcsx2_profiles, execute_shared_apply, execute_shared_rollback,
+    preview_shared_rollback, stage_pcsx2_pnach,
 };
 
 struct Fixture(PathBuf);
@@ -278,6 +280,167 @@ fn missing_backup_and_external_change_block_undo() {
     assert_eq!(
         changed.entries[0].outcome,
         SharedRollbackOutcome::DestinationChanged
+    );
+}
+
+/// A disposable "AppImage" fixture: a directory that stands in for the one
+/// containing a running `.AppImage`, with PCSX2 evidence written directly
+/// beside it, matching PCSX2's documented portable-mode layout (a
+/// `portable.ini` marker file next to the executable, data stored in that
+/// same directory).
+struct AppImageFixture(PathBuf);
+
+impl AppImageFixture {
+    fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-pcsx2-appimage-e2e-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let appimage_dir = root.join("appimage-dir");
+        fs::create_dir_all(appimage_dir.join("inis")).unwrap();
+        fs::write(appimage_dir.join("portable.ini"), b"").unwrap();
+        fs::write(
+            appimage_dir.join("game.iso"),
+            b"immutable game image fixture",
+        )
+        .unwrap();
+        Self(root)
+    }
+
+    fn appimage_dir(&self) -> PathBuf {
+        self.0.join("appimage-dir")
+    }
+
+    fn history(&self) -> PathBuf {
+        self.0.join("archivefs-history")
+    }
+
+    fn backups(&self) -> PathBuf {
+        self.0.join("archivefs-backups")
+    }
+}
+
+impl Drop for AppImageFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn appimage_adjacent_portable_profile_installs_named_grouped_cheat_with_journal_and_rollback() {
+    let fixture = AppImageFixture::new("portable-install");
+    // An isolated root tree, not the real environment: discovery must find
+    // only the AppImage-adjacent profile, so confirmation is unambiguous.
+    let roots = Pcsx2ProfileDiscoveryRoots {
+        home: fixture.0.join("isolated-home"),
+        xdg_config_home: fixture.0.join("isolated-home/.config"),
+        xdg_data_home: fixture.0.join("isolated-home/.local/share"),
+        documents_home: fixture.0.join("isolated-home/Documents"),
+        flatpak_system_root: fixture.0.join("isolated-system-flatpak"),
+        appimage_directory: Some(fixture.appimage_dir()),
+        portable_configuration_roots: Vec::new(),
+    };
+    let discovery = discover_pcsx2_profiles(&roots).unwrap();
+    let profile = confirmed_pcsx2_profile(&discovery, None)
+        .expect("the AppImage-adjacent portable profile is discovered and unambiguous")
+        .clone();
+    assert_eq!(profile.installation_type, Pcsx2InstallationType::Portable);
+    assert_eq!(profile.configuration_path, fixture.appimage_dir());
+
+    let identity = Pcsx2GameIdentity {
+        archive_path: fixture.appimage_dir().join("game.iso"),
+        title: "Fixture Game".to_string(),
+        region: Some("NTSC-U".to_string()),
+        serial: Some("SLUS-20312".to_string()),
+        executable_crc: Some("A1B2C3D4".to_string()),
+        state: Pcsx2IdentityState::Verified,
+        evidence: vec!["exact fixture bytes".to_string()],
+        plain_failure_reason: None,
+    };
+    let selected = vec![ManagedPnachCheat {
+        id: "infinite-health".to_string(),
+        name: "Infinite health".to_string(),
+        description: Some("Author: Codejunkies | GameHacking game ID: 42".to_string()),
+        patch_lines: vec![PnachPatchLine::parse("patch=1,EE,20123456,word,00000001").unwrap()],
+    }];
+
+    let staged = stage_pcsx2_pnach(
+        &fixture.0.join("staging"),
+        &profile,
+        identity.verified_crc().unwrap(),
+        &selected,
+    )
+    .unwrap();
+    let preview = build_pcsx2_install_preview(&Pcsx2InstallPreviewRequest {
+        selected_archive: identity.archive_path.clone(),
+        profile: profile.clone(),
+        identity,
+        staged,
+    })
+    .unwrap();
+    assert_eq!(preview.report.summary.blocked, 0);
+    let plan = build_shared_transaction_plan(
+        &preview.report,
+        &profile.profile_id,
+        "pcsx2-managed-pnach",
+        &preview.staged.staging_root,
+    )
+    .unwrap();
+    let result = execute_shared_apply(
+        &plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: "appimage-install".to_string(),
+            timestamp_unix_seconds: 1_700_000_100,
+            current_context: plan.context.clone(),
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert!(result.journal_path.is_some(), "install journal was written");
+
+    let destination = fixture.appimage_dir().join("cheats/A1B2C3D4.pnach");
+    let installed = String::from_utf8(fs::read(&destination).unwrap()).unwrap();
+    assert!(installed.contains("// ArchiveFS managed block: infinite-health"));
+    assert!(installed.contains("// Infinite health"));
+    assert!(installed.contains("Author: Codejunkies"));
+    assert!(installed.contains("patch=1,EE,20123456,word,00000001"));
+
+    // Rollback removes exactly the file this operation created.
+    let journal = result.journal_path.as_ref().unwrap();
+    let rollback_preview =
+        preview_shared_rollback(journal, &fixture.appimage_dir(), &fixture.backups());
+    assert!(rollback_preview.available);
+    let rollback = execute_shared_rollback(
+        &rollback_preview,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: rollback_preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "appimage-undo".to_string(),
+            timestamp_unix_seconds: 1_700_000_200,
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(!destination.exists());
+
+    // The emulator's game image and settings were never touched.
+    assert_eq!(
+        fs::read(fixture.appimage_dir().join("game.iso")).unwrap(),
+        b"immutable game image fixture"
     );
 }
 

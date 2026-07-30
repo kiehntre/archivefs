@@ -391,6 +391,74 @@ mod tests {
     }
 
     #[test]
+    fn grouped_pnach_output_keeps_real_names_authors_descriptions_in_separate_sections() {
+        use super::super::pcsx2_pnach::{merge_managed_pnach_cheats, parse_pnach_document};
+
+        let mut second = record();
+        second.id = "infinite-ammo".to_string();
+        second.name = "Infinite ammo".to_string();
+        second.description = Some("Ammo count never drops.".to_string());
+        second.author = Some("Ada".to_string());
+        second.source_game_id = Some("42".to_string());
+        second.source_url = Some("https://gamehacking.org/game/42".to_string());
+        second.patch_lines = vec!["patch=1,EE,20654321,word,00000063".to_string()];
+
+        let mut first = record();
+        first.description = Some("Health never decreases.".to_string());
+        first.author = Some("Codejunkies".to_string());
+        first.source_game_id = Some("42".to_string());
+        first.source_url = Some("https://gamehacking.org/game/42".to_string());
+
+        let catalogue = Pcsx2CheatProviderCatalogue {
+            provider_id: "gamehacking.org".to_string(),
+            provider_name: "GameHacking.org".to_string(),
+            source: "https://gamehacking.org/game/42".to_string(),
+            trust: Pcsx2ProviderTrust::Approved,
+            records: vec![first, second],
+        };
+        let candidates = build_pcsx2_cheat_candidates(&catalogue, &identity());
+        assert!(candidates.iter().all(Pcsx2CheatCandidate::selectable));
+        let selection = Pcsx2CheatSelection {
+            selected_ids: BTreeSet::from([
+                "infinite-health".to_string(),
+                "infinite-ammo".to_string(),
+            ]),
+        };
+        let managed = selected_pcsx2_managed_cheats(&candidates, &selection).unwrap();
+        assert_eq!(managed.len(), 2);
+
+        let document =
+            parse_pnach_document(b"// existing user note\npatch=0,EE,00100000,word,1\n").unwrap();
+        let rendered = merge_managed_pnach_cheats(&document, &managed).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+
+        // Real cheat names, per-cheat author attribution, and descriptions
+        // are present, each inside its own selectable managed section.
+        assert!(text.contains("// ArchiveFS managed block: infinite-health"));
+        assert!(text.contains("// Infinite health"));
+        assert!(text.contains("Author: Codejunkies"));
+        assert!(text.contains("Health never decreases."));
+        assert!(text.contains("patch=1,EE,20123456,word,00000001"));
+        assert!(text.contains("// End ArchiveFS managed block"));
+
+        assert!(text.contains("// ArchiveFS managed block: infinite-ammo"));
+        assert!(text.contains("// Infinite ammo"));
+        assert!(text.contains("Author: Ada"));
+        assert!(text.contains("Ammo count never drops."));
+        assert!(text.contains("patch=1,EE,20654321,word,00000063"));
+
+        // The original file's unrelated content is preserved byte-for-byte.
+        assert!(text.starts_with("// existing user note\npatch=0,EE,00100000,word,1\n"));
+
+        // Two independent, deterministically parseable managed sections.
+        let reparsed = parse_pnach_document(text.as_bytes()).unwrap();
+        assert_eq!(
+            reparsed.managed_block_ids(),
+            &BTreeSet::from(["infinite-health".to_string(), "infinite-ammo".to_string()])
+        );
+    }
+
+    #[test]
     fn selection_materializes_only_exact_selected_ids_and_rejects_stale_ids() {
         let candidates = build_pcsx2_cheat_candidates(&catalogue(record()), &identity());
         let selected = Pcsx2CheatSelection {

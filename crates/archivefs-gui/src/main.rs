@@ -18494,6 +18494,10 @@ fn show_pcsx2_workflow(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
+    let cheats_directory = workflow
+        .selected_pcsx2_profile_id
+        .as_deref()
+        .and_then(|profile_id| resolved_pcsx2_cheats_directory(profiles, profile_id));
     widgets::section_header(
         ui,
         "Stage 1 · PCSX2 profile",
@@ -18558,6 +18562,29 @@ fn show_pcsx2_workflow(
                     widgets::StatusTone::Warning,
                 );
             }
+            if workflow.selected_pcsx2_profile_id.is_some() {
+                match &cheats_directory {
+                    Some(cheats_directory) => {
+                        widgets::banner(
+                            ui,
+                            "PCSX2 cheats directory identified",
+                            &format!(
+                                "Cheats will be installed to: {}",
+                                cheats_directory.display()
+                            ),
+                            widgets::StatusTone::Success,
+                        );
+                    }
+                    None => {
+                        widgets::banner(
+                            ui,
+                            "PCSX2 cheats directory could not be confidently identified",
+                            "ArchiveFS will not guess a cheats directory for this profile. Choose a different profile, or resolve the profile's blockers above, before installing.",
+                            widgets::StatusTone::Blocked,
+                        );
+                    }
+                }
+            }
         }
     }
     if widgets::action_button(
@@ -18599,7 +18626,7 @@ fn show_pcsx2_workflow(
             "Choose an eligible PCSX2 profile before inspecting existing files.",
             widgets::StatusTone::Pending,
         );
-        return show_pcsx2_gamehacking(ui, workflow).or(action);
+        return show_pcsx2_gamehacking(ui, workflow, cheats_directory.as_deref()).or(action);
     };
     if workflow.pcsx2_inventory_profile_id.as_deref() != Some(selected_profile_id) {
         workflow.pcsx2_inventory_profile_id = None;
@@ -18636,7 +18663,7 @@ fn show_pcsx2_workflow(
             show_pcsx2_inventory(ui, workflow, inventory, clipboard);
         }
     }
-    show_pcsx2_gamehacking(ui, workflow).or(action)
+    show_pcsx2_gamehacking(ui, workflow, cheats_directory.as_deref()).or(action)
 }
 
 /// The beginner-facing entry point: a plain-English status, a simplified
@@ -21184,6 +21211,7 @@ fn show_pcsx2_inventory(
 fn show_pcsx2_gamehacking(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
+    cheats_directory: Option<&Path>,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
     ui.add_space(theme::SECTION_GAP);
@@ -21352,7 +21380,8 @@ fn show_pcsx2_gamehacking(
                         "Install selected",
                         widgets::ActionStyle::Primary,
                         !provider.selection.selected_ids.is_empty()
-                            && workflow.selected_pcsx2_profile_id.is_some(),
+                            && workflow.selected_pcsx2_profile_id.is_some()
+                            && cheats_directory.is_some(),
                     )
                     .clicked()
                 {
@@ -21370,6 +21399,12 @@ fn show_pcsx2_gamehacking(
         widgets::card(ui, |ui| {
             ui.strong("Install the selected cheats?");
             ui.label("ArchiveFS will use the verified CRC filename, keep a backup, and make this change undoable.");
+            for entry in &plan.entries {
+                ui.label(format!(
+                    "Target file: {}/{}",
+                    entry.destination_root.display, entry.destination_relative_path.display
+                ));
+            }
             let replacement_required = plan.entries.iter().any(|entry| {
                 entry.proposed_action
                     == archivefs_core::patch_manager::PreviewProposedAction::Replace
@@ -21401,9 +21436,10 @@ fn show_pcsx2_gamehacking(
 fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static str {
     match kind {
         Pcsx2InstallationType::Native => "Native",
+        Pcsx2InstallationType::NativeAlternate => "Native (alternate data location)",
         Pcsx2InstallationType::FlatpakUser => "Flatpak user",
         Pcsx2InstallationType::FlatpakSystem => "Flatpak system",
-        Pcsx2InstallationType::Portable => "Portable / explicit configuration",
+        Pcsx2InstallationType::Portable => "Portable / AppImage / explicit configuration",
     }
 }
 
@@ -23871,6 +23907,26 @@ fn eligible_pcsx2_profile_ids(discovery: &Pcsx2ProfileDiscovery) -> Vec<&str> {
         .filter(|profile| profile.eligible)
         .map(|profile| profile.profile_id.as_str())
         .collect()
+}
+
+/// Resolves the exact cheats directory for the currently selected PCSX2
+/// profile, or `None` when it cannot be confidently identified (profile not
+/// yet scanned, no longer eligible, or with no safe normal cheats
+/// directory). The GUI must never silently substitute another directory or
+/// proceed to install when this returns `None`.
+fn resolved_pcsx2_cheats_directory(
+    profiles: &Pcsx2ProfilesState,
+    profile_id: &str,
+) -> Option<PathBuf> {
+    let Pcsx2ProfilesState::Ready(discovery) = profiles else {
+        return None;
+    };
+    discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .and_then(archivefs_core::patch_manager::pcsx2_cheats_directory)
+        .map(Path::to_path_buf)
 }
 
 fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str> {
@@ -36195,6 +36251,104 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn pcsx2_workflow_shows_the_exact_resolved_cheats_directory_before_install() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        let profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![pcsx2_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "PCSX2 cheats directory identified"
+        ));
+        assert!(rendered_text_contains(&output, "/isolated/PCSX2/cheats"));
+    }
+
+    #[test]
+    fn pcsx2_workflow_warns_and_blocks_install_when_cheats_directory_is_unresolvable() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
+        let mut profile = pcsx2_profile_fixture();
+        // No documented `cheats` category patch directory is available or
+        // safely creatable: this profile cannot resolve an install target.
+        profile.patch_directories = vec![Pcsx2PatchDirectory {
+            path: PathBuf::from("/isolated/PCSX2/cheats"),
+            category: Pcsx2PatchCategory::Cheats,
+            state: Pcsx2PatchDirectoryState::UnsafePath,
+            warning: Some("directory is a symlink and will not be followed".to_string()),
+            identity: None,
+        }];
+        let profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![profile],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        assert!(resolved_pcsx2_cheats_directory(&profiles, "pcsx2-native-test").is_none());
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "PCSX2 cheats directory could not be confidently identified"
+        ));
+        assert!(!rendered_text_contains(&output, "Install selected"));
+    }
+
+    #[test]
+    fn pcsx2_workflow_requires_explicit_choice_between_multiple_eligible_profiles() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.platform = Some("PS2".to_string());
+        workflow.adapter = CheatEmulatorAdapter::Pcsx2;
+        workflow.selected_pcsx2_profile_id = None;
+        let mut second = pcsx2_profile_fixture();
+        second.profile_id = "pcsx2-portable-test".to_string();
+        second.installation_type = Pcsx2InstallationType::Portable;
+        second.scope = Pcsx2ProfileScope::Portable;
+        second.configuration_path = PathBuf::from("/isolated/appimage-dir");
+        let profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+            profiles: vec![pcsx2_profile_fixture(), second],
+            warnings: Vec::new(),
+            complete: true,
+        });
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_workflow(ui, workflow, &profiles, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "2 eligible profiles were found. Choose one explicitly."
+        ));
+        assert!(workflow.selected_pcsx2_profile_id.is_none());
+        assert!(!rendered_text_contains(
+            &output,
+            "PCSX2 cheats directory identified"
+        ));
+    }
+
+    #[test]
     fn pcsx2_gamehacking_title_candidate_shows_identity_before_confirmation() {
         let mut app = app_with_cheats_mods_context();
         let workflow = app.cheat_workflow.as_mut().unwrap();
@@ -36224,7 +36378,7 @@ $Instant Growth [Nayr]\n";
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_pcsx2_gamehacking(ui, workflow);
+                let _ = show_pcsx2_gamehacking(ui, workflow, None);
             });
         });
         for expected in [
@@ -36288,7 +36442,7 @@ $Instant Growth [Nayr]\n";
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_pcsx2_gamehacking(ui, workflow);
+                let _ = show_pcsx2_gamehacking(ui, workflow, None);
             });
         });
         for expected in [
