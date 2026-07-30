@@ -18214,6 +18214,7 @@ fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'st
         GeckoProviderFetchStatus::RateLimitedCache => "rate-limited cache",
         GeckoProviderFetchStatus::StaleCacheFallback => "stale cache fallback",
         GeckoProviderFetchStatus::Catalogue => "local Dolphin cheat catalogue",
+        GeckoProviderFetchStatus::NotAvailable => "no upstream file for this game",
     }
 }
 
@@ -18229,6 +18230,14 @@ enum BeginnerCheatStatus {
         compatible_count: usize,
     },
     NoCompatibleCheatsFound,
+    /// Dolphin's upstream GameSettings dataset has no file at all for this
+    /// exact game ID (an exact-lookup HTTP 404). Distinct from
+    /// `NoCompatibleCheatsFound` (a file exists, but nothing in it is safe
+    /// to offer): here there is nothing to offer because upstream simply
+    /// never published anything for this game - a normal outcome, not an
+    /// error, so it renders with neutral/info styling rather than the
+    /// warning/blocked tones used elsewhere in this enum.
+    NoUpstreamCheatsAvailable,
     EmulatorSetupNeeded,
     /// Multiple valid profiles were found; the profile chooser (rendered
     /// separately) is asking the user to pick one.
@@ -18260,6 +18269,9 @@ impl BeginnerCheatStatus {
                 format!("{compatible_count} {noun} found")
             }
             Self::NoCompatibleCheatsFound => "No compatible cheats found".to_string(),
+            Self::NoUpstreamCheatsAvailable => {
+                "No upstream Dolphin cheats are available for this game.".to_string()
+            }
             Self::EmulatorSetupNeeded => "Emulator setup needed".to_string(),
             Self::ChooseEmulatorProfile => "Choose an emulator profile".to_string(),
             Self::CouldNotCheckForCheats { .. } => "Could not check for cheats".to_string(),
@@ -18277,6 +18289,7 @@ impl BeginnerCheatStatus {
             Self::NoCompatibleCheatsFound | Self::UsingSavedResultsWhileOffline => {
                 widgets::StatusTone::Warning
             }
+            Self::NoUpstreamCheatsAvailable => widgets::StatusTone::Info,
             Self::CouldNotCheckForCheats { .. } | Self::IdentityUnavailable { .. } => {
                 widgets::StatusTone::Blocked
             }
@@ -18326,6 +18339,9 @@ fn dolphin_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus
             detail: message.clone(),
         },
         CheatStepResource::Ready(fetch) => {
+            if fetch.status == GeckoProviderFetchStatus::NotAvailable {
+                return BeginnerCheatStatus::NoUpstreamCheatsAvailable;
+            }
             if fetch.status == GeckoProviderFetchStatus::StaleCacheFallback {
                 return BeginnerCheatStatus::UsingSavedResultsWhileOffline;
             }
@@ -19580,6 +19596,11 @@ fn show_dolphin_beginner_summary(
                 });
             }
         }
+        BeginnerCheatStatus::NoUpstreamCheatsAvailable => {
+            ui.label(
+                "Dolphin's upstream GameSettings dataset has no entry for this exact game. This is expected for many games and is not an error - there is nothing to retry.",
+            );
+        }
         BeginnerCheatStatus::EmulatorSetupNeeded => {
             ui.label(
                 "ArchiveFS could not find a Dolphin profile to use yet. Open Details to type the Dolphin directory (portable/AppImage installs are not found automatically).",
@@ -20248,6 +20269,16 @@ fn show_dolphin_external_provider(
                 });
             }
         }
+        CheatStepResource::Ready(fetch)
+            if fetch.status == GeckoProviderFetchStatus::NotAvailable =>
+        {
+            widgets::banner(
+                ui,
+                "No upstream Dolphin cheats are available for this game.",
+                "Dolphin's upstream GameSettings dataset has no file for this exact game ID — this is expected for many games and is not an error.",
+                widgets::StatusTone::Info,
+            );
+        }
         CheatStepResource::Ready(fetch) => {
             widgets::card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -20333,6 +20364,9 @@ fn show_dolphin_provider_code_picker(
     ) else {
         return None;
     };
+    if fetch.result.entries.is_empty() {
+        return None;
+    }
     let selected_count = state.selection.selected_count();
     let selectable_count = state.selection.selectable_count();
     widgets::section_header(
@@ -36804,6 +36838,27 @@ $Instant Growth [Nayr]\n";
         }
     }
 
+    fn gafe01_not_available_fetch() -> GeckoProviderFetchResult {
+        GeckoProviderFetchResult {
+            result: GeckoProviderResult {
+                provider_id: "dolphin_upstream_gamesettings".to_string(),
+                provider_display_name: "Dolphin upstream GameSettings".to_string(),
+                source_identity: "https://raw.githubusercontent.com/dolphin-emu/dolphin/master/Data/Sys/GameSettings/GAFE01.ini".to_string(),
+                retrieved_at_unix_seconds: 1,
+                game_id: "GAFE01".to_string(),
+                title: None,
+                region: GeckoRegion::Usa,
+                revision: 0,
+                entries: Vec::new(),
+                warnings: Vec::new(),
+                attribution: "Gecko definitions from Dolphin upstream.".to_string(),
+                license: "GPL-2.0-or-later".to_string(),
+            },
+            status: GeckoProviderFetchStatus::NotAvailable,
+            refresh_error: None,
+        }
+    }
+
     fn install_provider_fixture(app: &mut ArchiveFsApp, configuration_path: &Path) {
         let fetch = gafe01_provider_fetch();
         let destination = load_dolphin_destination(configuration_path, "GAFE01").unwrap();
@@ -37247,6 +37302,99 @@ $Instant Growth [Nayr]\n";
             &output,
             "raw.githubusercontent.com"
         ));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn beginner_view_shows_neutral_state_for_missing_upstream_game_without_retry() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-beginner-not-available-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "dolphin-native-test".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+        });
+        workflow.dolphin_provider = CheatStepResource::Ready(gafe01_not_available_fetch());
+        assert_eq!(
+            dolphin_beginner_status(workflow),
+            BeginnerCheatStatus::NoUpstreamCheatsAvailable
+        );
+        assert_eq!(
+            BeginnerCheatStatus::NoUpstreamCheatsAvailable.tone(),
+            widgets::StatusTone::Info
+        );
+        let output = render_dolphin_workflow(&mut app);
+        assert!(rendered_text_contains(
+            &output,
+            "No upstream Dolphin cheats are available for this game."
+        ));
+        assert!(
+            !rendered_text_contains(&output, "Try again"),
+            "a deterministic missing-file result must not offer Retry"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn technical_details_shows_neutral_banner_without_retry_for_missing_upstream_game() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-details-not-available-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "dolphin-native-test".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+        });
+        workflow.dolphin_provider = CheatStepResource::Ready(gafe01_not_available_fetch());
+        workflow.dolphin_details_open = true;
+        let output = render_dolphin_workflow(&mut app);
+        assert!(rendered_text_contains(
+            &output,
+            "No upstream Dolphin cheats are available for this game."
+        ));
+        assert!(
+            !rendered_text_contains(&output, "Retry"),
+            "a deterministic missing-file result must not offer Retry"
+        );
+        assert!(!rendered_text_contains(
+            &output,
+            "Could not load matching cheats"
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn technical_details_keeps_retry_and_red_error_state_for_a_real_provider_failure() {
+        let temp = std::env::temp_dir().join(format!(
+            "archivefs-gui-details-real-failure-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&temp, "GAFE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: "dolphin-native-test".to_string(),
+            reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+        });
+        workflow.dolphin_provider =
+            CheatStepResource::Failed("Gecko provider returned HTTP 500".to_string());
+        workflow.dolphin_details_open = true;
+        let output = render_dolphin_workflow(&mut app);
+        assert!(rendered_text_contains(
+            &output,
+            "Could not load matching cheats"
+        ));
+        assert!(
+            rendered_text_contains(&output, "Retry"),
+            "a transient failure must still offer Retry"
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 

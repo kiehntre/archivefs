@@ -390,6 +390,12 @@ pub enum GeckoProviderFetchStatus {
     /// network request, not even a cache-freshness check against a remote
     /// server. See `dolphin_cheat_catalogue::resolve_dolphin_gecko_lookup`.
     Catalogue,
+    /// The exact per-game GameSettings file does not exist upstream (the
+    /// request returned HTTP 404). Dolphin's upstream repository simply has
+    /// no entry for this game ID - this is a normal, expected outcome, not
+    /// a provider failure, so it carries an empty `GeckoProviderResult`
+    /// rather than an error.
+    NotAvailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,7 +521,20 @@ pub fn fetch_dolphin_upstream_gecko_with_transport(
 
     let downloaded = download_provider_response(transport, &source_url);
     let bytes = match downloaded {
-        Ok(bytes) => bytes,
+        Ok(ProviderDownloadOutcome::Body(bytes)) => bytes,
+        // Dolphin's upstream repository has no GameSettings file for this
+        // exact game ID. This is the normal, expected shape of "no cheats
+        // published for this game" - not a fetch error - so it is reported
+        // as an empty result rather than propagated through
+        // `fallback_or_error` (which would otherwise mask it behind a
+        // validated stale cache, if one existed).
+        Ok(ProviderDownloadOutcome::ExactGameNotFound) => {
+            return Ok(GeckoProviderFetchResult {
+                result: not_available_result(query, &source_url, options.now_unix_seconds),
+                status: GeckoProviderFetchStatus::NotAvailable,
+                refresh_error: None,
+            });
+        }
         Err(error) => return fallback_or_error(cached, error),
     };
     let result = match provider.parse_response(query, &source_url, options.now_unix_seconds, &bytes)
@@ -536,10 +555,18 @@ pub fn fetch_dolphin_upstream_gecko_with_transport(
     })
 }
 
+/// Outcome of a single upstream HTTP request. Kept distinct from `Result`'s
+/// error side because an exact-game 404 is not a fetch error - see
+/// `GeckoProviderFetchStatus::NotAvailable`.
+enum ProviderDownloadOutcome {
+    Body(Vec<u8>),
+    ExactGameNotFound,
+}
+
 fn download_provider_response(
     transport: &dyn CheatSourceTransport,
     source_url: &str,
-) -> Result<Vec<u8>, GeckoProviderFetchError> {
+) -> Result<ProviderDownloadOutcome, GeckoProviderFetchError> {
     let mut bytes = Vec::new();
     let response = transport
         .get(
@@ -569,13 +596,42 @@ fn download_provider_response(
             format!("Gecko provider response exceeds {GECKO_PROVIDER_MAX_RESPONSE_BYTES} bytes"),
         ));
     }
+    // Exactly this status, from exactly this per-game upstream lookup, means
+    // Dolphin's upstream repository has no GameSettings file for this game
+    // ID - a normal "nothing published" outcome. Every other non-200 status
+    // (403, 429, 5xx, or anything else) remains a genuine provider error
+    // below; this branch never widens to other codes.
+    if response.status == 404 {
+        return Ok(ProviderDownloadOutcome::ExactGameNotFound);
+    }
     if response.status != 200 {
         return Err(fetch_error(
             GeckoProviderFetchErrorKind::HttpStatus,
             format!("Gecko provider returned HTTP {}", response.status),
         ));
     }
-    Ok(bytes)
+    Ok(ProviderDownloadOutcome::Body(bytes))
+}
+
+fn not_available_result(
+    query: &GeckoProviderQuery,
+    source_identity: &str,
+    retrieved_at_unix_seconds: u64,
+) -> GeckoProviderResult {
+    GeckoProviderResult {
+        provider_id: DOLPHIN_UPSTREAM_PROVIDER_ID.to_string(),
+        provider_display_name: DOLPHIN_UPSTREAM_PROVIDER_NAME.to_string(),
+        source_identity: source_identity.to_string(),
+        retrieved_at_unix_seconds,
+        game_id: query.game_id.clone(),
+        title: None,
+        region: query.region.clone(),
+        revision: query.revision,
+        entries: Vec::new(),
+        warnings: Vec::new(),
+        attribution: DOLPHIN_UPSTREAM_ATTRIBUTION.to_string(),
+        license: DOLPHIN_UPSTREAM_LICENSE.to_string(),
+    }
 }
 
 fn fallback_or_error(
@@ -838,6 +894,16 @@ mod tests {
                 error_code: Some(code),
             }
         }
+
+        fn with_status(status: u16) -> Self {
+            Self {
+                calls: Cell::new(0),
+                body: Vec::new(),
+                status,
+                reported_bytes: None,
+                error_code: None,
+            }
+        }
     }
 
     impl CheatSourceTransport for FakeTransport {
@@ -1078,5 +1144,73 @@ mod tests {
         .expect("rate-limited cache result");
         assert_eq!(result.status, GeckoProviderFetchStatus::RateLimitedCache);
         assert_eq!(unused.calls.get(), 0);
+    }
+
+    #[test]
+    fn exact_game_404_is_reported_as_a_normal_not_available_result_not_an_error() {
+        let cache = CacheFixture::new("404-not-available");
+        let transport = FakeTransport::with_status(404);
+        let fetch = fetch_dolphin_upstream_gecko_with_transport(
+            &query(),
+            &fetch_options(&cache.0, 1, false),
+            &transport,
+        )
+        .expect("a missing upstream file is Ok, not Err");
+        assert_eq!(fetch.status, GeckoProviderFetchStatus::NotAvailable);
+        assert!(fetch.result.entries.is_empty());
+        assert_eq!(fetch.result.game_id, "GAFE01");
+        assert!(fetch.refresh_error.is_none());
+    }
+
+    #[test]
+    fn forbidden_403_remains_a_genuine_provider_error() {
+        let cache = CacheFixture::new("403-forbidden");
+        let error = fetch_dolphin_upstream_gecko_with_transport(
+            &query(),
+            &fetch_options(&cache.0, 1, false),
+            &FakeTransport::with_status(403),
+        )
+        .expect_err("403 must not be treated as success");
+        assert_eq!(error.kind, GeckoProviderFetchErrorKind::HttpStatus);
+        assert!(error.detail.contains("403"));
+    }
+
+    #[test]
+    fn rate_limited_429_remains_a_genuine_provider_error() {
+        let cache = CacheFixture::new("429-rate-limited");
+        let error = fetch_dolphin_upstream_gecko_with_transport(
+            &query(),
+            &fetch_options(&cache.0, 1, false),
+            &FakeTransport::with_status(429),
+        )
+        .expect_err("429 must not be treated as success");
+        assert_eq!(error.kind, GeckoProviderFetchErrorKind::HttpStatus);
+        assert!(error.detail.contains("429"));
+    }
+
+    #[test]
+    fn server_error_500_remains_a_genuine_provider_error() {
+        let cache = CacheFixture::new("500-server-error");
+        let error = fetch_dolphin_upstream_gecko_with_transport(
+            &query(),
+            &fetch_options(&cache.0, 1, false),
+            &FakeTransport::with_status(500),
+        )
+        .expect_err("500 must not be treated as success");
+        assert_eq!(error.kind, GeckoProviderFetchErrorKind::HttpStatus);
+        assert!(error.detail.contains("500"));
+    }
+
+    #[test]
+    fn network_failure_remains_a_genuine_provider_error() {
+        let cache = CacheFixture::new("network-failure");
+        let error = fetch_dolphin_upstream_gecko_with_transport(
+            &query(),
+            &fetch_options(&cache.0, 1, false),
+            &FakeTransport::failing("connection_failed"),
+        )
+        .expect_err("network failure must not be treated as success");
+        assert_eq!(error.kind, GeckoProviderFetchErrorKind::Network);
+        assert!(error.detail.contains("connection_failed"));
     }
 }
