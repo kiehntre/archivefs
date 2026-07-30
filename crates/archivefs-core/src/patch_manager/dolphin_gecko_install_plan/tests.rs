@@ -86,6 +86,9 @@ fn inventory_for(configuration_path: &Path) -> DolphinGameIniInventory {
         xdg_data_home: configuration_path.parent().unwrap().to_path_buf(),
         flatpak_system_root: configuration_path.parent().unwrap().to_path_buf(),
         explicit_configuration_roots: Vec::new(),
+        running_commands: Vec::new(),
+        selected_launch_commands: Vec::new(),
+        selected_executable: None,
     };
     roots
         .explicit_configuration_roots

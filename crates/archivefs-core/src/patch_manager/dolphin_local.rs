@@ -8,12 +8,12 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -24,6 +24,10 @@ use crate::emulator_environment::EncodedPath;
 
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyFailureReason, validate_destination_root,
+};
+use super::resolved_emulator_profile::{
+    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
+    ResolvedEmulatorProfile,
 };
 
 pub const DOLPHIN_MAX_PROFILES: usize = 16;
@@ -41,6 +45,7 @@ const MAX_RETAINED_NAMES_PER_KIND: usize = 128;
 #[serde(rename_all = "snake_case")]
 pub enum DolphinInstallationType {
     Native,
+    AppImage,
     FlatpakUser,
     FlatpakSystem,
     Explicit,
@@ -96,7 +101,7 @@ pub struct DolphinProfile {
     pub installation_type: DolphinInstallationType,
     pub scope: DolphinProfileScope,
     pub configuration_path: PathBuf,
-    pub provenance: &'static str,
+    pub provenance: String,
     pub eligible: bool,
     pub blockers: Vec<DolphinProfileBlocker>,
     pub game_settings_path: PathBuf,
@@ -104,6 +109,7 @@ pub struct DolphinProfile {
     pub game_settings_warning: Option<String>,
     pub configuration_identity: Option<DolphinDirectoryIdentity>,
     pub game_settings_identity: Option<DolphinDirectoryIdentity>,
+    pub resolved: ResolvedEmulatorProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +127,22 @@ pub struct DolphinProfileDiscoveryRoots {
     pub flatpak_system_root: PathBuf,
     /// Exact, already-known Dolphin user directories; never search for these.
     pub explicit_configuration_roots: Vec<PathBuf>,
+    /// Running Dolphin argv records. Production fills these from bounded
+    /// `/proc/<pid>/cmdline` reads; tests and non-Linux callers can supply
+    /// the same lossless argv representation directly.
+    pub running_commands: Vec<DolphinCommandLine>,
+    /// Launch commands associated with the selected emulator even when it
+    /// is not currently running.
+    pub selected_launch_commands: Vec<DolphinCommandLine>,
+    /// Optional selected executable used to prefer its process/profile over
+    /// unrelated simultaneously running Dolphin installations.
+    pub selected_executable: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinCommandLine {
+    pub executable: PathBuf,
+    pub arguments: Vec<OsString>,
 }
 
 impl DolphinProfileDiscoveryRoots {
@@ -138,6 +160,9 @@ impl DolphinProfileDiscoveryRoots {
             home,
             flatpak_system_root: PathBuf::from("/var/lib/flatpak"),
             explicit_configuration_roots: Vec::new(),
+            running_commands: discover_running_dolphin_commands(),
+            selected_launch_commands: Vec::new(),
+            selected_executable: None,
         })
     }
 }
@@ -299,8 +324,12 @@ struct ProfileCandidate {
     installation_type: DolphinInstallationType,
     scope: DolphinProfileScope,
     path: PathBuf,
-    provenance: &'static str,
+    provenance: String,
     report_missing: bool,
+    executable: Option<PathBuf>,
+    explicit_profile: bool,
+    confidence: EmulatorProfileConfidence,
+    priority: u16,
 }
 
 /// Discovers documented paths and exact caller-supplied roots only.
@@ -331,17 +360,50 @@ pub fn discover_dolphin_profiles(
             installation_type: DolphinInstallationType::Native,
             scope: DolphinProfileScope::User,
             path: roots.xdg_config_home.join("dolphin-emu"),
-            provenance: "XDG Dolphin user directory",
+            provenance: "Native Dolphin XDG user directory fallback".to_string(),
             report_missing: false,
+            executable: None,
+            explicit_profile: false,
+            confidence: EmulatorProfileConfidence::Speculative,
+            priority: 100,
         },
         ProfileCandidate {
             installation_type: flatpak_kind,
             scope: flatpak_scope,
             path: flatpak_path,
-            provenance: "Flatpak org.DolphinEmu.dolphin-emu user directory",
+            provenance: "Flatpak org.DolphinEmu.dolphin-emu user directory".to_string(),
             report_missing: false,
+            executable: Some(PathBuf::from("/usr/bin/flatpak")),
+            explicit_profile: false,
+            confidence: EmulatorProfileConfidence::KnownPath,
+            priority: 150,
         },
     ];
+    for command in &roots.running_commands {
+        if let Some(path) = dolphin_user_path(&command.arguments) {
+            let selected_bonus = u16::from(
+                roots.selected_executable.as_deref() == Some(command.executable.as_path()),
+            ) * 25;
+            candidates.push(command_candidate(
+                command,
+                path,
+                EmulatorProfileConfidence::RunningExplicit,
+                400 + selected_bonus,
+                "Running Dolphin command line",
+            ));
+        }
+    }
+    for command in &roots.selected_launch_commands {
+        if let Some(path) = dolphin_user_path(&command.arguments) {
+            candidates.push(command_candidate(
+                command,
+                path,
+                EmulatorProfileConfidence::SelectedLaunch,
+                350,
+                "Selected Dolphin launch command",
+            ));
+        }
+    }
     candidates.extend(
         roots
             .explicit_configuration_roots
@@ -351,12 +413,29 @@ pub fn discover_dolphin_profiles(
                 installation_type: DolphinInstallationType::Explicit,
                 scope: DolphinProfileScope::Explicit,
                 path,
-                provenance: "Explicitly supplied Dolphin user directory",
+                provenance: "User-confirmed Dolphin profile override".to_string(),
                 report_missing: true,
+                executable: None,
+                explicit_profile: true,
+                confidence: EmulatorProfileConfidence::UserConfirmed,
+                priority: 500,
             }),
     );
-    candidates.sort_by(|a, b| a.path.cmp(&b.path));
-    candidates.dedup_by(|a, b| a.path == b.path);
+    candidates.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| b.priority.cmp(&a.priority))
+    });
+    candidates.dedup_by(|a, b| {
+        if a.path != b.path {
+            return false;
+        }
+        if !a.provenance.contains(&b.provenance) {
+            a.provenance.push_str("; ");
+            a.provenance.push_str(&b.provenance);
+        }
+        true
+    });
 
     let mut profiles = Vec::new();
     let mut warnings = Vec::new();
@@ -430,15 +509,16 @@ pub fn discover_dolphin_profiles(
             profile_id: profile_id(candidate.installation_type, &candidate.path),
             installation_type: candidate.installation_type,
             scope: candidate.scope,
-            configuration_path: candidate.path,
-            provenance: candidate.provenance,
+            configuration_path: candidate.path.clone(),
+            provenance: candidate.provenance.clone(),
             eligible: true,
             blockers: Vec::new(),
-            game_settings_path: settings_path,
+            game_settings_path: settings_path.clone(),
             game_settings_state: settings_state,
             game_settings_warning: settings_warning,
             configuration_identity: identity,
             game_settings_identity: settings_identity,
+            resolved: resolved_profile(&candidate, &settings_path),
         });
     }
     profiles.sort_by(|a, b| {
@@ -521,14 +601,15 @@ fn blocked(
         installation_type: candidate.installation_type,
         scope: candidate.scope,
         configuration_path: candidate.path.clone(),
-        provenance: candidate.provenance,
+        provenance: candidate.provenance.clone(),
         eligible: false,
         blockers: vec![blocker(kind, &candidate.path, detail)],
-        game_settings_path: settings,
+        game_settings_path: settings.clone(),
         game_settings_state: DolphinSettingsDirectoryState::Missing,
         game_settings_warning: None,
         configuration_identity: None,
         game_settings_identity: None,
+        resolved: resolved_profile(&candidate, &settings),
     }
 }
 
@@ -556,6 +637,7 @@ fn profile_id(kind: DolphinInstallationType, path: &Path) -> String {
     digest.update(path.as_os_str().to_string_lossy().as_bytes());
     let kind = match kind {
         DolphinInstallationType::Native => "native",
+        DolphinInstallationType::AppImage => "appimage",
         DolphinInstallationType::FlatpakUser => "flatpak-user",
         DolphinInstallationType::FlatpakSystem => "flatpak-system",
         DolphinInstallationType::Explicit => "explicit",
@@ -564,6 +646,156 @@ fn profile_id(kind: DolphinInstallationType, path: &Path) -> String {
         "dolphin-{kind}-{:016x}",
         u64::from_be_bytes(digest.finalize()[..8].try_into().unwrap())
     )
+}
+
+fn command_candidate(
+    command: &DolphinCommandLine,
+    path: PathBuf,
+    confidence: EmulatorProfileConfidence,
+    priority: u16,
+    evidence: &str,
+) -> ProfileCandidate {
+    let appimage = is_appimage_executable(&command.executable);
+    ProfileCandidate {
+        installation_type: if appimage {
+            DolphinInstallationType::AppImage
+        } else {
+            DolphinInstallationType::Explicit
+        },
+        scope: DolphinProfileScope::Explicit,
+        provenance: format!(
+            "{evidence}: {} -u {}",
+            command.executable.display(),
+            path.display()
+        ),
+        path,
+        report_missing: true,
+        executable: Some(command.executable.clone()),
+        explicit_profile: true,
+        confidence,
+        priority,
+    }
+}
+
+fn is_appimage_executable(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().to_string_lossy().starts_with(".mount_"))
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+}
+
+/// Extracts Dolphin's explicit user directory from a lossless argv vector.
+/// Both `-u path` and `-u=path` are supported; spaces are preserved because
+/// `/proc/<pid>/cmdline` is NUL-delimited rather than shell-tokenized.
+pub fn dolphin_user_path(arguments: &[OsString]) -> Option<PathBuf> {
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "-u" {
+            return arguments.next().map(PathBuf::from);
+        }
+        let text = argument.to_string_lossy();
+        if let Some(value) = text.strip_prefix("-u=")
+            && !value.is_empty()
+        {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+fn resolved_profile(candidate: &ProfileCandidate, settings_path: &Path) -> ResolvedEmulatorProfile {
+    let installation_type = match candidate.installation_type {
+        DolphinInstallationType::Native => EmulatorInstallationType::NativeSystem,
+        DolphinInstallationType::AppImage => EmulatorInstallationType::AppImage,
+        DolphinInstallationType::FlatpakUser | DolphinInstallationType::FlatpakSystem => {
+            EmulatorInstallationType::Flatpak
+        }
+        DolphinInstallationType::Explicit => EmulatorInstallationType::PortableCustom,
+    };
+    let writable = fs::metadata(&candidate.path)
+        .map(|metadata| !metadata.permissions().readonly())
+        .unwrap_or(false);
+    ResolvedEmulatorProfile {
+        emulator_executable: candidate.executable.clone(),
+        installation_type,
+        configuration_root: candidate.path.clone(),
+        data_user_root: candidate.path.clone(),
+        active_explicit_profile: candidate.explicit_profile.then(|| candidate.path.clone()),
+        destinations: EmulatorDestinationDirectories {
+            cheats: Some(settings_path.to_path_buf()),
+            patches: Some(settings_path.to_path_buf()),
+            mods: Some(candidate.path.join("Load")),
+            game_settings: Some(settings_path.to_path_buf()),
+        },
+        discovery_evidence: vec![candidate.provenance.clone()],
+        confidence: candidate.confidence,
+        priority: candidate.priority,
+        writable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn discover_running_dolphin_commands() -> Vec<DolphinCommandLine> {
+    const MAX_PROCESSES: usize = 4096;
+    const MAX_CMDLINE_BYTES: u64 = 64 * 1024;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    for entry in entries.filter_map(Result::ok).take(MAX_PROCESSES) {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let process = entry.path();
+        let Ok(executable) = fs::read_link(process.join("exe")) else {
+            continue;
+        };
+        let name_is_dolphin = executable.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("dolphin")
+        });
+        if !name_is_dolphin {
+            continue;
+        }
+        let Ok(mut file) = File::open(process.join("cmdline")) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .by_ref()
+            .take(MAX_CMDLINE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_CMDLINE_BYTES
+        {
+            continue;
+        }
+        #[cfg(unix)]
+        let arguments = bytes
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .skip(1)
+            .map(|argument| OsString::from_vec(argument.to_vec()))
+            .collect();
+        commands.push(DolphinCommandLine {
+            executable,
+            arguments,
+        });
+    }
+    commands.sort_by(|left, right| left.executable.cmp(&right.executable));
+    commands
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discover_running_dolphin_commands() -> Vec<DolphinCommandLine> {
+    Vec::new()
 }
 
 pub fn inspect_dolphin_profile(
@@ -1207,6 +1439,9 @@ mod tests {
             xdg_data_home: root.join("data"),
             flatpak_system_root: root.join("system"),
             explicit_configuration_roots: Vec::new(),
+            running_commands: Vec::new(),
+            selected_launch_commands: Vec::new(),
+            selected_executable: None,
         }
     }
 
@@ -1241,6 +1476,150 @@ mod tests {
         assert_eq!(discovery.profiles.len(), 3);
         assert!(discovery.profiles.iter().all(|p| p.eligible));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn command(executable: &str, arguments: &[&str]) -> DolphinCommandLine {
+        DolphinCommandLine {
+            executable: PathBuf::from(executable),
+            arguments: arguments.iter().map(OsString::from).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_running_u_forms_and_paths_with_spaces_losslessly() {
+        assert_eq!(
+            dolphin_user_path(&command("dolphin-emu", &["-u", "/profiles/Dolphin User"]).arguments),
+            Some(PathBuf::from("/profiles/Dolphin User"))
+        );
+        assert_eq!(
+            dolphin_user_path(&command("dolphin-emu", &["-u=/profiles/User"]).arguments),
+            Some(PathBuf::from("/profiles/User"))
+        );
+    }
+
+    #[test]
+    fn running_appimage_explicit_profile_beats_native_fallback() {
+        let root = fixture("running-appimage");
+        let native = make_profile(&root.join("config/dolphin-emu"));
+        let active = make_profile(&root.join("Applications/Dolphin/User"));
+        let mut discovery_roots = roots(&root);
+        discovery_roots.running_commands.push(command(
+            "/tmp/.mount_Dolphin123/bin/dolphin-emu",
+            &["-u", active.to_str().unwrap()],
+        ));
+        let discovery = discover_dolphin_profiles(&discovery_roots).unwrap();
+        let resolved = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_path == active)
+            .unwrap();
+        assert_eq!(
+            resolved.installation_type,
+            DolphinInstallationType::AppImage
+        );
+        assert_eq!(
+            resolved.resolved.confidence,
+            EmulatorProfileConfidence::RunningExplicit
+        );
+        assert!(
+            resolved.resolved.priority
+                > discovery
+                    .profiles
+                    .iter()
+                    .find(|p| p.configuration_path == native)
+                    .unwrap()
+                    .resolved
+                    .priority
+        );
+        assert_eq!(resolved.game_settings_path, active.join("GameSettings"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_launch_command_resolves_when_dolphin_is_not_running() {
+        let root = fixture("selected-launch");
+        let active = make_profile(&root.join("Selected AppImage User"));
+        let mut discovery_roots = roots(&root);
+        discovery_roots.selected_launch_commands.push(command(
+            "/opt/Dolphin.AppImage",
+            &[&format!("-u={}", active.display())],
+        ));
+        let discovery = discover_dolphin_profiles(&discovery_roots).unwrap();
+        let profile = discovery
+            .profiles
+            .iter()
+            .find(|p| p.configuration_path == active)
+            .unwrap();
+        assert_eq!(
+            profile.resolved.confidence,
+            EmulatorProfileConfidence::SelectedLaunch
+        );
+        assert_eq!(
+            profile.resolved.emulator_executable.as_deref(),
+            Some(Path::new("/opt/Dolphin.AppImage"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_default_is_fallback_when_no_stronger_evidence_exists() {
+        let root = fixture("native-fallback");
+        let native = make_profile(&root.join("config/dolphin-emu"));
+        let discovery = discover_dolphin_profiles(&roots(&root)).unwrap();
+        assert_eq!(discovery.profiles.len(), 1);
+        assert_eq!(discovery.profiles[0].configuration_path, native);
+        assert_eq!(discovery.profiles[0].resolved.priority, 100);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_executable_breaks_running_process_priority_tie() {
+        let root = fixture("selected-executable");
+        let selected = make_profile(&root.join("selected/User"));
+        let unrelated = make_profile(&root.join("unrelated/User"));
+        let selected_executable = PathBuf::from("/opt/selected/Dolphin.AppImage");
+        let mut discovery_roots = roots(&root);
+        discovery_roots.selected_executable = Some(selected_executable.clone());
+        discovery_roots.running_commands = vec![
+            command(
+                selected_executable.to_str().unwrap(),
+                &["-u", selected.to_str().unwrap()],
+            ),
+            command(
+                "/opt/unrelated/Dolphin.AppImage",
+                &["-u", unrelated.to_str().unwrap()],
+            ),
+        ];
+        let discovery = discover_dolphin_profiles(&discovery_roots).unwrap();
+        let selected_priority = discovery
+            .profiles
+            .iter()
+            .find(|p| p.configuration_path == selected)
+            .unwrap()
+            .resolved
+            .priority;
+        let unrelated_priority = discovery
+            .profiles
+            .iter()
+            .find(|p| p.configuration_path == unrelated)
+            .unwrap()
+            .resolved
+            .priority;
+        assert!(selected_priority > unrelated_priority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_real_command_resolves_exact_g9re7d_target() {
+        let arguments = command(
+            "/tmp/.mount_Dolphin/bin/dolphin-emu",
+            &["-u", "/home/davedap/Applications/Dolphin/User"],
+        );
+        let user = dolphin_user_path(&arguments.arguments).unwrap();
+        assert_eq!(
+            user.join("GameSettings/G9RE7D.ini"),
+            PathBuf::from("/home/davedap/Applications/Dolphin/User/GameSettings/G9RE7D.ini")
+        );
     }
 
     #[test]

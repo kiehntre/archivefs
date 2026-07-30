@@ -15,7 +15,8 @@ use archivefs_core::patch_manager::{
     SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
     SharedRollbackOutcome, build_gamecube_gamehacking_install_preview,
     build_shared_transaction_plan, execute_shared_apply, execute_shared_rollback,
-    load_dolphin_destination, preview_shared_rollback, stage_gamecube_gamehacking_install,
+    load_dolphin_destination, managed_names, parse_dolphin_ini, preview_shared_rollback,
+    require_dolphin_managed_gamehacking_verification, stage_gamecube_gamehacking_install,
     stage_gamecube_gamehacking_removal,
 };
 
@@ -180,13 +181,22 @@ impl Workflow {
         confirmed: bool,
         replacement_approved: bool,
     ) -> archivefs_core::patch_manager::SharedApplyResult {
-        let plan = build_shared_transaction_plan(
+        let mut plan = build_shared_transaction_plan(
             report,
             "test-gamecube-gamehacking-profile",
             "Dolphin GameSettings",
             &self.staging_root,
         )
         .expect("plan builds");
+        let source = report.entries[0].source_path.as_ref().unwrap();
+        let staged_contents = fs::read_to_string(source).expect("staged source remains readable");
+        require_dolphin_managed_gamehacking_verification(
+            &mut plan,
+            managed_names(&parse_dolphin_ini(&staged_contents))
+                .into_iter()
+                .collect(),
+        )
+        .expect("semantic verification contract attaches");
         let options = SharedApplyOptions {
             dry_run: !confirmed,
             confirmation: confirmed.then(|| SharedApplyConfirmation {
@@ -289,6 +299,91 @@ fn install_creates_a_new_destination_file_when_none_existed() {
         fs::read_to_string(workflow.destination()).expect("created file exists"),
         staged.contents
     );
+}
+
+#[test]
+fn reinstall_is_idempotent_and_staging_is_never_the_destination_root() {
+    let fixture = Fixture::new("idempotent");
+    let workflow = Workflow::new(&fixture, None);
+    let (first_report, _) = workflow.prepare_install();
+    assert_ne!(
+        first_report.entries[0].destination_root,
+        workflow.staging_root
+    );
+    assert_eq!(
+        first_report.entries[0].destination_path.as_deref(),
+        Some(workflow.destination().as_path())
+    );
+    assert_eq!(
+        workflow.apply(&first_report, true, false).journal.status,
+        SharedApplyStatus::Success
+    );
+    let installed = fs::read(workflow.destination()).unwrap();
+
+    let (second_report, _) = workflow.prepare_install();
+    assert_eq!(
+        second_report.entries[0].proposed_action,
+        archivefs_core::patch_manager::PreviewProposedAction::Skip
+    );
+    let second = workflow.apply(&second_report, true, false);
+    assert_eq!(second.journal.status, SharedApplyStatus::Success);
+    assert_eq!(
+        second.journal.entries[0].outcome,
+        archivefs_core::patch_manager::SharedApplyOutcome::AlreadyInstalled
+    );
+    assert_eq!(fs::read(workflow.destination()).unwrap(), installed);
+}
+
+#[test]
+fn staged_file_is_never_success_without_verified_live_destination() {
+    let fixture = Fixture::new("semantic-verification-failure");
+    let workflow = Workflow::new(&fixture, None);
+    let (report, staged) = workflow.prepare_install();
+    assert!(staged.path.exists(), "generated staging artifact exists");
+    assert!(
+        !workflow.destination().exists(),
+        "live target starts absent"
+    );
+
+    let mut plan = build_shared_transaction_plan(
+        &report,
+        "test-gamecube-gamehacking-profile",
+        "Dolphin GameSettings",
+        &workflow.staging_root,
+    )
+    .unwrap();
+    require_dolphin_managed_gamehacking_verification(
+        &mut plan,
+        vec!["A managed cheat that is not in the staged file".to_string()],
+    )
+    .unwrap();
+    let result = execute_shared_apply(
+        &plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: false,
+            }),
+            operation_id: format!(
+                "test-gamecube-semantic-failure-{}",
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+            timestamp_unix_seconds: 1_700_000_700,
+            current_context: plan.context.clone(),
+            history_root: workflow.history_root.clone(),
+            backup_root: workflow.backup_root.clone(),
+        },
+    );
+    assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+    assert!(
+        !workflow.destination().exists(),
+        "failed semantic verification removes the new live file"
+    );
+    assert!(result.journal.entries[0].failures.iter().any(|failure| {
+        failure.kind == archivefs_core::patch_manager::SharedApplyFailureKind::VerificationFailed
+    }));
 }
 
 #[test]

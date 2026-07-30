@@ -83,10 +83,16 @@ use archivefs_core::patch_manager::{
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
     parse_dolphin_ini, preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport,
     region_for_game_id, remembered_profile_for, remove_dolphin_catalogue,
-    resolve_cheat_destination, resolve_dolphin_gecko_lookup, select_emulator_profile,
-    selected_pcsx2_managed_cheats, stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
+    require_dolphin_managed_gamehacking_verification, resolve_cheat_destination,
+    resolve_dolphin_gecko_lookup, select_emulator_profile, selected_pcsx2_managed_cheats,
+    stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
     stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
     stage_xenia_patch_file,
+};
+#[cfg(test)]
+use archivefs_core::patch_manager::{
+    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
+    ResolvedEmulatorProfile,
 };
 use archivefs_core::patch_manager::{
     XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE, XENIA_UPSTREAM_REPOSITORY,
@@ -5519,6 +5525,7 @@ impl ArchiveFsApp {
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
+            transaction_notice: None,
             selected_profile_id,
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,
@@ -6819,7 +6826,29 @@ impl ArchiveFsApp {
             workflow.source_mode.label(),
             &approved_source_root,
         ) {
-            Ok(plan) => {
+            Ok(mut plan) => {
+                if let Some(generated) = &response.gamecube_gamehacking_generated {
+                    let expected_managed_names = archivefs_core::patch_manager::managed_names(
+                        &parse_dolphin_ini(&generated.staged.contents),
+                    )
+                    .into_iter()
+                    .collect();
+                    if let Err(error) = require_dolphin_managed_gamehacking_verification(
+                        &mut plan,
+                        expected_managed_names,
+                    ) {
+                        self.history.record(HistoryEntry::new(
+                            ActivityAction::CheatPreview,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Rejected,
+                            format!(
+                                "GameCube live-target verification plan blocked: {}",
+                                error.detail
+                            ),
+                        ));
+                        return;
+                    }
+                }
                 workflow.transaction = CheatTransactionState::Review {
                     key: response.key.clone(),
                     plan,
@@ -7125,6 +7154,7 @@ impl ArchiveFsApp {
             key: key.clone(),
             receiver,
         };
+        workflow.transaction_notice = None;
         self.history.record(HistoryEntry::new(
             ActivityAction::CheatInstall,
             Some(archive),
@@ -7558,7 +7588,7 @@ impl ArchiveFsApp {
     /// Resolves the Dolphin profile's own configuration root the same way
     /// `start_dolphin_install_preview` does - GameHacking.org GameCube
     /// installs write into exactly the same profile.
-    fn gamecube_gamehacking_configuration_path(&self) -> Option<PathBuf> {
+    fn gamecube_gamehacking_profile(&self) -> Option<DolphinProfile> {
         let workflow = self.cheat_workflow.as_ref()?;
         let profile_id = workflow.selected_dolphin_profile_id.as_ref()?;
         let DolphinProfilesState::Ready(discovery) = &self.dolphin_profiles else {
@@ -7568,7 +7598,7 @@ impl ArchiveFsApp {
             .profiles
             .iter()
             .find(|profile| profile.eligible && &profile.profile_id == profile_id)
-            .map(|profile| profile.configuration_path.clone())
+            .cloned()
     }
 
     /// GameHacking.org GameCube Stage: stages the selected `ActionReplay`/
@@ -7577,6 +7607,27 @@ impl ArchiveFsApp {
     /// preview. Synchronous for the same reason
     /// `start_dolphin_install_preview` is - a single small local file.
     fn start_gamecube_gamehacking_install_preview(&mut self) {
+        let staging_root = match default_generated_gamecube_gamehacking_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    self.cheat_workflow
+                        .as_ref()
+                        .map(|workflow| workflow.archive_path.clone()),
+                    ActivityOutcome::Failed,
+                    message,
+                ));
+                return;
+            }
+        };
+        self.start_gamecube_gamehacking_install_preview_with_staging_root(staging_root);
+    }
+
+    fn start_gamecube_gamehacking_install_preview_with_staging_root(
+        &mut self,
+        staging_root: PathBuf,
+    ) {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
@@ -7595,7 +7646,7 @@ impl ArchiveFsApp {
             ));
             return;
         };
-        let Some(configuration_path) = self.gamecube_gamehacking_configuration_path() else {
+        let Some(profile) = self.gamecube_gamehacking_profile() else {
             self.history.record(HistoryEntry::new(
                 ActivityAction::CheatPreview,
                 Some(workflow.archive_path.clone()),
@@ -7604,22 +7655,11 @@ impl ArchiveFsApp {
             ));
             return;
         };
+        let configuration_path = profile.configuration_path.clone();
         let cheats = state.cheats.clone();
         let selection = state.selection.clone();
         let archive_path = workflow.archive_path.clone();
         let key = cheat_preview_key(workflow);
-        let staging_root = match default_generated_gamecube_gamehacking_staging_root() {
-            Ok(root) => root,
-            Err(message) => {
-                self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
-                    Some(archive_path),
-                    ActivityOutcome::Failed,
-                    message,
-                ));
-                return;
-            }
-        };
         let response = (|| {
             let destination =
                 load_dolphin_destination(&configuration_path, &game_id).map_err(|failure| {
@@ -7660,6 +7700,7 @@ impl ArchiveFsApp {
                 gamecube_gamehacking_generated: Some(GeneratedGameCubeGameHackingInstall {
                     staging_root,
                     staged,
+                    profile,
                 }),
             },
             Err(error) => {
@@ -7689,6 +7730,8 @@ impl ArchiveFsApp {
         workflow.preview_request = Some(key);
         workflow.preview = CheatStepResource::Ready(message);
         workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+        self.review_cheat_apply();
     }
 
     /// GameHacking.org GameCube removal: stages removal of exactly the
@@ -7708,7 +7751,7 @@ impl ArchiveFsApp {
         let Some(game_id) = game.dolphin_game_id.clone() else {
             return;
         };
-        let Some(configuration_path) = self.gamecube_gamehacking_configuration_path() else {
+        let Some(profile) = self.gamecube_gamehacking_profile() else {
             self.history.record(HistoryEntry::new(
                 ActivityAction::CheatPreview,
                 Some(workflow.archive_path.clone()),
@@ -7717,6 +7760,7 @@ impl ArchiveFsApp {
             ));
             return;
         };
+        let configuration_path = profile.configuration_path.clone();
         let remove_names: Vec<String> = state
             .selection
             .entries
@@ -7777,6 +7821,7 @@ impl ArchiveFsApp {
                 gamecube_gamehacking_generated: Some(GeneratedGameCubeGameHackingInstall {
                     staging_root,
                     staged,
+                    profile,
                 }),
             },
             Err(error) => {
@@ -7806,6 +7851,8 @@ impl ArchiveFsApp {
         workflow.preview_request = Some(key);
         workflow.preview = CheatStepResource::Ready(message);
         workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+        self.review_cheat_apply();
     }
 
     fn update_pcsx2_cheat_selection(&mut self, id: &str, selected: bool) {
@@ -8508,15 +8555,48 @@ impl ArchiveFsApp {
                         SharedApplyStatus::Failed => ActivityOutcome::Failed,
                         SharedApplyStatus::DryRun => ActivityOutcome::Skipped,
                     };
+                    let final_targets = result
+                        .journal
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{}/{}",
+                                entry.plan_entry.destination_root.display,
+                                entry.plan_entry.destination_relative_path.display
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     preview_history_entry = Some(HistoryEntry::new(
                         ActivityAction::CheatInstall,
                         Some(workflow.archive_path.clone()),
                         outcome,
                         format!(
-                            "Shared apply '{}' finished with {:?}.",
-                            result.journal.operation_id, result.journal.status
+                            "Shared apply '{}' finished with {:?}. Live target(s): {}.",
+                            result.journal.operation_id, result.journal.status, final_targets
                         ),
                     ));
+                    if result.journal.status == SharedApplyStatus::Success {
+                        let managed_after = match &workflow.preview {
+                            CheatStepResource::Ready(response) => response
+                                .gamecube_gamehacking_generated
+                                .as_ref()
+                                .map(|generated| {
+                                    archivefs_core::patch_manager::managed_names(
+                                        &parse_dolphin_ini(&generated.staged.contents),
+                                    )
+                                }),
+                            _ => None,
+                        };
+                        if let (Some(managed), CheatStepResource::Ready(state)) =
+                            (managed_after, &mut workflow.gamecube_gamehacking)
+                        {
+                            for entry in &mut state.selection.entries {
+                                entry.already_managed = managed.contains(&entry.dolphin_name);
+                            }
+                        }
+                    }
                     if workflow.adapter == CheatEmulatorAdapter::Pcsx2
                         && result.journal.status == SharedApplyStatus::Success
                     {
@@ -8532,10 +8612,15 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         format!("Shared apply worker failed: {message}"),
                     ));
+                    workflow.transaction_notice = Some(format!("Install failed: {message}"));
                     workflow.transaction = CheatTransactionState::Idle;
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
+                    workflow.transaction_notice = Some(
+                        "Install failed: the apply worker stopped before reporting a result."
+                            .to_string(),
+                    );
                     workflow.transaction = CheatTransactionState::Idle;
                 }
             }
@@ -8963,6 +9048,9 @@ impl ArchiveFsApp {
     /// or `"xenia"`), if any.
     fn remembered_profile_id(&self, adapter: &str) -> Option<String> {
         remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+            .filter(|profile| {
+                adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root)
+            })
             .map(|profile| profile.profile_id.clone())
     }
 
@@ -8972,6 +9060,9 @@ impl ArchiveFsApp {
     /// it again every session.
     fn remembered_profile_root(&self, adapter: &str) -> Option<PathBuf> {
         remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+            .filter(|profile| {
+                adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root)
+            })
             .map(|profile| profile.root.clone())
     }
 
@@ -9167,7 +9258,6 @@ impl ArchiveFsApp {
                     ));
                     let candidates = dolphin_profile_candidates(&discovery);
                     let remembered = self.remembered_profile_id("dolphin");
-                    let mut to_persist: Option<(String, PathBuf)> = None;
                     if let Some(workflow) = self.cheat_workflow.as_mut()
                         && workflow.adapter == CheatEmulatorAdapter::Dolphin
                     {
@@ -9189,13 +9279,6 @@ impl ArchiveFsApp {
                             workflow.selected_dolphin_profile_id = Some(profile_id.clone());
                             workflow.dolphin_inventory_profile_id = None;
                             workflow.dolphin_inventory = CheatStepResource::NotLoaded;
-                            if let Some(root) = candidates
-                                .iter()
-                                .find(|candidate| candidate.profile_id == *profile_id)
-                                .map(|candidate| candidate.root.clone())
-                            {
-                                to_persist = Some((profile_id.clone(), root));
-                            }
                         } else if !matches!(selection, EmulatorProfileSelection::Auto { .. })
                             && !install_in_progress
                             && workflow
@@ -9216,9 +9299,6 @@ impl ArchiveFsApp {
                         && matches!(workflow.transaction, CheatTransactionState::Idle)
                     {
                         reconcile_dolphin_provider_selection(workflow, discovery);
-                    }
-                    if let Some((profile_id, root)) = to_persist {
-                        self.persist_remembered_profile("dolphin", &profile_id, &root);
                     }
                 }
                 Ok(Err(message)) => {
@@ -10914,6 +10994,10 @@ impl ArchiveFsApp {
                         Some(CheatWorkflowAction::CancelApply) => {
                             if let Some(workflow) = self.cheat_workflow.as_mut() {
                                 workflow.transaction = CheatTransactionState::Idle;
+                                workflow.transaction_notice = Some(
+                                    "Installation cancelled before apply; no live emulator file was changed."
+                                        .to_string(),
+                                );
                             }
                             self.history.record(HistoryEntry::new(
                                 ActivityAction::CheatInstall,
@@ -17256,6 +17340,7 @@ struct CheatWorkflowState {
     preview_request: Option<CheatPreviewRequestKey>,
     preview: CheatStepResource<CheatPreviewResponse>,
     transaction: CheatTransactionState,
+    transaction_notice: Option<String>,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never
@@ -17446,6 +17531,7 @@ struct GeneratedDolphinInstall {
 struct GeneratedGameCubeGameHackingInstall {
     staging_root: PathBuf,
     staged: StagedGameCubeIni,
+    profile: DolphinProfile,
 }
 
 /// The Xenia equivalent of `GeneratedDolphinInstall`: the exact chosen
@@ -19782,6 +19868,25 @@ fn show_beginner_install_result(
                 widgets::status_badge(ui, "Dry run complete", widgets::StatusTone::Info);
             }
         }
+        for entry in &result.journal.entries {
+            ui.label(format!(
+                "Live target: {}/{}",
+                entry.plan_entry.destination_root.display,
+                entry.plan_entry.destination_relative_path.display
+            ));
+            for failure in &entry.failures {
+                ui.label(format!(
+                    "Failed stage: {:?} · target: {} · {}",
+                    failure.kind,
+                    failure
+                        .path
+                        .as_ref()
+                        .map(|path| path.display.as_str())
+                        .unwrap_or("unknown"),
+                    failure.detail
+                ));
+            }
+        }
         let rollback_available = result.journal_path.is_some()
             && matches!(
                 result.journal.status,
@@ -20361,6 +20466,7 @@ fn xenia_profile_candidates(discovery: &XeniaProfileDiscovery) -> Vec<EmulatorPr
             root: profile.configuration_path.clone(),
             eligible: profile.eligible,
             is_portable: false,
+            evidence_priority: 0,
         })
         .collect()
 }
@@ -21548,6 +21654,25 @@ fn show_dolphin_profile_card(
         if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
             let _ = clipboard.set_text(profile.configuration_path.display().to_string());
         }
+        if let Some(executable) = &profile.resolved.emulator_executable
+            && widgets::path_value(ui, "Executable", executable)
+        {
+            let _ = clipboard.set_text(executable.display().to_string());
+        }
+        ui.label(format!(
+            "Discovery evidence: {}",
+            profile.resolved.discovery_evidence.join("; ")
+        ));
+        ui.label(format!(
+            "Confidence: {:?} · priority {} · writable: {}",
+            profile.resolved.confidence,
+            profile.resolved.priority,
+            if profile.resolved.writable {
+                "Yes"
+            } else {
+                "No"
+            }
+        ));
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(
                 ui,
@@ -21705,6 +21830,7 @@ fn show_dolphin_installation_unavailable(ui: &mut egui::Ui) {
 fn dolphin_installation_label(kind: DolphinInstallationType) -> &'static str {
     match kind {
         DolphinInstallationType::Native => "Native",
+        DolphinInstallationType::AppImage => "AppImage with explicit user directory",
         DolphinInstallationType::FlatpakUser => "Flatpak user",
         DolphinInstallationType::FlatpakSystem => "Flatpak system",
         DolphinInstallationType::Explicit => "Explicit user directory",
@@ -22230,6 +22356,22 @@ fn show_gamecube_gamehacking(
     );
     let identity_ready = gamecube_identity_for_workflow(workflow)
         .is_some_and(|identity| identity.verified_game_id().is_some());
+    if let Some(notice) = &workflow.transaction_notice {
+        widgets::banner(
+            ui,
+            if notice.starts_with("Install failed") {
+                "Installation failed"
+            } else {
+                "Installation cancelled"
+            },
+            notice,
+            if notice.starts_with("Install failed") {
+                widgets::StatusTone::Blocked
+            } else {
+                widgets::StatusTone::Info
+            },
+        );
+    }
     match &workflow.transaction {
         CheatTransactionState::Applying { .. } => {
             ui.horizontal(|ui| {
@@ -22483,6 +22625,13 @@ fn show_gamecube_gamehacking(
             .unwrap_or_default(),
         _ => Vec::new(),
     };
+    let gamecube_install_context = match &workflow.preview {
+        CheatStepResource::Ready(response) => response
+            .gamecube_gamehacking_generated
+            .as_ref()
+            .map(|generated| (generated.profile.clone(), generated.staged.path.clone())),
+        _ => None,
+    };
     let review_is_gamecube_gamehacking = !gamecube_gamehacking_affected.is_empty()
         || matches!(
             &workflow.preview,
@@ -22500,6 +22649,33 @@ fn show_gamecube_gamehacking(
             ui.label(
                 "ArchiveFS will write only to the [Gecko]/[ActionReplay] sections of this exact Dolphin GameSettings file, keep a backup, and make this change undoable.",
             );
+            if let Some((profile, staging_path)) = &gamecube_install_context {
+                ui.label(format!(
+                    "Selected Dolphin executable: {}",
+                    profile
+                        .resolved
+                        .emulator_executable
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "native/system fallback".to_string())
+                ));
+                ui.label(format!(
+                    "Discovery evidence: {}",
+                    profile.resolved.discovery_evidence.join("; ")
+                ));
+                ui.label(format!(
+                    "Dolphin user root: {}",
+                    profile.resolved.data_user_root.display()
+                ));
+                ui.label(format!(
+                    "GameSettings directory: {}",
+                    profile.game_settings_path.display()
+                ));
+                ui.label(format!(
+                    "Staging artifact (not destination): {}",
+                    staging_path.display()
+                ));
+            }
             for entry in &plan.entries {
                 ui.label(format!(
                     "Target file: {}/{}",
@@ -23948,7 +24124,9 @@ fn show_shared_cheat_preview(
                     response.materialized.is_some()
                         || response.generated.is_some()
                         || response.dolphin_generated.is_some()
-                        || response.xenia_generated.is_some(),
+                        || response.xenia_generated.is_some()
+                        || response.pcsx2_generated.is_some()
+                        || response.gamecube_gamehacking_generated.is_some(),
                     &mut workflow.transaction,
                     clipboard,
                 );
@@ -25093,9 +25271,21 @@ fn dolphin_profile_candidates(
             profile_id: profile.profile_id.clone(),
             root: profile.configuration_path.clone(),
             eligible: profile.eligible,
-            is_portable: profile.installation_type == DolphinInstallationType::Explicit,
+            is_portable: matches!(
+                profile.installation_type,
+                DolphinInstallationType::Explicit | DolphinInstallationType::AppImage
+            ),
+            evidence_priority: profile.resolved.priority,
         })
         .collect()
+}
+
+fn is_dolphin_standard_fallback_root(root: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    root == home.join(".config/dolphin-emu")
+        || root == home.join(".var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu")
 }
 
 /// Rebinds an already-fetched Dolphin result to the newly selected local
@@ -34892,6 +35082,7 @@ mod tests {
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
+            transaction_notice: None,
             selected_profile_id: Some("native-user".to_string()),
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
@@ -35371,7 +35562,7 @@ mod tests {
             installation_type: DolphinInstallationType::Native,
             scope: DolphinProfileScope::User,
             configuration_path: PathBuf::from("/isolated/dolphin-emu"),
-            provenance: "test fixture",
+            provenance: "test fixture".to_string(),
             eligible: true,
             blockers: Vec::new(),
             game_settings_path: PathBuf::from("/isolated/dolphin-emu/GameSettings"),
@@ -35379,6 +35570,21 @@ mod tests {
             game_settings_warning: None,
             configuration_identity: None,
             game_settings_identity: None,
+            resolved: ResolvedEmulatorProfile {
+                emulator_executable: None,
+                installation_type: EmulatorInstallationType::NativeSystem,
+                configuration_root: PathBuf::from("/isolated/dolphin-emu"),
+                data_user_root: PathBuf::from("/isolated/dolphin-emu"),
+                active_explicit_profile: None,
+                destinations: EmulatorDestinationDirectories {
+                    game_settings: Some(PathBuf::from("/isolated/dolphin-emu/GameSettings")),
+                    ..EmulatorDestinationDirectories::default()
+                },
+                discovery_evidence: vec!["test fixture".to_string()],
+                confidence: EmulatorProfileConfidence::KnownPath,
+                priority: 100,
+                writable: true,
+            },
         }
     }
 
@@ -35402,6 +35608,9 @@ mod tests {
             DolphinInstallationType::Native
         };
         profile.configuration_path = PathBuf::from(format!("/isolated/{id}"));
+        profile.resolved.configuration_root = profile.configuration_path.clone();
+        profile.resolved.data_user_root = profile.configuration_path.clone();
+        profile.resolved.priority = if portable { 500 } else { 100 };
         profile
     }
 
@@ -36667,6 +36876,7 @@ $Instant Growth [Nayr]\n";
             proposed_action: archivefs_core::patch_manager::PreviewProposedAction::Install,
             backup_required: false,
             parent_creation_approved: true,
+            content_verification: None,
         };
         let entry = SharedApplyEntry {
             plan_entry,
@@ -36889,6 +37099,65 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn beginner_failure_result_names_failed_stage_and_live_target() {
+        let mut result = successful_shared_apply_result();
+        result.journal.status = SharedApplyStatus::Failed;
+        result.journal.entries[0].outcome = SharedApplyOutcome::VerificationFailed;
+        result.journal.entries[0].verification_succeeded = false;
+        result.journal.entries[0].failures.push(
+            archivefs_core::patch_manager::SharedApplyFailure {
+                kind: archivefs_core::patch_manager::SharedApplyFailureKind::VerificationFailed,
+                path: Some(SharedTransactionPath::from_path(Path::new(
+                    "/dolphin/GameSettings/GAFE01.ini",
+                ))),
+                detail: "managed section missing".to_string(),
+            },
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_beginner_install_result(ui, &result);
+            });
+        });
+        for expected in [
+            "Install failed",
+            "VerificationFailed",
+            "/dolphin/GameSettings/GAFE01.ini",
+            "managed section missing",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn gamecube_cancel_notice_is_distinct_from_success_and_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-cancel-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "G9RE7D");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.transaction_notice = Some(
+            "Installation cancelled before apply; no live emulator file was changed.".to_string(),
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Installation cancelled"));
+        assert!(rendered_text_contains(
+            &output,
+            "no live emulator file was changed"
+        ));
+        assert!(!rendered_text_contains(&output, "Installed successfully"));
+    }
+
+    #[test]
     fn successful_undo_clears_the_matching_installed_state() {
         let temp = std::env::temp_dir().join(format!(
             "archivefs-gui-beginner-undo-state-{}",
@@ -37010,12 +37279,14 @@ $Instant Growth [Nayr]\n";
                     root: temp.clone(),
                     eligible: true,
                     is_portable: false,
+                    evidence_priority: 0,
                 },
                 EmulatorProfileCandidate {
                     profile_id: "profile-b".to_string(),
                     root: second.clone(),
                     eligible: true,
                     is_portable: false,
+                    evidence_priority: 0,
                 },
             ],
         });
@@ -38052,6 +38323,87 @@ $Instant Growth [Nayr]\n";
                 "missing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn gamecube_install_selected_reaches_review_and_names_live_and_staging_paths() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-gamecube-apply-review-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(directory.join("GameSettings")).unwrap();
+        std::fs::write(directory.join("Dolphin.ini"), "[Core]\n").unwrap();
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "G9RE7D");
+        let cheat = GameHackingGameCubeCheat {
+            id: "gh-gc-55194-1".to_string(),
+            name: "Infinite Money And Gems".to_string(),
+            author: Some("Codejunkies".to_string()),
+            description: None,
+            code_format: GameCubeCodeFormat::ActionReplay,
+            code_lines: vec!["040D30C8 3860270F".to_string()],
+            source_game_id: 55_194,
+            source_url: "https://gamehacking.org/game/55194".to_string(),
+        };
+        let mut selection = gamecube_gamehacking_selection_for(std::slice::from_ref(&cheat));
+        selection.select_all();
+        app.cheat_workflow.as_mut().unwrap().gamecube_gamehacking =
+            CheatStepResource::Ready(GameCubeGameHackingState {
+                status: GameHackingGameCubeMatchStatus::Matched,
+                detail: "Exact Game ID match".to_string(),
+                game: Some(GameHackingGameCubeGame {
+                    game_id: 55_194,
+                    title: "The Sims Bustin' Out".to_string(),
+                    system: "GameCube".to_string(),
+                    region: Some("USA".to_string()),
+                    dolphin_game_id: Some("G9RE7D".to_string()),
+                    revision: None,
+                    hash: None,
+                    source_url: "https://gamehacking.org/game/55194".to_string(),
+                }),
+                match_candidates: Vec::new(),
+                cheats: vec![cheat],
+                selection,
+            });
+
+        app.start_gamecube_gamehacking_install_preview_with_staging_root(directory.join("staging"));
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+            panic!("Install selected must reach shared review instead of stopping at staging")
+        };
+        assert_eq!(
+            format!(
+                "{}/{}",
+                plan.entries[0].destination_root.display,
+                plan.entries[0].destination_relative_path.display
+            ),
+            directory
+                .join("GameSettings/G9RE7D.ini")
+                .display()
+                .to_string()
+        );
+        assert!(
+            !plan
+                .destination_root
+                .display
+                .contains("generated-gamecube-gamehacking")
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Staging artifact (not destination)"
+        ));
+        assert!(rendered_text_contains(&output, "GameSettings/G9RE7D.ini"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -39601,6 +39953,7 @@ $Instant Growth [Nayr]\n";
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
+            transaction_notice: None,
             selected_profile_id: None,
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,
@@ -53624,6 +53977,7 @@ $Instant Growth [Nayr]\n";
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
+            transaction_notice: None,
             selected_profile_id: None,
             selected_pcsx2_profile_id: None,
             pcsx2_inventory_profile_id: None,

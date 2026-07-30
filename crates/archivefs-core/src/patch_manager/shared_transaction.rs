@@ -242,6 +242,18 @@ pub struct SharedPlanEntry {
     pub proposed_action: PreviewProposedAction,
     pub backup_required: bool,
     pub parent_creation_approved: bool,
+    #[serde(default)]
+    pub content_verification: Option<SharedContentVerification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedContentVerification {
+    DolphinManagedGameHacking {
+        expected_managed_names: Vec<String>,
+        require_managed_section: bool,
+        require_code_section: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +553,7 @@ pub fn build_shared_transaction_plan(
             parent_creation_approved: entry.warnings.iter().any(|warning| {
                 warning.kind == super::shared_preview::PreviewWarningKind::DestinationParentsMissing
             }),
+            content_verification: None,
         });
     }
     if entries.is_empty() {
@@ -572,6 +585,33 @@ pub fn build_shared_transaction_plan(
     };
     plan.plan_id = plan_digest(&plan)?;
     Ok(plan)
+}
+
+/// Adds GameCube GameHacking's semantic post-write contract to an already
+/// built shared plan and re-seals its digest. The generated source remains
+/// staging; verification always reads the exact live destination.
+pub fn require_dolphin_managed_gamehacking_verification(
+    plan: &mut SharedTransactionPlan,
+    expected_managed_names: Vec<String>,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::Dolphin || plan.entries.is_empty() {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "Dolphin managed-INI verification requires a Dolphin transaction",
+        ));
+    }
+    let require_sections = !expected_managed_names.is_empty();
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::DolphinManagedGameHacking {
+            expected_managed_names: expected_managed_names.clone(),
+            require_managed_section: require_sections,
+            require_code_section: require_sections,
+        });
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
 }
 
 pub fn execute_shared_apply(
@@ -950,6 +990,15 @@ fn apply_one(
         );
     }
     if plan.proposed_action == PreviewProposedAction::Skip {
+        if let Err(detail) = verify_entry_content(plan, &destination) {
+            return fail_result(
+                result,
+                SharedApplyOutcome::VerificationFailed,
+                SharedApplyFailureKind::VerificationFailed,
+                Some(&destination),
+                &detail,
+            );
+        }
         result.outcome = SharedApplyOutcome::AlreadyInstalled;
         result.final_destination_digest = Some(source_hash.digest);
         result.verification_succeeded = true;
@@ -1046,15 +1095,35 @@ fn apply_one(
     ) {
         Ok(temp) => {
             result.temporary_path = Some(SharedTransactionPath::from_path(&temp));
-            result.final_destination_digest = Some(source_hash.digest);
-            result.verification_succeeded = true;
-            result.outcome = if plan.proposed_action == PreviewProposedAction::Install {
-                SharedApplyOutcome::InstalledNew
-            } else {
-                SharedApplyOutcome::ReplacedExisting
-            };
-            result.stages.push(SharedTransactionStage::Success);
-            *written += source_hash.bytes;
+            match verify_entry_content(plan, &destination) {
+                Ok(()) => {
+                    result.final_destination_digest = Some(source_hash.digest);
+                    result.verification_succeeded = true;
+                    result.outcome = if plan.proposed_action == PreviewProposedAction::Install {
+                        SharedApplyOutcome::InstalledNew
+                    } else {
+                        SharedApplyOutcome::ReplacedExisting
+                    };
+                    result.stages.push(SharedTransactionStage::Success);
+                    *written += source_hash.bytes;
+                }
+                Err(detail) => {
+                    let restore = restore_after_failed_verification(plan, &result, &destination);
+                    let detail = match restore {
+                        Ok(()) => format!("{detail}; previous live file state restored"),
+                        Err(kind) => format!(
+                            "{detail}; restoring the previous live file state failed: {kind:?}"
+                        ),
+                    };
+                    result = fail_result(
+                        result,
+                        SharedApplyOutcome::VerificationFailed,
+                        SharedApplyFailureKind::VerificationFailed,
+                        Some(&destination),
+                        &detail,
+                    );
+                }
+            }
         }
         Err((kind, temp)) => {
             result.temporary_path = temp.as_deref().map(SharedTransactionPath::from_path);
@@ -1072,6 +1141,83 @@ fn apply_one(
         }
     }
     result
+}
+
+fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<(), String> {
+    let Some(contract) = &plan.content_verification else {
+        return Ok(());
+    };
+    let bytes = read_bounded(destination, SHARED_MAX_SOURCE_BYTES)
+        .map_err(|kind| format!("live target could not be re-read: {kind:?}"))?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| "live target is not valid UTF-8".to_string())?;
+    match contract {
+        SharedContentVerification::DolphinManagedGameHacking {
+            expected_managed_names,
+            require_managed_section,
+            require_code_section,
+        } => {
+            let document = super::gecko_document::parse_dolphin_ini(text);
+            let section_names = document.section_names();
+            let has_managed = section_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("ArchiveFS_Managed_GameHacking"));
+            if *require_managed_section && !has_managed {
+                return Err("live target is missing [ArchiveFS_Managed_GameHacking]".to_string());
+            }
+            let has_code_section = section_names.iter().any(|name| {
+                name.eq_ignore_ascii_case("ActionReplay") || name.eq_ignore_ascii_case("Gecko")
+            });
+            if *require_code_section && !has_code_section {
+                return Err("live target has neither [ActionReplay] nor [Gecko]".to_string());
+            }
+            let managed: BTreeSet<String> = document
+                .named_section_lines("ArchiveFS_Managed_GameHacking")
+                .into_iter()
+                .filter_map(|line| line.trim().strip_prefix('$').map(str::to_string))
+                .collect();
+            for expected in expected_managed_names {
+                if !managed.contains(expected) {
+                    return Err(format!(
+                        "live target managed section is missing '${expected}'"
+                    ));
+                }
+                let defined = document
+                    .action_replay_codes
+                    .iter()
+                    .chain(document.gecko_codes.iter())
+                    .any(|code| code.name == *expected);
+                if !defined {
+                    return Err(format!(
+                        "live target has no ActionReplay/Gecko definition for '${expected}'"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn restore_after_failed_verification(
+    plan: &SharedPlanEntry,
+    result: &SharedApplyEntry,
+    destination: &Path,
+) -> Result<(), SharedApplyFailureKind> {
+    if plan.proposed_action == PreviewProposedAction::Install {
+        return remove_and_verify_new_destination(destination);
+    }
+    let backup = result
+        .backup_path
+        .as_ref()
+        .ok_or(SharedApplyFailureKind::BackupMissing)?
+        .to_path_buf()?;
+    let digest = result
+        .backup_digest
+        .as_deref()
+        .ok_or(SharedApplyFailureKind::BackupChanged)?;
+    atomic_write(&backup, destination, digest, false)
+        .map(|_| ())
+        .map_err(|(kind, _)| kind)
 }
 
 pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport {

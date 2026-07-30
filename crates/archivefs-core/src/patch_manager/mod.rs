@@ -48,6 +48,7 @@ mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
 mod retroarch_cheat_library;
@@ -216,13 +217,13 @@ pub use dolphin_gecko_provider::{
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
     DOLPHIN_MAX_LINE_BYTES, DOLPHIN_MAX_LINES_PER_FILE, DOLPHIN_MAX_PROFILES,
-    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinDirectoryIdentity,
-    DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory, DolphinInspectionError,
-    DolphinInspectionWarning, DolphinInspectionWarningKind, DolphinInstallationType,
-    DolphinMatchResult, DolphinMatchState, DolphinProfile, DolphinProfileBlocker,
-    DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
-    DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
-    inspect_dolphin_profile, match_dolphin_inventory,
+    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinCommandLine,
+    DolphinDirectoryIdentity, DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory,
+    DolphinInspectionError, DolphinInspectionWarning, DolphinInspectionWarningKind,
+    DolphinInstallationType, DolphinMatchResult, DolphinMatchState, DolphinProfile,
+    DolphinProfileBlocker, DolphinProfileBlockerKind, DolphinProfileDiscovery,
+    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinSettingsDirectoryState,
+    discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_profile, match_dolphin_inventory,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
@@ -310,6 +311,10 @@ pub use pcsx2_provider::{
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
 };
+pub use resolved_emulator_profile::{
+    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
+    ResolvedEmulatorProfile,
+};
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
 pub use retroarch::{
     CoreAssociation, CoreMatchDisposition, CoreSelectionSource, DestinationKind, PlaylistEvidence,
@@ -369,6 +374,7 @@ pub use shared_transaction::{
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
+    require_dolphin_managed_gamehacking_verification,
 };
 pub use xenia_install_plan::{
     LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,
