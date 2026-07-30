@@ -259,8 +259,9 @@ pub use pcsx2_identity::{
 };
 pub use pcsx2_install_plan::{
     Pcsx2InstallPlanError, Pcsx2InstallPlanErrorKind, Pcsx2InstallPreview,
-    Pcsx2InstallPreviewRequest, StagedPcsx2Pnach, build_pcsx2_install_preview,
-    load_existing_pcsx2_pnach, pcsx2_crc_filename, stage_pcsx2_pnach,
+    Pcsx2InstallPreviewRequest, StagedPcsx2LegacyMigration, StagedPcsx2Pnach,
+    build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, load_existing_pcsx2_pnach,
+    pcsx2_crc_filename, pcsx2_pnach_filename, stage_pcsx2_pnach,
 };
 pub use pcsx2_local::{
     PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
@@ -275,8 +276,9 @@ pub use pcsx2_local::{
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
-    PnachDocumentError, PnachDocumentErrorKind, PnachPatchLine, merge_managed_pnach_cheats,
-    parse_pnach_document,
+    PnachDocumentError, PnachDocumentErrorKind, PnachPatchLine, RawManagedBlock,
+    append_raw_managed_blocks, extract_managed_blocks, merge_managed_pnach_cheats,
+    parse_pnach_document, remove_managed_blocks,
 };
 pub use pcsx2_provider::{
     Pcsx2CandidateBlockedReason, Pcsx2CheatCandidate, Pcsx2CheatCategory, Pcsx2CheatCompatibility,

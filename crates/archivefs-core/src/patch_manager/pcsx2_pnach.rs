@@ -277,6 +277,127 @@ pub fn merge_managed_pnach_cheats(
     Ok(output)
 }
 
+/// The exact original bytes of one already-validated ArchiveFS managed
+/// block (its `// ArchiveFS managed block: <id>` through `// End ArchiveFS
+/// managed block` lines, inclusive), used to migrate a block verbatim from
+/// one PNACH file into another without re-deriving it from cheat metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawManagedBlock {
+    pub id: String,
+    raw_text: String,
+}
+
+/// Extracts every managed block's exact original bytes from an
+/// already-`parse_pnach_document`-validated document. Infallible: block
+/// structure was already checked during parsing.
+pub fn extract_managed_blocks(document: &PnachDocument) -> Vec<RawManagedBlock> {
+    let text = std::str::from_utf8(&document.original)
+        .expect("PnachDocument bytes are validated UTF-8 by parse_pnach_document");
+    let mut blocks = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for segment in text.split_inclusive('\n') {
+        let trimmed = segment.trim_end_matches(['\n', '\r']);
+        if let Some(id) = trimmed.strip_prefix(BLOCK_START) {
+            current = Some((id.to_string(), segment.to_string()));
+        } else if trimmed == BLOCK_END {
+            if let Some((id, mut raw_text)) = current.take() {
+                raw_text.push_str(segment);
+                if !raw_text.ends_with('\n') {
+                    raw_text.push('\n');
+                }
+                blocks.push(RawManagedBlock { id, raw_text });
+            }
+        } else if let Some((_, raw_text)) = current.as_mut() {
+            raw_text.push_str(segment);
+        }
+    }
+    blocks
+}
+
+/// Appends already-extracted raw managed blocks verbatim, exactly like
+/// `merge_managed_pnach_cheats` appends freshly-rendered ones: rejects a
+/// duplicate ID against blocks already in `document`, and enforces the same
+/// block-count and byte-size limits.
+pub fn append_raw_managed_blocks(
+    document: &PnachDocument,
+    blocks: &[RawManagedBlock],
+) -> Result<Vec<u8>, PnachDocumentError> {
+    if blocks.is_empty() {
+        return Ok(document.original.clone());
+    }
+    if document
+        .managed_block_ids
+        .len()
+        .saturating_add(blocks.len())
+        > MAX_MANAGED_PNACH_BLOCKS
+    {
+        return Err(error(
+            PnachDocumentErrorKind::TooManyManagedBlocks,
+            None,
+            "managed block limit reached",
+        ));
+    }
+    let mut seen = document.managed_block_ids.clone();
+    let mut appended = String::new();
+    for block in blocks {
+        if !seen.insert(block.id.clone()) {
+            return Err(error(
+                PnachDocumentErrorKind::DuplicateManagedBlock,
+                None,
+                format!("managed cheat {} is already installed", block.id),
+            ));
+        }
+        appended.push_str(&block.raw_text);
+    }
+    let mut output = document.original.clone();
+    if !output.is_empty() {
+        if !output.ends_with(b"\n") {
+            output.push(b'\n');
+        }
+        output.push(b'\n');
+    }
+    output.extend_from_slice(appended.as_bytes());
+    if output.len() > MAX_MANAGED_PNACH_BYTES {
+        return Err(error(
+            PnachDocumentErrorKind::TooLarge,
+            None,
+            "merged PNACH exceeds the managed-file byte limit",
+        ));
+    }
+    Ok(output)
+}
+
+/// Strips the named managed blocks out of a document entirely (start
+/// marker through end marker, inclusive), byte-for-byte preserving every
+/// other line - including its original line terminator - exactly as found.
+/// Infallible: block structure was already checked during parsing.
+pub fn remove_managed_blocks(document: &PnachDocument, ids: &BTreeSet<String>) -> Vec<u8> {
+    if ids.is_empty() {
+        return document.original.clone();
+    }
+    let text = std::str::from_utf8(&document.original)
+        .expect("PnachDocument bytes are validated UTF-8 by parse_pnach_document");
+    let mut output = String::with_capacity(text.len());
+    let mut skipping = false;
+    for segment in text.split_inclusive('\n') {
+        let trimmed = segment.trim_end_matches(['\n', '\r']);
+        if skipping {
+            if trimmed == BLOCK_END {
+                skipping = false;
+            }
+            continue;
+        }
+        if let Some(id) = trimmed.strip_prefix(BLOCK_START)
+            && ids.contains(id)
+        {
+            skipping = true;
+            continue;
+        }
+        output.push_str(segment);
+    }
+    output.into_bytes()
+}
+
 fn valid_managed_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64

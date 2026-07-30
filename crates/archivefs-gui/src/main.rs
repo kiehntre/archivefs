@@ -61,8 +61,9 @@ use archivefs_core::patch_manager::{
     XeniaInstallPlanError, XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile,
     XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, adapter_write_support,
     build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
-    build_pcsx2_cheat_candidates, build_pcsx2_install_preview, build_shared_preview,
-    build_shared_transaction_plan, build_xenia_candidates, build_xenia_install_preview,
+    build_pcsx2_cheat_candidates, build_pcsx2_install_preview,
+    build_pcsx2_legacy_migration_preview, build_shared_preview, build_shared_transaction_plan,
+    build_xenia_candidates, build_xenia_install_preview,
     check_dolphin_catalogue_update_with_transport, default_cheat_source_cache_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
@@ -7457,17 +7458,30 @@ impl ArchiveFsApp {
                 detail: "verified PCSX2 CRC is required".to_string(),
             }
                 })?;
-            let staged = stage_pcsx2_pnach(&staging_root, &profile, crc, &selected)?;
+            let staged = stage_pcsx2_pnach(
+                &staging_root,
+                &profile,
+                identity.serial.as_deref(),
+                crc,
+                &selected,
+            )?;
+            let legacy_migration_report = build_pcsx2_legacy_migration_preview(
+                &staged,
+                &profile,
+                &workflow.archive_path,
+                crc,
+            )?
+            .map(|legacy_preview| legacy_preview.report);
             let preview = build_pcsx2_install_preview(&Pcsx2InstallPreviewRequest {
                 selected_archive: workflow.archive_path.clone(),
                 profile,
                 identity,
                 staged: staged.clone(),
             })?;
-            Ok::<_, Pcsx2InstallPlanError>((preview, staged))
+            Ok::<_, Pcsx2InstallPlanError>((preview, staged, legacy_migration_report))
         })();
         let message = match response {
-            Ok((preview, staged)) => {
+            Ok((preview, staged, legacy_migration_report)) => {
                 log::info!(
                     "pcsx2 install: staged pnach for {} at {} ({} byte(s)); target {}",
                     key.archive_path.display(),
@@ -7475,6 +7489,14 @@ impl ArchiveFsApp {
                     staged.contents.len(),
                     staged.destination_path.display(),
                 );
+                if let Some(migration) = &staged.legacy_migration {
+                    log::info!(
+                        "pcsx2 install: legacy file {} will be migrated ({} cheat id(s): {})",
+                        migration.legacy_destination_path.display(),
+                        migration.migrated_block_ids.len(),
+                        migration.migrated_block_ids.join(", "),
+                    );
+                }
                 CheatPreviewResponse {
                     key: key.clone(),
                     outcome: CheatPreviewOutcome::Ready(preview.report),
@@ -7482,7 +7504,10 @@ impl ArchiveFsApp {
                     generated: None,
                     dolphin_generated: None,
                     xenia_generated: None,
-                    pcsx2_generated: Some(GeneratedPcsx2Install { staging_root }),
+                    pcsx2_generated: Some(GeneratedPcsx2Install {
+                        staging_root,
+                        legacy_migration_report,
+                    }),
                 }
             }
             Err(failure) => {
@@ -7726,6 +7751,7 @@ impl ArchiveFsApp {
         let need_dolphin_provider_fetch = dolphin_provider_auto_fetch_needed(workflow);
         let need_xenia_provider_fetch = xenia_provider_auto_fetch_needed(workflow);
         let mut preview_history_entry = None;
+        let mut legacy_migration_history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.pcsx2_gamehacking {
             match receiver.try_recv() {
                 Ok(Ok(provider)) => {
@@ -8029,6 +8055,12 @@ impl ArchiveFsApp {
                             result.journal.operation_id, result.journal.status
                         ),
                     ));
+                    if workflow.adapter == CheatEmulatorAdapter::Pcsx2
+                        && result.journal.status == SharedApplyStatus::Success
+                    {
+                        legacy_migration_history_entry =
+                            apply_pcsx2_pending_legacy_migration(workflow, &result);
+                    }
                     workflow.transaction = CheatTransactionState::Result { key, result };
                 }
                 Ok(Err(message)) => {
@@ -8286,6 +8318,9 @@ impl ArchiveFsApp {
             self.history.record(entry);
         }
         if let Some(entry) = preview_history_entry {
+            self.history.record(entry);
+        }
+        if let Some(entry) = legacy_migration_history_entry {
             self.history.record(entry);
         }
         // Dolphin: try the local catalogue/cache first, synchronously and
@@ -9355,6 +9390,111 @@ impl ArchiveFsApp {
             self.refresh(context);
         }
     }
+}
+
+/// Runs the legacy CRC-only PNACH migration (staged alongside the primary
+/// install as `workflow.preview`'s `pcsx2_generated.legacy_migration_report`)
+/// as its own chained shared-apply operation, immediately after the
+/// primary install this belongs to succeeds. Deliberately a *separate*
+/// `execute_shared_apply` call with its own operation ID and journal: two
+/// verified-exact entries for one identity in a single PCSX2 preview/plan
+/// is treated as an unresolvable ambiguity elsewhere in this pipeline (see
+/// `PreviewBlockerKind::MultipleExactMatches`), so migration cleanup can
+/// never be folded into the primary plan. Its journal lands in the same
+/// shared history root as the primary apply, so it is already visible and
+/// independently undoable from History & Logs without any bespoke UI.
+/// Returns the `HistoryEntry` to record, or `None` if no migration was
+/// pending.
+fn apply_pcsx2_pending_legacy_migration(
+    workflow: &CheatWorkflowState,
+    primary_result: &SharedApplyResult,
+) -> Option<HistoryEntry> {
+    let CheatStepResource::Ready(response) = &workflow.preview else {
+        return None;
+    };
+    let legacy_report = response
+        .pcsx2_generated
+        .as_ref()
+        .and_then(|generated| generated.legacy_migration_report.clone())?;
+    let archive_path = Some(workflow.archive_path.clone());
+    let approved_source_root = match primary_result.journal.approved_source_root.to_path_buf() {
+        Ok(path) => path,
+        Err(message) => {
+            return Some(HistoryEntry::new(
+                ActivityAction::CheatInstall,
+                archive_path,
+                ActivityOutcome::Failed,
+                format!("Legacy PNACH migration path could not be reconstructed: {message:?}"),
+            ));
+        }
+    };
+    let plan = match build_shared_transaction_plan(
+        &legacy_report,
+        &primary_result.journal.context.profile_id,
+        &primary_result.journal.context.source_mode,
+        &approved_source_root,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Some(HistoryEntry::new(
+                ActivityAction::CheatInstall,
+                archive_path,
+                ActivityOutcome::Failed,
+                format!(
+                    "Legacy PNACH migration could not be planned: {}",
+                    error.detail
+                ),
+            ));
+        }
+    };
+    let (history_root, backup_root) =
+        match (default_shared_history_root(), default_shared_backup_root()) {
+            (Ok(history_root), Ok(backup_root)) => (history_root, backup_root),
+            _ => {
+                return Some(HistoryEntry::new(
+                    ActivityAction::CheatInstall,
+                    archive_path,
+                    ActivityOutcome::Failed,
+                    "Legacy PNACH migration could not resolve the shared history/backup root"
+                        .to_string(),
+                ));
+            }
+        };
+    let operation_id = format!("{}-legacy-migration", primary_result.journal.operation_id);
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let result = execute_shared_apply(
+        &plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: operation_id.clone(),
+            timestamp_unix_seconds: timestamp,
+            current_context: plan.context.clone(),
+            history_root,
+            backup_root,
+        },
+    );
+    let outcome = match result.journal.status {
+        SharedApplyStatus::Success => ActivityOutcome::Completed,
+        SharedApplyStatus::PartialFailure | SharedApplyStatus::Failed => ActivityOutcome::Failed,
+        SharedApplyStatus::DryRun => ActivityOutcome::Skipped,
+    };
+    Some(HistoryEntry::new(
+        ActivityAction::CheatInstall,
+        archive_path,
+        outcome,
+        format!(
+            "Legacy PNACH migration '{}' finished with {:?} (undo available from History & Logs).",
+            result.journal.operation_id, result.journal.status
+        ),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16837,6 +16977,16 @@ struct Pcsx2GameHackingState {
 #[derive(Clone)]
 struct GeneratedPcsx2Install {
     staging_root: PathBuf,
+    /// Present only when a legacy CRC-only file was found with
+    /// ArchiveFS-managed cheats that needed consolidating into the
+    /// serial+CRC file this PCSX2 build actually reads. Applied as its own
+    /// chained operation, with its own journal and independent Undo (via
+    /// the generic History & Logs rollback flow), immediately after the
+    /// primary install succeeds - PCSX2's shared preview pipeline treats
+    /// two verified-exact entries for one identity in the same report as
+    /// an unresolvable ambiguity, so this can never be folded into the
+    /// primary plan.
+    legacy_migration_report: Option<SharedPreviewReport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21476,12 +21626,22 @@ fn show_pcsx2_gamehacking(
     {
         widgets::card(ui, |ui| {
             ui.strong("Install the selected cheats?");
-            ui.label("ArchiveFS will use the verified CRC filename, keep a backup, and make this change undoable.");
+            ui.label("ArchiveFS will use the verified serial+CRC filename this PCSX2 build reads (falling back to CRC-only if no verified serial exists), keep a backup, and make this change undoable.");
             for entry in &plan.entries {
                 ui.label(format!(
                     "Target file: {}/{}",
                     entry.destination_root.display, entry.destination_relative_path.display
                 ));
+            }
+            if let CheatStepResource::Ready(response) = &workflow.preview
+                && response
+                    .pcsx2_generated
+                    .as_ref()
+                    .is_some_and(|generated| generated.legacy_migration_report.is_some())
+            {
+                ui.label(
+                    "A legacy CRC-only file for this game was found and will be migrated into the file above, then stripped of ArchiveFS content (kept, with a backup, as its own separately undoable step).",
+                );
             }
             let replacement_required = plan.entries.iter().any(|entry| {
                 entry.proposed_action
@@ -34122,7 +34282,7 @@ mod tests {
             .pcsx2_generated
             .as_ref()
             .expect("a successful PCSX2 preview stages a generated install");
-        let staged_path = generated.staging_root.join("A1B2C3D4.pnach");
+        let staged_path = generated.staging_root.join("SLUS-20312_A1B2C3D4.pnach");
         let staged = std::fs::read_to_string(&staged_path)
             .unwrap_or_else(|error| panic!("staged pnach at {staged_path:?} unreadable: {error}"));
         assert!(staged.contains("// ArchiveFS managed block: gh-42-1"));
@@ -34137,6 +34297,167 @@ mod tests {
         ));
 
         let staging_root = generated.staging_root.clone();
+        let _ = std::fs::remove_dir_all(&staging_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn install_selected_pcsx2_detects_legacy_file_and_confirmation_names_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-pcsx2-legacy-migration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cheats_directory = directory.join("cheats");
+        std::fs::create_dir_all(&cheats_directory).unwrap();
+        std::fs::write(
+            cheats_directory.join("A1B2C3D4.pnach"),
+            b"// old note\n// ArchiveFS managed block: legacy_cheat\n// Legacy cheat\npatch=1,EE,20999999,word,1\n// End ArchiveFS managed block\n",
+        )
+        .unwrap();
+        let mut profile = pcsx2_profile_fixture();
+        profile.configuration_path = directory.clone();
+        profile.patch_directories = vec![Pcsx2PatchDirectory {
+            path: cheats_directory.clone(),
+            category: Pcsx2PatchCategory::Cheats,
+            state: Pcsx2PatchDirectoryState::Available,
+            warning: None,
+            identity: None,
+        }];
+        let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+
+        app.start_pcsx2_install_preview();
+
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let CheatStepResource::Ready(response) = &workflow.preview else {
+            panic!("expected a resolved preview response");
+        };
+        let generated = response
+            .pcsx2_generated
+            .as_ref()
+            .expect("a successful PCSX2 preview stages a generated install");
+        assert!(
+            generated.legacy_migration_report.is_some(),
+            "a legacy CRC-only file with a managed block must be detected for migration"
+        );
+        let staging_root = generated.staging_root.clone();
+
+        // The confirmation card must name the migration explicitly, not
+        // silently fold it in.
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_pcsx2_gamehacking(ui, workflow, Some(cheats_directory.as_path()));
+            });
+        });
+        assert!(rendered_text_contains(&output, "legacy CRC-only file"));
+
+        let _ = std::fs::remove_dir_all(&staging_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn pcsx2_legacy_migration_strips_legacy_file_and_reports_a_history_entry() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-pcsx2-legacy-apply-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cheats_directory = directory.join("cheats");
+        std::fs::create_dir_all(&cheats_directory).unwrap();
+        let legacy_path = cheats_directory.join("A1B2C3D4.pnach");
+        std::fs::write(
+            &legacy_path,
+            b"// old note\n// ArchiveFS managed block: legacy_cheat\n// Legacy cheat\npatch=1,EE,20999999,word,1\n// End ArchiveFS managed block\n",
+        )
+        .unwrap();
+        let mut profile = pcsx2_profile_fixture();
+        profile.configuration_path = directory.clone();
+        profile.patch_directories = vec![Pcsx2PatchDirectory {
+            path: cheats_directory.clone(),
+            category: Pcsx2PatchCategory::Cheats,
+            state: Pcsx2PatchDirectoryState::Available,
+            warning: None,
+            identity: None,
+        }];
+        let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+        app.start_pcsx2_install_preview();
+
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        let staging_root = match &workflow.preview {
+            CheatStepResource::Ready(response) => response
+                .pcsx2_generated
+                .as_ref()
+                .expect("staged")
+                .staging_root
+                .clone(),
+            _ => panic!("expected a resolved preview response"),
+        };
+
+        // A minimal, real "primary install already succeeded" result: only
+        // the fields `apply_pcsx2_pending_legacy_migration` actually reads
+        // (profile ID, source mode, approved source root, operation ID,
+        // status) need to be realistic; the entries are irrelevant here.
+        let primary_result = SharedApplyResult {
+            journal: archivefs_core::patch_manager::SharedApplyJournal {
+                schema_version: 1,
+                operation_id: "test-legacy-wiring".to_string(),
+                plan_id: "test-plan".to_string(),
+                timestamp_unix_seconds: 1_700_000_000,
+                context: archivefs_core::patch_manager::SharedApplyContext {
+                    adapter: archivefs_core::patch_manager::PreviewAdapter::Pcsx2,
+                    selected_archive:
+                        archivefs_core::patch_manager::SharedTransactionPath::from_path(
+                            &workflow.archive_path,
+                        ),
+                    verified_game_identity: "A1B2C3D4".to_string(),
+                    profile_id: "pcsx2-native-test".to_string(),
+                    source_mode: "pcsx2-managed-pnach".to_string(),
+                },
+                approved_source_root:
+                    archivefs_core::patch_manager::SharedTransactionPath::from_path(&staging_root),
+                destination_root: archivefs_core::patch_manager::SharedTransactionPath::from_path(
+                    &directory,
+                ),
+                dry_run: false,
+                entries: Vec::new(),
+                status: SharedApplyStatus::Success,
+                rollback_operation_id: None,
+            },
+            journal_path: None,
+            journal_failure: None,
+        };
+
+        let entry = apply_pcsx2_pending_legacy_migration(workflow, &primary_result)
+            .expect("a pending legacy migration produces a history entry");
+        assert_eq!(entry.outcome, ActivityOutcome::Completed);
+        assert!(
+            entry
+                .message
+                .contains("test-legacy-wiring-legacy-migration")
+        );
+
+        let stripped = std::fs::read_to_string(&legacy_path).unwrap();
+        assert!(stripped.contains("old note"));
+        assert!(!stripped.contains("ArchiveFS managed block"));
+
+        // Cleanup: remove exactly the journal/backup artifacts this test
+        // created in the real shared history/backup roots, alongside the
+        // disposable profile directory.
+        if let Ok(history_root) = default_shared_history_root() {
+            let _ =
+                std::fs::remove_file(history_root.join("test-legacy-wiring-legacy-migration.json"));
+        }
+        if let Ok(backup_root) = default_shared_backup_root() {
+            let _ =
+                std::fs::remove_dir_all(backup_root.join("test-legacy-wiring-legacy-migration"));
+        }
         let _ = std::fs::remove_dir_all(&staging_root);
         let _ = std::fs::remove_dir_all(&directory);
     }

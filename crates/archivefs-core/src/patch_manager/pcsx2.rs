@@ -308,7 +308,7 @@ pub(super) fn parse_patch_identity(stem: &str) -> (Option<String>, Option<String
 /// Normalizes a PS2 disc serial to PCSX2's `XXXX-NNNNN` convention
 /// (4 ASCII letters, a hyphen, 5 ASCII digits), uppercased. `None` if
 /// `value` does not match that shape.
-fn normalize_serial(value: &str) -> Option<String> {
+pub(super) fn normalize_serial(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_uppercase();
     let (prefix, digits) = value.split_once('-')?;
     if prefix.len() == 4
