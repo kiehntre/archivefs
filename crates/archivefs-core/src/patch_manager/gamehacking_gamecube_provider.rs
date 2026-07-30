@@ -9,18 +9,24 @@
 //! This milestone is preview-only: there is no install/apply path here at
 //! all, unlike the PS2 provider.
 //!
+//! GameHacking.org's system slug for GameCube is confirmed to be `ngc`,
+//! not `gamecube` - the catalogue lives at
+//! `https://gamehacking.org/system/ngc/all` (see `GAMECUBE_INDEX_URL`).
+//! ArchiveFS's own user-facing platform name stays "GameCube"
+//! everywhere else (CLI command name, cache file names, the catalogue's
+//! `system` field, GUI labels) - only the GameHacking URL path and
+//! robots.txt check use the `ngc` slug.
+//!
 //! The numeric GameHacking.org system ID used for per-game cheat exports
-//! (see `GameCubeGameHackingAdapter::system_id`) could not be verified
-//! from the environment this module was written in - `gamehacking.org`
-//! answered every request (both `/system/ps2/all` and
-//! `/system/gamecube/all`) with a Cloudflare challenge page (HTTP 403),
-//! confirming this is an environment-wide block rather than anything
-//! GameCube-specific. Catalogue crawling, matching, and preview never
-//! need this constant (they only use `index_url()`, a URL directly
-//! parallel to PS2's already-working `/system/ps2/all`); only
-//! `fetch_cheats`/`fetch_cheats_for_confirmed_candidate` do, and both
-//! fail loudly with `GameHackingErrorKind::UnsupportedSystem` until
-//! `GameCubeGameHackingAdapter::system_id` is set to a confirmed value.
+//! (see `GameCubeGameHackingAdapter::system_id`) is still not confirmed:
+//! this sandbox's network egress to `gamehacking.org` answers every
+//! request (both `/system/ps2/all` and `/system/ngc/all`) with a
+//! Cloudflare challenge page (HTTP 403), confirming an environment-wide
+//! block rather than anything GameCube-specific. Catalogue crawling,
+//! matching, and preview never need this constant (they only use
+//! `index_url()`); only `fetch_cheats`/`fetch_cheats_for_confirmed_candidate`
+//! do, and both fail loudly with `GameHackingErrorKind::UnsupportedSystem`
+//! until `GameCubeGameHackingAdapter::system_id` is set to a confirmed value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -39,7 +45,10 @@ use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, I
 
 pub const GAMEHACKING_GAMECUBE_PROVIDER_ID: &str = "gamehacking.org";
 const BASE_URL: &str = "https://gamehacking.org";
-const GAMECUBE_INDEX_URL: &str = "https://gamehacking.org/system/gamecube/all";
+/// Confirmed GameHacking.org system slug for GameCube: `ngc`, not
+/// `gamecube`. Do not change this without re-confirming against a real
+/// request - see the module doc comment.
+const GAMECUBE_INDEX_URL: &str = "https://gamehacking.org/system/ngc/all";
 const EXPORT_URL: &str = "https://gamehacking.org/inc/sub.exportCodes.php";
 const ROBOTS_URL: &str = "https://gamehacking.org/robots.txt";
 const USER_AGENT: &str = concat!(
@@ -693,7 +702,7 @@ impl GameHackingGameCubeProvider {
     where
         F: FnMut(GameHackingGameCubeIndexProgress),
     {
-        self.check_robots(options, &["/system/gamecube/all"])?;
+        self.check_robots(options, &["/system/ngc/all"])?;
         prepare_cache(&options.cache_root)?;
         let root_path = options.cache_root.join(GAMECUBE_INDEX_ROOT_CACHE_FILE);
         let root_was_cached = root_path.is_file();
@@ -1096,7 +1105,7 @@ fn parse_gamecube_index_page_numbers(
 ) -> Result<Vec<u32>, GameHackingError> {
     let text = decode_provider_text(bytes, charset);
     let document = Html::parse_document(&text);
-    let selector = Selector::parse("a[href^='/system/gamecube/all/']").expect("static selector");
+    let selector = Selector::parse("a[href^='/system/ngc/all/']").expect("static selector");
     let mut pages = BTreeSet::new();
     for node in document.select(&selector) {
         if let Some(page) = node
@@ -1733,6 +1742,18 @@ mod tests {
         assert_eq!(verified.state, GameCubeIdentityState::Verified);
     }
 
+    /// GameHacking.org's confirmed system slug for GameCube is `ngc`, not
+    /// `gamecube` - a wrong slug here silently 404s (or matches the wrong
+    /// system) instead of failing loudly, so this is pinned exactly.
+    #[test]
+    fn gamecube_adapter_index_url_uses_the_confirmed_ngc_slug() {
+        let adapter = GameCubeGameHackingAdapter;
+        assert_eq!(
+            adapter.index_url(),
+            "https://gamehacking.org/system/ngc/all"
+        );
+    }
+
     #[test]
     fn normalize_gamecube_game_id_requires_exact_six_char_alnum_shape() {
         assert_eq!(
@@ -1878,12 +1899,11 @@ mod tests {
 
     #[test]
     fn index_page_numbers_require_a_complete_zero_based_run() {
-        let html = r#"<a href="/system/gamecube/all/0">0</a><a href="/system/gamecube/all/1">1</a><a href="/system/gamecube/all/2">2</a>"#;
+        let html = r#"<a href="/system/ngc/all/0">0</a><a href="/system/ngc/all/1">1</a><a href="/system/ngc/all/2">2</a>"#;
         let pages = parse_gamecube_index_page_numbers(html.as_bytes(), None).unwrap();
         assert_eq!(pages, vec![0, 1, 2]);
 
-        let incomplete =
-            r#"<a href="/system/gamecube/all/0">0</a><a href="/system/gamecube/all/2">2</a>"#;
+        let incomplete = r#"<a href="/system/ngc/all/0">0</a><a href="/system/ngc/all/2">2</a>"#;
         assert!(parse_gamecube_index_page_numbers(incomplete.as_bytes(), None).is_err());
     }
 
@@ -1935,7 +1955,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let index_html = r#"<a href="/system/gamecube/all/0">0</a><table>
+        let index_html = r#"<a href="/system/ngc/all/0">0</a><table>
 <tr><td>Test Racer</td></tr>
 <tr><td><a href="/game/501/test-racer">USA</a></td><td>GTRE01</td></tr>
 </table>"#;
@@ -1984,7 +2004,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let index_html = r#"<a href="/system/gamecube/all/0">0</a><table>
+        let index_html = r#"<a href="/system/ngc/all/0">0</a><table>
 <tr><td>Zeta Game</td></tr>
 <tr><td><a href="/game/900/zeta">USA</a></td><td>GZAE01</td></tr>
 <tr><td>Alpha Game</td></tr>
