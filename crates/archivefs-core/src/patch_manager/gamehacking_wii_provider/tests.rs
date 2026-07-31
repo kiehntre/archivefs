@@ -116,6 +116,96 @@ fn game(revision: Option<u16>) -> GameHackingWiiGame {
     }
 }
 
+fn catalogue_record(
+    index: usize,
+    dolphin_game_id: &str,
+    revision: Option<u16>,
+) -> GameHackingWiiIndexRecord {
+    GameHackingWiiIndexRecord {
+        game_id: 200_000 + index as u64,
+        title: format!("Synthetic Wii Game {index:05}"),
+        region: Some("Europe".to_string()),
+        dolphin_game_id: Some(dolphin_game_id.to_string()),
+        revision,
+        disc_number: Some(0),
+        crc32: None,
+        source_url: format!("https://gamehacking.org/game/{}", 200_000 + index),
+        index_source_url: WII_INDEX_URL.to_string(),
+        retrieved_at_unix_seconds: 1,
+    }
+}
+
+fn synthetic_catalogue(games: Vec<GameHackingWiiIndexRecord>) -> GameHackingWiiCatalogue {
+    GameHackingWiiCatalogue {
+        schema_version: WII_CATALOGUE_SCHEMA_VERSION,
+        provider: "gamehacking.org".to_string(),
+        system: "Wii".to_string(),
+        source_url: WII_INDEX_URL.to_string(),
+        retrieved_at_unix_seconds: 1,
+        pages: Vec::new(),
+        games,
+    }
+}
+
+fn identity_with_id(game_id: &str) -> WiiGameIdentity {
+    WiiGameIdentity::from_report(
+        "Synthetic Wii Game",
+        &report(IdentityPlatform::Wii, Some(game_id)),
+    )
+}
+
+#[test]
+fn ten_thousand_row_matching_is_single_pass_for_exact_and_no_match() {
+    let mut rows = (0..9_999)
+        .map(|index| catalogue_record(index, &format!("X{index:05}"), None))
+        .collect::<Vec<_>>();
+    rows.push(catalogue_record(9_999, "SMNE01", None));
+    let catalogue = synthetic_catalogue(rows);
+
+    let exact = match_wii_catalogue(&identity_with_id("SMNE01"), &catalogue, None).unwrap();
+    assert_eq!(exact.catalogue_rows_examined, 10_000);
+    assert_eq!(exact.result.status, GameHackingWiiMatchStatus::Matched);
+    assert_eq!(
+        exact
+            .result
+            .game
+            .as_ref()
+            .unwrap()
+            .dolphin_game_id
+            .as_deref(),
+        Some("SMNE01")
+    );
+
+    let missing = match_wii_catalogue(&identity_with_id("RMCE01"), &catalogue, None).unwrap();
+    assert_eq!(missing.catalogue_rows_examined, 10_000);
+    assert_eq!(missing.result.status, GameHackingWiiMatchStatus::NoMatch);
+}
+
+#[test]
+fn duplicate_and_revision_candidates_are_terminal_and_deterministic() {
+    let catalogue = synthetic_catalogue(vec![
+        catalogue_record(0, "SMNE01", Some(2)),
+        catalogue_record(1, "SMNE01", Some(1)),
+    ]);
+    let outcome = match_wii_catalogue(&identity_with_id("SMNE01"), &catalogue, None).unwrap();
+    assert_eq!(outcome.catalogue_rows_examined, 2);
+    assert_eq!(outcome.result.status, GameHackingWiiMatchStatus::Candidates);
+    assert_eq!(outcome.result.candidates.len(), 2);
+    assert!(outcome.result.candidates[0].game.title <= outcome.result.candidates[1].game.title);
+}
+
+#[test]
+fn catalogue_match_honours_cancellation_before_visiting_rows() {
+    let cancellation = AtomicBool::new(true);
+    let failure = match_wii_catalogue(
+        &identity_with_id("SMNE01"),
+        &synthetic_catalogue(vec![catalogue_record(0, "SMNE01", None)]),
+        Some(&cancellation),
+    )
+    .unwrap_err();
+    assert_eq!(failure.kind, GameHackingErrorKind::Cancelled);
+}
+
 #[test]
 fn confirmed_wii_url_and_slug_are_exact() {
     assert_eq!(WII_INDEX_URL, "https://gamehacking.org/system/wii/all");

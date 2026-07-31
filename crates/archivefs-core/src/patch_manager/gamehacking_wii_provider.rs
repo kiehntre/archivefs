@@ -7,7 +7,9 @@
 //! Dolphin identity policy, explicit label policy, and safety checks here.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use scraper::{Element, Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -323,6 +325,14 @@ pub struct GameHackingWiiMatch {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameHackingWiiMatchOutcome {
+    pub result: GameHackingWiiMatch,
+    /// Exactly one increment per catalogue row considered. Exposed for
+    /// bounded-work diagnostics and regression tests, not timing guesses.
+    pub catalogue_rows_examined: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WiiCodeFormat {
@@ -499,67 +509,66 @@ impl GameHackingWiiProvider {
         identity: &WiiGameIdentity,
         options: &GameHackingWiiFetchOptions,
     ) -> Result<GameHackingWiiMatch, GameHackingError> {
+        Ok(self.match_game_with_metrics(identity, options)?.result)
+    }
+
+    pub fn match_game_with_metrics(
+        &self,
+        identity: &WiiGameIdentity,
+        options: &GameHackingWiiFetchOptions,
+    ) -> Result<GameHackingWiiMatchOutcome, GameHackingError> {
         if identity.verified_game_id().is_none() {
-            return Ok(GameHackingWiiMatch {
-                status: GameHackingWiiMatchStatus::IdentityIncomplete,
-                game: None,
-                candidates: Vec::new(),
-                detail: "A verified Wii disc-header Game ID is required before matching."
-                    .to_string(),
+            return Ok(GameHackingWiiMatchOutcome {
+                result: GameHackingWiiMatch {
+                    status: GameHackingWiiMatchStatus::IdentityIncomplete,
+                    game: None,
+                    candidates: Vec::new(),
+                    detail: "A verified Wii disc-header Game ID is required before matching."
+                        .to_string(),
+                },
+                catalogue_rows_examined: 0,
             });
         }
         let catalogue = load_wii_catalogue(&options.cache_root)?;
-        let mut candidates = catalogue
-            .games
-            .iter()
-            .filter_map(|record| {
-                let game = record.as_game();
-                let (strength, requires_user_confirmation) = classify_wii_match(identity, &game)?;
-                Some(GameHackingWiiMatchCandidate {
-                    game,
-                    strength,
-                    requires_user_confirmation,
-                })
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(GameHackingWiiMatch {
-                status: GameHackingWiiMatchStatus::NoMatch,
-                game: None,
-                candidates: Vec::new(),
-                detail: "No exact six-character Wii Game ID match exists in the cached catalogue."
-                    .to_string(),
-            });
+        match_wii_catalogue(identity, &catalogue, options.cancellation.as_deref())
+    }
+
+    /// Reads only an exact imported/cached Wii game page. It never invokes
+    /// the shared transport, refreshes metadata, or falls through to a live
+    /// request when the file is absent.
+    pub fn load_cached_game_page_cheats(
+        &self,
+        identity: &WiiGameIdentity,
+        game: &GameHackingWiiGame,
+        options: &GameHackingWiiFetchOptions,
+    ) -> Result<Option<Vec<GameHackingWiiCheat>>, GameHackingError> {
+        if options
+            .cancellation
+            .as_deref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(wii_error(
+                GameHackingErrorKind::Cancelled,
+                "GameHacking.org Wii cached match was cancelled",
+            ));
         }
-        candidates.sort_by(|left, right| {
-            left.strength
-                .priority()
-                .cmp(&right.strength.priority())
-                .then_with(|| left.game.title.cmp(&right.game.title))
-                .then_with(|| left.game.game_id.cmp(&right.game.game_id))
-        });
-        let best = candidates[0].strength.priority();
-        candidates.retain(|candidate| candidate.strength.priority() == best);
-        if candidates.len() == 1 && !candidates[0].requires_user_confirmation {
-            let selected = candidates.remove(0);
-            return Ok(GameHackingWiiMatch {
-                status: GameHackingWiiMatchStatus::Matched,
-                detail: format!(
-                    "Matched {} by {} from the cached Wii catalogue.",
-                    selected.game.title,
-                    selected.strength.label()
-                ),
-                game: Some(selected.game),
-                candidates: Vec::new(),
-            });
+        let path = options
+            .cache_root
+            .join(format!("wii-game-{}.html", game.game_id));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(wii_error(
+                    GameHackingErrorKind::CacheUnavailable,
+                    format!("cached Wii game page could not be inspected: {error}"),
+                ));
+            }
         }
-        Ok(GameHackingWiiMatch {
-            status: GameHackingWiiMatchStatus::Candidates,
-            game: None,
-            candidates,
-            detail: "The Wii Game ID matches more than one revision, or the catalogue revision cannot be verified locally. Select the exact candidate explicitly."
-                .to_string(),
-        })
+        let bytes = bounded_read(&path, MAX_GAME_PAGE_BYTES)
+            .map_err(|failure| wii_error(failure.kind, failure.detail))?;
+        let cheats = parse_wii_game_page(identity, game, &bytes)?;
+        Ok(Some(cheats))
     }
 
     pub fn fetch_game_page_cheats(
@@ -610,6 +619,81 @@ impl GameHackingWiiProvider {
             retrieved_at_unix_seconds: response.retrieved_at_unix_seconds,
         })
     }
+}
+
+fn match_wii_catalogue(
+    identity: &WiiGameIdentity,
+    catalogue: &GameHackingWiiCatalogue,
+    cancellation: Option<&AtomicBool>,
+) -> Result<GameHackingWiiMatchOutcome, GameHackingError> {
+    let mut rows_examined = 0_usize;
+    let mut candidates = Vec::new();
+    for record in &catalogue.games {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(wii_error(
+                GameHackingErrorKind::Cancelled,
+                "GameHacking.org Wii cached match was cancelled",
+            ));
+        }
+        rows_examined = rows_examined.saturating_add(1);
+        let game = record.as_game();
+        let Some((strength, requires_user_confirmation)) = classify_wii_match(identity, &game)
+        else {
+            continue;
+        };
+        candidates.push(GameHackingWiiMatchCandidate {
+            game,
+            strength,
+            requires_user_confirmation,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(GameHackingWiiMatchOutcome {
+            result: GameHackingWiiMatch {
+                status: GameHackingWiiMatchStatus::NoMatch,
+                game: None,
+                candidates: Vec::new(),
+                detail: "No exact six-character Wii Game ID match exists in the cached catalogue."
+                    .to_string(),
+            },
+            catalogue_rows_examined: rows_examined,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.strength
+            .priority()
+            .cmp(&right.strength.priority())
+            .then_with(|| left.game.title.cmp(&right.game.title))
+            .then_with(|| left.game.game_id.cmp(&right.game.game_id))
+    });
+    let best = candidates[0].strength.priority();
+    candidates.retain(|candidate| candidate.strength.priority() == best);
+    if candidates.len() == 1 && !candidates[0].requires_user_confirmation {
+        let selected = candidates.remove(0);
+        return Ok(GameHackingWiiMatchOutcome {
+            result: GameHackingWiiMatch {
+                status: GameHackingWiiMatchStatus::Matched,
+                detail: format!(
+                    "Matched {} by {} from the cached Wii catalogue.",
+                    selected.game.title,
+                    selected.strength.label()
+                ),
+                game: Some(selected.game),
+                candidates: Vec::new(),
+            },
+            catalogue_rows_examined: rows_examined,
+        });
+    }
+    Ok(GameHackingWiiMatchOutcome {
+        result: GameHackingWiiMatch {
+            status: GameHackingWiiMatchStatus::Candidates,
+            game: None,
+            candidates,
+            detail: "The Wii Game ID matches more than one revision, or the catalogue revision cannot be verified locally. Select the exact candidate explicitly."
+                .to_string(),
+        },
+        catalogue_rows_examined: rows_examined,
+    })
 }
 
 fn classify_wii_match(
