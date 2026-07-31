@@ -18,13 +18,14 @@ use archivefs_core::patch_manager::{
     CheatJournalInspectionError, CheatProviderCoverageReport, CheatRollbackAvailability,
     CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
     DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
-    GameHackingGameCubeProvider, GameHackingProvider, HttpsMetadataFetcher, ProposedDestination,
-    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
+    GameHackingGameCubeProvider, GameHackingProvider, GameHackingWiiFetchOptions,
+    GameHackingWiiProvider, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
+    RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
     build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
     discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
-    inspect_cheat_install_journal, load_catalogue_evidence_read_only,
+    import_wii_game_page_file, inspect_cheat_install_journal, load_catalogue_evidence_read_only,
     load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
-    preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
+    load_wii_catalogue, preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -357,6 +358,100 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     result.pages_reused,
                     result.catalogue_path.display()
                 );
+            }
+        }
+        "gamehacking-wii-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-wii-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingWiiFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let result =
+                GameHackingWiiProvider::default().refresh_wii_index(&options, |progress| {
+                    eprintln!(
+                        "GameHacking Wii index: {}/{} pages · {} games · page {} {}",
+                        progress.pages_complete,
+                        progress.pages_total,
+                        progress.games_collected,
+                        progress
+                            .page_number
+                            .map(|page| page.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        if progress.downloaded {
+                            "downloaded"
+                        } else {
+                            "cached"
+                        }
+                    );
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking Wii catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "gamehacking-wii-import-page" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-wii-import-page requires --game-id <id>")?;
+            let image = extract_named_path_flag(&mut input_args, "--image")?
+                .ok_or("gamehacking-wii-import-page requires --image <path>")?;
+            let file = extract_named_path_flag(&mut input_args, "--file")?
+                .ok_or("gamehacking-wii-import-page requires --file <saved-page.html>")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-wii-import-page does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingWiiFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let report = inspect_catalogued_game_identity(&image, Some("Wii"));
+            let identity = WiiGameIdentity::from_report(
+                image
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Wii game"),
+                &report,
+            );
+            let catalogue = load_wii_catalogue(&options.cache_root)?;
+            let game = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| format!("game {game_id} is not in the cached Wii catalogue"))?
+                .as_game();
+            let outcome = import_wii_game_page_file(&options.cache_root, &identity, &game, &file)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("Imported {} named Wii cheats", outcome.cheats.len());
+                println!("Cache: {}", outcome.cache_path.display());
+                println!("Verified Wii Game ID: {}", outcome.dolphin_game_id);
             }
         }
         "gamehacking-gamecube-sysid-diagnostic" => {
@@ -4550,6 +4645,12 @@ fn print_help() {
     );
     println!(
         "  gamehacking-gamecube-index-refresh  Resume the cached public GameCube index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-wii-index-refresh  Resume the cached public Wii index crawl using the shared catalogue engine (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-wii-import-page --game-id <id> --image <path> --file <saved-page.html>  Validate and import one saved Wii game page without network access"
     );
     println!(
         "  gamehacking-gamecube-sysid-diagnostic --game-id <id>  Fetch one cached catalogue game's real page and print its cheat-export form action, hidden fields, and confirmed sysID (--cache-root/--json accepted)"

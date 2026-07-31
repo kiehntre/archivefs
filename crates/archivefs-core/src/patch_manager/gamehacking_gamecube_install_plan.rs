@@ -584,6 +584,16 @@ pub struct GameCubeGameHackingInstallPreview {
 pub fn build_gamecube_gamehacking_install_preview(
     request: &GameCubeGameHackingInstallPreviewRequest,
 ) -> Result<GameCubeGameHackingInstallPreview, GameCubeInstallPlanError> {
+    build_dolphin_gamehacking_install_preview(request, "GameCube")
+}
+
+/// Shared Dolphin GameSettings preview boundary for GameCube and Wii.
+/// The public GameCube wrapper remains unchanged; the Wii proof adapter
+/// supplies only its already-verified platform label.
+pub(crate) fn build_dolphin_gamehacking_install_preview(
+    request: &GameCubeGameHackingInstallPreviewRequest,
+    platform: &str,
+) -> Result<GameCubeGameHackingInstallPreview, GameCubeInstallPlanError> {
     let file_name = request
         .staged
         .path
@@ -604,7 +614,7 @@ pub fn build_gamecube_gamehacking_install_preview(
     let report = build_shared_preview(&SharedPreviewRequest {
         adapter: PreviewAdapter::Dolphin,
         selected_archive: request.selected_archive.clone(),
-        platform: Some("GameCube".to_string()),
+        platform: Some(platform.to_string()),
         identity: PreviewIdentity {
             kind: PreviewIdentityKind::DolphinGameId,
             state: PreviewIdentityState::Verified,

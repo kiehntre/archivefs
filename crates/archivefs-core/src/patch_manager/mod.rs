@@ -41,6 +41,7 @@ mod gamehacking_gamecube_install_plan;
 mod gamehacking_gamecube_provider;
 mod gamehacking_provider;
 mod gamehacking_shared;
+mod gamehacking_wii_provider;
 mod gecko_document;
 mod import_safety;
 mod matching;
@@ -264,6 +265,18 @@ pub use gamehacking_provider::{
     GameHackingSystemAdapter, Ps2GameHackingAdapter, gamehacking_cache_root, load_ps2_catalogue,
     normalize_ps2_serial, parse_gamehacking_game_page, parse_gamehacking_pnach,
     parse_gamehacking_ps2_index_page,
+};
+pub use gamehacking_wii_provider::{
+    GAMEHACKING_WII_PROVIDER_ID, GameHackingWiiCatalogue, GameHackingWiiCheat,
+    GameHackingWiiFetchOptions, GameHackingWiiGame, GameHackingWiiIndexPage,
+    GameHackingWiiIndexProgress, GameHackingWiiIndexRecord, GameHackingWiiIndexRefreshResult,
+    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
+    GameHackingWiiMatchStrength, GameHackingWiiProvider, WiiCheatSafety, WiiCodeFormat,
+    WiiGameIdentity, WiiIdentityState, WiiManualImportError, WiiManualImportErrorKind,
+    WiiManualImportOutcome, build_wii_gamehacking_install_preview, import_wii_game_page_bytes,
+    import_wii_game_page_file, import_wii_text_export_unverified, load_wii_catalogue,
+    normalize_wii_game_id, parse_gamehacking_wii_index_page, parse_wii_game_page,
+    stage_wii_gamehacking_install, stage_wii_gamehacking_removal,
 };
 pub use gecko_document::{
     DolphinCodeSectionKind, DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind,
