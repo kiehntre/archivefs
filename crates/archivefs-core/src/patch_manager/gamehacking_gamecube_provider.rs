@@ -1,8 +1,9 @@
 //! Cached GameCube catalogue and per-library-game access to GameHacking.org.
 //!
 //! GameCube only, mirroring the shape of the PS2 provider
-//! (`gamehacking_provider.rs`) without touching it: retrieval, HTML
-//! parsing, identity matching, and cheat-export parsing remain separate.
+//! (`gamehacking_provider.rs`): low-level retrieval and cache mechanics are
+//! shared, while HTML parsing, identity matching, and cheat-export parsing
+//! remain platform-specific.
 //! The explicit index command walks only the numbered public GameCube
 //! table pages. Runtime matching is local, and only one selected game's
 //! export is requested after an automatic match or user confirmation.
@@ -29,42 +30,40 @@
 //! until `GameCubeGameHackingAdapter::system_id` is set to a confirmed value.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use scraper::{Element, Html, Selector};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::gamehacking_provider::{
-    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameHackingError, GameHackingErrorKind,
-    GameHackingFetchOutcome, GameHackingHttpClassification, blocked_without_cache_message,
-    cached_bytes_are_cloudflare_challenge, classify_gamehacking_http_response,
-    classify_gamehacking_transport_error, clear_cloudflare_marker, cloudflare_cooldown_remaining,
-    gamehacking_cache_root, mark_cloudflare_blocked,
+    GameHackingError, GameHackingErrorKind, GameHackingFetchOutcome, gamehacking_cache_root,
 };
+use super::gamehacking_shared::{
+    BASE_URL, EXPORT_URL, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameHackingClient,
+    GameHackingRequestOptions, GameHackingRequestSpec, ProviderResponse, UreqGameHackingTransport,
+    atomic_write, bounded_read, cache_retrieved_at, cached_bytes_are_cloudflare_challenge,
+    check_cancelled, decode_provider_text, prepare_cache, provider_error, sha256_hex,
+    unix_seconds_now, validate_provider_url,
+};
+#[cfg(test)]
+use super::gamehacking_shared::{cloudflare_cooldown_remaining, mark_cloudflare_blocked};
 use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus};
 
 pub const GAMEHACKING_GAMECUBE_PROVIDER_ID: &str = "gamehacking.org";
-const BASE_URL: &str = "https://gamehacking.org";
 /// Confirmed GameHacking.org system slug for GameCube: `ngc`, not
 /// `gamecube`. Do not change this without re-confirming against a real
 /// request - see the module doc comment.
 const GAMECUBE_INDEX_URL: &str = "https://gamehacking.org/system/ngc/all";
-const EXPORT_URL: &str = "https://gamehacking.org/inc/sub.exportCodes.php";
-const ROBOTS_URL: &str = "https://gamehacking.org/robots.txt";
-const USER_AGENT: &str = concat!(
-    "ArchiveFS/",
-    env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/davedap/archivefs; one-game-at-a-time cheat provider)"
-);
 const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXPORT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_RETRIES: u8 = 3;
 const GAMECUBE_CATALOGUE_SCHEMA_VERSION: u32 = 1;
 const GAMECUBE_CATALOGUE_FILE: &str = "gamecube-catalogue.json";
 const GAMECUBE_INDEX_ROOT_CACHE_FILE: &str = "gamecube-index-root.html";
@@ -555,6 +554,24 @@ impl GameHackingGameCubeFetchOptions {
     }
 }
 
+impl GameHackingRequestOptions for GameHackingGameCubeFetchOptions {
+    fn cache_root(&self) -> &Path {
+        &self.cache_root
+    }
+
+    fn force_refresh(&self) -> bool {
+        self.force_refresh
+    }
+
+    fn delay(&self) -> Duration {
+        self.delay
+    }
+
+    fn cancellation(&self) -> Option<&AtomicBool> {
+        self.cancellation.as_deref()
+    }
+}
+
 /// GameHacking.org's system adapter for GameCube. `system_id` is the
 /// numeric `sysID` form field required only for per-game cheat exports.
 #[derive(Debug, Clone, Copy, Default)]
@@ -593,197 +610,20 @@ impl GameCubeGameHackingAdapter {
     }
 }
 
-// --- Transport --------------------------------------------------------
-
-trait GameCubeGameHackingTransport {
-    fn get(&self, url: &str, maximum_bytes: usize) -> Result<ProviderResponse, GameHackingError>;
-    fn post_form(
-        &self,
-        url: &str,
-        form: &[(&str, String)],
-        maximum_bytes: usize,
-    ) -> Result<ProviderResponse, GameHackingError>;
-}
-
-#[derive(Debug, Clone)]
-struct ProviderResponse {
-    bytes: Vec<u8>,
-    charset: Option<String>,
-    cached_fallback: bool,
-    retrieved_at_unix_seconds: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct UreqGameCubeGameHackingTransport {
-    agent: ureq::Agent,
-}
-
-impl UreqGameCubeGameHackingTransport {
-    fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(Duration::from_secs(30)))
-            .timeout_recv_body(Some(Duration::from_secs(15)))
-            .build();
-        Self {
-            agent: config.new_agent(),
-        }
-    }
-
-    fn read_response(
-        mut response: http::Response<ureq::Body>,
-        maximum_bytes: usize,
-    ) -> Result<ProviderResponse, GameHackingError> {
-        let status = response.status().as_u16();
-        let server = response
-            .headers()
-            .get("server")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let charset = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .and_then(charset_from_content_type);
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take((maximum_bytes + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|failure| {
-                gamecube_error(
-                    GameHackingErrorKind::TemporaryFailure,
-                    format!("GameHacking.org response could not be read: {failure}"),
-                )
-            })?;
-        match classify_gamehacking_http_response(status, server.as_deref(), &bytes) {
-            GameHackingHttpClassification::Success => {}
-            GameHackingHttpClassification::CloudflareBlocked => {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::CloudflareBlocked,
-                    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
-                ));
-            }
-            GameHackingHttpClassification::AccessDenied => {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::AccessDenied,
-                    format!("GameHacking.org denied access (HTTP {status})"),
-                ));
-            }
-            GameHackingHttpClassification::RateLimited => {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::RateLimited,
-                    "GameHacking.org asked ArchiveFS to slow down (HTTP 429)",
-                ));
-            }
-            GameHackingHttpClassification::ServerError => {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::TemporaryFailure,
-                    format!("GameHacking.org is temporarily unavailable (HTTP {status})"),
-                ));
-            }
-            GameHackingHttpClassification::OtherHttpError => {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::PermanentHttpFailure,
-                    format!("GameHacking.org returned HTTP {status}"),
-                ));
-            }
-        }
-        if bytes.len() > maximum_bytes {
-            return Err(gamecube_error(
-                GameHackingErrorKind::InvalidResponse,
-                "GameHacking.org response exceeded the bounded size limit",
-            ));
-        }
-        Ok(ProviderResponse {
-            bytes,
-            charset,
-            cached_fallback: false,
-            retrieved_at_unix_seconds: None,
-        })
-    }
-}
-
-impl GameCubeGameHackingTransport for UreqGameCubeGameHackingTransport {
-    fn get(&self, url: &str, maximum_bytes: usize) -> Result<ProviderResponse, GameHackingError> {
-        validate_provider_url(url)?;
-        let response = self
-            .agent
-            .get(url)
-            .header("Accept", "text/html, text/plain")
-            .header("Accept-Encoding", "identity")
-            .header("User-Agent", USER_AGENT)
-            .call()
-            .map_err(classify_gamehacking_transport_error)?;
-        Self::read_response(response, maximum_bytes)
-    }
-
-    fn post_form(
-        &self,
-        url: &str,
-        form: &[(&str, String)],
-        maximum_bytes: usize,
-    ) -> Result<ProviderResponse, GameHackingError> {
-        validate_provider_url(url)?;
-        let response = self
-            .agent
-            .post(url)
-            .header("Accept", "text/plain, application/octet-stream")
-            .header("Accept-Encoding", "identity")
-            .header("User-Agent", USER_AGENT)
-            .send_form(form.iter().map(|(key, value)| (*key, value.as_str())))
-            .map_err(classify_gamehacking_transport_error)?;
-        Self::read_response(response, maximum_bytes)
-    }
-}
-
 fn gamecube_error(kind: GameHackingErrorKind, detail: impl Into<String>) -> GameHackingError {
-    GameHackingError {
-        kind,
-        detail: detail.into(),
-    }
-}
-
-fn validate_provider_url(value: &str) -> Result<(), GameHackingError> {
-    let url = Url::parse(value).map_err(|_| {
-        gamecube_error(
-            GameHackingErrorKind::InvalidResponse,
-            "provider URL is invalid",
-        )
-    })?;
-    if url.scheme() != "https" || url.host_str() != Some("gamehacking.org") {
-        return Err(gamecube_error(
-            GameHackingErrorKind::InvalidResponse,
-            "provider URL is outside the fixed GameHacking.org HTTPS origin",
-        ));
-    }
-    Ok(())
-}
-
-fn charset_from_content_type(content_type: &str) -> Option<String> {
-    content_type.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.trim().split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("charset")
-            .then(|| value.trim().trim_matches(['\'', '"']).to_ascii_lowercase())
-    })
+    provider_error(kind, detail)
 }
 
 pub struct GameHackingGameCubeProvider {
     adapter: GameCubeGameHackingAdapter,
-    transport: UreqGameCubeGameHackingTransport,
+    client: GameHackingClient,
 }
 
 impl Default for GameHackingGameCubeProvider {
     fn default() -> Self {
         Self {
             adapter: GameCubeGameHackingAdapter,
-            transport: UreqGameCubeGameHackingTransport::new(),
+            client: GameHackingClient::default(),
         }
     }
 }
@@ -1148,113 +988,17 @@ impl GameHackingGameCubeProvider {
         request: F,
     ) -> Result<ProviderResponse, GameHackingError>
     where
-        F: Fn(&UreqGameCubeGameHackingTransport) -> Result<ProviderResponse, GameHackingError>,
+        F: Fn(&UreqGameHackingTransport) -> Result<ProviderResponse, GameHackingError>,
     {
-        prepare_cache(&options.cache_root)?;
-        let path = options.cache_root.join(file_name);
-        if !options.force_refresh && path.is_file() {
-            let bytes = bounded_read(&path, maximum_bytes)?;
-            if cached_bytes_are_cloudflare_challenge(&bytes) {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::CloudflareBlocked,
-                    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
-                ));
-            }
-            let response = ProviderResponse {
-                bytes,
-                charset: read_cached_charset(&path)?,
-                cached_fallback: false,
-                retrieved_at_unix_seconds: Some(cache_retrieved_at(&path)?),
-            };
-            let age =
-                unix_seconds_now().saturating_sub(response.retrieved_at_unix_seconds.unwrap_or(0));
-            log::info!(
-                "gamehacking request_url={} classification=cached cache_fallback=false cache_age_seconds={}",
+        self.client.cached_request(
+            GameHackingRequestSpec {
+                cache_file: file_name,
                 url,
-                age
-            );
-            return Ok(response);
-        }
-        if cloudflare_cooldown_remaining(&options.cache_root).is_some() {
-            if let Some(response) = cached_fallback_response(&path, maximum_bytes)? {
-                log_cached_fallback(url, &path, &response);
-                return Ok(response);
-            }
-            return Err(gamecube_error(
-                GameHackingErrorKind::CloudflareBlocked,
-                blocked_without_cache_message(&options.cache_root, file_name),
-            ));
-        }
-        let mut last_error = None;
-        for attempt in 0..MAX_RETRIES {
-            check_cancelled(options)?;
-            if attempt > 0 || request_delay_needed(&options.cache_root) {
-                cancellable_delay(options, options.delay.saturating_mul(1_u32 << attempt))?;
-            }
-            match request(&self.transport) {
-                Ok(response) => {
-                    atomic_write(&path, &response.bytes)?;
-                    atomic_write(
-                        &charset_cache_path(&path),
-                        response.charset.as_deref().unwrap_or_default().as_bytes(),
-                    )?;
-                    atomic_write(
-                        &retrieved_cache_path(&path),
-                        unix_seconds_now().to_string().as_bytes(),
-                    )?;
-                    touch_request_marker(&options.cache_root)?;
-                    clear_cloudflare_marker(&options.cache_root);
-                    log::info!(
-                        "gamehacking request_url={} classification=success cache_fallback=false cache_write=completed",
-                        url
-                    );
-                    return Ok(response);
-                }
-                Err(failure) if failure.kind == GameHackingErrorKind::CloudflareBlocked => {
-                    mark_cloudflare_blocked(&options.cache_root)?;
-                    log::warn!(
-                        "gamehacking request_url={} status=blocked classification=cloudflare cache_write=skipped",
-                        url
-                    );
-                    if let Some(response) = cached_fallback_response(&path, maximum_bytes)? {
-                        log_cached_fallback(url, &path, &response);
-                        return Ok(response);
-                    }
-                    return Err(gamecube_error(
-                        failure.kind,
-                        blocked_without_cache_message(&options.cache_root, file_name),
-                    ));
-                }
-                Err(failure)
-                    if matches!(
-                        failure.kind,
-                        GameHackingErrorKind::RateLimited | GameHackingErrorKind::TemporaryFailure
-                    ) =>
-                {
-                    log::warn!(
-                        "gamehacking request_url={} classification={:?} retry_attempt={}",
-                        url,
-                        failure.kind,
-                        attempt + 1
-                    );
-                    last_error = Some(failure);
-                }
-                Err(failure) => {
-                    log::warn!(
-                        "gamehacking request_url={} classification={:?} cache_fallback=false",
-                        url,
-                        failure.kind
-                    );
-                    return Err(failure);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            gamecube_error(
-                GameHackingErrorKind::TemporaryFailure,
-                "GameHacking.org retry limit reached",
-            )
-        }))
+                maximum_bytes,
+            },
+            options,
+            request,
+        )
     }
 
     fn check_robots(
@@ -1262,63 +1006,8 @@ impl GameHackingGameCubeProvider {
         options: &GameHackingGameCubeFetchOptions,
         paths: &[&str],
     ) -> Result<(), GameHackingError> {
-        let robots =
-            self.cached_request("robots.txt", ROBOTS_URL, 256 * 1024, options, |transport| {
-                transport.get(ROBOTS_URL, 256 * 1024)
-            })?;
-        let text = decode_provider_text(&robots.bytes, robots.charset.as_deref());
-        for path in paths {
-            if robots_disallows_archivefs(&text, path) {
-                return Err(gamecube_error(
-                    GameHackingErrorKind::AccessDenied,
-                    format!("GameHacking.org robots.txt does not allow access to {path}"),
-                ));
-            }
-        }
-        Ok(())
+        self.client.check_robots(options, paths)
     }
-}
-
-fn robots_disallows_archivefs(text: &str, path: &str) -> bool {
-    let mut relevant_group = false;
-    let mut saw_rule = false;
-    let mut strongest_rule: Option<(usize, bool)> = None;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or_default().trim();
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("user-agent") {
-            if saw_rule {
-                relevant_group = false;
-                saw_rule = false;
-            }
-            relevant_group |= value == "*" || value.eq_ignore_ascii_case("archivefs");
-        } else if name.eq_ignore_ascii_case("disallow") {
-            saw_rule = true;
-            if relevant_group
-                && !value.is_empty()
-                && path.starts_with(value)
-                && strongest_rule.is_none_or(|(length, _)| value.len() > length)
-            {
-                strongest_rule = Some((value.len(), false));
-            }
-        } else if name.eq_ignore_ascii_case("allow") {
-            saw_rule = true;
-            if relevant_group
-                && !value.is_empty()
-                && path.starts_with(value)
-                && strongest_rule.is_none_or(|(length, allowed)| {
-                    value.len() > length || (value.len() == length && !allowed)
-                })
-            {
-                strongest_rule = Some((value.len(), true));
-            }
-        }
-    }
-    strongest_rule.is_some_and(|(_, allowed)| !allowed)
 }
 
 fn authorize_gamecube_catalogue_match(
@@ -1412,13 +1101,6 @@ fn classify_gamecube_catalogue_match(
         return Some(GameHackingGameCubeMatchStrength::NormalizedTitleAndRegion);
     }
     None
-}
-
-fn decode_provider_text<'a>(bytes: &'a [u8], charset: Option<&str>) -> std::borrow::Cow<'a, str> {
-    if charset.is_none_or(|value| value.eq_ignore_ascii_case("utf-8")) {
-        return String::from_utf8_lossy(bytes);
-    }
-    String::from_utf8_lossy(bytes)
 }
 
 /// Extracts a page number from an `<a>` element's `href`, resolved
@@ -2145,23 +1827,6 @@ fn normalized_description(lines: Vec<String>) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.join("\n"))
 }
 
-// --- Cache helpers -------------------------------------------------------
-
-fn prepare_cache(root: &Path) -> Result<(), GameHackingError> {
-    if !root.is_absolute() || root.parent().is_none() {
-        return Err(gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            "GameHacking.org cache root must be an absolute non-root path",
-        ));
-    }
-    fs::create_dir_all(root).map_err(|failure| {
-        gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            format!("GameHacking.org cache could not be created: {failure}"),
-        )
-    })
-}
-
 pub fn load_gamecube_catalogue(
     root: &Path,
 ) -> Result<GameHackingGameCubeCatalogue, GameHackingError> {
@@ -2194,200 +1859,43 @@ pub fn load_gamecube_catalogue(
     Ok(catalogue)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn unix_seconds_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn retrieved_cache_path(path: &Path) -> PathBuf {
-    path.with_extension(format!(
-        "{}.retrieved",
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("cache")
-    ))
-}
-
-fn cache_retrieved_at(path: &Path) -> Result<u64, GameHackingError> {
-    let sidecar = retrieved_cache_path(path);
-    if sidecar.is_file() {
-        let bytes = bounded_read(&sidecar, 64)?;
-        if let Ok(value) = String::from_utf8_lossy(&bytes).trim().parse::<u64>() {
-            return Ok(value);
-        }
-    }
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .ok_or_else(|| {
-            gamecube_error(
-                GameHackingErrorKind::CacheUnavailable,
-                format!("cached retrieval date is unavailable: {}", path.display()),
-            )
-        })
-}
-
-fn cached_fallback_response(
-    path: &Path,
-    maximum_bytes: usize,
-) -> Result<Option<ProviderResponse>, GameHackingError> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes = bounded_read(path, maximum_bytes)?;
-    if cached_bytes_are_cloudflare_challenge(&bytes) {
-        log::warn!(
-            "gamehacking cache_path={} classification=cloudflare cache_fallback=false cache_write=skipped",
-            path.display()
-        );
-        return Ok(None);
-    }
-    Ok(Some(ProviderResponse {
-        bytes,
-        charset: read_cached_charset(path)?,
-        cached_fallback: true,
-        retrieved_at_unix_seconds: Some(cache_retrieved_at(path)?),
-    }))
-}
-
-fn log_cached_fallback(url: &str, path: &Path, response: &ProviderResponse) {
-    let retrieved_at = response.retrieved_at_unix_seconds.unwrap_or(0);
-    let age = unix_seconds_now().saturating_sub(retrieved_at);
-    log::warn!(
-        "gamehacking request_url={} classification=cloudflare cache_fallback=true cache_path={} cache_age_seconds={} cache_write=skipped",
-        url,
-        path.display(),
-        age
-    );
-}
-
-fn bounded_read(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, GameHackingError> {
-    let metadata = path.symlink_metadata().map_err(|failure| {
-        gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            format!("cached provider response could not be inspected: {failure}"),
-        )
-    })?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > maximum_bytes as u64
-    {
-        return Err(gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            "cached provider response is unsafe or oversized",
-        ));
-    }
-    fs::read(path).map_err(|failure| {
-        gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            format!("cached provider response could not be read: {failure}"),
-        )
-    })
-}
-
-fn charset_cache_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("response");
-    path.with_file_name(format!("{file_name}.charset"))
-}
-
-fn read_cached_charset(path: &Path) -> Result<Option<String>, GameHackingError> {
-    let path = charset_cache_path(path);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = bounded_read(&path, 128)?;
-    let value = std::str::from_utf8(&bytes).map_err(|_| {
-        gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            "cached provider charset metadata is invalid",
-        )
-    })?;
-    let value = value.trim();
-    Ok((!value.is_empty()).then(|| value.to_string()))
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), GameHackingError> {
-    let temporary = path.with_extension(format!("partial-{}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    })();
-    if let Err(failure) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            format!("provider cache could not be updated atomically: {failure}"),
-        ));
-    }
-    Ok(())
-}
-
-fn request_delay_needed(root: &Path) -> bool {
-    root.join("last-request").is_file()
-}
-
-fn touch_request_marker(root: &Path) -> Result<(), GameHackingError> {
-    let timestamp = unix_seconds_now();
-    fs::write(root.join("last-request"), timestamp.to_string()).map_err(|failure| {
-        gamecube_error(
-            GameHackingErrorKind::CacheUnavailable,
-            format!("provider rate-limit marker could not be written: {failure}"),
-        )
-    })
-}
-
-fn check_cancelled(options: &GameHackingGameCubeFetchOptions) -> Result<(), GameHackingError> {
-    if options
-        .cancellation
-        .as_ref()
-        .is_some_and(|flag| flag.load(Ordering::Relaxed))
-    {
-        return Err(gamecube_error(
-            GameHackingErrorKind::Cancelled,
-            "GameHacking.org request was cancelled",
-        ));
-    }
-    Ok(())
-}
-
-fn cancellable_delay(
-    options: &GameHackingGameCubeFetchOptions,
-    duration: Duration,
-) -> Result<(), GameHackingError> {
-    let slice = Duration::from_millis(100);
-    let mut remaining = duration;
-    while !remaining.is_zero() {
-        check_cancelled(options)?;
-        let pause = remaining.min(slice);
-        std::thread::sleep(pause);
-        remaining = remaining.saturating_sub(pause);
-    }
-    check_cancelled(options)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game_identity::{
         IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityProvenance,
     };
+
+    #[test]
+    fn gamecube_cache_paths_and_sidecars_remain_compatible() {
+        let root = Path::new("/tmp/archivefs-cache-contract");
+        assert_eq!(
+            root.join(GAMECUBE_CATALOGUE_FILE),
+            root.join("gamecube-catalogue.json")
+        );
+        assert_eq!(
+            root.join(GAMECUBE_INDEX_ROOT_CACHE_FILE),
+            root.join("gamecube-index-root.html")
+        );
+        assert_eq!(
+            root.join(format!("gamecube-index-page-{}.html", 36)),
+            root.join("gamecube-index-page-36.html")
+        );
+        assert_eq!(
+            root.join(format!("game-{}.html", 42)),
+            root.join("game-42.html")
+        );
+        let export = root.join(format!("export-{}.txt", 42));
+        assert_eq!(export, root.join("export-42.txt"));
+        assert_eq!(
+            super::super::gamehacking_shared::charset_cache_path(&export),
+            root.join("export-42.txt.charset")
+        );
+        assert_eq!(
+            super::super::gamehacking_shared::retrieved_cache_path(&export),
+            root.join("export-42.txt.retrieved")
+        );
+    }
 
     fn evidence(
         kind: IdentityKind,

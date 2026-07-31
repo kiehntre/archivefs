@@ -39,6 +39,7 @@ mod emulator_profile_memory;
 mod gamehacking_gamecube_install_plan;
 mod gamehacking_gamecube_provider;
 mod gamehacking_provider;
+mod gamehacking_shared;
 mod gecko_document;
 mod import_safety;
 mod matching;
