@@ -1892,6 +1892,46 @@ mod tests {
     }
 
     #[test]
+    fn sanitized_three_game_loose_iso_identities_match_by_verified_serial_and_region() {
+        use crate::patch_manager::Pcsx2IdentityState;
+
+        for (title, serial, crc, game_id) in [
+            ("Shadow of the Colossus", "SCUS-97472", "C19A374E", 104867),
+            ("God of War", "SCUS-97399", "D6385328", 103831),
+            (
+                "Metal Gear Solid 3: Snake Eater",
+                "SLUS-20915",
+                "AA31B5BF",
+                104247,
+            ),
+        ] {
+            let identity = Pcsx2GameIdentity {
+                archive_path: PathBuf::from(format!("/games/{serial}.iso")),
+                title: title.to_string(),
+                region: Some("NTSC-U".to_string()),
+                serial: Some(serial.to_string()),
+                executable_crc: Some(crc.to_string()),
+                state: Pcsx2IdentityState::Verified,
+                evidence: vec!["verified loose-image SYSTEM.CNF and ELF evidence".to_string()],
+                plain_failure_reason: None,
+            };
+            let remote = GameHackingGame {
+                game_id,
+                system: "PlayStation 2".to_string(),
+                title: title.to_string(),
+                serial: Some(serial.to_string()),
+                region: Some("USA".to_string()),
+                crc: None,
+                source_url: format!("https://gamehacking.org/game/{game_id}"),
+            };
+            assert_eq!(
+                classify_catalogue_match(&identity, &remote),
+                Some(GameHackingMatchStrength::ExactSerialAndRegion)
+            );
+        }
+    }
+
+    #[test]
     fn cached_index_pages_resume_without_network_and_json_is_deterministic() {
         let root = std::env::temp_dir().join(format!(
             "archivefs-gamehacking-index-{}-{}",

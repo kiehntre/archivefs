@@ -35,6 +35,9 @@ use std::{env, fs};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::emulator_environment::EncodedPath;
+use crate::game_identity::{
+    GameIdentityReport, IdentityPlatform, inspect_catalogued_game_identity,
+};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
@@ -99,6 +102,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         description: "add optional persisted source-level platform assignment",
         sql: include_str!("migrations/0005_source_platform_assignment.sql"),
+    },
+    Migration {
+        version: 6,
+        description: "persist bounded direct-image identity reports with source metadata",
+        sql: include_str!("migrations/0006_game_identity_reports.sql"),
     },
 ];
 
@@ -1234,6 +1242,9 @@ pub struct PersistedArchive {
     /// archive. Retained while the row is missing for review display.
     pub last_seen_at: String,
     pub last_verified_missing_at: Option<String>,
+    /// Bounded identity evidence captured from the exact loose image during
+    /// the last successful scan whose size and mtime matched this row.
+    pub identity_report: Option<GameIdentityReport>,
 }
 
 /// One automatically detected platform and the path evidence retained for a
@@ -2990,7 +3001,8 @@ impl Database {
                 "SELECT a.id, a.source_folder_id, a.relative_path, a.absolute_path_cached, \
                  a.archive_kind, a.display_name, a.normalized_name, a.size_bytes, \
                  a.modified_time_unix_seconds, p.platform, p.source, a.last_known_health, \
-                 a.last_seen_at, a.last_verified_missing_at \
+                 a.last_seen_at, a.last_verified_missing_at, a.identity_report_json, \
+                 a.identity_report_size_bytes, a.identity_report_modified_time_unix_seconds \
                  FROM archives a \
                  LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
                  ORDER BY a.id",
@@ -3002,6 +3014,18 @@ impl Database {
                 let relative_path_bytes: Vec<u8> = row.get(2)?;
                 let absolute_path_bytes: Vec<u8> = row.get(3)?;
                 let size_bytes: Option<i64> = row.get(7)?;
+                let identity_json: Option<Vec<u8>> = row.get(14)?;
+                let identity_size: Option<i64> = row.get(15)?;
+                let identity_modified: Option<i64> = row.get(16)?;
+                let identity_report = if identity_size == size_bytes
+                    && identity_modified == row.get::<_, Option<i64>>(8)?
+                {
+                    identity_json
+                        .as_deref()
+                        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                } else {
+                    None
+                };
                 Ok(PersistedArchive {
                     id: row.get(0)?,
                     source_folder_id: row.get(1)?,
@@ -3017,12 +3041,57 @@ impl Database {
                     last_known_health: row.get(11)?,
                     last_seen_at: row.get(12)?,
                     last_verified_missing_at: row.get(13)?,
+                    identity_report,
                 })
             })
             .map_err(|error| db_error("failed to query archives", error))?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| db_error("failed to read archives", error))
+    }
+
+    fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read current archive platform", error))
+    }
+
+    fn persist_identity_report(
+        &mut self,
+        archive_id: i64,
+        archive: &Archive,
+        report: Option<&GameIdentityReport>,
+    ) -> Result<()> {
+        let json = report
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "failed to serialize game identity report: {error}"
+                ))
+            })?;
+        let size = report
+            .and(archive.identity.size_bytes)
+            .map(|value| value as i64);
+        let modified = report.and_then(|_| {
+            archive
+                .identity
+                .modified_time
+                .and_then(system_time_to_unix_seconds)
+        });
+        self.connection
+            .execute(
+                "UPDATE archives SET identity_report_json = ?2, identity_report_size_bytes = ?3, \
+                 identity_report_modified_time_unix_seconds = ?4 WHERE id = ?1",
+                params![archive_id, json, size, modified],
+            )
+            .map_err(|error| db_error("failed to persist game identity report", error))?;
+        Ok(())
     }
 
     /// Builds display-oriented provenance details for already-loaded archive
@@ -3553,6 +3622,21 @@ fn persist_one_folder(
             }
         };
         database.assign_platform(outcome.archive_id, platform.as_deref(), source)?;
+
+        if archive.kind == ArchiveKind::DirectGameImage {
+            let effective_platform = database.current_platform_for_archive(outcome.archive_id)?;
+            if IdentityPlatform::from_catalogue(effective_platform.as_deref())
+                == IdentityPlatform::PlayStation2
+            {
+                let report =
+                    inspect_catalogued_game_identity(&archive.path, effective_platform.as_deref());
+                database.persist_identity_report(outcome.archive_id, archive, Some(&report))?;
+            } else {
+                // A prior manual PS2 assignment may have been replaced. Never
+                // replay identity evidence under a different effective platform.
+                database.persist_identity_report(outcome.archive_id, archive, None)?;
+            }
+        }
     }
 
     counts.archives_missing =
@@ -3574,6 +3658,7 @@ fn source_assignment_is_compatible(archive: &Archive, platform: &str) -> bool {
     match platform {
         "GameCube" => matches!(extension.as_str(), "iso" | "gcm" | "gcz" | "rvz" | "ciso"),
         "Wii" => matches!(extension.as_str(), "iso" | "gcz" | "rvz" | "wbfs" | "ciso"),
+        "PS2" => matches!(extension.as_str(), "iso" | "cue"),
         _ => matches!(extension.as_str(), "iso"),
     }
 }
@@ -3679,6 +3764,48 @@ mod tests {
         full_path
     }
 
+    fn ps2_iso_fixture() -> Vec<u8> {
+        const SECTOR: usize = 2_048;
+        fn record(name: &[u8], extent: u32, size: u32, directory: bool) -> Vec<u8> {
+            let length = 33 + name.len() + usize::from(name.len().is_multiple_of(2));
+            let mut value = vec![0_u8; length];
+            value[0] = length as u8;
+            value[2..6].copy_from_slice(&extent.to_le_bytes());
+            value[6..10].copy_from_slice(&extent.to_be_bytes());
+            value[10..14].copy_from_slice(&size.to_le_bytes());
+            value[14..18].copy_from_slice(&size.to_be_bytes());
+            value[25] = if directory { 2 } else { 0 };
+            value[28..30].copy_from_slice(&1_u16.to_le_bytes());
+            value[30..32].copy_from_slice(&1_u16.to_be_bytes());
+            value[32] = name.len() as u8;
+            value[33..33 + name.len()].copy_from_slice(name);
+            value
+        }
+
+        let cnf = b"BOOT2=cdrom0:\\SLUS_123.45;1\n";
+        let elf = [0x7f, b'E', b'L', b'F', 1, 2, 3, 4, 5, 6, 7, 8];
+        let mut iso = vec![0_u8; 24 * SECTOR];
+        let pvd = 16 * SECTOR;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = record(&[0], 20, SECTOR as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * SECTOR;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+        let root_offset = 20 * SECTOR;
+        let cnf_record = record(b"SYSTEM.CNF;1", 21, cnf.len() as u32, false);
+        let elf_record = record(b"SLUS_123.45;1", 22, elf.len() as u32, false);
+        iso[root_offset..root_offset + cnf_record.len()].copy_from_slice(&cnf_record);
+        let cursor = root_offset + cnf_record.len();
+        iso[cursor..cursor + elf_record.len()].copy_from_slice(&elf_record);
+        iso[21 * SECTOR..21 * SECTOR + cnf.len()].copy_from_slice(cnf);
+        iso[22 * SECTOR..22 * SECTOR + elf.len()].copy_from_slice(&elf);
+        iso
+    }
+
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
             source_folders: vec![source_dir.to_path_buf()],
@@ -3695,6 +3822,40 @@ mod tests {
             .iter()
             .find(|archive| archive.relative_path == Path::new(relative_path))
             .unwrap_or_else(|| panic!("no persisted archive with relative_path {relative_path}"))
+    }
+
+    #[test]
+    fn loose_ps2_iso_identity_survives_database_reopen() {
+        let root = temp_dir("loose-ps2-identity");
+        let source = root.join("ps2");
+        let mount = root.join("mount");
+        let image = write_archive_file(&source, "unrelated-name.iso", &ps2_iso_fixture());
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "unrelated-name.iso");
+        assert_eq!(archive.archive_kind, "direct_game_image");
+        let report = archive.identity_report.as_ref().unwrap();
+        assert_eq!(report.archive_path, image);
+        assert_eq!(report.verified_ps2_serial(), Some("SLUS-12345"));
+        assert!(report.verified_pcsx2_crc().is_some());
+        database.close().unwrap();
+
+        let database = Database::open_read_only(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "unrelated-name.iso");
+        assert_eq!(
+            archive
+                .identity_report
+                .as_ref()
+                .and_then(GameIdentityReport::verified_ps2_serial),
+            Some("SLUS-12345")
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     fn create_representative_older_database(path: &Path, schema_version: usize) {

@@ -214,6 +214,7 @@ mod tests {
             last_known_health: "present".to_string(),
             last_seen_at: "now".to_string(),
             last_verified_missing_at: missing.then(|| "later".to_string()),
+            identity_report: None,
         }
     }
 

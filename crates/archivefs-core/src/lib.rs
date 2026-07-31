@@ -2985,7 +2985,7 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         Some(ArchiveKind::Rar)
     } else if filename.ends_with(".gen") || filename.ends_with(".smd") {
         Some(ArchiveKind::MegaDriveRom)
-    } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
+    } else if [".iso", ".cue", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
         .iter()
         .any(|extension| filename.ends_with(extension))
     {
@@ -7170,6 +7170,52 @@ mod tests {
     }
 
     #[test]
+    fn loose_ps2_iso_and_cue_are_direct_images_without_duplicate_bin_tracks() {
+        let root = test_root("ps2-direct-game-images").join("ps2");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("DVD game.iso"), vec![0_u8; 64]).unwrap();
+        fs::write(
+            root.join("CD game.cue"),
+            b"FILE \"CD game.bin\" BINARY\n TRACK 01 MODE2/2352\n INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        fs::write(root.join("CD game.bin"), vec![0_u8; 2_352]).unwrap();
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+        };
+
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+        assert_eq!(discovery.archives.len(), 2);
+        assert!(discovery.archives.iter().all(|archive| {
+            archive.kind == ArchiveKind::DirectGameImage
+                && archive.identity.platform.as_deref() == Some("PS2")
+        }));
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("DVD game.iso"))
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("CD game.cue"))
+        );
+        assert!(
+            !discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("CD game.bin"))
+        );
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
     fn dated_region_collection_root_normalizes_to_gamecube() {
         let root = test_root("dated-gamecube-alias")
             .join("Nintendo - GameCube (2018-08-25 20-44-48) (America)");
@@ -7254,6 +7300,7 @@ mod tests {
         assert_eq!(archive_kind("game.RAR"), Some(ArchiveKind::Rar));
         for image in [
             "game.iso",
+            "game.cue",
             "game.GCM",
             "game.gcz",
             "game.RVZ",
@@ -12792,6 +12839,7 @@ mod tests {
             last_known_health: "Pending".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: (!present).then(|| "2026-01-02T00:00:00Z".to_string()),
+            identity_report: None,
         }
     }
 

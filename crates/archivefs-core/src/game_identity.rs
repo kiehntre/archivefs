@@ -4,10 +4,11 @@
 //! are `Verified`. Archive and member names can only produce `Candidate` values.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
@@ -82,7 +83,8 @@ const MAX_XEX_OPT_HEADERS: u32 = 512;
 /// any legitimate header while remaining a small, fixed, safe read.
 const XEX_HEADER_PREFIX_BYTES: u64 = 16 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityStatus {
     Verified,
     Candidate,
@@ -110,7 +112,8 @@ impl fmt::Display for IdentityStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
     Platform,
     Ps2Serial,
@@ -146,7 +149,8 @@ impl fmt::Display for IdentityKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityConfidence {
     ExactBytes,
     StructuredMetadata,
@@ -155,7 +159,8 @@ pub enum IdentityConfidence {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityPlatform {
     PlayStation2,
     GameCube,
@@ -199,9 +204,13 @@ impl IdentityPlatform {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityImageFormat {
     Iso,
+    /// A logical PS2 CD image described by a bounded CUE sheet and one
+    /// safely resolved local BIN track.
+    CueBin,
     ZipContainingIso,
     LooseCartridgeRom,
     Xex,
@@ -216,15 +225,16 @@ pub enum IdentityImageFormat {
     Unsupported,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityProvenance {
+    #[serde(with = "path_bytes_serde")]
     pub archive_path: PathBuf,
     pub member_path: Option<Vec<u8>>,
     pub member_index: Option<usize>,
     pub method: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityEvidence {
     pub kind: IdentityKind,
     pub status: IdentityStatus,
@@ -234,8 +244,9 @@ pub struct IdentityEvidence {
     pub diagnostic: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameIdentityReport {
+    #[serde(with = "path_bytes_serde")]
     pub archive_path: PathBuf,
     pub platform: IdentityPlatform,
     pub format: IdentityImageFormat,
@@ -246,6 +257,51 @@ pub struct GameIdentityReport {
     pub metadata_paths_inspected: usize,
     pub nested_container_depth: usize,
     pub complete: bool,
+}
+
+#[cfg(unix)]
+mod path_bytes_serde {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(path.as_os_str().as_bytes())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+}
+
+#[cfg(not(unix))]
+mod path_bytes_serde {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        path.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        PathBuf::deserialize(deserializer)
+    }
 }
 
 impl GameIdentityReport {
@@ -382,6 +438,7 @@ fn inspect_game_identity_with_platform_trust(
         .to_ascii_lowercase();
     match extension.as_str() {
         "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => inspect_direct_iso(&mut report),
+        "cue" if platform == IdentityPlatform::PlayStation2 => inspect_ps2_cue(&mut report),
         "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report),
         "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report),
         "zip" => inspect_zip_iso(&mut report),
@@ -402,7 +459,7 @@ fn inspect_game_identity_with_platform_trust(
         _ => add_unavailable(
             &mut report,
             IdentityStatus::Unsupported,
-            "only direct ISO/GCM, RVZ and CISO for GameCube/Wii, a single ISO inside ZIP, direct XEX, and a single XEX inside ZIP are supported",
+            "only direct ISO/GCM, safe PS2 CUE/BIN, RVZ and CISO for GameCube/Wii, a single ISO inside ZIP, direct XEX, and a single XEX inside ZIP are supported",
         ),
     }
     report
@@ -653,6 +710,247 @@ fn inspect_direct_iso(report: &mut GameIdentityReport) {
     };
     inspect_iso_source(report, &mut source, None, None);
     report.bytes_read = source.bytes_read;
+}
+
+const MAX_CUE_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct CueTrackLayout {
+    physical_sector_size: u64,
+    data_offset: u64,
+    first_sector: u64,
+}
+
+#[derive(Debug)]
+struct ParsedCue {
+    files: Vec<String>,
+    data_file_index: usize,
+    layout: CueTrackLayout,
+}
+
+fn inspect_ps2_cue(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::CueBin;
+    let mut cue = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let cue_len = match cue.metadata() {
+        Ok(metadata) if metadata.len() <= MAX_CUE_BYTES => metadata.len(),
+        Ok(_) => {
+            add_unavailable(
+                report,
+                IdentityStatus::ResourceLimitReached,
+                "CUE sheet exceeds the 64 KiB read limit",
+            );
+            return;
+        }
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut bytes = Vec::with_capacity(cue_len as usize);
+    if let Err(error) = cue.read_to_end(&mut bytes) {
+        add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+        return;
+    }
+    report.bytes_read = bytes.len() as u64;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "CUE sheet is not UTF-8 text",
+            );
+            return;
+        }
+    };
+    let parsed = match parse_ps2_cue(text) {
+        Ok(value) => value,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let Some(parent) = report.archive_path.parent() else {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "CUE sheet has no parent directory",
+        );
+        return;
+    };
+    let mut data_file = None;
+    for (index, track_name) in parsed.files.iter().enumerate() {
+        let track_relative = Path::new(track_name);
+        if track_relative.is_absolute()
+            || track_relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "CUE track path must be a safe relative path without traversal",
+            );
+            return;
+        }
+        let file = match open_cue_track(parent, track_relative) {
+            Ok(file) => file,
+            Err(message) => {
+                let status = if message.contains("refused") || message.contains("unsafe") {
+                    IdentityStatus::Invalid
+                } else {
+                    IdentityStatus::Missing
+                };
+                add_unavailable(
+                    report,
+                    status,
+                    &format!("CUE track is unavailable: {message}"),
+                );
+                return;
+            }
+        };
+        if index == parsed.data_file_index {
+            data_file = Some(file);
+        }
+    }
+    let track_name = &parsed.files[parsed.data_file_index];
+    let file = data_file.expect("the parsed data-file index belongs to the non-empty file list");
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut source = CueSectorSource::new(file, len, parsed.layout);
+    inspect_ps2_iso(
+        report,
+        &mut source,
+        Some(track_name.as_bytes().to_vec()),
+        None,
+    );
+    report.bytes_read = report.bytes_read.saturating_add(source.bytes_read());
+}
+
+fn open_cue_track(parent: &Path, relative: &Path) -> Result<File, String> {
+    let mut candidate = parent.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err("CUE track path contains an unsafe component".to_string());
+        };
+        candidate.push(component);
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|error| format!("{}: {error}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{}: symlinked CUE track paths are refused",
+                candidate.display()
+            ));
+        }
+    }
+    open_read_only_regular(&candidate)
+}
+
+fn parse_ps2_cue(text: &str) -> Result<ParsedCue, String> {
+    let mut files = Vec::new();
+    let mut data_tracks = Vec::new();
+    let mut current_file = None;
+    let mut current_data_track = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("REM ") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let directive = fields.next().unwrap_or_default().to_ascii_uppercase();
+        match directive.as_str() {
+            "FILE" => {
+                let rest = line[4..].trim();
+                let (name, kind) = if let Some(quoted) = rest.strip_prefix('"') {
+                    let end = quoted
+                        .find('"')
+                        .ok_or_else(|| "CUE FILE has an unterminated quoted path".to_string())?;
+                    (quoted[..end].to_string(), quoted[end + 1..].trim())
+                } else {
+                    let split = rest
+                        .rfind(char::is_whitespace)
+                        .ok_or_else(|| "CUE FILE is missing its type".to_string())?;
+                    (rest[..split].trim().to_string(), rest[split..].trim())
+                };
+                if name.is_empty() || !kind.eq_ignore_ascii_case("BINARY") {
+                    return Err("CUE must reference a non-empty BINARY track file".to_string());
+                }
+                files.push(name);
+                current_file = Some(files.len() - 1);
+                current_data_track = None;
+            }
+            "TRACK" => {
+                let _number = fields.next();
+                let mode = fields.next().unwrap_or_default().to_ascii_uppercase();
+                let layout = match mode.as_str() {
+                    "MODE1/2048" => Some((2_048, 0)),
+                    "MODE1/2352" => Some((2_352, 16)),
+                    "MODE2/2352" => Some((2_352, 24)),
+                    value if value.starts_with("AUDIO") => None,
+                    _ => return Err(format!("unsupported CUE track mode: {mode}")),
+                };
+                if let Some((physical_sector_size, data_offset)) = layout {
+                    let file_index =
+                        current_file.ok_or_else(|| "CUE TRACK appears before FILE".to_string())?;
+                    data_tracks.push((file_index, physical_sector_size, data_offset, 0_u64));
+                    current_data_track = Some(data_tracks.len() - 1);
+                } else {
+                    current_data_track = None;
+                }
+            }
+            "INDEX" if fields.next() == Some("01") => {
+                if let Some(track_index) = current_data_track {
+                    let timestamp = fields
+                        .next()
+                        .ok_or_else(|| "CUE INDEX 01 is missing a timestamp".to_string())?;
+                    data_tracks[track_index].3 = cue_timestamp_sectors(timestamp)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if files.is_empty() || data_tracks.len() != 1 {
+        return Err(
+            "CUE must contain local BINARY files and exactly one supported data track".to_string(),
+        );
+    }
+    let (file_index, physical_sector_size, data_offset, first_sector) = data_tracks[0];
+    Ok(ParsedCue {
+        files,
+        data_file_index: file_index,
+        layout: CueTrackLayout {
+            physical_sector_size,
+            data_offset,
+            first_sector,
+        },
+    })
+}
+
+fn cue_timestamp_sectors(value: &str) -> Result<u64, String> {
+    let parts = value
+        .split(':')
+        .map(|part| part.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "CUE INDEX timestamp is invalid".to_string())?;
+    if parts.len() != 3 || parts[1] >= 60 || parts[2] >= 75 {
+        return Err("CUE INDEX timestamp is invalid".to_string());
+    }
+    parts[0]
+        .checked_mul(60 * 75)
+        .and_then(|value| value.checked_add(parts[1] * 75))
+        .and_then(|value| value.checked_add(parts[2]))
+        .ok_or_else(|| "CUE INDEX timestamp overflows".to_string())
 }
 
 fn inspect_zip_iso(report: &mut GameIdentityReport) {
@@ -1926,6 +2224,90 @@ impl ByteSource for FileSource {
     }
 }
 
+struct CueSectorSource {
+    file: File,
+    physical_len: u64,
+    logical_len: u64,
+    layout: CueTrackLayout,
+    bytes_read: u64,
+}
+
+impl CueSectorSource {
+    fn new(file: File, physical_len: u64, layout: CueTrackLayout) -> Self {
+        let first_byte = layout
+            .first_sector
+            .saturating_mul(layout.physical_sector_size);
+        let sectors = physical_len
+            .saturating_sub(first_byte)
+            .checked_div(layout.physical_sector_size)
+            .unwrap_or(0);
+        Self {
+            file,
+            physical_len,
+            logical_len: sectors.saturating_mul(ISO_SECTOR_SIZE),
+            layout,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl ByteSource for CueSectorSource {
+    fn len(&self) -> u64 {
+        self.logical_len
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    fn read_exact_at(&mut self, offset: u64, mut buffer: &mut [u8]) -> io::Result<()> {
+        if self.bytes_read.saturating_add(buffer.len() as u64) > MAX_BYTES_READ {
+            return Err(io::Error::other("64 MiB identity read limit reached"));
+        }
+        let logical_end = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
+        if logical_end > self.logical_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read exceeds CUE data track",
+            ));
+        }
+        let mut logical_offset = offset;
+        while !buffer.is_empty() {
+            let sector = logical_offset / ISO_SECTOR_SIZE;
+            let within = logical_offset % ISO_SECTOR_SIZE;
+            let available = (ISO_SECTOR_SIZE - within) as usize;
+            let take = available.min(buffer.len());
+            let physical_sector = self
+                .layout
+                .first_sector
+                .checked_add(sector)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sector overflow"))?;
+            let physical_offset = physical_sector
+                .checked_mul(self.layout.physical_sector_size)
+                .and_then(|value| value.checked_add(self.layout.data_offset))
+                .and_then(|value| value.checked_add(within))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+            let physical_end = physical_offset
+                .checked_add(take as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+            if physical_end > self.physical_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "CUE sector is truncated",
+                ));
+            }
+            self.file.seek(SeekFrom::Start(physical_offset))?;
+            self.file.read_exact(&mut buffer[..take])?;
+            self.bytes_read += take as u64;
+            logical_offset += take as u64;
+            buffer = &mut buffer[take..];
+        }
+        Ok(())
+    }
+}
+
 struct SliceSource<'a> {
     data: &'a [u8],
     declared_len: u64,
@@ -2296,6 +2678,16 @@ mod tests {
         path
     }
 
+    fn raw_2352_track(iso: &[u8], data_offset: usize) -> Vec<u8> {
+        assert!(iso.len().is_multiple_of(ISO_SECTOR_SIZE as usize));
+        let mut track = vec![0_u8; iso.len() / ISO_SECTOR_SIZE as usize * 2_352];
+        for (sector, logical) in iso.chunks_exact(ISO_SECTOR_SIZE as usize).enumerate() {
+            let start = sector * 2_352 + data_offset;
+            track[start..start + logical.len()].copy_from_slice(logical);
+        }
+        track
+    }
+
     fn sha256_hex(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -2604,6 +2996,158 @@ mod tests {
         );
         assert_eq!(report.verified_pcsx2_crc(), Some(expected.as_str()));
         assert!(report.complete);
+    }
+
+    #[test]
+    fn identity_report_round_trip_preserves_verified_ps2_evidence() {
+        let directory = FixtureDir::new("ps2-report-serde");
+        let path = write_fixture(
+            &directory,
+            "disc.iso",
+            &ps2_iso(b"BOOT2=cdrom0:\\SLUS_123.45;1\n", true, None),
+        );
+        let report = inspect_game_identity(&path, Some("PS2"));
+        let encoded = serde_json::to_vec(&report).unwrap();
+        let decoded: GameIdentityReport = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, report);
+        assert_eq!(decoded.verified_ps2_serial(), Some("SLUS-12345"));
+        assert!(decoded.verified_pcsx2_crc().is_some());
+    }
+
+    #[test]
+    fn ps2_cue_bin_uses_the_existing_iso_identity_reader() {
+        let directory = FixtureDir::new("ps2-cue");
+        let iso = ps2_iso(b"BOOT2=cdrom0:\\SLUS_123.45;1\n", true, None);
+        write_fixture(&directory, "track 01.bin", &raw_2352_track(&iso, 16));
+        let cue = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"track 01.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n",
+        );
+
+        let report = inspect_game_identity(&cue, Some("PS2"));
+        assert_eq!(report.format, IdentityImageFormat::CueBin);
+        assert_eq!(report.verified_ps2_serial(), Some("SLUS-12345"));
+        assert!(report.verified_pcsx2_crc().is_some());
+        assert_eq!(
+            report
+                .evidence
+                .iter()
+                .find(|item| item.kind == IdentityKind::Ps2Serial)
+                .and_then(|item| item.provenance.member_path.as_deref()),
+            Some(b"track 01.bin".as_slice())
+        );
+        assert!(report.bytes_read <= MAX_BYTES_READ + MAX_CUE_BYTES);
+    }
+
+    #[test]
+    fn ps2_multi_file_cue_uses_its_single_data_track() {
+        let directory = FixtureDir::new("ps2-multi-file-cue");
+        let iso = ps2_iso(b"BOOT2=cdrom0:\\SLUS_123.45;1\n", true, None);
+        write_fixture(&directory, "data.bin", &raw_2352_track(&iso, 24));
+        write_fixture(&directory, "audio.bin", &[0_u8; 2_352]);
+        let cue = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"data.bin\" BINARY\n TRACK 01 MODE2/2352\n INDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\n TRACK 02 AUDIO\n INDEX 01 00:00:00\n",
+        );
+
+        let report = inspect_game_identity(&cue, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), Some("SLUS-12345"));
+        assert!(report.verified_pcsx2_crc().is_some());
+    }
+
+    #[test]
+    fn ps2_cue_reports_missing_track_and_rejects_path_escape() {
+        let directory = FixtureDir::new("ps2-cue-safety");
+        let missing = write_fixture(
+            &directory,
+            "missing.cue",
+            b"FILE \"missing.bin\" BINARY\n TRACK 01 MODE2/2352\n INDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&missing, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Missing)
+        );
+
+        let escape = write_fixture(
+            &directory,
+            "escape.cue",
+            b"FILE \"../outside.bin\" BINARY\n TRACK 01 MODE1/2048\n INDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&escape, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.status == IdentityStatus::Invalid && item.diagnostic.contains("safe relative path")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ps2_cue_rejects_a_symlinked_track_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("ps2-cue-symlink-escape");
+        let outside = FixtureDir::new("ps2-cue-symlink-outside");
+        write_fixture(
+            &outside,
+            "track.bin",
+            &ps2_iso(b"BOOT2=cdrom0:\\SLUS_123.45;1\n", true, None),
+        );
+        symlink(&outside.0, directory.0.join("tracks")).unwrap();
+        let cue = write_fixture(
+            &directory,
+            "escape.cue",
+            b"FILE \"tracks/track.bin\" BINARY\n TRACK 01 MODE1/2048\n INDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.status == IdentityStatus::Invalid && item.diagnostic.contains("symlinked")
+        }));
+    }
+
+    #[test]
+    fn unsupported_compressed_ps2_images_do_not_false_match_or_extract() {
+        let directory = FixtureDir::new("ps2-compressed-unsupported");
+        for (extension, expected_format, expected_status) in [
+            (
+                "chd",
+                IdentityImageFormat::Deferred,
+                IdentityStatus::Deferred,
+            ),
+            (
+                "cso",
+                IdentityImageFormat::Deferred,
+                IdentityStatus::Deferred,
+            ),
+            (
+                "zso",
+                IdentityImageFormat::Unsupported,
+                IdentityStatus::Unsupported,
+            ),
+        ] {
+            let path = write_fixture(
+                &directory,
+                &format!("SLUS_123.45.{extension}"),
+                b"not a supported image reader",
+            );
+            let report = inspect_game_identity(&path, Some("PS2"));
+            assert_eq!(report.verified_ps2_serial(), None);
+            assert_eq!(report.verified_pcsx2_crc(), None);
+            assert_eq!(report.format, expected_format);
+            assert!(
+                report
+                    .evidence
+                    .iter()
+                    .any(|item| item.status == expected_status)
+            );
+            assert_eq!(report.bytes_read, 0);
+        }
     }
 
     #[test]

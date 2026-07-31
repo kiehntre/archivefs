@@ -1546,6 +1546,7 @@ mod tests {
             last_known_health: "present".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: None,
+            identity_report: None,
         };
         let evidence = CatalogueGameEvidence::from(&archive);
         assert_eq!(evidence.serial, None);

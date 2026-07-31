@@ -5434,6 +5434,21 @@ impl ArchiveFsApp {
             return false;
         };
         let adapter = cheat_adapter_route(platform.as_deref());
+        let persisted_identity = self
+            .database_state
+            .snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .find(|archive| archive.absolute_path == archive_path)
+            })
+            .and_then(|archive| archive.identity_report.clone());
+        let persisted_identity_request = persisted_identity.as_ref().map(|_| GameIdentityRequest {
+            archive_path: archive_path.clone(),
+            platform: platform.clone(),
+            adapter,
+        });
         let selected_profile_id = match &self.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
                 let eligible = eligible_profile_ids(discovery);
@@ -5508,8 +5523,11 @@ impl ArchiveFsApp {
             source_root,
             size_bytes,
             adapter,
-            identity_request: None,
-            identity: CheatStepResource::NotLoaded,
+            identity_request: persisted_identity_request.clone(),
+            identity: match (persisted_identity_request, persisted_identity) {
+                (Some(request), Some(report)) => CheatStepResource::Ready((request, report)),
+                _ => CheatStepResource::NotLoaded,
+            },
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
@@ -5567,7 +5585,13 @@ impl ArchiveFsApp {
         // Read-only listing of the local trusted-source cache; safe to
         // start immediately (no network, background thread).
         self.start_cheat_source_list(context.clone());
-        self.start_game_identity_inspection(context.clone());
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| matches!(workflow.identity, CheatStepResource::NotLoaded))
+        {
+            self.start_game_identity_inspection(context.clone());
+        }
         if self
             .cheat_workflow
             .as_ref()
@@ -17543,6 +17567,7 @@ fn build_dolphin_provider_selection(
 fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
     match format {
         IdentityImageFormat::Iso => "This GameCube/Wii image",
+        IdentityImageFormat::CueBin => "This CUE/BIN image",
         IdentityImageFormat::ZipContainingIso => "This ZIP archive",
         IdentityImageFormat::Rvz => "This RVZ file",
         IdentityImageFormat::Ciso => "This CISO file",
@@ -22174,6 +22199,16 @@ fn show_shared_game_identity(
                         );
                         ui.label(format!("{} bytes hashed", report.bytes_read));
                     } else {
+                        if matches!(
+                            report.format,
+                            IdentityImageFormat::Iso | IdentityImageFormat::CueBin
+                        ) {
+                            widgets::status_badge(
+                                ui,
+                                "Media kind · Direct game image",
+                                widgets::StatusTone::Info,
+                            );
+                        }
                         ui.label(format!("Format: {:?}", report.format));
                         ui.label(format!("{} bytes read", report.bytes_read));
                     }
@@ -36746,6 +36781,27 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn loose_ps2_identity_technical_details_show_direct_image_and_verified_evidence() {
+        let mut app =
+            pcsx2_workflow_with_verified_identity_and_selected_cheat(pcsx2_profile_fixture());
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_shared_game_identity(ui, workflow, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Media kind · Direct game image"
+        ));
+        assert!(rendered_text_contains(&output, "SLUS-20312"));
+        assert!(rendered_text_contains(&output, "A1B2C3D4"));
+        assert!(rendered_text_contains(&output, "Verified"));
+    }
+
+    #[test]
     fn preview_result_is_rejected_after_profile_source_or_page_changes() {
         let mut app = app_with_cheats_mods_context();
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
@@ -39339,6 +39395,7 @@ $Instant Growth [Nayr]\n";
             last_known_health: "Pending".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: missing.then(|| "2026-01-01T00:00:00Z".to_string()),
+            identity_report: None,
         }
     }
 

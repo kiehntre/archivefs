@@ -214,19 +214,34 @@ mod tests {
             archive_path: PathBuf::from("/games/game.iso"),
             platform: IdentityPlatform::PlayStation2,
             format: IdentityImageFormat::Iso,
-            evidence: vec![IdentityEvidence {
-                kind: IdentityKind::Pcsx2ExecutableCrc,
-                status,
-                value: value.map(str::to_string),
-                confidence: IdentityConfidence::ExactBytes,
-                provenance: IdentityProvenance {
-                    archive_path: PathBuf::from("/games/game.iso"),
-                    member_path: None,
-                    member_index: None,
-                    method: "test".to_string(),
+            evidence: vec![
+                IdentityEvidence {
+                    kind: IdentityKind::Pcsx2ExecutableCrc,
+                    status,
+                    value: value.map(str::to_string),
+                    confidence: IdentityConfidence::ExactBytes,
+                    provenance: IdentityProvenance {
+                        archive_path: PathBuf::from("/games/game.iso"),
+                        member_path: None,
+                        member_index: None,
+                        method: "test".to_string(),
+                    },
+                    diagnostic: "test evidence".to_string(),
                 },
-                diagnostic: "test evidence".to_string(),
-            }],
+                IdentityEvidence {
+                    kind: IdentityKind::Ps2Serial,
+                    status: IdentityStatus::Verified,
+                    value: Some("SLUS-20312".to_string()),
+                    confidence: IdentityConfidence::StructuredMetadata,
+                    provenance: IdentityProvenance {
+                        archive_path: PathBuf::from("/games/game.iso"),
+                        member_path: None,
+                        member_index: None,
+                        method: "SYSTEM.CNF test fixture".to_string(),
+                    },
+                    diagnostic: "verified SYSTEM.CNF boot serial".to_string(),
+                },
+            ],
             warnings: Vec::new(),
             bytes_read: 1,
             archive_members_inspected: 0,
@@ -263,6 +278,9 @@ mod tests {
             &report(IdentityStatus::Verified, Some("a1b2c3d4")),
         );
         assert_eq!(verified.verified_crc(), Some("A1B2C3D4"));
+        assert_eq!(verified.serial.as_deref(), Some("SLUS-20312"));
+        assert_eq!(verified.region.as_deref(), Some("NTSC-U"));
+        assert_eq!(verified.archive_path, Path::new("/games/game.iso"));
         let candidate = Pcsx2GameIdentity::from_report(
             "Game",
             &report(IdentityStatus::Candidate, Some("A1B2C3D4")),
