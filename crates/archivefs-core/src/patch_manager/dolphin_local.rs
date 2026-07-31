@@ -29,6 +29,7 @@ use super::resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
     ResolvedEmulatorProfile,
 };
+use super::{EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection};
 
 pub const DOLPHIN_MAX_PROFILES: usize = 16;
 pub const DOLPHIN_MAX_ENTRIES_VISITED: usize = 10_000;
@@ -143,6 +144,9 @@ pub struct DolphinProfileDiscoveryRoots {
 pub struct DolphinCommandLine {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
+    /// Flatpak application identity established from the process sandbox's
+    /// `.flatpak-info`, never inferred from an arbitrary argv string.
+    pub flatpak_app_id: Option<String>,
 }
 
 impl DolphinProfileDiscoveryRoots {
@@ -323,6 +327,8 @@ pub struct DolphinMatchResult {
 struct ProfileCandidate {
     installation_type: DolphinInstallationType,
     scope: DolphinProfileScope,
+    configuration_root: PathBuf,
+    /// Dolphin user/data root containing GameSettings and Load.
     path: PathBuf,
     provenance: String,
     report_missing: bool,
@@ -336,11 +342,21 @@ struct ProfileCandidate {
 pub fn discover_dolphin_profiles(
     roots: &DolphinProfileDiscoveryRoots,
 ) -> Result<DolphinProfileDiscovery, DolphinDiscoveryError> {
-    let flatpak_path = roots
-        .home
-        .join(".var/app")
-        .join(FLATPAK_APP_ID)
-        .join("config/dolphin-emu");
+    let flatpak_sandbox = roots.home.join(".var/app").join(FLATPAK_APP_ID);
+    let flatpak_data_path = flatpak_sandbox.join("data/dolphin-emu");
+    let flatpak_legacy_config_path = flatpak_sandbox.join("config/dolphin-emu");
+    // Current Flatpak Dolphin splits configuration and user data: Dolphin.ini
+    // remains under config while GameSettings lives under data. An older
+    // config-tree user root is retained only when its own GameSettings is
+    // positive evidence and the data tree has no GameSettings.
+    let flatpak_uses_data_tree = real_directory(&flatpak_data_path)
+        && (real_directory(&flatpak_data_path.join("GameSettings"))
+            || !real_directory(&flatpak_legacy_config_path.join("GameSettings")));
+    let flatpak_user_path = if flatpak_uses_data_tree {
+        flatpak_data_path.clone()
+    } else {
+        flatpak_legacy_config_path.clone()
+    };
     let user_install = roots.xdg_data_home.join("flatpak/app").join(FLATPAK_APP_ID);
     let system_install = roots.flatpak_system_root.join("app").join(FLATPAK_APP_ID);
     let system_only = real_directory(&system_install) && !real_directory(&user_install);
@@ -359,6 +375,7 @@ pub fn discover_dolphin_profiles(
         ProfileCandidate {
             installation_type: DolphinInstallationType::Native,
             scope: DolphinProfileScope::User,
+            configuration_root: roots.xdg_config_home.join("dolphin-emu"),
             path: roots.xdg_config_home.join("dolphin-emu"),
             provenance: "Native Dolphin XDG user directory fallback".to_string(),
             report_missing: false,
@@ -370,8 +387,13 @@ pub fn discover_dolphin_profiles(
         ProfileCandidate {
             installation_type: flatpak_kind,
             scope: flatpak_scope,
-            path: flatpak_path,
-            provenance: "Flatpak org.DolphinEmu.dolphin-emu user directory".to_string(),
+            configuration_root: flatpak_legacy_config_path.clone(),
+            path: flatpak_user_path.clone(),
+            provenance: if flatpak_uses_data_tree {
+                "Known Flatpak data path for org.DolphinEmu.dolphin-emu".to_string()
+            } else {
+                "Existing legacy Flatpak config-tree Dolphin profile".to_string()
+            },
             report_missing: false,
             executable: Some(PathBuf::from("/usr/bin/flatpak")),
             explicit_profile: false,
@@ -391,6 +413,27 @@ pub fn discover_dolphin_profiles(
                 400 + selected_bonus,
                 "Running Dolphin command line",
             ));
+        } else if command.flatpak_app_id.as_deref() == Some(FLATPAK_APP_ID) {
+            let path = if real_directory(&flatpak_user_path) {
+                flatpak_user_path.clone()
+            } else {
+                continue;
+            };
+            candidates.push(ProfileCandidate {
+                installation_type: flatpak_kind,
+                scope: flatpak_scope,
+                configuration_root: flatpak_legacy_config_path.clone(),
+                path,
+                provenance: format!(
+                    "Running Flatpak Dolphin process: {} ({FLATPAK_APP_ID})",
+                    command.executable.display()
+                ),
+                report_missing: true,
+                executable: Some(command.executable.clone()),
+                explicit_profile: false,
+                confidence: EmulatorProfileConfidence::RunningExplicit,
+                priority: 400,
+            });
         }
     }
     for command in &roots.selected_launch_commands {
@@ -412,6 +455,7 @@ pub fn discover_dolphin_profiles(
             .map(|path| ProfileCandidate {
                 installation_type: DolphinInstallationType::Explicit,
                 scope: DolphinProfileScope::Explicit,
+                configuration_root: path.clone(),
                 path,
                 provenance: "User-confirmed Dolphin profile override".to_string(),
                 report_missing: true,
@@ -495,7 +539,7 @@ pub fn discover_dolphin_profiles(
             }
             continue;
         }
-        if let Err((kind, detail)) = inspect_marker(&candidate.path) {
+        if let Err((kind, detail)) = inspect_marker(&candidate.configuration_root) {
             profiles.push(blocked(candidate, kind, detail));
             continue;
         }
@@ -656,15 +700,19 @@ fn command_candidate(
     evidence: &str,
 ) -> ProfileCandidate {
     let appimage = is_appimage_executable(&command.executable);
+    let flatpak = command.flatpak_app_id.as_deref() == Some(FLATPAK_APP_ID);
     ProfileCandidate {
-        installation_type: if appimage {
+        installation_type: if flatpak {
+            DolphinInstallationType::FlatpakUser
+        } else if appimage {
             DolphinInstallationType::AppImage
         } else {
             DolphinInstallationType::Explicit
         },
         scope: DolphinProfileScope::Explicit,
+        configuration_root: path.clone(),
         provenance: format!(
-            "{evidence}: {} -u {}",
+            "{evidence}: {} --user-directory {}",
             command.executable.display(),
             path.display()
         ),
@@ -686,22 +734,102 @@ fn is_appimage_executable(path: &Path) -> bool {
 }
 
 /// Extracts Dolphin's explicit user directory from a lossless argv vector.
-/// Both `-u path` and `-u=path` are supported; spaces are preserved because
-/// `/proc/<pid>/cmdline` is NUL-delimited rather than shell-tokenized.
+/// `-u path`, `-u=path`, `--user path`, and `--user=path` are supported;
+/// spaces are preserved because `/proc/<pid>/cmdline` is NUL-delimited rather
+/// than shell-tokenized. Only absolute non-root paths are accepted here;
+/// filesystem and symlink safety is then checked by profile discovery.
 pub fn dolphin_user_path(arguments: &[OsString]) -> Option<PathBuf> {
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
-        if argument == "-u" {
-            return arguments.next().map(PathBuf::from);
+        if argument == "-u" || argument == "--user" {
+            return arguments
+                .next()
+                .and_then(|value| valid_dolphin_user_path(value.as_os_str()));
         }
         let text = argument.to_string_lossy();
-        if let Some(value) = text.strip_prefix("-u=")
-            && !value.is_empty()
+        if let Some(value) = text
+            .strip_prefix("-u=")
+            .or_else(|| text.strip_prefix("--user="))
         {
-            return Some(PathBuf::from(value));
+            return valid_dolphin_user_path(OsString::from(value).as_os_str());
         }
     }
     None
+}
+
+fn valid_dolphin_user_path(value: &std::ffi::OsStr) -> Option<PathBuf> {
+    let path = PathBuf::from(value);
+    (path.is_absolute() && path.parent().is_some()).then_some(path)
+}
+
+/// Dolphin-specific profile selection. A live runtime is authoritative over
+/// remembered or merely installed profiles. Ambiguous live runtimes, and
+/// multiple credible profiles while Dolphin is stopped, require an explicit
+/// current-session choice rather than a hidden default.
+pub fn select_dolphin_profile(
+    discovery: &DolphinProfileDiscovery,
+    session_explicit: Option<&str>,
+) -> EmulatorProfileSelection {
+    let candidates: Vec<EmulatorProfileCandidate> = discovery
+        .profiles
+        .iter()
+        .map(|profile| EmulatorProfileCandidate {
+            profile_id: profile.profile_id.clone(),
+            root: profile.configuration_path.clone(),
+            eligible: profile.eligible,
+            is_portable: matches!(
+                profile.installation_type,
+                DolphinInstallationType::Explicit | DolphinInstallationType::AppImage
+            ),
+            evidence_priority: profile.resolved.priority,
+        })
+        .collect();
+    let eligible: Vec<&DolphinProfile> = discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .collect();
+    let active: Vec<&DolphinProfile> = eligible
+        .iter()
+        .copied()
+        .filter(|profile| profile.resolved.confidence == EmulatorProfileConfidence::RunningExplicit)
+        .collect();
+
+    if active.len() == 1 {
+        return EmulatorProfileSelection::Auto {
+            profile_id: active[0].profile_id.clone(),
+            reason: EmulatorProfileSelectReason::StrongestEvidence,
+        };
+    }
+    if active.len() > 1 {
+        if let Some(selected) = session_explicit
+            && let Some(profile) = active.iter().find(|profile| profile.profile_id == selected)
+        {
+            return EmulatorProfileSelection::Auto {
+                profile_id: profile.profile_id.clone(),
+                reason: EmulatorProfileSelectReason::ExplicitChoice,
+            };
+        }
+        return EmulatorProfileSelection::NeedsChoice { candidates };
+    }
+    if let Some(selected) = session_explicit
+        && let Some(profile) = eligible
+            .iter()
+            .find(|profile| profile.profile_id == selected)
+    {
+        return EmulatorProfileSelection::Auto {
+            profile_id: profile.profile_id.clone(),
+            reason: EmulatorProfileSelectReason::ExplicitChoice,
+        };
+    }
+    match eligible.as_slice() {
+        [] => EmulatorProfileSelection::SetupNeeded,
+        [profile] => EmulatorProfileSelection::Auto {
+            profile_id: profile.profile_id.clone(),
+            reason: EmulatorProfileSelectReason::OnlyValidProfile,
+        },
+        _ => EmulatorProfileSelection::NeedsChoice { candidates },
+    }
 }
 
 fn resolved_profile(candidate: &ProfileCandidate, settings_path: &Path) -> ResolvedEmulatorProfile {
@@ -719,7 +847,7 @@ fn resolved_profile(candidate: &ProfileCandidate, settings_path: &Path) -> Resol
     ResolvedEmulatorProfile {
         emulator_executable: candidate.executable.clone(),
         installation_type,
-        configuration_root: candidate.path.clone(),
+        configuration_root: candidate.configuration_root.clone(),
         data_user_root: candidate.path.clone(),
         active_explicit_profile: candidate.explicit_profile.then(|| candidate.path.clone()),
         destinations: EmulatorDestinationDirectories {
@@ -784,13 +912,54 @@ fn discover_running_dolphin_commands() -> Vec<DolphinCommandLine> {
             .skip(1)
             .map(|argument| OsString::from_vec(argument.to_vec()))
             .collect();
+        // Re-read the executable after cmdline/sandbox inspection. If the
+        // process exited or the PID was reused, discard the stale snapshot.
+        if !same_executable_snapshot(
+            &executable,
+            fs::read_link(process.join("exe")).ok().as_deref(),
+        ) {
+            continue;
+        }
         commands.push(DolphinCommandLine {
             executable,
             arguments,
+            flatpak_app_id: read_flatpak_app_id(&process.join("root/.flatpak-info")),
         });
     }
     commands.sort_by(|left, right| left.executable.cmp(&right.executable));
     commands
+}
+
+#[cfg(target_os = "linux")]
+fn same_executable_snapshot(first: &Path, second: Option<&Path>) -> bool {
+    second == Some(first)
+}
+
+#[cfg(target_os = "linux")]
+fn read_flatpak_app_id(path: &Path) -> Option<String> {
+    const MAX_FLATPAK_INFO_BYTES: u64 = 16 * 1024;
+    let mut file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_FLATPAK_INFO_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_FLATPAK_INFO_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut in_application = false;
+    for line in text.lines() {
+        if line.starts_with('[') {
+            in_application = line == "[Application]";
+        } else if in_application
+            && let Some(value) = line.strip_prefix("name=")
+            && value == FLATPAK_APP_ID
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -819,7 +988,7 @@ fn inspect_dolphin_profile_with_limit(
         }
     })?;
     if validated.state() != DestinationRootState::ExistingDirectory
-        || inspect_marker(&profile.configuration_path).is_err()
+        || inspect_marker(&profile.resolved.configuration_root).is_err()
     {
         return Err(DolphinInspectionError::ProfileChanged {
             path: profile.configuration_path.clone(),
@@ -1482,6 +1651,7 @@ mod tests {
         DolphinCommandLine {
             executable: PathBuf::from(executable),
             arguments: arguments.iter().map(OsString::from).collect(),
+            flatpak_app_id: None,
         }
     }
 
@@ -1495,6 +1665,202 @@ mod tests {
             dolphin_user_path(&command("dolphin-emu", &["-u=/profiles/User"]).arguments),
             Some(PathBuf::from("/profiles/User"))
         );
+        assert_eq!(
+            dolphin_user_path(
+                &command("dolphin-emu", &["--user", "/profiles/Long Dolphin User"]).arguments
+            ),
+            Some(PathBuf::from("/profiles/Long Dolphin User"))
+        );
+        assert_eq!(
+            dolphin_user_path(&command("dolphin-emu", &["--user=/profiles/Equals User"]).arguments),
+            Some(PathBuf::from("/profiles/Equals User"))
+        );
+    }
+
+    #[test]
+    fn malformed_or_non_absolute_user_arguments_are_not_profile_targets() {
+        for arguments in [
+            vec!["--user"],
+            vec!["--user", "--batch"],
+            vec!["--user=relative/path"],
+            vec!["-u", "/"],
+        ] {
+            assert_eq!(
+                dolphin_user_path(&command("dolphin-emu", &arguments).arguments),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn flatpak_data_tree_replaces_config_tree_when_both_exist() {
+        let root = fixture("flatpak-data-tree");
+        let data =
+            make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu"));
+        let config =
+            make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu"));
+        let discovery = discover_dolphin_profiles(&roots(&root)).unwrap();
+        let profile = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_path == data)
+            .expect("Flatpak data-tree profile");
+        assert_eq!(profile.resolved.configuration_root, config);
+        assert_eq!(profile.resolved.data_user_root, data);
+        assert_eq!(profile.game_settings_path, data.join("GameSettings"));
+        assert!(
+            discovery
+                .profiles
+                .iter()
+                .all(|profile| profile.configuration_path != config)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_flatpak_config_tree_requires_positive_evidence() {
+        let root = fixture("flatpak-legacy-tree");
+        let config =
+            make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu"));
+        let discovery = discover_dolphin_profiles(&roots(&root)).unwrap();
+        assert!(
+            discovery
+                .profiles
+                .iter()
+                .any(|profile| profile.configuration_path == config)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn running_flatpak_selects_data_tree_over_inactive_appimage_profile() {
+        let root = fixture("active-flatpak");
+        let data =
+            make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu"));
+        make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu"));
+        let appimage = make_profile(&root.join("Applications/Dolphin/User"));
+        let mut discovery_roots = roots(&root);
+        discovery_roots
+            .explicit_configuration_roots
+            .push(appimage.clone());
+        let mut flatpak = command("/app/bin/dolphin-emu", &[]);
+        flatpak.flatpak_app_id = Some(FLATPAK_APP_ID.to_string());
+        discovery_roots.running_commands.push(flatpak);
+        let discovery = discover_dolphin_profiles(&discovery_roots).unwrap();
+        let selection = select_dolphin_profile(&discovery, None);
+        let selected = match selection {
+            EmulatorProfileSelection::Auto { profile_id, .. } => profile_id,
+            other => panic!("expected active Flatpak selection, got {other:?}"),
+        };
+        assert_eq!(
+            discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_id == selected)
+                .unwrap()
+                .configuration_path,
+            data
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unique_active_custom_profile_wins_over_inactive_flatpak() {
+        let root = fixture("active-custom");
+        make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu"));
+        make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu"));
+        let active = make_profile(&root.join("Applications/Dolphin/User"));
+        let mut discovery_roots = roots(&root);
+        discovery_roots.running_commands.push(command(
+            "/tmp/.mount_Dolphin123/bin/dolphin-emu",
+            &["--user", active.to_str().unwrap()],
+        ));
+        let discovery = discover_dolphin_profiles(&discovery_roots).unwrap();
+        let selection = select_dolphin_profile(&discovery, None);
+        assert!(matches!(
+            selection,
+            EmulatorProfileSelection::Auto { ref profile_id, .. }
+                if discovery.profiles.iter().any(|profile|
+                    profile.profile_id == *profile_id && profile.configuration_path == active)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn two_active_profiles_require_a_current_explicit_choice() {
+        let root = fixture("two-active");
+        let first = make_profile(&root.join("first/User"));
+        let second = make_profile(&root.join("second/User"));
+        let mut discovery_roots = roots(&root);
+        discovery_roots.running_commands = vec![
+            command(
+                "/opt/first/Dolphin.AppImage",
+                &["-u", first.to_str().unwrap()],
+            ),
+            command(
+                "/opt/second/Dolphin.AppImage",
+                &["--user", second.to_str().unwrap()],
+            ),
+        ];
+        let discovery = discover_dolphin_profiles(&discovery_roots).unwrap();
+        assert!(matches!(
+            select_dolphin_profile(&discovery, None),
+            EmulatorProfileSelection::NeedsChoice { .. }
+        ));
+        let second_id = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_path == second)
+            .unwrap()
+            .profile_id
+            .clone();
+        assert!(matches!(
+            select_dolphin_profile(&discovery, Some(&second_id)),
+            EmulatorProfileSelection::Auto {
+                reason: EmulatorProfileSelectReason::ExplicitChoice,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_dolphin_selects_one_profile_but_not_multiple_profiles() {
+        let root = fixture("stopped-selection");
+        make_profile(&root.join("config/dolphin-emu"));
+        let one = discover_dolphin_profiles(&roots(&root)).unwrap();
+        assert!(matches!(
+            select_dolphin_profile(&one, None),
+            EmulatorProfileSelection::Auto {
+                reason: EmulatorProfileSelectReason::OnlyValidProfile,
+                ..
+            }
+        ));
+        make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu"));
+        make_profile(&root.join("home/.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu"));
+        let multiple = discover_dolphin_profiles(&roots(&root)).unwrap();
+        assert!(matches!(
+            select_dolphin_profile(&multiple, None),
+            EmulatorProfileSelection::NeedsChoice { .. }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_process_executable_snapshot_is_rejected() {
+        assert!(same_executable_snapshot(
+            Path::new("/app/bin/dolphin-emu"),
+            Some(Path::new("/app/bin/dolphin-emu"))
+        ));
+        assert!(!same_executable_snapshot(
+            Path::new("/app/bin/dolphin-emu"),
+            Some(Path::new("/usr/bin/unrelated"))
+        ));
+        assert!(!same_executable_snapshot(
+            Path::new("/app/bin/dolphin-emu"),
+            None
+        ));
     }
 
     #[test]

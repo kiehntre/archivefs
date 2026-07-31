@@ -98,8 +98,8 @@ use archivefs_core::patch_manager::{
     parse_dolphin_ini, preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport,
     region_for_game_id, remembered_profile_for, remove_dolphin_catalogue,
     require_dolphin_managed_gamehacking_verification, resolve_cheat_destination,
-    resolve_dolphin_gecko_lookup, select_emulator_profile, selected_pcsx2_managed_cheats,
-    stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
+    resolve_dolphin_gecko_lookup, select_dolphin_profile, select_emulator_profile,
+    selected_pcsx2_managed_cheats, stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
     stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
     stage_xenia_patch_file,
 };
@@ -5995,12 +5995,8 @@ impl ArchiveFsApp {
         let (selected_dolphin_profile_id, dolphin_profile_selection) = match &self.dolphin_profiles
         {
             DolphinProfilesState::Ready(discovery) => {
-                let candidates = dolphin_profile_candidates(discovery);
-                let selection = select_emulator_profile(
-                    &candidates,
-                    self.remembered_profile_id("dolphin").as_deref(),
-                    previous_dolphin_profile_id.as_deref(),
-                );
+                let selection =
+                    select_dolphin_profile(discovery, previous_dolphin_profile_id.as_deref());
                 let selected = match &selection {
                     EmulatorProfileSelection::Auto { profile_id, .. } => Some(profile_id.clone()),
                     EmulatorProfileSelection::NeedsChoice { .. }
@@ -6065,6 +6061,8 @@ impl ArchiveFsApp {
             dolphin_destination_error: None,
             dolphin_local_lookup: DolphinLocalLookupState::NotAttempted,
             dolphin_profile_selection,
+            // Remembered standard/install-only profiles are rediscovery hints,
+            // not a hidden choice when more than one credible profile exists.
             dolphin_profile_choice: None,
             dolphin_details_open: false,
             dolphin_show_exact_changes: false,
@@ -10034,17 +10032,12 @@ impl ArchiveFsApp {
                             eligible.len()
                         ),
                     ));
-                    let candidates = dolphin_profile_candidates(&discovery);
-                    let remembered = self.remembered_profile_id("dolphin");
                     if let Some(workflow) = self.cheat_workflow.as_mut()
                         && workflow.adapter == CheatEmulatorAdapter::Dolphin
                     {
                         let session_explicit = workflow.dolphin_profile_choice.clone();
-                        let selection = select_emulator_profile(
-                            &candidates,
-                            remembered.as_deref(),
-                            session_explicit.as_deref(),
-                        );
+                        let selection =
+                            select_dolphin_profile(&discovery, session_explicit.as_deref());
                         // Rule: never silently switch the profile bound to
                         // an install already reviewed/applied this session.
                         let install_in_progress =
@@ -21127,7 +21120,7 @@ fn show_dolphin_beginner_summary(
         }
         BeginnerCheatStatus::EmulatorSetupNeeded => {
             ui.label(
-                "ArchiveFS could not find a Dolphin profile to use yet. Open Details to type the Dolphin directory (portable/AppImage installs are not found automatically).",
+                "ArchiveFS could not resolve one Dolphin profile safely. Open Details to select a discovered profile or provide a custom user directory.",
             );
         }
         BeginnerCheatStatus::FindingCompatibleCheats => {
@@ -21277,11 +21270,12 @@ fn show_dolphin_profile_chooser(
     let mut action = None;
     let eligible: Vec<&DolphinProfile> = discovery.profiles.iter().filter(|p| p.eligible).collect();
     widgets::card(ui, |ui| {
-        ui.strong(format!(
-            "ArchiveFS found {} Dolphin profiles.",
-            eligible.len()
+        ui.strong("Select the Dolphin profile to use");
+        ui.label(format!(
+            "ArchiveFS found {} credible Dolphin profile{}.",
+            eligible.len(),
+            if eligible.len() == 1 { "" } else { "s" }
         ));
-        ui.label("Choose the one you use:");
         for (index, profile) in eligible.iter().enumerate() {
             let selected =
                 workflow.dolphin_profile_choice.as_deref() == Some(profile.profile_id.as_str());
@@ -21306,8 +21300,20 @@ fn show_dolphin_profile_chooser(
                     profile.profile_id.clone(),
                 ));
             }
+            ui.label(format!(
+                "User root: {}",
+                profile.configuration_path.display()
+            ));
+            ui.label(format!(
+                "GameSettings destination: {}",
+                profile.game_settings_path.display()
+            ));
+            ui.weak(format!(
+                "Evidence: {}",
+                profile.resolved.discovery_evidence.join("; ")
+            ));
         }
-        ui.weak("The chosen profile will be remembered. Exact folders are available in Details.");
+        ui.weak("No profile is chosen merely because it appeared first. Your explicit choice will be remembered.");
     });
     action
 }
@@ -21503,7 +21509,7 @@ fn show_dolphin_workflow_details(
         ui,
         "Stage 1 · Dolphin profile",
         Some(
-            "ArchiveFS selects automatically only when exactly one discovered profile is eligible.",
+            "A unique running Dolphin profile wins. Otherwise ArchiveFS selects automatically only when exactly one credible profile exists.",
         ),
     );
     match profiles {
@@ -21543,7 +21549,7 @@ fn show_dolphin_workflow_details(
                 );
             } else if eligible.len() > 1 && workflow.selected_dolphin_profile_id.is_none() {
                 ui.label(format!(
-                    "{} eligible profiles were found. Choose one explicitly.",
+                    "Select the Dolphin profile to use. {} credible profiles were found and no single active runtime resolved the choice.",
                     eligible.len()
                 ));
             }
@@ -21566,7 +21572,7 @@ fn show_dolphin_workflow_details(
         ui.text_edit_singleline(&mut workflow.dolphin_explicit_root);
     });
     ui.label(
-        "Optional. Native and Flatpak installs are found automatically; a portable install's own User directory is not, and must be typed here.",
+        "Optional. Running Dolphin -u/--user directories, native profiles, and evidenced Flatpak profiles are discovered automatically. Enter a custom User directory only when it was not discovered.",
     );
     if widgets::action_button(
         ui,
@@ -23199,17 +23205,24 @@ fn show_dolphin_profile_card(
                     workflow.transaction = CheatTransactionState::Idle;
                     bind_dolphin_provider_to_configuration(workflow, &profile.configuration_path);
                 }
+                if selected {
+                    widgets::status_badge(
+                        ui,
+                        "Active Dolphin profile",
+                        widgets::StatusTone::Success,
+                    );
+                }
             } else {
                 widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
                 ui.strong(&profile.profile_id);
             }
             ui.label(format!(
-                "{} · {}",
+                "Profile type: {} · {}",
                 dolphin_installation_label(profile.installation_type),
                 dolphin_scope_label(profile.scope)
             ));
         });
-        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+        if widgets::path_value(ui, "Dolphin user root", &profile.configuration_path) {
             let _ = clipboard.set_text(profile.configuration_path.display().to_string());
         }
         if let Some(executable) = &profile.resolved.emulator_executable
@@ -23237,7 +23250,11 @@ fn show_dolphin_profile_card(
                 dolphin_directory_state_label(profile.game_settings_state),
                 dolphin_directory_state_tone(profile.game_settings_state),
             );
-            if widgets::path_value(ui, "GameSettings", &profile.game_settings_path) {
+            if widgets::path_value(
+                ui,
+                "Exact GameSettings destination",
+                &profile.game_settings_path,
+            ) {
                 let _ = clipboard.set_text(profile.game_settings_path.display().to_string());
             }
         });
@@ -26880,35 +26897,14 @@ fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str
         .collect()
 }
 
-/// Maps Dolphin's own discovery result into the adapter-agnostic shape
-/// `select_emulator_profile` understands. `installation_type ==
-/// Explicit` is the only kind that came from a user-typed directory
-/// (portable/AppImage installs), which is exactly what the beginner
-/// selection rules mean by "portable".
-fn dolphin_profile_candidates(
-    discovery: &DolphinProfileDiscovery,
-) -> Vec<EmulatorProfileCandidate> {
-    discovery
-        .profiles
-        .iter()
-        .map(|profile| EmulatorProfileCandidate {
-            profile_id: profile.profile_id.clone(),
-            root: profile.configuration_path.clone(),
-            eligible: profile.eligible,
-            is_portable: matches!(
-                profile.installation_type,
-                DolphinInstallationType::Explicit | DolphinInstallationType::AppImage
-            ),
-            evidence_priority: profile.resolved.priority,
-        })
-        .collect()
-}
-
+/// Standard roots are rediscovered from current filesystem/runtime evidence;
+/// they are not reintroduced as user-confirmed overrides from profile memory.
 fn is_dolphin_standard_fallback_root(root: &Path) -> bool {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return false;
     };
     root == home.join(".config/dolphin-emu")
+        || root == home.join(".var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu")
         || root == home.join(".var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu")
 }
 
@@ -37538,7 +37534,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_dolphin_profiles_prefers_remembered_profile_over_discovery_order() {
+    fn poll_dolphin_profiles_does_not_hide_multiple_stopped_profiles_behind_memory() {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
         app.remembered_emulator_profiles
@@ -37554,14 +37550,12 @@ mod tests {
                 dolphin_profile_fixture_with("second", false),
             ],
         );
-        assert_eq!(
-            app.cheat_workflow
-                .as_ref()
-                .unwrap()
-                .selected_dolphin_profile_id
-                .as_deref(),
-            Some("second")
-        );
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.selected_dolphin_profile_id, None);
+        assert!(matches!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::NeedsChoice { .. })
+        ));
     }
 
     #[test]
@@ -37585,7 +37579,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_dolphin_profiles_with_a_stale_remembered_profile_shows_setup_needed() {
+    fn poll_dolphin_profiles_ignores_stale_memory_when_one_credible_profile_exists() {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
         app.remembered_emulator_profiles
@@ -37596,15 +37590,22 @@ mod tests {
             });
         drive_dolphin_profile_scan(&mut app, vec![dolphin_profile_fixture()]);
         let workflow = app.cheat_workflow.as_ref().unwrap();
-        assert_eq!(workflow.selected_dolphin_profile_id, None);
         assert_eq!(
-            workflow.dolphin_profile_selection,
-            Some(EmulatorProfileSelection::SetupNeeded)
+            workflow.selected_dolphin_profile_id.as_deref(),
+            Some("dolphin-native-test")
         );
+        assert!(matches!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::Auto {
+                reason:
+                    archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn poll_dolphin_profiles_prefers_the_single_portable_profile_among_several_valid_ones() {
+    fn poll_dolphin_profiles_does_not_guess_portable_when_dolphin_is_stopped() {
         let mut app = app_with_cheats_mods_context();
         app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
         drive_dolphin_profile_scan(
@@ -37614,13 +37615,36 @@ mod tests {
                 dolphin_profile_fixture_with("portable", true),
             ],
         );
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(workflow.selected_dolphin_profile_id, None);
+        assert!(matches!(
+            workflow.dolphin_profile_selection,
+            Some(EmulatorProfileSelection::NeedsChoice { .. })
+        ));
+    }
+
+    #[test]
+    fn poll_dolphin_profiles_active_runtime_wins_over_remembered_installed_profile() {
+        let mut app = app_with_cheats_mods_context();
+        app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
+        app.remembered_emulator_profiles
+            .push(RememberedEmulatorProfile {
+                adapter: "dolphin".to_string(),
+                profile_id: "installed".to_string(),
+                root: PathBuf::from("/isolated/installed"),
+            });
+        let installed = dolphin_profile_fixture_with("installed", false);
+        let mut active = dolphin_profile_fixture_with("active", true);
+        active.resolved.confidence = EmulatorProfileConfidence::RunningExplicit;
+        active.resolved.priority = 400;
+        drive_dolphin_profile_scan(&mut app, vec![installed, active]);
         assert_eq!(
             app.cheat_workflow
                 .as_ref()
                 .unwrap()
                 .selected_dolphin_profile_id
                 .as_deref(),
-            Some("portable")
+            Some("active")
         );
     }
 
@@ -39286,13 +39310,17 @@ $Instant Growth [Nayr]\n";
         });
         let output = render_dolphin_workflow(&mut app);
         assert!(
-            rendered_text_contains(&output, "ArchiveFS found 2 Dolphin profiles."),
+            rendered_text_contains(&output, "Select the Dolphin profile to use"),
             "rendering mismatch"
         );
+        assert!(rendered_text_contains(
+            &output,
+            "ArchiveFS found 2 credible Dolphin profiles."
+        ));
         assert!(rendered_text_contains(&output, "Native profile 1"));
         assert!(rendered_text_contains(&output, "Native profile 2"));
         assert!(!rendered_text_contains(&output, "Use selected profile"));
-        assert!(!rendered_text_contains(
+        assert!(rendered_text_contains(
             &output,
             &second.display().to_string()
         ));

@@ -227,6 +227,7 @@ pub use dolphin_local::{
     DolphinProfileBlocker, DolphinProfileBlockerKind, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinSettingsDirectoryState,
     discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_profile, match_dolphin_inventory,
+    select_dolphin_profile,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
