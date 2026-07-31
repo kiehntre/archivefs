@@ -11,6 +11,13 @@ const CATALOGUE_FIXTURE: &[u8] =
 const GAME_PAGE_FIXTURE: &[u8] =
     include_bytes!("../../../tests/fixtures/gamehacking/wii-game-page-sanitized.html");
 const CHALLENGE: &[u8] = b"<html><title>Just a moment...</title>Cloudflare Ray ID: test</html>";
+const REAL_SAVED_PAGE_SHAPE: &[u8] = br#"<!doctype html><html><head><title>GameHacking.org | New Super Mario Bros. Wii (USA) (v1.01)</title></head><body>
+<a href="/system/wii">Wii</a><table><tr><th>Languages</th><th>CRC32</th><th>Region</th><th>Serial</th></tr>
+<tr><td>English</td><td>1CC03C30</td><td>USA</td><td>SMNE01</td></tr></table>
+<form><input name="sysID" value="22"><input name="gamID" value="56268"></form>
+<table><tr><td><div class="row"><div class="codID col-sm-5 col-md-6"><label><input name="codID[]" value="1">Infinite Test</label></div>
+<div class="col-sm-3"><small>Gecko</small></div><div class="col-sm-4 col-md-3"><pre>040D30C8 3860270F</pre></div></div></td></tr></table>
+</body></html>"#;
 
 fn temp_root(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -144,6 +151,8 @@ fn synthetic_catalogue(games: Vec<GameHackingWiiIndexRecord>) -> GameHackingWiiC
         retrieved_at_unix_seconds: 1,
         pages: Vec::new(),
         games,
+        coverage: WiiCatalogueCoverage::CompleteCrawl,
+        browser_imports: Vec::new(),
     }
 }
 
@@ -333,6 +342,185 @@ fn manual_page_import_is_bounded_validated_namespaced_and_challenge_safe() {
         import_wii_game_page_bytes(&root, &identity(), &game(None), CHALLENGE).unwrap_err();
     assert_eq!(failure.kind, WiiManualImportErrorKind::ChallengeContent);
     assert_eq!(fs::read(&outcome.cache_path).unwrap(), previous);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_import_bootstraps_partial_catalogue_and_cached_match_without_network() {
+    let root = temp_root("bootstrap");
+    let outcome =
+        import_wii_game_page_bootstrap_bytes(&root, &identity(), 131_936, GAME_PAGE_FIXTURE)
+            .unwrap();
+    assert_eq!(
+        outcome.coverage,
+        WiiCatalogueCoverage::BrowserAssistedPartial
+    );
+    assert!(!outcome.network_used);
+    assert_eq!(outcome.game_id, 131_936);
+    assert_eq!(outcome.dolphin_game_id, "R3HX6Z");
+    assert_eq!(outcome.cheats.len(), 7);
+    assert_eq!(outcome.supported_cheat_count, 3);
+    assert_eq!(outcome.blocked_or_unknown_count, 4);
+    assert_eq!(outcome.content_sha256.len(), 64);
+    let catalogue = load_wii_catalogue(&root).unwrap();
+    assert_eq!(
+        catalogue.coverage,
+        WiiCatalogueCoverage::BrowserAssistedPartial
+    );
+    assert!(catalogue.pages.is_empty());
+    assert_eq!(catalogue.games.len(), 1);
+    assert_eq!(catalogue.browser_imports.len(), 1);
+    assert_eq!(catalogue.games[0].game_id, 131_936);
+    assert_eq!(
+        catalogue.games[0].dolphin_game_id.as_deref(),
+        Some("R3HX6Z")
+    );
+    let matched = GameHackingWiiProvider::default()
+        .match_game(
+            &identity(),
+            &GameHackingWiiFetchOptions {
+                cache_root: root.clone(),
+                force_refresh: false,
+                delay: Duration::ZERO,
+                cancellation: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(matched.status, GameHackingWiiMatchStatus::Matched);
+    assert!(matched.detail.contains("browser-imported entries only"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_import_accepts_the_verified_header_row_value_row_page_shape() {
+    let root = temp_root("bootstrap-real-shape");
+    let outcome = import_wii_game_page_bootstrap_bytes(
+        &root,
+        &identity_with_id("SMNE01"),
+        56_268,
+        REAL_SAVED_PAGE_SHAPE,
+    )
+    .unwrap();
+    assert_eq!(outcome.game_id, 56_268);
+    assert_eq!(outcome.dolphin_game_id, "SMNE01");
+    assert_eq!(
+        outcome.game_title,
+        "New Super Mario Bros. Wii (USA) (v1.01)"
+    );
+    assert_eq!(outcome.supported_cheat_count, 1);
+    let catalogue = load_wii_catalogue(&root).unwrap();
+    assert_eq!(catalogue.games[0].region.as_deref(), Some("USA"));
+    assert_eq!(catalogue.games[0].crc32.as_deref(), Some("1CC03C30"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_import_rejects_wrong_ids_and_challenges_before_cache_writes() {
+    for (label, game_id, imported_identity, bytes, expected_kind) in [
+        (
+            "wrong-numeric",
+            56268,
+            identity(),
+            GAME_PAGE_FIXTURE,
+            WiiManualImportErrorKind::IdentityConflict,
+        ),
+        (
+            "wrong-local",
+            131_936,
+            identity_with_id("SMNE01"),
+            GAME_PAGE_FIXTURE,
+            WiiManualImportErrorKind::IdentityConflict,
+        ),
+        (
+            "challenge",
+            131_936,
+            identity(),
+            CHALLENGE,
+            WiiManualImportErrorKind::ChallengeContent,
+        ),
+    ] {
+        let root = temp_root(label);
+        let failure =
+            import_wii_game_page_bootstrap_bytes(&root, &imported_identity, game_id, bytes)
+                .unwrap_err();
+        assert_eq!(failure.kind, expected_kind);
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn browser_import_is_idempotent_and_updates_provenance_for_changed_content() {
+    let root = temp_root("bootstrap-idempotent");
+    let first =
+        import_wii_game_page_bootstrap_bytes(&root, &identity(), 131_936, GAME_PAGE_FIXTURE)
+            .unwrap();
+    let second =
+        import_wii_game_page_bootstrap_bytes(&root, &identity(), 131_936, GAME_PAGE_FIXTURE)
+            .unwrap();
+    assert_eq!(first.content_sha256, second.content_sha256);
+    assert_eq!(load_wii_catalogue(&root).unwrap().games.len(), 1);
+    assert_eq!(load_wii_catalogue(&root).unwrap().browser_imports.len(), 1);
+
+    let mut changed = GAME_PAGE_FIXTURE.to_vec();
+    changed.extend_from_slice(b"\n<!-- saved again -->\n");
+    let changed =
+        import_wii_game_page_bootstrap_bytes(&root, &identity(), 131_936, &changed).unwrap();
+    assert_ne!(first.content_sha256, changed.content_sha256);
+    let catalogue = load_wii_catalogue(&root).unwrap();
+    assert_eq!(catalogue.games.len(), 1);
+    assert_eq!(
+        catalogue.browser_imports[0].content_sha256,
+        changed.content_sha256
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_import_enriches_an_existing_complete_catalogue_without_downgrading_coverage() {
+    let root = temp_root("bootstrap-existing");
+    let record = catalogue_record(0, "R3HX6Z", None);
+    let mut catalogue = synthetic_catalogue(vec![record]);
+    catalogue.games[0].game_id = 131_936;
+    catalogue.games[0].title = "Agent Hugo: Hula Holiday".to_string();
+    fs::write(
+        root.join(WII_CATALOGUE_FILE),
+        serde_json::to_vec_pretty(&catalogue).unwrap(),
+    )
+    .unwrap();
+    let outcome =
+        import_wii_game_page_bootstrap_bytes(&root, &identity(), 131_936, GAME_PAGE_FIXTURE)
+            .unwrap();
+    assert_eq!(outcome.coverage, WiiCatalogueCoverage::CompleteCrawl);
+    let catalogue = load_wii_catalogue(&root).unwrap();
+    assert_eq!(catalogue.coverage, WiiCatalogueCoverage::CompleteCrawl);
+    assert_eq!(catalogue.games.len(), 1);
+    assert_eq!(catalogue.browser_imports.len(), 1);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn full_crawl_retains_browser_import_provenance_and_becomes_complete() {
+    let root = temp_root("bootstrap-merge");
+    import_wii_game_page_bootstrap_bytes(&root, &identity(), 131_936, GAME_PAGE_FIXTURE).unwrap();
+    fs::write(root.join("robots.txt"), b"User-agent: *\nAllow: /\n").unwrap();
+    fs::write(root.join(WII_INDEX_ROOT_CACHE_FILE), CATALOGUE_FIXTURE).unwrap();
+    fs::write(root.join("wii-index-root.retrieved"), b"1700000000").unwrap();
+    GameHackingWiiProvider::default()
+        .refresh_wii_index(
+            &GameHackingWiiFetchOptions {
+                cache_root: root.clone(),
+                force_refresh: false,
+                delay: Duration::ZERO,
+                cancellation: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+    let catalogue = load_wii_catalogue(&root).unwrap();
+    assert_eq!(catalogue.coverage, WiiCatalogueCoverage::CompleteCrawl);
+    assert_eq!(catalogue.browser_imports.len(), 1);
+    assert!(catalogue.games.iter().any(|game| game.game_id == 131_936));
     let _ = fs::remove_dir_all(root);
 }
 

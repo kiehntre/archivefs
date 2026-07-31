@@ -26,9 +26,9 @@ use archivefs_core::patch_manager::{
     RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
     build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
     discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
-    import_wii_game_page_file, inspect_cheat_install_journal, load_catalogue_evidence_read_only,
-    load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
-    load_wii_catalogue, preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
+    import_wii_game_page_bootstrap_file, inspect_cheat_install_journal,
+    load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot, load_dolphin_catalogue,
+    load_gamecube_catalogue, preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -459,20 +459,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or("Wii game"),
                 &report,
             );
-            let catalogue = load_wii_catalogue(&options.cache_root)?;
-            let game = catalogue
-                .games
-                .iter()
-                .find(|record| record.game_id == game_id)
-                .ok_or_else(|| format!("game {game_id} is not in the cached Wii catalogue"))?
-                .as_game();
-            let outcome = import_wii_game_page_file(&options.cache_root, &identity, &game, &file)?;
+            let outcome = import_wii_game_page_bootstrap_file(
+                &options.cache_root,
+                &identity,
+                game_id,
+                &file,
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
-                println!("Imported {} named Wii cheats", outcome.cheats.len());
+                println!("Imported GameHacking.org Wii game {}", outcome.game_id);
+                println!("Verified Dolphin Game ID: {}", outcome.dolphin_game_id);
+                println!("Game: {}", outcome.game_title);
+                println!("Imported cheats: {}", outcome.cheats.len());
+                println!("Supported cheats: {}", outcome.supported_cheat_count);
+                println!(
+                    "Blocked or unknown cheats: {}",
+                    outcome.blocked_or_unknown_count
+                );
                 println!("Cache: {}", outcome.cache_path.display());
-                println!("Verified Wii Game ID: {}", outcome.dolphin_game_id);
+                println!("Catalogue: {}", outcome.catalogue_path.display());
+                println!("Coverage: {}", outcome.coverage.label());
+                println!("Content SHA-256: {}", outcome.content_sha256);
+                println!("Provenance: {}", outcome.provenance);
+                println!(
+                    "Network used: {}",
+                    if outcome.network_used { "yes" } else { "no" }
+                );
             }
         }
         "gamehacking-gamecube-sysid-diagnostic" => {

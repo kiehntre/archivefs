@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use scraper::{Element, Html, Selector};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::gamehacking_catalogue::{
@@ -249,6 +250,38 @@ pub struct GameHackingWiiCatalogue {
     pub retrieved_at_unix_seconds: u64,
     pub pages: Vec<GameHackingWiiIndexPage>,
     pub games: Vec<GameHackingWiiIndexRecord>,
+    #[serde(default)]
+    pub coverage: WiiCatalogueCoverage,
+    #[serde(default)]
+    pub browser_imports: Vec<WiiBrowserImportProvenance>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WiiCatalogueCoverage {
+    BrowserAssistedPartial,
+    #[default]
+    CompleteCrawl,
+}
+
+impl WiiCatalogueCoverage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BrowserAssistedPartial => "browser-assisted partial cache",
+            Self::CompleteCrawl => "complete catalogue crawl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WiiBrowserImportProvenance {
+    pub parser_schema_version: u32,
+    pub game_id: u64,
+    pub dolphin_game_id: String,
+    pub imported_at_unix_seconds: u64,
+    pub content_sha256: String,
+    pub cache_file: String,
+    pub game: GameHackingWiiIndexRecord,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -441,6 +474,8 @@ impl GameHackingCatalogueHooks for WiiCatalogueHooks {
             retrieved_at_unix_seconds: metadata.retrieved_at_unix_seconds,
             pages,
             games,
+            coverage: WiiCatalogueCoverage::CompleteCrawl,
+            browser_imports: Vec::new(),
         }
     }
 }
@@ -459,6 +494,9 @@ impl GameHackingWiiProvider {
     where
         F: FnMut(GameHackingWiiIndexProgress),
     {
+        let retained_imports = load_wii_catalogue(&options.cache_root)
+            .map(|catalogue| catalogue.browser_imports)
+            .unwrap_or_default();
         let root_files = [WII_INDEX_ROOT_CACHE_FILE];
         let spec = GameHackingCatalogueSpec {
             schema_version: WII_CATALOGUE_SCHEMA_VERSION,
@@ -493,6 +531,17 @@ impl GameHackingWiiProvider {
                 });
             },
         )?;
+        if !retained_imports.is_empty() {
+            let mut catalogue = load_wii_catalogue(&options.cache_root)?;
+            merge_browser_imports(&mut catalogue, retained_imports);
+            let bytes = serde_json::to_vec_pretty(&catalogue).map_err(|failure| {
+                wii_error(
+                    GameHackingErrorKind::CacheUnavailable,
+                    format!("merged Wii catalogue could not be serialized: {failure}"),
+                )
+            })?;
+            atomic_write(&result.catalogue_path, &bytes)?;
+        }
         Ok(GameHackingWiiIndexRefreshResult {
             catalogue_path: result.catalogue_path,
             pages_total: result.pages_total,
@@ -626,6 +675,18 @@ fn match_wii_catalogue(
     catalogue: &GameHackingWiiCatalogue,
     cancellation: Option<&AtomicBool>,
 ) -> Result<GameHackingWiiMatchOutcome, GameHackingError> {
+    let coverage_note = match catalogue.coverage {
+        WiiCatalogueCoverage::BrowserAssistedPartial => format!(
+            " Wii cache available. Coverage: browser-imported entries only ({} game{} imported).",
+            catalogue.browser_imports.len(),
+            if catalogue.browser_imports.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+        WiiCatalogueCoverage::CompleteCrawl => String::new(),
+    };
     let mut rows_examined = 0_usize;
     let mut candidates = Vec::new();
     for record in &catalogue.games {
@@ -653,8 +714,9 @@ fn match_wii_catalogue(
                 status: GameHackingWiiMatchStatus::NoMatch,
                 game: None,
                 candidates: Vec::new(),
-                detail: "No exact six-character Wii Game ID match exists in the cached catalogue."
-                    .to_string(),
+                detail: format!(
+                    "No exact six-character Wii Game ID match exists in the cached catalogue.{coverage_note}"
+                ),
             },
             catalogue_rows_examined: rows_examined,
         });
@@ -674,7 +736,7 @@ fn match_wii_catalogue(
             result: GameHackingWiiMatch {
                 status: GameHackingWiiMatchStatus::Matched,
                 detail: format!(
-                    "Matched {} by {} from the cached Wii catalogue.",
+                    "Matched {} by {} from the cached Wii catalogue.{coverage_note}",
                     selected.game.title,
                     selected.strength.label()
                 ),
@@ -689,8 +751,9 @@ fn match_wii_catalogue(
             status: GameHackingWiiMatchStatus::Candidates,
             game: None,
             candidates,
-            detail: "The Wii Game ID matches more than one revision, or the catalogue revision cannot be verified locally. Select the exact candidate explicitly."
-                .to_string(),
+            detail: format!(
+                "The Wii Game ID matches more than one revision, or the catalogue revision cannot be verified locally. Select the exact candidate explicitly.{coverage_note}"
+            ),
         },
         catalogue_rows_examined: rows_examined,
     })
@@ -954,6 +1017,149 @@ pub fn load_wii_catalogue(root: &Path) -> Result<GameHackingWiiCatalogue, GameHa
     Ok(catalogue)
 }
 
+fn merge_browser_imports(
+    catalogue: &mut GameHackingWiiCatalogue,
+    imports: Vec<WiiBrowserImportProvenance>,
+) {
+    for imported in imports {
+        if let Some(existing) = catalogue
+            .games
+            .iter_mut()
+            .find(|record| record.game_id == imported.game_id)
+        {
+            if existing.dolphin_game_id.is_none()
+                || existing.dolphin_game_id != Some(imported.dolphin_game_id.clone())
+            {
+                *existing = imported.game.clone();
+            }
+        } else {
+            catalogue.games.push(imported.game.clone());
+        }
+        if let Some(existing) = catalogue
+            .browser_imports
+            .iter_mut()
+            .find(|entry| entry.game_id == imported.game_id)
+        {
+            *existing = imported;
+        } else {
+            catalogue.browser_imports.push(imported);
+        }
+    }
+    catalogue.games.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then_with(|| left.game_id.cmp(&right.game_id))
+    });
+    catalogue.browser_imports.sort_by_key(|entry| entry.game_id);
+}
+
+fn page_table_metadata(document: &Html) -> BTreeMap<String, String> {
+    let table_selector = Selector::parse("table").expect("static selector");
+    let row_selector = Selector::parse("tr").expect("static selector");
+    let cell_selector = Selector::parse("th, td").expect("static selector");
+    let mut metadata = BTreeMap::new();
+    for table in document.select(&table_selector) {
+        let rows = table
+            .select(&row_selector)
+            .map(|row| {
+                row.select(&cell_selector)
+                    .map(element_text)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|cells| !cells.is_empty())
+            .collect::<Vec<_>>();
+        for cells in &rows {
+            if cells.len() == 2 {
+                metadata.insert(
+                    cells[0].trim().to_ascii_lowercase(),
+                    cells[1].trim().to_string(),
+                );
+            }
+        }
+        for pair in rows.windows(2) {
+            if pair[0].len() == pair[1].len() {
+                for (label, value) in pair[0].iter().zip(&pair[1]) {
+                    if ["system", "region", "serial", "game id", "crc32", "revision"]
+                        .iter()
+                        .any(|known| label.trim().eq_ignore_ascii_case(known))
+                    {
+                        metadata
+                            .insert(label.trim().to_ascii_lowercase(), value.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    metadata
+}
+
+fn game_from_imported_wii_page(
+    identity: &WiiGameIdentity,
+    game_id: u64,
+    bytes: &[u8],
+) -> Result<GameHackingWiiGame, WiiManualImportError> {
+    if bytes.len() > MAX_GAME_PAGE_BYTES || cached_bytes_are_cloudflare_challenge(bytes) {
+        return Err(import_error(
+            if bytes.len() > MAX_GAME_PAGE_BYTES {
+                WiiManualImportErrorKind::InputTooLarge
+            } else {
+                WiiManualImportErrorKind::ChallengeContent
+            },
+            "saved content is not a bounded completed Wii game page",
+        ));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let document = Html::parse_document(&text);
+    let title_selector = Selector::parse("title").expect("static selector");
+    let title = document
+        .select(&title_selector)
+        .next()
+        .map(element_text)
+        .map(|value| {
+            value
+                .strip_prefix("GameHacking.org | ")
+                .unwrap_or(&value)
+                .trim()
+                .to_string()
+        })
+        .filter(|value: &String| !value.is_empty())
+        .ok_or_else(|| {
+            import_error(
+                WiiManualImportErrorKind::InvalidPage,
+                "saved Wii game page has no game title",
+            )
+        })?;
+    let local_game_id = identity
+        .verified_game_id()
+        .and_then(normalize_wii_game_id)
+        .ok_or_else(|| {
+            import_error(
+                WiiManualImportErrorKind::IdentityConflict,
+                "a verified local Wii Dolphin Game ID is required for import",
+            )
+        })?;
+    let metadata = page_table_metadata(&document);
+    let game = GameHackingWiiGame {
+        game_id,
+        title,
+        system: "Wii".to_string(),
+        region: metadata.get("region").cloned(),
+        dolphin_game_id: Some(local_game_id),
+        revision: metadata
+            .get("revision")
+            .and_then(|value| parse_revision(value)),
+        disc_number: None,
+        crc32: metadata
+            .get("crc32")
+            .and_then(|value| normalize_crc32(value)),
+        source_url: format!("{BASE_URL}/game/{game_id}"),
+    };
+    validate_wii_page_identity(&document, identity, &game).map_err(|failure| {
+        import_error(WiiManualImportErrorKind::IdentityConflict, failure.detail)
+    })?;
+    Ok(game)
+}
+
 pub fn parse_wii_game_page(
     identity: &WiiGameIdentity,
     game: &GameHackingWiiGame,
@@ -1079,26 +1285,16 @@ fn validate_wii_page_identity(
             "imported game page does not carry the verified Wii sysID 22",
         ));
     }
-    let row_selector = Selector::parse("tr").expect("static selector");
-    let cell_selector = Selector::parse("th, td").expect("static selector");
-    let mut serial = None;
-    let mut system_is_wii = false;
-    for row in document.select(&row_selector) {
-        let cells = row
-            .select(&cell_selector)
-            .map(element_text)
-            .collect::<Vec<_>>();
-        if cells.len() < 2 {
-            continue;
-        }
-        if cells[0].eq_ignore_ascii_case("serial") || cells[0].eq_ignore_ascii_case("game id") {
-            serial = normalize_wii_game_id(&cells[1]);
-        }
-        if cells[0].eq_ignore_ascii_case("system") {
-            system_is_wii = cells[1].trim().eq_ignore_ascii_case("wii")
-                || cells[1].to_ascii_lowercase().contains("nintendo wii");
-        }
-    }
+    let metadata = page_table_metadata(document);
+    let serial = metadata
+        .get("serial")
+        .or_else(|| metadata.get("game id"))
+        .and_then(|value| normalize_wii_game_id(value));
+    let system_link_selector = Selector::parse("a[href^='/system/wii']").expect("static selector");
+    let system_is_wii = metadata.get("system").is_some_and(|value| {
+        value.trim().eq_ignore_ascii_case("wii")
+            || value.to_ascii_lowercase().contains("nintendo wii")
+    }) || document.select(&system_link_selector).next().is_some();
     let local = identity.verified_game_id().and_then(normalize_wii_game_id);
     if serial.is_none() || serial != local || serial != game.dolphin_game_id {
         return Err(wii_error(
@@ -1285,10 +1481,18 @@ impl std::error::Error for WiiManualImportError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WiiManualImportOutcome {
     pub cache_path: PathBuf,
+    pub catalogue_path: PathBuf,
     pub retrieved_at_unix_seconds: u64,
     pub game_id: u64,
     pub dolphin_game_id: String,
+    pub game_title: String,
     pub cheats: Vec<GameHackingWiiCheat>,
+    pub supported_cheat_count: usize,
+    pub blocked_or_unknown_count: usize,
+    pub coverage: WiiCatalogueCoverage,
+    pub content_sha256: String,
+    pub provenance: String,
+    pub network_used: bool,
 }
 
 fn import_error(kind: WiiManualImportErrorKind, detail: impl Into<String>) -> WiiManualImportError {
@@ -1317,6 +1521,179 @@ pub fn import_wii_game_page_file(
     import_wii_game_page_bytes(cache_root, identity, game, &bytes)
 }
 
+pub fn import_wii_game_page_bootstrap_file(
+    cache_root: &Path,
+    identity: &WiiGameIdentity,
+    game_id: u64,
+    source: &Path,
+) -> Result<WiiManualImportOutcome, WiiManualImportError> {
+    let bytes = bounded_read(source, MAX_GAME_PAGE_BYTES).map_err(|failure| {
+        import_error(
+            if failure.detail.contains("oversized") {
+                WiiManualImportErrorKind::InputTooLarge
+            } else {
+                WiiManualImportErrorKind::SourceUnreadable
+            },
+            failure.detail,
+        )
+    })?;
+    import_wii_game_page_bootstrap_bytes(cache_root, identity, game_id, &bytes)
+}
+
+pub fn import_wii_game_page_bootstrap_bytes(
+    cache_root: &Path,
+    identity: &WiiGameIdentity,
+    game_id: u64,
+    bytes: &[u8],
+) -> Result<WiiManualImportOutcome, WiiManualImportError> {
+    let catalogue_path = cache_root.join(WII_CATALOGUE_FILE);
+    let existing_catalogue = match std::fs::symlink_metadata(&catalogue_path) {
+        Ok(_) => Some(load_wii_catalogue(cache_root).map_err(|failure| {
+            import_error(WiiManualImportErrorKind::InvalidPage, failure.detail)
+        })?),
+        Err(failure) if failure.kind() == io::ErrorKind::NotFound => None,
+        Err(failure) => {
+            return Err(import_error(
+                WiiManualImportErrorKind::CacheWriteFailed,
+                format!("Wii catalogue could not be inspected: {failure}"),
+            ));
+        }
+    };
+    let game = if let Some(catalogue) = &existing_catalogue {
+        catalogue
+            .games
+            .iter()
+            .find(|record| record.game_id == game_id)
+            .ok_or_else(|| {
+                import_error(
+                    WiiManualImportErrorKind::IdentityConflict,
+                    format!("game {game_id} is not in the cached Wii catalogue"),
+                )
+            })?
+            .as_game()
+    } else {
+        game_from_imported_wii_page(identity, game_id, bytes)?
+    };
+
+    // Validate completely before creating the cache directory or changing a
+    // cache file. This rejects wrong IDs, systems, serials and challenges.
+    let normalized = String::from_utf8_lossy(bytes);
+    parse_wii_game_page(identity, &game, normalized.as_bytes()).map_err(|failure| {
+        import_error(
+            if failure.kind == GameHackingErrorKind::IdentityConflict {
+                WiiManualImportErrorKind::IdentityConflict
+            } else {
+                WiiManualImportErrorKind::InvalidPage
+            },
+            failure.detail,
+        )
+    })?;
+
+    let cache_path = cache_root.join(format!("wii-game-{game_id}.html"));
+    let affected_paths = [
+        cache_path.clone(),
+        charset_cache_path(&cache_path),
+        retrieved_cache_path(&cache_path),
+        catalogue_path.clone(),
+    ];
+    let snapshots = affected_paths
+        .iter()
+        .map(|path| match std::fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= 32 * 1024 * 1024 =>
+            {
+                std::fs::read(path).map(Some).map_err(|failure| {
+                    import_error(
+                        WiiManualImportErrorKind::CacheWriteFailed,
+                        format!("existing Wii cache file could not be backed up: {failure}"),
+                    )
+                })
+            }
+            Ok(_) => Err(import_error(
+                WiiManualImportErrorKind::CacheWriteFailed,
+                "existing Wii cache file is unsafe or oversized",
+            )),
+            Err(failure) if failure.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(failure) => Err(import_error(
+                WiiManualImportErrorKind::CacheWriteFailed,
+                format!("existing Wii cache file could not be inspected: {failure}"),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = (|| {
+        let mut outcome = import_wii_game_page_bytes(cache_root, identity, &game, bytes)?;
+        let stored = bounded_read(&outcome.cache_path, MAX_GAME_PAGE_BYTES).map_err(|failure| {
+            import_error(WiiManualImportErrorKind::CacheWriteFailed, failure.detail)
+        })?;
+        let content_sha256 = hex_sha256(&stored);
+        let record = GameHackingWiiIndexRecord {
+            game_id: game.game_id,
+            title: game.title.clone(),
+            dolphin_game_id: game.dolphin_game_id.clone(),
+            region: game.region.clone(),
+            revision: game.revision,
+            disc_number: game.disc_number,
+            crc32: game.crc32.clone(),
+            source_url: game.source_url.clone(),
+            index_source_url: "browser-assisted-import".to_string(),
+            retrieved_at_unix_seconds: outcome.retrieved_at_unix_seconds,
+        };
+        let provenance = WiiBrowserImportProvenance {
+            parser_schema_version: WII_CATALOGUE_SCHEMA_VERSION,
+            game_id,
+            dolphin_game_id: identity.verified_game_id().unwrap_or_default().to_string(),
+            imported_at_unix_seconds: outcome.retrieved_at_unix_seconds,
+            content_sha256: content_sha256.clone(),
+            cache_file: cache_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            game: record.clone(),
+        };
+        let mut catalogue = existing_catalogue.unwrap_or_else(|| GameHackingWiiCatalogue {
+            schema_version: WII_CATALOGUE_SCHEMA_VERSION,
+            provider: GAMEHACKING_WII_PROVIDER_ID.to_string(),
+            system: "Wii".to_string(),
+            source_url: "browser-assisted-import".to_string(),
+            retrieved_at_unix_seconds: outcome.retrieved_at_unix_seconds,
+            pages: Vec::new(),
+            games: Vec::new(),
+            coverage: WiiCatalogueCoverage::BrowserAssistedPartial,
+            browser_imports: Vec::new(),
+        });
+        merge_browser_imports(&mut catalogue, vec![provenance]);
+        let catalogue_bytes = serde_json::to_vec_pretty(&catalogue).map_err(|failure| {
+            import_error(
+                WiiManualImportErrorKind::CacheWriteFailed,
+                format!("Wii partial catalogue could not be serialized: {failure}"),
+            )
+        })?;
+        atomic_write(&catalogue_path, &catalogue_bytes).map_err(|failure| {
+            import_error(WiiManualImportErrorKind::CacheWriteFailed, failure.detail)
+        })?;
+        outcome.catalogue_path = catalogue_path.clone();
+        outcome.coverage = catalogue.coverage;
+        outcome.content_sha256 = content_sha256;
+        Ok(outcome)
+    })();
+    if result.is_err() {
+        for (path, snapshot) in affected_paths.iter().zip(snapshots) {
+            match snapshot {
+                Some(bytes) => {
+                    let _ = atomic_write(path, &bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+    result
+}
+
 pub fn import_wii_game_page_bytes(
     cache_root: &Path,
     identity: &WiiGameIdentity,
@@ -1335,7 +1712,9 @@ pub fn import_wii_game_page_bytes(
             "that is a Cloudflare challenge page, not the completed Wii game page",
         ));
     }
-    let cheats = parse_wii_game_page(identity, game, bytes).map_err(|failure| {
+    let decoded = String::from_utf8_lossy(bytes);
+    let normalized_bytes = decoded.as_bytes();
+    let cheats = parse_wii_game_page(identity, game, normalized_bytes).map_err(|failure| {
         import_error(
             if failure.kind == GameHackingErrorKind::IdentityConflict {
                 WiiManualImportErrorKind::IdentityConflict
@@ -1345,13 +1724,7 @@ pub fn import_wii_game_page_bytes(
             failure.detail,
         )
     })?;
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        import_error(
-            WiiManualImportErrorKind::InvalidPage,
-            "saved Wii game page is not UTF-8 text",
-        )
-    })?;
-    let sanitized = sanitize_imported_html(text);
+    let sanitized = sanitize_imported_html(&decoded);
     // Re-parse the bytes that will actually be cached. Sanitization must not
     // be capable of removing identity or cheat evidence.
     parse_wii_game_page(identity, game, sanitized.as_bytes())
@@ -1383,11 +1756,35 @@ pub fn import_wii_game_page_bytes(
     .map_err(|failure| import_error(WiiManualImportErrorKind::CacheWriteFailed, failure.detail))?;
     Ok(WiiManualImportOutcome {
         cache_path,
+        catalogue_path: cache_root.join(WII_CATALOGUE_FILE),
         retrieved_at_unix_seconds,
         game_id: game.game_id,
         dolphin_game_id: identity.verified_game_id().unwrap_or_default().to_string(),
+        game_title: game.title.clone(),
+        supported_cheat_count: cheats
+            .iter()
+            .filter(|cheat| cheat.safety == WiiCheatSafety::Installable)
+            .count(),
+        blocked_or_unknown_count: cheats
+            .iter()
+            .filter(|cheat| cheat.safety != WiiCheatSafety::Installable)
+            .count(),
         cheats,
+        coverage: WiiCatalogueCoverage::CompleteCrawl,
+        content_sha256: String::new(),
+        provenance: "browser-assisted saved Wii game page import".to_string(),
+        network_used: false,
     })
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Explicitly blocked until a real Wii Text response fixture verifies its
