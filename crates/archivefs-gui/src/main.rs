@@ -16,6 +16,12 @@ use std::sync::{
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use archivefs_core::diagnostics::DoctorCategory;
+use archivefs_core::diagnostics::{
+    CoverageStatus, DoctorScan, DoctorScanInputs, DoctorSeverity, Finding, Gathered,
+    MountRootSafety, assess_mount_root_safety, run_doctor_scan,
+};
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
     DiscoveryEnvironment, ProfileKind, ProfileScope,
@@ -102,21 +108,23 @@ use archivefs_core::{
     ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
-    Config, ConfigIdentity, Database, DatabaseHealth, DoctorReport, DoctorStatus, HealthCategory,
-    HealthIssue, InspectorEntry, InspectorEntryClassification, InspectorEntryKind, InspectorReport,
-    LazyUnmountCleanupResult, LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate,
-    LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
-    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction,
-    RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
+    Config, ConfigIdentity, Database, DatabaseHealth, DatabaseHealthReport, DoctorReport,
+    DoctorStatus, HealthCategory, HealthIssue, InspectorEntry, InspectorEntryClassification,
+    InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult, LibraryViewApplyReport,
+    LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan, LibraryViewPlanAction,
+    LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, MountOneOutcome,
+    MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
+    PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction, RecoveryOffer,
+    RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
     SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability, SourceFolderConfig,
-    SourceFolderView, UnmountOneOutcome, add_library_view_default, add_source_folder_default,
-    apply_library_view_default, assign_source_platform_default, build_source_folder_views,
-    canonical_platform_names, catalogue_filename_duplicates, check_database_health,
-    classify_archive_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
-    create_starter_config_default, default_config_path, default_database_path,
-    edit_library_view_default, format_unix_timestamp_utc, inspect_archive, is_inspectable,
-    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    SourceFolderView, SourceHealthIssue, UnmountOneOutcome, add_library_view_default,
+    add_source_folder_default, apply_library_view_default, assign_source_platform_default,
+    build_source_folder_views, canonical_platform_names, catalogue_filename_duplicates,
+    check_database_health, classify_archive_health, cleanup_selected_mount_tree,
+    create_configured_mount_root_default, create_starter_config_default, default_config_path,
+    default_database_path, diagnose_database, edit_library_view_default, format_unix_timestamp_utc,
+    inspect_archive, is_inspectable, latest_schema_version,
+    lazy_unmount_one_archive_path_with_progress, list_source_folder_views_default,
     load_library_view_configs_default, load_read_only_snapshot_default,
     load_source_folder_configs_from, mount_one_archive_path,
     persisted_archive_has_unknown_platform, preview_library_view_default, remount_one_archive_path,
@@ -1541,6 +1549,107 @@ impl RefreshGeneration {
 
     fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
+    }
+}
+
+// --- Doctor Stage 1A: read-only diagnostic scan --------------------------
+
+/// One completed read-only Doctor scan, plus when it finished.
+struct DoctorScanOutcome {
+    scan: DoctorScan,
+    finished_at_unix_seconds: i64,
+}
+
+/// The inputs one Doctor run collects on a worker thread. Only the
+/// path-based subsystems are gathered here; the preloaded, session-owned
+/// ones (`LoadedData::doctor`, live health issues, discovered RetroArch
+/// profiles) are borrowed on the main thread when the result arrives, so
+/// nothing large has to be cloned into the worker.
+struct DoctorGathered {
+    mount_root_safety: Gathered<MountRootSafety>,
+    database: Gathered<DatabaseHealthReport>,
+    source_health: Gathered<Vec<SourceHealthIssue>>,
+    transactions: Gathered<SharedHistoryReport>,
+}
+
+enum DoctorScanState {
+    NotRun,
+    Running {
+        generation: RefreshGeneration,
+        receiver: Receiver<(RefreshGeneration, DoctorGathered)>,
+        /// The previous result stays on screen while a new run is in
+        /// flight, so the page never blanks.
+        previous: Option<Box<DoctorScanOutcome>>,
+    },
+    Ready(Box<DoctorScanOutcome>),
+}
+
+impl DoctorScanState {
+    /// The result to display right now - the completed one, or the previous
+    /// one while a new run is still gathering.
+    fn displayed(&self) -> Option<&DoctorScanOutcome> {
+        match self {
+            Self::NotRun => None,
+            Self::Running { previous, .. } => previous.as_deref(),
+            Self::Ready(outcome) => Some(outcome),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+}
+
+/// Collects the path-based Doctor inputs. Runs on a worker thread.
+///
+/// Every call here is read-only by the callee's own documented contract:
+/// `assess_mount_root_safety` wraps `validate_destination_root` (which
+/// "never creates a directory or file"), `diagnose_database` performs no
+/// migration/recovery/checkpoint, `list_source_folder_views_default` reads
+/// config plus the catalogue read-only, and `discover_shared_apply_history`
+/// only reads existing journal files.
+///
+/// Nothing here scans archives, mounts anything, or writes. In particular
+/// `run_setup_diagnostics` is deliberately **not** called: its "Mount root
+/// is writable" check probes by creating and removing a file, which changes
+/// the mount root's modification time. Doctor borrows the already-computed
+/// `SetupDiagnostics` from `self.diagnostics` instead, so opening Doctor
+/// never performs that write.
+fn gather_doctor_inputs() -> DoctorGathered {
+    let config = Config::load_default();
+    DoctorGathered {
+        mount_root_safety: match &config {
+            Ok(config) => Gathered::Ready(assess_mount_root_safety(&config.mount_root)),
+            Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+        },
+        database: match default_database_path() {
+            Ok(path) => Gathered::Ready(diagnose_database(&path)),
+            Err(error) => Gathered::Failed(format!("database path could not be resolved: {error}")),
+        },
+        source_health: match list_source_folder_views_default() {
+            Ok(views) => Gathered::Ready(source_health_issues(views.as_slice())),
+            Err(error) => Gathered::Failed(format!("source folders could not be listed: {error}")),
+        },
+        transactions: match default_shared_history_root() {
+            Ok(root) => Gathered::Ready(discover_shared_apply_history(&root)),
+            Err(error) => Gathered::Failed(format!(
+                "install history root is unavailable: {}",
+                error.detail
+            )),
+        },
+    }
+}
+
+/// Borrows an owned gathered value as the runner's input, preserving the
+/// unavailable/failed reason unchanged.
+fn borrowed<'a, T, B: ?Sized>(
+    gathered: &'a Gathered<T>,
+    borrow: impl FnOnce(&'a T) -> &'a B,
+) -> Gathered<&'a B> {
+    match gathered {
+        Gathered::Ready(value) => Gathered::Ready(borrow(value)),
+        Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+        Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
     }
 }
 
@@ -3026,6 +3135,13 @@ struct ArchiveFsApp {
     history: OperationHistory,
     cleanup_after_unmount: bool,
     diagnostics: DiagnosticsState,
+    /// Doctor Stage 1A: the current read-only diagnostic scan. Entirely
+    /// separate from `self.state`/`self.refresh`, so running Doctor never
+    /// reloads the application.
+    doctor_scan: DoctorScanState,
+    doctor_scan_generation: RefreshGeneration,
+    /// The finding whose evidence panel is open, by stable finding id.
+    doctor_selected_finding: Option<String>,
     setup_action: Option<RunningSetupAction>,
     refresh_error: Option<String>,
     snapshot_stale: bool,
@@ -3282,6 +3398,9 @@ impl ArchiveFsApp {
             history,
             cleanup_after_unmount: false,
             diagnostics: start_diagnostics(context.clone(), generation),
+            doctor_scan: DoctorScanState::NotRun,
+            doctor_scan_generation: RefreshGeneration::INITIAL,
+            doctor_selected_finding: None,
             setup_action: None,
             refresh_error: None,
             snapshot_stale: false,
@@ -3852,6 +3971,146 @@ impl ArchiveFsApp {
             let _ = sender.send(result);
             context.request_repaint();
         });
+    }
+
+    // --- Doctor Stage 1A ------------------------------------------------
+
+    /// Starts a read-only Doctor scan.
+    ///
+    /// Deliberately **not** `self.refresh(context)`: this never reloads the
+    /// application, never rescans the library, never creates the mount root,
+    /// and never touches the database. The path-based inputs are gathered on
+    /// a worker thread; the preloaded, session-owned inputs are borrowed
+    /// when the result arrives.
+    ///
+    /// Cancellation follows the existing generation pattern: a superseded
+    /// run's result is discarded on arrival, and the previous result stays
+    /// visible until a newer one completes.
+    fn start_doctor_scan(&mut self, context: egui::Context) {
+        let generation = self.doctor_scan_generation.next();
+        self.doctor_scan_generation = generation;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send((generation, gather_doctor_inputs()));
+            context.request_repaint();
+        });
+        let previous = match std::mem::replace(&mut self.doctor_scan, DoctorScanState::NotRun) {
+            DoctorScanState::Ready(outcome) => Some(outcome),
+            DoctorScanState::Running { previous, .. } => previous,
+            DoctorScanState::NotRun => None,
+        };
+        self.doctor_scan = DoctorScanState::Running {
+            generation,
+            receiver,
+            previous,
+        };
+    }
+
+    /// Completes a Doctor scan once its worker delivers the gathered inputs.
+    ///
+    /// The pure runner itself is executed here, on the main thread, because
+    /// it does no I/O and needs to borrow the session-owned inputs
+    /// (`LoadedData::doctor`, the cached live health issues, and any already
+    /// discovered RetroArch environment). None of those is re-collected: if
+    /// a subsystem has not been loaded in this session it is reported as not
+    /// checked, never as a pass.
+    fn poll_doctor_scan(&mut self) {
+        let received = match &self.doctor_scan {
+            DoctorScanState::Running {
+                generation,
+                receiver,
+                ..
+            } => match receiver.try_recv() {
+                Ok((received_generation, gathered)) => {
+                    Some((received_generation == *generation, gathered))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The worker vanished. Report it once, against the
+                    // first subsystem, rather than as four identical copies.
+                    Some((
+                        true,
+                        DoctorGathered {
+                            mount_root_safety: Gathered::Failed(
+                                "the Doctor worker stopped unexpectedly".to_string(),
+                            ),
+                            database: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            source_health: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            transactions: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                        },
+                    ))
+                }
+            },
+            DoctorScanState::NotRun | DoctorScanState::Ready(_) => None,
+        };
+        let Some((is_current, gathered)) = received else {
+            return;
+        };
+        if !is_current {
+            // A newer run superseded this one; discard it and keep waiting.
+            return;
+        }
+
+        // `cached_health_issues` needs `&mut self`; copying the small,
+        // already-built vector out ends that borrow before the immutable
+        // borrows below - the same pattern the Health tab already uses.
+        let health_issues = self.cached_health_issues().to_vec();
+        let doctor_report = match &self.state {
+            LoadState::Ready(data) => Gathered::Ready(&data.doctor),
+            LoadState::Loading { .. } | LoadState::Error(_) => Gathered::NotLoaded(
+                "The library has not finished loading, so the archive-scan and mount-status checks were not available.",
+            ),
+        };
+        let retroarch = match &self.retroarch_profiles {
+            RetroArchProfilesState::Ready(discovery) => Gathered::Ready(&discovery.environment),
+            RetroArchProfilesState::Error(message) => Gathered::Failed(message.clone()),
+            RetroArchProfilesState::NotScanned | RetroArchProfilesState::Scanning { .. } => {
+                Gathered::NotLoaded(
+                    "RetroArch profiles have not been discovered in this session. Doctor never starts that scan itself; use Settings to rescan.",
+                )
+            }
+        };
+
+        // The already-computed setup diagnostics, never recomputed here:
+        // recomputing would run the mount-root write probe.
+        let setup = match &self.diagnostics {
+            DiagnosticsState::Ready { report, .. } => Gathered::Ready(report),
+            DiagnosticsState::Error { message, .. } => Gathered::Failed(message.clone()),
+            DiagnosticsState::Loading { .. } => Gathered::NotLoaded(
+                "Configuration diagnostics are still loading. Doctor reuses them rather than re-running them, because that check writes a temporary file to test the mount root.",
+            ),
+        };
+        let inputs = DoctorScanInputs {
+            doctor_report,
+            setup,
+            health_issues: Gathered::Ready(health_issues.as_slice()),
+            source_health: borrowed(&gathered.source_health, |value| value.as_slice()),
+            database: borrowed(&gathered.database, |value| value),
+            mount_root_safety: borrowed(&gathered.mount_root_safety, |value| value),
+            retroarch,
+            transactions: borrowed(&gathered.transactions, |value| value),
+        };
+        let scan = run_doctor_scan(&inputs);
+        let finished_at_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        // Keep the selected finding only if it still exists.
+        if let Some(selected) = &self.doctor_selected_finding
+            && scan.finding(selected).is_none()
+        {
+            self.doctor_selected_finding = None;
+        }
+        self.doctor_scan = DoctorScanState::Ready(Box::new(DoctorScanOutcome {
+            scan,
+            finished_at_unix_seconds,
+        }));
     }
 
     fn poll_setup_action(&mut self, context: &egui::Context) {
@@ -9168,6 +9427,7 @@ impl ArchiveFsApp {
         self.poll_database_load(context);
         self.poll_diagnostics();
         self.poll_setup_action(context);
+        self.poll_doctor_scan();
         self.poll_platform_action(context);
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
@@ -9543,6 +9803,12 @@ impl ArchiveFsApp {
                                 }
                             }
                         }
+                        // The original `DoctorReport` checks, unchanged. The
+                        // Doctor *page* now shows the shared read-only
+                        // findings instead (see `show_doctor_page`), so this
+                        // overlay keeps the older per-check view - and the
+                        // summary/report text that belongs with it -
+                        // reachable rather than dropping either.
                         ToolsOverlay::DoctorChecks => {
                             if show_tools_overlay_header(ui, "Doctor Checks") {
                                 self.tools_overlay = ToolsOverlay::None;
@@ -9551,6 +9817,20 @@ impl ArchiveFsApp {
                                 LoadState::Ready(data) => Some(&data.doctor),
                                 _ => None,
                             };
+                            if let Some(report) = doctor {
+                                ui.label(doctor_summary_text(report));
+                                if widgets::action_button(
+                                    ui,
+                                    "Copy summary",
+                                    widgets::ActionStyle::Secondary,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    let _ = self.clipboard.set_text(doctor_report_text(report));
+                                }
+                                ui.add_space(8.0);
+                            }
                             show_doctor_checks_panel(ui, doctor);
                         }
                         ToolsOverlay::ArchiveInspector => {
@@ -10215,77 +10495,21 @@ impl ArchiveFsApp {
                     widgets::page_header(
                         ui,
                         "Doctor",
-                        "Check ArchiveFS health, with blocking issues and warnings shown first.",
+                        "A read-only check of this ArchiveFS installation. Running it changes nothing.",
                     );
-                    let mut run_requested = false;
-                    {
-                        let doctor = match &self.state {
-                            LoadState::Ready(data) => Some(&data.doctor),
-                            _ => None,
-                        };
-                        if let Some(report) = doctor {
-                            widgets::card(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    let failures = report
-                                        .checks
-                                        .iter()
-                                        .filter(|check| check.status == DoctorStatus::Fail)
-                                        .count();
-                                    let warnings = report
-                                        .checks
-                                        .iter()
-                                        .filter(|check| check.status == DoctorStatus::Warn)
-                                        .count();
-                                    widgets::status_badge(
-                                        ui,
-                                        if failures == 0 {
-                                            "Healthy"
-                                        } else {
-                                            "Needs attention"
-                                        },
-                                        if failures == 0 {
-                                            widgets::StatusTone::Success
-                                        } else {
-                                            widgets::StatusTone::Blocked
-                                        },
-                                    );
-                                    ui.label(doctor_summary_text(report));
-                                    if widgets::action_button(
-                                        ui,
-                                        "Run all checks",
-                                        widgets::ActionStyle::Primary,
-                                        !loading && !busy,
-                                    )
-                                    .clicked()
-                                    {
-                                        run_requested = true;
-                                    }
-                                    if widgets::action_button(
-                                        ui,
-                                        "Copy summary",
-                                        widgets::ActionStyle::Secondary,
-                                        true,
-                                    )
-                                    .clicked()
-                                    {
-                                        let _ = self.clipboard.set_text(doctor_report_text(report));
-                                    }
-                                    if warnings > 0 {
-                                        widgets::status_badge(
-                                            ui,
-                                            format!("{warnings} warnings"),
-                                            widgets::StatusTone::Warning,
-                                        );
-                                    }
-                                })
-                                .inner
-                            });
-                            ui.add_space(12.0);
+                    let action = show_doctor_page(
+                        ui,
+                        &self.doctor_scan,
+                        &mut self.doctor_selected_finding,
+                        &mut self.clipboard,
+                    );
+                    match action {
+                        // Never `self.refresh(context)`: Doctor must not
+                        // reload the application or rescan the library.
+                        Some(DoctorPageAction::RunScan) => {
+                            self.start_doctor_scan(context.clone());
                         }
-                        show_doctor_checks_panel(ui, doctor);
-                    }
-                    if run_requested {
-                        self.refresh(context);
+                        None => {}
                     }
                     return;
                 }
@@ -11861,6 +12085,339 @@ fn show_activity_panel(
         });
     action
 }
+/// The only thing the Doctor page can ask for in Stage 1A. There is no
+/// repair action here by design: findings are read-only, and no finding
+/// renders a clickable fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoctorPageAction {
+    RunScan,
+}
+
+/// The read-only Doctor dashboard.
+///
+/// Shows severity counts, findings grouped by category, and an evidence
+/// panel for the selected finding. Where a repair already exists elsewhere
+/// in ArchiveFS the finding *says so in words* and stops there - Stage 1A
+/// exposes no repair control at all.
+fn show_doctor_page(
+    ui: &mut egui::Ui,
+    state: &DoctorScanState,
+    selected: &mut Option<String>,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<DoctorPageAction> {
+    let mut action = None;
+    let running = state.is_running();
+    let displayed = state.displayed();
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            match displayed {
+                Some(outcome) if outcome.scan.is_healthy() => {
+                    widgets::status_badge(ui, "Healthy", widgets::StatusTone::Success)
+                }
+                Some(outcome) => widgets::status_badge(
+                    ui,
+                    outcome.scan.overall_severity().label(),
+                    doctor_severity_tone(outcome.scan.overall_severity()),
+                ),
+                None => widgets::status_badge(ui, "Not run yet", widgets::StatusTone::Pending),
+            }
+            if widgets::action_button(ui, "Run Doctor", widgets::ActionStyle::Primary, !running)
+                .clicked()
+            {
+                action = Some(DoctorPageAction::RunScan);
+            }
+            if let Some(outcome) = displayed
+                && widgets::action_button(ui, "Copy report", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+            {
+                let _ = clipboard.set_text(doctor_scan_report_text(outcome));
+            }
+        });
+        ui.label(DOCTOR_READ_ONLY_NOTICE);
+        match displayed {
+            Some(outcome) => ui.weak(format!(
+                "Last run: {}",
+                format_unix_timestamp_utc(outcome.finished_at_unix_seconds)
+            )),
+            None => ui.weak("Last run: never"),
+        };
+        if running {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if displayed.is_some() {
+                    "Re-checking… the previous result stays on screen until this finishes."
+                } else {
+                    "Checking…"
+                });
+            });
+        }
+    });
+
+    let Some(outcome) = displayed else {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::empty_state(
+            ui,
+            "No scan has run yet",
+            "Run Doctor to check configuration, the mount root, source folders, the library, the catalogue database and recent installs. Nothing is changed.",
+            None,
+        );
+        return action;
+    };
+
+    let scan = &outcome.scan;
+    ui.add_space(theme::SECTION_GAP);
+    ui.horizontal_wrapped(|ui| {
+        for (severity, count) in scan.counts() {
+            widgets::status_badge(
+                ui,
+                format!("{}: {count}", severity.label()),
+                if count == 0 {
+                    widgets::StatusTone::Pending
+                } else {
+                    doctor_severity_tone(severity)
+                },
+            );
+        }
+    });
+    if scan.merged_duplicate_count > 0 {
+        ui.weak(format!(
+            "{} duplicate finding(s) reported by more than one check were merged.",
+            scan.merged_duplicate_count
+        ));
+    }
+
+    if scan.is_healthy() {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::banner(
+            ui,
+            "Healthy",
+            "No problems detected by the available read-only checks.",
+            widgets::StatusTone::Success,
+        );
+    }
+
+    for (category, findings) in scan.by_category() {
+        ui.add_space(theme::SECTION_GAP);
+        egui::CollapsingHeader::new(format!("{} ({})", category.label(), findings.len()))
+            .id_salt(("doctor-category", category.label()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for finding in findings {
+                    let is_selected = selected.as_deref() == Some(finding.id.as_str());
+                    widgets::card(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            widgets::status_badge(
+                                ui,
+                                finding.severity.label(),
+                                doctor_severity_tone(finding.severity),
+                            );
+                            ui.label(egui::RichText::new(&finding.title).strong());
+                        });
+                        ui.add(egui::Label::new(&finding.explanation).wrap());
+                        if let Some(affected) = &finding.affected {
+                            ui.add(
+                                egui::Label::new(format!("Resource: {}", affected.display)).wrap(),
+                            );
+                            if affected.lossy {
+                                ui.weak(
+                                    "This path contains bytes that are not valid text, so it is shown approximately.",
+                                );
+                            }
+                        }
+                        if widgets::action_button(
+                            ui,
+                            if is_selected { "Hide details" } else { "Details" },
+                            widgets::ActionStyle::Quiet,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            *selected = if is_selected {
+                                None
+                            } else {
+                                Some(finding.id.clone())
+                            };
+                        }
+                        if is_selected {
+                            show_doctor_finding_details(ui, finding);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    show_doctor_coverage(ui, scan);
+    action
+}
+
+/// The selected finding's evidence and provenance. Everything here is
+/// observed fact or existing guidance prose - no invented advice, and no
+/// control that could change anything.
+fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding) {
+    ui.add_space(6.0);
+    ui.separator();
+    if let Some(why) = &finding.why_it_matters {
+        ui.label(egui::RichText::new("Why it matters").strong());
+        ui.add(egui::Label::new(why).wrap());
+    }
+    if let Some(next) = &finding.next_step {
+        ui.label(egui::RichText::new("Recommended next step").strong());
+        ui.add(egui::Label::new(next).wrap());
+    }
+    if !finding.evidence.is_empty() {
+        ui.label(egui::RichText::new("Evidence").strong());
+        for item in &finding.evidence {
+            ui.add(egui::Label::new(format!("• {item}")).wrap());
+        }
+    }
+    if let Some(recovery) = &finding.recovery {
+        // Informational only. Stage 1A deliberately renders no button here:
+        // exposing these safely needs confirmation and post-repair
+        // verification, which is Stage 1B's job.
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(recovery.notice()).wrap());
+    }
+    ui.add_space(4.0);
+    ui.weak(format!(
+        "Reported by {} · finding ID {}",
+        finding.subsystem.label(),
+        finding.id
+    ));
+}
+
+/// What this scan actually covered, what it could not, and what ArchiveFS
+/// does not check at all yet. Without this a clean result would read as
+/// "everything is fine", which would be untrue.
+fn show_doctor_coverage(ui: &mut egui::Ui, scan: &DoctorScan) {
+    egui::CollapsingHeader::new("What was checked")
+        .id_salt("doctor-coverage")
+        .default_open(scan.is_healthy())
+        .show(ui, |ui| {
+            let checked = scan.checked_subsystems();
+            if checked.is_empty() {
+                ui.label("Nothing could be checked in this run.");
+            } else {
+                for entry in checked {
+                    ui.label(format!(
+                        "Checked: {} ({})",
+                        entry.category.label(),
+                        entry.subsystem.label()
+                    ));
+                }
+            }
+            let unavailable = scan.unavailable_subsystems();
+            if !unavailable.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Not checked in this run").strong());
+                for entry in unavailable {
+                    let reason = match &entry.status {
+                        CoverageStatus::Unavailable { reason } => reason.as_str(),
+                        CoverageStatus::Checked => "",
+                    };
+                    ui.add(
+                        egui::Label::new(format!("{}: {reason}", entry.category.label())).wrap(),
+                    );
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Not checked by ArchiveFS yet").strong());
+            ui.weak(
+                "These are not covered by the result above, so a healthy result does not mean they are fine.",
+            );
+            for deferred in scan.deferred {
+                ui.add(egui::Label::new(format!("{}: {}", deferred.name, deferred.reason)).wrap());
+            }
+        });
+}
+
+fn doctor_severity_tone(severity: DoctorSeverity) -> widgets::StatusTone {
+    match severity {
+        DoctorSeverity::Critical | DoctorSeverity::Error => widgets::StatusTone::Blocked,
+        DoctorSeverity::Warning => widgets::StatusTone::Warning,
+        DoctorSeverity::Info => widgets::StatusTone::Info,
+        DoctorSeverity::Healthy => widgets::StatusTone::Success,
+    }
+}
+
+/// The exact statement shown on the Doctor page, kept as one constant so the
+/// GUI and its tests cannot drift.
+const DOCTOR_READ_ONLY_NOTICE: &str = "This scan is read-only: it inspects configuration, existing files and existing records only. It never creates, mounts, unmounts, repairs, rebuilds or removes anything.";
+
+/// Plain-text form of a scan, for "Copy report".
+fn doctor_scan_report_text(outcome: &DoctorScanOutcome) -> String {
+    let scan = &outcome.scan;
+    let mut lines = vec![
+        "ArchiveFS Doctor - read-only diagnostic scan".to_string(),
+        format!(
+            "Last run: {}",
+            format_unix_timestamp_utc(outcome.finished_at_unix_seconds)
+        ),
+        scan.counts()
+            .iter()
+            .map(|(severity, count)| format!("{}: {count}", severity.label()))
+            .collect::<Vec<_>>()
+            .join("  "),
+        String::new(),
+    ];
+    if scan.is_healthy() {
+        lines.push("No problems detected by the available read-only checks.".to_string());
+        lines.push(String::new());
+    }
+    for (category, findings) in scan.by_category() {
+        lines.push(format!("{} ({})", category.label(), findings.len()));
+        for finding in findings {
+            lines.push(format!(
+                "  [{}] {} - {}",
+                finding.severity.label().to_lowercase(),
+                finding.id,
+                finding.title
+            ));
+            lines.push(format!("      {}", finding.explanation));
+            if let Some(affected) = &finding.affected {
+                lines.push(format!("      Resource: {}", affected.display));
+            }
+            if let Some(why) = &finding.why_it_matters {
+                lines.push(format!("      Why it matters: {why}"));
+            }
+            if let Some(next) = &finding.next_step {
+                lines.push(format!("      Next step: {next}"));
+            }
+            for item in &finding.evidence {
+                lines.push(format!("      Evidence: {item}"));
+            }
+            lines.push(format!("      Reported by: {}", finding.subsystem.label()));
+        }
+        lines.push(String::new());
+    }
+    lines.push("Checked:".to_string());
+    for entry in scan.checked_subsystems() {
+        lines.push(format!(
+            "  {} ({})",
+            entry.category.label(),
+            entry.subsystem.label()
+        ));
+    }
+    for entry in scan.unavailable_subsystems() {
+        let reason = match &entry.status {
+            CoverageStatus::Unavailable { reason } => reason.as_str(),
+            CoverageStatus::Checked => "",
+        };
+        lines.push(format!(
+            "  Not checked: {} - {reason}",
+            entry.category.label()
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Not checked by ArchiveFS yet:".to_string());
+    for deferred in scan.deferred {
+        lines.push(format!("  {} - {}", deferred.name, deferred.reason));
+    }
+    lines.join("\n")
+}
+
 fn doctor_summary_text(report: &DoctorReport) -> String {
     let passed = report
         .checks
@@ -37087,6 +37644,397 @@ $Instant Growth [Nayr]\n";
         }
     }
 
+    // --- Doctor Stage 1A ------------------------------------------------
+
+    fn doctor_health_issue(path: &str, category: HealthCategory) -> HealthIssue {
+        HealthIssue {
+            path: PathBuf::from(path),
+            platform: Some("SNES".to_string()),
+            present: category != HealthCategory::Missing,
+            mount_state: Some(MountState::Pending),
+            category,
+            reason: format!("reason for {}", category.label()),
+            retryable: category.is_retryable(),
+            recovery_action: match category {
+                HealthCategory::RetryableFailure => Some(RecoveryAction::RetryMount),
+                _ => None,
+            },
+            last_seen_at: Some("2026-07-31T00:00:00Z".to_string()),
+            size_bytes: Some(4096),
+            modified_time_unix_seconds: Some(1_700_000_000),
+        }
+    }
+
+    /// Builds a real scan through the real runner, so the GUI tests exercise
+    /// the same code path the application does.
+    fn doctor_scan_from(issues: &[HealthIssue]) -> DoctorScan {
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.health_issues = Gathered::Ready(issues);
+        run_doctor_scan(&inputs)
+    }
+
+    fn doctor_outcome(scan: DoctorScan) -> DoctorScanState {
+        DoctorScanState::Ready(Box::new(DoctorScanOutcome {
+            scan,
+            finished_at_unix_seconds: 1_700_000_000,
+        }))
+    }
+
+    fn render_doctor_page(
+        state: &DoctorScanState,
+        selected: &mut Option<String>,
+    ) -> egui::FullOutput {
+        let mut clipboard = InMemoryClipboard::default();
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_doctor_page(ui, state, selected, &mut clipboard);
+            });
+        })
+    }
+
+    #[test]
+    fn doctor_page_states_the_scan_is_read_only() {
+        let output = render_doctor_page(&DoctorScanState::NotRun, &mut None);
+        assert!(rendered_text_contains(&output, "read-only"));
+        assert!(rendered_text_contains(
+            &output,
+            "never creates, mounts, unmounts, repairs, rebuilds or removes anything"
+        ));
+        assert!(rendered_text_contains(&output, "Run Doctor"));
+        assert!(rendered_text_contains(&output, "Last run: never"));
+        assert!(rendered_text_contains(&output, "No scan has run yet"));
+    }
+
+    #[test]
+    fn doctor_page_shows_exact_severity_counts_and_a_last_run_timestamp() {
+        let issues = vec![
+            doctor_health_issue("/roms/a.zip", HealthCategory::TerminalFailure),
+            doctor_health_issue("/roms/b.zip", HealthCategory::Missing),
+            doctor_health_issue("/roms/c.zip", HealthCategory::CachedOnly),
+            doctor_health_issue("/roms/d.zip", HealthCategory::UnknownPlatform),
+        ];
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page(&state, &mut None);
+
+        for expected in [
+            "Critical: 0",
+            "Error: 1",
+            "Warning: 1",
+            "Info: 2",
+            "Last run: ",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_page_groups_findings_by_category_in_stable_order() {
+        let issues = vec![
+            doctor_health_issue("/roms/a.zip", HealthCategory::TerminalFailure),
+            doctor_health_issue("/roms/b.zip", HealthCategory::Missing),
+        ];
+        let scan = doctor_scan_from(&issues);
+        // Mounts precedes Library in `DoctorCategory::ALL`, so the grouped
+        // order the page renders is that order, not insertion order.
+        assert_eq!(
+            scan.by_category()
+                .into_iter()
+                .map(|(category, _)| category)
+                .collect::<Vec<_>>(),
+            vec![DoctorCategory::Mounts, DoctorCategory::Library]
+        );
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut None);
+        assert!(rendered_text_contains(&output, "Mounts (1)"));
+        assert!(rendered_text_contains(&output, "Library (1)"));
+    }
+
+    #[test]
+    fn doctor_page_shows_evidence_only_for_the_selected_finding() {
+        let issues = vec![doctor_health_issue("/roms/a.zip", HealthCategory::Missing)];
+        let state = doctor_outcome(doctor_scan_from(&issues));
+
+        let collapsed = render_doctor_page(&state, &mut None);
+        assert!(!rendered_text_contains(&collapsed, "Evidence"));
+        assert!(rendered_text_contains(&collapsed, "Details"));
+
+        let mut selected = Some("library.archive_missing".to_string());
+        let expanded = render_doctor_page(&state, &mut selected);
+        for expected in [
+            "Evidence",
+            "Classification: Missing",
+            "Last seen: 2026-07-31T00:00:00Z",
+            "Reported by archive health",
+            "library.archive_missing",
+            "Hide details",
+        ] {
+            assert!(
+                rendered_text_contains(&expanded, expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_page_shows_why_it_matters_and_the_next_step_when_one_exists() {
+        let setup = SetupDiagnostics {
+            config_path: Some(PathBuf::from("/config/config.toml")),
+            config_path_error: None,
+            config_missing: false,
+            mount_root: Some(PathBuf::from("/mount")),
+            can_create_mount_root: true,
+            ready_for_scanning: false,
+            ready_for_actions: false,
+            config_identity: ConfigIdentity {
+                config_path: Some(PathBuf::from("/config/config.toml")),
+                content_digest: None,
+            },
+            checks: vec![SetupDiagnostic {
+                name: "ratarmount is available".to_string(),
+                status: SetupDiagnosticStatus::Error,
+                detail: "ratarmount was not found.".to_string(),
+                why_it_matters: "ArchiveFS uses ratarmount to expose archive contents.".to_string(),
+                next_step: "Install ratarmount and ensure it is available on PATH.".to_string(),
+            }],
+        };
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.setup = Gathered::Ready(&setup);
+        let scan = run_doctor_scan(&inputs);
+        let id = scan.findings[0].id.clone();
+        let state = doctor_outcome(scan);
+
+        let output = render_doctor_page(&state, &mut Some(id));
+        assert!(rendered_text_contains(&output, "Why it matters"));
+        assert!(rendered_text_contains(
+            &output,
+            "ArchiveFS uses ratarmount to expose archive contents."
+        ));
+        assert!(rendered_text_contains(&output, "Recommended next step"));
+        assert!(rendered_text_contains(
+            &output,
+            "Install ratarmount and ensure it is available on PATH."
+        ));
+    }
+
+    /// Stage 1A states that a repair exists but never offers one. The words
+    /// are informational; there is no control of any kind.
+    #[test]
+    fn doctor_page_names_an_existing_repair_without_offering_it() {
+        let issues = vec![doctor_health_issue(
+            "/roms/a.zip",
+            HealthCategory::RetryableFailure,
+        )];
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page(&state, &mut Some("mounts.retryable_failure".to_string()));
+
+        assert!(rendered_text_contains(
+            &output,
+            "A repair action already exists elsewhere in ArchiveFS"
+        ));
+        assert!(rendered_text_contains(&output, "Library → Health, Retry"));
+        // No repair control is rendered anywhere on the page.
+        for forbidden in [
+            "Retry mount",
+            "Remount",
+            "Force unmount",
+            "Clean up",
+            "Repair",
+            "Fix",
+            "Roll back",
+            "Remove missing",
+            "Rescan",
+        ] {
+            assert_eq!(
+                count_exact_text_occurrences(&output, forbidden),
+                0,
+                "Stage 1A must render no repair control, but found `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_page_shows_a_healthy_result_rather_than_an_empty_screen() {
+        let state = doctor_outcome(doctor_scan_from(&[]));
+        let output = render_doctor_page(&state, &mut None);
+        assert!(rendered_text_contains(&output, "Healthy"));
+        assert!(rendered_text_contains(
+            &output,
+            "No problems detected by the available read-only checks."
+        ));
+    }
+
+    /// A healthy result must never read as "everything was checked".
+    #[test]
+    fn doctor_page_lists_unchecked_and_deferred_checks_alongside_a_healthy_result() {
+        let state = doctor_outcome(doctor_scan_from(&[]));
+        let output = render_doctor_page(&state, &mut None);
+
+        assert!(rendered_text_contains(&output, "What was checked"));
+        assert!(rendered_text_contains(&output, "Not checked in this run"));
+        assert!(rendered_text_contains(
+            &output,
+            "Not checked by ArchiveFS yet"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "a healthy result does not mean they are fine"
+        ));
+        for deferred in ["Free disk space", "Emulator profile writability", "Repairs"] {
+            assert!(
+                rendered_text_contains(&output, deferred),
+                "the deferred check `{deferred}` must be visible"
+            );
+        }
+        // And nothing claims a pass for a check that never ran.
+        assert_eq!(
+            count_exact_text_occurrences(&output, "All checks passed"),
+            0
+        );
+    }
+
+    #[test]
+    fn doctor_page_renders_long_unicode_paths_without_panicking() {
+        let long_name = "ロング".repeat(150);
+        let path = format!("/roms/{long_name}/ゲーム 💾 [!].zip");
+        let issues = vec![doctor_health_issue(&path, HealthCategory::Missing)];
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page(&state, &mut Some("library.archive_missing".to_string()));
+        assert!(rendered_text_contains(&output, "ゲーム 💾 [!].zip"));
+        assert!(rendered_text_contains(&output, "Evidence"));
+    }
+
+    #[test]
+    fn doctor_page_keeps_the_previous_result_visible_while_a_new_run_is_in_flight() {
+        let issues = vec![doctor_health_issue("/roms/a.zip", HealthCategory::Missing)];
+        let (_sender, receiver) = mpsc::channel();
+        let state = DoctorScanState::Running {
+            generation: RefreshGeneration::INITIAL,
+            receiver,
+            previous: Some(Box::new(DoctorScanOutcome {
+                scan: doctor_scan_from(&issues),
+                finished_at_unix_seconds: 1_700_000_000,
+            })),
+        };
+        let output = render_doctor_page(&state, &mut None);
+        assert!(rendered_text_contains(
+            &output,
+            "the previous result stays on screen"
+        ));
+        assert!(rendered_text_contains(&output, "Library (1)"));
+        assert!(state.is_running());
+    }
+
+    /// The core rule: Run Doctor must not reload the application, rescan the
+    /// library, or disturb any existing state.
+    #[test]
+    fn running_doctor_does_not_refresh_or_reload_the_application() {
+        let mut app = app_for_operation_tests();
+        let state_before = match &app.state {
+            LoadState::Ready(data) => std::ptr::from_ref(data.as_ref()) as usize,
+            _ => panic!("fixture must be Ready"),
+        };
+        let refresh_generation_before = app.refresh_generation;
+        let snapshot_generation_before = app.snapshot_generation;
+        let database_generation_before = app.database_generation;
+
+        app.start_doctor_scan(egui::Context::default());
+
+        assert!(app.doctor_scan.is_running(), "the scan started");
+        assert_eq!(
+            match &app.state {
+                LoadState::Ready(data) => std::ptr::from_ref(data.as_ref()) as usize,
+                _ => panic!("state must still be Ready"),
+            },
+            state_before,
+            "Run Doctor replaced the loaded application state"
+        );
+        assert_eq!(
+            app.refresh_generation, refresh_generation_before,
+            "Run Doctor triggered an application refresh"
+        );
+        assert_eq!(app.snapshot_generation, snapshot_generation_before);
+        assert_eq!(
+            app.database_generation, database_generation_before,
+            "Run Doctor touched the database worker"
+        );
+    }
+
+    #[test]
+    fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
+        let mut app = app_for_operation_tests();
+        // A result carrying an older generation must be ignored.
+        let (sender, receiver) = mpsc::channel();
+        app.doctor_scan_generation = RefreshGeneration::INITIAL.next().next();
+        app.doctor_scan = DoctorScanState::Running {
+            generation: app.doctor_scan_generation,
+            receiver,
+            previous: None,
+        };
+        sender
+            .send((
+                RefreshGeneration::INITIAL,
+                DoctorGathered {
+                    mount_root_safety: Gathered::NotLoaded("stale"),
+                    database: Gathered::NotLoaded("stale"),
+                    source_health: Gathered::NotLoaded("stale"),
+                    transactions: Gathered::NotLoaded("stale"),
+                },
+            ))
+            .expect("send");
+        app.poll_doctor_scan();
+        assert!(
+            app.doctor_scan.is_running(),
+            "a stale result must not complete the run"
+        );
+    }
+
+    #[test]
+    fn a_current_doctor_run_completes_and_records_when_it_finished() {
+        let mut app = app_for_operation_tests();
+        let (sender, receiver) = mpsc::channel();
+        app.doctor_scan = DoctorScanState::Running {
+            generation: app.doctor_scan_generation,
+            receiver,
+            previous: None,
+        };
+        sender
+            .send((
+                app.doctor_scan_generation,
+                DoctorGathered {
+                    mount_root_safety: Gathered::Failed(
+                        "the mount root could not be inspected".to_string(),
+                    ),
+                    database: Gathered::NotLoaded("no database"),
+                    source_health: Gathered::NotLoaded("no sources"),
+                    transactions: Gathered::NotLoaded("no history"),
+                },
+            ))
+            .expect("send");
+        app.poll_doctor_scan();
+
+        let outcome = match &app.doctor_scan {
+            DoctorScanState::Ready(outcome) => outcome,
+            _ => panic!("the run must complete"),
+        };
+        assert!(outcome.finished_at_unix_seconds > 0);
+        // A failed gather becomes a visible finding, not a panic or a gap.
+        let failure = outcome
+            .scan
+            .finding("doctor.adapter_failed.destination_safety")
+            .expect("the gather failure is reported");
+        assert_eq!(failure.severity, DoctorSeverity::Error);
+        assert!(
+            failure
+                .evidence
+                .iter()
+                .any(|item| item.contains("the mount root could not be inspected"))
+        );
+    }
+
     fn app_for_operation_tests() -> ArchiveFsApp {
         ArchiveFsApp {
             state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
@@ -37094,6 +38042,9 @@ $Instant Growth [Nayr]\n";
                 database_path: PathBuf::from("/config/library.sqlite3"),
             },
             database_generation: DatabaseGeneration::INITIAL,
+            doctor_scan: DoctorScanState::NotRun,
+            doctor_scan_generation: RefreshGeneration::INITIAL,
+            doctor_selected_finding: None,
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,

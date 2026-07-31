@@ -17,6 +17,10 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 mod database;
+/// Read-only Doctor diagnostics: one shared finding model plus adapters
+/// over the existing per-subsystem reports. See the module documentation
+/// for the read-only contract.
+pub mod diagnostics;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
