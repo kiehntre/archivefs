@@ -136,6 +136,35 @@ impl<'a> DoctorScanInputs<'a> {
     }
 }
 
+/// The total outcome of resolving one finding by identity.
+///
+/// Deliberately total rather than `Option`: each way a lookup can fail is a
+/// different refusal with a different explanation, and collapsing them would
+/// make "that resource is not attached to that finding" indistinguishable
+/// from "that finding does not exist".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingLookup<'a> {
+    Found(&'a Finding),
+    /// No finding in this scan has that id.
+    UnknownId,
+    /// Findings with that id exist, but none carries that affected resource.
+    /// A supplied resource selects among existing findings; it can never
+    /// introduce a new target.
+    ResourceNotAttached,
+    /// Several findings share that id and no resource was supplied, so
+    /// acting would repair a guess.
+    Ambiguous(usize),
+}
+
+impl<'a> FindingLookup<'a> {
+    pub fn found(self) -> Option<&'a Finding> {
+        match self {
+            Self::Found(finding) => Some(finding),
+            Self::UnknownId | Self::ResourceNotAttached | Self::Ambiguous(_) => None,
+        }
+    }
+}
+
 /// What one Doctor run produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorScan {
@@ -242,20 +271,42 @@ impl DoctorScan {
     /// Resolves exactly one finding by its full identity - the same
     /// `(id, affected resource)` pair duplicate suppression keys on.
     ///
-    /// `Err(count)` when the id alone is ambiguous and no resource was
-    /// given: acting on a guess would repair the wrong resource. `Ok(None)`
-    /// when nothing matches at all.
-    pub fn finding_for(&self, id: &str, affected: Option<&str>) -> Result<Option<&Finding>, usize> {
+    /// # A supplied resource can only *select*, never *introduce*
+    ///
+    /// `affected` is matched for exact equality against the `affected`
+    /// [`EncodedPath::display`] of a finding this scan actually reproduced.
+    /// It is a selector among existing findings and nothing else:
+    ///
+    /// - it cannot name a resource the finding does not carry, even if that
+    ///   resource exists on disk and would itself be a legitimate target of
+    ///   the same repair;
+    /// - it cannot attach a resource to a finding whose `affected` is `None`;
+    /// - it cannot borrow a resource from a finding with a different id;
+    /// - there is no fallback: a non-matching resource resolves to
+    ///   [`FindingLookup::ResourceNotAttached`], never to the first candidate.
+    ///
+    /// [`EncodedPath::display`]: crate::emulator_environment::EncodedPath::display
+    pub fn finding_for(&self, id: &str, affected: Option<&str>) -> FindingLookup<'_> {
         let candidates = self.findings_with_id(id);
+        if candidates.is_empty() {
+            return FindingLookup::UnknownId;
+        }
         match affected {
-            Some(affected) => Ok(candidates.into_iter().find(|finding| {
-                finding
-                    .affected
-                    .as_ref()
-                    .is_some_and(|path| path.display == affected)
-            })),
-            None if candidates.len() > 1 => Err(candidates.len()),
-            None => Ok(candidates.into_iter().next()),
+            Some(affected) => candidates
+                .into_iter()
+                .find(|finding| {
+                    finding
+                        .affected
+                        .as_ref()
+                        .is_some_and(|path| path.display == affected)
+                })
+                .map_or(FindingLookup::ResourceNotAttached, FindingLookup::Found),
+            None if candidates.len() > 1 => FindingLookup::Ambiguous(candidates.len()),
+            // `unwrap` is unreachable: emptiness was handled above.
+            None => candidates
+                .into_iter()
+                .next()
+                .map_or(FindingLookup::UnknownId, FindingLookup::Found),
         }
     }
 }

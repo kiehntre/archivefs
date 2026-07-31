@@ -4192,7 +4192,7 @@ impl ArchiveFsApp {
         };
         // Ambiguous by id alone means the caller should have supplied the
         // resource (which `show_doctor_page` always does), so refuse to guess.
-        let Ok(Some(finding)) = outcome.scan.finding_for(&finding_id, None) else {
+        let Some(finding) = outcome.scan.finding_for(&finding_id, None).found() else {
             return;
         };
         self.doctor_repair_review = Some(DoctorRepairReview {
@@ -4216,9 +4216,12 @@ impl ArchiveFsApp {
         let Some(outcome) = self.doctor_scan.displayed() else {
             return;
         };
-        let Ok(Some(finding)) = outcome
+        // The resource comes from a finding this scan reproduced, and is
+        // re-matched against it here - it can only select, never introduce.
+        let Some(finding) = outcome
             .scan
             .finding_for(&finding_id, Some(affected.as_str()))
+            .found()
         else {
             return;
         };

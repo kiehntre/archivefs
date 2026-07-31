@@ -72,7 +72,7 @@ pub mod runner;
 #[cfg(test)]
 mod tests;
 
-pub use runner::{DoctorScan, DoctorScanInputs, Gathered, run_doctor_scan};
+pub use runner::{DoctorScan, DoctorScanInputs, FindingLookup, Gathered, run_doctor_scan};
 
 // --- Severity -------------------------------------------------------------
 

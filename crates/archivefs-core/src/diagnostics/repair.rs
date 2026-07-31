@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{DoctorScan, DoctorSeverity, Finding};
+use super::{DoctorScan, DoctorSeverity, Finding, FindingLookup};
 use crate::emulator_environment::EncodedPath;
 use crate::{
     ArchiveHealth, Config, MountState, build_and_write_archive_index_to, clean_mount_root,
@@ -234,6 +234,11 @@ pub enum DoctorRepairRejection {
     /// Several findings share that id and no resource was given, so acting
     /// would repair a guess.
     AmbiguousFinding,
+    /// A resource was named that the finding does not carry. A supplied
+    /// resource selects among findings this scan reproduced; it can never
+    /// introduce a new target, even one that exists on disk and would
+    /// otherwise be a legitimate target of the same repair.
+    ResourceNotAttachedToFinding,
     /// The finding exists but does not offer this action.
     ActionNotOfferedForFinding,
     /// The finding offers a repair but carries no affected resource, so
@@ -269,6 +274,9 @@ impl DoctorRepairRejection {
             }
             Self::AmbiguousFinding => {
                 "Several findings share that identifier. Name the exact resource to repair."
+            }
+            Self::ResourceNotAttachedToFinding => {
+                "That resource is not the one this finding reported. A resource can only pick out a finding Doctor already found; it cannot point a repair at something else. Run Doctor again and use the resource it reports."
             }
             Self::ActionNotOfferedForFinding => "That repair is not offered for that finding.",
             Self::MissingAffectedResource => {
@@ -398,15 +406,31 @@ pub fn execute_doctor_repair(
     let spec = request.action.spec();
 
     // Gate 1: exactly one finding must still match, by full identity.
+    //
+    // `request.affected` is consumed *here and nowhere else*: every step
+    // below reads `finding.affected`, the value this scan actually recorded.
+    // A resource the finding does not carry is refused now, before any
+    // planning and long before any mutation - it cannot become a target.
     let finding = match context
         .scan
         .finding_for(&request.finding_id, request.affected.as_deref())
     {
-        Ok(Some(finding)) => finding,
-        Ok(None) => {
+        FindingLookup::Found(finding) => finding,
+        FindingLookup::UnknownId => {
             return reject(request, spec, None, DoctorRepairRejection::UnknownFinding);
         }
-        Err(_) => {
+        FindingLookup::ResourceNotAttached => {
+            return reject(
+                request,
+                spec,
+                // Deliberately not echoed into the record: an unmatched
+                // user-supplied path must never appear where a validated
+                // target belongs.
+                None,
+                DoctorRepairRejection::ResourceNotAttachedToFinding,
+            );
+        }
+        FindingLookup::Ambiguous(_) => {
             return reject(request, spec, None, DoctorRepairRejection::AmbiguousFinding);
         }
     };
@@ -679,8 +703,16 @@ fn validate_rebuild_index(
     finding: &Finding,
     context: &DoctorRepairContext<'_>,
 ) -> Result<RepairTarget, DoctorRepairRejection> {
-    // The index is ArchiveFS's own derived cache, so the guard is on the
-    // destination rather than on a finding-supplied path.
+    // The index path is supplied by the caller (always `default_index_path()`
+    // in production; injected in tests), which makes it the one target not
+    // derived from the finding. So require the finding to name it: the
+    // index-freshness adapter records the exact path it checked, and this
+    // refuses to rebuild anything else. Together with `affected_path`'s lossy
+    // check, a repair can only ever write the index the finding reported.
+    let named = affected_path(finding)?;
+    if named != context.index_path {
+        return Err(DoctorRepairRejection::ResourceNotAttachedToFinding);
+    }
     guard_against_source_roots(context.index_path, context.config)?;
     if !context.index_path.is_absolute() {
         return Err(DoctorRepairRejection::PathOutsideMountRoot);
@@ -700,7 +732,6 @@ fn validate_rebuild_index(
     {
         return Err(DoctorRepairRejection::SourceMissing);
     }
-    let _ = finding;
     Ok(RepairTarget::Index)
 }
 

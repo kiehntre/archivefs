@@ -1372,3 +1372,327 @@ fn a_dry_run_needs_no_confirmation_because_it_changes_nothing() {
     assert!(leftover.is_dir());
     assert_eq!(before, snapshot(&fixture.root));
 }
+
+// --- `--resource` can only select, never introduce ------------------------
+
+/// The core invariant: a supplied resource is matched against the `affected`
+/// path of a finding this scan reproduced. It cannot point a repair at
+/// anything else - not even at a folder that is genuinely stale and would be
+/// a perfectly legitimate target of the same repair on its own.
+#[test]
+fn a_resource_not_attached_to_the_finding_is_refused_even_when_it_is_itself_repairable() {
+    let fixture = Fixture::new("resource-not-attached");
+    let config = fixture.config();
+    let named = fixture.dir("mnt/Named Game");
+    let other = fixture.dir("mnt/Other Game");
+    let before = snapshot(&fixture.root);
+
+    // Both folders are stale, so each has its own finding.
+    let stale = crate::plan_stale_mount_directories(&config).expect("plan");
+    assert!(
+        stale.contains(&named) && stale.contains(&other),
+        "{stale:?}"
+    );
+
+    // Build a scan containing *only* the finding for `named`, then ask to
+    // repair it while naming `other`.
+    let only_named = [named.clone()];
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.stale_mount_directories = Gathered::Ready(&only_named);
+    let scan = run_doctor_scan(&inputs);
+
+    let outcome = execute_doctor_repair(
+        &request_for(
+            DoctorRepairAction::CleanMountPath,
+            "mount_root.stale_mount_directory",
+            &other,
+        ),
+        &context(&config, &scan, &fixture.index_path()),
+    );
+
+    assert_eq!(outcome.record.status, DoctorRepairStatus::Rejected);
+    assert_eq!(
+        outcome.record.rejection,
+        Some(DoctorRepairRejection::ResourceNotAttachedToFinding),
+        "a resource the finding does not carry must be refused"
+    );
+    assert!(
+        other.is_dir(),
+        "the named-but-unattached folder is untouched"
+    );
+    assert!(named.is_dir(), "and so is the finding's own folder");
+    assert_eq!(before, snapshot(&fixture.root), "nothing changed at all");
+}
+
+/// The refusal happens before any planning, so an unattached resource never
+/// reaches a validation step that could resolve or act on it.
+#[test]
+fn an_unattached_resource_is_refused_before_any_planning_or_mutation() {
+    let fixture = Fixture::new("resource-before-planning");
+    let config = fixture.config();
+    let named = fixture.dir("mnt/Named Game");
+    let only_named = [named.clone()];
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.stale_mount_directories = Gathered::Ready(&only_named);
+    let scan = run_doctor_scan(&inputs);
+
+    // A path that does not exist at all: if planning had run, it would have
+    // been refused as stale instead. Getting `ResourceNotAttachedToFinding`
+    // proves the identity gate ran first.
+    let ghost = fixture.root.join("mnt/Never Existed");
+    let outcome = execute_doctor_repair(
+        &request_for(
+            DoctorRepairAction::CleanMountPath,
+            "mount_root.stale_mount_directory",
+            &ghost,
+        ),
+        &context(&config, &scan, &fixture.index_path()),
+    );
+    assert_eq!(
+        outcome.record.rejection,
+        Some(DoctorRepairRejection::ResourceNotAttachedToFinding),
+        "identity must be checked before staleness or path safety"
+    );
+    // And the refusal never echoes the unmatched path as if it were a target.
+    assert!(
+        outcome.record.affected.is_none(),
+        "an unvalidated path must not appear where a target belongs"
+    );
+    assert!(
+        !outcome.record.summary.contains("Never Existed"),
+        "{}",
+        outcome.record.summary
+    );
+}
+
+/// A resource cannot be attached to a finding that reported none.
+#[test]
+fn a_resource_cannot_be_attached_to_a_finding_that_has_none() {
+    let fixture = Fixture::new("resource-on-none");
+    let config = fixture.config();
+    // Two leftovers, so the aggregate summary finding exists. It carries no
+    // affected resource of its own.
+    let planned = planned_mount_paths(&fixture, &config, &["One", "Two"]);
+    let scan = scan_with_stale_directories(&config);
+    let summary = scan
+        .finding("mount_root.stale_mount_directories")
+        .expect("summary");
+    assert!(summary.affected.is_none(), "the summary names no resource");
+    let before = snapshot(&fixture.root);
+
+    let outcome = execute_doctor_repair(
+        &request_for(
+            DoctorRepairAction::CleanMountRoot,
+            "mount_root.stale_mount_directories",
+            &planned[0],
+        ),
+        &context(&config, &scan, &fixture.index_path()),
+    );
+    assert_eq!(
+        outcome.record.rejection,
+        Some(DoctorRepairRejection::ResourceNotAttachedToFinding)
+    );
+    assert_eq!(before, snapshot(&fixture.root));
+}
+
+/// A resource belonging to a *different* finding id cannot be borrowed.
+#[test]
+fn a_resource_from_another_finding_cannot_be_borrowed() {
+    let fixture = Fixture::new("resource-borrowed");
+    let config = fixture.config();
+    let leftover = fixture.dir("mnt/Old Game");
+    let archive = fixture.file("roms/game.zip", b"bytes");
+
+    // One scan holding both a leftover-folder finding and a retry-mount
+    // finding, each with its own resource.
+    let stale = [leftover.clone()];
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.stale_mount_directories = Gathered::Ready(&stale);
+    let mut scan = run_doctor_scan(&inputs);
+    scan.findings
+        .extend(scan_with_retry_finding(&archive).findings);
+    let before = snapshot(&fixture.root);
+
+    // The archive belongs to the retry finding, not to the cleanup finding.
+    let outcome = execute_doctor_repair(
+        &request_for(
+            DoctorRepairAction::CleanMountPath,
+            "mount_root.stale_mount_directory",
+            &archive,
+        ),
+        &context(&config, &scan, &fixture.index_path()),
+    );
+    assert_eq!(
+        outcome.record.rejection,
+        Some(DoctorRepairRejection::ResourceNotAttachedToFinding)
+    );
+    assert!(archive.is_file(), "the archive is untouched");
+    assert_eq!(before, snapshot(&fixture.root));
+}
+
+/// Exact string equality, not prefix or suffix matching.
+#[test]
+fn a_resource_must_match_the_findings_path_exactly() {
+    let fixture = Fixture::new("resource-exact");
+    let config = fixture.config();
+    let exact = fixture.dir("mnt/Old Game");
+    let stale = [exact.clone()];
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.stale_mount_directories = Gathered::Ready(&stale);
+    let scan = run_doctor_scan(&inputs);
+    let before = snapshot(&fixture.root);
+
+    let display = exact.display().to_string();
+    for near_miss in [
+        format!("{display}/"),
+        format!("{display}/.."),
+        format!("{display}x"),
+        display.trim_end_matches("Old Game").to_string(),
+        display.to_ascii_uppercase(),
+        format!(" {display}"),
+    ] {
+        let outcome = execute_doctor_repair(
+            &DoctorRepairRequest {
+                action: DoctorRepairAction::CleanMountPath,
+                finding_id: "mount_root.stale_mount_directory".to_string(),
+                affected: Some(near_miss.clone()),
+                confirmed: true,
+                dry_run: false,
+            },
+            &context(&config, &scan, &fixture.index_path()),
+        );
+        assert_eq!(
+            outcome.record.rejection,
+            Some(DoctorRepairRejection::ResourceNotAttachedToFinding),
+            "`{near_miss}` must not match `{display}`"
+        );
+    }
+    assert!(exact.is_dir());
+    assert_eq!(before, snapshot(&fixture.root));
+
+    // The exact string does select it.
+    let outcome = execute_doctor_repair(
+        &request_for(
+            DoctorRepairAction::CleanMountPath,
+            "mount_root.stale_mount_directory",
+            &exact,
+        ),
+        &context(&config, &scan, &fixture.index_path()),
+    );
+    assert_eq!(
+        outcome.record.status,
+        DoctorRepairStatus::Succeeded,
+        "{:?}",
+        outcome.record
+    );
+}
+
+/// A dry run applies the identity gate too, so `--dry-run --resource <other>`
+/// cannot be used to probe or plan against an unattached path.
+#[test]
+fn a_dry_run_also_refuses_an_unattached_resource() {
+    let fixture = Fixture::new("resource-dry-run");
+    let config = fixture.config();
+    let named = fixture.dir("mnt/Named Game");
+    let other = fixture.dir("mnt/Other Game");
+    let only_named = [named];
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.stale_mount_directories = Gathered::Ready(&only_named);
+    let scan = run_doctor_scan(&inputs);
+
+    let outcome = execute_doctor_repair(
+        &DoctorRepairRequest {
+            action: DoctorRepairAction::CleanMountPath,
+            finding_id: "mount_root.stale_mount_directory".to_string(),
+            affected: Some(other.display().to_string()),
+            confirmed: true,
+            dry_run: true,
+        },
+        &context(&config, &scan, &fixture.index_path()),
+    );
+    assert_eq!(outcome.record.status, DoctorRepairStatus::Rejected);
+    assert_eq!(
+        outcome.record.rejection,
+        Some(DoctorRepairRejection::ResourceNotAttachedToFinding),
+        "a dry run must not plan against an unattached resource either"
+    );
+}
+
+/// The lookup itself is total, and each refusal is distinguishable.
+#[test]
+fn the_finding_lookup_distinguishes_every_way_it_can_fail() {
+    let fixture = Fixture::new("lookup-total");
+    let config = fixture.config();
+    let one = fixture.dir("mnt/One");
+    let two = fixture.dir("mnt/Two");
+    let scan = scan_with_stale_directories(&config);
+
+    // Unknown id.
+    assert_eq!(
+        scan.finding_for("no.such.finding", None),
+        crate::diagnostics::FindingLookup::UnknownId
+    );
+    // Ambiguous: two findings share the per-folder id.
+    assert!(matches!(
+        scan.finding_for("mount_root.stale_mount_directory", None),
+        crate::diagnostics::FindingLookup::Ambiguous(2)
+    ));
+    // Resource not attached.
+    assert_eq!(
+        scan.finding_for("mount_root.stale_mount_directory", Some("/somewhere/else")),
+        crate::diagnostics::FindingLookup::ResourceNotAttached
+    );
+    // Found, for each real resource.
+    for path in [&one, &two] {
+        let found = scan
+            .finding_for(
+                "mount_root.stale_mount_directory",
+                Some(path.display().to_string().as_str()),
+            )
+            .found()
+            .expect("the finding is selected by its own resource");
+        assert_eq!(
+            found.affected.as_ref().expect("affected").display,
+            path.display().to_string()
+        );
+    }
+    // An unambiguous id needs no resource.
+    let index_scan = scan_with_index_finding(&fixture.index_path());
+    assert!(
+        index_scan
+            .finding_for("library.index_out_of_date", None)
+            .found()
+            .is_some()
+    );
+}
+
+/// `RebuildIndex`'s destination is the one target supplied by the caller
+/// rather than by the finding, so it must equal the path the finding
+/// reported. A context pointed at a different index is refused.
+#[test]
+fn rebuild_index_refuses_an_index_path_the_finding_did_not_name() {
+    let fixture = Fixture::new("rebuild-other-index");
+    let config = fixture.config();
+    fixture.file("roms/game.zip", b"bytes");
+    let named = fixture.index_path();
+    let other = fixture.root.join("data/somewhere-else.json");
+    // The finding reports `named`...
+    let scan = scan_with_index_finding(&named);
+    let before = snapshot(&fixture.root);
+
+    // ...but the context points at a different file.
+    let outcome = execute_doctor_repair(
+        &request(
+            DoctorRepairAction::RebuildIndex,
+            "library.index_out_of_date",
+        ),
+        &context(&config, &scan, &other),
+    );
+    assert_eq!(outcome.record.status, DoctorRepairStatus::Rejected);
+    assert_eq!(
+        outcome.record.rejection,
+        Some(DoctorRepairRejection::ResourceNotAttachedToFinding)
+    );
+    assert!(!other.exists(), "no index was written anywhere else");
+    assert_eq!(before, snapshot(&fixture.root));
+}

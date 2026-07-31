@@ -4188,11 +4188,13 @@ fn gather_doctor_scan() -> DoctorScan {
 
 /// Runs one Doctor repair.
 ///
-/// The target is never taken from the command line: `--finding` (and
-/// `--resource`, when several findings share an id) names a finding in a
-/// freshly gathered scan, and every safety gate is re-applied against live
-/// state inside `execute_doctor_repair`. There is no flag that accepts a
-/// filesystem path to operate on.
+/// The target is never taken from the command line. `--finding` (and
+/// `--resource`, when several findings share an id) *selects* a finding in a
+/// freshly gathered scan; `--resource` must equal the resource that finding
+/// itself reported, so it can never introduce a target of its own. Every
+/// safety gate is then re-applied against live state inside
+/// `execute_doctor_repair`. There is no flag that accepts a filesystem path
+/// to operate on.
 fn run_doctor_repair(
     action: DoctorRepairAction,
     finding_id: &str,
@@ -4724,7 +4726,7 @@ fn print_help() {
         "  doctor --findings  Read-only diagnostic scan across configuration, mount root, sources, library, catalogue database and install history, grouped by category with stable finding IDs (--json accepted). Changes nothing; exits 0 whenever the scan completes, whatever it finds."
     );
     println!(
-        "  doctor --repair <action-id> --finding <finding-id>  Perform one existing repair on a finding from a fresh scan. Actions: clean_mount_root, clean_mount_path, retry_mount, rebuild_index. Add --resource <path> when several findings share an ID, --confirm to allow the change, --dry-run to validate without changing anything, --json for machine-readable output. No flag accepts an arbitrary path to operate on: the target is resolved from the finding and revalidated. Exits 0 whenever the command ran, including when the repair was refused."
+        "  doctor --repair <action-id> --finding <finding-id>  Perform one existing repair on a finding from a fresh scan. Actions: clean_mount_root, clean_mount_path, retry_mount, rebuild_index. Add --resource <path> when several findings share an ID; it must exactly match the resource that finding reported, and can only pick out one of Doctor's own findings - it can never point a repair at anything else, even a path that would be a valid target on its own. --confirm to allow the change, --dry-run to validate without changing anything, --json for machine-readable output. No flag accepts an arbitrary path to operate on: the target is resolved from the finding and revalidated. Exits 0 whenever the command ran, including when the repair was refused."
     );
     println!("  config-check   Validate ArchiveFS configuration");
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
