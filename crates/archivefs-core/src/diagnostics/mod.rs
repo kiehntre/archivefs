@@ -46,6 +46,7 @@
 //!   product itself, every check Stage 1A does not perform, so a clean scan
 //!   can never be presented as "everything is fine".
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -66,6 +67,9 @@ use crate::{
     SourceHealthIssue,
 };
 
+pub mod environment;
+pub mod managed;
+pub mod profiles;
 pub mod repair;
 pub mod runner;
 
@@ -147,12 +151,20 @@ impl fmt::Display for DoctorSeverity {
 #[serde(rename_all = "snake_case")]
 pub enum DoctorCategory {
     Configuration,
+    /// Free space on the filesystems ArchiveFS depends on.
+    Storage,
+    /// How those filesystems are mounted.
+    Filesystems,
     MountRoot,
     Mounts,
     Sources,
     Library,
     Database,
     Emulators,
+    /// Discovered emulator profiles and whether ArchiveFS could write to them.
+    EmulatorProfiles,
+    /// ArchiveFS-managed cheat and patch entries.
+    ManagedEntries,
     Transactions,
     /// Doctor reporting on itself - an adapter that could not run.
     Doctor,
@@ -160,14 +172,18 @@ pub enum DoctorCategory {
 
 impl DoctorCategory {
     /// Display order, stable and exhaustive.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 13] = [
         Self::Configuration,
+        Self::Storage,
+        Self::Filesystems,
         Self::MountRoot,
         Self::Mounts,
         Self::Sources,
         Self::Library,
         Self::Database,
         Self::Emulators,
+        Self::EmulatorProfiles,
+        Self::ManagedEntries,
         Self::Transactions,
         Self::Doctor,
     ];
@@ -175,12 +191,16 @@ impl DoctorCategory {
     pub fn label(self) -> &'static str {
         match self {
             Self::Configuration => "Configuration",
+            Self::Storage => "Storage",
+            Self::Filesystems => "Filesystems",
             Self::MountRoot => "Mount root",
             Self::Mounts => "Mounts",
             Self::Sources => "Source folders",
             Self::Library => "Library",
             Self::Database => "Catalogue database",
             Self::Emulators => "Emulators",
+            Self::EmulatorProfiles => "Emulator profiles",
+            Self::ManagedEntries => "Managed entries",
             Self::Transactions => "Installs and rollbacks",
             Self::Doctor => "Doctor itself",
         }
@@ -226,6 +246,16 @@ pub enum DoctorSubsystem {
     MountRootCleanup,
     /// `crate::check_archive_index_freshness`
     ArchiveIndex,
+    /// `diagnostics::environment::filesystem_stat` (`statvfs(3)`)
+    FilesystemCapacity,
+    /// `diagnostics::environment::mount_table` (`/proc/self/mountinfo`)
+    FilesystemMountState,
+    /// `discover_dolphin_profiles` / `discover_pcsx2_profiles` /
+    /// `discover_xenia_profiles`
+    EmulatorProfiles,
+    /// ArchiveFS-managed cheat and patch entries, anchored on install
+    /// journals and on each adapter's own ownership marker.
+    ManagedEntries,
     /// The Doctor runner itself.
     DoctorRunner,
 }
@@ -245,6 +275,10 @@ impl DoctorSubsystem {
             Self::SharedTransactions => "shared_transactions",
             Self::MountRootCleanup => "mount_root_cleanup",
             Self::ArchiveIndex => "archive_index",
+            Self::FilesystemCapacity => "filesystem_capacity",
+            Self::FilesystemMountState => "filesystem_mount_state",
+            Self::EmulatorProfiles => "emulator_profiles",
+            Self::ManagedEntries => "managed_entries",
             Self::DoctorRunner => "doctor_runner",
         }
     }
@@ -261,6 +295,10 @@ impl DoctorSubsystem {
             Self::SharedTransactions => "install history",
             Self::MountRootCleanup => "mount-root cleanup",
             Self::ArchiveIndex => "archive index",
+            Self::FilesystemCapacity => "filesystem capacity",
+            Self::FilesystemMountState => "filesystem mount state",
+            Self::EmulatorProfiles => "emulator profiles",
+            Self::ManagedEntries => "managed entries",
             Self::DoctorRunner => "Doctor runner",
         }
     }
@@ -353,6 +391,62 @@ pub struct Finding {
     /// the target is re-derived from live state at execution time. See
     /// [`repair::execute_doctor_repair`].
     pub repair: Option<repair::DoctorRepairAction>,
+    /// Machine-readable values behind the prose, for `--json` consumers.
+    ///
+    /// Evidence strings stay the human-facing account; these are the same
+    /// facts as typed numbers and flags, so a script never has to parse
+    /// "3.2 GiB free" out of a sentence. Empty for every finding that has no
+    /// measurement to report.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub measurements: BTreeMap<String, Measurement>,
+}
+
+/// One machine-readable value attached to a finding.
+///
+/// Deliberately not `serde_json::Value`: [`Finding`] is `Eq`, and keeping
+/// these values `Eq` means findings stay directly comparable in tests. A
+/// percentage is carried in hundredths for the same reason, and serialised
+/// back out as an ordinary JSON number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Measurement {
+    Text(String),
+    Integer(u64),
+    Flag(bool),
+    PercentHundredths(u32),
+}
+
+impl Measurement {
+    pub fn percent(value: f64) -> Self {
+        Self::PercentHundredths((value.clamp(0.0, 100.0) * 100.0).round() as u32)
+    }
+
+    pub fn text(value: impl Into<String>) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+impl Serialize for Measurement {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(value) => serializer.serialize_str(value),
+            Self::Integer(value) => serializer.serialize_u64(*value),
+            Self::Flag(value) => serializer.serialize_bool(*value),
+            Self::PercentHundredths(value) => serializer.serialize_f64(f64::from(*value) / 100.0),
+        }
+    }
+}
+
+impl fmt::Display for Measurement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(value) => write!(f, "{value}"),
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Flag(value) => write!(f, "{value}"),
+            Self::PercentHundredths(value) => {
+                write!(f, "{:.2}%", f64::from(*value) / 100.0)
+            }
+        }
+    }
 }
 
 impl Finding {
@@ -377,7 +471,20 @@ impl Finding {
             affected: None,
             recovery: None,
             repair: None,
+            measurements: BTreeMap::new(),
         }
+    }
+
+    fn with_measurements(
+        mut self,
+        measurements: impl IntoIterator<Item = (&'static str, Measurement)>,
+    ) -> Self {
+        self.measurements.extend(
+            measurements
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value)),
+        );
+        self
     }
 
     /// Attaches one of Doctor's own repairs to this finding.
@@ -511,20 +618,16 @@ pub struct DeferredCheck {
 /// the GUI and the CLI cannot drift apart on it.
 pub const DEFERRED_CHECKS: &[DeferredCheck] = &[
     DeferredCheck {
-        name: "Free disk space",
-        reason: "ArchiveFS has no free-space check yet in any subsystem.",
+        name: "Per-directory disk quotas",
+        reason: "Free space is now reported per filesystem. Quotas that apply to one user or one directory below the filesystem are not read, so a filesystem can look free while a quota is exhausted.",
     },
     DeferredCheck {
-        name: "Read-only filesystem detection",
-        reason: "Only generic I/O errors are classified today; there is no read-only-filesystem check.",
+        name: "Write access inside a sandbox",
+        reason: "Read-only mounts and permissions are now assessed from metadata. A Flatpak or Snap portal can still refuse a write that permissions appear to allow, and proving that would need a write probe ArchiveFS deliberately does not perform.",
     },
     DeferredCheck {
-        name: "Emulator profile writability",
-        reason: "Writability is probed only for the mount root. Emulator profile directories are checked for existence, not for write access.",
-    },
-    DeferredCheck {
-        name: "Orphaned ArchiveFS-managed cheat entries",
-        reason: "No scanner exists that walks emulator profiles looking for managed entries ArchiveFS no longer tracks.",
+        name: "Managed entries with no install record",
+        reason: "Managed entries are matched against ArchiveFS's install history. PCSX2 .pnach files and GameHacking-managed Dolphin INIs additionally carry in-file ArchiveFS ownership markers. Xenia and RetroArch files carry no marker, so an entry whose install record was deleted cannot be recognised - and ArchiveFS will not guess, because your own entries look identical.",
     },
     DeferredCheck {
         name: "Dolphin, PCSX2 and Xenia diagnostic reports",
@@ -539,8 +642,8 @@ pub const DEFERRED_CHECKS: &[DeferredCheck] = &[
         reason: "These are per-session state. Doctor reads persisted and preloaded state only, so a mount failure appears here only once the library view has observed it.",
     },
     DeferredCheck {
-        name: "Repairs",
-        reason: "Stage 1A is diagnostic only. Doctor states when a repair already exists elsewhere, but never performs one.",
+        name: "Repairs beyond the four safe mount and index actions",
+        reason: "Doctor performs only the four repairs it lists explicitly. Everything else - permission changes, remounting, database repair, removing managed cheat entries, rolling back an interrupted install - is reported and explained, never performed.",
     },
 ];
 
@@ -607,12 +710,16 @@ impl DoctorCategory {
     fn slug(self) -> &'static str {
         match self {
             Self::Configuration => "config",
+            Self::Storage => "filesystem",
+            Self::Filesystems => "filesystem",
             Self::MountRoot => "mount_root",
             Self::Mounts => "mounts",
             Self::Sources => "sources",
             Self::Library => "library",
             Self::Database => "database",
             Self::Emulators => "emulators",
+            Self::EmulatorProfiles => "emulator_profile",
+            Self::ManagedEntries => "managed_entry",
             Self::Transactions => "transactions",
             Self::Doctor => "doctor",
         }

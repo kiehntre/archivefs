@@ -3,6 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::diagnostics::environment::{
+    FreeSpacePolicy, assess_storage, mount_table, storage_resources,
+};
+use archivefs_core::diagnostics::managed::scan_managed_entries;
+use archivefs_core::diagnostics::profiles::{
+    DiscoveredProfiles, assess_emulator_profiles, managed_scan_targets,
+    profile_destination_directories,
+};
 use archivefs_core::diagnostics::repair::{
     DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRequest,
     DoctorRepairStatus, execute_doctor_repair,
@@ -4537,6 +4545,33 @@ fn gather_doctor_scan() -> DoctorScan {
         Err(error) => Gathered::Failed(format!("index path could not be resolved: {error}")),
     };
 
+    // Emulator profiles, then everything that depends on where they live.
+    // Discovery inspects documented paths only and creates nothing; Xenia has
+    // no documented native path, so it is discovered only from roots the user
+    // has already supplied - none from a CLI.
+    let mount_table = mount_table();
+    let discovered = DiscoveredProfiles::from_environment(Vec::new());
+    let profile_report = assess_emulator_profiles(&discovered.borrowed(), mount_table.as_deref());
+
+    let storage = assess_storage(&storage_resources(
+        config.as_ref().ok(),
+        database_path.as_ref().ok().map(PathBuf::as_path),
+        index_path.as_ref().ok().map(PathBuf::as_path),
+        default_shared_history_root().ok().as_deref(),
+        &profile_destination_directories(&profile_report),
+    ));
+
+    // Managed entries are accounted for against the install history. Without
+    // that history there is no ownership record, so nothing can be claimed.
+    let managed = match &transactions {
+        Gathered::Ready(history) => Gathered::Ready(scan_managed_entries(
+            history,
+            &managed_scan_targets(&profile_report),
+        )),
+        Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+        Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+    };
+
     let inputs = DoctorScanInputs {
         doctor_report: Gathered::NotLoaded(
             "The archive-scan and mount-status checks need a library snapshot, which a diagnostic run never builds. Run `archivefs status` or open the GUI for those.",
@@ -4589,6 +4624,14 @@ fn gather_doctor_scan() -> DoctorScan {
                 Gathered::NotLoaded("the index path could not be resolved")
             }
         },
+        storage: Gathered::Ready(&storage),
+        emulator_profiles: Gathered::Ready(&profile_report),
+        managed_entries: match &managed {
+            Gathered::Ready(scan) => Gathered::Ready(scan),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        free_space_policy: FreeSpacePolicy::default(),
     };
     run_doctor_scan(&inputs)
 }
@@ -4732,6 +4775,11 @@ fn format_doctor_scan(scan: &DoctorScan) -> String {
             }
             for item in &finding.evidence {
                 lines.push(format!("      Evidence: {item}"));
+            }
+            // The same facts as the evidence above, as typed values. `--json`
+            // carries these verbatim so a script never parses prose.
+            for (key, value) in &finding.measurements {
+                lines.push(format!("      Measured: {key} = {value}"));
             }
             if let Some(repair) = finding.offered_repair() {
                 lines.push(format!(
@@ -8931,5 +8979,187 @@ mod tests {
         assert!(!json.contains(root.to_string_lossy().as_ref()));
         assert!(human.contains("Read-only bounded selection: yes"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod doctor_stage1c_tests {
+    use super::*;
+    use archivefs_core::diagnostics::environment::{
+        FilesystemGroup, FilesystemStat, MountMode, ResourceRole, StorageAssessment,
+    };
+    use archivefs_core::diagnostics::managed::{
+        ManagedFormat, ManagedScanTarget, scan_managed_entries,
+    };
+    use archivefs_core::emulator_environment::EncodedPath;
+    use archivefs_core::patch_manager::SharedHistoryReport;
+    use std::path::Path;
+
+    fn storage_assessment(available_bytes: u64, read_only: bool) -> StorageAssessment {
+        StorageAssessment {
+            filesystems: vec![FilesystemGroup {
+                representative_path: EncodedPath::from_path(Path::new("/var/lib/archivefs")),
+                device_id: Some(1),
+                mount_point: Some(EncodedPath::from_path(Path::new("/var"))),
+                filesystem_type: Some("ext4".to_string()),
+                mount_mode: if read_only {
+                    MountMode::ReadOnly
+                } else {
+                    MountMode::ReadWrite
+                },
+                stat: Some(FilesystemStat {
+                    available_bytes,
+                    total_bytes: 100 * 1024 * 1024 * 1024,
+                }),
+                roles: vec![ResourceRole::Database],
+                paths: vec![EncodedPath::from_path(Path::new("/var/lib/archivefs"))],
+                evidence_source: "statvfs and /proc/self/mountinfo",
+            }],
+            unassessed: Vec::new(),
+            mount_table_available: true,
+        }
+    }
+
+    fn scan_with(assessment: &StorageAssessment) -> DoctorScan {
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.storage = Gathered::Ready(assessment);
+        run_doctor_scan(&inputs)
+    }
+
+    /// Test 90
+    #[test]
+    fn the_text_report_groups_low_space_under_storage_with_a_readable_size() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(text.contains("Storage (1)"));
+        assert!(text.contains("filesystem.critically_low_space"));
+        assert!(
+            text.contains("MiB"),
+            "a size must be readable, not a raw byte count"
+        );
+    }
+
+    /// Test 91
+    #[test]
+    fn the_text_report_prints_every_measured_value() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        for expected in [
+            "Measured: available_bytes = ",
+            "Measured: total_bytes = ",
+            "Measured: available_percent = ",
+            "Measured: filesystem_read_only = false",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`");
+        }
+    }
+
+    /// Test 92
+    #[test]
+    fn the_json_output_carries_typed_values_a_script_can_read() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let scan = scan_with(&assessment);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&scan).expect("serialise"))
+                .expect("valid JSON");
+        let finding = json["findings"]
+            .as_array()
+            .expect("findings is an array")
+            .iter()
+            .find(|finding| finding["id"] == "filesystem.critically_low_space")
+            .expect("the low-space finding is present");
+        let measurements = &finding["measurements"];
+        assert_eq!(
+            measurements["available_bytes"],
+            serde_json::json!(100 * 1024 * 1024u64),
+            "a byte count must be a number, not prose"
+        );
+        assert!(measurements["available_percent"].is_f64());
+        assert_eq!(
+            measurements["filesystem_read_only"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// Test 93
+    #[test]
+    fn a_read_only_filesystem_is_reported_under_filesystems_with_a_flag() {
+        let assessment = storage_assessment(80 * 1024 * 1024 * 1024, true);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(text.contains("Filesystems (1)"));
+        assert!(text.contains("Measured: filesystem_read_only = true"));
+    }
+
+    /// Test 94
+    #[test]
+    fn no_new_finding_advertises_a_repair_flag() {
+        let assessment = storage_assessment(100 * 1024 * 1024, true);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(
+            !text.contains("Repair available"),
+            "Stage 1C-A adds no repair, so the CLI must not offer one"
+        );
+        assert!(!text.contains("--repair"));
+    }
+
+    /// Test 95
+    #[test]
+    fn the_report_states_the_narrowed_deferred_checks_rather_than_the_old_claims() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(text.contains("Per-directory disk quotas"));
+        assert!(text.contains("Write access inside a sandbox"));
+        assert!(text.contains("Managed entries with no install record"));
+        for stale in [
+            "Free disk space - ",
+            "Read-only filesystem detection - ",
+            "Orphaned ArchiveFS-managed cheat entries - ",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "`{stale}` is implemented now and must not be listed as missing"
+            );
+        }
+    }
+
+    /// Test 96
+    #[test]
+    fn a_managed_entry_finding_reaches_the_text_report_with_its_reason() {
+        let temporary = std::env::temp_dir().join(format!(
+            "archivefs-cli-managed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let profile = temporary.join("patches");
+        std::fs::create_dir_all(&profile).expect("fixture");
+        std::fs::write(
+            profile.join("SLUS-20946.pnach"),
+            b"// ArchiveFS managed block: op-1\npatch=1,EE,00100000,word,1\n// End ArchiveFS managed block\n",
+        )
+        .expect("fixture");
+
+        let managed = scan_managed_entries(
+            &SharedHistoryReport {
+                journals: Vec::new(),
+                warnings: Vec::new(),
+                complete: true,
+            },
+            &[ManagedScanTarget {
+                format: ManagedFormat::Pcsx2Pnach,
+                destination_root: profile,
+            }],
+        );
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.managed_entries = Gathered::Ready(&managed);
+        let text = format_doctor_scan(&run_doctor_scan(&inputs));
+        let _ = std::fs::remove_dir_all(&temporary);
+
+        assert!(text.contains("Managed entries (1)"));
+        assert!(text.contains("managed_entry.ownership_record_missing"));
+        assert!(text.contains("Measured: managed_format = PCSX2 PNACH"));
+        assert!(text.contains("Measured: orphan_reason = "));
     }
 }

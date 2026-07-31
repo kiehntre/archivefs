@@ -7056,6 +7056,16 @@ fn mount_path_from_mountinfo_line(line: &[u8]) -> Option<PathBuf> {
     mountinfo_path_from_bytes(&unescape_mountinfo_path(field))
 }
 
+/// Decodes one `/proc/self/mountinfo` path field, applying the same octal
+/// unescaping the mount code itself uses.
+///
+/// Exposed to `crate::diagnostics` so the read-only mount-state check cannot
+/// drift from how mounts are actually matched - see
+/// `diagnostics::environment::parse_mount_table`.
+pub(crate) fn mountinfo_path_for_diagnostics(field: &[u8]) -> Option<PathBuf> {
+    mountinfo_path_from_bytes(&unescape_mountinfo_path(field))
+}
+
 fn unescape_mountinfo_path(path: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(path.len());
     let mut index = 0;

@@ -35,14 +35,14 @@ use crate::{
 
 // --- Fixtures -------------------------------------------------------------
 
-struct TempTree {
+pub(super) struct TempTree {
     root: PathBuf,
 }
 
 impl TempTree {
-    fn new(label: &str) -> Self {
+    pub(super) fn new(label: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
-            "archivefs-doctor-stage1a-{label}-{}-{}",
+            "archivefs-doctor-{label}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -52,6 +52,10 @@ impl TempTree {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp tree");
         Self { root }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.root
     }
 }
 
@@ -63,7 +67,7 @@ impl Drop for TempTree {
 
 /// Every entry beneath `root`, with the facts a mutation would disturb.
 /// Sorted, so comparison is order-independent.
-fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
+pub(super) fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
     let mut entries = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -1051,7 +1055,7 @@ fn a_clean_scan_is_healthy_but_never_claims_complete_coverage() {
     assert!(
         scan.deferred
             .iter()
-            .any(|deferred| deferred.name == "Free disk space")
+            .any(|deferred| deferred.name == "Per-directory disk quotas")
     );
 }
 
@@ -1065,13 +1069,15 @@ fn every_deferred_check_names_itself_and_explains_why() {
             deferred.name
         );
     }
+    // These are the narrowed entries left once Stage 1C-A implemented free
+    // space, read-only detection, profile writability and managed-entry
+    // accounting. Each names the part that genuinely remains uncovered.
     for expected in [
-        "Free disk space",
-        "Read-only filesystem detection",
-        "Emulator profile writability",
-        "Orphaned ArchiveFS-managed cheat entries",
+        "Per-directory disk quotas",
+        "Write access inside a sandbox",
+        "Managed entries with no install record",
         "GameHacking.org cache health",
-        "Repairs",
+        "Repairs beyond the four safe mount and index actions",
     ] {
         assert!(
             DEFERRED_CHECKS
@@ -1180,6 +1186,7 @@ fn no_finding_is_ever_emitted_with_healthy_severity() {
         transactions: Gathered::Ready(&history),
         stale_mount_directories: Gathered::NotLoaded("not gathered in this test"),
         index_freshness: Gathered::NotLoaded("not gathered in this test"),
+        ..DoctorScanInputs::none_loaded()
     };
     let scan = run_doctor_scan(&inputs);
 
@@ -1290,6 +1297,9 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("mod.rs"),
         include_str!("runner.rs"),
         include_str!("repair.rs"),
+        include_str!("environment.rs"),
+        include_str!("managed.rs"),
+        include_str!("profiles.rs"),
     ] {
         assert!(!source.contains("migrations/"));
         assert!(!source.contains("apply_migrations"));
@@ -1298,20 +1308,23 @@ fn stage_1a_introduces_no_database_migration() {
 
 // --- 26. No GameHacking or Wii dependency -------------------------------
 
-/// Doctor must not gain a dependency on the GameHacking or Wii providers -
-/// they are not part of this release, and Doctor must keep compiling
-/// identically with or without those feature branches merged.
+/// Doctor's integrated Dolphin marker reader may reuse the same generic INI
+/// document functions as GameHacking installation, but it must not depend on
+/// a GameHacking/Wii provider, browser import, Cloudflare, or network type.
 ///
 /// This checks for real *code* references (module paths and type names),
 /// not for the word appearing anywhere: `DEFERRED_CHECKS` deliberately
 /// contains the user-facing string "GameHacking.org cache health", which is
 /// prose the product shows, not a dependency.
 #[test]
-fn core_diagnostics_reference_no_gamehacking_or_wii_symbol() {
+fn core_diagnostics_reference_no_gamehacking_or_wii_provider_symbol() {
     for source in [
         include_str!("mod.rs"),
         include_str!("runner.rs"),
         include_str!("repair.rs"),
+        include_str!("environment.rs"),
+        include_str!("managed.rs"),
+        include_str!("profiles.rs"),
     ] {
         // No import may mention them at all.
         for line in source
@@ -1483,6 +1496,7 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
         transactions: Gathered::Ready(&transactions),
         stale_mount_directories: Gathered::Ready(stale.as_slice()),
         index_freshness: Gathered::Ready((&freshness, index_path.as_path())),
+        ..DoctorScanInputs::none_loaded()
     };
     let scan = run_doctor_scan(&inputs);
 
@@ -1505,9 +1519,12 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // Seven subsystems were genuinely checked, and the rest are honestly
     // recorded as unavailable rather than as passes.
     assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
+    // Storage, filesystem mount state, emulator profiles and managed entries
+    // are not gathered by this test, so they must appear as unavailable
+    // alongside the snapshot, setup and RetroArch subsystems - never as passes.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        3,
+        7,
         "{:?}",
         scan.coverage
     );
@@ -1672,4 +1689,256 @@ fn probe_free_setup_coverage_reaches_the_doctor_scan() {
         .expect("the unrun check is surfaced");
     assert!(not_checked.reason.starts_with("Not probed:"));
     assert!(!not_checked.next_step.is_empty());
+}
+
+// --- Stage 1C-A: the four new families, through the real runner -----------
+
+/// Test 79
+#[test]
+fn the_storage_subsystems_appear_as_two_separately_reported_checks() {
+    let tree = TempTree::new("stage1c-runner-storage");
+    let data = tree.root.join("data");
+    fs::create_dir_all(&data).expect("fixture");
+    let assessed = environment::assess_storage(&[environment::StorageResource::new(
+        environment::ResourceRole::DataDirectory,
+        &data,
+    )]);
+    let scan = run_doctor_scan(&only!(storage = &assessed));
+
+    let checked: Vec<DoctorSubsystem> = scan
+        .checked_subsystems()
+        .iter()
+        .map(|entry| entry.subsystem)
+        .collect();
+    assert!(checked.contains(&DoctorSubsystem::FilesystemCapacity));
+    assert!(
+        checked.contains(&DoctorSubsystem::FilesystemMountState),
+        "capacity and mount state are different questions and must be reported separately"
+    );
+}
+
+/// Test 80
+#[test]
+fn the_new_subsystems_are_unavailable_rather_than_passing_when_not_gathered() {
+    let scan = run_doctor_scan(&DoctorScanInputs::none_loaded());
+    let unavailable: Vec<DoctorSubsystem> = scan
+        .unavailable_subsystems()
+        .iter()
+        .map(|entry| entry.subsystem)
+        .collect();
+    for subsystem in [
+        DoctorSubsystem::FilesystemCapacity,
+        DoctorSubsystem::FilesystemMountState,
+        DoctorSubsystem::EmulatorProfiles,
+        DoctorSubsystem::ManagedEntries,
+    ] {
+        assert!(
+            unavailable.contains(&subsystem),
+            "{subsystem:?} must be declared unavailable, never silently healthy"
+        );
+    }
+}
+
+/// Test 81
+#[test]
+fn a_read_only_data_filesystem_reaches_the_scan_as_an_error() {
+    let assessed = environment::StorageAssessment {
+        filesystems: vec![environment::FilesystemGroup {
+            representative_path: EncodedPath::from_path(Path::new("/var/lib/archivefs")),
+            device_id: Some(1),
+            mount_point: Some(EncodedPath::from_path(Path::new("/var"))),
+            filesystem_type: Some("ext4".to_string()),
+            mount_mode: environment::MountMode::ReadOnly,
+            stat: Some(environment::FilesystemStat {
+                available_bytes: 100 * 1024 * 1024 * 1024,
+                total_bytes: 200 * 1024 * 1024 * 1024,
+            }),
+            roles: vec![environment::ResourceRole::Database],
+            paths: vec![EncodedPath::from_path(Path::new("/var/lib/archivefs"))],
+            evidence_source: "statvfs and /proc/self/mountinfo",
+        }],
+        unassessed: Vec::new(),
+        mount_table_available: true,
+    };
+    let scan = run_doctor_scan(&only!(storage = &assessed));
+    let finding = scan
+        .finding("filesystem.read_only")
+        .expect("a read-only database filesystem must be reported");
+    assert_eq!(finding.severity, DoctorSeverity::Error);
+    assert_eq!(finding.category, DoctorCategory::Filesystems);
+    assert!(
+        finding.repair.is_none(),
+        "no repair exists for a mount mode"
+    );
+}
+
+/// Test 82
+#[test]
+fn every_new_category_has_a_label_and_a_slug_of_its_own() {
+    for category in [
+        DoctorCategory::Storage,
+        DoctorCategory::Filesystems,
+        DoctorCategory::EmulatorProfiles,
+        DoctorCategory::ManagedEntries,
+    ] {
+        assert!(
+            DoctorCategory::ALL.contains(&category),
+            "{category:?} must be part of the stable grouping order"
+        );
+        assert!(!category.label().is_empty());
+    }
+}
+
+/// Test 83
+#[test]
+fn no_new_finding_is_ever_emitted_with_healthy_severity_or_an_unnamespaced_id() {
+    let tree = TempTree::new("stage1c-finding-shape");
+    let profile = tree.root.join("patches");
+    fs::create_dir_all(&profile).expect("fixture");
+    let assessed = environment::assess_storage(&[environment::StorageResource::new(
+        environment::ResourceRole::DataDirectory,
+        &profile,
+    )]);
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.storage = Gathered::Ready(&assessed);
+    let scan = run_doctor_scan(&inputs);
+    for finding in &scan.findings {
+        assert_ne!(finding.severity, DoctorSeverity::Healthy);
+        assert!(
+            finding.id.contains('.'),
+            "{} must be namespaced by subsystem",
+            finding.id
+        );
+    }
+}
+
+/// Read-only proof 10: a scan with all four new families gathered against a
+/// real tree leaves that tree byte for byte unchanged.
+#[test]
+fn gathering_and_scanning_the_new_families_changes_nothing_on_disk() {
+    let tree = TempTree::new("stage1c-read-only-proof");
+    let data = tree.root.join("data");
+    let profile = tree.root.join("emulator/patches");
+    fs::create_dir_all(&data).expect("fixture");
+    fs::create_dir_all(&profile).expect("fixture");
+    fs::write(data.join("library.sqlite3"), b"not a real database").expect("fixture");
+    fs::write(
+        profile.join("SLUS-20946.pnach"),
+        b"// ArchiveFS managed block: op-1\npatch=1,EE,00100000,word,1\n// End ArchiveFS managed block\n",
+    )
+    .expect("fixture");
+    fs::write(
+        profile.join("mine.pnach"),
+        b"// my own codes\npatch=1,EE,1,word,1\n",
+    )
+    .expect("fixture");
+    let before = snapshot_tree(&tree.root);
+
+    let storage = environment::assess_storage(&[
+        environment::StorageResource::new(environment::ResourceRole::DataDirectory, &data),
+        environment::StorageResource::new(environment::ResourceRole::EmulatorProfile, &profile),
+        // A path that does not exist must be reported, never created.
+        environment::StorageResource::new(
+            environment::ResourceRole::MountRoot,
+            tree.root.join("mounts"),
+        ),
+    ]);
+    let managed = managed::scan_managed_entries(
+        &SharedHistoryReport {
+            journals: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+        },
+        &[managed::ManagedScanTarget {
+            format: managed::ManagedFormat::Pcsx2Pnach,
+            destination_root: profile.clone(),
+        }],
+    );
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.storage = Gathered::Ready(&storage);
+    inputs.managed_entries = Gathered::Ready(&managed);
+    let scan = run_doctor_scan(&inputs);
+
+    assert_eq!(
+        snapshot_tree(&tree.root),
+        before,
+        "gathering or scanning the new families changed the tree"
+    );
+    assert_eq!(
+        fs::read(profile.join("mine.pnach")).expect("user file"),
+        b"// my own codes\npatch=1,EE,1,word,1\n".to_vec(),
+        "a user's own cheat file must never be touched"
+    );
+    assert!(
+        scan.finding("managed_entry.ownership_record_missing")
+            .is_some(),
+        "the marked file with no install record must still be reported: {:?}",
+        scan.findings
+    );
+}
+
+/// Read-only proof 11: no finding from any of the four new families offers a
+/// repair, so Stage 1C-A cannot present a Delete, Clean, Repair or Fix button.
+#[test]
+fn no_finding_from_the_new_families_offers_a_repair() {
+    let tree = TempTree::new("stage1c-no-repair");
+    let profile = tree.root.join("patches");
+    fs::create_dir_all(&profile).expect("fixture");
+    let storage = environment::assess_storage(&[environment::StorageResource::new(
+        environment::ResourceRole::Database,
+        &profile,
+    )]);
+    let managed = managed::scan_managed_entries(
+        &SharedHistoryReport {
+            journals: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+        },
+        &[],
+    );
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.storage = Gathered::Ready(&storage);
+    inputs.managed_entries = Gathered::Ready(&managed);
+    let scan = run_doctor_scan(&inputs);
+    for finding in &scan.findings {
+        if matches!(
+            finding.category,
+            DoctorCategory::Storage
+                | DoctorCategory::Filesystems
+                | DoctorCategory::EmulatorProfiles
+                | DoctorCategory::ManagedEntries
+        ) {
+            assert!(
+                finding.repair.is_none(),
+                "{} offers a repair in a diagnostic-only milestone",
+                finding.id
+            );
+        }
+    }
+}
+
+/// Read-only proof 12: the deferred list still tells the truth. Each of the
+/// four families implemented here has had its entry narrowed to the part that
+/// genuinely remains uncovered, and none claims to be entirely unimplemented.
+#[test]
+fn the_deferred_list_no_longer_claims_the_new_families_are_missing() {
+    for stale in [
+        "Free disk space",
+        "Read-only filesystem detection",
+        "Emulator profile writability",
+        "Orphaned ArchiveFS-managed cheat entries",
+    ] {
+        assert!(
+            !DEFERRED_CHECKS
+                .iter()
+                .any(|deferred| deferred.name == stale),
+            "`{stale}` is implemented now, so claiming it is deferred would be false"
+        );
+    }
+    // What remains must still be specific about what is not covered.
+    let sandbox = DEFERRED_CHECKS
+        .iter()
+        .find(|deferred| deferred.name == "Write access inside a sandbox")
+        .expect("the sandbox limitation remains real");
+    assert!(sandbox.reason.contains("write probe"));
 }

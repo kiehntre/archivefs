@@ -18,6 +18,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use archivefs_core::diagnostics::DoctorCategory;
+use archivefs_core::diagnostics::environment::{
+    FreeSpacePolicy, StorageAssessment, assess_storage, mount_table, storage_resources,
+};
+use archivefs_core::diagnostics::managed::{ManagedEntryScan, scan_managed_entries};
+use archivefs_core::diagnostics::profiles::{
+    DiscoveredProfiles, ProfileAssessmentReport, assess_emulator_profiles, managed_scan_targets,
+    profile_destination_directories,
+};
 use archivefs_core::diagnostics::repair::{
     DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRequest,
     DoctorRepairStatus, DoctorRepairVerification, execute_doctor_repair,
@@ -1635,6 +1643,9 @@ struct DoctorGathered {
     database: Gathered<DatabaseHealthReport>,
     source_health: Gathered<Vec<SourceHealthIssue>>,
     transactions: Gathered<SharedHistoryReport>,
+    storage: Gathered<StorageAssessment>,
+    emulator_profiles: Gathered<ProfileAssessmentReport>,
+    managed_entries: Gathered<ManagedEntryScan>,
 }
 
 /// The confirmation screen for one repair. Holding this is the *only* way a
@@ -1695,6 +1706,22 @@ impl DoctorScanState {
 /// never performs that write.
 fn gather_doctor_inputs() -> DoctorGathered {
     let config = Config::load_default();
+
+    let transactions = match default_shared_history_root() {
+        Ok(root) => Gathered::Ready(discover_shared_apply_history(&root)),
+        Err(error) => Gathered::Failed(format!(
+            "install history root is unavailable: {}",
+            error.detail
+        )),
+    };
+    // Emulator profiles first: where they live decides which filesystems and
+    // which managed files matter. Xenia has no documented native path, so it
+    // is never guessed at.
+    let mount_table = mount_table();
+    let discovered = DiscoveredProfiles::from_environment(Vec::new());
+    let profile_report = assess_emulator_profiles(&discovered.borrowed(), mount_table.as_deref());
+    let managed_targets = managed_scan_targets(&profile_report);
+
     DoctorGathered {
         mount_root_safety: match &config {
             Ok(config) => Gathered::Ready(assess_mount_root_safety(&config.mount_root)),
@@ -1730,12 +1757,23 @@ fn gather_doctor_inputs() -> DoctorGathered {
             Ok(views) => Gathered::Ready(source_health_issues(views.as_slice())),
             Err(error) => Gathered::Failed(format!("source folders could not be listed: {error}")),
         },
-        transactions: match default_shared_history_root() {
-            Ok(root) => Gathered::Ready(discover_shared_apply_history(&root)),
-            Err(error) => Gathered::Failed(format!(
-                "install history root is unavailable: {}",
-                error.detail
-            )),
+        transactions: transactions.clone(),
+        // Free space and mount state for every location ArchiveFS depends on,
+        // read from `statvfs` and `/proc/self/mountinfo`. No probe file.
+        storage: Gathered::Ready(assess_storage(&storage_resources(
+            config.as_ref().ok(),
+            default_database_path().ok().as_deref(),
+            default_index_path().ok().as_deref(),
+            default_shared_history_root().ok().as_deref(),
+            &profile_destination_directories(&profile_report),
+        ))),
+        emulator_profiles: Gathered::Ready(profile_report),
+        managed_entries: match &transactions {
+            Gathered::Ready(history) => {
+                Gathered::Ready(scan_managed_entries(history, &managed_targets))
+            }
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
         },
     }
 }
@@ -4160,6 +4198,13 @@ impl ArchiveFsApp {
                             index_freshness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            storage: Gathered::NotLoaded("not gathered: the Doctor worker stopped"),
+                            emulator_profiles: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            managed_entries: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                         },
                     ))
                 }
@@ -4220,6 +4265,10 @@ impl ArchiveFsApp {
                 Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
                 Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
             },
+            storage: borrowed(&gathered.storage, |value| value),
+            emulator_profiles: borrowed(&gathered.emulator_profiles, |value| value),
+            managed_entries: borrowed(&gathered.managed_entries, |value| value),
+            free_space_policy: FreeSpacePolicy::default(),
         };
         let scan = run_doctor_scan(&inputs);
         let finished_at_unix_seconds = SystemTime::now()
@@ -14096,6 +14145,18 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding) {
             ui.add(egui::Label::new(format!("• {item}")).wrap());
         }
     }
+    if !finding.measurements.is_empty() {
+        // The same facts as the evidence above, as values. Shown collapsed so
+        // the prose stays the primary account for a person reading this.
+        egui::CollapsingHeader::new("Measured values")
+            .id_salt(format!("doctor-measurements-{}", finding.id))
+            .default_open(false)
+            .show(ui, |ui| {
+                for (key, value) in &finding.measurements {
+                    ui.label(format!("{key}: {value}"));
+                }
+            });
+    }
     if let Some(recovery) = &finding.recovery {
         // Informational only. Stage 1A deliberately renders no button here:
         // exposing these safely needs confirmation and post-repair
@@ -14207,7 +14268,7 @@ fn doctor_repair_history_detail(outcome: &DoctorRepairOutcome) -> String {
 
 /// The exact statement shown on the Doctor page, kept as one constant so the
 /// GUI and its tests cannot drift.
-const DOCTOR_READ_ONLY_NOTICE: &str = "This scan is read-only: it inspects configuration, existing files and existing records only. It never creates, mounts, unmounts, repairs, rebuilds or removes anything.";
+const DOCTOR_READ_ONLY_NOTICE: &str = "This scan is read-only: it inspects configuration, existing files and existing records only. It never creates, mounts, unmounts, repairs, rebuilds or removes anything. Free space and write access are read from the filesystem itself - no test file is ever written, and your emulator profiles, cheats and patches are never modified.";
 
 /// Plain-text form of a scan, for "Copy report".
 fn doctor_scan_report_text(outcome: &DoctorScanOutcome) -> String {
@@ -14250,6 +14311,9 @@ fn doctor_scan_report_text(outcome: &DoctorScanOutcome) -> String {
             }
             for item in &finding.evidence {
                 lines.push(format!("      Evidence: {item}"));
+            }
+            for (key, value) in &finding.measurements {
+                lines.push(format!("      Measured: {key} = {value}"));
             }
             lines.push(format!("      Reported by: {}", finding.subsystem.label()));
         }
@@ -42944,6 +43008,135 @@ $Instant Growth [Nayr]\n";
         })
     }
 
+    /// A storage scan built from values, so the page can be exercised without
+    /// depending on whatever the test machine's disks happen to look like.
+    fn doctor_scan_with_storage(
+        available_bytes: u64,
+        total_bytes: u64,
+        read_only: bool,
+    ) -> DoctorScan {
+        use archivefs_core::diagnostics::environment::{
+            FilesystemGroup, FilesystemStat, MountMode, ResourceRole, StorageAssessment,
+        };
+        use archivefs_core::emulator_environment::EncodedPath;
+        let assessment = StorageAssessment {
+            filesystems: vec![FilesystemGroup {
+                representative_path: EncodedPath::from_path(Path::new("/var/lib/archivefs")),
+                device_id: Some(1),
+                mount_point: Some(EncodedPath::from_path(Path::new("/var"))),
+                filesystem_type: Some("ext4".to_string()),
+                mount_mode: if read_only {
+                    MountMode::ReadOnly
+                } else {
+                    MountMode::ReadWrite
+                },
+                stat: Some(FilesystemStat {
+                    available_bytes,
+                    total_bytes,
+                }),
+                roles: vec![ResourceRole::Database],
+                paths: vec![EncodedPath::from_path(Path::new("/var/lib/archivefs"))],
+                evidence_source: "statvfs and /proc/self/mountinfo",
+            }],
+            unassessed: Vec::new(),
+            mount_table_available: true,
+        };
+        let mut inputs = DoctorScanInputs::none_loaded();
+        // Borrowed for the duration of the scan only; the scan owns its output.
+        inputs.storage = Gathered::Ready(&assessment);
+        run_doctor_scan(&inputs)
+    }
+
+    /// Test 84
+    #[test]
+    fn doctor_page_groups_low_space_under_storage_with_a_readable_size() {
+        let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut None);
+        assert!(rendered_text_contains(&output, "Storage (1)"));
+        assert!(
+            rendered_text_contains(&output, "MiB"),
+            "a person must see a size, not a byte count"
+        );
+    }
+
+    /// Test 85
+    #[test]
+    fn doctor_page_groups_a_read_only_filesystem_under_filesystems() {
+        let scan =
+            doctor_scan_with_storage(500 * 1024 * 1024 * 1024, 1000 * 1024 * 1024 * 1024, true);
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut None);
+        assert!(rendered_text_contains(&output, "Filesystems (1)"));
+        assert!(rendered_text_contains(&output, "mounted read-only"));
+    }
+
+    /// Test 86
+    #[test]
+    fn doctor_page_shows_measured_values_only_for_the_selected_finding() {
+        let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+        let finding_id = scan.findings[0].id.clone();
+        let state = doctor_outcome(scan);
+
+        let collapsed = render_doctor_page(&state, &mut None);
+        assert!(!rendered_text_contains(&collapsed, "Measured values"));
+
+        let mut selected = Some(finding_id);
+        let expanded = render_doctor_page(&state, &mut selected);
+        assert!(rendered_text_contains(&expanded, "Measured values"));
+    }
+
+    /// Test 87
+    #[test]
+    fn doctor_page_offers_no_destructive_button_for_a_storage_or_filesystem_finding() {
+        for read_only in [false, true] {
+            let scan =
+                doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, read_only);
+            for finding in &scan.findings {
+                assert!(
+                    finding.repair.is_none(),
+                    "{} must not offer a repair, so no button can be rendered for it",
+                    finding.id
+                );
+            }
+            let finding_id = scan.findings[0].id.clone();
+            let state = doctor_outcome(scan);
+            let output = render_doctor_page(&state, &mut Some(finding_id));
+            for forbidden in ["Delete", "Clean up", "Repair", "Fix"] {
+                assert!(
+                    !rendered_text_contains(&output, forbidden),
+                    "`{forbidden}` must not appear anywhere on a diagnostic-only result"
+                );
+            }
+        }
+    }
+
+    /// Test 88
+    #[test]
+    fn the_copied_report_carries_the_measured_values_too() {
+        let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+        let text = doctor_scan_report_text(&DoctorScanOutcome {
+            scan,
+            finished_at_unix_seconds: 1_700_000_000,
+        });
+        assert!(text.contains("Measured: available_bytes = "));
+        assert!(text.contains("Measured: total_bytes = "));
+    }
+
+    /// Test 89
+    #[test]
+    fn the_read_only_notice_states_that_no_probe_file_is_written() {
+        let output = render_doctor_page(&DoctorScanState::NotRun, &mut None);
+        assert!(rendered_text_contains(
+            &output,
+            "no test file is ever written"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "emulator profiles, cheats and patches are never modified"
+        ));
+    }
+
     #[test]
     fn doctor_page_states_the_scan_is_read_only() {
         let output = render_doctor_page(&DoctorScanState::NotRun, &mut None);
@@ -43134,7 +43327,11 @@ $Instant Growth [Nayr]\n";
             &output,
             "a healthy result does not mean they are fine"
         ));
-        for deferred in ["Free disk space", "Emulator profile writability", "Repairs"] {
+        for deferred in [
+            "Per-directory disk quotas",
+            "Write access inside a sandbox",
+            "Managed entries with no install record",
+        ] {
             assert!(
                 rendered_text_contains(&output, deferred),
                 "the deferred check `{deferred}` must be visible"
@@ -43235,6 +43432,9 @@ $Instant Growth [Nayr]\n";
                     database: Gathered::NotLoaded("stale"),
                     source_health: Gathered::NotLoaded("stale"),
                     transactions: Gathered::NotLoaded("stale"),
+                    storage: Gathered::NotLoaded("stale"),
+                    emulator_profiles: Gathered::NotLoaded("stale"),
+                    managed_entries: Gathered::NotLoaded("stale"),
                 },
             ))
             .expect("send");
@@ -43266,6 +43466,9 @@ $Instant Growth [Nayr]\n";
                     database: Gathered::NotLoaded("no database"),
                     source_health: Gathered::NotLoaded("no sources"),
                     transactions: Gathered::NotLoaded("no history"),
+                    storage: Gathered::NotLoaded("not gathered"),
+                    emulator_profiles: Gathered::NotLoaded("not gathered"),
+                    managed_entries: Gathered::NotLoaded("not gathered"),
                 },
             ))
             .expect("send");
