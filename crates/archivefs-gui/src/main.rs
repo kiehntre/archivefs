@@ -32476,11 +32476,56 @@ fn gamer_platform_card_width(viewport_width: f32) -> f32 {
     (viewport_width * 0.14).clamp(PLATFORM_CARD_MIN_WIDTH, PLATFORM_CARD_MAX_WIDTH)
 }
 
+/// Horizontal padding reserved inside a platform card around its label
+/// text (artwork and card border share the rest of `card_width`).
+const PLATFORM_LABEL_HORIZONTAL_PADDING: f32 = 16.0;
+/// Assumed average glyph advance width, in pixels, for the platform
+/// shelf's label font (`FontId::proportional(10.0)`, see
+/// `show_platform_shelf_item`). Deliberately conservative: real measured
+/// widths for ordinary mixed-case platform names at this size average
+/// ~4.4-5.0px/char, so this leaves headroom for names with more
+/// uppercase-heavy or wide glyphs than typical without overflowing the
+/// card. Because `platform_label_character_limit` derives its ceiling
+/// from this same constant, a truncated label is guaranteed (for text at
+/// or under this average width) to fit within `card_width -
+/// PLATFORM_LABEL_HORIZONTAL_PADDING`, which
+/// `compact_platform_label_never_overflows_the_available_card_width`
+/// verifies against the real bundled font.
+const PLATFORM_LABEL_ASSUMED_PX_PER_CHAR: f32 = 6.5;
+/// Never show fewer than this many characters, even for a pathologically
+/// narrow card - keeps a truncated label recognisable rather than a bare
+/// ellipsis, and gives `compact_platform_label` a defined, panic-free
+/// floor for zero, negative, or otherwise degenerate widths.
+const PLATFORM_LABEL_MIN_CHARACTERS: usize = 10;
+
+/// The character budget a card of `card_width` gets before truncation
+/// kicks in. Scales with `card_width` between `PLATFORM_LABEL_MIN_CHARACTERS`
+/// and whatever `PLATFORM_CARD_MAX_WIDTH` itself naturally allows - tied
+/// directly to the card-width constants so enlarging or shrinking the
+/// platform shelf's cards (`PLATFORM_CARD_MIN_WIDTH`/`_MAX_WIDTH`) can
+/// never desynchronise this ceiling from them again, the way a
+/// previously separate, unrelated magic number once did.
+fn platform_label_character_limit(card_width: f32) -> usize {
+    let budget = (card_width - PLATFORM_LABEL_HORIZONTAL_PADDING).max(0.0);
+    let natural = (budget / PLATFORM_LABEL_ASSUMED_PX_PER_CHAR).floor() as usize;
+    let ceiling = (((PLATFORM_CARD_MAX_WIDTH - PLATFORM_LABEL_HORIZONTAL_PADDING)
+        / PLATFORM_LABEL_ASSUMED_PX_PER_CHAR)
+        .floor() as usize)
+        .max(PLATFORM_LABEL_MIN_CHARACTERS);
+    natural.clamp(PLATFORM_LABEL_MIN_CHARACTERS, ceiling)
+}
+
 /// Keep the count on its own visible line. Long platform names use the
 /// full-name hover/accessibility label and a width-aware compact form in
 /// the card rather than forcing the shelf taller.
+///
+/// Pure and deterministic: the character budget is a fixed arithmetic
+/// function of `card_width` (see `platform_label_character_limit`), never
+/// a live font/glyph measurement, so this needs no `egui::Context` and
+/// behaves identically on every host regardless of installed system
+/// fonts.
 fn compact_platform_label(label: &str, card_width: f32) -> String {
-    let character_limit = ((card_width - 16.0) / 6.5).floor().clamp(10.0, 16.0) as usize;
+    let character_limit = platform_label_character_limit(card_width);
     if label.chars().count() <= character_limit {
         return label.to_string();
     }
@@ -33852,11 +33897,188 @@ mod tests {
         let compact =
             compact_platform_label("A Very Long Platform Display Name", PLATFORM_CARD_MIN_WIDTH);
         assert!(compact.ends_with('\u{2026}'));
-        assert!(compact.chars().count() <= 12);
+        assert!(
+            compact.chars().count() < "A Very Long Platform Display Name".chars().count(),
+            "a long label at the narrowest card width must actually be shortened"
+        );
+        assert!(
+            measured_text_width_px(&compact)
+                <= PLATFORM_CARD_MIN_WIDTH - PLATFORM_LABEL_HORIZONTAL_PADDING,
+            "the truncated label must fit inside the narrowest card, measured with the \
+             real bundled egui font actually used to paint it (not a guessed character count)"
+        );
         assert_eq!(
             compact_platform_label("PlayStation Vita", PLATFORM_CARD_MAX_WIDTH),
             "PlayStation Vita",
             "wider cards should retain useful names instead of applying a fixed early cutoff"
+        );
+    }
+
+    /// Renders `text` with the exact `FontId` the platform shelf paints
+    /// its label with (see `show_platform_shelf_item`) through egui's own
+    /// bundled font (never a host-installed one - egui embeds its default
+    /// font family and does not consult system fonts unless the app
+    /// explicitly installs its own, which this app does not), and returns
+    /// the laid-out width in pixels. Fully deterministic across machines
+    /// and CI runners: the glyph data is compiled into the `egui`/`epaint`
+    /// crates, not read from the host.
+    fn measured_text_width_px(text: &str) -> f32 {
+        let ctx = egui::Context::default();
+        let font_id = egui::FontId::proportional(10.0);
+        let mut width = 0.0_f32;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                width = ui.fonts_mut(|fonts| {
+                    fonts
+                        .layout_no_wrap(text.to_string(), font_id.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                });
+            });
+        });
+        width
+    }
+
+    #[test]
+    fn compact_platform_label_preserves_short_core_category_labels_at_every_card_width() {
+        // "All" and "Unknown" are the two fixed, non-optional categories
+        // that must never be truncated (they're always well under the
+        // minimum character floor), across the entire realistic card
+        // width range - not just the two boundary widths.
+        for card_width in [
+            0.0,
+            10.0,
+            PLATFORM_CARD_MIN_WIDTH,
+            150.0,
+            PLATFORM_CARD_MAX_WIDTH,
+            400.0,
+        ] {
+            assert_eq!(compact_platform_label("All", card_width), "All");
+            assert_eq!(compact_platform_label("Unknown", card_width), "Unknown");
+        }
+    }
+
+    #[test]
+    fn compact_platform_label_degrades_gracefully_at_narrow_and_extremely_narrow_widths() {
+        let long_name = "Nintendo Entertainment System";
+        // Narrow (the shelf's real minimum) through pathologically narrow
+        // and outright invalid (zero/negative) widths must never panic
+        // and must always leave a recognisable, non-empty label.
+        for card_width in [PLATFORM_CARD_MIN_WIDTH, 40.0, 1.0, 0.0, -50.0, f32::MIN] {
+            let compact = compact_platform_label(long_name, card_width);
+            assert!(!compact.is_empty());
+            assert!(compact.ends_with('\u{2026}'));
+            assert!(
+                compact.chars().count() >= PLATFORM_LABEL_MIN_CHARACTERS,
+                "even the narrowest card must keep at least the minimum \
+                 recognisable character count for {card_width}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_platform_label_never_overflows_the_available_card_width() {
+        // A representative spread of card widths and label lengths, all
+        // checked against the width egui's real bundled font actually
+        // measures - the property this whole function exists to
+        // guarantee, verified directly rather than via a proxy character
+        // count that can silently go stale when the card-width constants
+        // change (see `platform_label_character_limit`'s doc comment).
+        let labels = [
+            "PlayStation",
+            "A Very Long Platform Display Name",
+            "Commodore 64",
+            "Neo Geo Pocket Color",
+            "Nintendo Entertainment System",
+        ];
+        for card_width in [
+            PLATFORM_CARD_MIN_WIDTH,
+            148.0,
+            PLATFORM_CARD_MAX_WIDTH,
+            250.0,
+        ] {
+            let available = card_width - PLATFORM_LABEL_HORIZONTAL_PADDING;
+            for label in labels {
+                let compact = compact_platform_label(label, card_width);
+                let width = measured_text_width_px(&compact);
+                assert!(
+                    width <= available,
+                    "{label:?} compacted to {compact:?} at card_width={card_width} \
+                     measures {width}px, wider than the {available}px available"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_platform_label_handles_unicode_and_long_labels_without_panicking() {
+        let cases = [
+            "セガサターン",
+            "Pokémon Mini",
+            "e\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}mulator", // stacked combining marks
+            "🎮🕹️👾 Retro Console",
+            &"A".repeat(2_000),
+            "",
+        ];
+        for label in cases {
+            for card_width in [0.0, PLATFORM_CARD_MIN_WIDTH, PLATFORM_CARD_MAX_WIDTH] {
+                let compact = compact_platform_label(label, card_width);
+                // Must always be valid UTF-8 (guaranteed by `String`) and
+                // never panic on a multi-byte boundary, since truncation
+                // walks `.chars()`, not byte offsets.
+                assert!(compact.chars().count() <= label.chars().count() + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_platform_label_is_deterministic_across_repeated_calls() {
+        let label = "A Very Long Platform Display Name";
+        let first = compact_platform_label(label, PLATFORM_CARD_MIN_WIDTH);
+        for _ in 0..50 {
+            assert_eq!(
+                compact_platform_label(label, PLATFORM_CARD_MIN_WIDTH),
+                first
+            );
+        }
+        // The width-measurement invariant test above depends on egui's
+        // font layout also being repeatable; confirm that independently
+        // too, since it is the one part of this test suite that touches
+        // (headless, bundled-font) rendering.
+        let first_width = measured_text_width_px(&first);
+        for _ in 0..20 {
+            assert_eq!(measured_text_width_px(&first), first_width);
+        }
+    }
+
+    #[test]
+    fn detected_platform_counts_orders_named_platforms_stably_regardless_of_insertion_order() {
+        let forward = [
+            Some("Wii"),
+            Some("GameCube"),
+            Some("Dreamcast"),
+            Some("GameCube"),
+        ];
+        let reversed = [
+            Some("GameCube"),
+            Some("Dreamcast"),
+            Some("GameCube"),
+            Some("Wii"),
+        ];
+        let forward_summary = detected_platform_counts(forward.into_iter());
+        let reversed_summary = detected_platform_counts(reversed.into_iter());
+        assert_eq!(
+            forward_summary.named, reversed_summary.named,
+            "the platform shelf's ordering must not depend on archive scan/insertion order"
+        );
+        assert_eq!(
+            forward_summary.named,
+            vec![
+                ("Dreamcast".to_string(), 1),
+                ("GameCube".to_string(), 2),
+                ("Wii".to_string(), 1),
+            ],
+            "named platforms must be in a stable, deterministic (alphabetical) order"
         );
     }
 
