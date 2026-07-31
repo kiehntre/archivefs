@@ -5,9 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use archivefs_core::patch_manager::{
     ManagedPnachCheat, Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2InstallPreviewRequest,
     Pcsx2InstallationType, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
-    Pcsx2Profile, Pcsx2ProfileScope, PnachPatchLine, SharedApplyConfirmation, SharedApplyOptions,
-    SharedApplyResult, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
-    SharedRollbackOutcome, build_pcsx2_install_preview, build_shared_transaction_plan,
+    Pcsx2Profile, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PnachPatchLine,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedApplyStatus,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackOutcome,
+    build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview,
+    build_shared_transaction_plan, confirmed_pcsx2_profile, discover_pcsx2_profiles,
     execute_shared_apply, execute_shared_rollback, preview_shared_rollback, stage_pcsx2_pnach,
 };
 
@@ -77,6 +79,10 @@ impl Fixture {
     }
 
     fn destination(&self) -> PathBuf {
+        self.profile_root().join("cheats/SLUS-20312_A1B2C3D4.pnach")
+    }
+
+    fn legacy_crc_only_destination(&self) -> PathBuf {
         self.profile_root().join("cheats/A1B2C3D4.pnach")
     }
 
@@ -116,6 +122,7 @@ fn install(
     let staged = stage_pcsx2_pnach(
         &fixture.0.join(format!("staging-{operation}")),
         &profile,
+        identity.serial.as_deref(),
         identity.verified_crc().unwrap(),
         selected,
     )
@@ -194,6 +201,58 @@ fn new_file_install_and_undo_remove_only_the_created_pnach() {
         fs::read(fixture.profile_root().join("game.iso")).unwrap(),
         rom_before
     );
+}
+
+#[test]
+fn missing_target_file_is_created_atomically_with_a_journal() {
+    let fixture = Fixture::new("missing-target");
+    assert!(!fixture.destination().exists());
+    let result = install(&fixture, "missing-target", &[cheat("health", "20123456")]);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    let journal_path = result
+        .journal_path
+        .as_ref()
+        .expect("a successful install writes a journal");
+    assert!(journal_path.exists());
+    assert!(fixture.destination().exists());
+    // No stray temp/partial files were left in the destination directory.
+    let leftovers: Vec<_> = fs::read_dir(fixture.destination().parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().contains(".partial"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+}
+
+#[test]
+fn zero_byte_existing_target_is_treated_as_valid_empty_content_and_populated_safely() {
+    let fixture = Fixture::new("zero-byte-existing");
+    fs::create_dir(fixture.profile_root().join("cheats")).unwrap();
+    fs::write(fixture.destination(), b"").unwrap();
+    assert_eq!(fs::metadata(fixture.destination()).unwrap().len(), 0);
+    let result = install(
+        &fixture,
+        "zero-byte-existing",
+        &[cheat("health", "20123456")],
+    );
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "entries: {:#?}",
+        result.journal.entries
+    );
+    let installed = String::from_utf8(fs::read(fixture.destination()).unwrap()).unwrap();
+    assert!(installed.contains("// ArchiveFS managed block: health"));
+    assert!(installed.contains("patch=1,EE,20123456,word,00000001"));
+    assert_eq!(
+        undo(&fixture, &result, "undo-zero-byte-existing"),
+        SharedApplyStatus::Success
+    );
+    // Undo restores the file to its original (empty) content, not deletion,
+    // since the destination already existed before this operation.
+    assert!(fixture.destination().exists());
+    assert_eq!(fs::metadata(fixture.destination()).unwrap().len(), 0);
 }
 
 #[test]
@@ -281,6 +340,170 @@ fn missing_backup_and_external_change_block_undo() {
     );
 }
 
+/// A disposable "AppImage" fixture: a directory that stands in for the one
+/// containing a running `.AppImage`, with PCSX2 evidence written directly
+/// beside it, matching PCSX2's documented portable-mode layout (a
+/// `portable.ini` marker file next to the executable, data stored in that
+/// same directory).
+struct AppImageFixture(PathBuf);
+
+impl AppImageFixture {
+    fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-pcsx2-appimage-e2e-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let appimage_dir = root.join("appimage-dir");
+        fs::create_dir_all(appimage_dir.join("inis")).unwrap();
+        fs::write(appimage_dir.join("portable.ini"), b"").unwrap();
+        fs::write(
+            appimage_dir.join("game.iso"),
+            b"immutable game image fixture",
+        )
+        .unwrap();
+        Self(root)
+    }
+
+    fn appimage_dir(&self) -> PathBuf {
+        self.0.join("appimage-dir")
+    }
+
+    fn history(&self) -> PathBuf {
+        self.0.join("archivefs-history")
+    }
+
+    fn backups(&self) -> PathBuf {
+        self.0.join("archivefs-backups")
+    }
+}
+
+impl Drop for AppImageFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn appimage_adjacent_portable_profile_installs_named_grouped_cheat_with_journal_and_rollback() {
+    let fixture = AppImageFixture::new("portable-install");
+    // An isolated root tree, not the real environment: discovery must find
+    // only the AppImage-adjacent profile, so confirmation is unambiguous.
+    let roots = Pcsx2ProfileDiscoveryRoots {
+        home: fixture.0.join("isolated-home"),
+        xdg_config_home: fixture.0.join("isolated-home/.config"),
+        xdg_data_home: fixture.0.join("isolated-home/.local/share"),
+        documents_home: fixture.0.join("isolated-home/Documents"),
+        flatpak_system_root: fixture.0.join("isolated-system-flatpak"),
+        appimage_directory: Some(fixture.appimage_dir()),
+        portable_configuration_roots: Vec::new(),
+    };
+    let discovery = discover_pcsx2_profiles(&roots).unwrap();
+    let profile = confirmed_pcsx2_profile(&discovery, None)
+        .expect("the AppImage-adjacent portable profile is discovered and unambiguous")
+        .clone();
+    assert_eq!(profile.installation_type, Pcsx2InstallationType::Portable);
+    assert_eq!(profile.configuration_path, fixture.appimage_dir());
+
+    let identity = Pcsx2GameIdentity {
+        archive_path: fixture.appimage_dir().join("game.iso"),
+        title: "Fixture Game".to_string(),
+        region: Some("NTSC-U".to_string()),
+        serial: Some("SLUS-20312".to_string()),
+        executable_crc: Some("A1B2C3D4".to_string()),
+        state: Pcsx2IdentityState::Verified,
+        evidence: vec!["exact fixture bytes".to_string()],
+        plain_failure_reason: None,
+    };
+    let selected = vec![ManagedPnachCheat {
+        id: "infinite-health".to_string(),
+        name: "Infinite health".to_string(),
+        description: Some("Author: Codejunkies | GameHacking game ID: 42".to_string()),
+        patch_lines: vec![PnachPatchLine::parse("patch=1,EE,20123456,word,00000001").unwrap()],
+    }];
+
+    let staged = stage_pcsx2_pnach(
+        &fixture.0.join("staging"),
+        &profile,
+        identity.serial.as_deref(),
+        identity.verified_crc().unwrap(),
+        &selected,
+    )
+    .unwrap();
+    let preview = build_pcsx2_install_preview(&Pcsx2InstallPreviewRequest {
+        selected_archive: identity.archive_path.clone(),
+        profile: profile.clone(),
+        identity,
+        staged,
+    })
+    .unwrap();
+    assert_eq!(preview.report.summary.blocked, 0);
+    let plan = build_shared_transaction_plan(
+        &preview.report,
+        &profile.profile_id,
+        "pcsx2-managed-pnach",
+        &preview.staged.staging_root,
+    )
+    .unwrap();
+    let result = execute_shared_apply(
+        &plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: "appimage-install".to_string(),
+            timestamp_unix_seconds: 1_700_000_100,
+            current_context: plan.context.clone(),
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert!(result.journal_path.is_some(), "install journal was written");
+
+    let destination = fixture
+        .appimage_dir()
+        .join("cheats/SLUS-20312_A1B2C3D4.pnach");
+    let installed = String::from_utf8(fs::read(&destination).unwrap()).unwrap();
+    assert!(installed.contains("// ArchiveFS managed block: infinite-health"));
+    assert!(installed.contains("// Infinite health"));
+    assert!(installed.contains("Author: Codejunkies"));
+    assert!(installed.contains("patch=1,EE,20123456,word,00000001"));
+
+    // Rollback removes exactly the file this operation created.
+    let journal = result.journal_path.as_ref().unwrap();
+    let rollback_preview =
+        preview_shared_rollback(journal, &fixture.appimage_dir(), &fixture.backups());
+    assert!(rollback_preview.available);
+    let rollback = execute_shared_rollback(
+        &rollback_preview,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: rollback_preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "appimage-undo".to_string(),
+            timestamp_unix_seconds: 1_700_000_200,
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(!destination.exists());
+
+    // The emulator's game image and settings were never touched.
+    assert_eq!(
+        fs::read(fixture.appimage_dir().join("game.iso")).unwrap(),
+        b"immutable game image fixture"
+    );
+}
+
 #[test]
 fn unwritable_profile_fails_without_touching_rom_or_creating_pnach() {
     #[cfg(unix)]
@@ -305,4 +528,164 @@ fn unwritable_profile_fails_without_touching_rom_or_creating_pnach() {
             rom_before
         );
     }
+}
+
+/// A real-world upgrade scenario: a game was previously installed by an
+/// ArchiveFS build that only knew the legacy `<CRC>.pnach` naming. This
+/// PCSX2 build only reads `<SERIAL>_<CRC>.pnach`, so the next "Install
+/// selected" must detect the legacy file, migrate its managed cheat into
+/// the serial+CRC file the running PCSX2 actually opens, and leave the
+/// legacy file stripped of ArchiveFS content (but otherwise untouched) -
+/// never silently leaving two active copies of the same cheat. Migration
+/// cleanup of the legacy file is its own chained operation (its own
+/// journal, its own independent undo), so both steps are driven and
+/// verified explicitly here rather than through the single-file `install`
+/// helper used by the rest of this suite.
+#[test]
+fn legacy_crc_only_file_is_detected_migrated_and_independently_undoable() {
+    let fixture = Fixture::new("legacy-migration");
+    fs::create_dir(fixture.profile_root().join("cheats")).unwrap();
+    let legacy_original = b"// pre-existing user note\r\n// ArchiveFS managed block: old_cheat\n// Old cheat\npatch=1,EE,20111111,word,1\n// End ArchiveFS managed block\n".to_vec();
+    fs::write(fixture.legacy_crc_only_destination(), &legacy_original).unwrap();
+    assert!(!fixture.destination().exists());
+
+    let profile = fixture.profile();
+    let identity = fixture.identity();
+    let crc = identity.verified_crc().unwrap();
+    let staged = stage_pcsx2_pnach(
+        &fixture.0.join("staging-primary"),
+        &profile,
+        identity.serial.as_deref(),
+        crc,
+        &[cheat("health", "20123456")],
+    )
+    .unwrap();
+    let migration = staged
+        .legacy_migration
+        .as_ref()
+        .expect("the pre-existing legacy file has a managed block to migrate")
+        .clone();
+    assert_eq!(migration.migrated_block_ids, vec!["old_cheat".to_string()]);
+
+    let primary_preview = build_pcsx2_install_preview(&Pcsx2InstallPreviewRequest {
+        selected_archive: identity.archive_path.clone(),
+        profile: profile.clone(),
+        identity: identity.clone(),
+        staged,
+    })
+    .unwrap();
+    assert_eq!(primary_preview.report.summary.blocked, 0);
+    let primary_plan = build_shared_transaction_plan(
+        &primary_preview.report,
+        "fixture-profile",
+        "pcsx2-managed-pnach",
+        &primary_preview.staged.staging_root,
+    )
+    .unwrap();
+    let primary_result = execute_shared_apply(
+        &primary_plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: primary_plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: "legacy-migration-primary".to_string(),
+            timestamp_unix_seconds: 1_700_000_000,
+            current_context: primary_plan.context.clone(),
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(primary_result.journal.status, SharedApplyStatus::Success);
+    assert!(fixture.destination().exists());
+    let installed = fs::read_to_string(fixture.destination()).unwrap();
+    assert!(installed.contains("// ArchiveFS managed block: health"));
+    assert!(installed.contains("// ArchiveFS managed block: old_cheat"));
+    assert!(installed.contains("patch=1,EE,20111111,word,1"));
+
+    // The legacy file on disk is untouched by the primary apply alone -
+    // migration cleanup is a separate, explicit chained operation.
+    let legacy_before_cleanup = fs::read_to_string(fixture.legacy_crc_only_destination()).unwrap();
+    assert!(legacy_before_cleanup.contains("ArchiveFS managed block: old_cheat"));
+
+    let legacy_preview = build_pcsx2_legacy_migration_preview(
+        &primary_preview.staged,
+        &profile,
+        &identity.archive_path,
+        crc,
+    )
+    .unwrap()
+    .expect("a legacy migration was staged");
+    assert_eq!(legacy_preview.report.summary.blocked, 0);
+    let legacy_plan = build_shared_transaction_plan(
+        &legacy_preview.report,
+        "fixture-profile",
+        "pcsx2-managed-pnach",
+        &legacy_preview.staged.staging_root,
+    )
+    .unwrap();
+    let legacy_result = execute_shared_apply(
+        &legacy_plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: legacy_plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: "legacy-migration-cleanup".to_string(),
+            timestamp_unix_seconds: 1_700_000_001,
+            current_context: legacy_plan.context.clone(),
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(legacy_result.journal.status, SharedApplyStatus::Success);
+
+    // The legacy file keeps its unrelated content but no longer carries any
+    // ArchiveFS-managed block - it is not left as a silently duplicated
+    // active copy of the same cheat.
+    let legacy_now = fs::read_to_string(fixture.legacy_crc_only_destination()).unwrap();
+    assert!(legacy_now.contains("pre-existing user note"));
+    assert!(!legacy_now.contains("ArchiveFS managed block"));
+
+    // Each operation undoes independently: rolling back the legacy cleanup
+    // exactly restores its original bytes without touching the primary
+    // install, and rolling back the primary install removes only the file
+    // it created.
+    let legacy_journal_path = legacy_result.journal_path.as_ref().unwrap();
+    let legacy_rollback_preview = preview_shared_rollback(
+        legacy_journal_path,
+        &fixture.profile_root(),
+        &fixture.backups(),
+    );
+    assert!(legacy_rollback_preview.available);
+    let legacy_rollback = execute_shared_rollback(
+        &legacy_rollback_preview,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: legacy_rollback_preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "legacy-migration-cleanup-undo".to_string(),
+            timestamp_unix_seconds: 1_700_000_100,
+            history_root: fixture.history(),
+            backup_root: fixture.backups(),
+        },
+    );
+    assert_eq!(legacy_rollback.status, SharedApplyStatus::Success);
+    assert_eq!(
+        fs::read(fixture.legacy_crc_only_destination()).unwrap(),
+        legacy_original
+    );
+    // The primary install is unaffected by the legacy undo above.
+    assert!(fixture.destination().exists());
+
+    assert_eq!(
+        undo(&fixture, &primary_result, "legacy-migration-primary-undo"),
+        SharedApplyStatus::Success
+    );
+    assert!(!fixture.destination().exists());
 }

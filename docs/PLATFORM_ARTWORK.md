@@ -1,210 +1,172 @@
 # Platform artwork
 
-Status: visual picker implemented on `feature/gui-navigation-reset`;
-responsive sizing and safe custom rendering completed on
-`feature/gamer-view-finishing-pass`.
-Covers Gamer View's visual platform picker - see
-`docs/GUI_NAVIGATION_RESET_DESIGN.md` for the surrounding navigation
-design this sits inside.
+Status: Platform Artwork Pack v1 adds exact hardware illustrations to the
+existing Gamer View platform shelf without changing its filtering, selection,
+scrolling, or fallback model.
 
-## Policy
+## Runtime policy
 
-- All built-in platform artwork is **original ArchiveFS project artwork**,
-  drawn specifically for this feature. No third-party artwork, theme
-  pack, or icon set was copied, traced, or adapted - not from ES-DE,
-  RetroPie, Batocera, RomM, RetroArch themes, Wikimedia, or any other
-  source.
-- No manufacturer logo, product photo, or trademarked design is
-  reproduced. Console-shaped glyphs (e.g. the GameCube/PlayStation
-  2/Xbox-inspired shapes) are deliberately abstract geometric
-  interpretations - a cube, a tower, a circle with crossed bands - not
-  reproductions of any real product's shape, logo, or branding.
-- **No network access of any kind is used to obtain, update, or check for
-  platform artwork.** Every built-in asset ships inside the repository;
-  every mapping from a platform to an asset is a static, compile-time
-  Rust table (`platform_asset_id`/`platform_asset_category` in
-  `crates/archivefs-gui/src/main.rs`). A custom artwork directory (see
-  below) is read from the local filesystem only.
-- "Do not block the feature on creating a unique image for every obscure
-  platform" - a small, closed set of **category fallbacks** (console,
-  handheld, computer, arcade, optical-disc, cartridge, unknown) covers
-  every platform that doesn't have a dedicated asset. An unmapped
-  platform is not a bug; it correctly and honestly falls back to a
-  category, or to Unknown if even the category is unrecognised.
+Artwork resolution is deterministic and strictly ordered:
 
-## Built-in asset format and rendering
+1. A valid PNG in the explicitly configured custom-artwork directory, named
+   for the resolved exact asset id (or fallback category id).
+2. The exact Platform Artwork Pack v1 PNG compiled into the GUI executable.
+3. The existing category fallback native glyph: console, handheld, computer,
+   arcade, optical-disc, or cartridge.
+4. The existing Unknown native glyph.
 
-`crates/archivefs-gui/assets/platforms/*.svg` - one SVG file per asset,
-`<lowercase-asset-id>.svg`. Total bundle size: **4,303 bytes** (10 files,
-~430 bytes average) - not embedded as Rust byte arrays; they exist as
-plain files in the repository for review and licensing clarity. They are
-not parsed at runtime.
+Compact game-list rows use a related three-step chain: a valid custom
+`game-<normalised-title>.png`, the resolved platform artwork above, then the
+Unknown glyph. Game and platform textures share the bounded session cache, so
+scrolling does not reopen or decode files each frame.
 
-Gamer View's platform shelf renders a small **native vector glyph** drawn
-directly with egui's own painter (`paint_platform_glyph`/
-`paint_platform_glyph_at` in `main.rs`), keyed by the same asset
-identifier the SVG files are named after - not a rasterized copy of the
-on-disk SVG content.
+Exact aliases are tested before category inference. Matching is
+case-insensitive and normalization removes spaces and hyphens only. There is
+no substring, fuzzy, or broad family matching: Wii U cannot become Wii, and
+Xbox 360 cannot become original Xbox.
 
-The on-disk SVG files remain the canonical built-in artwork source and
-licensing record. Runtime SVG parsing remains deferred because it would
-introduce an XML/vector rendering stack (`resvg`/`usvg`/`tiny-skia`) for
-content that is currently satisfied by the native fallback. Custom
-artwork uses the deliberately narrower PNG path described below.
+Every bundled PNG is compiled with `include_bytes!` from a closed static
+registry in `crates/archivefs-gui/src/main.rs`. Installed builds never read a
+source-tree asset path. PNGs are decoded in process using the existing
+`image` dependency with PNG support only, uploaded as egui textures, and
+cached for the GUI session. A malformed bundled PNG is cached as a failure
+and falls through to the category/Unknown glyph. Images are aspect-fitted,
+centred, and never cropped or stretched.
 
-## Responsive shelf behaviour
+There is no runtime artwork network access, URL lookup, update check,
+download, external image command, or automatic launcher/theme discovery.
+Release builds are fully offline with respect to artwork and contain the
+same compile-time byte registry for identical inputs.
 
-- The shelf is always one horizontal row and remains horizontally
-  scrollable; it never wraps or increases its fixed height.
-- Cards scale between 96 and 124 logical pixels according to the viewport.
-  They cannot collapse below the readable minimum or expand without bound.
-- The count always remains on its own line. A platform name that does not
-  fit is shortened once with an ellipsis; the hover text and accessible
-  name retain the complete platform name and count.
-- `All` and `Unknown` remain unabridged at the minimum card width.
-- Selection uses egui's selected button state and keyboard focus remains
-  the standard button focus ring.
+## Platform Artwork Pack v1 aliases
 
-## Fallback categories
-
-| Category | Asset id | Used for (examples) |
-|---|---|---|
-| Console | `console` | GameCube, Wii, Switch, N64, NES, SNES, MegaDrive, PS2, PS3, Xbox, Xbox 360, Saturn, Dreamcast, and others with no dedicated asset |
-| Handheld | `handheld` | Game Boy family, Nintendo DS, Nintendo 3DS, PSP, PlayStation Vita, Atari Lynx, Neo Geo Pocket family, WonderSwan family, N-Gage |
-| Computer | `computer` | PC, DOS, ScummVM, Amiga, Atari ST, Commodore 64, ZX Spectrum, Acorn Archimedes, Sharp X68000, NEC PC-8801/9801, MSX family |
-| Arcade | `arcade` | Arcade |
-| Optical disc | `optical-disc` | Amiga CD32 (a narrow category today - most CD-based consoles above are classified as Console for now, since that's how players commonly think of them) |
-| Cartridge | `cartridge` | Atari 2600/5200/7800, Atari Jaguar, Vectrex, TurboGrafx-16, PC Engine |
-| Unknown | `unknown` | Any platform this build doesn't recognise at all, and every row where platform detection itself found nothing (`unknown_platform: true`) |
-
-Classification lives in `platform_asset_category()` in `main.rs` and is
-covered by `platform_asset_id_falls_back_to_category_for_unmapped_specific_platforms`
-and related tests.
-
-## Dedicated (specific) assets
-
-Only platforms with real, original artwork get their own asset id instead
-of a category fallback:
-
-| Platform | Asset id |
+| Bundled PNG | Exact aliases |
 |---|---|
-| GameCube | `gamecube` |
-| PS2 | `playstation2` |
-| Xbox, Xbox 360 | `xbox` |
+| `acornarchimedes.png` | Acorn Archimedes; Archimedes |
+| `amiga.png` | Amiga; Commodore Amiga |
+| `dreamcast.png` | Dreamcast; Sega Dreamcast |
+| `gameboy.png` | Game Boy; Nintendo Game Boy |
+| `gamecube.png` | GameCube; Nintendo GameCube; Nintendo Game Cube |
+| `megadrive.png` | Mega Drive; Sega Mega Drive; Genesis; Sega Genesis |
+| `n64.png` | Nintendo 64; N64 |
+| `playstation.png` | PlayStation; PlayStation 1; PS1; PSX |
+| `playstation2.png` | PlayStation 2; PS2 |
+| `playstation3.png` | PlayStation 3; PS3 |
+| `saturn.png` | Saturn; Sega Saturn |
+| `snes.png` | Super Nintendo; Super Nintendo Entertainment System; SNES; Super Famicom |
+| `switch.png` | Nintendo Switch; Switch |
+| `wii.png` | Nintendo Wii; Wii |
+| `wiiu.png` | Nintendo Wii U; Wii U; WiiU |
+| `xbox.png` | Xbox; Original Xbox |
+| `xbox360.png` | Xbox 360; X360 |
 
-Adding a fourth dedicated asset means: add the `.svg` file to
-`crates/archivefs-gui/assets/platforms/`, add its manifest row below, add
-a native-vector case to `paint_platform_glyph_at`, and add a match arm to
-`platform_asset_id`. No other code changes needed - everything else
-(the shelf UI, the accessible-label logic, custom-override resolution)
-is already generic over asset id.
+Aliases determine both the bundled image and the filename for a higher
+priority custom override. For example, `PSX` resolves to
+`playstation.png`, not `psx.png`.
 
-## Custom artwork directory (Advanced View → Settings → "5. Platform
-artwork")
+## Inspection and PNG manifest
 
-An optional, session-configurable directory of the user's own PNG files,
-named by canonical platform identifier in lowercase
-(`gamecube.png`, `playstation2.png`, `xbox.png`, or a category id like
-`console.png`). The full supported mapping is the asset-id column in the
-tables above: `console`, `handheld`, `computer`, `arcade`, `optical-disc`,
-`cartridge`, `unknown`, `gamecube`, `playstation2`, and `xbox`.
+All files were inspected at native size and on the current dark background
+at 96×96. Encoded format for every row is 1024×1024, 8-bit RGBA,
+non-interlaced PNG. Every file contains a real alpha channel with both fully
+transparent and fully opaque pixels. Padding is the transparent distance in
+pixels from the alpha-content bounds to left/top/right/bottom canvas edges.
 
-The matching PNG's actual pixels are decoded and rendered in Gamer View.
-SVG custom files are not parsed and therefore fall back to the built-in
-glyph; this is intentional and is never presented as SVG support.
+| Filename | Encoded bytes | Transparent padding L/T/R/B | Text/logo inspection | 96×96 and suitability |
+|---|---:|---:|---|---|
+| `acornarchimedes.png` | 1,662,887 | 60/102/48/58 | No visible text or logo | Readable; complete computer/mouse; accepted |
+| `amiga.png` | 1,635,956 | 60/200/3/89 | No visible text or logo | Readable; right-heavy but not cropped; accepted |
+| `dreamcast.png` | 1,597,369 | 20/6/3/33 | No visible text or logo | Readable; complete console/controller; accepted |
+| `gameboy.png` | 1,576,726 | 256/102/3/49 | No visible text or logo | Readable; asymmetric horizontal padding; accepted |
+| `gamecube.png` | 1,594,670 | 172/142/131/89 | No visible text or logo | Readable and well centred; accepted |
+| `megadrive.png` | 1,555,855 | 85/6/3/33 | No visible text or logo | Readable; complete console; accepted |
+| `n64.png` | 1,571,533 | 44/6/3/65 | No visible text or logo | Readable; complete console/controller; accepted |
+| `playstation.png` | 1,575,183 | 111/102/3/65 | No visible text or logo | Readable; right-heavy but complete; accepted |
+| `playstation2.png` | 1,483,067 | 108/93/3/89 | No visible text or logo | Readable; slim tower remains distinct; accepted |
+| `playstation3.png` | 1,520,358 | 92/142/3/89 | No visible text or logo | Readable; complete console/controller; accepted |
+| `saturn.png` | 1,537,579 | 184/142/80/58 | No visible text or logo | Readable and complete; accepted |
+| `snes.png` | 1,633,370 | 140/102/59/58 | No visible text or logo | Readable and complete; accepted |
+| `switch.png` | 1,509,672 | 92/142/19/89 | No visible text or logo | Readable and complete; accepted |
+| `wii.png` | 1,489,732 | 4/14/3/9 | No visible text or logo | Readable; subject nearly fills canvas but is not cropped; accepted |
+| `wiiu.png` | 1,641,337 | 96/176/56/58 | No visible text or logo | Readable and complete; accepted |
+| `xbox.png` | 1,582,929 | 44/6/3/33 | No text; a green X-like hardware detail is visible | Readable and complete; accepted; no wordmark detected |
+| `xbox360.png` | 1,533,459 | 276/62/3/49 | No visible text or wordmark | Readable; asymmetric horizontal padding; accepted |
 
-Safety boundaries:
+Total bundled PNG size: **26,701,682 bytes (25.46 MiB)**. No supplied v1
+asset was rejected. `dreamcatst.png` is not part of the pack or registry.
+No image was regenerated, resized on disk, recompressed, or otherwise
+altered during integration.
 
-- Files must be regular local files directly inside the configured
-  directory. Symlinks, invalid asset ids, missing files, and other file
-  types are rejected.
-- Maximum encoded file size: **1 MiB**.
-- Maximum dimensions: **1024×1024 pixels**; decoded allocation is bounded
-  to **4 MiB**.
-- Only PNG decoding is enabled. Malformed or unsupported content is not
-  partially rendered and cannot crash the interface.
-- Every rejection falls back to the original built-in vector glyph while
-  the platform's text name, count, focus, and keyboard activation remain.
+## Provenance and endorsement
 
-Successful textures and failed decode results are cached by asset id plus
-the configured directory, file length, and modification time. Changing
-the configured directory clears the cache immediately. Changing a file's
-length or modification time causes it to be decoded again on the next
-render; unchanged files are not reparsed per frame.
+The PNGs were supplied for this milestone as original/generated ArchiveFS
+project artwork. The repository does not record a third-party source,
+photographer, or external artwork pack for them. No manufacturer wordmarks,
+manufacturer logos, or copied photographs were intentionally used. The
+inspection above records the one visible X-like hardware detail rather than
+silently treating it as absent. These illustrations necessarily identify
+recognisable hardware but do not claim trademark ownership, official status,
+manufacturer approval, or endorsement. They are distributed under the same
+licence terms as the repository's own source unless a future provenance
+record says otherwise.
 
-- **Never copies the custom file anywhere.** ArchiveFS only ever
-  references the path the user configured; nothing is written into
-  ArchiveFS's own storage or config directory.
-- Persisted as a single path string in its own small file
-  (`~/.config/archivefs/platform_artwork_directory.txt`), written only
-  when the setting is explicitly changed - the same persistence pattern
-  `docs/GUI_NAVIGATION_RESET_DESIGN.md`'s `GuiMode` preference already
-  uses, and for the same reason (one dedicated file per preference, never
-  a shared one that risks one preference's write corrupting another's).
-- No automatic ES-DE (or any other launcher's) theme discovery is
-  implemented - the user must point ArchiveFS at a directory explicitly.
+## Custom artwork directory
 
-## No-network guarantee
+Advanced View → Settings → “5. Platform artwork” accepts an optional local
+directory. Custom PNGs remain higher priority than the bundled pack and
+retain the established safety limits:
 
-Grep-verifiable: no HTTP client, URL loader, download, or "check for
-updates" logic exists anywhere in the platform-artwork code path. The
-decoder receives only bytes opened from the explicitly configured local
-directory. No automatic discovery or download is performed.
+- regular files directly inside the configured directory only; symlinks,
+  invalid ids, and non-files are rejected;
+- PNG only; custom SVG is never parsed;
+- maximum encoded size 1 MiB;
+- maximum dimensions 1024×1024 and maximum decoded allocation 4 MiB;
+- malformed, oversized, missing, or unsupported files fall through safely;
+- successful textures and failed decode fingerprints are cached by directory,
+  asset id, length, and modification time;
+- custom files are read in place and never copied or modified.
 
-`image` 0.25.10 is now a direct GUI dependency with only its `png` feature
-enabled. It was already present in the resolved dependency graph, adds no
-network capability, and is licensed `MIT OR Apache-2.0`, compatible with
-ArchiveFS. No SVG rendering dependencies were added.
+The directory preference is persisted in
+`~/.config/archivefs/platform_artwork_directory.txt` only when explicitly
+changed. Category custom filenames (`console.png`, `handheld.png`, etc.)
+continue to work for platforms without an exact bundled mapping.
 
-## Storage impact
+## SVG/category fallbacks
 
-10 SVG files, 4,303 bytes total on disk. None are currently compiled into
-the binary (the native-vector rendering path doesn't read them at
-runtime) - see "Built-in asset format and rendering" above.
+The existing SVG files remain canonical category/fallback references,
+lightweight source records, and licensing documentation. They are not deleted
+or parsed at runtime; egui draws their established native equivalents.
 
-## Asset manifest
+| SVG | Runtime role |
+|---|---|
+| `console.svg` | Console category fallback |
+| `handheld.svg` | Handheld category fallback |
+| `computer.svg` | Computer category fallback |
+| `arcade.svg` | Arcade category fallback |
+| `optical-disc.svg` | Optical-disc category fallback |
+| `cartridge.svg` | Cartridge category fallback |
+| `unknown.svg` | Final Unknown fallback |
+| `gamecube.svg` | Canonical legacy abstract GameCube reference |
+| `playstation2.svg` | Canonical legacy abstract PS2 reference |
+| `xbox.svg` | Canonical legacy abstract Xbox reference |
 
-| Asset filename | Platform / category | Creator | Licence | Attribution required |
-|---|---|---|---|---|
-| `console.svg` | Console (category fallback) | ArchiveFS project (original) | Same licence as this repository's own source | No - original project artwork |
-| `handheld.svg` | Handheld (category fallback) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `computer.svg` | Computer (category fallback) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `arcade.svg` | Arcade (category fallback) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `optical-disc.svg` | Optical-disc system (category fallback) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `cartridge.svg` | Cartridge system (category fallback) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `unknown.svg` | Unknown-platform fallback | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `gamecube.svg` | GameCube (dedicated, abstract) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `playstation2.svg` | PS2 (dedicated, abstract) | ArchiveFS project (original) | Same licence as this repository's own source | No |
-| `xbox.svg` | Xbox / Xbox 360 (dedicated, abstract) | ArchiveFS project (original) | Same licence as this repository's own source | No |
+Fallback category examples remain unchanged: Game Boy Advance uses handheld,
+NES uses console, PC uses computer, Arcade uses arcade, Amiga CD32 uses
+optical-disc, Atari 2600 uses cartridge, and an unrecognised platform uses
+Unknown.
 
-Every asset is original project artwork with no attribution obligation.
-If a future contribution adds third-party or externally-sourced artwork,
-add its row here with the real creator, licence, and attribution
-requirement **before** merging it - this table is the single place that
-decision must be recorded.
+## Presentation and testing
 
-## Process for adding a new platform asset
+The shelf remains one horizontally scrolling row. Cards retain responsive
+96–124 logical-pixel widths, platform name, count, selected state, standard
+button keyboard focus/activation, full-name tooltip/accessibility label, and
+1024×600 behavior. Hardware illustrations are aspect-fitted at 108 logical
+pixels in a 142-pixel card, centred with transparent padding preserved. Compact
+game rows use a recognisable 56-pixel thumbnail in a 64-pixel row.
 
-1. Confirm the artwork is original, or that its licence explicitly
-   permits redistribution in this project, and that it doesn't reproduce
-   a manufacturer's logo, trademark, or copyrighted product design.
-2. Add `crates/archivefs-gui/assets/platforms/<asset-id>.svg`.
-3. Add a row to the manifest table above with the real creator/licence.
-4. Add a `paint_platform_glyph_at` match arm for `<asset-id>` (native
-   vector rendering - see "Rendering approach" above for why this is
-   still the current mechanism).
-5. Add or extend a `platform_asset_id`/`platform_asset_category` match
-   arm so the relevant platform(s) resolve to `<asset-id>`.
-6. Add a test alongside the existing `platform_asset_id_*` tests in
-   `main.rs` proving the new mapping.
-
-## Unresolved / follow-up
-
-- **True SVG rasterization is not wired up.** The on-disk SVG files remain
-  the canonical built-in source assets. Users who want custom artwork must
-  supply PNG files under the documented limits.
-- No automated visual/pixel-diff test exists for the glyphs themselves
-  (deliberately - "do not create fragile screenshot-pixel tests unless
-  the existing test approach supports them reliably," and it does not).
-  Coverage instead proves mapping, responsive bounds, safe decoding,
-  cache invalidation, texture use, and built-in fallback behaviour.
+Tests cover the complete registry and alias table, case normalization,
+related-platform separation, category and Unknown fallbacks, custom override
+precedence, malformed custom and bundled data, deterministic embedded decode,
+absence of a bundled filesystem input, aspect fitting, card sizing, and
+unchanged platform filtering/selection state. Pixel-perfect screenshots are
+deliberately not used.

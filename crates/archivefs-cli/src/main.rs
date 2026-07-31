@@ -9,7 +9,10 @@ use archivefs_core::emulator_environment::retroarch::{
     ProfileScope, ResolutionState, RetroArchEnvironmentReport, RetroArchProfile,
     discover_retroarch_environment,
 };
-use archivefs_core::game_identity::{IdentityKind, inspect_catalogued_game_identity};
+use archivefs_core::game_identity::{
+    GameIdentityReport, IdentityConfidence, IdentityKind, IdentityStatus,
+    inspect_catalogued_game_identity,
+};
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatBackupAssessment,
@@ -17,12 +20,15 @@ use archivefs_core::patch_manager::{
     CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
     CheatJournalInspectionError, CheatProviderCoverageReport, CheatRollbackAvailability,
     CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
-    DolphinCatalogueLoad, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
-    RetroArchAdvisoryPlan, build_cheat_availability_report, build_cheat_provider_coverage_report,
-    default_dolphin_catalogue_cache_root, discover_cheat_history, execute_cheat_install_run,
-    execute_cheat_rollback_run, inspect_cheat_install_journal, load_catalogue_evidence_read_only,
-    load_cheat_catalogue_snapshot, load_dolphin_catalogue,
-    preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
+    DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
+    GameHackingGameCubeProvider, GameHackingProvider, GameHackingWiiFetchOptions,
+    GameHackingWiiProvider, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
+    RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
+    build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
+    discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
+    import_wii_game_page_bootstrap_file, inspect_cheat_install_journal,
+    load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot, load_dolphin_catalogue,
+    load_gamecube_catalogue, preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -257,6 +263,358 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print!("{}", format_advisory_patch_plan(&plan));
+            }
+        }
+        "gamehacking-ps2-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-ps2-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let provider = GameHackingProvider::default();
+            let result = provider.refresh_ps2_index(&options, |progress| {
+                eprintln!(
+                    "GameHacking PS2 index: {}/{} pages · {} games · page {} {}",
+                    progress.pages_complete,
+                    progress.pages_total,
+                    progress.games_collected,
+                    progress
+                        .page_number
+                        .map(|page| page.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    if progress.downloaded {
+                        "downloaded"
+                    } else {
+                        "cached"
+                    }
+                );
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking PS2 catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "gamehacking-gamecube-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let provider = GameHackingGameCubeProvider::default();
+            let result = provider.refresh_gamecube_index(&options, |progress| {
+                eprintln!(
+                    "GameHacking GameCube index: {}/{} pages · {} games · page {} {}",
+                    progress.pages_complete,
+                    progress.pages_total,
+                    progress.games_collected,
+                    progress
+                        .page_number
+                        .map(|page| page.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    if progress.downloaded {
+                        "downloaded"
+                    } else {
+                        "cached"
+                    }
+                );
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking GameCube catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "gamehacking-wii-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-wii-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingWiiFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let result =
+                GameHackingWiiProvider::default().refresh_wii_index(&options, |progress| {
+                    eprintln!(
+                        "GameHacking Wii index: {}/{} pages · {} games · page {} {}",
+                        progress.pages_complete,
+                        progress.pages_total,
+                        progress.games_collected,
+                        progress
+                            .page_number
+                            .map(|page| page.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        if progress.downloaded {
+                            "downloaded"
+                        } else {
+                            "cached"
+                        }
+                    );
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking Wii catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "game-identity-inspect" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let path = extract_named_path_flag(&mut input_args, "--path")?
+                .ok_or("game-identity-inspect requires --path <image>")?;
+            let platform = extract_named_flag(&mut input_args, "--platform")?;
+            if !input_args.is_empty() {
+                return Err(
+                    format!("game-identity-inspect does not accept {:?}", input_args).into(),
+                );
+            }
+            let report = inspect_catalogued_game_identity(&path, platform.as_deref());
+            if json {
+                print_game_identity_report_json(&report)?;
+            } else {
+                print_game_identity_report(&report);
+            }
+        }
+        "gamehacking-wii-import-page" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-wii-import-page requires --game-id <id>")?;
+            let image = extract_named_path_flag(&mut input_args, "--image")?
+                .ok_or("gamehacking-wii-import-page requires --image <path>")?;
+            let file = extract_named_path_flag(&mut input_args, "--file")?
+                .ok_or("gamehacking-wii-import-page requires --file <saved-page.html>")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-wii-import-page does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingWiiFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let report = inspect_catalogued_game_identity(&image, Some("Wii"));
+            let identity = WiiGameIdentity::from_report(
+                image
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Wii game"),
+                &report,
+            );
+            let outcome = import_wii_game_page_bootstrap_file(
+                &options.cache_root,
+                &identity,
+                game_id,
+                &file,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("Imported GameHacking.org Wii game {}", outcome.game_id);
+                println!("Verified Dolphin Game ID: {}", outcome.dolphin_game_id);
+                println!("Game: {}", outcome.game_title);
+                println!("Imported cheats: {}", outcome.cheats.len());
+                println!("Supported cheats: {}", outcome.supported_cheat_count);
+                println!(
+                    "Blocked or unknown cheats: {}",
+                    outcome.blocked_or_unknown_count
+                );
+                println!("Cache: {}", outcome.cache_path.display());
+                println!("Catalogue: {}", outcome.catalogue_path.display());
+                println!("Coverage: {}", outcome.coverage.label());
+                println!("Content SHA-256: {}", outcome.content_sha256);
+                println!("Provenance: {}", outcome.provenance);
+                println!(
+                    "Network used: {}",
+                    if outcome.network_used { "yes" } else { "no" }
+                );
+            }
+        }
+        "gamehacking-gamecube-sysid-diagnostic" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-gamecube-sysid-diagnostic requires --game-id <id>")?;
+            let verify_fetch = extract_flag(&mut input_args, "--verify-fetch");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-sysid-diagnostic does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let catalogue = load_gamecube_catalogue(&options.cache_root)?;
+            let record = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| {
+                    format!(
+                        "game {game_id} was not found in the cached GameCube catalogue; run gamehacking-gamecube-index-refresh first"
+                    )
+                })?;
+            let game = record.as_game();
+            let provider = GameHackingGameCubeProvider::default();
+            let diagnostics = provider.diagnose_export_form(&game, &options)?;
+            let cheats = if verify_fetch && diagnostics.sys_id.is_some() {
+                Some(provider.fetch_cheats_for_diagnostic(&game, &options)?)
+            } else {
+                None
+            };
+            if json {
+                #[derive(serde::Serialize)]
+                struct DiagnosticOutput<'a> {
+                    #[serde(flatten)]
+                    diagnostics: &'a archivefs_core::patch_manager::GameCubeSysIdDiagnostics,
+                    cheats:
+                        Option<&'a Vec<archivefs_core::patch_manager::GameHackingGameCubeCheat>>,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&DiagnosticOutput {
+                        diagnostics: &diagnostics,
+                        cheats: cheats.as_ref(),
+                    })?
+                );
+            } else {
+                println!("Game ID: {}", diagnostics.game_id);
+                println!("Title: {}", diagnostics.title);
+                println!("Game page URL: {}", diagnostics.game_page_url);
+                println!("Export form action: {}", diagnostics.export_form_action);
+                println!("Hidden fields:");
+                for (name, value) in &diagnostics.hidden_fields {
+                    println!("  {name} = {value}");
+                }
+                match diagnostics.sys_id {
+                    Some(sys_id) => println!("Confirmed sysID: {sys_id}"),
+                    None => println!(
+                        "Confirmed sysID: none found (no hidden sysID field, or it did not parse as a number)"
+                    ),
+                }
+                if let Some(cheats) = &cheats {
+                    println!("Verified fetch: {} named cheat(s) parsed", cheats.len());
+                    for cheat in cheats {
+                        println!("  - {} [{:?}]", cheat.name, cheat.code_format);
+                    }
+                }
+            }
+        }
+        "gamehacking-gamecube-code-format-audit" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-gamecube-code-format-audit requires --game-id <id>")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-code-format-audit does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let catalogue = load_gamecube_catalogue(&options.cache_root)?;
+            let record = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| {
+                    format!(
+                        "game {game_id} was not found in the cached GameCube catalogue; run gamehacking-gamecube-index-refresh first"
+                    )
+                })?;
+            let game = record.as_game();
+            let provider = GameHackingGameCubeProvider::default();
+            let cheats = provider.fetch_cheats_for_diagnostic(&game, &options)?;
+            let diagnostics: Vec<_> = cheats
+                .iter()
+                .map(archivefs_core::patch_manager::diagnose_gamecube_cheat_code_format)
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+            } else {
+                println!("Game ID: {game_id}");
+                println!("Title: {}", game.title);
+                println!("Cheats: {}", diagnostics.len());
+                for cheat in &diagnostics {
+                    println!();
+                    println!("- {}", cheat.name);
+                    println!("  Author: {}", cheat.author.as_deref().unwrap_or("(none)"));
+                    println!("  Line count: {}", cheat.line_count);
+                    println!("  Opcode prefixes: {}", cheat.opcode_prefixes.join(", "));
+                    println!("  Classification: {:?}", cheat.code_format);
+                    println!("  Reason: {}", cheat.classification_reason);
+                    println!("  Raw lines:");
+                    for line in &cheat.code_lines {
+                        println!("    {line}");
+                    }
+                }
             }
         }
         "retroarch-environment" => {
@@ -3653,6 +4011,55 @@ fn extract_named_path_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(value))
+}
+
+fn extract_named_u64_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}").into())
+}
+
 fn cheat_history_options(
     journal_root_override: Option<PathBuf>,
 ) -> Result<CheatHistoryOptions, Box<dyn std::error::Error>> {
@@ -4089,6 +4496,149 @@ fn print_archive_info(info: &ArchiveInfo) {
     print!("{}", format_archive_info(info));
 }
 
+/// Read-only identity diagnostic for one image. Reports exactly what the
+/// shared inspector proved, never a filename guess: values appear only
+/// when their evidence reached `Verified`, and the terminal status of the
+/// primary identity evidence is surfaced as the failure code.
+fn game_identity_report_rows(report: &GameIdentityReport) -> Vec<(&'static str, String)> {
+    let is_primary_kind = |item: &&archivefs_core::game_identity::IdentityEvidence| {
+        matches!(
+            item.kind,
+            IdentityKind::DolphinGameId | IdentityKind::Ps2Serial | IdentityKind::XexTitleId
+        )
+    };
+    // Prefer proven evidence: a filename candidate for the same kind is
+    // also present, and must never be reported as the provenance of the
+    // identity or as the reason one is missing.
+    let primary = report
+        .evidence
+        .iter()
+        .find(|item| is_primary_kind(item) && item.status == IdentityStatus::Verified)
+        .or_else(|| {
+            report
+                .evidence
+                .iter()
+                .filter(is_primary_kind)
+                .find(|item| item.confidence != IdentityConfidence::FilenameOnly)
+        });
+    let missing = || "unavailable".to_string();
+    // Wii deliberately keeps the outer-header revision as a candidate, so
+    // report it separately rather than claiming it is verified.
+    let revision = report.verified_dolphin_revision().map_or_else(
+        || {
+            report
+                .evidence
+                .iter()
+                .find(|item| {
+                    item.kind == IdentityKind::DolphinRevision
+                        && item.status == IdentityStatus::Candidate
+                })
+                .and_then(|item| item.value.as_deref())
+                .map_or_else(missing, |value| format!("{value} (candidate)"))
+        },
+        |value| value.to_string(),
+    );
+    vec![
+        ("Path", report.archive_path.display().to_string()),
+        ("Platform", report.platform.label().to_string()),
+        ("Image format", format!("{:?}", report.format)),
+        (
+            "Verified Game ID",
+            report
+                .verified_dolphin_game_id()
+                .map_or_else(missing, str::to_owned),
+        ),
+        (
+            "Disc number",
+            report
+                .verified_value(IdentityKind::DolphinDiscNumber)
+                .map_or_else(missing, str::to_owned),
+        ),
+        ("Revision", revision),
+        (
+            "Region",
+            report
+                .verified_value(IdentityKind::DolphinRegion)
+                .map_or_else(missing, str::to_owned),
+        ),
+        (
+            "Provenance",
+            primary.map_or_else(missing, |item| item.provenance.method.clone()),
+        ),
+        ("Bytes read", report.bytes_read.to_string()),
+        (
+            "Failure code",
+            primary.map_or_else(
+                || "None".to_string(),
+                |item| {
+                    if item.status == IdentityStatus::Verified {
+                        "None".to_string()
+                    } else {
+                        item.status.to_string()
+                    }
+                },
+            ),
+        ),
+        ("Complete", report.complete.to_string()),
+    ]
+}
+
+fn print_game_identity_report(report: &GameIdentityReport) {
+    println!("ArchiveFS Game Identity\n");
+    for (label, value) in game_identity_report_rows(report) {
+        println!("  {label}: {value}");
+    }
+    if !report.evidence.is_empty() {
+        println!("\nEvidence:");
+        for item in &report.evidence {
+            println!(
+                "  {} = {} [{}] ({:?}; {}; {})",
+                item.kind,
+                item.value.as_deref().unwrap_or("-"),
+                item.status,
+                item.confidence,
+                item.provenance.method,
+                item.diagnostic
+            );
+        }
+    }
+}
+
+fn print_game_identity_report_json(report: &GameIdentityReport) -> Result<(), serde_json::Error> {
+    let rows = game_identity_report_rows(report)
+        .into_iter()
+        .map(|(label, value)| {
+            (
+                label.to_ascii_lowercase().replace(' ', "_"),
+                serde_json::Value::String(value),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let evidence = report
+        .evidence
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "kind": item.kind.to_string(),
+                "status": item.status.to_string(),
+                "value": item.value,
+                "confidence": format!("{:?}", item.confidence),
+                "method": item.provenance.method,
+                "diagnostic": item.diagnostic,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "identity": rows,
+            "evidence": evidence,
+            "warnings": report.warnings,
+        }))?
+    );
+    Ok(())
+}
+
 fn print_archive_info_json(info: &ArchiveInfo) -> Result<(), serde_json::Error> {
     println!("{}", format_archive_info_json(info)?);
     Ok(())
@@ -4290,6 +4840,27 @@ fn print_help() {
     println!("  doctor         Check whether ArchiveFS is ready to run");
     println!("  config-check   Validate ArchiveFS configuration");
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
+    println!(
+        "  gamehacking-ps2-index-refresh  Resume the cached public PS2 index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-gamecube-index-refresh  Resume the cached public GameCube index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-wii-index-refresh  Resume the cached public Wii index crawl using the shared catalogue engine (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  game-identity-inspect --path <image> [--platform <name>] [--json]  Report the read-only disc identity evidence for one image"
+    );
+    println!(
+        "  gamehacking-wii-import-page --game-id <id> --image <path> --file <saved-page.html>  Validate and import one saved Wii game page without network access"
+    );
+    println!(
+        "  gamehacking-gamecube-sysid-diagnostic --game-id <id>  Fetch one cached catalogue game's real page and print its cheat-export form action, hidden fields, and confirmed sysID (--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-gamecube-code-format-audit --game-id <id>  Fetch one cached catalogue game's real cheat export and print, per cheat, its title/author/raw code lines/opcode prefixes/classification and why (--cache-root/--json accepted)"
+    );
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
@@ -4398,6 +4969,10 @@ fn print_help() {
     println!("  archivefs config-check");
     println!("  archivefs pcsx2-patch-preview");
     println!("  archivefs pcsx2-patch-preview --json");
+    println!("  archivefs gamehacking-ps2-index-refresh");
+    println!("  archivefs gamehacking-gamecube-index-refresh");
+    println!("  archivefs gamehacking-gamecube-sysid-diagnostic --game-id 54172");
+    println!("  archivefs gamehacking-gamecube-code-format-audit --game-id 54172");
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");

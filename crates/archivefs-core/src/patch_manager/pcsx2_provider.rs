@@ -36,6 +36,9 @@ pub struct Pcsx2CheatProviderRecord {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub author: Option<String>,
+    pub source_game_id: Option<String>,
+    pub source_url: Option<String>,
     pub game_crc: String,
     pub serial_constraint: Option<String>,
     pub region_constraint: Option<String>,
@@ -111,6 +114,9 @@ pub struct Pcsx2CheatCandidate {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub author: Option<String>,
+    pub source_game_id: Option<String>,
+    pub source_url: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub source: String,
@@ -148,6 +154,9 @@ pub fn build_pcsx2_cheat_candidates(
                 id: record.id.clone(),
                 name: record.name.clone(),
                 description: record.description.clone(),
+                author: record.author.clone(),
+                source_game_id: record.source_game_id.clone(),
+                source_url: record.source_url.clone(),
                 provider_id: catalogue.provider_id.clone(),
                 provider_name: catalogue.provider_name.clone(),
                 source: catalogue.source.clone(),
@@ -246,7 +255,28 @@ pub fn selected_pcsx2_managed_cheats(
             Ok(ManagedPnachCheat {
                 id: candidate.id.clone(),
                 name: candidate.name.clone(),
-                description: candidate.description.clone(),
+                description: Some(
+                    [
+                        candidate.description.clone(),
+                        candidate
+                            .author
+                            .as_ref()
+                            .map(|author| format!("Author: {author}")),
+                        candidate
+                            .source_game_id
+                            .as_ref()
+                            .map(|game_id| format!("GameHacking game ID: {game_id}")),
+                        candidate
+                            .source_url
+                            .as_ref()
+                            .map(|source| format!("Source: {source}")),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                )
+                .filter(|description| !description.is_empty()),
                 patch_lines: candidate.patch_lines.clone(),
             })
         })
@@ -276,6 +306,9 @@ mod tests {
             id: "infinite-health".to_string(),
             name: "Infinite health".to_string(),
             description: None,
+            author: None,
+            source_game_id: None,
+            source_url: None,
             game_crc: "A1B2C3D4".to_string(),
             serial_constraint: Some("SLUS-20312".to_string()),
             region_constraint: Some("NTSC-U".to_string()),
@@ -354,6 +387,74 @@ mod tests {
         assert_eq!(
             candidate.compatibility,
             Pcsx2CheatCompatibility::Blocked(Pcsx2CandidateBlockedReason::WidescreenKeptSeparate)
+        );
+    }
+
+    #[test]
+    fn grouped_pnach_output_keeps_real_names_authors_descriptions_in_separate_sections() {
+        use super::super::pcsx2_pnach::{merge_managed_pnach_cheats, parse_pnach_document};
+
+        let mut second = record();
+        second.id = "infinite-ammo".to_string();
+        second.name = "Infinite ammo".to_string();
+        second.description = Some("Ammo count never drops.".to_string());
+        second.author = Some("Ada".to_string());
+        second.source_game_id = Some("42".to_string());
+        second.source_url = Some("https://gamehacking.org/game/42".to_string());
+        second.patch_lines = vec!["patch=1,EE,20654321,word,00000063".to_string()];
+
+        let mut first = record();
+        first.description = Some("Health never decreases.".to_string());
+        first.author = Some("Codejunkies".to_string());
+        first.source_game_id = Some("42".to_string());
+        first.source_url = Some("https://gamehacking.org/game/42".to_string());
+
+        let catalogue = Pcsx2CheatProviderCatalogue {
+            provider_id: "gamehacking.org".to_string(),
+            provider_name: "GameHacking.org".to_string(),
+            source: "https://gamehacking.org/game/42".to_string(),
+            trust: Pcsx2ProviderTrust::Approved,
+            records: vec![first, second],
+        };
+        let candidates = build_pcsx2_cheat_candidates(&catalogue, &identity());
+        assert!(candidates.iter().all(Pcsx2CheatCandidate::selectable));
+        let selection = Pcsx2CheatSelection {
+            selected_ids: BTreeSet::from([
+                "infinite-health".to_string(),
+                "infinite-ammo".to_string(),
+            ]),
+        };
+        let managed = selected_pcsx2_managed_cheats(&candidates, &selection).unwrap();
+        assert_eq!(managed.len(), 2);
+
+        let document =
+            parse_pnach_document(b"// existing user note\npatch=0,EE,00100000,word,1\n").unwrap();
+        let rendered = merge_managed_pnach_cheats(&document, &managed).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+
+        // Real cheat names, per-cheat author attribution, and descriptions
+        // are present, each inside its own selectable managed section.
+        assert!(text.contains("// ArchiveFS managed block: infinite-health"));
+        assert!(text.contains("// Infinite health"));
+        assert!(text.contains("Author: Codejunkies"));
+        assert!(text.contains("Health never decreases."));
+        assert!(text.contains("patch=1,EE,20123456,word,00000001"));
+        assert!(text.contains("// End ArchiveFS managed block"));
+
+        assert!(text.contains("// ArchiveFS managed block: infinite-ammo"));
+        assert!(text.contains("// Infinite ammo"));
+        assert!(text.contains("Author: Ada"));
+        assert!(text.contains("Ammo count never drops."));
+        assert!(text.contains("patch=1,EE,20654321,word,00000063"));
+
+        // The original file's unrelated content is preserved byte-for-byte.
+        assert!(text.starts_with("// existing user note\npatch=0,EE,00100000,word,1\n"));
+
+        // Two independent, deterministically parseable managed sections.
+        let reparsed = parse_pnach_document(text.as_bytes()).unwrap();
+        assert_eq!(
+            reparsed.managed_block_ids(),
+            &BTreeSet::from(["infinite-health".to_string(), "infinite-ammo".to_string()])
         );
     }
 

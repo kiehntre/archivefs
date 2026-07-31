@@ -35,6 +35,9 @@ use std::{env, fs};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::emulator_environment::EncodedPath;
+use crate::game_identity::{
+    GameIdentityReport, IdentityPlatform, inspect_catalogued_game_identity,
+};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
@@ -99,6 +102,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         description: "add optional persisted source-level platform assignment",
         sql: include_str!("migrations/0005_source_platform_assignment.sql"),
+    },
+    Migration {
+        version: 6,
+        description: "persist bounded direct-image identity reports with source metadata",
+        sql: include_str!("migrations/0006_game_identity_reports.sql"),
     },
 ];
 
@@ -1234,6 +1242,9 @@ pub struct PersistedArchive {
     /// archive. Retained while the row is missing for review display.
     pub last_seen_at: String,
     pub last_verified_missing_at: Option<String>,
+    /// Bounded identity evidence captured from the exact loose image during
+    /// the last successful scan whose size and mtime matched this row.
+    pub identity_report: Option<GameIdentityReport>,
 }
 
 /// One automatically detected platform and the path evidence retained for a
@@ -2990,7 +3001,8 @@ impl Database {
                 "SELECT a.id, a.source_folder_id, a.relative_path, a.absolute_path_cached, \
                  a.archive_kind, a.display_name, a.normalized_name, a.size_bytes, \
                  a.modified_time_unix_seconds, p.platform, p.source, a.last_known_health, \
-                 a.last_seen_at, a.last_verified_missing_at \
+                 a.last_seen_at, a.last_verified_missing_at, a.identity_report_json, \
+                 a.identity_report_size_bytes, a.identity_report_modified_time_unix_seconds \
                  FROM archives a \
                  LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
                  ORDER BY a.id",
@@ -3002,6 +3014,18 @@ impl Database {
                 let relative_path_bytes: Vec<u8> = row.get(2)?;
                 let absolute_path_bytes: Vec<u8> = row.get(3)?;
                 let size_bytes: Option<i64> = row.get(7)?;
+                let identity_json: Option<Vec<u8>> = row.get(14)?;
+                let identity_size: Option<i64> = row.get(15)?;
+                let identity_modified: Option<i64> = row.get(16)?;
+                let identity_report = if identity_size == size_bytes
+                    && identity_modified == row.get::<_, Option<i64>>(8)?
+                {
+                    identity_json
+                        .as_deref()
+                        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                } else {
+                    None
+                };
                 Ok(PersistedArchive {
                     id: row.get(0)?,
                     source_folder_id: row.get(1)?,
@@ -3017,12 +3041,57 @@ impl Database {
                     last_known_health: row.get(11)?,
                     last_seen_at: row.get(12)?,
                     last_verified_missing_at: row.get(13)?,
+                    identity_report,
                 })
             })
             .map_err(|error| db_error("failed to query archives", error))?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| db_error("failed to read archives", error))
+    }
+
+    fn persist_identity_report(
+        &mut self,
+        archive_id: i64,
+        archive: &Archive,
+        report: Option<&GameIdentityReport>,
+    ) -> Result<()> {
+        let json = report
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "failed to serialize game identity report: {error}"
+                ))
+            })?;
+        let size = report
+            .and(archive.identity.size_bytes)
+            .map(|value| value as i64);
+        let modified = report.and_then(|_| {
+            archive
+                .identity
+                .modified_time
+                .and_then(system_time_to_unix_seconds)
+        });
+        self.connection
+            .execute(
+                "UPDATE archives SET identity_report_json = ?2, identity_report_size_bytes = ?3, \
+                 identity_report_modified_time_unix_seconds = ?4 WHERE id = ?1",
+                params![archive_id, json, size, modified],
+            )
+            .map_err(|error| db_error("failed to persist game identity report", error))?;
+        Ok(())
+    }
+
+    fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read current archive platform", error))
     }
 
     /// Builds display-oriented provenance details for already-loaded archive
@@ -3553,6 +3622,22 @@ fn persist_one_folder(
             }
         };
         database.assign_platform(outcome.archive_id, platform.as_deref(), source)?;
+
+        if archive.kind == ArchiveKind::DirectGameImage {
+            let effective_platform = database.current_platform_for_archive(outcome.archive_id)?;
+            let identity_platform = IdentityPlatform::from_catalogue(effective_platform.as_deref());
+            if matches!(
+                identity_platform,
+                IdentityPlatform::PlayStation2 | IdentityPlatform::Wii
+            ) {
+                let report =
+                    inspect_catalogued_game_identity(&archive.path, effective_platform.as_deref());
+                database.persist_identity_report(outcome.archive_id, archive, Some(&report))?;
+            } else {
+                // Never replay evidence after an effective platform change.
+                database.persist_identity_report(outcome.archive_id, archive, None)?;
+            }
+        }
     }
 
     counts.archives_missing =
@@ -3679,6 +3764,25 @@ mod tests {
         full_path
     }
 
+    fn wii_wbfs_fixture(game_id: &[u8; 6], revision: u8) -> Vec<u8> {
+        const HD_SHIFT: u8 = 9;
+        const WBFS_SHIFT: u8 = 21;
+        let file_len = 4_usize << WBFS_SHIFT;
+        let mut bytes = vec![0_u8; file_len];
+        bytes[..4].copy_from_slice(b"WBFS");
+        bytes[4..8].copy_from_slice(&u32::try_from(file_len >> HD_SHIFT).unwrap().to_be_bytes());
+        bytes[8] = HD_SHIFT;
+        bytes[9] = WBFS_SHIFT;
+        bytes[12] = 1;
+        let disc_info = 1_usize << HD_SHIFT;
+        bytes[disc_info..disc_info + 6].copy_from_slice(game_id);
+        bytes[disc_info + 6] = 0;
+        bytes[disc_info + 7] = revision;
+        bytes[disc_info + 0x18..disc_info + 0x1c].copy_from_slice(&[0x5d, 0x1c, 0x9e, 0xa3]);
+        bytes[disc_info + 0x100..disc_info + 0x102].copy_from_slice(&1_u16.to_be_bytes());
+        bytes
+    }
+
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
             source_folders: vec![source_dir.to_path_buf()],
@@ -3695,6 +3799,47 @@ mod tests {
             .iter()
             .find(|archive| archive.relative_path == Path::new(relative_path))
             .unwrap_or_else(|| panic!("no persisted archive with relative_path {relative_path}"))
+    }
+
+    #[test]
+    fn loose_wii_wbfs_identity_survives_database_reopen() {
+        let root = temp_dir("loose-wii-wbfs-identity");
+        let source = root.join("wii");
+        let mount = root.join("mount");
+        let image = write_archive_file(
+            &source,
+            "Wrong Filename [RZDE01].wbfs",
+            &wii_wbfs_fixture(b"SMNE01", 1),
+        );
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "Wrong Filename [RZDE01].wbfs");
+        assert_eq!(archive.archive_kind, "direct_game_image");
+        let report = archive.identity_report.as_ref().unwrap();
+        assert_eq!(report.archive_path, image);
+        assert_eq!(report.verified_dolphin_game_id(), Some("SMNE01"));
+        assert_eq!(
+            report.verified_value(crate::game_identity::IdentityKind::DolphinRegion),
+            Some("E")
+        );
+        database.close().unwrap();
+
+        let database = Database::open_read_only(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "Wrong Filename [RZDE01].wbfs");
+        assert_eq!(
+            archive
+                .identity_report
+                .as_ref()
+                .and_then(GameIdentityReport::verified_dolphin_game_id),
+            Some("SMNE01")
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     fn create_representative_older_database(path: &Path, schema_version: usize) {

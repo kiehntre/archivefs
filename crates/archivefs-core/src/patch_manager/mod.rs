@@ -36,6 +36,12 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod emulator_profile_memory;
+mod gamehacking_catalogue;
+mod gamehacking_gamecube_install_plan;
+mod gamehacking_gamecube_provider;
+mod gamehacking_provider;
+mod gamehacking_shared;
+mod gamehacking_wii_provider;
 mod gecko_document;
 mod import_safety;
 mod matching;
@@ -45,6 +51,7 @@ mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
 mod retroarch_cheat_library;
@@ -213,13 +220,13 @@ pub use dolphin_gecko_provider::{
 pub use dolphin_local::{
     DOLPHIN_MAX_ENTRIES_VISITED, DOLPHIN_MAX_GAME_INI_BYTES, DOLPHIN_MAX_GAME_INI_FILES,
     DOLPHIN_MAX_LINE_BYTES, DOLPHIN_MAX_LINES_PER_FILE, DOLPHIN_MAX_PROFILES,
-    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinDirectoryIdentity,
-    DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory, DolphinInspectionError,
-    DolphinInspectionWarning, DolphinInspectionWarningKind, DolphinInstallationType,
-    DolphinMatchResult, DolphinMatchState, DolphinProfile, DolphinProfileBlocker,
-    DolphinProfileBlockerKind, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
-    DolphinProfileScope, DolphinSettingsDirectoryState, discover_dolphin_profiles,
-    inspect_dolphin_profile, match_dolphin_inventory,
+    DOLPHIN_MAX_TOTAL_GAME_INI_BYTES, DolphinCodeKind, DolphinCommandLine,
+    DolphinDirectoryIdentity, DolphinDiscoveryError, DolphinGameIniFile, DolphinGameIniInventory,
+    DolphinInspectionError, DolphinInspectionWarning, DolphinInspectionWarningKind,
+    DolphinInstallationType, DolphinMatchResult, DolphinMatchState, DolphinProfile,
+    DolphinProfileBlocker, DolphinProfileBlockerKind, DolphinProfileDiscovery,
+    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinSettingsDirectoryState,
+    discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_profile, match_dolphin_inventory,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
@@ -228,11 +235,57 @@ pub use emulator_profile_memory::{
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
 };
+pub use gamehacking_gamecube_install_plan::{
+    GameCubeCheatSelection, GameCubeCheatSelectionEntry, GameCubeGameHackingInstallPreview,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, MANAGED_SECTION_NAME,
+    MAX_GENERATED_INI_BYTES as GAMECUBE_GAMEHACKING_MAX_GENERATED_INI_BYTES, StagedGameCubeCheat,
+    StagedGameCubeIni, build_gamecube_gamehacking_install_preview, dolphin_code_name,
+    managed_names, stage_gamecube_gamehacking_install, stage_gamecube_gamehacking_removal,
+};
+pub use gamehacking_gamecube_provider::{
+    GAMEHACKING_GAMECUBE_PROVIDER_ID, GameCubeCheatCodeDiagnostic, GameCubeCodeFormat,
+    GameCubeGameHackingAdapter, GameCubeGameIdentity, GameCubeIdentityState,
+    GameCubeSysIdDiagnostics, GameHackingGameCubeCatalogue, GameHackingGameCubeCheat,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeIndexPage,
+    GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
+    GameHackingGameCubeIndexRefreshResult, GameHackingGameCubeMatch,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
+    apply_gamecube_page_format_labels, diagnose_gamecube_cheat_code_format,
+    load_gamecube_catalogue, normalize_gamecube_game_id, parse_gamecube_sysid_diagnostics,
+    parse_gamehacking_gamecube_export, parse_gamehacking_gamecube_index_page,
+};
+pub use gamehacking_provider::{
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GAMEHACKING_PROVIDER_ID, GameHackingCheat,
+    GameHackingError, GameHackingErrorKind, GameHackingFetchOptions, GameHackingFetchOutcome,
+    GameHackingGame, GameHackingIndexPage, GameHackingIndexProgress, GameHackingIndexRecord,
+    GameHackingIndexRefreshResult, GameHackingMatch, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingMatchStrength, GameHackingProvider, GameHackingPs2Catalogue,
+    GameHackingSystemAdapter, Ps2GameHackingAdapter, gamehacking_cache_root, load_ps2_catalogue,
+    normalize_ps2_serial, parse_gamehacking_game_page, parse_gamehacking_pnach,
+    parse_gamehacking_ps2_index_page,
+};
+pub use gamehacking_wii_provider::{
+    GAMEHACKING_WII_PROVIDER_ID, GameHackingWiiCatalogue, GameHackingWiiCheat,
+    GameHackingWiiFetchOptions, GameHackingWiiGame, GameHackingWiiIndexPage,
+    GameHackingWiiIndexProgress, GameHackingWiiIndexRecord, GameHackingWiiIndexRefreshResult,
+    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchOutcome,
+    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
+    WiiBrowserImportProvenance, WiiCatalogueCoverage, WiiCheatSafety, WiiCodeFormat,
+    WiiGameIdentity, WiiIdentityState, WiiManualImportError, WiiManualImportErrorKind,
+    WiiManualImportOutcome, build_wii_gamehacking_install_preview,
+    import_wii_game_page_bootstrap_bytes, import_wii_game_page_bootstrap_file,
+    import_wii_game_page_bytes, import_wii_game_page_file, import_wii_text_export_unverified,
+    load_wii_catalogue, normalize_wii_game_id, parse_gamehacking_wii_index_page,
+    parse_wii_game_page, stage_wii_gamehacking_install, stage_wii_gamehacking_removal,
+};
 pub use gecko_document::{
-    DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind, GeckoCode, GeckoCodeWarning,
-    GeckoCodeWarningKind, GeckoMergeError, MAX_GECKO_CODE_LINES, MAX_GECKO_CODES,
-    MAX_GECKO_LINE_BYTES, merge_external_gecko_codes, parse_dolphin_ini,
-    replace_gecko_enabled_section,
+    DolphinCodeSectionKind, DolphinIniDocument, DolphinIniWarning, DolphinIniWarningKind,
+    GeckoCode, GeckoCodeWarning, GeckoCodeWarningKind, GeckoMergeError, MAX_GECKO_CODE_LINES,
+    MAX_GECKO_CODES, MAX_GECKO_LINE_BYTES, merge_external_action_replay_codes,
+    merge_external_gecko_codes, parse_dolphin_ini, remove_named_codes,
+    replace_gecko_enabled_section, replace_named_section,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
@@ -249,8 +302,9 @@ pub use pcsx2_identity::{
 };
 pub use pcsx2_install_plan::{
     Pcsx2InstallPlanError, Pcsx2InstallPlanErrorKind, Pcsx2InstallPreview,
-    Pcsx2InstallPreviewRequest, StagedPcsx2Pnach, build_pcsx2_install_preview,
-    load_existing_pcsx2_pnach, pcsx2_crc_filename, stage_pcsx2_pnach,
+    Pcsx2InstallPreviewRequest, StagedPcsx2LegacyMigration, StagedPcsx2Pnach,
+    build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, load_existing_pcsx2_pnach,
+    pcsx2_crc_filename, pcsx2_pnach_filename, stage_pcsx2_pnach,
 };
 pub use pcsx2_local::{
     PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
@@ -265,14 +319,19 @@ pub use pcsx2_local::{
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
-    PnachDocumentError, PnachDocumentErrorKind, PnachPatchLine, merge_managed_pnach_cheats,
-    parse_pnach_document,
+    PnachDocumentError, PnachDocumentErrorKind, PnachPatchLine, RawManagedBlock,
+    append_raw_managed_blocks, extract_managed_blocks, merge_managed_pnach_cheats,
+    parse_pnach_document, remove_managed_blocks,
 };
 pub use pcsx2_provider::{
     Pcsx2CandidateBlockedReason, Pcsx2CheatCandidate, Pcsx2CheatCategory, Pcsx2CheatCompatibility,
     Pcsx2CheatConfidence, Pcsx2CheatProviderCatalogue, Pcsx2CheatProviderRecord,
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
+};
+pub use resolved_emulator_profile::{
+    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
+    ResolvedEmulatorProfile,
 };
 pub use retrieval::{HttpsMetadataFetcher, MetadataFetcher};
 pub use retroarch::{
@@ -333,6 +392,7 @@ pub use shared_transaction::{
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
+    require_dolphin_managed_gamehacking_verification,
 };
 pub use xenia_install_plan::{
     LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,
@@ -1534,6 +1594,7 @@ mod tests {
             last_known_health: "present".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: None,
+            identity_report: None,
         };
         let evidence = CatalogueGameEvidence::from(&archive);
         assert_eq!(evidence.serial, None);

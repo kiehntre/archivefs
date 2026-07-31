@@ -11,12 +11,69 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
+## Unreleased
+
+### Gamer View
+
+- Platform Artwork Pack v1 replaces temporary exact-platform abstract glyphs
+  with 17 original/generated PNG hardware illustrations embedded in the GUI
+  executable. Exact, case-insensitive aliases cover Acorn Archimedes, Amiga,
+  Dreamcast, Game Boy, GameCube, Mega Drive/Genesis, Nintendo 64, PlayStation
+  1/2/3, Saturn, SNES/Super Famicom, Switch, Wii, Wii U, Xbox, and Xbox 360.
+- Artwork resolution is now valid custom local PNG, exact bundled PNG,
+  category glyph, then Unknown. Custom safety limits and precedence are
+  unchanged; bundled images require neither network access nor installed
+  source-tree files and decoded textures are cached.
+- The one-row responsive platform shelf, filtering, selected/focus states,
+  labels, counts, tooltips, and narrow-window behavior remain unchanged.
+- Platform hardware illustrations are now prominent, and compact game rows
+  again show cached artwork: local per-game PNG, platform artwork, then
+  Unknown.
+- Increased hardware illustrations to 108 pixels in 142-pixel cards and game
+  thumbnails to 56 pixels in compact 64-pixel rows after manual readability
+  testing, without cropping or stretching transparent PNGs.
+
+### Cheats & Mods
+
+- GameHacking native PCSX2 section headers, authors, and multiline
+  descriptions are now retained, so selectable entries show their real cheat
+  names and notes instead of generic `Cheat N` placeholders.
+
+- Replaced the incomplete single-page GameHacking PS2 lookup with a resumable,
+  rate-limited local index catalogue covering every numbered public PS2 index
+  page. Runtime matching now prioritizes normalized serial/CRC/region evidence;
+  title-only and ambiguous results are shown for explicit confirmation before
+  one native PCSX2 export is requested. Downloaded index/catalogue data remains
+  private cache data and is not shipped or committed.
+
+- Added the general GameHacking.org provider core with PS2/PCSX2 as its first
+  adapter. It checks one selected local-library game at a time, fails closed on
+  serial/CRC/region conflicts, caches public pages and native PNACH exports,
+  preserves author/description/source provenance, and rate-limits bounded
+  fixed-origin HTTPS requests.
+- Selected GameHacking.org cheats can be previewed and installed under the
+  verified local PCSX2 CRC through ArchiveFS's existing confirmation, backup,
+  journal, and Undo transaction flow. No crawler, automatic fetch, PNACH
+  conversion, ROM modification, or user-file overwrite without confirmation
+  was added.
+- GameHacking HTML no longer requires strict UTF-8: declared HTTP charsets are
+  honoured and other pages use safe lossy decoding while original response
+  bytes remain unchanged in the cache.
+
+### Documentation
+
+- Expanded the platform artwork manifest with every bundled filename, alias,
+  encoded size, alpha/padding inspection, runtime format, offline guarantee,
+  provenance statement, fallback behavior, and rejection record.
+- Added `docs/GAMEHACKING_PROVIDER.md` covering provider scope, identity gates,
+  caching, rate limiting, provenance, native export, and future adapters.
+
 ## v0.7.0-alpha (unreleased)
 
 See [`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the
 full narrative release notes, installation instructions, and manual QA
-summary. This entry groups the same changes by area. No tag has been
-created yet; this is a release candidate under final validation.
+summary. This entry groups the same changes by area. The published annotated
+tag peels to source commit `908c00da23303216cd28563a00b4ec835bc87207`.
 
 ### Gamer View
 

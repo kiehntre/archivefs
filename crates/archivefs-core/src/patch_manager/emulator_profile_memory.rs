@@ -237,6 +237,7 @@ pub struct EmulatorProfileCandidate {
     /// multiple valid profiles when nothing has been remembered or
     /// explicitly chosen yet.
     pub is_portable: bool,
+    pub evidence_priority: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +246,7 @@ pub enum EmulatorProfileSelectReason {
     ExplicitChoice,
     OnlyValidProfile,
     PortablePreferred,
+    StrongestEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +312,27 @@ pub fn select_emulator_profile(
         };
     }
 
+    let strongest = eligible
+        .iter()
+        .map(|candidate| candidate.evidence_priority)
+        .max()
+        .unwrap_or(0);
+    let strongest_candidates: Vec<_> = eligible
+        .iter()
+        .filter(|candidate| candidate.evidence_priority == strongest)
+        .collect();
+    if strongest > 0 && strongest_candidates.len() == 1 {
+        return EmulatorProfileSelection::Auto {
+            profile_id: strongest_candidates[0].profile_id.clone(),
+            reason: EmulatorProfileSelectReason::StrongestEvidence,
+        };
+    }
+    if strongest > 0 && strongest_candidates.len() > 1 {
+        return EmulatorProfileSelection::NeedsChoice {
+            candidates: discovered.to_vec(),
+        };
+    }
+
     let portable: Vec<&&EmulatorProfileCandidate> =
         eligible.iter().filter(|c| c.is_portable).collect();
     if portable.len() == 1 {
@@ -344,7 +367,28 @@ mod tests {
             root: PathBuf::from(format!("/profiles/{id}")),
             eligible,
             is_portable: portable,
+            evidence_priority: 0,
         }
+    }
+
+    #[test]
+    fn unique_strongest_evidence_wins_but_equal_priority_requires_choice() {
+        let mut native = candidate("native", true, false);
+        native.evidence_priority = 100;
+        let mut running = candidate("running", true, true);
+        running.evidence_priority = 400;
+        assert_eq!(
+            select_emulator_profile(&[native.clone(), running.clone()], None, None),
+            EmulatorProfileSelection::Auto {
+                profile_id: "running".to_string(),
+                reason: EmulatorProfileSelectReason::StrongestEvidence,
+            }
+        );
+        native.evidence_priority = 400;
+        assert!(matches!(
+            select_emulator_profile(&[native, running], None, None),
+            EmulatorProfileSelection::NeedsChoice { .. }
+        ));
     }
 
     #[test]

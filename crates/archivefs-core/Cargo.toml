@@ -17,7 +17,15 @@ notify = "8"
 sha2 = "0.11.0"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+http = "1"
 url = "2"
+# GameHacking.org exposes ordinary HTML rather than a supported public API.
+# Keep CSS selectors isolated in one read-only provider module so layout
+# repairs do not spread through matching, caching, or installation code.
+scraper = { version = "0.27", default-features = false }
+# Decode provider HTML according to an explicit HTTP charset without ever
+# altering the original cached response bytes.
+encoding_rs = "0.8"
 # Xenia Canary patch files (`*.patch.toml`): parsed as bounded, generic
 # TOML syntax via this crate, then mapped through our own strict,
 # schema-specific validator - see patch_manager::xenia_patch_document.

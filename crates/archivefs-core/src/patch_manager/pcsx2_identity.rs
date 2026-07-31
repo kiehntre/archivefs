@@ -89,7 +89,7 @@ impl Pcsx2GameIdentity {
         Self {
             archive_path: report.archive_path.clone(),
             title,
-            region: None,
+            region: serial.as_deref().and_then(pcsx2_region_for_serial),
             serial,
             executable_crc,
             state,
@@ -102,6 +102,23 @@ impl Pcsx2GameIdentity {
         (self.state == Pcsx2IdentityState::Verified)
             .then_some(self.executable_crc.as_deref())
             .flatten()
+    }
+}
+
+/// Region family encoded by documented PS2 serial prefixes. This is derived
+/// from the same exact disc serial evidence, never from a filename or title.
+fn pcsx2_region_for_serial(serial: &str) -> Option<String> {
+    let prefix = serial
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .take(4)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match prefix.as_str() {
+        "SLUS" | "SCUS" => Some("NTSC-U".to_string()),
+        "SLES" | "SCES" => Some("PAL".to_string()),
+        "SLPS" | "SCPS" | "SLPM" | "SCPM" => Some("NTSC-J".to_string()),
+        _ => None,
     }
 }
 

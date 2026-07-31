@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }
+log = "0.4"
 eframe = {
     version = "0.34.3",
     default-features = false,

@@ -116,6 +116,9 @@ impl Workflow {
             xdg_data_home: self.configuration_path.parent().unwrap().to_path_buf(),
             flatpak_system_root: self.configuration_path.parent().unwrap().to_path_buf(),
             explicit_configuration_roots: Vec::new(),
+            running_commands: Vec::new(),
+            selected_launch_commands: Vec::new(),
+            selected_executable: None,
         };
         roots
             .explicit_configuration_roots
