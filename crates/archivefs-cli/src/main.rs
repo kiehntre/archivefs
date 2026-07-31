@@ -33,11 +33,11 @@ use archivefs_core::patch_manager::{
     GameHackingWiiProvider, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
     RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
     build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
-    default_shared_history_root, discover_cheat_history,
-    discover_shared_apply_history, execute_cheat_install_run, execute_cheat_rollback_run,
-    import_wii_game_page_bootstrap_file, inspect_cheat_install_journal,
-    load_catalogue_evidence_read_only, load_cheat_catalogue_snapshot, load_dolphin_catalogue,
-    load_gamecube_catalogue, preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
+    default_shared_history_root, discover_cheat_history, discover_shared_apply_history,
+    execute_cheat_install_run, execute_cheat_rollback_run, import_wii_game_page_bootstrap_file,
+    inspect_cheat_install_journal, load_catalogue_evidence_read_only,
+    load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
+    preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,

@@ -1268,17 +1268,18 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 
 // --- 24. No migration ---------------------------------------------------
 
-/// Stage 1A stores nothing, so it must not have added, renumbered, or
-/// modified a migration. Asserted against the compiled-in migration set so
-/// it holds wherever the tests run.
+/// Doctor stores nothing, so it must not add, renumber, or modify a
+/// migration. The integrated Wii identity feature legitimately owns 0006;
+/// this guard includes it while still proving Doctor introduced no 0007.
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 5] = [
+    const EXPECTED: [&str; 6] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
         include_str!("../migrations/0004_scan_skip_counts.sql"),
         include_str!("../migrations/0005_source_platform_assignment.sql"),
+        include_str!("../migrations/0006_game_identity_reports.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
