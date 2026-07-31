@@ -36,6 +36,7 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod emulator_profile_memory;
+mod gamehacking_browser_import;
 mod gamehacking_gamecube_install_plan;
 mod gamehacking_gamecube_provider;
 mod gamehacking_provider;
@@ -232,6 +233,18 @@ pub use emulator_profile_memory::{
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
 };
+pub use gamehacking_browser_import::{
+    BROWSER_IMPORT_PARSER_SCHEMA_VERSION, BROWSER_IMPORT_PROVENANCE_SCHEMA_VERSION,
+    BrowserImportDestination, BrowserImportError, BrowserImportErrorKind, BrowserImportKind,
+    BrowserImportLocalIdentity, BrowserImportOutcome, BrowserImportPlan, BrowserImportPlatform,
+    BrowserImportProvenance, BrowserImportRequest, BrowserImportSource, BrowserImportTextOrigin,
+    BrowserLauncher, DesktopBrowserLauncher, ExistingBrowserImportCache,
+    GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY, GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE,
+    MANUAL_BROWSER_IMPORT_SOURCE, MAX_BROWSER_IMPORT_BYTES, gamehacking_browser_launch_command,
+    gamehacking_game_id_from_url, gamehacking_game_page_url, import_gamehacking_browser_content,
+    open_gamehacking_url_in_browser, plan_gamehacking_browser_import,
+    read_browser_import_provenance, sanitize_imported_html, validate_gamehacking_browser_url,
+};
 pub use gamehacking_gamecube_install_plan::{
     GameCubeCheatSelection, GameCubeCheatSelectionEntry, GameCubeGameHackingInstallPreview,
     GameCubeGameHackingInstallPreviewRequest, GameCubeInstallPlanError,
@@ -242,16 +255,17 @@ pub use gamehacking_gamecube_install_plan::{
 };
 pub use gamehacking_gamecube_provider::{
     GAMEHACKING_GAMECUBE_PROVIDER_ID, GameCubeCheatCodeDiagnostic, GameCubeCodeFormat,
-    GameCubeGameHackingAdapter, GameCubeGameIdentity, GameCubeIdentityState,
-    GameCubeSysIdDiagnostics, GameHackingGameCubeCatalogue, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeIndexPage,
-    GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
+    GameCubeGameHackingAdapter, GameCubeGameIdentity, GameCubeGamePageSummary,
+    GameCubeIdentityState, GameCubeSysIdDiagnostics, GameHackingGameCubeCatalogue,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeIndexPage, GameHackingGameCubeIndexProgress, GameHackingGameCubeIndexRecord,
     GameHackingGameCubeIndexRefreshResult, GameHackingGameCubeMatch,
     GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
     GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
     apply_gamecube_page_format_labels, diagnose_gamecube_cheat_code_format,
     load_gamecube_catalogue, normalize_gamecube_game_id, parse_gamecube_sysid_diagnostics,
     parse_gamehacking_gamecube_export, parse_gamehacking_gamecube_index_page,
+    summarize_gamecube_game_page,
 };
 pub use gamehacking_provider::{
     GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GAMEHACKING_PROVIDER_ID, GameHackingCheat,

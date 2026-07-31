@@ -1810,6 +1810,49 @@ fn parse_gamecube_game_page_cheats(bytes: &[u8]) -> Vec<GameCubePageCheat> {
     cheats
 }
 
+/// What one real GameCube game page's own cheat entries carry, counted
+/// without touching the Text export at all. Used by the browser-assisted
+/// import path to report what an imported page actually contained, and to
+/// decide whether the page has any recognisable cheat entries at all -
+/// the same `.codID` shape `parse_gamecube_game_page_cheats` already
+/// anchors on, never a second parser.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GameCubeGamePageSummary {
+    pub entry_count: usize,
+    pub action_replay_count: usize,
+    pub gecko_count: usize,
+    /// Entries whose visible label is absent or is not one this provider
+    /// recognises exactly (see `map_gamecube_page_label`). Never guessed
+    /// into a format.
+    pub unlabelled_count: usize,
+    pub entry_titles: Vec<String>,
+}
+
+/// Counts an already-decoded game page's own cheat entries and their
+/// explicit `ARMax`/`Gecko` labels. Infallible and best-effort in exactly
+/// the same way `parse_gamecube_game_page_cheats` is: an unexpected page
+/// shape yields `entry_count == 0` rather than an error.
+pub fn summarize_gamecube_game_page(page_bytes: &[u8]) -> GameCubeGamePageSummary {
+    let entries = parse_gamecube_game_page_cheats(page_bytes);
+    let mut summary = GameCubeGamePageSummary {
+        entry_count: entries.len(),
+        ..Default::default()
+    };
+    for entry in &entries {
+        match entry
+            .format_label
+            .as_deref()
+            .and_then(map_gamecube_page_label)
+        {
+            Some(GameCubeCodeFormat::ActionReplay) => summary.action_replay_count += 1,
+            Some(GameCubeCodeFormat::Gecko) => summary.gecko_count += 1,
+            _ => summary.unlabelled_count += 1,
+        }
+        summary.entry_titles.push(entry.title.clone());
+    }
+    summary
+}
+
 /// Maps the page's own label text to a format - the only place a cheat
 /// is ever promoted out of `RawUnknown`. Anything not recognised exactly
 /// (including no label at all) maps to `None`, never a guess.

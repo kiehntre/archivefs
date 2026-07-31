@@ -11,20 +11,24 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::game_identity::{IdentityKind, inspect_catalogued_game_identity};
 use archivefs_core::patch_manager::{
-    AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
-    CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatBackupAssessment,
-    CheatDestinationAssessment, CheatHistoryOptions, CheatHistoryReport, CheatInstallOptions,
-    CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
+    AdvisoryPatchPlan, BrowserImportKind, BrowserImportLocalIdentity, BrowserImportPlatform,
+    BrowserImportRequest, BrowserImportSource, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME,
+    CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport,
+    CheatBackupAssessment, CheatDestinationAssessment, CheatHistoryOptions, CheatHistoryReport,
+    CheatInstallOptions, CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
     CheatJournalInspectionError, CheatProviderCoverageReport, CheatRollbackAvailability,
-    CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
-    DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
-    GameHackingGameCubeProvider, GameHackingProvider, HttpsMetadataFetcher, ProposedDestination,
-    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
-    build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
-    discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
+    CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DesktopBrowserLauncher,
+    DestinationKind, DolphinCatalogueLoad, GameCubeGameIdentity, GameHackingFetchOptions,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeProvider, GameHackingProvider,
+    HttpsMetadataFetcher, Pcsx2GameIdentity, ProposedDestination, ReadOnlyPcsx2Adapter,
+    RetroArchAdvisoryPlan, build_cheat_availability_report, build_cheat_provider_coverage_report,
+    default_dolphin_catalogue_cache_root, discover_cheat_history, execute_cheat_install_run,
+    execute_cheat_rollback_run, gamehacking_game_page_url, import_gamehacking_browser_content,
     inspect_cheat_install_journal, load_catalogue_evidence_read_only,
     load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
-    preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
+    normalize_gamecube_game_id, normalize_ps2_serial, open_gamehacking_url_in_browser,
+    plan_gamehacking_browser_import, preview_retroarch_patch_and_cheat_destinations,
+    region_for_game_id,
 };
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
@@ -486,6 +490,159 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         println!("    {line}");
                     }
                 }
+            }
+        }
+        // Browser-assisted import: no request is made to GameHacking.org
+        // at all here. It reads a file the person already saved (or piped
+        // in) from their own browser, validates it, and writes the exact
+        // cache key the live provider would have written.
+        "gamehacking-browser-import" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let platform_value = extract_named_string_flag(&mut input_args, "--platform")?
+                .ok_or("gamehacking-browser-import requires --platform <gamecube|ps2>")?;
+            let platform = BrowserImportPlatform::parse_slug(&platform_value).ok_or_else(|| {
+                format!(
+                    "--platform must be gamecube or ps2 (this milestone adds no other platform), got {platform_value:?}"
+                )
+            })?;
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-browser-import requires --game-id <id>")?;
+            let source = extract_named_path_flag(&mut input_args, "--source")?
+                .ok_or("gamehacking-browser-import requires --source <path>")?;
+            let kind_value = extract_named_string_flag(&mut input_args, "--kind")?;
+            let kind = match kind_value.as_deref() {
+                None => None,
+                Some(value) => Some(
+                    BrowserImportKind::parse_slug(value)
+                        .ok_or_else(|| format!("--kind must be page or export, got {value:?}"))?,
+                ),
+            };
+            let archive = extract_named_path_flag(&mut input_args, "--archive")?;
+            let dolphin_game_id = extract_named_string_flag(&mut input_args, "--dolphin-game-id")?;
+            let crc = extract_named_string_flag(&mut input_args, "--crc")?;
+            let serial = extract_named_string_flag(&mut input_args, "--serial")?;
+            let title = extract_named_string_flag(&mut input_args, "--title")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(
+                    format!("gamehacking-browser-import does not accept {input_args:?}").into(),
+                );
+            }
+            let cache_root = match cache_root {
+                Some(cache_root) => cache_root,
+                None => archivefs_core::patch_manager::gamehacking_cache_root()?,
+            };
+            let (identity, identity_source) = resolve_browser_import_identity(
+                platform,
+                archive.as_deref(),
+                dolphin_game_id,
+                crc,
+                serial,
+                title.clone(),
+            )?;
+            let candidate_title = title
+                .clone()
+                .unwrap_or_else(|| identity.title().to_string());
+            let plan =
+                plan_gamehacking_browser_import(platform, game_id, None, &identity, &cache_root)?;
+            let request = BrowserImportRequest {
+                platform,
+                game_id,
+                source_url: Some(plan.expected_source_url.clone()),
+                candidate_title,
+                identity,
+                cache_root,
+                kind,
+                source: BrowserImportSource::File(source),
+            };
+            let outcome = import_gamehacking_browser_content(&request)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("Detected input kind: {}", outcome.kind.label());
+                println!(
+                    "Validated platform: {} (GameHacking system `{}`)",
+                    outcome.platform.label(),
+                    outcome.platform.gamehacking_system_slug()
+                );
+                println!(
+                    "Validated GameHacking game ID: {}",
+                    outcome.gamehacking_game_id
+                );
+                println!("Expected source URL: {}", plan.expected_source_url);
+                println!(
+                    "Local identity ({identity_source}): {}",
+                    outcome.provenance.local_identity.summary()
+                );
+                println!("Local identity match:");
+                for note in &outcome.verified_evidence {
+                    println!("  - {note}");
+                }
+                println!(
+                    "Imported title: {}",
+                    outcome.imported_title.as_deref().unwrap_or("(none)")
+                );
+                println!("Parsed cheats: {}", outcome.cheat_count);
+                println!("  Action Replay: {}", outcome.action_replay_count);
+                println!("  Gecko: {}", outcome.gecko_count);
+                println!("  Raw (format not declared): {}", outcome.raw_unknown_count);
+                println!("  Unsupported: {}", outcome.unsupported_count);
+                if let Some(enriched) = &outcome.enriched_from_cache {
+                    println!("Enriched against: {}", enriched.display());
+                }
+                println!("Cache destination: {}", outcome.cache_path.display());
+                println!(
+                    "Content SHA-256 (as supplied): {}",
+                    outcome.provenance.supplied_sha256
+                );
+                println!(
+                    "Content SHA-256 (as stored): {}",
+                    outcome.provenance.stored_sha256
+                );
+                match &outcome.replaced {
+                    Some(replaced) => {
+                        println!(
+                            "Replaced existing cache: yes (source {}, retrieved/imported Unix {})",
+                            replaced.source,
+                            replaced
+                                .retrieved_at_unix_seconds
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                        if let Some(backup) = &outcome.backup_path {
+                            println!("Replaced copy kept at: {}", backup.display());
+                        }
+                    }
+                    None => println!("Replaced existing cache: no"),
+                }
+                println!(
+                    "Provenance: {} (source {})",
+                    outcome.provenance_path.display(),
+                    outcome.provenance.source
+                );
+            }
+        }
+        // Prints, and optionally opens, the exact page URL a person should
+        // fetch in their own browser. Opening it is never an import.
+        "gamehacking-browser-import-url" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let open = extract_flag(&mut input_args, "--open");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-browser-import-url requires --game-id <id>")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-browser-import-url does not accept {input_args:?}"
+                )
+                .into());
+            }
+            let url = gamehacking_game_page_url(game_id);
+            println!("{url}");
+            if open {
+                println!(
+                    "{}",
+                    open_gamehacking_url_in_browser(&url, &DesktopBrowserLauncher)?
+                );
             }
         }
         "retroarch-environment" => {
@@ -3882,6 +4039,112 @@ fn extract_named_path_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_string_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(value))
+}
+
+/// Resolves the verified local identity a browser import is checked
+/// against, from exactly one of two sources:
+///
+/// - `--archive <path>`: the real path. The existing read-only identity
+///   inspection runs, and only its *verified* evidence is used - a
+///   candidate or filename-derived value is never promoted.
+/// - explicit `--dolphin-game-id` / `--crc` (+ optional `--serial`): an
+///   operator-declared identity for diagnostics. Reported as such, so a
+///   printed "identity match" is never mistaken for disc evidence.
+fn resolve_browser_import_identity(
+    platform: BrowserImportPlatform,
+    archive: Option<&Path>,
+    dolphin_game_id: Option<String>,
+    crc: Option<String>,
+    serial: Option<String>,
+    title: Option<String>,
+) -> Result<(BrowserImportLocalIdentity, &'static str), Box<dyn std::error::Error>> {
+    let declared = dolphin_game_id.is_some() || crc.is_some();
+    match (archive, declared) {
+        (Some(_), true) => Err(
+            "--archive cannot be combined with --dolphin-game-id/--crc: choose verified disc evidence or an explicitly declared identity, not both"
+                .into(),
+        ),
+        (None, false) => Err(format!(
+            "gamehacking-browser-import needs a local identity: pass --archive <path> for verified disc evidence, or {} for an explicitly declared one",
+            match platform {
+                BrowserImportPlatform::GameCube => "--dolphin-game-id <ID>",
+                BrowserImportPlatform::PlayStation2 => "--crc <CRC> [--serial <SERIAL>]",
+            }
+        )
+        .into()),
+        (Some(archive), false) => {
+            let platform_hint = match platform {
+                BrowserImportPlatform::GameCube => "GameCube",
+                BrowserImportPlatform::PlayStation2 => "PlayStation 2",
+            };
+            let report = inspect_catalogued_game_identity(archive, Some(platform_hint));
+            let display_title = title.unwrap_or_else(|| {
+                archive
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            });
+            let identity = match platform {
+                BrowserImportPlatform::GameCube => BrowserImportLocalIdentity::from_gamecube(
+                    &GameCubeGameIdentity::from_report(display_title, &report),
+                )?,
+                BrowserImportPlatform::PlayStation2 => BrowserImportLocalIdentity::from_ps2(
+                    &Pcsx2GameIdentity::from_report(display_title, &report),
+                )?,
+            };
+            Ok((identity, "verified from the local image's own evidence"))
+        }
+        (None, true) => {
+            let display_title = title.unwrap_or_else(|| "Unknown".to_string());
+            let identity = match platform {
+                BrowserImportPlatform::GameCube => {
+                    let dolphin_game_id = dolphin_game_id
+                        .as_deref()
+                        .and_then(normalize_gamecube_game_id)
+                        .ok_or(
+                            "--dolphin-game-id must be an exact 6-character alphanumeric Dolphin Game ID",
+                        )?;
+                    BrowserImportLocalIdentity::GameCube {
+                        title: display_title,
+                        dolphin_game_id,
+                        region: None,
+                    }
+                }
+                BrowserImportPlatform::PlayStation2 => BrowserImportLocalIdentity::PlayStation2 {
+                    title: display_title,
+                    executable_crc: crc
+                        .ok_or("--crc <CRC> is required for a declared PlayStation 2 identity")?,
+                    serial: serial.as_deref().and_then(normalize_ps2_serial),
+                    region: None,
+                },
+            };
+            Ok((identity, "declared on the command line, not disc-verified"))
+        }
+    }
+}
+
 fn extract_named_u64_flag(
     args: &mut Vec<String>,
     flag: &str,
@@ -4557,6 +4820,12 @@ fn print_help() {
     println!(
         "  gamehacking-gamecube-code-format-audit --game-id <id>  Fetch one cached catalogue game's real cheat export and print, per cheat, its title/author/raw code lines/opcode prefixes/classification and why (--cache-root/--json accepted)"
     );
+    println!(
+        "  gamehacking-browser-import --platform <gamecube|ps2> --game-id <id> --source <path>  Validate and import a game page or cheat export you saved from your own browser into the provider's exact cache key; makes no request to GameHacking.org (--kind page|export/--archive <path>/--dolphin-game-id <ID>/--crc <CRC>/--serial <SERIAL>/--title <title>/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-browser-import-url --game-id <id>  Print the exact GameHacking.org game-page URL to open yourself (--open hands it to your desktop browser; opening is never an import)"
+    );
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
@@ -4669,6 +4938,13 @@ fn print_help() {
     println!("  archivefs gamehacking-gamecube-index-refresh");
     println!("  archivefs gamehacking-gamecube-sysid-diagnostic --game-id 54172");
     println!("  archivefs gamehacking-gamecube-code-format-audit --game-id 54172");
+    println!("  archivefs gamehacking-browser-import-url --game-id 54172");
+    println!(
+        "  archivefs gamehacking-browser-import --platform gamecube --game-id 54172 --source /path/to/page.html --archive \"/library/Luigi's Mansion (USA).rvz\""
+    );
+    println!(
+        "  archivefs gamehacking-browser-import --platform gamecube --game-id 54172 --source /path/to/export.txt --kind export --dolphin-game-id GLME01"
+    );
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");

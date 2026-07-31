@@ -14,7 +14,7 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
@@ -27,27 +27,31 @@ use archivefs_core::game_identity::{
     inspect_catalogued_game_identity,
 };
 use archivefs_core::patch_manager::{
-    CheatCandidate, CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList,
-    CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
-    CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation, CheatSourceError,
-    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DolphinCatalogue, DolphinCatalogueError,
-    DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult,
-    DolphinCatalogueLoad, DolphinCatalogueUpdateCheck, DolphinGameIniInventory,
-    DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
-    DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
-    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
-    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
-    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
-    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
-    GameCubeInstallPlanErrorKind, GameHackingFetchOptions, GameHackingGame,
-    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
-    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    BrowserImportErrorKind, BrowserImportKind, BrowserImportLocalIdentity, BrowserImportOutcome,
+    BrowserImportPlan, BrowserImportPlatform, BrowserImportRequest, BrowserImportSource,
+    BrowserImportTextOrigin, CheatCandidate, CheatCandidateArchive, CheatCandidateClassification,
+    CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest,
+    CheatInstallPlanError, CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation,
+    CheatSourceError, CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus,
+    CheatSourceFreshness, CheatSourceList, CheatSourceListEntry, CheatSourceProgress,
+    CheatSourceProgressPhase, CheatSourceProgressReporter, DesktopBrowserLauncher,
+    DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
+    DolphinCatalogueUpdateCheck, DolphinGameIniInventory, DolphinGeckoLookupResult,
+    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
+    EmulatorProfileCandidate, EmulatorProfileSelection, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
+    GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
+    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
+    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
+    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
+    GameHackingGameCubeMatchStatus, GameHackingGameCubeProvider, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingProvider, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
     Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
     Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
     Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
@@ -76,13 +80,15 @@ use archivefs_core::patch_manager::{
     discover_shared_apply_history, discover_xenia_profiles, execute_shared_apply,
     execute_shared_rollback, fetch_dolphin_catalogue_with_transport, fetch_dolphin_upstream_gecko,
     fetch_retroarch_cheat_source, fetch_xenia_provider_patches, generate_shared_operation_id,
-    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
-    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
-    load_dolphin_catalogue, load_dolphin_catalogue_update_state, load_dolphin_destination,
+    import_gamehacking_browser_content, inspect_dolphin_profile, inspect_pcsx2_profile,
+    inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
+    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_catalogue,
+    load_dolphin_catalogue_update_state, load_dolphin_destination,
     load_remembered_emulator_profiles_default, load_xenia_destination, match_dolphin_inventory,
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
-    parse_dolphin_ini, preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport,
-    region_for_game_id, remembered_profile_for, remove_dolphin_catalogue,
+    open_gamehacking_url_in_browser, parse_dolphin_ini, plan_gamehacking_browser_import,
+    preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport, region_for_game_id,
+    remembered_profile_for, remove_dolphin_catalogue,
     require_dolphin_managed_gamehacking_verification, resolve_cheat_destination,
     resolve_dolphin_gecko_lookup, select_emulator_profile, selected_pcsx2_managed_cheats,
     stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
@@ -91,8 +97,8 @@ use archivefs_core::patch_manager::{
 };
 #[cfg(test)]
 use archivefs_core::patch_manager::{
-    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
-    ResolvedEmulatorProfile,
+    BrowserImportProvenance, EmulatorDestinationDirectories, EmulatorInstallationType,
+    EmulatorProfileConfidence, MANUAL_BROWSER_IMPORT_SOURCE, ResolvedEmulatorProfile,
 };
 use archivefs_core::patch_manager::{
     XENIA_UPSTREAM_ATTRIBUTION, XENIA_UPSTREAM_LICENSE, XENIA_UPSTREAM_REPOSITORY,
@@ -5533,6 +5539,8 @@ impl ArchiveFsApp {
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking_blocked: false,
+            browser_import: None,
+            browser_import_open_error: None,
             selected_dolphin_profile_id,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -7599,6 +7607,421 @@ impl ArchiveFsApp {
         workflow.preview = CheatStepResource::NotLoaded;
         workflow.preview_request = None;
         workflow.transaction = CheatTransactionState::Idle;
+    }
+
+    // --- Browser-assisted GameHacking.org import ------------------------
+    //
+    // None of these methods make a network request. The only outward
+    // action any of them takes is asking the desktop to open a validated
+    // `https://gamehacking.org` URL, which is deliberately never treated
+    // as a successful import.
+
+    /// Opens the import panel for the currently selected GameHacking.org
+    /// candidate.
+    ///
+    /// The candidate's numeric game ID is resolved by re-running the
+    /// provider's *local* catalogue match (`match_game` reads only the
+    /// already-cached catalogue file). That matters when live access is
+    /// blocked: the failed fetch left no match result behind, but the
+    /// match itself never needed the network.
+    fn open_browser_import(&mut self, platform: BrowserImportPlatform) {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let cache_root = match archivefs_core::patch_manager::gamehacking_cache_root() {
+            Ok(cache_root) => cache_root,
+            Err(failure) => {
+                self.set_browser_import_failure(
+                    "Cache unavailable".to_string(),
+                    failure.to_string(),
+                );
+                return;
+            }
+        };
+        let resolved = match platform {
+            BrowserImportPlatform::GameCube => {
+                self.resolve_gamecube_browser_import_target(workflow, &cache_root)
+            }
+            BrowserImportPlatform::PlayStation2 => {
+                self.resolve_ps2_browser_import_target(workflow, &cache_root)
+            }
+        };
+        let (identity, game_id, source_url, candidate_title) = match resolved {
+            Ok(resolved) => resolved,
+            Err((headline, detail)) => {
+                self.set_browser_import_failure(headline, detail);
+                return;
+            }
+        };
+        match plan_gamehacking_browser_import(
+            platform,
+            game_id,
+            source_url.as_deref(),
+            &identity,
+            &cache_root,
+        ) {
+            Ok(plan) => {
+                let state = BrowserImportState::new(plan, identity, candidate_title);
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.browser_import_open_error = None;
+                    workflow.browser_import = Some(state);
+                }
+            }
+            Err(failure) => {
+                self.set_browser_import_failure(
+                    failure.kind.headline().to_string(),
+                    failure.detail,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_gamecube_browser_import_target(
+        &self,
+        workflow: &CheatWorkflowState,
+        cache_root: &Path,
+    ) -> Result<(BrowserImportLocalIdentity, u64, Option<String>, String), (String, String)> {
+        let identity = gamecube_identity_for_workflow(workflow).ok_or_else(|| {
+            (
+                "Local game identity incomplete".to_string(),
+                "ArchiveFS needs this GameCube game's verified Dolphin Game ID before it can check an imported page against it.".to_string(),
+            )
+        })?;
+        let local = BrowserImportLocalIdentity::from_gamecube(&identity)
+            .map_err(|failure| (failure.kind.headline().to_string(), failure.detail))?;
+        // An already-matched candidate wins; otherwise the local
+        // catalogue match is re-run, which never touches the network.
+        if let CheatStepResource::Ready(state) = &workflow.gamecube_gamehacking
+            && let Some(game) = &state.game
+        {
+            return Ok((
+                local,
+                game.game_id,
+                Some(game.source_url.clone()),
+                game.title.clone(),
+            ));
+        }
+        let options = GameHackingGameCubeFetchOptions {
+            cache_root: cache_root.to_path_buf(),
+            force_refresh: false,
+            delay: Duration::from_secs(0),
+            cancellation: None,
+        };
+        let matched = GameHackingGameCubeProvider::default()
+            .match_game(&identity, &options)
+            .map_err(|failure| ("Cached catalogue unavailable".to_string(), failure.detail))?;
+        let game = matched.game.ok_or_else(|| {
+            (
+                "No GameHacking candidate selected".to_string(),
+                format!(
+                    "{} Choose the correct GameHacking.org game first - an import is always checked against one exact candidate.",
+                    matched.detail
+                ),
+            )
+        })?;
+        Ok((
+            local,
+            game.game_id,
+            Some(game.source_url.clone()),
+            game.title.clone(),
+        ))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_ps2_browser_import_target(
+        &self,
+        workflow: &CheatWorkflowState,
+        cache_root: &Path,
+    ) -> Result<(BrowserImportLocalIdentity, u64, Option<String>, String), (String, String)> {
+        let identity = pcsx2_identity_for_workflow(workflow).ok_or_else(|| {
+            (
+                "Local game identity incomplete".to_string(),
+                "ArchiveFS needs this PS2 game's verified PCSX2 executable CRC before it can check an imported export against it.".to_string(),
+            )
+        })?;
+        let local = BrowserImportLocalIdentity::from_ps2(&identity)
+            .map_err(|failure| (failure.kind.headline().to_string(), failure.detail))?;
+        if let CheatStepResource::Ready(state) = &workflow.pcsx2_gamehacking
+            && let Some(game) = &state.game
+        {
+            return Ok((
+                local,
+                game.game_id,
+                Some(game.source_url.clone()),
+                game.title.clone(),
+            ));
+        }
+        let options = GameHackingFetchOptions {
+            cache_root: cache_root.to_path_buf(),
+            force_refresh: false,
+            delay: Duration::from_secs(0),
+            cancellation: None,
+        };
+        let matched = GameHackingProvider::default()
+            .match_game(&identity, &options)
+            .map_err(|failure| ("Cached catalogue unavailable".to_string(), failure.detail))?;
+        let game = matched.game.ok_or_else(|| {
+            (
+                "No GameHacking candidate selected".to_string(),
+                format!(
+                    "{} Choose the correct GameHacking.org game first - an import is always checked against one exact candidate.",
+                    matched.detail
+                ),
+            )
+        })?;
+        Ok((
+            local,
+            game.game_id,
+            Some(game.source_url.clone()),
+            game.title.clone(),
+        ))
+    }
+
+    /// Surfaces a browser-import failure without opening the panel, for
+    /// the cases that stop it opening at all.
+    fn set_browser_import_failure(&mut self, headline: String, detail: String) {
+        if let Some(workflow) = self.cheat_workflow.as_mut() {
+            workflow.browser_import_open_error = Some((headline, detail));
+        }
+    }
+
+    fn close_browser_import(&mut self) {
+        if let Some(workflow) = self.cheat_workflow.as_mut() {
+            workflow.browser_import = None;
+            workflow.browser_import_open_error = None;
+        }
+    }
+
+    /// Hands the exact validated page URL to the desktop's default
+    /// browser. On success the panel says so *and* says nothing has been
+    /// imported yet, so a launch can never be mistaken for an import.
+    fn open_gamehacking_page_in_browser(&mut self) {
+        let Some(url) = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.browser_import.as_ref())
+            .map(|state| state.plan.expected_source_url.clone())
+        else {
+            return;
+        };
+        let outcome = open_gamehacking_url_in_browser(&url, &DesktopBrowserLauncher);
+        let Some(state) = self
+            .cheat_workflow
+            .as_mut()
+            .and_then(|workflow| workflow.browser_import.as_mut())
+        else {
+            return;
+        };
+        state.clear_result();
+        match outcome {
+            Ok(notice) => state.notice = Some(notice),
+            Err(failure) => {
+                state.failure = Some((failure.kind.headline().to_string(), failure.detail))
+            }
+        }
+    }
+
+    fn copy_gamehacking_page_url(&mut self) {
+        let Some(url) = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.browser_import.as_ref())
+            .map(|state| state.plan.expected_source_url.clone())
+        else {
+            return;
+        };
+        let result = self.clipboard.set_text(url.clone());
+        let Some(state) = self
+            .cheat_workflow
+            .as_mut()
+            .and_then(|workflow| workflow.browser_import.as_mut())
+        else {
+            return;
+        };
+        state.clear_result();
+        match result {
+            Ok(()) => state.notice = Some(format!("Copied {url} to the clipboard.")),
+            Err(reason) => {
+                state.failure = Some((
+                    BrowserImportErrorKind::ClipboardUnavailable
+                        .headline()
+                        .to_string(),
+                    format!("ArchiveFS could not write to the clipboard on this system: {reason}"),
+                ))
+            }
+        }
+    }
+
+    /// Reads the clipboard exactly once, only because "Paste from
+    /// clipboard" was clicked. Nothing is retained beyond this import.
+    fn import_browser_clipboard(&mut self, context: egui::Context) {
+        let status = self.clipboard.get_text_status();
+        match status {
+            ClipboardTextStatus::Ready(text) => {
+                self.import_browser_content(
+                    context,
+                    BrowserImportSource::Text {
+                        text,
+                        origin: BrowserImportTextOrigin::Clipboard,
+                    },
+                );
+            }
+            ClipboardTextStatus::Empty => self.record_browser_import_failure(
+                BrowserImportErrorKind::ClipboardEmpty.headline().to_string(),
+                "The clipboard held no text. Copy the game page or Text export in your browser first."
+                    .to_string(),
+            ),
+            ClipboardTextStatus::Unavailable(reason) => self.record_browser_import_failure(
+                BrowserImportErrorKind::ClipboardUnavailable
+                    .headline()
+                    .to_string(),
+                format!("ArchiveFS could not read the clipboard on this system: {reason}"),
+            ),
+        }
+    }
+
+    fn import_browser_pasted_text(&mut self, context: egui::Context) {
+        let Some(text) = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.browser_import.as_ref())
+            .map(|state| state.pasted.clone())
+        else {
+            return;
+        };
+        self.import_browser_content(
+            context,
+            BrowserImportSource::Text {
+                text,
+                origin: BrowserImportTextOrigin::PastedText,
+            },
+        );
+    }
+
+    /// Opens the native file picker for a saved page or export. `rfd`'s
+    /// `pick_file` is synchronous and returns `None` on cancel, so a
+    /// cancelled picker simply does nothing.
+    fn import_browser_saved_file(&mut self, context: egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import a saved GameHacking.org page or export")
+            .add_filter(
+                "Saved page or cheat export",
+                &["html", "htm", "txt", "pnach"],
+            )
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_browser_content(context, BrowserImportSource::File(path));
+    }
+
+    /// Runs one validated import and, on success, refreshes the provider
+    /// state so the normal preview/selection/install flow picks the
+    /// imported cache up immediately.
+    fn import_browser_content(&mut self, context: egui::Context, source: BrowserImportSource) {
+        let Some(state) = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.browser_import.as_ref())
+        else {
+            return;
+        };
+        let platform = state.plan.platform;
+        let request = BrowserImportRequest {
+            platform,
+            game_id: state.plan.gamehacking_game_id,
+            source_url: Some(state.plan.expected_source_url.clone()),
+            candidate_title: if state.candidate_title.trim().is_empty() {
+                state.plan.local_game_title.clone()
+            } else {
+                state.candidate_title.clone()
+            },
+            identity: state.identity.clone(),
+            cache_root: match archivefs_core::patch_manager::gamehacking_cache_root() {
+                Ok(cache_root) => cache_root,
+                Err(failure) => {
+                    self.record_browser_import_failure(
+                        "Cache unavailable".to_string(),
+                        failure.to_string(),
+                    );
+                    return;
+                }
+            },
+            kind: state.kind,
+            source,
+        };
+        match import_gamehacking_browser_content(&request) {
+            Ok(outcome) => {
+                let summary = format!(
+                    "Browser import successful: {} cheat(s) from GameHacking game {} written to {}.",
+                    outcome.cheat_count,
+                    outcome.gamehacking_game_id,
+                    outcome.cache_path.display()
+                );
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatInstall,
+                    self.cheat_workflow
+                        .as_ref()
+                        .map(|workflow| workflow.archive_path.clone()),
+                    ActivityOutcome::Completed,
+                    &summary,
+                ));
+                // The plan's "would this replace an existing cached
+                // response?" facts are now stale - the import just wrote
+                // there - so they are recomputed against the real cache.
+                let refreshed_plan = plan_gamehacking_browser_import(
+                    platform,
+                    request.game_id,
+                    request.source_url.as_deref(),
+                    &request.identity,
+                    &request.cache_root,
+                )
+                .ok();
+                if let Some(state) = self
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.browser_import.as_mut())
+                {
+                    state.clear_result();
+                    state.pasted.clear();
+                    state.paste_open = false;
+                    state.outcome = Some(outcome);
+                    if let Some(plan) = refreshed_plan {
+                        state.plan = plan;
+                    }
+                }
+                // The whole point: the ordinary provider flow continues
+                // from the imported cache, with no special case.
+                match platform {
+                    BrowserImportPlatform::GameCube => {
+                        self.start_gamecube_gamehacking_fetch(context, false)
+                    }
+                    BrowserImportPlatform::PlayStation2 => {
+                        self.start_pcsx2_gamehacking_fetch(context, false)
+                    }
+                }
+            }
+            Err(failure) => {
+                self.record_browser_import_failure(
+                    failure.kind.headline().to_string(),
+                    failure.detail,
+                );
+            }
+        }
+    }
+
+    fn record_browser_import_failure(&mut self, headline: String, detail: String) {
+        if let Some(state) = self
+            .cheat_workflow
+            .as_mut()
+            .and_then(|workflow| workflow.browser_import.as_mut())
+        {
+            state.notice = None;
+            state.outcome = None;
+            state.failure = Some((headline, detail));
+        }
     }
 
     /// Resolves the Dolphin profile's own configuration root the same way
@@ -10986,6 +11409,45 @@ impl ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::RemoveSelectedGameCubeGameHacking) => {
                             self.start_gamecube_gamehacking_removal_preview();
+                        }
+                        Some(CheatWorkflowAction::OpenBrowserImport(platform)) => {
+                            self.open_browser_import(platform);
+                        }
+                        Some(CheatWorkflowAction::CloseBrowserImport) => {
+                            self.close_browser_import();
+                        }
+                        Some(CheatWorkflowAction::OpenGameHackingPageInBrowser) => {
+                            self.open_gamehacking_page_in_browser();
+                        }
+                        Some(CheatWorkflowAction::CopyGameHackingPageUrl) => {
+                            self.copy_gamehacking_page_url();
+                        }
+                        Some(CheatWorkflowAction::ImportBrowserSavedFile) => {
+                            self.import_browser_saved_file(context.clone());
+                        }
+                        Some(CheatWorkflowAction::ToggleBrowserImportPaste(open)) => {
+                            if let Some(state) = self
+                                .cheat_workflow
+                                .as_mut()
+                                .and_then(|workflow| workflow.browser_import.as_mut())
+                            {
+                                state.paste_open = open;
+                            }
+                        }
+                        Some(CheatWorkflowAction::ImportBrowserPastedText) => {
+                            self.import_browser_pasted_text(context.clone());
+                        }
+                        Some(CheatWorkflowAction::ImportBrowserClipboard) => {
+                            self.import_browser_clipboard(context.clone());
+                        }
+                        Some(CheatWorkflowAction::ChooseBrowserImportKind(kind)) => {
+                            if let Some(state) = self
+                                .cheat_workflow
+                                .as_mut()
+                                .and_then(|workflow| workflow.browser_import.as_mut())
+                            {
+                                state.kind = kind;
+                            }
                         }
                         Some(CheatWorkflowAction::RescanDolphinProfiles) => {
                             self.start_dolphin_profile_scan(context.clone());
@@ -17382,6 +17844,15 @@ struct CheatWorkflowState {
     /// Retry, since retrying immediately cannot help and core-side cooldown
     /// gating already prevents hammering a blocked origin.
     gamecube_gamehacking_blocked: bool,
+    /// The open browser-assisted import flow, for either GameHacking
+    /// platform. `None` whenever it is closed - which is also how it is
+    /// reset when the selected game changes.
+    browser_import: Option<BrowserImportState>,
+    /// Why the browser-assisted import panel could not be opened at all
+    /// (no verified local identity, no cached catalogue, no selected
+    /// candidate). Kept outside `browser_import` precisely because in
+    /// these cases there is no panel to put it in.
+    browser_import_open_error: Option<(String, String)>,
     selected_dolphin_profile_id: Option<String>,
     /// An optional additional Dolphin configuration directory to scan,
     /// typed by the user - covers portable/AppImage installs, which have
@@ -17601,6 +18072,65 @@ fn gamecube_gamehacking_selection_for(
     cheats: &[GameHackingGameCubeCheat],
 ) -> GameCubeCheatSelection {
     GameCubeCheatSelection::from_cheats(cheats, &parse_dolphin_ini(""))
+}
+
+/// The "Import through browser" flow for one selected GameHacking.org
+/// candidate: a person opens the exact page in their own browser and
+/// hands the saved page, or the Text/PCSX2 export, back to ArchiveFS.
+///
+/// Nothing here fetches anything. The only outward action it can take is
+/// asking the desktop to open a validated `https://gamehacking.org` URL,
+/// and doing that is deliberately *not* an import (see
+/// `open_gamehacking_url_in_browser`).
+struct BrowserImportState {
+    plan: BrowserImportPlan,
+    /// The verified local identity every import is checked against, built
+    /// once when the panel opens from the existing verified identity
+    /// adapters - never from user-typed text.
+    identity: BrowserImportLocalIdentity,
+    /// The selected GameHacking candidate's own title: the only identity
+    /// evidence a PCSX2 pnach export carries at all.
+    candidate_title: String,
+    /// Set only when the person explicitly picks one destination; `None`
+    /// lets the imported content itself decide which it is.
+    kind: Option<BrowserImportKind>,
+    /// The page source or export text pasted into ArchiveFS's own field.
+    /// Never read from the clipboard without an explicit click.
+    pasted: String,
+    paste_open: bool,
+    /// A neutral notice (for example "Opened … in your browser"). Never a
+    /// success claim about an import.
+    notice: Option<String>,
+    /// A local import failure: its own headline and detail, never an HTTP
+    /// or network message.
+    failure: Option<(String, String)>,
+    outcome: Option<BrowserImportOutcome>,
+}
+
+impl BrowserImportState {
+    fn new(
+        plan: BrowserImportPlan,
+        identity: BrowserImportLocalIdentity,
+        candidate_title: String,
+    ) -> Self {
+        Self {
+            plan,
+            identity,
+            candidate_title,
+            kind: None,
+            pasted: String::new(),
+            paste_open: false,
+            notice: None,
+            failure: None,
+            outcome: None,
+        }
+    }
+
+    fn clear_result(&mut self) {
+        self.notice = None;
+        self.failure = None;
+        self.outcome = None;
+    }
 }
 
 #[derive(Clone)]
@@ -18613,6 +19143,22 @@ enum CheatWorkflowAction {
     },
     InstallSelectedGameCubeGameHacking,
     RemoveSelectedGameCubeGameHacking,
+    /// Browser-assisted import: offered whenever a GameHacking.org
+    /// candidate is known, not only when live access is blocked.
+    OpenBrowserImport(BrowserImportPlatform),
+    CloseBrowserImport,
+    /// Hands the exact validated page URL to the desktop's own browser.
+    /// Never counts as an import.
+    OpenGameHackingPageInBrowser,
+    CopyGameHackingPageUrl,
+    /// Opens a native file picker for a saved page or export.
+    ImportBrowserSavedFile,
+    ToggleBrowserImportPaste(bool),
+    ImportBrowserPastedText,
+    /// Reads the clipboard once, only because this was clicked.
+    ImportBrowserClipboard,
+    /// Restricts an import to one destination, or lets the content decide.
+    ChooseBrowserImportKind(Option<BrowserImportKind>),
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -22168,6 +22714,7 @@ fn show_pcsx2_gamehacking(
     );
     let identity_ready = pcsx2_identity_for_workflow(workflow)
         .is_some_and(|identity| identity.verified_crc().is_some());
+    let browser_import_open = workflow.browser_import.is_some();
     match &mut workflow.transaction {
         CheatTransactionState::Applying { .. } => {
             ui.horizontal(|ui| {
@@ -22214,6 +22761,19 @@ fn show_pcsx2_gamehacking(
                 ui.spinner();
                 ui.label("Checking GameHacking.org for this game…");
             });
+        }
+        // A confirmed Cloudflare/anti-bot block is offered the
+        // browser-assisted route instead of a bare Retry, exactly as the
+        // GameCube section already does.
+        CheatStepResource::Failed(message)
+            if message.contains(GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE) =>
+        {
+            action = show_browser_import_blocked_banner(
+                ui,
+                BrowserImportPlatform::PlayStation2,
+                message,
+                browser_import_open,
+            );
         }
         CheatStepResource::Failed(message) => {
             widgets::banner(
@@ -22326,6 +22886,20 @@ fn show_pcsx2_gamehacking(
                         force_refresh: true,
                     });
                 }
+                // Offered here too, not only when live access is blocked.
+                if !browser_import_open
+                    && widgets::action_button(
+                        ui,
+                        "Import through browser",
+                        widgets::ActionStyle::Quiet,
+                        identity_ready,
+                    )
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::OpenBrowserImport(
+                        BrowserImportPlatform::PlayStation2,
+                    ));
+                }
                 if matches!(workflow.transaction, CheatTransactionState::Idle)
                     && widgets::action_button(
                         ui,
@@ -22404,6 +22978,277 @@ fn show_pcsx2_gamehacking(
             }
         });
     }
+    show_browser_import_open_error(ui, workflow);
+    if let Some(state) = workflow.browser_import.as_mut()
+        && state.plan.platform == BrowserImportPlatform::PlayStation2
+        && let Some(import_action) = show_browser_import(ui, state)
+    {
+        action = Some(import_action);
+    }
+    action
+}
+
+/// The buttons offered when live GameHacking.org access is blocked. Kept
+/// separate from the banner so the exact required wording lives in one
+/// place and the same row can be reused by both platforms.
+fn show_browser_import_blocked_banner(
+    ui: &mut egui::Ui,
+    platform: BrowserImportPlatform,
+    provider_message: &str,
+    dialog_open: bool,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::banner(
+        ui,
+        GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE,
+        GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
+        widgets::StatusTone::Warning,
+    );
+    // The provider's own verbatim message (including the last-attempt
+    // timestamp) stays visible underneath rather than being replaced.
+    ui.weak(provider_message);
+    if !dialog_open {
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Import through browser",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::OpenBrowserImport(platform));
+            }
+        });
+    }
+    action
+}
+
+/// Shows why the browser-assisted import panel could not be opened.
+/// These are all local, actionable reasons - never an HTTP failure.
+fn show_browser_import_open_error(ui: &mut egui::Ui, workflow: &CheatWorkflowState) {
+    if let Some((headline, detail)) = &workflow.browser_import_open_error {
+        ui.add_space(4.0);
+        widgets::banner(ui, headline, detail, widgets::StatusTone::Blocked);
+    }
+}
+
+/// The browser-assisted import panel. Shows every fact the person needs
+/// before handing anything over - platform, local game, verified local
+/// identity, GameHacking game ID, the exact URL expected, accepted
+/// formats, the destination cache key, and whether an existing cached
+/// response would be replaced - then the four import routes.
+fn show_browser_import(
+    ui: &mut egui::Ui,
+    state: &mut BrowserImportState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.add_space(theme::SECTION_GAP);
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Import through browser")
+                .size(17.0)
+                .strong(),
+        );
+        ui.label(
+            "ArchiveFS never pretends to be a browser. Open the page yourself, then hand the saved page or its Text export back here.",
+        );
+        ui.add_space(6.0);
+        ui.label(format!("Platform: {}", state.plan.platform_label));
+        ui.label(format!(
+            "Selected local game: {}",
+            state.plan.local_game_title
+        ));
+        ui.label(format!(
+            "Verified local identity: {}",
+            state.plan.local_identity_summary
+        ));
+        ui.label(format!(
+            "GameHacking game ID: {}",
+            state.plan.gamehacking_game_id
+        ));
+        ui.label(format!(
+            "Expected page URL: {}",
+            state.plan.expected_source_url
+        ));
+        ui.label(format!(
+            "Accepted formats: {}",
+            state.plan.accepted_formats.join(" · ")
+        ));
+        for destination in &state.plan.destinations {
+            match &destination.existing {
+                Some(existing) => ui.label(format!(
+                    "Destination ({}): {} — replaces an existing cached response ({}{})",
+                    destination.kind.label(),
+                    destination.cache_file_name,
+                    existing.source,
+                    existing
+                        .retrieved_at_unix_seconds
+                        .map(|value| format!(", Unix timestamp {value}"))
+                        .unwrap_or_default()
+                )),
+                None => ui.label(format!(
+                    "Destination ({}): {} — nothing cached yet",
+                    destination.kind.label(),
+                    destination.cache_file_name
+                )),
+            };
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Open game page in browser",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::OpenGameHackingPageInBrowser);
+            }
+            if widgets::action_button(ui, "Copy page URL", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                action = Some(CheatWorkflowAction::CopyGameHackingPageUrl);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Import saved page",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ImportBrowserSavedFile);
+            }
+            if widgets::action_button(
+                ui,
+                "Paste page/export",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ToggleBrowserImportPaste(
+                    !state.paste_open,
+                ));
+            }
+            if widgets::action_button(
+                ui,
+                "Paste from clipboard",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ImportBrowserClipboard);
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                action = Some(CheatWorkflowAction::CloseBrowserImport);
+            }
+        });
+
+        if state.plan.destinations.len() > 1 {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Treat the import as:");
+                if ui
+                    .selectable_label(state.kind.is_none(), "Detect from content")
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::ChooseBrowserImportKind(None));
+                }
+                for destination in &state.plan.destinations {
+                    if ui
+                        .selectable_label(
+                            state.kind == Some(destination.kind),
+                            destination.kind.label(),
+                        )
+                        .clicked()
+                    {
+                        action = Some(CheatWorkflowAction::ChooseBrowserImportKind(Some(
+                            destination.kind,
+                        )));
+                    }
+                }
+            });
+        }
+
+        if state.paste_open {
+            ui.add_space(6.0);
+            ui.label("Paste the complete page source, or the Text/PCSX2 export:");
+            ui.add(
+                egui::TextEdit::multiline(&mut state.pasted)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            );
+            if widgets::action_button(
+                ui,
+                "Import pasted content",
+                widgets::ActionStyle::Primary,
+                !state.pasted.trim().is_empty(),
+            )
+            .clicked()
+            {
+                action = Some(CheatWorkflowAction::ImportBrowserPastedText);
+            }
+        }
+
+        if let Some(notice) = &state.notice {
+            ui.add_space(6.0);
+            widgets::banner(ui, "Browser opened", notice, widgets::StatusTone::Info);
+        }
+        if let Some((headline, detail)) = &state.failure {
+            ui.add_space(6.0);
+            widgets::banner(ui, headline, detail, widgets::StatusTone::Blocked);
+        }
+        if let Some(outcome) = &state.outcome {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                outcome.headline(),
+                &format!(
+                    "{} — GameHacking game {}",
+                    outcome
+                        .imported_title
+                        .as_deref()
+                        .unwrap_or(&state.plan.local_game_title),
+                    outcome.gamehacking_game_id
+                ),
+                widgets::StatusTone::Success,
+            );
+            ui.label(format!(
+                "{} cheat{} parsed · Action Replay {} · Gecko {} · Raw (format not declared) {}{}",
+                outcome.cheat_count,
+                if outcome.cheat_count == 1 { "" } else { "s" },
+                outcome.action_replay_count,
+                outcome.gecko_count,
+                outcome.raw_unknown_count,
+                if outcome.unsupported_count > 0 {
+                    format!(" · Unsupported {}", outcome.unsupported_count)
+                } else {
+                    String::new()
+                }
+            ));
+            ui.label(format!(
+                "Cache destination: {}",
+                outcome.cache_path.display()
+            ));
+            ui.weak(format!(
+                "Provenance: {} · SHA-256 {}{}",
+                outcome.provenance.source,
+                outcome.provenance.stored_sha256,
+                if outcome.replaced_existing_cache {
+                    " · replaced the previous cached response"
+                } else {
+                    ""
+                }
+            ));
+        }
+    });
     action
 }
 
@@ -22428,6 +23273,7 @@ fn show_gamecube_gamehacking(
     );
     let identity_ready = gamecube_identity_for_workflow(workflow)
         .is_some_and(|identity| identity.verified_game_id().is_some());
+    let browser_import_open = workflow.browser_import.is_some();
     if let Some(notice) = &workflow.transaction_notice {
         widgets::banner(
             ui,
@@ -22495,15 +23341,15 @@ fn show_gamecube_gamehacking(
             // A confirmed Cloudflare/anti-bot block, not a generic failure:
             // retrying immediately cannot help (core-side cooldown gating
             // already prevents hammering the origin again), so no Retry is
-            // offered here at all - matches
-            // `GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE` exactly, which is
-            // also why `message` itself is rendered verbatim rather than a
-            // separately-maintained copy of the wording.
-            widgets::banner(
+            // offered here at all. The provider's own verbatim `message`
+            // (which matches `GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE` plus
+            // its last-attempt timestamp) stays on screen underneath the
+            // banner, alongside the browser-assisted route out.
+            action = show_browser_import_blocked_banner(
                 ui,
-                "GameHacking.org access blocked",
+                BrowserImportPlatform::GameCube,
                 message,
-                widgets::StatusTone::Warning,
+                browser_import_open,
             );
         }
         CheatStepResource::Failed(message) => {
@@ -22683,6 +23529,21 @@ fn show_gamecube_gamehacking(
                 {
                     action = Some(CheatWorkflowAction::RemoveSelectedGameCubeGameHacking);
                 }
+                // Offered here too, not only when live access is blocked:
+                // a person may simply prefer to fetch the page themself.
+                if !browser_import_open
+                    && widgets::action_button(
+                        ui,
+                        "Import through browser",
+                        widgets::ActionStyle::Quiet,
+                        identity_ready,
+                    )
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::OpenBrowserImport(
+                        BrowserImportPlatform::GameCube,
+                    ));
+                }
             });
             if let (CheatTransactionState::Idle, CheatStepResource::Ready(response)) =
                 (&workflow.transaction, &workflow.preview)
@@ -22697,6 +23558,13 @@ fn show_gamecube_gamehacking(
                 );
             }
         }
+    }
+    show_browser_import_open_error(ui, workflow);
+    if let Some(state) = workflow.browser_import.as_mut()
+        && state.plan.platform == BrowserImportPlatform::GameCube
+        && let Some(import_action) = show_browser_import(ui, state)
+    {
+        action = Some(import_action);
     }
     let skipped_raw_unknown: Vec<String> = match &workflow.gamecube_gamehacking {
         CheatStepResource::Ready(state) => state
@@ -35185,6 +36053,8 @@ mod tests {
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking_blocked: false,
+            browser_import: None,
+            browser_import_open_error: None,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -38719,6 +39589,392 @@ $Instant Growth [Nayr]\n";
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    // --- Browser-assisted import ------------------------------------
+
+    /// A temporary GameHacking cache root, so the panel's
+    /// "would this replace an existing cached response?" facts are read
+    /// from a real directory rather than the user's own cache.
+    fn browser_import_cache_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("cache root");
+        root
+    }
+
+    fn browser_import_identity() -> BrowserImportLocalIdentity {
+        BrowserImportLocalIdentity::GameCube {
+            title: "Test Racer".to_string(),
+            dolphin_game_id: "GTRE01".to_string(),
+            region: Some("E".to_string()),
+        }
+    }
+
+    fn browser_import_state(cache_root: &Path) -> BrowserImportState {
+        let identity = browser_import_identity();
+        let plan = plan_gamehacking_browser_import(
+            BrowserImportPlatform::GameCube,
+            501,
+            Some("https://gamehacking.org/game/501"),
+            &identity,
+            cache_root,
+        )
+        .expect("plan");
+        BrowserImportState::new(plan, identity, "Test Racer".to_string())
+    }
+
+    #[test]
+    fn a_blocked_gamecube_provider_offers_the_browser_route_with_the_exact_required_wording() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-blocked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking =
+            CheatStepResource::Failed(GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE.to_string());
+        workflow.gamecube_gamehacking_blocked = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "GameHacking.org access blocked"
+        ));
+        assert!(
+            rendered_text_contains(
+                &output,
+                "ArchiveFS cannot fetch this page automatically, but you can open it in your browser and import the page or Text export."
+            ),
+            "the required blocked-state copy is shown verbatim"
+        );
+        assert!(rendered_text_contains(&output, "Import through browser"));
+        // The provider's own message is still there, and no Retry appears.
+        assert!(rendered_text_contains(
+            &output,
+            GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE
+        ));
+        assert_eq!(count_exact_text_occurrences(&output, "Try again"), 0);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_browser_import_panel_shows_every_required_fact_and_route() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-panel-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_root = browser_import_cache_root("panel");
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking =
+            CheatStepResource::Failed(GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE.to_string());
+        workflow.gamecube_gamehacking_blocked = true;
+        workflow.browser_import = Some(browser_import_state(&cache_root));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        for expected in [
+            "Platform: GameCube",
+            "Selected local game: Test Racer",
+            "Verified local identity: Verified Dolphin Game ID GTRE01",
+            "GameHacking game ID: 501",
+            "Expected page URL: https://gamehacking.org/game/501",
+            "Accepted formats:",
+            "Saved game page (.html, .htm)",
+            "GameHacking Text export (.txt)",
+            "game-501.html",
+            "export-501.txt",
+            "nothing cached yet",
+            // Every required route.
+            "Open game page in browser",
+            "Import saved page",
+            "Paste page/export",
+            "Paste from clipboard",
+            "Copy page URL",
+            "Cancel",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_panel_names_the_existing_cached_response_it_would_replace() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-replace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_root = browser_import_cache_root("replace");
+        std::fs::write(cache_root.join("game-501.html"), b"<html></html>").expect("seed cache");
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.browser_import = Some(browser_import_state(&cache_root));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "replaces an existing cached response (live_fetch"
+        ));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_browser_route_is_offered_even_when_live_access_is_not_blocked() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-unblocked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.gamecube_gamehacking = CheatStepResource::Ready(GameCubeGameHackingState {
+            status: GameHackingGameCubeMatchStatus::NoMatch,
+            detail: "No match in the cached catalogue.".to_string(),
+            game: None,
+            match_candidates: Vec::new(),
+            cheats: Vec::new(),
+            selection: gamecube_gamehacking_selection_for(&[]),
+            cached_fallback: false,
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Import through browser"));
+        assert!(!rendered_text_contains(
+            &output,
+            "GameHacking.org access blocked"
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_successful_browser_import_reports_its_counts_destination_and_provenance() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-success-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_root = browser_import_cache_root("success");
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut state = browser_import_state(&cache_root);
+        let cache_path = cache_root.join("export-501.txt");
+        state.outcome = Some(BrowserImportOutcome {
+            platform: BrowserImportPlatform::GameCube,
+            gamehacking_game_id: 501,
+            kind: BrowserImportKind::TextExport,
+            imported_title: Some("Test Racer (USA)".to_string()),
+            cache_path: cache_path.clone(),
+            provenance_path: cache_root.join("export-501.txt.import.json"),
+            provenance: BrowserImportProvenance {
+                schema_version: 1,
+                source: MANUAL_BROWSER_IMPORT_SOURCE.to_string(),
+                imported_at_unix_seconds: 1_700_000_000,
+                expected_source_url: "https://gamehacking.org/game/501".to_string(),
+                supplied_sha256: "a".repeat(64),
+                stored_sha256: "b".repeat(64),
+                platform: BrowserImportPlatform::GameCube,
+                gamehacking_game_id: 501,
+                import_kind: BrowserImportKind::TextExport,
+                local_identity: browser_import_identity(),
+                original_filename: Some("Test Racer.txt".to_string()),
+                parser_schema_version: 1,
+                cache_file_name: "export-501.txt".to_string(),
+                verified_evidence: vec!["Dolphin Game ID GTRE01 confirmed".to_string()],
+            },
+            replaced_existing_cache: false,
+            replaced: None,
+            backup_path: None,
+            cheat_count: 6,
+            action_replay_count: 4,
+            gecko_count: 1,
+            raw_unknown_count: 1,
+            unsupported_count: 0,
+            enriched_from_cache: None,
+            verified_evidence: vec!["Dolphin Game ID GTRE01 confirmed".to_string()],
+        });
+        workflow.browser_import = Some(state);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        for expected in [
+            "Browser import successful",
+            "Test Racer (USA)",
+            "GameHacking game 501",
+            "6 cheats parsed",
+            "Action Replay 4",
+            "Gecko 1",
+            "Raw (format not declared) 1",
+            MANUAL_BROWSER_IMPORT_SOURCE,
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        assert!(rendered_text_contains(
+            &output,
+            &cache_path.display().to_string()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_local_browser_import_failure_is_never_shown_as_an_http_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_root = browser_import_cache_root("failure");
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut state = browser_import_state(&cache_root);
+        state.failure = Some((
+            BrowserImportErrorKind::ChallengeContent.headline().to_string(),
+            "That looks like the Cloudflare \"checking your browser\" page, not a GameHacking.org game page.".to_string(),
+        ));
+        workflow.browser_import = Some(state);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Imported a Cloudflare challenge page"
+        ));
+        for http_shaped in ["HTTP", "403", "network", "request failed"] {
+            assert!(
+                !rendered_text_contains(&output, http_shaped),
+                "a local import failure must not read as {http_shaped}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_paste_field_only_appears_after_paste_page_export_is_chosen() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-paste-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_root = browser_import_cache_root("paste");
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.browser_import = Some(browser_import_state(&cache_root));
+        let ctx = egui::Context::default();
+        let closed = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(!rendered_text_contains(
+            &closed,
+            "Paste the complete page source"
+        ));
+        workflow.browser_import.as_mut().unwrap().paste_open = true;
+        let opened = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &opened,
+            "Paste the complete page source"
+        ));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_panel_that_cannot_open_says_why_instead_of_failing_silently() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-gui-browser-import-open-error-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GTRE01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.browser_import_open_error = Some((
+            "No GameHacking candidate selected".to_string(),
+            "Choose the correct GameHacking.org game first.".to_string(),
+        ));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_gamecube_gamehacking(ui, workflow);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "No GameHacking candidate selected"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "Choose the correct GameHacking.org game first."
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn gamecube_gamehacking_marks_a_successful_cached_fallback_as_stale() {
         let directory = std::env::temp_dir().join(format!(
@@ -40286,6 +41542,8 @@ $Instant Growth [Nayr]\n";
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking_blocked: false,
+            browser_import: None,
+            browser_import_open_error: None,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -54311,6 +55569,8 @@ $Instant Growth [Nayr]\n";
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking_blocked: false,
+            browser_import: None,
+            browser_import_open_error: None,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
