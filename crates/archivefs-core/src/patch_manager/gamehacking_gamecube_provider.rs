@@ -43,8 +43,9 @@ use url::Url;
 use super::gamehacking_provider::{
     GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameHackingError, GameHackingErrorKind,
     GameHackingFetchOutcome, GameHackingHttpClassification, cached_bytes_are_cloudflare_challenge,
-    classify_gamehacking_http_response, clear_cloudflare_marker, cloudflare_cooldown_remaining,
-    gamehacking_cache_root, mark_cloudflare_blocked,
+    classify_gamehacking_http_response, classify_gamehacking_transport_error,
+    clear_cloudflare_marker, cloudflare_cooldown_remaining, gamehacking_cache_root,
+    mark_cloudflare_blocked,
 };
 use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus};
 
@@ -660,12 +661,6 @@ impl UreqGameCubeGameHackingTransport {
                     format!("GameHacking.org response could not be read: {failure}"),
                 )
             })?;
-        if bytes.len() > maximum_bytes {
-            return Err(gamecube_error(
-                GameHackingErrorKind::InvalidResponse,
-                "GameHacking.org response exceeded the bounded size limit",
-            ));
-        }
         match classify_gamehacking_http_response(status, server.as_deref(), &bytes) {
             GameHackingHttpClassification::Success => {}
             GameHackingHttpClassification::CloudflareBlocked => {
@@ -699,6 +694,12 @@ impl UreqGameCubeGameHackingTransport {
                 ));
             }
         }
+        if bytes.len() > maximum_bytes {
+            return Err(gamecube_error(
+                GameHackingErrorKind::InvalidResponse,
+                "GameHacking.org response exceeded the bounded size limit",
+            ));
+        }
         Ok(ProviderResponse {
             bytes,
             charset,
@@ -718,7 +719,7 @@ impl GameCubeGameHackingTransport for UreqGameCubeGameHackingTransport {
             .header("Accept-Encoding", "identity")
             .header("User-Agent", USER_AGENT)
             .call()
-            .map_err(classify_transport_error)?;
+            .map_err(classify_gamehacking_transport_error)?;
         Self::read_response(response, maximum_bytes)
     }
 
@@ -736,7 +737,7 @@ impl GameCubeGameHackingTransport for UreqGameCubeGameHackingTransport {
             .header("Accept-Encoding", "identity")
             .header("User-Agent", USER_AGENT)
             .send_form(form.iter().map(|(key, value)| (*key, value.as_str())))
-            .map_err(classify_transport_error)?;
+            .map_err(classify_gamehacking_transport_error)?;
         Self::read_response(response, maximum_bytes)
     }
 }
@@ -762,13 +763,6 @@ fn validate_provider_url(value: &str) -> Result<(), GameHackingError> {
         ));
     }
     Ok(())
-}
-
-fn classify_transport_error(failure: ureq::Error) -> GameHackingError {
-    gamecube_error(
-        GameHackingErrorKind::TemporaryFailure,
-        format!("GameHacking.org request failed: {failure}"),
-    )
 }
 
 fn charset_from_content_type(content_type: &str) -> Option<String> {
