@@ -5450,6 +5450,21 @@ impl ArchiveFsApp {
             return false;
         };
         let adapter = cheat_adapter_route(platform.as_deref());
+        let persisted_identity = self
+            .database_state
+            .snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .find(|archive| archive.absolute_path == archive_path)
+            })
+            .and_then(|archive| archive.identity_report.clone());
+        let persisted_identity_request = persisted_identity.as_ref().map(|_| GameIdentityRequest {
+            archive_path: archive_path.clone(),
+            platform: platform.clone(),
+            adapter,
+        });
         let selected_profile_id = match &self.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
                 let eligible = eligible_profile_ids(discovery);
@@ -5524,8 +5539,11 @@ impl ArchiveFsApp {
             source_root,
             size_bytes,
             adapter,
-            identity_request: None,
-            identity: CheatStepResource::NotLoaded,
+            identity_request: persisted_identity_request.clone(),
+            identity: match (persisted_identity_request, persisted_identity) {
+                (Some(request), Some(report)) => CheatStepResource::Ready((request, report)),
+                _ => CheatStepResource::NotLoaded,
+            },
             preview_request: None,
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
@@ -5586,7 +5604,13 @@ impl ArchiveFsApp {
         // Read-only listing of the local trusted-source cache; safe to
         // start immediately (no network, background thread).
         self.start_cheat_source_list(context.clone());
-        self.start_game_identity_inspection(context.clone());
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| matches!(workflow.identity, CheatStepResource::NotLoaded))
+        {
+            self.start_game_identity_inspection(context.clone());
+        }
         if self
             .cheat_workflow
             .as_ref()
@@ -18401,6 +18425,7 @@ fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
         IdentityImageFormat::ZipContainingIso => "This ZIP archive",
         IdentityImageFormat::Rvz => "This RVZ file",
         IdentityImageFormat::Ciso => "This CISO file",
+        IdentityImageFormat::Wbfs => "This WBFS file",
         IdentityImageFormat::Deferred => "This disc image format",
         IdentityImageFormat::LooseCartridgeRom
         | IdentityImageFormat::Xex
@@ -38631,6 +38656,65 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn wbfs_identity_has_a_specific_gui_format_label() {
+        assert_eq!(
+            dolphin_identity_format_label(IdentityImageFormat::Wbfs),
+            "This WBFS file"
+        );
+    }
+
+    #[test]
+    fn persisted_wbfs_identity_seeds_cheats_workspace_after_restart() {
+        let path = PathBuf::from("/roms/Wrong [RZDE01].wbfs");
+        let mut app = app_for_operation_tests();
+        if let LoadState::Ready(data) = &mut app.state {
+            let mut item = record(path.to_str().unwrap(), MountState::Pending);
+            item.identity.platform = Some("Wii".to_string());
+            data.records.push(item);
+        }
+        let report = GameIdentityReport {
+            archive_path: path.clone(),
+            platform: archivefs_core::game_identity::IdentityPlatform::Wii,
+            format: IdentityImageFormat::Wbfs,
+            evidence: vec![archivefs_core::game_identity::IdentityEvidence {
+                kind: IdentityKind::DolphinGameId,
+                status: IdentityStatus::Verified,
+                value: Some("SMNE01".to_string()),
+                confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+                provenance: archivefs_core::game_identity::IdentityProvenance {
+                    archive_path: path.clone(),
+                    member_path: None,
+                    member_index: None,
+                    method: "WBFS-contained Wii disc-info header copy".to_string(),
+                },
+                diagnostic: "verified synthetic fixture".to_string(),
+            }],
+            warnings: Vec::new(),
+            bytes_read: 5_028,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        };
+        let mut persisted = persisted_archive(path.clone(), false);
+        persisted.platform = Some("Wii".to_string());
+        persisted.identity_report = Some(report);
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(cached_snapshot(vec![persisted])),
+            last_scan_summary: None,
+        };
+        app.cheat_workflow = None;
+
+        assert!(app.prepare_cheats_mods_workspace(path));
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(
+            ready_game_identity(workflow).and_then(GameIdentityReport::verified_dolphin_game_id),
+            Some("SMNE01")
+        );
+        assert!(matches!(workflow.identity, CheatStepResource::Ready(_)));
+    }
+
+    #[test]
     fn preview_result_is_rejected_after_profile_source_or_page_changes() {
         let mut app = app_with_cheats_mods_context();
         app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
@@ -41659,6 +41743,7 @@ $Instant Growth [Nayr]\n";
             last_known_health: "Pending".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: missing.then(|| "2026-01-01T00:00:00Z".to_string()),
+            identity_report: None,
         }
     }
 

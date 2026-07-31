@@ -9,7 +9,10 @@ use archivefs_core::emulator_environment::retroarch::{
     ProfileScope, ResolutionState, RetroArchEnvironmentReport, RetroArchProfile,
     discover_retroarch_environment,
 };
-use archivefs_core::game_identity::{IdentityKind, inspect_catalogued_game_identity};
+use archivefs_core::game_identity::{
+    GameIdentityReport, IdentityConfidence, IdentityKind, IdentityStatus,
+    inspect_catalogued_game_identity,
+};
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatBackupAssessment,
@@ -407,6 +410,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     result.pages_reused,
                     result.catalogue_path.display()
                 );
+            }
+        }
+        "game-identity-inspect" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let path = extract_named_path_flag(&mut input_args, "--path")?
+                .ok_or("game-identity-inspect requires --path <image>")?;
+            let platform = extract_named_flag(&mut input_args, "--platform")?;
+            if !input_args.is_empty() {
+                return Err(
+                    format!("game-identity-inspect does not accept {:?}", input_args).into(),
+                );
+            }
+            let report = inspect_catalogued_game_identity(&path, platform.as_deref());
+            if json {
+                print_game_identity_report_json(&report)?;
+            } else {
+                print_game_identity_report(&report);
             }
         }
         "gamehacking-wii-import-page" => {
@@ -3977,6 +3998,29 @@ fn extract_named_path_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(value))
+}
+
 fn extract_named_u64_flag(
     args: &mut Vec<String>,
     flag: &str,
@@ -4439,6 +4483,149 @@ fn print_archive_info(info: &ArchiveInfo) {
     print!("{}", format_archive_info(info));
 }
 
+/// Read-only identity diagnostic for one image. Reports exactly what the
+/// shared inspector proved, never a filename guess: values appear only
+/// when their evidence reached `Verified`, and the terminal status of the
+/// primary identity evidence is surfaced as the failure code.
+fn game_identity_report_rows(report: &GameIdentityReport) -> Vec<(&'static str, String)> {
+    let is_primary_kind = |item: &&archivefs_core::game_identity::IdentityEvidence| {
+        matches!(
+            item.kind,
+            IdentityKind::DolphinGameId | IdentityKind::Ps2Serial | IdentityKind::XexTitleId
+        )
+    };
+    // Prefer proven evidence: a filename candidate for the same kind is
+    // also present, and must never be reported as the provenance of the
+    // identity or as the reason one is missing.
+    let primary = report
+        .evidence
+        .iter()
+        .find(|item| is_primary_kind(item) && item.status == IdentityStatus::Verified)
+        .or_else(|| {
+            report
+                .evidence
+                .iter()
+                .filter(is_primary_kind)
+                .find(|item| item.confidence != IdentityConfidence::FilenameOnly)
+        });
+    let missing = || "unavailable".to_string();
+    // Wii deliberately keeps the outer-header revision as a candidate, so
+    // report it separately rather than claiming it is verified.
+    let revision = report.verified_dolphin_revision().map_or_else(
+        || {
+            report
+                .evidence
+                .iter()
+                .find(|item| {
+                    item.kind == IdentityKind::DolphinRevision
+                        && item.status == IdentityStatus::Candidate
+                })
+                .and_then(|item| item.value.as_deref())
+                .map_or_else(missing, |value| format!("{value} (candidate)"))
+        },
+        |value| value.to_string(),
+    );
+    vec![
+        ("Path", report.archive_path.display().to_string()),
+        ("Platform", report.platform.label().to_string()),
+        ("Image format", format!("{:?}", report.format)),
+        (
+            "Verified Game ID",
+            report
+                .verified_dolphin_game_id()
+                .map_or_else(missing, str::to_owned),
+        ),
+        (
+            "Disc number",
+            report
+                .verified_value(IdentityKind::DolphinDiscNumber)
+                .map_or_else(missing, str::to_owned),
+        ),
+        ("Revision", revision),
+        (
+            "Region",
+            report
+                .verified_value(IdentityKind::DolphinRegion)
+                .map_or_else(missing, str::to_owned),
+        ),
+        (
+            "Provenance",
+            primary.map_or_else(missing, |item| item.provenance.method.clone()),
+        ),
+        ("Bytes read", report.bytes_read.to_string()),
+        (
+            "Failure code",
+            primary.map_or_else(
+                || "None".to_string(),
+                |item| {
+                    if item.status == IdentityStatus::Verified {
+                        "None".to_string()
+                    } else {
+                        item.status.to_string()
+                    }
+                },
+            ),
+        ),
+        ("Complete", report.complete.to_string()),
+    ]
+}
+
+fn print_game_identity_report(report: &GameIdentityReport) {
+    println!("ArchiveFS Game Identity\n");
+    for (label, value) in game_identity_report_rows(report) {
+        println!("  {label}: {value}");
+    }
+    if !report.evidence.is_empty() {
+        println!("\nEvidence:");
+        for item in &report.evidence {
+            println!(
+                "  {} = {} [{}] ({:?}; {}; {})",
+                item.kind,
+                item.value.as_deref().unwrap_or("-"),
+                item.status,
+                item.confidence,
+                item.provenance.method,
+                item.diagnostic
+            );
+        }
+    }
+}
+
+fn print_game_identity_report_json(report: &GameIdentityReport) -> Result<(), serde_json::Error> {
+    let rows = game_identity_report_rows(report)
+        .into_iter()
+        .map(|(label, value)| {
+            (
+                label.to_ascii_lowercase().replace(' ', "_"),
+                serde_json::Value::String(value),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let evidence = report
+        .evidence
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "kind": item.kind.to_string(),
+                "status": item.status.to_string(),
+                "value": item.value,
+                "confidence": format!("{:?}", item.confidence),
+                "method": item.provenance.method,
+                "diagnostic": item.diagnostic,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "identity": rows,
+            "evidence": evidence,
+            "warnings": report.warnings,
+        }))?
+    );
+    Ok(())
+}
+
 fn print_archive_info_json(info: &ArchiveInfo) -> Result<(), serde_json::Error> {
     println!("{}", format_archive_info_json(info)?);
     Ok(())
@@ -4648,6 +4835,9 @@ fn print_help() {
     );
     println!(
         "  gamehacking-wii-index-refresh  Resume the cached public Wii index crawl using the shared catalogue engine (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  game-identity-inspect --path <image> [--platform <name>] [--json]  Report the read-only disc identity evidence for one image"
     );
     println!(
         "  gamehacking-wii-import-page --game-id <id> --image <path> --file <saved-page.html>  Validate and import one saved Wii game page without network access"

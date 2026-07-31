@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
@@ -61,6 +62,37 @@ const CISO_MAGIC: [u8; 4] = *b"CISO";
 const CISO_HEADER_SIZE: u64 = 0x8000;
 const CISO_MAP_OFFSET: u64 = 8;
 
+/// WBFS container format, per `libwbfs.c`/`libwbfs.h` (Kwiirk/WiiThemer,
+/// as also read by Dolphin's `WbfsBlob.cpp`). The first HD sector holds
+/// `wbfs_head_t`: a 4-byte magic, a big-endian `u32 n_hd_sec`, then two
+/// `u8` power-of-two shifts (`hd_sec_sz_s`, `wbfs_sec_sz_s`), followed by
+/// the disc table - one byte per disc slot, non-zero when occupied. Each
+/// occupied slot begins with `wbfs_disc_info_t`, whose first 0x100 bytes
+/// are a verbatim copy of the original disc header, so the same bytes
+/// `inspect_dolphin_header` reads from offset 0 of a plain ISO are stored
+/// uncompressed and can be read directly. Only the head, the disc table,
+/// the small `wlba` mapping table, and that one bounded disc header are
+/// read; mapped disc-data sectors are never read.
+const WBFS_MAGIC: [u8; 4] = *b"WBFS";
+const WBFS_N_HD_SEC_OFFSET: usize = 0x04;
+const WBFS_HD_SEC_SZ_S_OFFSET: u64 = 0x08;
+const WBFS_WBFS_SEC_SZ_S_OFFSET: u64 = 0x09;
+const WBFS_DISC_TABLE_OFFSET: u64 = 0x0c;
+/// `wbfs_disc_info_t.disc_header_copy` is a fixed 0x100-byte prefix.
+const WBFS_DISC_INFO_HEADER_BYTES: u64 = 0x100;
+/// A full, unscrubbed Wii DVD image (`WII_MAX_DISC_SIZE` in libwbfs);
+/// used only to size the per-slot `wlba` table so slot offsets can be
+/// computed. Never used as a read length.
+const WBFS_WII_DISC_SIZE: u64 = 0x1_1824_0000;
+/// HD sector shifts outside 512 B..64 KiB are not produced by any real
+/// formatter and would make the slot arithmetic meaningless.
+const WBFS_MIN_HD_SECTOR_SHIFT: u32 = 9;
+const WBFS_MAX_HD_SECTOR_SHIFT: u32 = 16;
+/// WBFS sector shifts outside 64 KiB..64 MiB likewise indicate a corrupt
+/// or hostile header.
+const WBFS_MIN_SECTOR_SHIFT: u32 = 16;
+const WBFS_MAX_SECTOR_SHIFT: u32 = 26;
+
 /// Xbox 360 XEX2 module header - see `xex2_header` in Xenia's
 /// `xex2_info.h`. Only the unencrypted, uncompressed header is ever read;
 /// the compressed/encrypted module body is never touched.
@@ -82,7 +114,8 @@ const MAX_XEX_OPT_HEADERS: u32 = 512;
 /// any legitimate header while remaining a small, fixed, safe read.
 const XEX_HEADER_PREFIX_BYTES: u64 = 16 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityStatus {
     Verified,
     Candidate,
@@ -110,7 +143,8 @@ impl fmt::Display for IdentityStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
     Platform,
     Ps2Serial,
@@ -146,7 +180,8 @@ impl fmt::Display for IdentityKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityConfidence {
     ExactBytes,
     StructuredMetadata,
@@ -155,7 +190,8 @@ pub enum IdentityConfidence {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityPlatform {
     PlayStation2,
     GameCube,
@@ -199,7 +235,8 @@ impl IdentityPlatform {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityImageFormat {
     Iso,
     ZipContainingIso,
@@ -212,19 +249,24 @@ pub enum IdentityImageFormat {
     /// The uncompressed, sparse-block GameCube/Wii `.ciso` format (distinct
     /// from PSP CISO) - identity is read from the first stored block only.
     Ciso,
+    /// The WBFS container format - identity is read from the plain, stored
+    /// Wii disc header at the start of the single occupied disc slot. Its
+    /// bounded mapping table is validated; mapped disc data is never read.
+    Wbfs,
     Deferred,
     Unsupported,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityProvenance {
+    #[serde(with = "path_bytes_serde")]
     pub archive_path: PathBuf,
     pub member_path: Option<Vec<u8>>,
     pub member_index: Option<usize>,
     pub method: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityEvidence {
     pub kind: IdentityKind,
     pub status: IdentityStatus,
@@ -234,8 +276,9 @@ pub struct IdentityEvidence {
     pub diagnostic: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameIdentityReport {
+    #[serde(with = "path_bytes_serde")]
     pub archive_path: PathBuf,
     pub platform: IdentityPlatform,
     pub format: IdentityImageFormat,
@@ -246,6 +289,51 @@ pub struct GameIdentityReport {
     pub metadata_paths_inspected: usize,
     pub nested_container_depth: usize,
     pub complete: bool,
+}
+
+#[cfg(unix)]
+mod path_bytes_serde {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(path.as_os_str().as_bytes())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+}
+
+#[cfg(not(unix))]
+mod path_bytes_serde {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        path.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        PathBuf::deserialize(deserializer)
+    }
 }
 
 impl GameIdentityReport {
@@ -390,6 +478,9 @@ fn inspect_game_identity_with_platform_trust(
         }
         "ciso" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
             inspect_ciso(&mut report);
+        }
+        "wbfs" if platform == IdentityPlatform::Wii => {
+            inspect_wbfs(&mut report);
         }
         "chd" | "cso" | "rvz" | "wbfs" | "ciso" | "gcz" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
@@ -1427,6 +1518,257 @@ fn inspect_ciso(report: &mut GameIdentityReport) {
     // of the map to locate it.
     inspect_dolphin_header(report, &mut source, None, None, CISO_HEADER_SIZE);
     report.bytes_read = source.bytes_read();
+}
+
+/// Locate the single occupied disc slot in a WBFS container, returning the
+/// absolute byte offset of its stored disc-header copy. Every step uses
+/// checked arithmetic and is validated against the real file length, so a
+/// malformed or hostile header can only produce an error - never an
+/// out-of-range or wrapped read. Returns the diagnostic for an `Invalid`
+/// or `Ambiguous` result rather than choosing a slot silently.
+fn checked_wbfs_sector_offset(sector: u64, sector_size: u64) -> Option<u64> {
+    sector.checked_mul(sector_size)
+}
+
+fn wbfs_disc_header_offset(
+    source: &mut dyn ByteSource,
+) -> Result<u64, (IdentityStatus, &'static str)> {
+    let mut header = [0_u8; WBFS_DISC_TABLE_OFFSET as usize];
+    source
+        .read_exact_at(0, &mut header)
+        .map_err(|_| (IdentityStatus::Invalid, "WBFS file header is truncated"))?;
+    if header[..4] != WBFS_MAGIC {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS magic bytes do not match the documented wbfs_head_t header",
+        ));
+    }
+    let n_hd_sec = u64::from(u32::from_be_bytes(
+        header[WBFS_N_HD_SEC_OFFSET..WBFS_N_HD_SEC_OFFSET + 4]
+            .try_into()
+            .expect("fixed WBFS header slice"),
+    ));
+    if n_hd_sec == 0 {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS n_hd_sec declares an empty source device",
+        ));
+    }
+    let hd_sec_sz_s = u32::from(header[WBFS_HD_SEC_SZ_S_OFFSET as usize]);
+    let wbfs_sec_sz_s = u32::from(header[WBFS_WBFS_SEC_SZ_S_OFFSET as usize]);
+    if !(WBFS_MIN_HD_SECTOR_SHIFT..=WBFS_MAX_HD_SECTOR_SHIFT).contains(&hd_sec_sz_s) {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS hd_sec_sz_s is outside the supported 512 B..64 KiB range",
+        ));
+    }
+    if !(WBFS_MIN_SECTOR_SHIFT..=WBFS_MAX_SECTOR_SHIFT).contains(&wbfs_sec_sz_s) {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS wbfs_sec_sz_s is outside the supported 64 KiB..64 MiB range",
+        ));
+    }
+    if wbfs_sec_sz_s <= hd_sec_sz_s {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS sector size must be larger than the host sector size",
+        ));
+    }
+    let hd_sec_sz = 1_u64.checked_shl(hd_sec_sz_s).ok_or((
+        IdentityStatus::Invalid,
+        "WBFS host sector-size shift overflows",
+    ))?;
+    let wbfs_sec_sz = 1_u64
+        .checked_shl(wbfs_sec_sz_s)
+        .ok_or((IdentityStatus::Invalid, "WBFS sector-size shift overflows"))?;
+    let declared_bytes = n_hd_sec.checked_mul(hd_sec_sz).ok_or((
+        IdentityStatus::Invalid,
+        "WBFS declared source size overflows",
+    ))?;
+    if declared_bytes != source.len() {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS declared source size does not match the file length",
+        ));
+    }
+
+    // The disc table fills the remainder of the first HD sector, one byte
+    // per slot, and is additionally capped so a large `hd_sec_sz` cannot
+    // drive an unbounded read.
+    let slots = hd_sec_sz.checked_sub(WBFS_DISC_TABLE_OFFSET).ok_or((
+        IdentityStatus::Invalid,
+        "WBFS hd_sec_sz is smaller than the wbfs_head_t it must contain",
+    ))?;
+    let mut table = vec![0_u8; slots as usize];
+    source
+        .read_exact_at(WBFS_DISC_TABLE_OFFSET, &mut table)
+        .map_err(|_| (IdentityStatus::Invalid, "WBFS disc table is truncated"))?;
+    let mut occupied = table
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, entry)| (*entry != 0).then_some(slot));
+    let Some(slot) = occupied.next() else {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS disc table is empty; the container holds no disc",
+        ));
+    };
+    if occupied.next().is_some() {
+        return Err((
+            IdentityStatus::Ambiguous,
+            "WBFS container holds more than one disc; ArchiveFS will not choose one silently",
+        ));
+    }
+
+    let n_wbfs_sec = declared_bytes / wbfs_sec_sz;
+
+    // `wbfs_disc_info_t` stores a 0x100-byte disc-header copy followed by
+    // one big-endian u16 physical-sector mapping per logical WBFS sector.
+    // Reading and validating this small table proves every non-empty mapping
+    // remains within the same file; the mapped disc data itself is not read.
+    let sectors_per_disc = WBFS_WII_DISC_SIZE.div_ceil(wbfs_sec_sz);
+    let wlba_bytes = sectors_per_disc
+        .checked_mul(2)
+        .ok_or((IdentityStatus::Invalid, "WBFS WLBA table size overflows"))?;
+    let unaligned_disc_info_bytes = WBFS_DISC_INFO_HEADER_BYTES
+        .checked_add(wlba_bytes)
+        .ok_or((IdentityStatus::Invalid, "WBFS disc-info size overflows"))?;
+    let disc_info_bytes = unaligned_disc_info_bytes
+        .checked_add(hd_sec_sz - 1)
+        .map(|value| value & !(hd_sec_sz - 1))
+        .ok_or((
+            IdentityStatus::Invalid,
+            "WBFS aligned disc-info size overflows",
+        ))?;
+    if disc_info_bytes > wbfs_sec_sz - hd_sec_sz {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS disc-info slot does not fit before mapped data sectors",
+        ));
+    }
+    let max_disc_slots = (wbfs_sec_sz - hd_sec_sz) / disc_info_bytes;
+    let slot = u64::try_from(slot).map_err(|_| {
+        (
+            IdentityStatus::ResourceLimitReached,
+            "WBFS disc-table slot exceeds host index range",
+        )
+    })?;
+    if slot >= max_disc_slots {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS occupied disc-table slot lies outside the packed disc-info area",
+        ));
+    }
+    let offset = slot
+        .checked_mul(disc_info_bytes)
+        .and_then(|relative| hd_sec_sz.checked_add(relative))
+        .ok_or((
+            IdentityStatus::Invalid,
+            "WBFS disc-info slot offset overflows",
+        ))?;
+    let end = offset
+        .checked_add(unaligned_disc_info_bytes)
+        .ok_or((IdentityStatus::Invalid, "WBFS disc-info offset overflows"))?;
+    if end > source.len() {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS disc-info or WLBA table lies beyond the end of the file",
+        ));
+    }
+    let wlba_len = usize::try_from(wlba_bytes).map_err(|_| {
+        (
+            IdentityStatus::ResourceLimitReached,
+            "WBFS WLBA table exceeds the bounded host allocation",
+        )
+    })?;
+    let mut wlba = vec![0_u8; wlba_len];
+    source
+        .read_exact_at(offset + WBFS_DISC_INFO_HEADER_BYTES, &mut wlba)
+        .map_err(|_| (IdentityStatus::Invalid, "WBFS WLBA table is truncated"))?;
+    let mut mapped_sectors = 0_usize;
+    for entry in wlba.chunks_exact(2) {
+        let physical = u64::from(u16::from_be_bytes([entry[0], entry[1]]));
+        if physical == 0 {
+            continue;
+        }
+        mapped_sectors += 1;
+        if physical >= n_wbfs_sec {
+            return Err((
+                IdentityStatus::Invalid,
+                "WBFS WLBA entry points beyond the declared container sectors",
+            ));
+        }
+        let physical_offset = checked_wbfs_sector_offset(physical, wbfs_sec_sz)
+            .ok_or((IdentityStatus::Invalid, "WBFS WLBA sector offset overflows"))?;
+        let physical_end = physical_offset
+            .checked_add(wbfs_sec_sz)
+            .ok_or((IdentityStatus::Invalid, "WBFS WLBA sector end overflows"))?;
+        if physical_end > source.len() {
+            return Err((
+                IdentityStatus::Invalid,
+                "WBFS WLBA entry points beyond the end of the file",
+            ));
+        }
+    }
+    if mapped_sectors == 0 {
+        return Err((
+            IdentityStatus::Invalid,
+            "WBFS disc has no mapped logical Wii sectors",
+        ));
+    }
+    Ok(offset)
+}
+
+/// WBFS direct identity: reads the container head, the disc table, and the
+/// stored copy of the Wii disc header belonging to the single occupied
+/// slot. The scrubbed disc body is never read, nothing is decompressed or
+/// mounted, no external tool is launched, and the file is opened read-only
+/// with symlinks refused by `open_read_only_regular`.
+fn inspect_wbfs(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::Wbfs;
+    let file = match open_read_only_regular(&report.archive_path) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let before = match StableFileMetadata::from_file(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let len = before.len;
+    let mut source = FileSource {
+        file,
+        len,
+        bytes_read: 0,
+    };
+    let evidence_start = report.evidence.len();
+    match wbfs_disc_header_offset(&mut source) {
+        Ok(offset) => inspect_dolphin_header(report, &mut source, None, None, offset),
+        Err((status, diagnostic)) => add_unavailable(report, status, diagnostic),
+    }
+    report.bytes_read = source.bytes_read();
+    for item in &mut report.evidence[evidence_start..] {
+        item.provenance.method =
+            "WBFS-contained Wii disc-info header copy after disc-table and WLBA validation"
+                .to_string();
+    }
+    match StableFileMetadata::from_file(&source.file) {
+        Ok(after) if after == before => {}
+        Ok(_) | Err(_) => {
+            report.evidence.truncate(evidence_start);
+            report.complete = false;
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "WBFS source metadata changed during bounded identity inspection",
+            );
+        }
+    }
 }
 
 fn inspect_ps2_iso(
@@ -2542,6 +2884,32 @@ mod tests {
         bytes
     }
 
+    fn wbfs_fixture(file_name_id: &[u8; 6], revision: u8) -> Vec<u8> {
+        const HD_SHIFT: u8 = 9;
+        const WBFS_SHIFT: u8 = 21;
+        let file_len = 4_usize << WBFS_SHIFT;
+        let mut bytes = vec![0_u8; file_len];
+        bytes[..4].copy_from_slice(&WBFS_MAGIC);
+        let hd_sectors = u32::try_from(file_len >> HD_SHIFT).unwrap();
+        bytes[4..8].copy_from_slice(&hd_sectors.to_be_bytes());
+        bytes[WBFS_HD_SEC_SZ_S_OFFSET as usize] = HD_SHIFT;
+        bytes[WBFS_WBFS_SEC_SZ_S_OFFSET as usize] = WBFS_SHIFT;
+        bytes[WBFS_DISC_TABLE_OFFSET as usize] = 1;
+
+        let disc_info = 1_usize << HD_SHIFT;
+        let mut header = dolphin_fixture(IdentityPlatform::Wii, file_name_id, revision);
+        header[6] = 0;
+        bytes[disc_info..disc_info + header.len()].copy_from_slice(&header);
+        // Logical Wii sector zero is stored in physical WBFS sector one.
+        bytes[disc_info + WBFS_DISC_INFO_HEADER_BYTES as usize..][..2]
+            .copy_from_slice(&1_u16.to_be_bytes());
+        bytes
+    }
+
+    fn evidence_status(report: &GameIdentityReport, status: IdentityStatus) -> bool {
+        report.evidence.iter().any(|item| item.status == status)
+    }
+
     #[test]
     fn ciso_recovers_exact_game_id_from_the_first_stored_block() {
         let directory = FixtureDir::new("ciso");
@@ -2573,9 +2941,157 @@ mod tests {
     }
 
     #[test]
-    fn gcz_and_wbfs_remain_honestly_deferred_not_unsupported() {
-        let directory = FixtureDir::new("gcz-wbfs");
-        for extension in ["gcz", "wbfs"] {
+    fn wbfs_extracts_verified_wii_identity_from_bytes_not_filename() {
+        let directory = FixtureDir::new("wbfs-valid");
+        let path = write_fixture(
+            &directory,
+            "Wrong Game ID [RZDE01].wbfs",
+            &wbfs_fixture(b"SMNE01", 1),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("Wii"));
+        assert_eq!(report.format, IdentityImageFormat::Wbfs);
+        assert_eq!(report.verified_dolphin_game_id(), Some("SMNE01"));
+        assert_eq!(
+            report.verified_value(IdentityKind::DolphinDiscNumber),
+            Some("0")
+        );
+        assert_eq!(
+            report.verified_value(IdentityKind::DolphinRegion),
+            Some("E")
+        );
+        assert_eq!(report.verified_dolphin_revision(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::DolphinRevision
+                && item.status == IdentityStatus::Candidate
+                && item.value.as_deref() == Some("1")
+        }));
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::DolphinGameId
+                && item.status == IdentityStatus::Candidate
+                && item.value.as_deref() == Some("RZDE01")
+        }));
+        assert!(report.bytes_read > DOLPHIN_HEADER_BYTES as u64);
+        assert!(report.bytes_read < 128 * 1024);
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn wbfs_rejects_invalid_and_truncated_headers() {
+        let directory = FixtureDir::new("wbfs-header-errors");
+        let mut bad_magic = wbfs_fixture(b"SMNE01", 0);
+        bad_magic[..4].copy_from_slice(b"NOPE");
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "bad.wbfs", &bad_magic),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+        assert_eq!(report.verified_dolphin_game_id(), None);
+
+        let truncated = write_fixture(&directory, "short.wbfs", b"WBFS\0\0");
+        let report = inspect_catalogued_game_identity(&truncated, Some("Wii"));
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+        assert_eq!(report.bytes_read, 0);
+    }
+
+    #[test]
+    fn wbfs_rejects_invalid_sector_shifts_and_declared_length() {
+        let directory = FixtureDir::new("wbfs-size-errors");
+        for (name, offset, value) in [
+            ("host", WBFS_HD_SEC_SZ_S_OFFSET as usize, 8),
+            ("wbfs", WBFS_WBFS_SEC_SZ_S_OFFSET as usize, 63),
+        ] {
+            let mut bytes = wbfs_fixture(b"SMNE01", 0);
+            bytes[offset] = value;
+            let report = inspect_catalogued_game_identity(
+                &write_fixture(&directory, &format!("{name}.wbfs"), &bytes),
+                Some("Wii"),
+            );
+            assert!(evidence_status(&report, IdentityStatus::Invalid));
+        }
+        let mut wrong_length = wbfs_fixture(b"SMNE01", 0);
+        wrong_length[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "declared.wbfs", &wrong_length),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+        assert_eq!(checked_wbfs_sector_offset(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn wbfs_rejects_empty_ambiguous_and_out_of_range_disc_slots() {
+        let directory = FixtureDir::new("wbfs-slots");
+        let mut empty = wbfs_fixture(b"SMNE01", 0);
+        empty[WBFS_DISC_TABLE_OFFSET as usize] = 0;
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "empty.wbfs", &empty),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+
+        let mut ambiguous = wbfs_fixture(b"SMNE01", 0);
+        ambiguous[WBFS_DISC_TABLE_OFFSET as usize + 1] = 1;
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "multi.wbfs", &ambiguous),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Ambiguous));
+
+        let mut outside = wbfs_fixture(b"SMNE01", 0);
+        outside[WBFS_DISC_TABLE_OFFSET as usize] = 0;
+        outside[WBFS_DISC_TABLE_OFFSET as usize + 500] = 1;
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "outside.wbfs", &outside),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+    }
+
+    #[test]
+    fn wbfs_rejects_invalid_mapping_and_game_id_bytes() {
+        let directory = FixtureDir::new("wbfs-content-errors");
+        let mut mapping = wbfs_fixture(b"SMNE01", 0);
+        let wlba = (1_usize << 9) + WBFS_DISC_INFO_HEADER_BYTES as usize;
+        mapping[wlba..wlba + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "mapping.wbfs", &mapping),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+
+        let mut invalid_id = wbfs_fixture(b"SMNE01", 0);
+        invalid_id[1_usize << 9] = 0xff;
+        let report = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "invalid-id.wbfs", &invalid_id),
+            Some("Wii"),
+        );
+        assert!(evidence_status(&report, IdentityStatus::Invalid));
+        assert_eq!(report.verified_dolphin_game_id(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wbfs_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("wbfs-symlink");
+        let target = write_fixture(&directory, "target.wbfs", &wbfs_fixture(b"SMNE01", 0));
+        let link = directory.0.join("SMNE01.wbfs");
+        symlink(&target, &link).unwrap();
+        let report = inspect_catalogued_game_identity(&link, Some("Wii"));
+        assert_eq!(report.verified_dolphin_game_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.diagnostic.contains("symlink refused"))
+        );
+    }
+
+    #[test]
+    fn gcz_remains_honestly_deferred_not_unsupported() {
+        let directory = FixtureDir::new("gcz");
+        for extension in ["gcz", "chd", "cso"] {
             let path = write_fixture(&directory, &format!("disc.{extension}"), b"whatever");
             let report = inspect_game_identity(&path, Some("GameCube"));
             assert_eq!(report.format, IdentityImageFormat::Deferred);
@@ -2586,6 +3102,10 @@ mod tests {
                     .any(|item| item.status == IdentityStatus::Deferred)
             );
         }
+        let wbfs = write_fixture(&directory, "gamecube.wbfs", &wbfs_fixture(b"SMNE01", 0));
+        let report = inspect_game_identity(&wbfs, Some("GameCube"));
+        assert_eq!(report.format, IdentityImageFormat::Deferred);
+        assert_eq!(report.verified_dolphin_game_id(), None);
     }
 
     #[test]

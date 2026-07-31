@@ -162,6 +162,32 @@ fn filename_only_and_gamecube_identity_are_never_trusted_for_wii() {
 }
 
 #[test]
+fn persisted_wbfs_header_identity_is_accepted_but_candidate_only_is_blocked() {
+    let mut verified = report(IdentityPlatform::Wii, Some("R3HX6Z"));
+    verified.format = IdentityImageFormat::Wbfs;
+    verified.archive_path = PathBuf::from("/games/Wrong [SMNE01].wbfs");
+    for item in &mut verified.evidence {
+        item.provenance.archive_path = verified.archive_path.clone();
+        item.provenance.method = "WBFS-contained Wii disc-info header copy".to_string();
+    }
+    let identity = WiiGameIdentity::from_report("Agent Hugo", &verified);
+    assert_eq!(identity.verified_game_id(), Some("R3HX6Z"));
+
+    let mut candidate_only = report(IdentityPlatform::Wii, None);
+    candidate_only.format = IdentityImageFormat::Wbfs;
+    candidate_only.evidence.push(evidence(
+        IdentityKind::DolphinGameId,
+        IdentityStatus::Candidate,
+        Some("R3HX6Z"),
+        IdentityConfidence::FilenameOnly,
+    ));
+    assert_eq!(
+        WiiGameIdentity::from_report("Agent Hugo", &candidate_only).verified_game_id(),
+        None
+    );
+}
+
+#[test]
 fn exact_id_and_region_matches_but_revision_requires_confirmation() {
     assert_eq!(
         classify_wii_match(&identity(), &game(None)),
