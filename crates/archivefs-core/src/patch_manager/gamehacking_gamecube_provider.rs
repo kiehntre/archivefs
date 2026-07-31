@@ -42,10 +42,10 @@ use url::Url;
 
 use super::gamehacking_provider::{
     GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameHackingError, GameHackingErrorKind,
-    GameHackingFetchOutcome, GameHackingHttpClassification, cached_bytes_are_cloudflare_challenge,
-    classify_gamehacking_http_response, classify_gamehacking_transport_error,
-    clear_cloudflare_marker, cloudflare_cooldown_remaining, gamehacking_cache_root,
-    mark_cloudflare_blocked,
+    GameHackingFetchOutcome, GameHackingHttpClassification, blocked_without_cache_message,
+    cached_bytes_are_cloudflare_challenge, classify_gamehacking_http_response,
+    classify_gamehacking_transport_error, clear_cloudflare_marker, cloudflare_cooldown_remaining,
+    gamehacking_cache_root, mark_cloudflare_blocked,
 };
 use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus};
 
@@ -1182,7 +1182,7 @@ impl GameHackingGameCubeProvider {
             }
             return Err(gamecube_error(
                 GameHackingErrorKind::CloudflareBlocked,
-                blocked_without_cache_message(file_name),
+                blocked_without_cache_message(&options.cache_root, file_name),
             ));
         }
         let mut last_error = None;
@@ -1220,7 +1220,10 @@ impl GameHackingGameCubeProvider {
                         log_cached_fallback(url, &path, &response);
                         return Ok(response);
                     }
-                    return Err(failure);
+                    return Err(gamecube_error(
+                        failure.kind,
+                        blocked_without_cache_message(&options.cache_root, file_name),
+                    ));
                 }
                 Err(failure)
                     if matches!(
@@ -2265,14 +2268,6 @@ fn log_cached_fallback(url: &str, path: &Path, response: &ProviderResponse) {
         path.display(),
         age
     );
-}
-
-fn blocked_without_cache_message(file_name: &str) -> &'static str {
-    if file_name.starts_with("export-") {
-        "GameHacking.org blocked the live request and no cached cheat export is available."
-    } else {
-        GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE
-    }
 }
 
 fn bounded_read(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, GameHackingError> {

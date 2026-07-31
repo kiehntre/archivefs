@@ -967,7 +967,7 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
             }
             return Err(error(
                 GameHackingErrorKind::CloudflareBlocked,
-                blocked_without_cache_message(file_name),
+                blocked_without_cache_message(&options.cache_root, file_name),
             ));
         }
         let mut last_error = None;
@@ -1005,7 +1005,10 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
                         log_cached_fallback(_url, &path, &response);
                         return Ok(response);
                     }
-                    return Err(failure);
+                    return Err(error(
+                        failure.kind,
+                        blocked_without_cache_message(&options.cache_root, file_name),
+                    ));
                 }
                 Err(failure)
                     if matches!(
@@ -1732,11 +1735,18 @@ fn log_cached_fallback(url: &str, path: &Path, response: &ProviderResponse) {
     );
 }
 
-fn blocked_without_cache_message(file_name: &str) -> &'static str {
-    if file_name.starts_with("export-") {
+pub(crate) fn blocked_without_cache_message(cache_root: &Path, file_name: &str) -> String {
+    let message = if file_name.starts_with("export-") {
         "GameHacking.org blocked the live request and no cached cheat export is available."
     } else {
         GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE
+    };
+    match fs::read_to_string(cloudflare_marker_path(cache_root))
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(timestamp) => format!("{message} Last attempted: Unix timestamp {timestamp}."),
+        None => message.to_string(),
     }
 }
 
