@@ -27,6 +27,16 @@
 
 use serde::Serialize;
 
+use super::environment::{
+    FreeSpacePolicy, StorageAssessment, findings_from_free_space,
+    findings_from_read_only_filesystems, not_checked_from_storage,
+};
+use super::managed::{
+    ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
+};
+use super::profiles::{
+    ProfileAssessmentReport, findings_from_emulator_profiles, not_checked_from_emulator_profiles,
+};
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
 use super::{
     CoverageStatus, DEFERRED_CHECKS, DeferredCheck, DoctorCategory, DoctorSeverity,
@@ -111,6 +121,16 @@ pub struct DoctorScanInputs<'a> {
     /// From `check_archive_index_freshness`, paired with the index path it
     /// was computed for.
     pub index_freshness: Gathered<(&'a ArchiveIndexFreshness, &'a std::path::Path)>,
+    /// From `environment::assess_storage` - free space and mount mode for
+    /// every filesystem ArchiveFS depends on.
+    pub storage: Gathered<&'a StorageAssessment>,
+    /// From `profiles::assess_emulator_profiles`.
+    pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
+    /// From `managed::scan_managed_entries`.
+    pub managed_entries: Gathered<&'a ManagedEntryScan>,
+    /// The free-space thresholds to apply. Not a `Gathered`: policy is always
+    /// available, and the default is the documented one.
+    pub free_space_policy: FreeSpacePolicy,
 }
 
 impl<'a> DoctorScanInputs<'a> {
@@ -132,6 +152,16 @@ impl<'a> DoctorScanInputs<'a> {
                 "The mount root has not been inspected for leftover folders yet.",
             ),
             index_freshness: Gathered::NotLoaded("The archive index has not been checked yet."),
+            storage: Gathered::NotLoaded(
+                "Filesystem capacity and mount state have not been inspected yet.",
+            ),
+            emulator_profiles: Gathered::NotLoaded(
+                "Emulator profiles have not been discovered in this session.",
+            ),
+            managed_entries: Gathered::NotLoaded(
+                "ArchiveFS-managed cheat entries have not been scanned yet.",
+            ),
+            free_space_policy: FreeSpacePolicy::default(),
         }
     }
 }
@@ -404,12 +434,49 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
             input.0, input.1
         )
     );
+    // Storage is two subsystems over one gathered assessment: capacity and
+    // mount state are different questions with different severities, and a
+    // person should be able to see one covered and the other not.
+    let policy = inputs.free_space_policy;
+    subsystem!(
+        inputs.storage,
+        DoctorCategory::Storage,
+        DoctorSubsystem::FilesystemCapacity,
+        |assessment: &&StorageAssessment| findings_from_free_space(assessment, &policy)
+    );
+    subsystem!(
+        inputs.storage,
+        DoctorCategory::Filesystems,
+        DoctorSubsystem::FilesystemMountState,
+        |assessment: &&StorageAssessment| findings_from_read_only_filesystems(assessment)
+    );
+    subsystem!(
+        inputs.emulator_profiles,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorProfiles,
+        |report: &&ProfileAssessmentReport| findings_from_emulator_profiles(report)
+    );
+    subsystem!(
+        inputs.managed_entries,
+        DoctorCategory::ManagedEntries,
+        DoctorSubsystem::ManagedEntries,
+        |scan: &&ManagedEntryScan| findings_from_managed_entries(scan)
+    );
 
-    let not_checked = inputs
+    let mut not_checked = inputs
         .setup
         .as_ready()
         .map(|setup| not_checked_from_setup_diagnostics(setup))
         .unwrap_or_default();
+    if let Some(assessment) = inputs.storage.as_ready() {
+        not_checked.extend(not_checked_from_storage(assessment));
+    }
+    if let Some(report) = inputs.emulator_profiles.as_ready() {
+        not_checked.extend(not_checked_from_emulator_profiles(report));
+    }
+    if let Some(scan) = inputs.managed_entries.as_ready() {
+        not_checked.extend(not_checked_from_managed_entries(scan));
+    }
 
     let before = findings.len();
     let mut findings = merge_duplicates(findings);
