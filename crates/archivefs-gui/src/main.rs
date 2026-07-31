@@ -18,6 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use archivefs_core::diagnostics::DoctorCategory;
+use archivefs_core::diagnostics::repair::{
+    DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRequest,
+    DoctorRepairStatus, DoctorRepairVerification, execute_doctor_repair,
+};
 use archivefs_core::diagnostics::{
     CoverageStatus, DoctorScan, DoctorScanInputs, DoctorSeverity, Finding, Gathered,
     MountRootSafety, assess_mount_root_safety, run_doctor_scan,
@@ -120,14 +124,15 @@ use archivefs_core::{
     SourceFolderView, SourceHealthIssue, UnmountOneOutcome, add_library_view_default,
     add_source_folder_default, apply_library_view_default, assign_source_platform_default,
     build_source_folder_views, canonical_platform_names, catalogue_filename_duplicates,
-    check_database_health, classify_archive_health, cleanup_selected_mount_tree,
-    create_configured_mount_root_default, create_starter_config_default, default_config_path,
-    default_database_path, diagnose_database, edit_library_view_default, format_unix_timestamp_utc,
-    inspect_archive, is_inspectable, latest_schema_version,
-    lazy_unmount_one_archive_path_with_progress, list_source_folder_views_default,
-    load_library_view_configs_default, load_read_only_snapshot_default,
-    load_source_folder_configs_from, mount_one_archive_path,
-    persisted_archive_has_unknown_platform, preview_library_view_default, remount_one_archive_path,
+    check_archive_index_freshness, check_database_health, classify_archive_health,
+    cleanup_selected_mount_tree, create_configured_mount_root_default,
+    create_starter_config_default, default_config_path, default_database_path, default_index_path,
+    diagnose_database, edit_library_view_default, format_unix_timestamp_utc, inspect_archive,
+    is_inspectable, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    list_source_folder_views_default, load_library_view_configs_default,
+    load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
+    persisted_archive_has_unknown_platform, plan_stale_mount_directories,
+    preview_library_view_default, read_archive_index, remount_one_archive_path,
     remove_library_view_default, remove_source_folder_default, repair_library_view_default,
     run_setup_diagnostics_default, scan_all_enabled_sources_default, scan_and_persist,
     scan_source_folder_default, set_library_view_enabled_default,
@@ -273,6 +278,9 @@ enum ActivityAction {
     Remount,
     Cleanup,
     Diagnostics,
+    /// A Doctor repair attempt (Stage 1B). Recorded whatever the result, so
+    /// a refused or failed repair is as visible as a successful one.
+    DoctorRepair,
     Setup,
     LibraryDatabase,
     PlatformAssignment,
@@ -438,6 +446,7 @@ impl std::fmt::Display for ActivityAction {
             Self::Remount => "Remount",
             Self::Cleanup => "Cleanup",
             Self::Diagnostics => "Diagnostics",
+            Self::DoctorRepair => "Doctor repair",
             Self::Setup => "Setup",
             Self::LibraryDatabase => "Library database",
             Self::PlatformAssignment => "Platform assignment",
@@ -1567,9 +1576,24 @@ struct DoctorScanOutcome {
 /// nothing large has to be cloned into the worker.
 struct DoctorGathered {
     mount_root_safety: Gathered<MountRootSafety>,
+    stale_mount_directories: Gathered<Vec<PathBuf>>,
+    index_freshness: Gathered<(archivefs_core::ArchiveIndexFreshness, PathBuf)>,
     database: Gathered<DatabaseHealthReport>,
     source_health: Gathered<Vec<SourceHealthIssue>>,
     transactions: Gathered<SharedHistoryReport>,
+}
+
+/// The confirmation screen for one repair. Holding this is the *only* way a
+/// repair can be executed: `show_doctor_page` never calls the executor, and
+/// no repair runs from expanding a finding or from Run Doctor.
+struct DoctorRepairReview {
+    action: DoctorRepairAction,
+    finding_id: String,
+    /// The exact resource, when the finding names one. Used to resolve the
+    /// finding unambiguously - never as a repair target in its own right.
+    affected: Option<String>,
+    finding_title: String,
+    evidence: Vec<String>,
 }
 
 enum DoctorScanState {
@@ -1621,6 +1645,28 @@ fn gather_doctor_inputs() -> DoctorGathered {
         mount_root_safety: match &config {
             Ok(config) => Gathered::Ready(assess_mount_root_safety(&config.mount_root)),
             Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+        },
+        // Read-only: walks only ArchiveFS's own mount root, never an archive,
+        // and shares its removability predicate with the remover.
+        stale_mount_directories: match &config {
+            Ok(config) => match plan_stale_mount_directories(config) {
+                Ok(stale) => Gathered::Ready(stale),
+                Err(error) => {
+                    Gathered::Failed(format!("the mount root could not be inspected: {error}"))
+                }
+            },
+            Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+        },
+        index_freshness: match default_index_path() {
+            Ok(path) => match read_archive_index(&path) {
+                Ok(index) => Gathered::Ready((check_archive_index_freshness(&index), path)),
+                // No index yet is not a failure - there is simply nothing to
+                // report about its freshness.
+                Err(_) => Gathered::NotLoaded(
+                    "No archive index has been built yet, so its freshness was not checked.",
+                ),
+            },
+            Err(error) => Gathered::Failed(format!("index path could not be resolved: {error}")),
         },
         database: match default_database_path() {
             Ok(path) => Gathered::Ready(diagnose_database(&path)),
@@ -3142,6 +3188,14 @@ struct ArchiveFsApp {
     doctor_scan_generation: RefreshGeneration,
     /// The finding whose evidence panel is open, by stable finding id.
     doctor_selected_finding: Option<String>,
+    /// The repair awaiting confirmation, if any.
+    doctor_repair_review: Option<DoctorRepairReview>,
+    /// The most recent repair result, kept on screen next to the finding it
+    /// was for.
+    doctor_repair_result: Option<Box<DoctorRepairOutcome>>,
+    /// When the last repair finished, alongside (never replacing) the scan's
+    /// own timestamp.
+    doctor_repair_finished_at_unix_seconds: Option<i64>,
     setup_action: Option<RunningSetupAction>,
     refresh_error: Option<String>,
     snapshot_stale: bool,
@@ -3401,6 +3455,9 @@ impl ArchiveFsApp {
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,
+            doctor_repair_review: None,
+            doctor_repair_result: None,
+            doctor_repair_finished_at_unix_seconds: None,
             setup_action: None,
             refresh_error: None,
             snapshot_stale: false,
@@ -4043,6 +4100,12 @@ impl ArchiveFsApp {
                             transactions: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            stale_mount_directories: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            index_freshness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                         },
                     ))
                 }
@@ -4095,6 +4158,14 @@ impl ArchiveFsApp {
             mount_root_safety: borrowed(&gathered.mount_root_safety, |value| value),
             retroarch,
             transactions: borrowed(&gathered.transactions, |value| value),
+            stale_mount_directories: borrowed(&gathered.stale_mount_directories, |value| {
+                value.as_slice()
+            }),
+            index_freshness: match &gathered.index_freshness {
+                Gathered::Ready((freshness, path)) => Gathered::Ready((freshness, path.as_path())),
+                Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+                Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+            },
         };
         let scan = run_doctor_scan(&inputs);
         let finished_at_unix_seconds = SystemTime::now()
@@ -4111,6 +4182,163 @@ impl ArchiveFsApp {
             scan,
             finished_at_unix_seconds,
         }));
+    }
+
+    /// Opens the confirmation screen for a repair. Opening it changes
+    /// nothing; only `confirm_doctor_repair` can execute.
+    fn review_doctor_repair(&mut self, action: DoctorRepairAction, finding_id: String) {
+        let Some(outcome) = self.doctor_scan.displayed() else {
+            return;
+        };
+        // Ambiguous by id alone means the caller should have supplied the
+        // resource (which `show_doctor_page` always does), so refuse to guess.
+        let Ok(Some(finding)) = outcome.scan.finding_for(&finding_id, None) else {
+            return;
+        };
+        self.doctor_repair_review = Some(DoctorRepairReview {
+            action,
+            finding_id,
+            affected: finding.affected.as_ref().map(|path| path.display.clone()),
+            finding_title: finding.title.clone(),
+            evidence: finding.evidence.clone(),
+        });
+        self.doctor_repair_result = None;
+    }
+
+    /// Same as [`Self::review_doctor_repair`], for a finding identified by
+    /// both its id and its exact resource.
+    fn review_doctor_repair_for(
+        &mut self,
+        action: DoctorRepairAction,
+        finding_id: String,
+        affected: String,
+    ) {
+        let Some(outcome) = self.doctor_scan.displayed() else {
+            return;
+        };
+        let Ok(Some(finding)) = outcome
+            .scan
+            .finding_for(&finding_id, Some(affected.as_str()))
+        else {
+            return;
+        };
+        self.doctor_repair_review = Some(DoctorRepairReview {
+            action,
+            finding_id,
+            affected: Some(affected),
+            finding_title: finding.title.clone(),
+            evidence: finding.evidence.clone(),
+        });
+        self.doctor_repair_result = None;
+    }
+
+    fn cancel_doctor_repair(&mut self) {
+        // Cancelling is purely a state reset. Nothing was executed, so there
+        // is nothing to undo.
+        self.doctor_repair_review = None;
+    }
+
+    /// Executes the reviewed repair. The only path that mutates.
+    ///
+    /// Every safety gate lives in `execute_doctor_repair`, which re-resolves
+    /// the finding against live state; nothing here trusts the review's
+    /// captured path. Afterwards only the affected finding's own check is
+    /// re-run (inside the executor), never the whole scan, and exactly one
+    /// History entry is recorded whatever the result.
+    fn confirm_doctor_repair(&mut self) {
+        let Some(review) = self.doctor_repair_review.take() else {
+            return;
+        };
+        let config = match Config::load_default() {
+            Ok(config) => config,
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::DoctorRepair,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("Doctor repair could not start: {error}"),
+                ));
+                return;
+            }
+        };
+        let index_path = match default_index_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::DoctorRepair,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("Doctor repair could not start: {error}"),
+                ));
+                return;
+            }
+        };
+        let Some(displayed) = self.doctor_scan.displayed() else {
+            return;
+        };
+        let request = DoctorRepairRequest {
+            action: review.action,
+            finding_id: review.finding_id.clone(),
+            affected: review.affected.clone(),
+            confirmed: true,
+            dry_run: false,
+        };
+        let outcome = execute_doctor_repair(
+            &request,
+            &DoctorRepairContext {
+                config: &config,
+                scan: &displayed.scan,
+                index_path: &index_path,
+            },
+        );
+
+        // One History entry per attempt, success or not.
+        self.history.record(HistoryEntry::new(
+            ActivityAction::DoctorRepair,
+            outcome
+                .record
+                .affected
+                .as_ref()
+                .map(|path| PathBuf::from(&path.display)),
+            match outcome.record.status {
+                DoctorRepairStatus::Succeeded => match outcome.record.verification {
+                    DoctorRepairVerification::Verified => ActivityOutcome::Completed,
+                    _ => ActivityOutcome::Skipped,
+                },
+                DoctorRepairStatus::DryRun => ActivityOutcome::Offered,
+                DoctorRepairStatus::Rejected => ActivityOutcome::Rejected,
+                DoctorRepairStatus::Failed => ActivityOutcome::Failed,
+            },
+            doctor_repair_history_detail(&outcome),
+        ));
+        self.doctor_repair_finished_at_unix_seconds = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        // Update only the affected finding, never the whole scan: the repair
+        // verified (or did not verify) exactly one check, and unrelated
+        // findings must be preserved.
+        if outcome.record.status == DoctorRepairStatus::Succeeded
+            && outcome.record.verification == DoctorRepairVerification::Verified
+            && let DoctorScanState::Ready(displayed) = &mut self.doctor_scan
+        {
+            let finding_id = outcome.record.finding_id.clone();
+            let affected = outcome
+                .record
+                .affected
+                .as_ref()
+                .map(|path| path.display.clone());
+            displayed.scan.findings.retain(|finding| {
+                finding.id != finding_id
+                    || finding.affected.as_ref().map(|path| path.display.clone()) != affected
+            });
+        }
+        if self.doctor_selected_finding.as_deref() == Some(outcome.record.finding_id.as_str()) {
+            self.doctor_selected_finding = None;
+        }
+        self.doctor_repair_result = Some(Box::new(outcome));
     }
 
     fn poll_setup_action(&mut self, context: &egui::Context) {
@@ -10501,6 +10729,9 @@ impl ArchiveFsApp {
                         ui,
                         &self.doctor_scan,
                         &mut self.doctor_selected_finding,
+                        self.doctor_repair_review.as_ref(),
+                        self.doctor_repair_result.as_deref(),
+                        self.doctor_repair_finished_at_unix_seconds,
                         &mut self.clipboard,
                     );
                     match action {
@@ -10508,6 +10739,22 @@ impl ArchiveFsApp {
                         // reload the application or rescan the library.
                         Some(DoctorPageAction::RunScan) => {
                             self.start_doctor_scan(context.clone());
+                        }
+                        Some(DoctorPageAction::ReviewRepair {
+                            action,
+                            finding_id,
+                            affected,
+                        }) => match affected {
+                            Some(affected) => {
+                                self.review_doctor_repair_for(action, finding_id, affected);
+                            }
+                            None => self.review_doctor_repair(action, finding_id),
+                        },
+                        Some(DoctorPageAction::ConfirmRepair) => {
+                            self.confirm_doctor_repair();
+                        }
+                        Some(DoctorPageAction::CancelRepair) => {
+                            self.cancel_doctor_repair();
                         }
                         None => {}
                     }
@@ -11855,6 +12102,8 @@ fn show_setup_diagnostics(
             for check in &report.checks {
                 let (state_label, color) = match check.status {
                     SetupDiagnosticStatus::Ready => ("Ready", egui::Color32::from_rgb(70, 170, 90)),
+                    // Neither a pass nor a problem: the check did not run.
+                    SetupDiagnosticStatus::NotChecked => ("Not checked", theme::muted(ui)),
                     SetupDiagnosticStatus::Warning => {
                         ("Warning", egui::Color32::from_rgb(220, 170, 40))
                     }
@@ -12088,9 +12337,18 @@ fn show_activity_panel(
 /// The only thing the Doctor page can ask for in Stage 1A. There is no
 /// repair action here by design: findings are read-only, and no finding
 /// renders a clickable fix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DoctorPageAction {
     RunScan,
+    /// Open the confirmation screen. Never executes anything.
+    ReviewRepair {
+        action: DoctorRepairAction,
+        finding_id: String,
+        affected: Option<String>,
+    },
+    /// The only action that mutates, and only from the confirmation screen.
+    ConfirmRepair,
+    CancelRepair,
 }
 
 /// The read-only Doctor dashboard.
@@ -12103,9 +12361,17 @@ fn show_doctor_page(
     ui: &mut egui::Ui,
     state: &DoctorScanState,
     selected: &mut Option<String>,
+    review: Option<&DoctorRepairReview>,
+    repair_result: Option<&DoctorRepairOutcome>,
+    repair_finished_at_unix_seconds: Option<i64>,
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<DoctorPageAction> {
     let mut action = None;
+    // The confirmation screen replaces the finding list while it is open, so
+    // there is no way to trigger a second repair from behind it.
+    if let Some(review) = review {
+        return show_doctor_repair_review(ui, review);
+    }
     let running = state.is_running();
     let displayed = state.displayed();
 
@@ -12142,6 +12408,13 @@ fn show_doctor_page(
             )),
             None => ui.weak("Last run: never"),
         };
+        // The scan timestamp is retained; the repair timestamp is additional.
+        if let Some(repaired_at) = repair_finished_at_unix_seconds {
+            ui.weak(format!(
+                "Last repair: {}",
+                format_unix_timestamp_utc(repaired_at)
+            ));
+        }
         if running {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -12185,6 +12458,11 @@ fn show_doctor_page(
             "{} duplicate finding(s) reported by more than one check were merged.",
             scan.merged_duplicate_count
         ));
+    }
+
+    if let Some(outcome) = repair_result {
+        ui.add_space(theme::SECTION_GAP);
+        show_doctor_repair_result(ui, outcome);
     }
 
     if scan.is_healthy() {
@@ -12239,6 +12517,45 @@ fn show_doctor_page(
                                 Some(finding.id.clone())
                             };
                         }
+                        if let Some(repair) = finding.offered_repair() {
+                            ui.horizontal_wrapped(|ui| {
+                                widgets::status_badge(
+                                    ui,
+                                    "Repair available",
+                                    widgets::StatusTone::Active,
+                                );
+                                ui.label(repair.title);
+                                widgets::status_badge(
+                                    ui,
+                                    match repair.risk {
+                                        archivefs_core::diagnostics::repair::DoctorRepairRisk::Safe => {
+                                            "Safe · confirmation required"
+                                        }
+                                        archivefs_core::diagnostics::repair::DoctorRepairRisk::NeedsConfirmation => {
+                                            "Changes real state · confirmation required"
+                                        }
+                                    },
+                                    widgets::StatusTone::Warning,
+                                );
+                            });
+                            if widgets::action_button(
+                                ui,
+                                "Review repair",
+                                widgets::ActionStyle::Secondary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(DoctorPageAction::ReviewRepair {
+                                    action: repair.action,
+                                    finding_id: finding.id.clone(),
+                                    affected: finding
+                                        .affected
+                                        .as_ref()
+                                        .map(|path| path.display.clone()),
+                                });
+                            }
+                        }
                         if is_selected {
                             show_doctor_finding_details(ui, finding);
                         }
@@ -12251,6 +12568,129 @@ fn show_doctor_page(
     ui.add_space(theme::SECTION_GAP);
     show_doctor_coverage(ui, scan);
     action
+}
+
+/// The confirmation screen. The only route to executing a repair, and it
+/// states every fact the milestone requires before a person approves.
+fn show_doctor_repair_review(
+    ui: &mut egui::Ui,
+    review: &DoctorRepairReview,
+) -> Option<DoctorPageAction> {
+    let mut action = None;
+    let spec = review.action.spec();
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Review this repair")
+                .size(17.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(format!("Finding: {}", review.finding_title)).wrap());
+        match &review.affected {
+            Some(affected) => {
+                ui.add(egui::Label::new(format!("Affected resource: {affected}")).wrap());
+            }
+            None => {
+                ui.label("Affected resource: this ArchiveFS installation");
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Repair").strong());
+        ui.add(egui::Label::new(spec.title).wrap());
+        ui.weak(format!("Runs the existing {}", spec.invokes));
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Exactly what will change").strong());
+        ui.add(egui::Label::new(spec.expected_mutation).wrap());
+        if spec.performs_library_scan {
+            widgets::banner(
+                ui,
+                "This rescans your library",
+                "As part of its existing implementation, this repair scans every configured source folder. Nothing in your library is modified, but on a large library it can take a while.",
+                widgets::StatusTone::Warning,
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("What will not be touched").strong());
+        ui.add(egui::Label::new(spec.never_touches).wrap());
+
+        if !review.evidence.is_empty() {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Evidence for this repair").strong());
+            for item in &review.evidence {
+                ui.add(egui::Label::new(format!("• {item}")).wrap());
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Afterwards").strong());
+        ui.add(egui::Label::new(spec.verification).wrap());
+        ui.add(egui::Label::new(format!("Undo: {}", spec.undo.label())).wrap());
+
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                action = Some(DoctorPageAction::CancelRepair);
+            }
+            if widgets::action_button(ui, "Confirm repair", widgets::ActionStyle::Primary, true)
+                .clicked()
+            {
+                action = Some(DoctorPageAction::ConfirmRepair);
+            }
+        });
+    });
+    action
+}
+
+/// What one repair attempt did, including when it did not work.
+fn show_doctor_repair_result(ui: &mut egui::Ui, outcome: &DoctorRepairOutcome) {
+    let record = &outcome.record;
+    let (title, tone) = match record.status {
+        DoctorRepairStatus::Succeeded => match record.verification {
+            DoctorRepairVerification::Verified => ("Repair verified", widgets::StatusTone::Success),
+            DoctorRepairVerification::FindingRemains => (
+                "Repair completed but finding remains",
+                widgets::StatusTone::Warning,
+            ),
+            DoctorRepairVerification::CouldNotComplete => (
+                "Verification could not complete",
+                widgets::StatusTone::Warning,
+            ),
+            DoctorRepairVerification::NotAttempted => {
+                ("Repair completed", widgets::StatusTone::Info)
+            }
+        },
+        DoctorRepairStatus::Failed => (
+            "Repair failed and state was preserved",
+            widgets::StatusTone::Blocked,
+        ),
+        DoctorRepairStatus::Rejected => (
+            "Repair was refused and nothing was changed",
+            widgets::StatusTone::Blocked,
+        ),
+        DoctorRepairStatus::DryRun => ("Validated only", widgets::StatusTone::Info),
+    };
+    widgets::banner(ui, title, &record.summary, tone);
+    widgets::card(ui, |ui| {
+        ui.label(format!("Repair: {}", record.action_title));
+        if let Some(affected) = &record.affected {
+            ui.add(egui::Label::new(format!("Resource: {}", affected.display)).wrap());
+        }
+        if record.changed_paths.is_empty() {
+            ui.label("Nothing was changed on disk.");
+        } else {
+            ui.label(egui::RichText::new("Changed on disk").strong());
+            for path in &record.changed_paths {
+                ui.add(egui::Label::new(format!("• {}", path.display)).wrap());
+            }
+        }
+        ui.label(format!("Undo: {}", record.undo.label()));
+        if let Some(error) = &record.error {
+            ui.add(egui::Label::new(format!("Error: {error}")).wrap());
+        }
+        ui.weak("This attempt was recorded in History & Logs.");
+    });
 }
 
 /// The selected finding's evidence and provenance. Everything here is
@@ -12340,6 +12780,46 @@ fn doctor_severity_tone(severity: DoctorSeverity) -> widgets::StatusTone {
         DoctorSeverity::Info => widgets::StatusTone::Info,
         DoctorSeverity::Healthy => widgets::StatusTone::Success,
     }
+}
+
+/// The History detail line for one repair attempt.
+///
+/// Records everything the milestone requires that `HistoryEntry` itself has
+/// no column for - action id, finding id, confirmation, verification, changed
+/// paths, undo availability and any error - as one structured line, rather
+/// than adding a database migration to store it.
+fn doctor_repair_history_detail(outcome: &DoctorRepairOutcome) -> String {
+    let record = &outcome.record;
+    let mut parts = vec![
+        format!("action={}", record.action_id),
+        format!("finding={}", record.finding_id),
+        format!("confirmed={}", record.confirmed),
+        format!("dry_run={}", record.dry_run),
+        format!("result={:?}", record.status),
+        format!("verification={}", record.verification.label()),
+        format!("undo={}", record.undo.label()),
+    ];
+    if let Some(affected) = &record.affected {
+        parts.push(format!("resource={}", affected.display));
+    }
+    if !record.changed_paths.is_empty() {
+        parts.push(format!(
+            "changed=[{}]",
+            record
+                .changed_paths
+                .iter()
+                .map(|path| path.display.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(rejection) = &record.rejection {
+        parts.push(format!("refused={rejection:?}"));
+    }
+    if let Some(error) = &record.error {
+        parts.push(format!("error={error}"));
+    }
+    format!("{} | {}", record.summary, parts.join(" "))
 }
 
 /// The exact statement shown on the Doctor page, kept as one constant so the
@@ -37684,11 +38164,29 @@ $Instant Growth [Nayr]\n";
         state: &DoctorScanState,
         selected: &mut Option<String>,
     ) -> egui::FullOutput {
+        render_doctor_page_with(state, selected, None, None, None)
+    }
+
+    fn render_doctor_page_with(
+        state: &DoctorScanState,
+        selected: &mut Option<String>,
+        review: Option<&DoctorRepairReview>,
+        repair_result: Option<&DoctorRepairOutcome>,
+        repaired_at: Option<i64>,
+    ) -> egui::FullOutput {
         let mut clipboard = InMemoryClipboard::default();
         let ctx = egui::Context::default();
         ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_doctor_page(ui, state, selected, &mut clipboard);
+                let _ = show_doctor_page(
+                    ui,
+                    state,
+                    selected,
+                    review,
+                    repair_result,
+                    repaired_at,
+                    &mut clipboard,
+                );
             });
         })
     }
@@ -37979,6 +38477,8 @@ $Instant Growth [Nayr]\n";
                 RefreshGeneration::INITIAL,
                 DoctorGathered {
                     mount_root_safety: Gathered::NotLoaded("stale"),
+                    stale_mount_directories: Gathered::NotLoaded("stale"),
+                    index_freshness: Gathered::NotLoaded("stale"),
                     database: Gathered::NotLoaded("stale"),
                     source_health: Gathered::NotLoaded("stale"),
                     transactions: Gathered::NotLoaded("stale"),
@@ -38008,6 +38508,8 @@ $Instant Growth [Nayr]\n";
                     mount_root_safety: Gathered::Failed(
                         "the mount root could not be inspected".to_string(),
                     ),
+                    stale_mount_directories: Gathered::NotLoaded("not gathered"),
+                    index_freshness: Gathered::NotLoaded("not gathered"),
                     database: Gathered::NotLoaded("no database"),
                     source_health: Gathered::NotLoaded("no sources"),
                     transactions: Gathered::NotLoaded("no history"),
@@ -38035,6 +38537,321 @@ $Instant Growth [Nayr]\n";
         );
     }
 
+    // --- Doctor Stage 1B: repairs ---------------------------------------
+
+    /// A scan whose single finding offers `CleanMountPath`, built through the
+    /// real adapter so the GUI test exercises real data.
+    fn doctor_scan_with_repair() -> DoctorScan {
+        let stale = vec![PathBuf::from("/mount/SNES/Old Game")];
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.stale_mount_directories = Gathered::Ready(stale.as_slice());
+        run_doctor_scan(&inputs)
+    }
+
+    fn doctor_review() -> DoctorRepairReview {
+        DoctorRepairReview {
+            action: DoctorRepairAction::CleanMountPath,
+            finding_id: "mount_root.stale_mount_directory".to_string(),
+            affected: Some("/mount/SNES/Old Game".to_string()),
+            finding_title: "Leftover empty mount folder".to_string(),
+            evidence: vec!["/mount/SNES/Old Game".to_string()],
+        }
+    }
+
+    #[test]
+    fn a_finding_with_a_repair_shows_review_repair_but_never_runs_it() {
+        let state = doctor_outcome(doctor_scan_with_repair());
+        let output = render_doctor_page(&state, &mut None);
+
+        assert!(rendered_text_contains(&output, "Repair available"));
+        assert!(rendered_text_contains(
+            &output,
+            "Remove this leftover mount folder"
+        ));
+        assert!(rendered_text_contains(&output, "confirmation required"));
+        assert!(rendered_text_contains(&output, "Review repair"));
+        // No control that would execute directly.
+        for forbidden in ["Confirm repair", "Repair now", "Fix now", "Clean up now"] {
+            assert_eq!(
+                count_exact_text_occurrences(&output, forbidden),
+                0,
+                "the finding list must not offer `{forbidden}` without review"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finding_without_a_repair_shows_no_repair_control() {
+        let issues = vec![doctor_health_issue(
+            "/roms/a.zip",
+            HealthCategory::TerminalFailure,
+        )];
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page(&state, &mut None);
+        assert_eq!(count_exact_text_occurrences(&output, "Review repair"), 0);
+        assert_eq!(count_exact_text_occurrences(&output, "Repair available"), 0);
+    }
+
+    #[test]
+    fn the_review_screen_states_every_fact_before_confirming() {
+        let state = doctor_outcome(doctor_scan_with_repair());
+        let review = doctor_review();
+        let output = render_doctor_page_with(&state, &mut None, Some(&review), None, None);
+
+        for expected in [
+            "Review this repair",
+            "Finding: Leftover empty mount folder",
+            "Affected resource: /mount/SNES/Old Game",
+            "Remove this leftover mount folder",
+            "archivefs_core::cleanup_selected_mount_tree",
+            "Exactly what will change",
+            "stopping at the configured mount root",
+            "What will not be touched",
+            "Symlinks are never followed",
+            "Evidence for this repair",
+            "Afterwards",
+            "Undo:",
+            "Cancel",
+            "Confirm repair",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "the review screen must state: {expected}"
+            );
+        }
+    }
+
+    /// While the review screen is open the finding list is replaced, so a
+    /// second repair cannot be started from behind it.
+    #[test]
+    fn the_review_screen_replaces_the_finding_list() {
+        let state = doctor_outcome(doctor_scan_with_repair());
+        let review = doctor_review();
+        let output = render_doctor_page_with(&state, &mut None, Some(&review), None, None);
+        assert_eq!(count_exact_text_occurrences(&output, "Review repair"), 0);
+        assert_eq!(count_exact_text_occurrences(&output, "Run Doctor"), 0);
+    }
+
+    #[test]
+    fn a_repair_that_rescans_the_library_says_so_before_confirming() {
+        let state = doctor_outcome(doctor_scan_with_repair());
+        let review = DoctorRepairReview {
+            action: DoctorRepairAction::RebuildIndex,
+            finding_id: "library.index_out_of_date".to_string(),
+            affected: None,
+            finding_title: "The archive index is out of date".to_string(),
+            evidence: Vec::new(),
+        };
+        let output = render_doctor_page_with(&state, &mut None, Some(&review), None, None);
+        assert!(rendered_text_contains(&output, "This rescans your library"));
+        assert!(rendered_text_contains(
+            &output,
+            "scans every configured source folder"
+        ));
+        // And it does not pretend to be reversible.
+        assert!(rendered_text_contains(&output, "Undo unavailable."));
+    }
+
+    #[test]
+    fn cancelling_a_review_leaves_no_repair_pending_and_changes_nothing() {
+        let mut app = app_for_operation_tests();
+        app.doctor_scan = doctor_outcome(doctor_scan_with_repair());
+        app.doctor_repair_review = Some(doctor_review());
+        let history_before = app.history.entries().count();
+
+        app.cancel_doctor_repair();
+
+        assert!(app.doctor_repair_review.is_none());
+        assert!(app.doctor_repair_result.is_none());
+        assert_eq!(
+            app.history.entries().count(),
+            history_before,
+            "cancelling is not an attempt, so it is not recorded"
+        );
+        assert!(
+            app.doctor_repair_finished_at_unix_seconds.is_none(),
+            "nothing ran"
+        );
+    }
+
+    #[test]
+    fn opening_a_review_executes_nothing() {
+        let mut app = app_for_operation_tests();
+        app.doctor_scan = doctor_outcome(doctor_scan_with_repair());
+        let findings_before = match &app.doctor_scan {
+            DoctorScanState::Ready(outcome) => outcome.scan.findings.len(),
+            _ => panic!("ready"),
+        };
+        let history_before = app.history.entries().count();
+
+        app.review_doctor_repair_for(
+            DoctorRepairAction::CleanMountPath,
+            "mount_root.stale_mount_directory".to_string(),
+            "/mount/SNES/Old Game".to_string(),
+        );
+
+        assert!(app.doctor_repair_review.is_some(), "the review is open");
+        assert!(app.doctor_repair_result.is_none(), "nothing was executed");
+        assert_eq!(app.history.entries().count(), history_before);
+        assert_eq!(
+            match &app.doctor_scan {
+                DoctorScanState::Ready(outcome) => outcome.scan.findings.len(),
+                _ => panic!("ready"),
+            },
+            findings_before,
+            "the findings are unchanged"
+        );
+    }
+
+    /// A refused repair is still an attempt, so it is recorded, and the
+    /// result is shown honestly rather than as a success.
+    #[test]
+    fn a_refused_repair_is_recorded_in_history_and_shown_as_refused() {
+        let mut app = app_for_operation_tests();
+        // The finding names a path that does not exist, so revalidation
+        // refuses it. Nothing in the fixture can be mutated either way.
+        app.doctor_scan = doctor_outcome(doctor_scan_with_repair());
+        app.doctor_repair_review = Some(doctor_review());
+        let history_before = app.history.entries().count();
+
+        app.confirm_doctor_repair();
+
+        assert_eq!(
+            app.history.entries().count(),
+            history_before + 1,
+            "exactly one History entry per attempt"
+        );
+        let entry = app.history.entries().last().expect("entry");
+        assert_eq!(entry.action, ActivityAction::DoctorRepair);
+        assert!(
+            entry.message.contains("action=clean_mount_path"),
+            "{}",
+            entry.message
+        );
+        assert!(
+            entry
+                .message
+                .contains("finding=mount_root.stale_mount_directory"),
+            "{}",
+            entry.message
+        );
+        assert!(
+            entry.message.contains("confirmed=true"),
+            "{}",
+            entry.message
+        );
+        assert!(entry.message.contains("undo="), "{}", entry.message);
+
+        let outcome = app.doctor_repair_result.as_deref().expect("result");
+        assert_ne!(outcome.record.status, DoctorRepairStatus::Succeeded);
+        assert!(outcome.record.changed_paths.is_empty());
+        assert!(app.doctor_repair_review.is_none(), "the review closed");
+        assert!(app.doctor_repair_finished_at_unix_seconds.is_some());
+
+        // The result is rendered honestly, and the scan timestamp is kept.
+        let output = render_doctor_page_with(
+            &app.doctor_scan,
+            &mut None,
+            None,
+            app.doctor_repair_result.as_deref(),
+            app.doctor_repair_finished_at_unix_seconds,
+        );
+        assert!(rendered_text_contains(&output, "nothing was changed"));
+        assert!(rendered_text_contains(&output, "Last run: "));
+        assert!(rendered_text_contains(&output, "Last repair: "));
+        assert!(rendered_text_contains(
+            &output,
+            "recorded in History & Logs"
+        ));
+    }
+
+    #[test]
+    fn the_history_detail_records_every_required_field() {
+        let record = DoctorRepairOutcome {
+            action: DoctorRepairAction::CleanMountPath,
+            spec: DoctorRepairAction::CleanMountPath.spec(),
+            record: archivefs_core::diagnostics::repair::DoctorRepairRecord {
+                action_id: "clean_mount_path",
+                action_title: "Remove this leftover mount folder",
+                finding_id: "mount_root.stale_mount_directory".to_string(),
+                affected: Some(
+                    archivefs_core::emulator_environment::EncodedPath::from_path(Path::new(
+                        "/mount/SNES/Old Game",
+                    )),
+                ),
+                confirmed: true,
+                dry_run: false,
+                status: DoctorRepairStatus::Succeeded,
+                verification: DoctorRepairVerification::Verified,
+                changed_paths: vec![
+                    archivefs_core::emulator_environment::EncodedPath::from_path(Path::new(
+                        "/mount/SNES/Old Game",
+                    )),
+                ],
+                undo: archivefs_core::diagnostics::repair::DoctorRepairUndo::NothingToUndo,
+                summary: "done".to_string(),
+                rejection: None,
+                error: None,
+            },
+        };
+        let detail = doctor_repair_history_detail(&record);
+        for expected in [
+            "action=clean_mount_path",
+            "finding=mount_root.stale_mount_directory",
+            "confirmed=true",
+            "dry_run=false",
+            "result=Succeeded",
+            "verification=Repair verified",
+            "undo=",
+            "resource=/mount/SNES/Old Game",
+            "changed=[/mount/SNES/Old Game]",
+        ] {
+            assert!(detail.contains(expected), "missing {expected} in {detail}");
+        }
+    }
+
+    #[test]
+    fn a_verified_repair_removes_only_that_finding_and_keeps_the_rest() {
+        let mut app = app_for_operation_tests();
+        // Two unrelated findings plus the repairable one.
+        let issues = vec![
+            doctor_health_issue("/roms/a.zip", HealthCategory::Missing),
+            doctor_health_issue("/roms/b.zip", HealthCategory::UnknownPlatform),
+        ];
+        let stale = vec![PathBuf::from("/mount/SNES/Old Game")];
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.health_issues = Gathered::Ready(issues.as_slice());
+        inputs.stale_mount_directories = Gathered::Ready(stale.as_slice());
+        app.doctor_scan = doctor_outcome(run_doctor_scan(&inputs));
+        let before = match &app.doctor_scan {
+            DoctorScanState::Ready(outcome) => outcome.scan.findings.len(),
+            _ => panic!("ready"),
+        };
+        assert!(before >= 3);
+
+        app.doctor_repair_review = Some(doctor_review());
+        app.confirm_doctor_repair();
+
+        // The repair is refused here (the path does not exist), so nothing is
+        // removed - unrelated findings are preserved either way.
+        let after = match &app.doctor_scan {
+            DoctorScanState::Ready(outcome) => &outcome.scan.findings,
+            _ => panic!("ready"),
+        };
+        assert!(
+            after
+                .iter()
+                .any(|finding| finding.id == "library.archive_missing"),
+            "an unrelated finding must survive a repair"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|finding| finding.id == "library.unknown_platform"),
+            "an unrelated finding must survive a repair"
+        );
+    }
+
     fn app_for_operation_tests() -> ArchiveFsApp {
         ArchiveFsApp {
             state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
@@ -38045,6 +38862,9 @@ $Instant Growth [Nayr]\n";
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,
+            doctor_repair_review: None,
+            doctor_repair_result: None,
+            doctor_repair_finished_at_unix_seconds: None,
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,

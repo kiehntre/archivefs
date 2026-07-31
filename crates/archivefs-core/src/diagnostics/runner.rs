@@ -27,13 +27,16 @@
 
 use serde::Serialize;
 
+use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
 use super::{
     CoverageStatus, DEFERRED_CHECKS, DeferredCheck, DoctorCategory, DoctorSeverity,
-    DoctorSubsystem, Finding, MountRootSafety, SubsystemCoverage, findings_from_database_report,
-    findings_from_doctor_report, findings_from_health_issues, findings_from_mount_root_safety,
-    findings_from_retroarch_environment, findings_from_setup_diagnostics,
-    findings_from_source_health, findings_from_transaction_history,
+    DoctorSubsystem, Finding, MountRootSafety, NotCheckedCheck, SubsystemCoverage,
+    findings_from_database_report, findings_from_doctor_report, findings_from_health_issues,
+    findings_from_mount_root_safety, findings_from_retroarch_environment,
+    findings_from_setup_diagnostics, findings_from_source_health,
+    findings_from_transaction_history, not_checked_from_setup_diagnostics,
 };
+use crate::ArchiveIndexFreshness;
 use crate::database::DatabaseHealthReport;
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::patch_manager::SharedHistoryReport;
@@ -102,6 +105,12 @@ pub struct DoctorScanInputs<'a> {
     pub retroarch: Gathered<&'a RetroArchEnvironmentReport>,
     /// From `discover_shared_apply_history`.
     pub transactions: Gathered<&'a SharedHistoryReport>,
+    /// From `plan_stale_mount_directories` - the read-only list of empty,
+    /// unmounted folders left beneath the mount root.
+    pub stale_mount_directories: Gathered<&'a [std::path::PathBuf]>,
+    /// From `check_archive_index_freshness`, paired with the index path it
+    /// was computed for.
+    pub index_freshness: Gathered<(&'a ArchiveIndexFreshness, &'a std::path::Path)>,
 }
 
 impl<'a> DoctorScanInputs<'a> {
@@ -119,6 +128,10 @@ impl<'a> DoctorScanInputs<'a> {
                 "RetroArch profiles have not been discovered in this session.",
             ),
             transactions: Gathered::NotLoaded("Install history has not been loaded yet."),
+            stale_mount_directories: Gathered::NotLoaded(
+                "The mount root has not been inspected for leftover folders yet.",
+            ),
+            index_freshness: Gathered::NotLoaded("The archive index has not been checked yet."),
         }
     }
 }
@@ -137,6 +150,8 @@ pub struct DoctorScan {
     /// How many duplicate findings were merged away. Surfaced so the
     /// suppression is visible rather than mysterious.
     pub merged_duplicate_count: usize,
+    /// Individual checks that were available but did not run, and why.
+    pub not_checked: Vec<NotCheckedCheck>,
 }
 
 impl DoctorScan {
@@ -209,8 +224,39 @@ impl DoctorScan {
             .collect()
     }
 
+    /// The first finding with this id. Convenient, but note that several
+    /// findings can legitimately share an id about *different* resources
+    /// (one per leftover folder, one per missing archive), so a caller that
+    /// is about to act must use [`Self::finding_for`] instead.
     pub fn finding(&self, id: &str) -> Option<&Finding> {
         self.findings.iter().find(|finding| finding.id == id)
+    }
+
+    pub fn findings_with_id(&self, id: &str) -> Vec<&Finding> {
+        self.findings
+            .iter()
+            .filter(|finding| finding.id == id)
+            .collect()
+    }
+
+    /// Resolves exactly one finding by its full identity - the same
+    /// `(id, affected resource)` pair duplicate suppression keys on.
+    ///
+    /// `Err(count)` when the id alone is ambiguous and no resource was
+    /// given: acting on a guess would repair the wrong resource. `Ok(None)`
+    /// when nothing matches at all.
+    pub fn finding_for(&self, id: &str, affected: Option<&str>) -> Result<Option<&Finding>, usize> {
+        let candidates = self.findings_with_id(id);
+        match affected {
+            Some(affected) => Ok(candidates.into_iter().find(|finding| {
+                finding
+                    .affected
+                    .as_ref()
+                    .is_some_and(|path| path.display == affected)
+            })),
+            None if candidates.len() > 1 => Err(candidates.len()),
+            None => Ok(candidates.into_iter().next()),
+        }
     }
 }
 
@@ -293,6 +339,26 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorSubsystem::SharedTransactions,
         |report: &&SharedHistoryReport| findings_from_transaction_history(report)
     );
+    subsystem!(
+        inputs.stale_mount_directories,
+        DoctorCategory::MountRoot,
+        DoctorSubsystem::MountRootCleanup,
+        |stale: &&[std::path::PathBuf]| findings_from_stale_mount_directories(stale)
+    );
+    subsystem!(
+        inputs.index_freshness,
+        DoctorCategory::Library,
+        DoctorSubsystem::ArchiveIndex,
+        |input: &(&ArchiveIndexFreshness, &std::path::Path)| findings_from_index_freshness(
+            input.0, input.1
+        )
+    );
+
+    let not_checked = inputs
+        .setup
+        .as_ready()
+        .map(|setup| not_checked_from_setup_diagnostics(setup))
+        .unwrap_or_default();
 
     let before = findings.len();
     let mut findings = merge_duplicates(findings);
@@ -306,6 +372,7 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         coverage,
         deferred: DEFERRED_CHECKS,
         merged_duplicate_count,
+        not_checked,
     }
 }
 

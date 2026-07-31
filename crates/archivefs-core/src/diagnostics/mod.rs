@@ -66,6 +66,7 @@ use crate::{
     SourceHealthIssue,
 };
 
+pub mod repair;
 pub mod runner;
 
 #[cfg(test)]
@@ -221,6 +222,10 @@ pub enum DoctorSubsystem {
     RetroArchEnvironment,
     /// `patch_manager::shared_transaction::discover_shared_apply_history`
     SharedTransactions,
+    /// `crate::plan_stale_mount_directories`
+    MountRootCleanup,
+    /// `crate::check_archive_index_freshness`
+    ArchiveIndex,
     /// The Doctor runner itself.
     DoctorRunner,
 }
@@ -238,6 +243,8 @@ impl DoctorSubsystem {
             Self::DestinationSafety => "destination_safety",
             Self::RetroArchEnvironment => "retroarch_environment",
             Self::SharedTransactions => "shared_transactions",
+            Self::MountRootCleanup => "mount_root_cleanup",
+            Self::ArchiveIndex => "archive_index",
             Self::DoctorRunner => "doctor_runner",
         }
     }
@@ -252,6 +259,8 @@ impl DoctorSubsystem {
             Self::DestinationSafety => "destination safety",
             Self::RetroArchEnvironment => "RetroArch environment",
             Self::SharedTransactions => "install history",
+            Self::MountRootCleanup => "mount-root cleanup",
+            Self::ArchiveIndex => "archive index",
             Self::DoctorRunner => "Doctor runner",
         }
     }
@@ -336,8 +345,14 @@ pub struct Finding {
     /// containing non-UTF-8 bytes is still displayable and still flagged
     /// `lossy`, instead of being silently mangled.
     pub affected: Option<EncodedPath>,
-    /// Informational only - see [`KnownRecovery`].
+    /// Informational only - see [`KnownRecovery`]. Present when a repair
+    /// exists somewhere else in ArchiveFS but Doctor does not offer it.
     pub recovery: Option<KnownRecovery>,
+    /// The repair Doctor itself offers for this finding, if any. Fieldless,
+    /// so a finding can never smuggle a path or a command into a repair -
+    /// the target is re-derived from live state at execution time. See
+    /// [`repair::execute_doctor_repair`].
+    pub repair: Option<repair::DoctorRepairAction>,
 }
 
 impl Finding {
@@ -361,7 +376,14 @@ impl Finding {
             evidence: Vec::new(),
             affected: None,
             recovery: None,
+            repair: None,
         }
+    }
+
+    /// Attaches one of Doctor's own repairs to this finding.
+    fn offering(mut self, repair: repair::DoctorRepairAction) -> Self {
+        self.repair = Some(repair);
+        self
     }
 
     fn with_evidence(mut self, evidence: impl IntoIterator<Item = String>) -> Self {
@@ -394,10 +416,15 @@ impl Finding {
         self
     }
 
-    /// Whether a repair for this fault already exists somewhere in
-    /// ArchiveFS. Stage 1A only *states* this; it never offers it.
+    /// Whether a repair for this fault exists somewhere in ArchiveFS,
+    /// whether or not Doctor offers it here.
     pub fn repair_may_exist(&self) -> bool {
-        self.recovery.is_some()
+        self.recovery.is_some() || self.repair.is_some()
+    }
+
+    /// The repair Doctor offers for this finding, with its full description.
+    pub fn offered_repair(&self) -> Option<repair::DoctorRepairSpec> {
+        self.repair.map(repair::DoctorRepairAction::spec)
     }
 
     /// The identity used for duplicate suppression: the stable id plus the
@@ -455,6 +482,21 @@ impl SubsystemCoverage {
     pub fn was_checked(&self) -> bool {
         matches!(self.status, CoverageStatus::Checked)
     }
+}
+
+/// An individual check that was available but did not run in this scan, and
+/// why. Distinct from [`DeferredCheck`] (which ArchiveFS cannot do at all)
+/// and from [`CoverageStatus::Unavailable`] (which is whole-subsystem):
+/// this is a single check inside a subsystem that *was* consulted.
+///
+/// Populated today by mount-root writability under
+/// `run_setup_diagnostics_read_only`, which reports
+/// [`SetupDiagnosticStatus::NotChecked`] rather than writing a probe file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotCheckedCheck {
+    pub name: String,
+    pub reason: String,
+    pub next_step: String,
 }
 
 /// A check ArchiveFS does not perform yet. Shown in the product so a clean
@@ -626,7 +668,10 @@ fn setup_status_severity(status: SetupDiagnosticStatus) -> Option<DoctorSeverity
     match status {
         SetupDiagnosticStatus::Error => Some(DoctorSeverity::Error),
         SetupDiagnosticStatus::Warning => Some(DoctorSeverity::Warning),
-        SetupDiagnosticStatus::Ready => None,
+        // A pass is not a finding, and neither is a check that did not run:
+        // the latter is surfaced as a coverage gap instead (see
+        // `not_checked_from_setup_diagnostics`).
+        SetupDiagnosticStatus::Ready | SetupDiagnosticStatus::NotChecked => None,
     }
 }
 
@@ -634,10 +679,13 @@ fn setup_status_severity(status: SetupDiagnosticStatus) -> Option<DoctorSeverity
 /// literals `run_setup_diagnostics_with_checks` emits.
 fn setup_check_category(name: &str) -> DoctorCategory {
     let lower = name.to_ascii_lowercase();
-    if lower.starts_with("config") {
-        DoctorCategory::Configuration
-    } else if lower.contains("source folder") {
+    // "source folder" is tested before the `config` prefix on purpose:
+    // "Configured source folder exists" starts with "config" but is a source
+    // folder problem, not a configuration one.
+    if lower.contains("source folder") {
         DoctorCategory::Sources
+    } else if lower.starts_with("config") {
+        DoctorCategory::Configuration
     } else if lower.contains("mount root") {
         DoctorCategory::MountRoot
     } else if lower.contains("mount/unmount") || lower.contains("mount and unmount") {
@@ -679,6 +727,21 @@ fn finding_from_setup_diagnostic(check: &SetupDiagnostic) -> Option<Finding> {
         )
         .with_guidance(check.why_it_matters.clone(), check.next_step.clone()),
     )
+}
+
+/// The checks in an already-computed `SetupDiagnostics` that deliberately
+/// did not run. Never presented as passes.
+pub fn not_checked_from_setup_diagnostics(diagnostics: &SetupDiagnostics) -> Vec<NotCheckedCheck> {
+    diagnostics
+        .checks
+        .iter()
+        .filter(|check| check.status == SetupDiagnosticStatus::NotChecked)
+        .map(|check| NotCheckedCheck {
+            name: check.name.clone(),
+            reason: check.detail.clone(),
+            next_step: check.next_step.clone(),
+        })
+        .collect()
 }
 
 /// Adapts an already-computed `SetupDiagnostics`. This is the only existing

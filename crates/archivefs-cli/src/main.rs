@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::diagnostics::repair::{
+    DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRequest,
+    DoctorRepairStatus, execute_doctor_repair,
+};
 use archivefs_core::diagnostics::{
     CoverageStatus, DoctorScan, DoctorScanInputs, Gathered, assess_mount_root_safety,
     run_doctor_scan,
@@ -42,13 +46,15 @@ use archivefs_core::{
     apply_library_view_default, build_and_write_archive_index, canonical_platform_names,
     catalogue_health_report, check_archive_index_freshness, check_database_health,
     clean_mount_root, cleanup_selected_mount_dir, current_archive_info, current_archive_stats,
-    current_statuses, default_database_path, default_index_path, diagnose_database,
-    find_archive_index_entries, latest_schema_version, list_source_folder_views_default,
-    load_library_view_configs_default, load_source_folder_configs_default, mount_archives,
-    mount_one_archive, persisted_archive_has_unknown_platform, preview_library_view_default,
-    read_default_archive_index, remove_library_view_default, remove_source_folder_default,
-    repair_library_view_default, resolve_source_folder_identifier, run_config_check_default,
-    run_doctor_default, scan_all_enabled_sources_default, scan_and_persist,
+    current_statuses, default_config_path, default_database_path, default_index_path,
+    diagnose_database, find_archive_index_entries, latest_schema_version,
+    list_source_folder_views_default, load_library_view_configs_default,
+    load_source_folder_configs_default, mount_archives, mount_one_archive,
+    persisted_archive_has_unknown_platform, plan_stale_mount_directories,
+    preview_library_view_default, read_archive_index, read_default_archive_index,
+    remove_library_view_default, remove_source_folder_default, repair_library_view_default,
+    resolve_source_folder_identifier, run_config_check_default, run_doctor_default,
+    run_setup_diagnostics_read_only, scan_all_enabled_sources_default, scan_and_persist,
     scan_source_folder_default, set_source_folder_enabled_default, source_health_issues,
     summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
 };
@@ -239,7 +245,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // `--findings` selects the shared read-only Doctor model. The
             // default output is deliberately byte-identical to before, so
             // existing scripts keep working.
-            if input_args.iter().any(|arg| arg == "--findings") {
+            let mut input_args = input_args;
+            let repair_action = extract_named_string_flag(&mut input_args, "--repair")?;
+            if let Some(action_id) = repair_action {
+                let action = DoctorRepairAction::from_id(&action_id).ok_or_else(|| {
+                    format!(
+                        "unknown repair action {action_id:?}; expected one of: {}",
+                        DoctorRepairAction::ALL
+                            .iter()
+                            .map(|action| action.spec().id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+                let finding_id = extract_named_string_flag(&mut input_args, "--finding")?
+                    .ok_or("doctor --repair requires --finding <finding-id>")?;
+                let affected = extract_named_string_flag(&mut input_args, "--resource")?;
+                let confirm = extract_flag(&mut input_args, "--confirm");
+                let dry_run = extract_flag(&mut input_args, "--dry-run");
+                let json = extract_flag(&mut input_args, "--json") || json;
+                if !input_args.is_empty() {
+                    return Err(format!("doctor --repair does not accept {input_args:?}").into());
+                }
+                let outcome =
+                    run_doctor_repair(action, &finding_id, affected.as_deref(), confirm, dry_run)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    print!("{}", format_doctor_repair(&outcome));
+                }
+            } else if input_args.iter().any(|arg| arg == "--findings") {
                 let scan = gather_doctor_scan();
                 if json {
                     println!("{}", serde_json::to_string_pretty(&scan)?);
@@ -3648,6 +3683,29 @@ fn extract_cheat_destination_root_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_string_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(value))
+}
+
 fn extract_named_path_flag(
     args: &mut Vec<String>,
     flag: &str,
@@ -3998,17 +4056,20 @@ fn print_unmount_one(plan: &MountPlan) {
 /// rather than `run_doctor`, because the latter creates a missing mount root
 /// and would make a diagnostic command change the filesystem.
 fn gather_doctor_scan() -> DoctorScan {
-    // Two existing entry points are deliberately *not* used here:
+    // `run_doctor_read_only_default()` is deliberately not used: it still
+    // calls `ArchiveScanner::scan_archives()`, and a diagnostic run must not
+    // scan the library.
     //
-    // - `run_doctor_read_only_default()` still calls
-    //   `ArchiveScanner::scan_archives()`, and a diagnostic run must not
-    //   scan the library.
-    // - `run_setup_diagnostics_default()` probes mount-root writability by
-    //   creating and removing a file, which changes the mount root's
-    //   modification time. A strictly read-only scan must not do that.
-    //
-    // `archivefs config-check` and `archivefs doctor` still perform both, so
-    // no capability is lost - it simply is not folded into this scan.
+    // `run_setup_diagnostics_read_only` is the probe-free variant: it reports
+    // config presence, config parsing, source folders, mount-root presence
+    // and tool presence exactly as usual, and reports mount-root writability
+    // as "not probed" rather than creating and removing a file to find out.
+    let setup = match default_config_path() {
+        Ok(path) => Gathered::Ready(run_setup_diagnostics_read_only(path)),
+        Err(error) => {
+            Gathered::Failed(format!("configuration path could not be resolved: {error}"))
+        }
+    };
 
     let config = Config::load_default();
     let mount_root_safety = match &config {
@@ -4046,13 +4107,38 @@ fn gather_doctor_scan() -> DoctorScan {
         )),
     };
 
+    let config_for_plan = Config::load_default();
+    let stale = match &config_for_plan {
+        Ok(config) => match plan_stale_mount_directories(config) {
+            Ok(stale) => Gathered::Ready(stale),
+            Err(error) => {
+                Gathered::Failed(format!("the mount root could not be inspected: {error}"))
+            }
+        },
+        Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+    };
+    let index_path = default_index_path();
+    let freshness = match &index_path {
+        Ok(path) => match read_archive_index(path) {
+            Ok(index) => Gathered::Ready(check_archive_index_freshness(&index)),
+            // A missing or unreadable index is not a gather failure: there
+            // is simply nothing to report about its freshness yet.
+            Err(_) => Gathered::NotLoaded(
+                "No archive index has been built yet, or it could not be read. Run `archivefs index-build` to create one.",
+            ),
+        },
+        Err(error) => Gathered::Failed(format!("index path could not be resolved: {error}")),
+    };
+
     let inputs = DoctorScanInputs {
         doctor_report: Gathered::NotLoaded(
             "The archive-scan and mount-status checks need a library snapshot, which a diagnostic run never builds. Run `archivefs status` or open the GUI for those.",
         ),
-        setup: Gathered::NotLoaded(
-            "The configuration and tool checks probe mount-root writability by writing a temporary file, which a read-only scan must not do. Run `archivefs config-check` or `archivefs doctor` for those.",
-        ),
+        setup: match &setup {
+            Gathered::Ready(report) => Gathered::Ready(report),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
         health_issues: match &health {
             Gathered::Ready(issues) => Gathered::Ready(issues.as_slice()),
             Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
@@ -4083,8 +4169,100 @@ fn gather_doctor_scan() -> DoctorScan {
             Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
             Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
         },
+        stale_mount_directories: match &stale {
+            Gathered::Ready(stale) => Gathered::Ready(stale.as_slice()),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        index_freshness: match (&freshness, &index_path) {
+            (Gathered::Ready(freshness), Ok(path)) => Gathered::Ready((freshness, path.as_path())),
+            (Gathered::Failed(reason), _) => Gathered::Failed(reason.clone()),
+            (Gathered::NotLoaded(reason), _) => Gathered::NotLoaded(reason),
+            (Gathered::Ready(_), Err(_)) => {
+                Gathered::NotLoaded("the index path could not be resolved")
+            }
+        },
     };
     run_doctor_scan(&inputs)
+}
+
+/// Runs one Doctor repair.
+///
+/// The target is never taken from the command line: `--finding` (and
+/// `--resource`, when several findings share an id) names a finding in a
+/// freshly gathered scan, and every safety gate is re-applied against live
+/// state inside `execute_doctor_repair`. There is no flag that accepts a
+/// filesystem path to operate on.
+fn run_doctor_repair(
+    action: DoctorRepairAction,
+    finding_id: &str,
+    affected: Option<&str>,
+    confirmed: bool,
+    dry_run: bool,
+) -> Result<DoctorRepairOutcome, Box<dyn std::error::Error>> {
+    let config = Config::load_default()?;
+    let index_path = default_index_path()?;
+    // A fresh scan, so the finding is resolved against current state rather
+    // than against whatever a previous `--findings` run reported.
+    let scan = gather_doctor_scan();
+    let request = DoctorRepairRequest {
+        action,
+        finding_id: finding_id.to_string(),
+        affected: affected.map(str::to_string),
+        confirmed,
+        dry_run,
+    };
+    Ok(execute_doctor_repair(
+        &request,
+        &DoctorRepairContext {
+            config: &config,
+            scan: &scan,
+            index_path: &index_path,
+        },
+    ))
+}
+
+/// Renders a repair outcome for a terminal.
+///
+/// Exit-status policy matches `doctor --findings`: 0 whenever the command
+/// itself ran, including when the repair was refused or failed. The outcome's
+/// `status` field (and `--json`) is the machine-readable result.
+fn format_doctor_repair(outcome: &DoctorRepairOutcome) -> String {
+    let spec = &outcome.spec;
+    let record = &outcome.record;
+    let mut lines = vec![
+        format!("Repair: {} ({})", spec.title, spec.id),
+        format!("Calls: {}", spec.invokes),
+        format!("Finding: {}", record.finding_id),
+    ];
+    if let Some(affected) = &record.affected {
+        lines.push(format!("Resource: {}", affected.display));
+    }
+    lines.push(format!("Confirmed: {}", record.confirmed));
+    lines.push(format!("Dry run: {}", record.dry_run));
+    lines.push(format!(
+        "Result: {}",
+        match record.status {
+            DoctorRepairStatus::DryRun => "dry run - validated, nothing changed",
+            DoctorRepairStatus::Rejected => "refused",
+            DoctorRepairStatus::Succeeded => "completed",
+            DoctorRepairStatus::Failed => "failed",
+        }
+    ));
+    lines.push(format!("Verification: {}", record.verification.label()));
+    lines.push(format!("Undo: {}", record.undo.label()));
+    if !record.changed_paths.is_empty() {
+        lines.push("Changed:".to_string());
+        for path in &record.changed_paths {
+            lines.push(format!("  {}", path.display));
+        }
+    }
+    if let Some(error) = &record.error {
+        lines.push(format!("Error: {error}"));
+    }
+    lines.push(record.summary.clone());
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 /// Renders a scan for a terminal.
@@ -4146,7 +4324,26 @@ fn format_doctor_scan(scan: &DoctorScan) -> String {
             for item in &finding.evidence {
                 lines.push(format!("      Evidence: {item}"));
             }
-            if let Some(recovery) = &finding.recovery {
+            if let Some(repair) = finding.offered_repair() {
+                lines.push(format!(
+                    "      Repair available: {} (--repair {})",
+                    repair.title, repair.id
+                ));
+                lines.push(format!("      Repair calls: {}", repair.invokes));
+                lines.push(format!("      Will change: {}", repair.expected_mutation));
+                lines.push(format!("      Will not touch: {}", repair.never_touches));
+                if repair.performs_library_scan {
+                    lines.push(
+                        "      Note: this repair rescans every configured source folder."
+                            .to_string(),
+                    );
+                }
+                lines.push(format!("      Undo: {}", repair.undo.label()));
+                lines.push(
+                    "      Requires --confirm; add --dry-run to validate without changing anything."
+                        .to_string(),
+                );
+            } else if let Some(recovery) = &finding.recovery {
                 lines.push(format!("      {}", recovery.notice()));
             }
             lines.push(format!("      Reported by: {}", finding.subsystem.label()));
@@ -4184,6 +4381,14 @@ fn format_doctor_scan(scan: &DoctorScan) -> String {
                 entry.category.label(),
                 entry.subsystem.label()
             ));
+        }
+    }
+    if !scan.not_checked.is_empty() {
+        lines.push(String::new());
+        lines.push("Checks that did not run:".to_string());
+        for item in &scan.not_checked {
+            lines.push(format!("  {} - {}", item.name, item.reason));
+            lines.push(format!("      Next step: {}", item.next_step));
         }
     }
     lines.push(String::new());
@@ -4518,6 +4723,9 @@ fn print_help() {
     println!(
         "  doctor --findings  Read-only diagnostic scan across configuration, mount root, sources, library, catalogue database and install history, grouped by category with stable finding IDs (--json accepted). Changes nothing; exits 0 whenever the scan completes, whatever it finds."
     );
+    println!(
+        "  doctor --repair <action-id> --finding <finding-id>  Perform one existing repair on a finding from a fresh scan. Actions: clean_mount_root, clean_mount_path, retry_mount, rebuild_index. Add --resource <path> when several findings share an ID, --confirm to allow the change, --dry-run to validate without changing anything, --json for machine-readable output. No flag accepts an arbitrary path to operate on: the target is resolved from the finding and revalidated. Exits 0 whenever the command ran, including when the repair was refused."
+    );
     println!("  config-check   Validate ArchiveFS configuration");
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
@@ -4627,6 +4835,12 @@ fn print_help() {
     println!("  archivefs doctor");
     println!("  archivefs doctor --findings");
     println!("  archivefs doctor --findings --json");
+    println!(
+        "  archivefs doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --dry-run"
+    );
+    println!(
+        "  archivefs doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --confirm"
+    );
     println!("  archivefs config-check");
     println!("  archivefs pcsx2-patch-preview");
     println!("  archivefs pcsx2-patch-preview --json");

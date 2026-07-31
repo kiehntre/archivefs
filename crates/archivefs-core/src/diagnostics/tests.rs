@@ -1178,6 +1178,8 @@ fn no_finding_is_ever_emitted_with_healthy_severity() {
         mount_root_safety: Gathered::NotLoaded("not gathered in this test"),
         retroarch: Gathered::Ready(&retroarch),
         transactions: Gathered::Ready(&history),
+        stale_mount_directories: Gathered::NotLoaded("not gathered in this test"),
+        index_freshness: Gathered::NotLoaded("not gathered in this test"),
     };
     let scan = run_doctor_scan(&inputs);
 
@@ -1283,7 +1285,11 @@ fn stage_1a_introduces_no_database_migration() {
         EXPECTED.len() as i64,
         "the schema version changed, so a migration was added or removed"
     );
-    for source in [include_str!("mod.rs"), include_str!("runner.rs")] {
+    for source in [
+        include_str!("mod.rs"),
+        include_str!("runner.rs"),
+        include_str!("repair.rs"),
+    ] {
         assert!(!source.contains("migrations/"));
         assert!(!source.contains("apply_migrations"));
     }
@@ -1301,7 +1307,11 @@ fn stage_1a_introduces_no_database_migration() {
 /// prose the product shows, not a dependency.
 #[test]
 fn core_diagnostics_reference_no_gamehacking_or_wii_symbol() {
-    for source in [include_str!("mod.rs"), include_str!("runner.rs")] {
+    for source in [
+        include_str!("mod.rs"),
+        include_str!("runner.rs"),
+        include_str!("repair.rs"),
+    ] {
         // No import may mention them at all.
         for line in source
             .lines()
@@ -1451,6 +1461,15 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
         crate::list_source_folder_views_at(&config_path, &database_path).expect("views");
     let source_health = crate::source_health_issues(&source_views);
     let transactions = discover_shared_apply_history(&history_root);
+    // The two Stage 1B read-only gatherers: the leftover-mount-folder plan
+    // and index freshness. Both must be as non-mutating as the rest.
+    let config = crate::Config::load_from(&config_path).expect("config");
+    let stale = crate::plan_stale_mount_directories(&config).expect("plan");
+    let index = crate::ArchiveIndex {
+        archives: Vec::new(),
+    };
+    let freshness = crate::check_archive_index_freshness(&index);
+    let index_path = tree.root.join("data/index.json");
 
     let inputs = DoctorScanInputs {
         doctor_report: Gathered::NotLoaded("no snapshot in this test"),
@@ -1461,6 +1480,8 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
         mount_root_safety: Gathered::Ready(&mount_root_safety),
         retroarch: Gathered::NotLoaded("discovery is never started by Doctor"),
         transactions: Gathered::Ready(&transactions),
+        stale_mount_directories: Gathered::Ready(stale.as_slice()),
+        index_freshness: Gathered::Ready((&freshness, index_path.as_path())),
     };
     let scan = run_doctor_scan(&inputs);
 
@@ -1480,13 +1501,174 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
         "{:?}",
         scan.findings
     );
-    // Four subsystems were genuinely checked, and the rest are honestly
+    // Seven subsystems were genuinely checked, and the rest are honestly
     // recorded as unavailable rather than as passes.
-    assert_eq!(scan.checked_subsystems().len(), 5, "{:?}", scan.coverage);
+    assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
     assert_eq!(
         scan.unavailable_subsystems().len(),
         3,
         "{:?}",
         scan.coverage
     );
+}
+
+// --- Stage 1B: probe-free setup diagnostics -----------------------------
+
+/// The probe used by the normal path creates and removes a file inside the
+/// mount root. The read-only variant must not, and this is the test that
+/// caught it in Stage 1A.
+#[test]
+fn probe_free_setup_diagnostics_create_no_files_and_change_no_mtime() {
+    let tree = TempTree::new("probe-free");
+    let mount_root = tree.root.join("mnt");
+    let source = tree.root.join("roms");
+    fs::create_dir_all(&mount_root).expect("mount root");
+    fs::create_dir_all(&source).expect("source");
+    let config_path = tree.root.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "source_folders = [\"{}\"]\nmount_root = \"{}\"\n",
+            source.display(),
+            mount_root.display()
+        ),
+    )
+    .expect("config");
+
+    let before = snapshot_tree(&tree.root);
+    let read_only = crate::run_setup_diagnostics_read_only(&config_path);
+    let after = snapshot_tree(&tree.root);
+
+    assert_eq!(
+        before, after,
+        "the probe-free variant created a file or changed a modification time"
+    );
+
+    // The two variants differ exactly where they should: the probing one
+    // establishes writability by writing, the read-only one declines to.
+    let probed = crate::run_setup_diagnostics(&config_path);
+    assert!(
+        probed
+            .checks
+            .iter()
+            .any(|check| check.name == "Mount root is writable"
+                && check.status == SetupDiagnosticStatus::Ready),
+        "the probing variant establishes writability"
+    );
+    assert!(
+        read_only
+            .checks
+            .iter()
+            .any(|check| check.name == "Mount root is writable"
+                && check.status == SetupDiagnosticStatus::NotChecked),
+        "the read-only variant declines to"
+    );
+}
+
+#[test]
+fn probe_free_setup_diagnostics_report_writability_as_not_checked() {
+    let tree = TempTree::new("probe-free-status");
+    let mount_root = tree.root.join("mnt");
+    let source = tree.root.join("roms");
+    fs::create_dir_all(&mount_root).expect("mount root");
+    fs::create_dir_all(&source).expect("source");
+    let config_path = tree.root.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "source_folders = [\"{}\"]\nmount_root = \"{}\"\n",
+            source.display(),
+            mount_root.display()
+        ),
+    )
+    .expect("config");
+
+    let report = crate::run_setup_diagnostics_read_only(&config_path);
+    let writable = report
+        .checks
+        .iter()
+        .find(|check| check.name == "Mount root is writable")
+        .expect("the check is still present");
+    assert_eq!(writable.status, SetupDiagnosticStatus::NotChecked);
+    assert!(
+        writable.detail.starts_with("Not probed:"),
+        "{}",
+        writable.detail
+    );
+    assert!(!writable.next_step.is_empty());
+    // Readiness is never asserted on an unprobed mount root.
+    assert!(
+        !report.ready_for_actions,
+        "actions must not be reported ready without established writability"
+    );
+    // Everything else is still checked normally.
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "Config file exists"
+                && check.status == SetupDiagnosticStatus::Ready)
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "Configured source folder exists"
+                && check.status == SetupDiagnosticStatus::Ready)
+    );
+}
+
+/// The CLI's `doctor --findings` regains setup coverage: the checks produce
+/// findings as usual, and the unprobed one is surfaced as a coverage gap
+/// rather than as a pass or a problem.
+#[test]
+fn probe_free_setup_coverage_reaches_the_doctor_scan() {
+    let tree = TempTree::new("probe-free-scan");
+    let mount_root = tree.root.join("mnt");
+    fs::create_dir_all(&mount_root).expect("mount root");
+    let config_path = tree.root.join("config.toml");
+    // A source folder that does not exist, so there is a real finding too.
+    fs::write(
+        &config_path,
+        format!(
+            "source_folders = [\"{}\"]\nmount_root = \"{}\"\n",
+            tree.root.join("missing-roms").display(),
+            mount_root.display()
+        ),
+    )
+    .expect("config");
+
+    let setup = crate::run_setup_diagnostics_read_only(&config_path);
+    let scan = run_doctor_scan(&only!(setup = &setup));
+
+    // The subsystem counts as checked.
+    assert!(
+        scan.checked_subsystems()
+            .iter()
+            .any(|entry| entry.subsystem == DoctorSubsystem::SetupDiagnostics)
+    );
+    // The missing source folder is a real finding, carrying its guidance.
+    let finding = scan
+        .findings
+        .iter()
+        .find(|finding| finding.category == DoctorCategory::Sources)
+        .expect("the missing source folder is reported");
+    assert_eq!(finding.severity, DoctorSeverity::Error);
+    assert!(finding.why_it_matters.is_some());
+    assert!(finding.next_step.is_some());
+    // And the unprobed check is a coverage gap, not a finding.
+    assert!(
+        !scan
+            .findings
+            .iter()
+            .any(|finding| finding.title == "Mount root is writable"),
+        "an unrun check must not be reported as a problem"
+    );
+    let not_checked = scan
+        .not_checked
+        .iter()
+        .find(|item| item.name == "Mount root is writable")
+        .expect("the unrun check is surfaced");
+    assert!(not_checked.reason.starts_with("Not probed:"));
+    assert!(!not_checked.next_step.is_empty());
 }

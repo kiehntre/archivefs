@@ -3,7 +3,7 @@ use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -301,6 +301,11 @@ pub struct ConfigCheckReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupDiagnosticStatus {
     Ready,
+    /// The check did not run, so its answer is unknown. Never a pass and
+    /// never a problem - a gap. Used by
+    /// [`run_setup_diagnostics_read_only`] for mount-root writability,
+    /// which can only be established by writing.
+    NotChecked,
     Warning,
     Error,
 }
@@ -777,6 +782,22 @@ fn run_setup_diagnostics_default_with_path(config_path: Result<PathBuf>) -> Setu
     }
 }
 
+/// Setup diagnostics that never write.
+///
+/// Identical to [`run_setup_diagnostics`] except that mount-root
+/// writability is reported as [`SetupDiagnosticStatus::NotChecked`] instead
+/// of being probed. The probe used by the normal path
+/// ([`directory_is_writable`]) creates and removes a file inside the mount
+/// root, which changes that directory's modification time - unacceptable
+/// for a strictly read-only diagnostic.
+///
+/// `ready_for_actions` is therefore always `false` here: ArchiveFS cannot
+/// honestly assert that mount and unmount actions are usable without having
+/// established writability.
+pub fn run_setup_diagnostics_read_only(config_path: impl AsRef<Path>) -> SetupDiagnostics {
+    run_setup_diagnostics_with_command_check_and_probe(config_path, command_available, false)
+}
+
 pub fn run_setup_diagnostics(config_path: impl AsRef<Path>) -> SetupDiagnostics {
     run_setup_diagnostics_with_command_check(config_path, command_available)
 }
@@ -830,12 +851,21 @@ fn run_setup_diagnostics_with_command_check(
     config_path: impl AsRef<Path>,
     command_check: impl Fn(&str) -> bool,
 ) -> SetupDiagnostics {
+    run_setup_diagnostics_with_command_check_and_probe(config_path, command_check, true)
+}
+
+fn run_setup_diagnostics_with_command_check_and_probe(
+    config_path: impl AsRef<Path>,
+    command_check: impl Fn(&str) -> bool,
+    probe_writability: bool,
+) -> SetupDiagnostics {
     let config_path = config_path.as_ref().to_path_buf();
     run_setup_diagnostics_with_checks(
         config_path,
         |path| fs::read_to_string(path),
         inspect_path,
         command_check,
+        probe_writability,
     )
 }
 
@@ -844,6 +874,7 @@ fn run_setup_diagnostics_with_checks(
     read_config: impl Fn(&Path) -> io::Result<String>,
     inspect: impl Fn(&Path) -> PathInspection,
     command_check: impl Fn(&str) -> bool,
+    probe_writability: bool,
 ) -> SetupDiagnostics {
     let (config_missing, config_read_ok, config_read_detail, contents) =
         match read_config(&config_path) {
@@ -927,10 +958,18 @@ fn run_setup_diagnostics_with_checks(
     let mount_root_ready = mount_root_state
         .as_ref()
         .is_some_and(PathInspection::is_directory);
-    let mount_root_writable = mount_root_ready
-        && mount_root
-            .as_ref()
-            .is_some_and(|root| directory_is_writable(root));
+    // `None` when writability was deliberately not established. Never
+    // `Some(true)` unless a real probe ran and succeeded.
+    let mount_root_writable: Option<bool> = if probe_writability {
+        Some(
+            mount_root_ready
+                && mount_root
+                    .as_ref()
+                    .is_some_and(|root| directory_is_writable(root)),
+        )
+    } else {
+        None
+    };
     let ratarmount_name = fields
         .as_ref()
         .and_then(|fields| fields.ratarmount_bin.as_deref())
@@ -938,9 +977,11 @@ fn run_setup_diagnostics_with_checks(
     let ratarmount_ready = command_check(ratarmount_name);
     let unmount_ready = command_check("fusermount3") || command_check("umount");
     let ready_for_scanning = config_valid && sources_ready;
+    // An unprobed mount root can never make actions "ready": ArchiveFS has
+    // not established that it can create mount points there.
     let ready_for_actions = ready_for_scanning
         && mount_root_ready
-        && mount_root_writable
+        && mount_root_writable == Some(true)
         && ratarmount_ready
         && unmount_ready;
     let mut checks = Vec::new();
@@ -1024,18 +1065,41 @@ fn run_setup_diagnostics_with_checks(
         "Mount and unmount actions require a safe dedicated root.",
         "Use Create Mount Root when offered, or correct its parent path.",
     );
-    setup_check_with_warning(
-        &mut checks,
-        "Mount root is writable",
-        mount_root_writable,
-        can_create_mount_root,
-        mount_root.as_ref().map_or_else(
-            || "No mount root is available to test.".to_string(),
-            |root| format!("Writable directory required: {}", root.display()),
+    match mount_root_writable {
+        Some(writable) => setup_check_with_warning(
+            &mut checks,
+            "Mount root is writable",
+            writable,
+            can_create_mount_root,
+            mount_root.as_ref().map_or_else(
+                || "No mount root is available to test.".to_string(),
+                |root| format!("Writable directory required: {}", root.display()),
+            ),
+            "ArchiveFS must create mount-point directories below mount_root.",
+            "Grant the current user write access or choose another mount_root.",
         ),
-        "ArchiveFS must create mount-point directories below mount_root.",
-        "Grant the current user write access or choose another mount_root.",
-    );
+        // Deliberately not probed - see `run_setup_diagnostics_read_only`.
+        // Reported as unknown rather than as a pass or a failure.
+        None => checks.push(SetupDiagnostic {
+            name: "Mount root is writable".to_string(),
+            status: SetupDiagnosticStatus::NotChecked,
+            detail: mount_root.as_ref().map_or_else(
+                || "Not probed: no mount root is configured.".to_string(),
+                |root| {
+                    format!(
+                        "Not probed: establishing write access means creating and removing a file in {}, which a read-only check never does.",
+                        root.display()
+                    )
+                },
+            ),
+            why_it_matters:
+                "ArchiveFS must create mount-point directories below mount_root before it can mount anything."
+                    .to_string(),
+            next_step:
+                "Run `archivefs config-check`, or use Settings -> Validate configuration, to test write access."
+                    .to_string(),
+        }),
+    }
     setup_check(
         &mut checks,
         "ratarmount is available",
@@ -5228,22 +5292,60 @@ pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
     })
 }
 
+/// Publishes the index atomically: the JSON is written to a temporary file
+/// beside the destination, fsynced, and only then renamed into place.
+///
+/// This matters because the index is a derived cache that readers parse
+/// wholesale. A direct `fs::write` truncates first, so an interrupted write
+/// would leave a half-written index that parses as an empty or partial
+/// library. With a rename, a reader ever only sees the complete previous
+/// index or the complete new one, and a failed write leaves the previous
+/// index exactly as it was.
 pub fn write_archive_index(index: &ArchiveIndex, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
     }
-    fs::write(path, archive_index_to_json(index))
-        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))
+    let temporary = path.with_extension(format!("partial-{}", std::process::id()));
+    let json = archive_index_to_json(index);
+    let write = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if let Err(source) = write {
+        let _ = fs::remove_file(&temporary);
+        return Err(ArchiveFsError::io(path.to_path_buf(), source));
+    }
+    Ok(())
 }
 
 pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
-    let index_path = default_index_path()?;
+    build_and_write_archive_index_to(config, &default_index_path()?)
+}
+
+/// Same as [`build_and_write_archive_index`], with the destination supplied
+/// rather than derived from `$HOME`. Exists so callers - including tests -
+/// can rebuild a specific index without depending on the invoking user's
+/// home directory.
+///
+/// The index is built completely *before* anything is written, so a scan
+/// failure leaves the existing index untouched, and publication itself is
+/// atomic (see [`write_archive_index`]).
+pub fn build_and_write_archive_index_to(
+    config: &Config,
+    index_path: &Path,
+) -> Result<ArchiveIndex> {
     info!("starting index rebuild");
     debug!("index path {}", index_path.display());
     let index = build_archive_index(config)?;
-    write_archive_index(&index, &index_path)?;
+    write_archive_index(&index, index_path)?;
     info!(
         "index rebuild complete: {} archive(s) written to {}",
         index.archives.len(),
@@ -6748,10 +6850,21 @@ pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result
     Ok(removed)
 }
 
-fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<bool> {
+/// The exact conditions that must hold before an empty mount directory may
+/// be removed: it exists, it is not a symlink, it is a directory, it is not
+/// an active mount point, and it is empty.
+///
+/// Extracted so a read-only *plan* ([`plan_stale_mount_directories`]) and
+/// the actual removal ([`remove_empty_unmounted_dir`]) can never disagree
+/// about what is removable. Returns the observed metadata on success so the
+/// remover can re-stat and compare identity before acting.
+fn empty_unmounted_dir_is_removable(
+    path: &Path,
+    mounted_paths: &HashSet<PathBuf>,
+) -> Result<Option<fs::Metadata>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(ArchiveFsError::io(path.to_path_buf(), source)),
     };
     if metadata.file_type().is_symlink()
@@ -6759,8 +6872,78 @@ fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> 
         || mounted_paths.contains(path)
         || !directory_is_empty(path)?
     {
-        return Ok(false);
+        return Ok(None);
     }
+    Ok(Some(metadata))
+}
+
+/// Lists the empty, unmounted directories beneath the configured mount root
+/// that [`cleanup_selected_mount_tree`] would remove - **without removing
+/// anything**.
+///
+/// Read-only by construction: it walks only ArchiveFS's own mount root (not
+/// the library, and never an archive), applies exactly the same predicate the
+/// remover applies via [`empty_unmounted_dir_is_removable`], refuses to
+/// follow symlinks, and never descends into an active mount point. The walk
+/// is bounded by `MAX_MOUNT_ROOT_PLAN_DEPTH` and
+/// `MAX_MOUNT_ROOT_PLAN_ENTRIES` so a pathological tree cannot make a
+/// diagnostic hang.
+///
+/// Deterministically sorted, deepest path first, matching the order
+/// `clean_mount_root` removes in.
+pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
+    const MAX_MOUNT_ROOT_PLAN_DEPTH: usize = 6;
+    const MAX_MOUNT_ROOT_PLAN_ENTRIES: usize = 4096;
+
+    if !config.mount_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    ensure_no_symlink_components(&config.mount_root)?;
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+    let mut stale = Vec::new();
+    let mut inspected = 0usize;
+    let mut queue = vec![(config.mount_root.clone(), 0usize)];
+    while let Some((directory, depth)) = queue.pop() {
+        if depth >= MAX_MOUNT_ROOT_PLAN_DEPTH || inspected >= MAX_MOUNT_ROOT_PLAN_ENTRIES {
+            continue;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(ArchiveFsError::io(directory.clone(), source)),
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            inspected += 1;
+            if inspected > MAX_MOUNT_ROOT_PLAN_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Never follow a symlink and never enter an active mount.
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || mounted_paths.contains(&path)
+            {
+                continue;
+            }
+            if empty_unmounted_dir_is_removable(&path, &mounted_paths)?.is_some() {
+                stale.push(path);
+            } else {
+                queue.push((path, depth + 1));
+            }
+        }
+    }
+    stale.sort_by(|left, right| right.cmp(left));
+    stale.dedup();
+    Ok(stale)
+}
+
+fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<bool> {
+    let Some(metadata) = empty_unmounted_dir_is_removable(path, mounted_paths)? else {
+        return Ok(false);
+    };
     let revalidated = fs::symlink_metadata(path)
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     if revalidated.file_type().is_symlink()
@@ -11963,6 +12146,7 @@ mod tests {
             |_| Err(io::Error::from(io::ErrorKind::NotFound)),
             |_| PathInspection::Missing,
             |_| false,
+            true,
         );
         assert!(missing.config_missing);
 
@@ -11971,6 +12155,7 @@ mod tests {
             |_| Err(io::Error::from(io::ErrorKind::NotFound)),
             |_| PathInspection::PermissionDenied("permission denied".to_string()),
             |_| false,
+            true,
         );
         assert!(!ambiguous.config_missing);
         assert!(ambiguous.checks.iter().any(|check| {
@@ -12085,6 +12270,7 @@ mod tests {
                 }
             },
             |_| true,
+            true,
         );
         assert!(missing_mount.can_create_mount_root);
 
@@ -12099,6 +12285,7 @@ mod tests {
                 }
             },
             |_| true,
+            true,
         );
         assert!(!ambiguous_mount.can_create_mount_root);
         assert!(ambiguous_mount.checks.iter().any(|check| {
@@ -12132,6 +12319,7 @@ mod tests {
             },
             |_| PathInspection::Directory,
             |_| true,
+            true,
         );
 
         assert_eq!(reads.get(), 1);
