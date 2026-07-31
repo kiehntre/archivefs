@@ -5,7 +5,7 @@
 //! PS2 table pages. Runtime matching is local, and only one selected game's
 //! PNACH is requested after an automatic match or user confirmation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -18,11 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::gamehacking_catalogue::ordered_contiguous_page_numbers;
+use super::gamehacking_catalogue::{
+    GameHackingCatalogueCrawler, GameHackingCatalogueHooks, GameHackingCatalogueMetadata,
+    GameHackingCataloguePageMetadata, GameHackingCatalogueSpec,
+};
 use super::gamehacking_shared::{
     BASE_URL, EXPORT_URL, GameHackingClient, GameHackingRequestOptions, GameHackingRequestSpec,
-    ProviderResponse, UreqGameHackingTransport, atomic_write, bounded_read, cache_retrieved_at,
-    check_cancelled, decode_provider_text, prepare_cache, provider_error, sha256_hex,
-    unix_seconds_now,
+    ProviderResponse, UreqGameHackingTransport, bounded_read, decode_provider_text, provider_error,
 };
 pub use super::gamehacking_shared::{
     GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameHackingError, GameHackingErrorKind,
@@ -33,7 +37,7 @@ use super::gamehacking_shared::{
     GameHackingHttpClassification, cancellable_delay, charset_from_content_type,
     classify_gamehacking_http_response, classify_gamehacking_transport_error,
     clear_cloudflare_marker, cloudflare_cooldown_remaining, mark_cloudflare_blocked,
-    retrieved_cache_path, robots_disallows_archivefs, validate_provider_url,
+    retrieved_cache_path, robots_disallows_archivefs, unix_seconds_now, validate_provider_url,
 };
 
 use super::pcsx2::normalize_crc;
@@ -289,6 +293,67 @@ pub struct GameHackingProvider<A = Ps2GameHackingAdapter> {
     client: GameHackingClient,
 }
 
+struct Ps2CatalogueHooks;
+
+impl GameHackingCatalogueHooks for Ps2CatalogueHooks {
+    type Record = GameHackingIndexRecord;
+    type Page = GameHackingIndexPage;
+    type Catalogue = GameHackingPs2Catalogue;
+
+    fn discover_page_numbers(
+        &self,
+        bytes: &[u8],
+        charset: Option<&str>,
+    ) -> Result<Vec<u32>, GameHackingError> {
+        Ok(discover_ps2_index_page_numbers(bytes, charset))
+    }
+
+    fn parse_page(
+        &self,
+        source_url: &str,
+        retrieved_at_unix_seconds: u64,
+        bytes: &[u8],
+        charset: Option<&str>,
+    ) -> Result<Vec<Self::Record>, GameHackingError> {
+        parse_ps2_index_page(source_url, retrieved_at_unix_seconds, bytes, charset)
+    }
+
+    fn record_id(&self, record: &Self::Record) -> u64 {
+        record.game_id
+    }
+
+    fn record_title<'a>(&self, record: &'a Self::Record) -> &'a str {
+        &record.title
+    }
+
+    fn make_page(&self, metadata: GameHackingCataloguePageMetadata) -> Self::Page {
+        GameHackingIndexPage {
+            page_number: metadata.page_number,
+            source_url: metadata.source_url,
+            retrieved_at_unix_seconds: metadata.retrieved_at_unix_seconds,
+            sha256: metadata.sha256,
+            game_count: metadata.game_count,
+        }
+    }
+
+    fn make_catalogue(
+        &self,
+        metadata: GameHackingCatalogueMetadata<'_>,
+        pages: Vec<Self::Page>,
+        games: Vec<Self::Record>,
+    ) -> Self::Catalogue {
+        GameHackingPs2Catalogue {
+            schema_version: metadata.schema_version,
+            provider: metadata.provider.to_string(),
+            system: metadata.system.to_string(),
+            source_url: metadata.source_url.to_string(),
+            retrieved_at_unix_seconds: metadata.retrieved_at_unix_seconds,
+            pages,
+            games,
+        }
+    }
+}
+
 impl Default for GameHackingProvider<Ps2GameHackingAdapter> {
     fn default() -> Self {
         Self {
@@ -364,142 +429,48 @@ impl<A: GameHackingSystemAdapter> GameHackingProvider<A> {
     where
         F: FnMut(GameHackingIndexProgress),
     {
-        self.check_robots(options, &["/system/ps2/all"])?;
-        prepare_cache(&options.cache_root)?;
-        let preferred_root = options.cache_root.join(PS2_INDEX_ROOT_CACHE_FILE);
-        let legacy_root = options.cache_root.join(LEGACY_PS2_INDEX_CACHE_FILE);
-        let root_cache_name = if preferred_root.is_file() {
-            PS2_INDEX_ROOT_CACHE_FILE
-        } else if legacy_root.is_file() {
-            LEGACY_PS2_INDEX_CACHE_FILE
-        } else {
-            PS2_INDEX_ROOT_CACHE_FILE
-        };
-        let root_path = options.cache_root.join(root_cache_name);
-        let root_was_cached = root_path.is_file();
-        let root_options = GameHackingFetchOptions {
-            cache_root: options.cache_root.clone(),
-            force_refresh: options.force_refresh,
-            delay: Duration::from_secs(2),
-            cancellation: options.cancellation.clone(),
-        };
-        let root = self.cached_request(
-            root_cache_name,
-            self.adapter.index_url(),
-            MAX_INDEX_BYTES,
-            &root_options,
-            |transport| transport.get(self.adapter.index_url(), MAX_INDEX_BYTES),
-        )?;
-        let cached_fallback = root.cached_fallback;
-        let resume_options = GameHackingFetchOptions {
-            force_refresh: false,
-            ..root_options
-        };
-        let page_numbers = parse_ps2_index_page_numbers(&root.bytes, root.charset.as_deref())?;
-        if page_numbers.len() > MAX_PS2_INDEX_PAGES {
-            return Err(error(
-                GameHackingErrorKind::InvalidResponse,
-                "GameHacking.org PS2 index exceeded the page limit",
-            ));
-        }
-        let mut pages = Vec::with_capacity(page_numbers.len());
-        let mut games_by_id = BTreeMap::<u64, GameHackingIndexRecord>::new();
-        let mut downloaded = 0usize;
-        let mut reused = 0usize;
-        for (position, page_number) in page_numbers.iter().copied().enumerate() {
-            check_cancelled(&resume_options)?;
-            let url = format!("{}/{}", self.adapter.index_url(), page_number);
-            let cache_name = format!("ps2-index-page-{page_number}.html");
-            let cache_path = options.cache_root.join(&cache_name);
-            let (response, was_cached, retrieval_path, page_source_url) = if page_number == 0 {
-                (
-                    root.clone(),
-                    root_was_cached,
-                    root_path.clone(),
-                    self.adapter.index_url().to_string(),
-                )
-            } else {
-                let was_cached = cache_path.is_file();
-                let response = self.cached_request(
-                    &cache_name,
-                    &url,
-                    MAX_INDEX_BYTES,
-                    &resume_options,
-                    |transport| transport.get(&url, MAX_INDEX_BYTES),
-                )?;
-                (response, was_cached, cache_path, url.clone())
-            };
-            if was_cached {
-                reused += 1;
-            } else {
-                downloaded += 1;
-            }
-            let retrieved_at = cache_retrieved_at(&retrieval_path)?;
-            let mut page_games = parse_ps2_index_page(
-                &page_source_url,
-                retrieved_at,
-                &response.bytes,
-                response.charset.as_deref(),
-            )?;
-            page_games.sort_by_key(|game| game.game_id);
-            for game in &page_games {
-                games_by_id
-                    .entry(game.game_id)
-                    .or_insert_with(|| game.clone());
-            }
-            pages.push(GameHackingIndexPage {
-                page_number,
-                source_url: page_source_url,
-                retrieved_at_unix_seconds: retrieved_at,
-                sha256: sha256_hex(&response.bytes),
-                game_count: page_games.len(),
-            });
-            progress(GameHackingIndexProgress {
-                pages_complete: position + 1,
-                pages_total: page_numbers.len(),
-                page_number: Some(page_number),
-                downloaded: !was_cached,
-                games_collected: games_by_id.len(),
-            });
-        }
-        let mut games = games_by_id.into_values().collect::<Vec<_>>();
-        games.sort_by(|left, right| {
-            left.game_id
-                .cmp(&right.game_id)
-                .then_with(|| left.title.cmp(&right.title))
-        });
-        pages.sort_by_key(|page| page.page_number);
-        let retrieved_at = pages
-            .iter()
-            .map(|page| page.retrieved_at_unix_seconds)
-            .max()
-            .unwrap_or_else(unix_seconds_now);
-        let catalogue = GameHackingPs2Catalogue {
+        let root_cache_files = [PS2_INDEX_ROOT_CACHE_FILE, LEGACY_PS2_INDEX_CACHE_FILE];
+        let spec = GameHackingCatalogueSpec {
             schema_version: PS2_CATALOGUE_SCHEMA_VERSION,
-            provider: GAMEHACKING_PROVIDER_ID.to_string(),
-            system: self.adapter.system_name().to_string(),
-            source_url: self.adapter.index_url().to_string(),
-            retrieved_at_unix_seconds: retrieved_at,
-            pages,
-            games,
+            provider: GAMEHACKING_PROVIDER_ID,
+            system: self.adapter.system_name(),
+            index_url: self.adapter.index_url(),
+            robots_path: "/system/ps2/all",
+            root_cache_files: &root_cache_files,
+            page_cache_prefix: "ps2-index-page-",
+            page_cache_suffix: ".html",
+            catalogue_cache_file: PS2_CATALOGUE_FILE,
+            maximum_index_bytes: MAX_INDEX_BYTES,
+            maximum_pages: MAX_PS2_INDEX_PAGES,
+            insert_root_page_zero: false,
+            no_pages_error: "GameHacking.org PS2 root index contained no numbered pages",
+            page_count_error: "GameHacking.org PS2 index page count is invalid",
+            incomplete_pagination_error: "GameHacking.org PS2 index pagination is incomplete",
+            page_limit_error: "GameHacking.org PS2 index exceeded the page limit",
         };
-        let catalogue_path = options.cache_root.join(PS2_CATALOGUE_FILE);
-        let mut bytes = serde_json::to_vec_pretty(&catalogue).map_err(|failure| {
-            error(
-                GameHackingErrorKind::CacheUnavailable,
-                format!("GameHacking.org catalogue could not be serialized: {failure}"),
-            )
-        })?;
-        bytes.push(b'\n');
-        atomic_write(&catalogue_path, &bytes)?;
+        let result = GameHackingCatalogueCrawler::new(&self.client).crawl(
+            &spec,
+            options,
+            &Ps2CatalogueHooks,
+            |transport, url, maximum_bytes| transport.get(url, maximum_bytes),
+            |event| {
+                progress(GameHackingIndexProgress {
+                    pages_complete: event.pages_complete,
+                    pages_total: event.pages_total,
+                    page_number: event.page_number,
+                    downloaded: event.downloaded,
+                    games_collected: event.games_collected,
+                });
+            },
+        )?;
         Ok(GameHackingIndexRefreshResult {
-            catalogue_path,
-            pages_total: catalogue.pages.len(),
-            pages_downloaded: downloaded,
-            pages_reused: reused,
-            games: catalogue.games.len(),
-            retrieved_at_unix_seconds: retrieved_at,
-            cached_fallback,
+            catalogue_path: result.catalogue_path,
+            pages_total: result.pages_total,
+            pages_downloaded: result.pages_downloaded,
+            pages_reused: result.pages_reused,
+            games: result.games,
+            retrieved_at_unix_seconds: result.retrieved_at_unix_seconds,
+            cached_fallback: result.cached_fallback,
         })
     }
 
@@ -803,14 +774,25 @@ fn normalize_identity_token(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn parse_ps2_index_page_numbers(
     bytes: &[u8],
     charset: Option<&str>,
 ) -> Result<Vec<u32>, GameHackingError> {
+    ordered_contiguous_page_numbers(
+        discover_ps2_index_page_numbers(bytes, charset),
+        false,
+        "GameHacking.org PS2 root index contained no numbered pages",
+        "GameHacking.org PS2 index page count is invalid",
+        "GameHacking.org PS2 index pagination is incomplete",
+    )
+}
+
+fn discover_ps2_index_page_numbers(bytes: &[u8], charset: Option<&str>) -> Vec<u32> {
     let text = decode_provider_text(bytes, charset);
     let document = Html::parse_document(&text);
     let selector = Selector::parse("a[href^='/system/ps2/all/']").expect("static selector");
-    let mut pages = BTreeSet::new();
+    let mut pages = Vec::new();
     for node in document.select(&selector) {
         if let Some(page) = node
             .value()
@@ -818,29 +800,10 @@ fn parse_ps2_index_page_numbers(
             .and_then(|href| href.trim_end_matches('/').rsplit('/').next())
             .and_then(|page| page.parse::<u32>().ok())
         {
-            pages.insert(page);
+            pages.push(page);
         }
     }
-    if pages.is_empty() {
-        return Err(error(
-            GameHackingErrorKind::InvalidResponse,
-            "GameHacking.org PS2 root index contained no numbered pages",
-        ));
-    }
-    let pages = pages.into_iter().collect::<Vec<_>>();
-    let expected_len = u32::try_from(pages.len()).map_err(|_| {
-        error(
-            GameHackingErrorKind::InvalidResponse,
-            "GameHacking.org PS2 index page count is invalid",
-        )
-    })?;
-    if pages.first() != Some(&0) || pages.iter().copied().ne(0..expected_len) {
-        return Err(error(
-            GameHackingErrorKind::InvalidResponse,
-            "GameHacking.org PS2 index pagination is incomplete",
-        ));
-    }
-    Ok(pages)
+    pages
 }
 
 pub fn parse_gamehacking_ps2_index_page(
@@ -1555,10 +1518,32 @@ mod tests {
             cancellation: None,
         };
         let provider = GameHackingProvider::default();
-        let first = provider.refresh_ps2_index(&options, |_| {}).unwrap();
+        let mut progress = Vec::new();
+        let first = provider
+            .refresh_ps2_index(&options, |event| progress.push(event))
+            .unwrap();
         assert_eq!(first.pages_downloaded, 0);
         assert_eq!(first.pages_reused, 2);
         assert_eq!(first.games, 2);
+        assert_eq!(
+            progress,
+            vec![
+                GameHackingIndexProgress {
+                    pages_complete: 1,
+                    pages_total: 2,
+                    page_number: Some(0),
+                    downloaded: false,
+                    games_collected: 1,
+                },
+                GameHackingIndexProgress {
+                    pages_complete: 2,
+                    pages_total: 2,
+                    page_number: Some(1),
+                    downloaded: false,
+                    games_collected: 2,
+                },
+            ]
+        );
         let first_json = fs::read(&first.catalogue_path).unwrap();
         let second = provider.refresh_ps2_index(&options, |_| {}).unwrap();
         assert_eq!(first_json, fs::read(&second.catalogue_path).unwrap());
