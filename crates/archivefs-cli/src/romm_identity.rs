@@ -22,6 +22,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
 use archivefs_core::identity_source::cache::{CacheRefusal, IdentityCache};
 use archivefs_core::identity_source::hashing::{LocalHashCache, LocalHashes, hash_file};
 use archivefs_core::identity_source::matching::{LocalFileFacts, PathClaims};
@@ -56,6 +57,7 @@ pub const COMMANDS: &[&str] = &[
     "record",
     "conflicts",
     "stale-summary",
+    "artwork",
     "verify-hash",
     "enable",
     "disable",
@@ -95,6 +97,7 @@ fn dispatch(
         json,
         output,
         source_roots: source_roots.unwrap_or_else(configured_source_roots),
+        identity_root: identity_root.clone(),
         settings: SettingsLocation::new(&identity_root, IdentityProvider::Romm),
         api: IdentitySourceApi::new(&identity_root, IdentityProvider::Romm),
     };
@@ -125,6 +128,7 @@ fn dispatch(
         "record" => record(&context, args),
         "conflicts" => conflicts(&context, args),
         "stale-summary" => stale_summary(&context, args),
+        "artwork" => artwork(&context, args),
         "verify-hash" => verify_hash(&context, args),
         "enable" => {
             reject_extra(&args, "enable")?;
@@ -190,6 +194,8 @@ struct Context<'a> {
     /// The configured source folders. Mapping destinations must be inside one,
     /// and so must any path `verify-hash` is asked to read.
     source_roots: Vec<PathBuf>,
+    /// Where ArchiveFS keeps its own identity data, including the artwork cache.
+    identity_root: PathBuf,
     settings: SettingsLocation,
     api: IdentitySourceApi,
 }
@@ -2510,6 +2516,13 @@ fn human_bytes(bytes: usize) -> String {
     }
 }
 
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -2842,6 +2855,214 @@ fn stale_summary(
             "Nothing was changed: no file was read, no hash computed, and RomM was not contacted."
                 .to_string(),
         );
+        lines
+    })
+}
+
+// --- artwork --------------------------------------------------------------
+
+/// Reports the thumbnail cache, and optionally warms or clears it.
+///
+/// The GUI will drive the same core; this exists so the cache can be inspected and
+/// exercised without a window, and so a bounded prefetch is available to anyone who
+/// wants covers ready before going offline.
+#[derive(Debug, Serialize)]
+struct ArtworkReport {
+    directory: PathBuf,
+    items: usize,
+    bytes: u64,
+    maximum_bytes: u64,
+    format_version: u32,
+    last_cleanup_unix_seconds: Option<i64>,
+    thumbnail_max_width: u32,
+    thumbnail_max_height: u32,
+    /// Records in the cache that have a RomM-hosted cover, so could be fetched.
+    fetchable_records: usize,
+    /// Records whose only cover is on a public host, which is never fetched.
+    public_only_records: usize,
+    records_without_artwork: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fetched: Option<ArtworkFetchReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared: Option<archivefs_core::identity_source::artwork::ArtworkClearOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtworkFetchReport {
+    requested: usize,
+    already_cached: usize,
+    fetched: usize,
+    refused: usize,
+    elapsed_milliseconds: u128,
+    /// Refusal codes and how many records each accounted for, bounded.
+    refusals: Vec<(String, usize)>,
+}
+
+fn artwork(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let fetch = take_number(&mut args, "--fetch")?;
+    let clear = take_flag(&mut args, "--clear");
+    let confirmed = take_flag(&mut args, "--confirm");
+    reject_extra(&args, "artwork")?;
+    if clear && !confirmed {
+        return Err("clearing the thumbnail cache needs --confirm; nothing was removed".into());
+    }
+
+    let settings = context.load_settings()?;
+    let cache = open_cache_for_reading(context)?;
+    let server_id = cache.server_id.clone();
+    let artwork_cache = ArtworkCache::new(&context.identity_root, IdentityProvider::Romm);
+
+    // What the catalogue could offer, counted from the cache alone.
+    let mut fetchable = 0;
+    let mut public_only = 0;
+    let mut none_at_all = 0;
+    for record in &cache.records {
+        let request = ArtworkRequest::from_record(record);
+        match (request.small_reference, request.public_reference) {
+            (Some(reference), _) if !reference.trim().is_empty() => fetchable += 1,
+            (_, Some(public)) if !public.trim().is_empty() => public_only += 1,
+            _ => none_at_all += 1,
+        }
+    }
+
+    let cleared = if clear {
+        Some(
+            artwork_cache
+                .clear(&server_id, true)
+                .map_err(|refusal| refusal.detail())?,
+        )
+    } else {
+        None
+    };
+
+    let fetched = match fetch {
+        Some(limit) if limit > 0 => {
+            let source = context.validated(&settings)?;
+            let transport = UreqTransport::new();
+            let cancel = AtomicBool::new(false);
+            let started = std::time::Instant::now();
+            let mut report = ArtworkFetchReport {
+                requested: 0,
+                already_cached: 0,
+                fetched: 0,
+                refused: 0,
+                elapsed_milliseconds: 0,
+                refusals: Vec::new(),
+            };
+            let mut refusals: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let now = now_unix_seconds();
+            for record in cache.records.iter().take(limit) {
+                report.requested += 1;
+                let request = ArtworkRequest::from_record(record);
+                if artwork_cache.lookup(&server_id, &request).is_some() {
+                    report.already_cached += 1;
+                    continue;
+                }
+                context.progress(&format!(
+                    "  fetching cover {} of {limit}...",
+                    report.requested
+                ));
+                match artwork_cache.fetch(&source, &transport, &request, now, Some(&cancel)) {
+                    Ok(_) => report.fetched += 1,
+                    Err(refusal) => {
+                        report.refused += 1;
+                        *refusals.entry(refusal.code().to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+            report.elapsed_milliseconds = started.elapsed().as_millis();
+            let mut codes: Vec<(String, usize)> = refusals.into_iter().collect();
+            codes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            report.refusals = codes;
+            Some(report)
+        }
+        _ => None,
+    };
+
+    let stats = artwork_cache.stats(&server_id);
+    let report = ArtworkReport {
+        directory: stats.directory,
+        items: stats.items,
+        bytes: stats.bytes,
+        maximum_bytes: stats.maximum_bytes,
+        format_version: stats.format_version,
+        last_cleanup_unix_seconds: stats.last_cleanup_unix_seconds,
+        thumbnail_max_width: archivefs_core::identity_source::artwork::THUMBNAIL_MAX_WIDTH,
+        thumbnail_max_height: archivefs_core::identity_source::artwork::THUMBNAIL_MAX_HEIGHT,
+        fetchable_records: fetchable,
+        public_only_records: public_only,
+        records_without_artwork: none_at_all,
+        fetched,
+        cleared,
+    };
+
+    context.emit(&report, || {
+        let mut lines = vec![
+            "RomM cover thumbnails".to_string(),
+            format!("  Location:        {}", report.directory.display()),
+            format!(
+                "  Cached:          {} thumbnail(s), {}",
+                report.items,
+                human_bytes(report.bytes as usize)
+            ),
+            format!(
+                "  Ceiling:         {} (least-recently-used eviction)",
+                human_bytes(report.maximum_bytes as usize)
+            ),
+            format!(
+                "  Thumbnail size:  fits within {}x{}, aspect preserved, never enlarged",
+                report.thumbnail_max_width, report.thumbnail_max_height
+            ),
+            format!("  Cache version:   {}", report.format_version),
+            format!(
+                "  Last cleanup:    {}",
+                report
+                    .last_cleanup_unix_seconds
+                    .map(|seconds| format!("unix {seconds}"))
+                    .unwrap_or_else(|| "never".to_string())
+            ),
+            String::new(),
+            "What the catalogue offers".to_string(),
+            format!(
+                "  {} record(s) have a cover on your RomM instance, which is the only place \
+                 ArchiveFS fetches from",
+                report.fetchable_records
+            ),
+            format!(
+                "  {} record(s) have only a public scraper cover (igdb, retroachievements and \
+                 similar), which is left as a placeholder",
+                report.public_only_records
+            ),
+            format!(
+                "  {} record(s) have no cover at all",
+                report.records_without_artwork
+            ),
+        ];
+        if let Some(cleared) = &report.cleared {
+            lines.push(String::new());
+            lines.push(format!(
+                "Cleared {} thumbnail(s), {}. The identity cache was not touched.",
+                cleared.removed_items,
+                human_bytes(cleared.removed_bytes as usize)
+            ));
+        }
+        if let Some(fetched) = &report.fetched {
+            lines.push(String::new());
+            lines.push(format!(
+                "Prefetched {} of {} record(s) in {} ms: {} newly cached, {} already cached, {} \
+                 refused",
+                fetched.fetched + fetched.already_cached,
+                fetched.requested,
+                fetched.elapsed_milliseconds,
+                fetched.fetched,
+                fetched.already_cached,
+                fetched.refused
+            ));
+            for (code, count) in &fetched.refusals {
+                lines.push(format!("    {count} x {code}"));
+            }
+        }
         lines
     })
 }

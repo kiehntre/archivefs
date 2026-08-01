@@ -103,6 +103,7 @@ version = "0.7.0-alpha"
 dependencies = [
  "encoding_rs",
  "http",
+ "image",
  "libc",
  "log",
  "md-5",

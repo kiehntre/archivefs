@@ -5463,6 +5463,9 @@ fn print_help() {
         "  identity source romm stale-summary [--examples <n>]  Explain the stale records in the published cache instead of just counting them: grouped by why no file could be matched (nothing there, a directory, a link whose target is gone, a whole folder missing), and by platform, RomM path prefix, local folder, extension and mapping used. Says how many RomM itself already reports as missing on its own filesystem, which is what distinguishes ordinary library drift from a mapping fault. Reads the cache and file metadata only: no network request, no file contents, no hashing, and nothing written. Group and example lists are bounded, with the remainder stated as a count."
     );
     println!(
+        "  identity source romm artwork [--fetch <n>] [--clear --confirm]  Report the bounded cover-thumbnail cache: location, item count, size, its 1 GiB ceiling, thumbnail box and cache version, plus how many records have a cover on your RomM instance versus only a public scraper URL. --fetch <n> warms the first n covers, one bounded request each; --clear --confirm empties it. Thumbnails are fetched only from your RomM instance - a cover hosted on igdb.com or retroachievements.org is left as a placeholder rather than fetched from the public internet. Never touches the identity cache, RomM, or a ROM."
+    );
+    println!(
         "  identity source romm remove --confirm  Delete only ArchiveFS's own RomM cache and provider configuration (--keep-config keeps the latter). Never deletes your token file, never touches RomM, never touches a ROM."
     );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");

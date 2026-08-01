@@ -47,6 +47,11 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Bounded decode, downscale and re-encode of RomM cover thumbnails. Exactly the
+# crate, version and feature set the GUI already resolves, so this adds no new
+# crate to the tree - and keeping it here rather than in the GUI is what lets the
+# thumbnail cache be tested without a window.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 # Same crate, fuller feature set: only test fixtures need to *write* zip
