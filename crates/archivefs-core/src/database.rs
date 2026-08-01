@@ -3670,7 +3670,7 @@ fn source_assignment_is_compatible(archive: &Archive, platform: &str) -> bool {
 /// built-in folder alias walk (`detect_platform_from_folder_alias`)
 /// exactly, but consulting the persisted `platform_aliases` table (via
 /// [`Database::lookup_custom_platform_alias`]) instead of the built-in
-/// `FOLDER_PLATFORM_ALIASES` table. The archive's own filename is
+/// built-in folder-alias table in the `platform` registry. The archive's own filename is
 /// excluded, same as the built-in walk.
 fn find_custom_platform_alias(
     database: &Database,
@@ -7822,7 +7822,7 @@ mod tests {
 
     #[test]
     fn custom_alias_outranks_the_built_in_folder_alias_for_the_same_folder_name() {
-        // "n64" is already a built-in FOLDER_PLATFORM_ALIASES key (-> N64).
+        // "n64" is already a built-in folder alias in the platform registry (-> N64).
         // A custom alias for the exact same folder name must win instead.
         let root = temp_dir("custom-alias-outranks-built-in");
         let source = root.join("source");

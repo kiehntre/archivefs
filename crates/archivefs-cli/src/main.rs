@@ -39,6 +39,10 @@ use archivefs_core::patch_manager::{
     load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
     preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
+use archivefs_core::platform::{
+    DetectionConfidence, DetectionRequest, DetectionSource, PlatformDetectionReport,
+    detect_platform_report,
+};
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
@@ -1218,6 +1222,68 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&saved)?);
             } else {
                 print_platform_alias_saved(&saved);
+            }
+        }
+        "platform-detect" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let audit = extract_flag(&mut input_args, "--audit");
+            let manual = extract_named_string_flag(&mut input_args, "--assume-manual")?;
+            let root_flag = extract_named_string_flag(&mut input_args, "--root")?;
+            if audit {
+                let root = root_flag
+                    .map(PathBuf::from)
+                    .ok_or("platform-detect --audit requires --root <directory>")?;
+                let limit = extract_named_string_flag(&mut input_args, "--limit")?
+                    .map(|value| value.parse::<usize>())
+                    .transpose()
+                    .map_err(|error| format!("--limit must be a number: {error}"))?;
+                if !input_args.is_empty() {
+                    return Err(format!("platform-detect does not accept {input_args:?}").into());
+                }
+                let report = audit_platform_detection(&root, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", format_platform_audit(&report));
+                }
+            } else {
+                let Some(target) = input_args.first().cloned() else {
+                    return Err(
+                        "platform-detect requires a path, e.g. archivefs-cli platform-detect /roms/scummvm/laurabow2/RESOURCE.GEN"
+                            .into(),
+                    );
+                };
+                input_args.remove(0);
+                if !input_args.is_empty() {
+                    return Err(format!("platform-detect does not accept {input_args:?}").into());
+                }
+                let target = PathBuf::from(target);
+                // The source root defaults to every configured source folder
+                // that actually contains the path, so folder-alias matching sees
+                // the same boundary a real scan would.
+                let root = match root_flag {
+                    Some(root) => PathBuf::from(root),
+                    None => Config::load_default()
+                        .ok()
+                        .and_then(|config| {
+                            config
+                                .source_folders
+                                .into_iter()
+                                .find(|folder| target.starts_with(folder))
+                        })
+                        .or_else(|| target.parent().map(Path::to_path_buf))
+                        .unwrap_or_default(),
+                };
+                let request = DetectionRequest::new(&target, &root)
+                    .with_manual_platform(manual.as_deref())
+                    .inspecting_content();
+                let report = detect_platform_report(&request);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", format_platform_detection(&target, &root, &report));
+                }
             }
         }
         "platform-alias-remove" => {
@@ -5273,6 +5339,12 @@ fn print_help() {
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether ArchiveFS is ready to run");
     println!(
+        "  platform-detect <path>  Explain how platform detection sees one path: canonical platform, confidence (confirmed/probable/ambiguous/unknown), what decided it, and the full evidence with any conflicting candidates. --json for the complete structured evidence, --root <dir> to set the source-folder boundary, --assume-manual <platform> to see how an explicit assignment would override detection. Read-only: bounded header reads and one directory listing, nothing written."
+    );
+    println!(
+        "  platform-detect --audit --root <dir>  Walk a library read-only and report how detection behaves across it: counts by confidence and platform, the extensions that stay unresolved, and every classification that differs from what this build concluded before. --limit <n> to sample, --json for the full report. Corrects nothing."
+    );
+    println!(
         "  doctor --findings  Read-only diagnostic scan across configuration, mount root, sources, library, catalogue database and install history, grouped by category with stable finding IDs (--json accepted). Changes nothing; exits 0 whenever the scan completes, whatever it finds."
     );
     println!(
@@ -8931,5 +9003,472 @@ mod tests {
         assert!(!json.contains(root.to_string_lossy().as_ref()));
         assert!(human.contains("Read-only bounded selection: yes"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// --- Platform detection reporting -----------------------------------------
+
+/// The human-readable form of one detection. Concise by design: the full
+/// structured evidence is what `--json` is for.
+fn format_platform_detection(path: &Path, root: &Path, report: &PlatformDetectionReport) -> String {
+    let mut lines = vec![
+        format!("Path: {}", path.display()),
+        format!("Source root: {}", root.display()),
+        String::new(),
+    ];
+    match report.platform {
+        Some(platform) => {
+            lines.push(format!(
+                "Platform: {} ({platform})",
+                report.display_name.unwrap_or(platform)
+            ));
+            lines.push(format!("Confidence: {}", report.confidence.label()));
+            lines.push(format!(
+                "Detected from: {}",
+                report
+                    .deciding_source
+                    .map(DetectionSource::label)
+                    .unwrap_or("no evidence")
+            ));
+            lines.push(format!(
+                "Assignment: {}",
+                if report.manually_assigned {
+                    "Manually assigned"
+                } else {
+                    "Automatically detected"
+                }
+            ));
+        }
+        None => {
+            lines.push("Platform unknown".to_string());
+            lines.push(format!("Confidence: {}", report.confidence.label()));
+        }
+    }
+    if let Some(reason) = &report.ambiguity_reason {
+        lines.push(format!("Reason: {reason}"));
+    }
+    if report.platform.is_none() && !report.candidates.is_empty() {
+        lines.push(format!(
+            "Possible candidates: {}",
+            report
+                .candidates
+                .iter()
+                .map(|candidate| candidate.display_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        lines.push("Action: assign platform manually".to_string());
+    }
+    if report.requires_confirmation {
+        lines.push("Confirmation: a person should confirm this before it is relied on".to_string());
+    }
+    if !report.evidence.is_empty() {
+        lines.push(String::new());
+        lines.push("Evidence (strongest first):".to_string());
+        for item in &report.evidence {
+            lines.push(format!(
+                "  [{}] {} - {}",
+                item.source.label(),
+                item.platform,
+                item.detail
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// One audit of a directory tree: how detection behaves across a real library,
+/// with nothing written and nothing corrected.
+#[derive(Debug, Default, Serialize)]
+struct PlatformAuditReport {
+    root: String,
+    files_considered: usize,
+    directories_considered: usize,
+    confirmed: usize,
+    probable: usize,
+    ambiguous: usize,
+    unknown: usize,
+    /// Detections per canonical platform, sorted by count then name.
+    platform_counts: Vec<(String, usize)>,
+    /// The extensions that most often produce an ambiguous or unknown result.
+    top_ambiguous_extensions: Vec<(String, usize)>,
+    /// Paths that previously carried a platform and now carry a different one.
+    /// This is where a historical misclassification shows up, so it is sampled
+    /// separately and never crowded out by the far more numerous cases where
+    /// nothing was classified before.
+    reclassified: Vec<PlatformAuditChange>,
+    reclassified_total: usize,
+    /// Paths that carried no platform before and carry one now.
+    newly_detected: Vec<PlatformAuditChange>,
+    newly_detected_total: usize,
+    /// Files the rule this build used before this milestone would have called
+    /// Mega Drive ROMs purely from a `.gen`/`.smd` extension, and which the
+    /// evidence-based detector now places elsewhere. These are the historical
+    /// misclassifications - the reported ScummVM `RESOURCE.GEN` case is one.
+    historical_misclassifications: Vec<PlatformAuditChange>,
+    historical_misclassifications_total: usize,
+    /// Requested platforms with no file in this sample at all.
+    requested_platforms_absent: Vec<String>,
+    elapsed_milliseconds: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct PlatformAuditChange {
+    path: String,
+    before: Option<String>,
+    after: Option<String>,
+    confidence: DetectionConfidence,
+    reason: String,
+}
+
+/// Walks `root` read-only and records what detection concludes.
+///
+/// Bounded throughout: `read_dir` and `symlink_metadata` only, signature reads
+/// are the same short positional reads detection always does, symlinked
+/// directories are never descended into, and nothing is written.
+fn audit_platform_detection(
+    root: &Path,
+    limit: Option<usize>,
+) -> Result<PlatformAuditReport, Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut report = PlatformAuditReport {
+        root: root.display().to_string(),
+        ..Default::default()
+    };
+    let mut platform_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ambiguous_extensions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen_platforms: std::collections::BTreeSet<String> = Default::default();
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in read_dir.filter_map(Result::ok) {
+            if limit.is_some_and(|limit| report.files_considered >= limit) {
+                break;
+            }
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                // Never follow a symlink during an audit.
+                continue;
+            }
+            if metadata.is_dir() {
+                report.directories_considered += 1;
+                stack.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            report.files_considered += 1;
+
+            // What this build concluded before the registry existed: the
+            // pre-milestone path was `Archive::from_path_in_root`, whose
+            // platform came from folder alias, filename heuristic, disc header,
+            // or the `.gen`/`.smd` extension rule.
+            let before = archivefs_core::Archive::from_path_in_root(&path, root)
+                .and_then(|archive| archive.identity.platform);
+
+            let request = DetectionRequest::new(&path, root).inspecting_content();
+            let detected = detect_platform_report(&request);
+            match detected.confidence {
+                DetectionConfidence::Confirmed => report.confirmed += 1,
+                DetectionConfidence::Probable => report.probable += 1,
+                DetectionConfidence::Ambiguous => report.ambiguous += 1,
+                DetectionConfidence::Unknown => report.unknown += 1,
+            }
+            if let Some(platform) = detected.platform {
+                *platform_counts.entry(platform.to_string()).or_default() += 1;
+                seen_platforms.insert(platform.to_string());
+            } else if let Some(extension) = archivefs_core::platform::extension_of(&path) {
+                *ambiguous_extensions.entry(extension).or_default() += 1;
+            }
+
+            // The rule this build applied before the registry existed, stated
+            // exactly: any file whose name ended in `.gen` or `.smd` became an
+            // `ArchiveKind::MegaDriveRom`, and that kind then overwrote the
+            // platform unconditionally. Reproduced here - and only here - so the
+            // audit can count what it used to get wrong.
+            let legacy_called_it_mega_drive = archivefs_core::platform::extension_of(&path)
+                .is_some_and(|extension| matches!(extension.as_str(), "gen" | "smd"));
+            if legacy_called_it_mega_drive && detected.platform != Some("MegaDrive") {
+                report.historical_misclassifications_total += 1;
+                if report.historical_misclassifications.len() < 20 {
+                    report
+                        .historical_misclassifications
+                        .push(PlatformAuditChange {
+                            path: path.display().to_string(),
+                            before: Some("MegaDrive".to_string()),
+                            after: detected.platform.map(str::to_string),
+                            confidence: detected.confidence,
+                            reason: detected
+                                .evidence
+                                .first()
+                                .map(|item| item.detail.clone())
+                                .unwrap_or_else(|| "no evidence".to_string()),
+                        });
+                }
+            }
+
+            let after = detected.platform.map(str::to_string);
+            if before != after {
+                let change = PlatformAuditChange {
+                    path: path.display().to_string(),
+                    before: before.clone(),
+                    after: after.clone(),
+                    confidence: detected.confidence,
+                    reason: detected
+                        .ambiguity_reason
+                        .clone()
+                        .or_else(|| detected.evidence.first().map(|item| item.detail.clone()))
+                        .unwrap_or_else(|| "no evidence".to_string()),
+                };
+                if before.is_some() {
+                    report.reclassified_total += 1;
+                    if report.reclassified.len() < 40 {
+                        report.reclassified.push(change);
+                    }
+                } else {
+                    report.newly_detected_total += 1;
+                    if report.newly_detected.len() < 10 {
+                        report.newly_detected.push(change);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut counts: Vec<(String, usize)> = platform_counts.into_iter().collect();
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    report.platform_counts = counts;
+
+    let mut extensions: Vec<(String, usize)> = ambiguous_extensions.into_iter().collect();
+    extensions.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    extensions.truncate(15);
+    report.top_ambiguous_extensions = extensions;
+
+    report.requested_platforms_absent = MILESTONE_PLATFORMS
+        .iter()
+        .filter(|id| !seen_platforms.contains(**id))
+        .map(|id| (*id).to_string())
+        .collect();
+    report.elapsed_milliseconds = started.elapsed().as_millis();
+    Ok(report)
+}
+
+/// The canonical identifiers this milestone asked for, so the audit can report
+/// which of them the sample library contains no evidence for.
+const MILESTONE_PLATFORMS: &[&str] = &[
+    "ZX Spectrum",
+    "BBC Micro",
+    "Acorn Electron",
+    "Amstrad CPC",
+    "Amiga",
+    "AmigaCD32",
+    "Commodore 64",
+    "Commodore 128",
+    "VIC-20",
+    "Atari 8-bit",
+    "AtariST",
+    "Atari Jaguar",
+    "Atari Lynx",
+    "MegaDrive",
+    "Sega CD",
+    "Sega 32X",
+    "MasterSystem",
+    "GameGear",
+    "Philips CD-i",
+    "NeoGeo",
+    "Neo Geo CD",
+    "MSX",
+    "MSX2",
+    "PC Engine",
+    "TurboGrafx-16",
+    "PC Engine CD",
+    "ColecoVision",
+    "Intellivision",
+    "Vectrex",
+    "DOS",
+    "ScummVM",
+    "Sharp X68000",
+    "FM Towns",
+    "PC-98",
+    "Apple II",
+    "Macintosh",
+    "Acorn Archimedes",
+    "3DO",
+    "Commodore CDTV",
+];
+
+fn format_platform_audit(report: &PlatformAuditReport) -> String {
+    let mut lines = vec![
+        "ArchiveFS platform-detection audit (read-only)".to_string(),
+        format!("Root: {}", report.root),
+        format!(
+            "Considered: {} files, {} directories in {} ms",
+            report.files_considered, report.directories_considered, report.elapsed_milliseconds
+        ),
+        String::new(),
+        format!(
+            "Confirmed: {}  Probable: {}  Ambiguous: {}  Unknown: {}",
+            report.confirmed, report.probable, report.ambiguous, report.unknown
+        ),
+        String::new(),
+        format!("Detections by platform ({}):", report.platform_counts.len()),
+    ];
+    for (platform, count) in &report.platform_counts {
+        lines.push(format!("  {count:>7}  {platform}"));
+    }
+    if !report.top_ambiguous_extensions.is_empty() {
+        lines.push(String::new());
+        lines.push("Top unresolved extension groups:".to_string());
+        for (extension, count) in &report.top_ambiguous_extensions {
+            lines.push(format!("  {count:>7}  .{extension}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Reclassified - a platform was previously asserted and now differs: {} (showing {})",
+        report.reclassified_total,
+        report.reclassified.len()
+    ));
+    if report.reclassified.is_empty() {
+        lines.push("  none: every platform this build previously asserted still holds".to_string());
+    }
+    for change in &report.reclassified {
+        lines.push(format!(
+            "  {} : {} -> {} [{}]",
+            change.path,
+            change.before.as_deref().unwrap_or("Unknown"),
+            change.after.as_deref().unwrap_or("Unknown"),
+            change.confidence.label()
+        ));
+        lines.push(format!("      {}", change.reason));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Newly detected - nothing was classified before: {} (showing {})",
+        report.newly_detected_total,
+        report.newly_detected.len()
+    ));
+    for change in &report.newly_detected {
+        lines.push(format!(
+            "  {} : -> {} [{}]",
+            change.path,
+            change.after.as_deref().unwrap_or("Unknown"),
+            change.confidence.label()
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Historical misclassifications - the old `.gen`/`.smd` extension rule would have called these Mega Drive ROMs: {} (showing {})",
+        report.historical_misclassifications_total,
+        report.historical_misclassifications.len()
+    ));
+    for change in &report.historical_misclassifications {
+        lines.push(format!(
+            "  {} : MegaDrive -> {} [{}]",
+            change.path,
+            change.after.as_deref().unwrap_or("Unknown"),
+            change.confidence.label()
+        ));
+        lines.push(format!("      {}", change.reason));
+    }
+    if !report.requested_platforms_absent.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Requested platforms with no detection in this sample ({}):",
+            report.requested_platforms_absent.len()
+        ));
+        lines.push(format!(
+            "  {}",
+            report.requested_platforms_absent.join(", ")
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Nothing was written, corrected, mounted or extracted.".to_string());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod platform_detect_tests {
+    use super::*;
+
+    /// The audit's scope list names canonical identifiers, so it must not be
+    /// allowed to drift away from the registry.
+    #[test]
+    fn every_milestone_platform_exists_in_the_registry() {
+        for id in MILESTONE_PLATFORMS {
+            assert!(
+                archivefs_core::platform::platform_by_id(id).is_some(),
+                "`{id}` is not a canonical platform identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn the_text_report_names_the_platform_its_confidence_and_its_evidence() {
+        let report = detect_platform_report(&DetectionRequest::new(
+            Path::new("/roms/zx-spectrum/game.tzx"),
+            Path::new("/roms"),
+        ));
+        let text = format_platform_detection(
+            Path::new("/roms/zx-spectrum/game.tzx"),
+            Path::new("/roms"),
+            &report,
+        );
+        assert!(text.contains("Platform: ZX Spectrum (ZX Spectrum)"));
+        assert!(text.contains("Confidence: Probable"));
+        assert!(text.contains("Detected from: folder name"));
+        assert!(text.contains("Assignment: Automatically detected"));
+        assert!(text.contains("Evidence (strongest first):"));
+    }
+
+    #[test]
+    fn an_unknown_platform_is_reported_with_candidates_and_an_action() {
+        let report = detect_platform_report(&DetectionRequest::new(
+            Path::new("/roms/unsorted/game.bin"),
+            Path::new("/roms"),
+        ));
+        let text = format_platform_detection(
+            Path::new("/roms/unsorted/game.bin"),
+            Path::new("/roms"),
+            &report,
+        );
+        assert!(text.contains("Platform unknown"));
+        assert!(text.contains("Possible candidates:"));
+        assert!(
+            text.contains("Action: assign platform manually"),
+            "a person must be told what to do about it"
+        );
+        assert!(
+            text.contains("Sega CD"),
+            "the real candidates must be named"
+        );
+    }
+
+    #[test]
+    fn a_manual_assignment_is_shown_as_manual_in_the_text_report() {
+        let report = detect_platform_report(
+            &DetectionRequest::new(Path::new("/roms/unsorted/game.bin"), Path::new("/roms"))
+                .with_manual_platform(Some("Amstrad CPC")),
+        );
+        let text = format_platform_detection(
+            Path::new("/roms/unsorted/game.bin"),
+            Path::new("/roms"),
+            &report,
+        );
+        assert!(text.contains("Platform: Amstrad CPC"));
+        assert!(text.contains("Confidence: Confirmed"));
+        assert!(text.contains("Assignment: Manually assigned"));
     }
 }
