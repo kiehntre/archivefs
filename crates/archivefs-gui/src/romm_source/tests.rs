@@ -199,6 +199,11 @@ fn a_not_configured_source_says_what_to_do() {
         value_of(&view, "Token file").as_deref(),
         Some("not configured")
     );
+    // Configuring is exactly what an unconfigured source needs, so it stays open.
+    assert!(
+        action_named(&view, "Configure").enabled,
+        "an unconfigured source must still be configurable"
+    );
     // Nothing that talks to RomM can be started.
     for prefix in ["Test connection", "Import sample", "Import full"] {
         let action = action_named(&view, prefix);
@@ -432,7 +437,7 @@ fn unfinished_actions_are_present_disabled_and_honestly_labelled() {
         None,
         false,
     );
-    for prefix in ["Configure", "Browse records", "View stale summary"] {
+    for prefix in ["Browse records", "View stale summary"] {
         let action = action_named(&view, prefix);
         assert!(action.coming_next, "{prefix} belongs to a later slice");
         assert!(!action.enabled, "{prefix} must not look functional");
@@ -443,6 +448,13 @@ fn unfinished_actions_are_present_disabled_and_honestly_labelled() {
             action.label
         );
     }
+    // Configure arrived in slice 2: enabled, and dispatching nothing itself because
+    // it opens a dialog rather than starting an operation.
+    let configure = action_named(&view, "Configure");
+    assert!(!configure.coming_next);
+    assert!(configure.enabled);
+    assert!(configure.operation.is_none());
+    assert!(!configure.label.contains("coming next"));
 }
 
 // --- Secrecy --------------------------------------------------------------

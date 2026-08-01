@@ -50,6 +50,12 @@ pub(crate) enum RommOperation {
     FullImport,
     Refresh,
     ClearArtwork,
+    /// Write the configuration. Validates again in the worker, and contacts nothing.
+    SaveConfiguration(Box<archivefs_core::identity_source::settings::ProviderSettings>),
+    /// Translate a bounded sample of provider paths. Publishes nothing.
+    Preview {
+        limit: usize,
+    },
 }
 
 impl RommOperation {
@@ -58,6 +64,14 @@ impl RommOperation {
     /// A status load does not, which is what makes it safe to run while a mutating
     /// operation is in flight.
     pub(crate) fn is_mutating(&self) -> bool {
+        !matches!(self, Self::LoadStatus | Self::Preview { .. })
+    }
+
+    /// Whether this should disable the card's actions while it runs.
+    ///
+    /// Everything except a status load, which is a fast local read that happens
+    /// when the page opens and must not make the card look busy.
+    pub(crate) fn blocks_actions(&self) -> bool {
         !matches!(self, Self::LoadStatus)
     }
 
@@ -65,7 +79,11 @@ impl RommOperation {
     pub(crate) fn uses_network(&self) -> bool {
         matches!(
             self,
-            Self::TestConnection | Self::SampleImport { .. } | Self::FullImport | Self::Refresh
+            Self::TestConnection
+                | Self::SampleImport { .. }
+                | Self::FullImport
+                | Self::Refresh
+                | Self::Preview { .. }
         )
     }
 
@@ -87,6 +105,8 @@ impl RommOperation {
             Self::FullImport => "Importing the RomM catalogue",
             Self::Refresh => "Refreshing from RomM",
             Self::ClearArtwork => "Clearing cover thumbnails",
+            Self::SaveConfiguration(_) => "Saving the RomM configuration",
+            Self::Preview { .. } => "Previewing path mappings",
         }
     }
 }
@@ -120,6 +140,8 @@ pub(crate) enum RommOperationOutcome {
         items: usize,
         bytes: u64,
     },
+    Saved(Box<archivefs_core::identity_source::settings::ProviderSettings>),
+    Preview(Box<crate::romm_config::RommPreviewSummary>),
 }
 
 /// The connection test, reduced to what the card shows. Built in the worker so no
@@ -332,9 +354,9 @@ pub(crate) fn build_card_view(
     running: Option<&RommOperation>,
     cancellation_requested: bool,
 ) -> RommCardView {
-    let busy = running.is_some_and(RommOperation::is_mutating);
+    let busy = running.is_some_and(RommOperation::blocks_actions);
     let busy_label = running
-        .filter(|operation| operation.is_mutating())
+        .filter(|operation| operation.blocks_actions())
         .map(|operation| operation.label().to_string());
     let cancellable =
         running.is_some_and(RommOperation::reports_progress) && !cancellation_requested;
@@ -630,8 +652,19 @@ fn build_actions(
         coming_next: false,
     });
 
+    // Configuration and mappings live in their own dialog, which needs no source to
+    // be configured already - that is what it is for.
+    actions.push(CardAction {
+        label: "Configure".to_string(),
+        operation: None,
+        enabled: !busy,
+        disabled_reason: busy.then(|| busy_reason.clone()),
+        style: CardActionStyle::Secondary,
+        coming_next: false,
+    });
+
     // Later slices. Present, honestly labelled, and impossible to click.
-    for label in ["Configure", "Browse records", "View stale summary"] {
+    for label in ["Browse records", "View stale summary"] {
         actions.push(CardAction {
             label: format!("{label} (coming next)"),
             operation: None,
@@ -769,6 +802,26 @@ pub(crate) fn build_result_view(
                 "The imported identity, RomM's own artwork and your ROM files were not touched."
                     .to_string(),
             ],
+        },
+        Ok(RommOperationOutcome::Saved(settings)) => RommResultView {
+            succeeded: true,
+            headline: "Configuration saved".to_string(),
+            rows: crate::romm_config::describe_saved(settings),
+            notes: vec![
+                "Written atomically to ArchiveFS's own configuration. Nothing was contacted, and \
+                 no import ran - use Test connection or Refresh when you are ready."
+                    .to_string(),
+            ],
+        },
+        Ok(RommOperationOutcome::Preview(summary)) => RommResultView {
+            succeeded: summary.path_shape_agrees() && summary.refused == 0,
+            headline: summary.headline(),
+            rows: crate::romm_config::preview_count_rows(summary),
+            notes: vec![format!(
+                "Sampled {} path(s) from {}. Nothing was imported, published or changed.",
+                summary.examples.len(),
+                summary.sample_source
+            )],
         },
         Ok(RommOperationOutcome::Connection(summary)) => build_connection_result(summary),
         Ok(RommOperationOutcome::Sample(summary)) => build_import_result(summary, true),
@@ -1016,6 +1069,8 @@ pub(crate) enum RommProgressEvent {
 pub(crate) enum RommCardRequest {
     Start(RommOperation),
     Cancel,
+    /// Open the configuration and mappings dialog.
+    OpenConfigure,
 }
 
 /// Draws the card. Thin by design: every decision was made in
@@ -1173,6 +1228,9 @@ pub(crate) fn show_romm_source_card(
                         }
                         None if action.label == "Cancel" => {
                             request = Some(RommCardRequest::Cancel);
+                        }
+                        None if action.label == "Configure" => {
+                            request = Some(RommCardRequest::OpenConfigure);
                         }
                         None => {}
                     }
