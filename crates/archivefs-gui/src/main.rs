@@ -45,22 +45,24 @@ use archivefs_core::game_identity::{
     inspect_catalogued_game_identity,
 };
 use archivefs_core::patch_manager::{
-    CheatCandidate, CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList,
-    CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
-    CheatInstallPreviewRequest, CheatSelection, CheatSourceCancellation, CheatSourceError,
+    BsFreeCatalogue, BsFreeCheat, BsFreeDownloadOptions, BsFreeGame, BsFreeGameSearchRequest,
+    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, CheatCandidate, CheatCandidateArchive,
+    CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus,
+    CheatDestinationRequest, CheatInstallPlanError, CheatInstallPreviewRequest,
+    CheatProviderSourceState, CheatSelection, CheatSourceCancellation, CheatSourceError,
     CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
     CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DolphinCatalogue, DolphinCatalogueError,
-    DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult,
-    DolphinCatalogueLoad, DolphinCatalogueUpdateCheck, DolphinGameIniInventory,
-    DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
-    DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
-    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
-    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelectReason,
-    EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection,
-    GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity,
-    GameCubeInstallPlanError, GameCubeInstallPlanErrorKind, GameHackingErrorKind,
-    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
+    CheatSourceProgressReporter, DeviceFormatCompatibility, DolphinCatalogue,
+    DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
+    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinCatalogueUpdateCheck,
+    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
+    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
+    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
+    EmulatorProfileSelectReason, EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
+    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
+    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
+    GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
     GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
     GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
     GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
@@ -69,12 +71,13 @@ use archivefs_core::patch_manager::{
     GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
     GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
     LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
-    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewSourceItem, PreviewState, RememberedEmulatorProfile,
+    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
+    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
+    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
+    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
+    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
+    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
     ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
     RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
@@ -92,12 +95,14 @@ use archivefs_core::patch_manager::{
     build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
     build_shared_transaction_plan, build_wii_gamehacking_install_preview, build_xenia_candidates,
     build_xenia_install_preview, check_dolphin_catalogue_update_with_transport,
-    default_cheat_source_cache_root, default_dolphin_catalogue_cache_root,
-    default_gecko_provider_cache_root, default_shared_backup_root, default_shared_history_root,
-    discover_dolphin_profiles, discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
-    discover_shared_apply_history, discover_xenia_profiles, execute_shared_apply,
-    execute_shared_rollback, fetch_dolphin_catalogue_with_transport, fetch_dolphin_upstream_gecko,
-    fetch_retroarch_cheat_source, fetch_xenia_provider_patches, generate_shared_operation_id,
+    default_bsfree_source_root, default_cheat_source_cache_root,
+    default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
+    default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    discover_shared_apply_history, discover_xenia_profiles, download_bsfree_database,
+    execute_shared_apply, execute_shared_rollback, fetch_dolphin_catalogue_with_transport,
+    fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
+    generate_shared_operation_id, import_local_bsfree_database, inspect_bsfree_source,
     inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
     list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
     load_dolphin_catalogue, load_dolphin_catalogue_update_state, load_dolphin_destination,
@@ -105,11 +110,12 @@ use archivefs_core::patch_manager::{
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
     parse_dolphin_ini, preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport,
     region_for_game_id, remembered_profile_for, remove_dolphin_catalogue,
-    require_dolphin_managed_gamehacking_verification, resolve_cheat_destination,
-    resolve_dolphin_gecko_lookup, select_dolphin_profile, select_emulator_profile,
-    selected_pcsx2_managed_cheats, stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
+    remove_local_bsfree_source, require_dolphin_managed_gamehacking_verification,
+    resolve_cheat_destination, resolve_dolphin_gecko_lookup, select_dolphin_profile,
+    select_emulator_profile, selected_pcsx2_managed_cheats, set_bsfree_enabled,
+    stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
     stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
-    stage_xenia_patch_file,
+    stage_xenia_patch_file, validate_installed_bsfree_source,
 };
 #[cfg(test)]
 use archivefs_core::patch_manager::{
@@ -2422,6 +2428,54 @@ struct RunningSourceAction {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Debug)]
+enum BsFreeManagerState {
+    NotLoaded,
+    Ready(Box<BsFreeSourceStatus>),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+enum BsFreeOperation {
+    LoadStatus,
+    Download,
+    Import(PathBuf),
+    Validate,
+    SetEnabled(bool),
+    Remove,
+    Search(BsFreeGameSearchRequest),
+    LoadGame { upstream_uid: i64, offset: u32 },
+}
+
+#[derive(Debug)]
+enum BsFreeOperationResult {
+    Status(Box<BsFreeSourceStatus>),
+    Removed,
+    Search(BsFreeGameSearchResult),
+    Game(
+        BsFreeGame,
+        archivefs_core::patch_manager::ProviderPage<BsFreeCheat>,
+    ),
+}
+
+struct RunningBsFreeOperation {
+    operation: BsFreeOperation,
+    receiver: Receiver<Result<BsFreeOperationResult, String>>,
+}
+
+#[derive(Debug, Default)]
+struct BsFreeGuiState {
+    import_path: String,
+    download_confirm: bool,
+    remove_confirm: bool,
+    search_context: Option<PathBuf>,
+    search_title: String,
+    search_platform: String,
+    search_result: Option<Result<BsFreeGameSearchResult, String>>,
+    selected_game: Option<BsFreeGame>,
+    cheats: Option<Result<archivefs_core::patch_manager::ProviderPage<BsFreeCheat>, String>>,
+}
+
 /// The "Add Folder" dialog's state - `Some` on `ArchiveFsApp` exactly
 /// while the dialog is open, mirroring how every other confirmation
 /// dialog in this app (`confirm_unmount`, `confirm_remove_missing`, ...)
@@ -3372,6 +3426,9 @@ struct ArchiveFsApp {
     /// mirrors `alias_action` exactly, including the "one writer at a
     /// time" convention `source_action_available` enforces.
     source_action: Option<RunningSourceAction>,
+    bsfree_manager: BsFreeManagerState,
+    bsfree_operation: Option<RunningBsFreeOperation>,
+    bsfree_ui: BsFreeGuiState,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -3599,6 +3656,9 @@ impl ArchiveFsApp {
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
+            bsfree_manager: BsFreeManagerState::NotLoaded,
+            bsfree_operation: None,
+            bsfree_ui: BsFreeGuiState::default(),
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -4967,6 +5027,78 @@ impl ArchiveFsApp {
                     more_information: None,
                 });
             }
+        }
+    }
+
+    fn start_bsfree_operation(&mut self, context: egui::Context, operation: BsFreeOperation) {
+        if self.bsfree_operation.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.bsfree_operation = Some(RunningBsFreeOperation {
+            operation: operation.clone(),
+            receiver,
+        });
+        thread::spawn(move || {
+            let result = run_bsfree_operation(&operation).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_bsfree_operation(&mut self, context: &egui::Context) {
+        let result = self.bsfree_operation.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.operation.clone(), result))
+        });
+        let Some((operation, result)) = result else {
+            return;
+        };
+        self.bsfree_operation = None;
+        match result {
+            Ok(BsFreeOperationResult::Status(status)) => {
+                self.bsfree_manager = BsFreeManagerState::Ready(status);
+            }
+            Ok(BsFreeOperationResult::Removed) => {
+                self.bsfree_manager = BsFreeManagerState::NotLoaded;
+                self.bsfree_ui = BsFreeGuiState::default();
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message: "Removed ArchiveFS's local BSFree source copy only.".to_string(),
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+            }
+            Ok(BsFreeOperationResult::Search(result)) => {
+                self.bsfree_ui.search_result = Some(Ok(result));
+                self.bsfree_ui.selected_game = None;
+                self.bsfree_ui.cheats = None;
+            }
+            Ok(BsFreeOperationResult::Game(game, cheats)) => {
+                self.bsfree_ui.selected_game = Some(game);
+                self.bsfree_ui.cheats = Some(Ok(cheats));
+            }
+            Err(message) => match operation {
+                BsFreeOperation::Search(_) => self.bsfree_ui.search_result = Some(Err(message)),
+                BsFreeOperation::LoadGame { .. } => self.bsfree_ui.cheats = Some(Err(message)),
+                BsFreeOperation::LoadStatus => {
+                    self.bsfree_manager = BsFreeManagerState::Failed(message)
+                }
+                _ => {
+                    self.feedback = Some(ActionFeedback {
+                        succeeded: false,
+                        message,
+                        cleanup: None,
+                        warning: None,
+                        more_information: None,
+                    });
+                    self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
+                }
+            },
         }
     }
 
@@ -11070,6 +11202,7 @@ impl ArchiveFsApp {
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
         self.poll_source_action(context);
+        self.poll_bsfree_operation(context);
         self.poll_catalogue_manager(context);
         self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
@@ -11082,6 +11215,12 @@ impl ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_cheat_workflow(context);
+        if matches!(self.view, MainView::Sources | MainView::CheatsMods)
+            && matches!(self.bsfree_manager, BsFreeManagerState::NotLoaded)
+            && self.bsfree_operation.is_none()
+        {
+            self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
+        }
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
                 workflow.adapter == CheatEmulatorAdapter::Dolphin
@@ -11669,6 +11808,17 @@ impl ArchiveFsApp {
                     }
 
                     ui.add_space(theme::SECTION_GAP);
+                    if let Some(operation) = show_bsfree_source_card(
+                        ui,
+                        &self.bsfree_manager,
+                        self.bsfree_operation.is_some(),
+                        &mut self.bsfree_ui,
+                        &mut self.clipboard,
+                    ) {
+                        self.start_bsfree_operation(context.clone(), operation);
+                    }
+
+                    ui.add_space(theme::SECTION_GAP);
                     show_sources_recent_activity(ui, &self.history);
                     return;
                 }
@@ -11703,7 +11853,14 @@ impl ArchiveFsApp {
                     let now_unix_seconds = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| duration.as_secs());
-                    let (action, catalogue_action, dolphin_catalogue_action) = egui::ScrollArea::vertical()
+                    let bsfree_context = self.cheat_workflow.as_ref().map(|workflow| {
+                        (
+                            workflow.archive_path.clone(),
+                            workflow.display_name.clone(),
+                            workflow.platform.clone().unwrap_or_default(),
+                        )
+                    });
+                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -11737,6 +11894,14 @@ impl ArchiveFsApp {
                                 busy || self.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
                             );
+                            ui.add_space(theme::SECTION_GAP);
+                            let bsfree_action = show_bsfree_game_browser(
+                                ui,
+                                &self.bsfree_manager,
+                                self.bsfree_operation.is_some(),
+                                &mut self.bsfree_ui,
+                                bsfree_context.as_ref(),
+                            );
                             let catalogue_action = retroarch_route.then(|| {
                                 ui.add_space(theme::SECTION_GAP);
                                 widgets::section_header(
@@ -11755,7 +11920,7 @@ impl ArchiveFsApp {
                                     &mut self.clipboard,
                                 )
                             }).flatten();
-                            (action, catalogue_action, dolphin_catalogue_action)
+                            (action, catalogue_action, dolphin_catalogue_action, bsfree_action)
                         })
                         .inner;
                     let picker_rows = live
@@ -11772,6 +11937,9 @@ impl ArchiveFsApp {
                     }
                     if let Some(dolphin_catalogue_action) = dolphin_catalogue_action {
                         self.handle_dolphin_catalogue_manager_action(context, dolphin_catalogue_action);
+                    }
+                    if let Some(bsfree_action) = bsfree_action {
+                        self.start_bsfree_operation(context.clone(), bsfree_action);
                     }
                     match action {
                         Some(CheatWorkflowAction::ChooseArchive) => {
@@ -15129,6 +15297,52 @@ fn run_source_action(action: &SourceAction) -> archivefs_core::Result<SourceActi
     }
 }
 
+fn run_bsfree_operation(
+    operation: &BsFreeOperation,
+) -> Result<BsFreeOperationResult, archivefs_core::patch_manager::BsFreeError> {
+    let paths = BsFreePaths::at(default_bsfree_source_root()?);
+    match operation {
+        BsFreeOperation::LoadStatus => inspect_bsfree_source(&paths)
+            .map(Box::new)
+            .map(BsFreeOperationResult::Status),
+        BsFreeOperation::Download => download_bsfree_database(
+            &paths,
+            &BsFreeDownloadOptions::default(),
+            &HttpsCheatSourceTransport::new(),
+        )
+        .map(|result| BsFreeOperationResult::Status(Box::new(result.status))),
+        BsFreeOperation::Import(source) => import_local_bsfree_database(&paths, source)
+            .map(|result| BsFreeOperationResult::Status(Box::new(result.status))),
+        BsFreeOperation::Validate => validate_installed_bsfree_source(&paths)
+            .map(Box::new)
+            .map(BsFreeOperationResult::Status),
+        BsFreeOperation::SetEnabled(enabled) => set_bsfree_enabled(&paths, *enabled)
+            .map(Box::new)
+            .map(BsFreeOperationResult::Status),
+        BsFreeOperation::Remove => {
+            remove_local_bsfree_source(&paths, true)?;
+            Ok(BsFreeOperationResult::Removed)
+        }
+        BsFreeOperation::Search(request) => BsFreeCatalogue::open_installed(&paths)?
+            .search_games(request)
+            .map(BsFreeOperationResult::Search),
+        BsFreeOperation::LoadGame {
+            upstream_uid,
+            offset,
+        } => {
+            let catalogue = BsFreeCatalogue::open_installed(&paths)?;
+            let game = catalogue.game(*upstream_uid)?.ok_or_else(|| {
+                archivefs_core::patch_manager::BsFreeError {
+                    kind: archivefs_core::patch_manager::BsFreeErrorKind::Query,
+                    message: "BSFree game is no longer present".to_string(),
+                }
+            })?;
+            let cheats = catalogue.cheats(*upstream_uid, PageRequest::cheats(*offset))?;
+            Ok(BsFreeOperationResult::Game(game, cheats))
+        }
+    }
+}
+
 fn library_view_action_log_category(action: &LibraryViewAction) -> ActivityAction {
     match action {
         LibraryViewAction::Add { .. } => ActivityAction::LibraryViewAdded,
@@ -16702,6 +16916,520 @@ fn show_sources_page(
         }
     }
 
+    action
+}
+
+fn bsfree_state_label(state: CheatProviderSourceState) -> &'static str {
+    match state {
+        CheatProviderSourceState::NotInstalled => "Not installed",
+        CheatProviderSourceState::Downloading => "Downloading",
+        CheatProviderSourceState::Validating => "Validating",
+        CheatProviderSourceState::Ready => "Ready",
+        CheatProviderSourceState::UpdateAvailable => "Update available",
+        CheatProviderSourceState::Invalid => "Invalid",
+        CheatProviderSourceState::UnsupportedSchema => "Unsupported schema",
+        CheatProviderSourceState::DownloadFailed => "Download failed",
+        CheatProviderSourceState::ValidationFailed => "Validation failed",
+        CheatProviderSourceState::Disabled => "Disabled",
+    }
+}
+
+fn bsfree_state_tone(state: CheatProviderSourceState) -> widgets::StatusTone {
+    match state {
+        CheatProviderSourceState::Ready => widgets::StatusTone::Success,
+        CheatProviderSourceState::Downloading | CheatProviderSourceState::Validating => {
+            widgets::StatusTone::Active
+        }
+        CheatProviderSourceState::NotInstalled | CheatProviderSourceState::Disabled => {
+            widgets::StatusTone::Pending
+        }
+        CheatProviderSourceState::UpdateAvailable
+        | CheatProviderSourceState::DownloadFailed
+        | CheatProviderSourceState::ValidationFailed => widgets::StatusTone::Warning,
+        CheatProviderSourceState::Invalid | CheatProviderSourceState::UnsupportedSchema => {
+            widgets::StatusTone::Blocked
+        }
+    }
+}
+
+fn show_bsfree_source_card(
+    ui: &mut egui::Ui,
+    manager: &BsFreeManagerState,
+    busy: bool,
+    state: &mut BsFreeGuiState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<BsFreeOperation> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "BSFree Archive",
+        Some("Optional third-party, read-only historical cheat catalogue."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("BSFree Archive");
+            match manager {
+                BsFreeManagerState::NotLoaded => {
+                    widgets::status_badge(ui, "Checking local state", widgets::StatusTone::Pending)
+                }
+                BsFreeManagerState::Ready(status) => widgets::status_badge(
+                    ui,
+                    bsfree_state_label(status.state),
+                    bsfree_state_tone(status.state),
+                ),
+                BsFreeManagerState::Failed(_) => {
+                    widgets::status_badge(ui, "Status unavailable", widgets::StatusTone::Warning)
+                }
+            }
+            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+        });
+        ui.label("Source: BSFree Archive");
+        ui.label("Maintainer: Andrew Mackrodt");
+        ui.label("Origin: Historical bsfree.org database");
+        ui.label("Distribution status: Optional third-party download");
+        ui.label("Verification: Historical community data, not verified by ArchiveFS");
+        widgets::banner(
+            ui,
+            "Database-content licence not established",
+            "The upstream application code is MIT, but ArchiveFS does not claim that licence covers the historical cheat dataset.",
+            widgets::StatusTone::Warning,
+        );
+        ui.label(
+            "No cheats are installed automatically. Stage 1 provides search and browsing only.",
+        );
+
+        match manager {
+            BsFreeManagerState::Ready(status) => {
+                if widgets::path_value(ui, "Local destination", &status.database_path) {
+                    let _ = clipboard.set_text(status.database_path.display().to_string());
+                }
+                if let Some(validation) = &status.validation {
+                    widgets::status_strip(
+                        ui,
+                        &[
+                            ("Immutable read-only SQLite", widgets::StatusTone::Success),
+                            ("Query-only", widgets::StatusTone::Success),
+                        ],
+                    );
+                    widgets::copyable_value(
+                        ui,
+                        "Database SHA-256",
+                        &validation.result.source_fingerprint.sha256,
+                    );
+                    ui.label(format!(
+                        "{} systems · {} games · {} codes · {} bytes",
+                        validation.counts.systems,
+                        validation.counts.games,
+                        validation.counts.codes,
+                        validation.result.source_fingerprint.size_bytes
+                    ));
+                    ui.label(format!(
+                        "Validated: {}",
+                        format_unix_timestamp_utc(
+                            validation.result.validated_at_unix_seconds as i64
+                        )
+                    ));
+                }
+                if let Some(error) = &status.last_error {
+                    widgets::banner(
+                        ui,
+                        "Last operation failed",
+                        &error.message,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+            }
+            BsFreeManagerState::Failed(message) => widgets::banner(
+                ui,
+                "Could not inspect BSFree source",
+                message,
+                widgets::StatusTone::Warning,
+            ),
+            BsFreeManagerState::NotLoaded => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading local source metadata...");
+                });
+            }
+        }
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Download database",
+                widgets::ActionStyle::Primary,
+                !busy,
+            )
+            .clicked()
+            {
+                state.download_confirm = true;
+            }
+            if widgets::action_button(
+                ui,
+                "Validate",
+                widgets::ActionStyle::Secondary,
+                !busy
+                    && matches!(manager, BsFreeManagerState::Ready(status) if status.fingerprint.is_some()),
+            )
+            .clicked()
+            {
+                action = Some(BsFreeOperation::Validate);
+            }
+            if let BsFreeManagerState::Ready(status) = manager {
+                if widgets::action_button(
+                    ui,
+                    if status.enabled { "Disable" } else { "Enable" },
+                    widgets::ActionStyle::Quiet,
+                    !busy,
+                )
+                .clicked()
+                {
+                    action = Some(BsFreeOperation::SetEnabled(!status.enabled));
+                }
+                if widgets::action_button(
+                    ui,
+                    "Remove local copy",
+                    widgets::ActionStyle::Destructive,
+                    !busy && status.fingerprint.is_some(),
+                )
+                .clicked()
+                {
+                    state.remove_confirm = true;
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Import local BSFree SQLite database");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.import_path)
+                    .desired_width(360.0)
+                    .hint_text("/path/to/bsfree.4cfee26.db"),
+            );
+            if widgets::action_button(
+                ui,
+                "Import local database",
+                widgets::ActionStyle::Secondary,
+                !busy && !state.import_path.trim().is_empty(),
+            )
+            .clicked()
+            {
+                action = Some(BsFreeOperation::Import(PathBuf::from(
+                    state.import_path.trim(),
+                )));
+            }
+        });
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("BSFree operation in progress...");
+            });
+        }
+        if state.download_confirm {
+            widgets::banner(
+                ui,
+                "Download optional third-party database?",
+                "Approximately 283 MiB. Network access is required. The database-content licence is not established, it will be stored in ArchiveFS's data directory, and no cheats will be installed.",
+                widgets::StatusTone::Warning,
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Confirm download",
+                    widgets::ActionStyle::Primary,
+                    !busy,
+                )
+                .clicked()
+                {
+                    state.download_confirm = false;
+                    action = Some(BsFreeOperation::Download);
+                }
+                if ui.button("Cancel").clicked() {
+                    state.download_confirm = false;
+                }
+            });
+        }
+        if state.remove_confirm {
+            widgets::banner(
+                ui,
+                "Remove ArchiveFS's local BSFree copy?",
+                "Only the BSFree database and ArchiveFS-owned BSFree metadata are removed. Emulator profiles and other cheat providers are untouched.",
+                widgets::StatusTone::Warning,
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Confirm removal",
+                    widgets::ActionStyle::Destructive,
+                    !busy,
+                )
+                .clicked()
+                {
+                    state.remove_confirm = false;
+                    action = Some(BsFreeOperation::Remove);
+                }
+                if ui.button("Cancel").clicked() {
+                    state.remove_confirm = false;
+                }
+            });
+        }
+    });
+    action
+}
+
+fn bsfree_match_label(confidence: ProviderGameMatchConfidence) -> &'static str {
+    match confidence {
+        ProviderGameMatchConfidence::ExactTitlePlatform => "Exact title + platform",
+        ProviderGameMatchConfidence::ProbableTitlePlatform => "Probable title + platform",
+        ProviderGameMatchConfidence::Ambiguous => "Ambiguous candidates",
+        ProviderGameMatchConfidence::NoMatch => "No match",
+    }
+}
+
+fn bsfree_compatibility_label(compatibility: DeviceFormatCompatibility) -> &'static str {
+    match compatibility {
+        DeviceFormatCompatibility::DirectlyInstallable => "Directly installable",
+        DeviceFormatCompatibility::PotentiallyConvertible => "Potentially convertible",
+        DeviceFormatCompatibility::ReferenceOnly => "Reference only",
+        DeviceFormatCompatibility::Unsupported => "Unsupported",
+        DeviceFormatCompatibility::Unknown => "Unknown format",
+    }
+}
+
+fn show_bsfree_game_browser(
+    ui: &mut egui::Ui,
+    manager: &BsFreeManagerState,
+    busy: bool,
+    state: &mut BsFreeGuiState,
+    context: Option<&(PathBuf, String, String)>,
+) -> Option<BsFreeOperation> {
+    let mut action = None;
+    if let Some((archive_path, title, platform)) = context
+        && state.search_context.as_ref() != Some(archive_path)
+    {
+        state.search_context = Some(archive_path.clone());
+        state.search_title.clone_from(title);
+        state.search_platform.clone_from(platform);
+        state.search_result = None;
+        state.selected_game = None;
+        state.cheats = None;
+    }
+
+    widgets::section_header(
+        ui,
+        "BSFree Archive",
+        Some("Search an optional historical catalogue by title and platform."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+            ui.label(
+                "Installation support will be added only for verified formats in a later stage.",
+            );
+        });
+        ui.label("Match based on platform and title. Exact game revision is not verified.");
+
+        let usable = matches!(manager, BsFreeManagerState::Ready(status) if status.usable);
+        match manager {
+            BsFreeManagerState::Ready(status) if !status.usable => widgets::banner(
+                ui,
+                "BSFree source is not ready",
+                "Download or import and validate the optional database from Cheats → Sources.",
+                widgets::StatusTone::Pending,
+            ),
+            BsFreeManagerState::Failed(message) => widgets::banner(
+                ui,
+                "BSFree status unavailable",
+                message,
+                widgets::StatusTone::Warning,
+            ),
+            BsFreeManagerState::NotLoaded => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking BSFree source...");
+                });
+            }
+            BsFreeManagerState::Ready(_) => {}
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Platform");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search_platform)
+                    .desired_width(130.0)
+                    .hint_text("Canonical platform"),
+            );
+            ui.label("Title");
+            ui.add(egui::TextEdit::singleline(&mut state.search_title).desired_width(300.0));
+            if widgets::action_button(
+                ui,
+                "Search BSFree Archive",
+                widgets::ActionStyle::Secondary,
+                usable && !busy && !state.search_title.trim().is_empty(),
+            )
+            .clicked()
+            {
+                action = Some(BsFreeOperation::Search(BsFreeGameSearchRequest {
+                    platform_id: (!state.search_platform.trim().is_empty())
+                        .then(|| state.search_platform.trim().to_string()),
+                    title: state.search_title.trim().to_string(),
+                    version: None,
+                    device_id: None,
+                    upstream_game_id: None,
+                    page: PageRequest::games(0),
+                }));
+            }
+        });
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading the local BSFree database...");
+            });
+        }
+
+        if let Some(result) = &state.search_result {
+            ui.separator();
+            match result {
+                Err(message) => widgets::banner(
+                    ui,
+                    "BSFree search failed",
+                    message,
+                    widgets::StatusTone::Warning,
+                ),
+                Ok(result) => {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(
+                            ui,
+                            bsfree_match_label(result.confidence),
+                            if result.confidence == ProviderGameMatchConfidence::NoMatch {
+                                widgets::StatusTone::Pending
+                            } else {
+                                widgets::StatusTone::Info
+                            },
+                        );
+                        ui.label(format!(
+                            "{} candidate(s); revision not verified",
+                            result.page.total
+                        ));
+                    });
+                    ui.label(&result.explanation);
+                    for game in &result.page.rows {
+                        ui.group(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(&game.name);
+                                widgets::status_badge(
+                                    ui,
+                                    &game.system.name,
+                                    widgets::StatusTone::Info,
+                                );
+                                widgets::status_badge(
+                                    ui,
+                                    &game.device.name,
+                                    widgets::StatusTone::Pending,
+                                );
+                            });
+                            ui.label(format!(
+                                "Version: {} · {} cheats · BSFree game UID {} / historical game ID {}",
+                                game.version.as_deref().unwrap_or("not supplied"),
+                                game.cheat_count,
+                                game.upstream_uid,
+                                game.upstream_game_id
+                            ));
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Browse cheats"))
+                                .clicked()
+                            {
+                                action = Some(BsFreeOperation::LoadGame {
+                                    upstream_uid: game.upstream_uid,
+                                    offset: 0,
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        if let (Some(game), Some(cheats)) = (&state.selected_game, &state.cheats) {
+            ui.separator();
+            ui.heading(&game.name);
+            ui.label(format!(
+                "{} · {} · {}",
+                game.system.name,
+                game.device.name,
+                game.version.as_deref().unwrap_or("version not supplied")
+            ));
+            match cheats {
+                Err(message) => widgets::banner(
+                    ui,
+                    "Could not load BSFree cheats",
+                    message,
+                    widgets::StatusTone::Warning,
+                ),
+                Ok(page) => {
+                    ui.label(format!(
+                        "Showing {}–{} of {} cheats",
+                        page.offset.saturating_add(1),
+                        page.offset.saturating_add(page.rows.len() as u32),
+                        page.total
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !busy && page.offset > 0,
+                                egui::Button::new("Previous 100"),
+                            )
+                            .clicked()
+                        {
+                            action = Some(BsFreeOperation::LoadGame {
+                                upstream_uid: game.upstream_uid,
+                                offset: page
+                                    .offset
+                                    .saturating_sub(PageRequest::DEFAULT_CHEAT_LIMIT as u32),
+                            });
+                        }
+                        if ui
+                            .add_enabled(!busy && page.has_more, egui::Button::new("Next 100"))
+                            .clicked()
+                        {
+                            action = Some(BsFreeOperation::LoadGame {
+                                upstream_uid: game.upstream_uid,
+                                offset: page.offset.saturating_add(page.limit as u32),
+                            });
+                        }
+                    });
+                    for cheat in &page.rows {
+                        ui.group(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(&cheat.name);
+                                widgets::status_badge(
+                                    ui,
+                                    bsfree_compatibility_label(cheat.compatibility),
+                                    widgets::StatusTone::Pending,
+                                );
+                            });
+                            if let Some(section) = &cheat.section {
+                                ui.label(format!("Section: {}", section.name));
+                            }
+                            if let Some(author) = &cheat.author {
+                                ui.label(format!("Author: {}", author.name));
+                            }
+                            if let Some(note) = &cheat.note {
+                                ui.label(note);
+                            }
+                            ui.collapsing("Raw code and provenance", |ui| {
+                                ui.monospace(&cheat.code);
+                                ui.label(format!(
+                                    "Provider: BSFree Archive · device: {} · row ID: {}",
+                                    cheat.device.name, cheat.upstream_id
+                                ));
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    });
     action
 }
 
@@ -44261,6 +44989,9 @@ $Instant Growth [Nayr]\n";
             show_about: false,
             select_all_visible_requested: false,
             source_action: None,
+            bsfree_manager: BsFreeManagerState::NotLoaded,
+            bsfree_operation: None,
+            bsfree_ui: BsFreeGuiState::default(),
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -57896,5 +58627,43 @@ $Instant Growth [Nayr]\n";
             !rendered_text_contains(&output, "All technical blockers"),
             "the old bespoke CollapsingHeader wording must no longer render"
         );
+    }
+
+    #[test]
+    fn bsfree_stage_one_labels_all_formats_as_browse_only_compatibility() {
+        assert_eq!(
+            bsfree_compatibility_label(DeviceFormatCompatibility::PotentiallyConvertible),
+            "Potentially convertible"
+        );
+        assert_eq!(
+            bsfree_compatibility_label(DeviceFormatCompatibility::ReferenceOnly),
+            "Reference only"
+        );
+        assert_eq!(
+            bsfree_compatibility_label(DeviceFormatCompatibility::Unknown),
+            "Unknown format"
+        );
+        assert_eq!(
+            bsfree_match_label(ProviderGameMatchConfidence::Ambiguous),
+            "Ambiguous candidates"
+        );
+    }
+
+    #[test]
+    fn bsfree_gui_is_bounded_browse_only_and_has_no_install_action() {
+        let source = include_str!("main.rs");
+        let browser = source
+            .split("fn show_bsfree_game_browser(")
+            .nth(1)
+            .unwrap()
+            .split("/// The Sources page's compact")
+            .next()
+            .unwrap();
+        assert!(browser.contains("Browse only"));
+        assert!(browser.contains("PageRequest::games(0)"));
+        assert!(browser.contains("Previous 100"));
+        assert!(browser.contains("Next 100"));
+        assert!(!browser.contains("Install selected"));
+        assert!(!browser.contains("BsFreeOperation::Install"));
     }
 }

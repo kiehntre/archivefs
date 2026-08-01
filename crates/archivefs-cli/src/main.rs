@@ -74,6 +74,7 @@ use archivefs_core::{
 };
 use serde::Serialize;
 
+mod bsfree;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -306,6 +307,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
+        }
+        "cheats" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            if input_args.first().map(String::as_str) != Some("source")
+                || input_args.get(1).map(String::as_str) != Some("bsfree")
+            {
+                return Err("cheats currently supports only `source bsfree <command>`".into());
+            }
+            input_args.drain(0..2);
+            bsfree::run(input_args)?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -5327,6 +5338,9 @@ fn print_help() {
         "  doctor --repair <action-id> --finding <finding-id>  Perform one existing repair on a finding from a fresh scan. Actions: clean_mount_root, clean_mount_path, retry_mount, rebuild_index. Add --resource <path> when several findings share an ID; it must exactly match the resource that finding reported, and can only pick out one of Doctor's own findings - it can never point a repair at anything else, even a path that would be a valid target on its own. --confirm to allow the change, --dry-run to validate without changing anything, --json for machine-readable output. No flag accepts an arbitrary path to operate on: the target is resolved from the finding and revalidated. Exits 0 whenever the command ran, including when the repair was refused."
     );
     println!("  config-check   Validate ArchiveFS configuration");
+    println!(
+        "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!(
         "  gamehacking-ps2-index-refresh  Resume the cached public PS2 index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
