@@ -77,6 +77,17 @@ struct Migration {
     sql: &'static str,
 }
 
+/// The schema versions this build ships, for a test in another module to assert
+/// that a milestone added none. Test-only: nothing in the runtime needs it,
+/// because the migration runner reads `MIGRATIONS` directly.
+#[cfg(test)]
+pub(crate) fn migration_versions_for_tests() -> Vec<i64> {
+    MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .collect()
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,

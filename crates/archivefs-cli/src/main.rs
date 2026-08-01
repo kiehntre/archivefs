@@ -9385,6 +9385,10 @@ struct PlatformAuditReport {
     /// misclassifications - the reported ScummVM `RESOURCE.GEN` case is one.
     historical_misclassifications: Vec<PlatformAuditChange>,
     historical_misclassifications_total: usize,
+    /// Structural disk-format outcomes, by extension. Counted separately from
+    /// the confidence totals because "the parser validated this" and "detection
+    /// reached Confirmed" are different claims.
+    disk_format: Vec<DiskFormatAuditRow>,
     /// How many files were symlinks, and what happened to each.
     symlinks_seen: usize,
     /// Symlinks whose signature could be read because both the link and its
@@ -9397,6 +9401,23 @@ struct PlatformAuditReport {
     /// Requested platforms with no file in this sample at all.
     requested_platforms_absent: Vec<String>,
     elapsed_milliseconds: u128,
+}
+
+/// What the structural adapters actually concluded for one extension.
+#[derive(Debug, Default, Serialize)]
+struct DiskFormatAuditRow {
+    extension: String,
+    files: usize,
+    /// The parser validated the structure.
+    structurally_valid: usize,
+    /// The structure was read and rejected.
+    malformed: usize,
+    /// The file could not be opened under the trusted-root policy.
+    refused: usize,
+    /// Refusal reasons, by stable code.
+    refusals: Vec<(String, usize)>,
+    /// Total bytes the adapters read across every file of this extension.
+    bytes_inspected: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -9428,6 +9449,7 @@ fn audit_platform_detection(
     let mut platform_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut ambiguous_extensions: BTreeMap<String, usize> = BTreeMap::new();
     let mut symlink_refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut disk_format_rows: BTreeMap<String, DiskFormatAuditAccumulator> = BTreeMap::new();
     let mut seen_platforms: std::collections::BTreeSet<String> = Default::default();
 
     // The configured source folders, so a symlink from one into another can be
@@ -9553,6 +9575,45 @@ fn audit_platform_detection(
                 }
             }
 
+            // The structural layer, asked directly, so the audit reports what the
+            // parser proved rather than inferring it from the final confidence.
+            if let Some(extension) = archivefs_core::platform::extension_of(&path)
+                && matches!(extension.as_str(), "st" | "stx")
+            {
+                let folder = detected
+                    .evidence
+                    .iter()
+                    .find(|item| item.source == DetectionSource::FolderAlias)
+                    .map(|item| item.platform);
+                let inspected = archivefs_core::disk_format::inspect_disk_format(
+                    &path,
+                    &trusted,
+                    archivefs_core::disk_format::DiskFormatContext {
+                        folder_platform: folder,
+                    },
+                    None,
+                );
+                let row = disk_format_rows.entry(extension).or_default();
+                row.files += 1;
+                row.bytes_inspected = row
+                    .bytes_inspected
+                    .saturating_add(inspected.bytes_inspected);
+                match (&inspected.format, &inspected.refusal) {
+                    (Some(_), _) => row.structurally_valid += 1,
+                    (None, Some(refusal)) => {
+                        match refusal.code() {
+                            "malformed" | "geometry_mismatch" | "not_sector_aligned"
+                            | "too_small" | "too_large" | "truncated" => row.malformed += 1,
+                            _ => row.refused += 1,
+                        }
+                        *row.refusal_counts
+                            .entry(refusal.code().to_string())
+                            .or_default() += 1;
+                    }
+                    (None, None) => {}
+                }
+            }
+
             let after = detected.platform.map(str::to_string);
             if before != after {
                 let change = PlatformAuditChange {
@@ -9589,6 +9650,23 @@ fn audit_platform_detection(
     extensions.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     extensions.truncate(15);
     report.top_ambiguous_extensions = extensions;
+
+    report.disk_format = disk_format_rows
+        .into_iter()
+        .map(|(extension, row)| {
+            let mut refusals: Vec<(String, usize)> = row.refusal_counts.into_iter().collect();
+            refusals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            DiskFormatAuditRow {
+                extension,
+                files: row.files,
+                structurally_valid: row.structurally_valid,
+                malformed: row.malformed,
+                refused: row.refused,
+                refusals,
+                bytes_inspected: row.bytes_inspected,
+            }
+        })
+        .collect();
 
     let mut refusals: Vec<(String, usize)> = symlink_refusals.into_iter().collect();
     refusals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -9671,6 +9749,24 @@ fn format_platform_audit(report: &PlatformAuditReport) -> String {
         lines.push("Top unresolved extension groups:".to_string());
         for (extension, count) in &report.top_ambiguous_extensions {
             lines.push(format!("  {count:>7}  .{extension}"));
+        }
+    }
+    if !report.disk_format.is_empty() {
+        lines.push(String::new());
+        lines.push("Structural disk-format validation (what the parser proved):".to_string());
+        for row in &report.disk_format {
+            lines.push(format!(
+                "  .{}: {} file(s), {} structurally valid, {} malformed, {} refused, {} bytes read",
+                row.extension,
+                row.files,
+                row.structurally_valid,
+                row.malformed,
+                row.refused,
+                row.bytes_inspected
+            ));
+            for (reason, count) in &row.refusals {
+                lines.push(format!("      {count:>6}  {reason}"));
+            }
         }
     }
     lines.push(String::new());
@@ -9818,4 +9914,15 @@ mod platform_detect_tests {
         assert!(text.contains("Confidence: Confirmed"));
         assert!(text.contains("Assignment: Manually assigned"));
     }
+}
+
+/// Mutable accumulator behind one [`DiskFormatAuditRow`].
+#[derive(Debug, Default)]
+struct DiskFormatAuditAccumulator {
+    files: usize,
+    structurally_valid: usize,
+    malformed: usize,
+    refused: usize,
+    refusal_counts: std::collections::BTreeMap<String, usize>,
+    bytes_inspected: u64,
 }

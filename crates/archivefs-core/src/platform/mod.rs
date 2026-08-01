@@ -505,7 +505,7 @@ pub const PLATFORMS: &[Platform] = &[
         layout: &[],
         conflicts_with: &["Amstrad CPC", "BBC Micro"],
         preferred_emulator: None,
-        explanation: "`.st`/`.msa` are ST disk formats. `.dsk` is shared with several other disk systems and is only weak evidence.",
+        explanation: "`.st` and `.stx` are validated structurally, not taken on trust: a `.st` file's FAT12 boot-sector geometry must account for its exact length, and a `.stx` file must be a consistent Pasti container. A valid Pasti container settles the platform on its own; a raw `.st` dump has the same boot sector a PC DOS floppy of that geometry would, so it reaches confirmed only alongside folder evidence. `.msa` and `.mfm` are recognised by extension only, and `.dsk` is shared with several other disk systems.",
     },
     Platform {
         id: "WonderSwan",

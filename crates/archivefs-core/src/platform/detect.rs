@@ -127,6 +127,15 @@ pub struct DetectionEvidence {
     pub platform: &'static str,
     /// What was actually observed, in a person's words.
     pub detail: String,
+    /// Whether this fact settles the platform on its own.
+    ///
+    /// Usually implied by [`DetectionSource::is_decisive`], but not always:
+    /// structural evidence can be strong without being conclusive. An Atari ST
+    /// `.st` image is recognised from a valid FAT12 boot sector, which a PC DOS
+    /// floppy of the same geometry also has - real evidence, but not proof - so
+    /// that fact arrives here with `conclusive: false` while a Pasti `.stx`
+    /// container, a format written only for Atari ST media, arrives with `true`.
+    pub conclusive: bool,
 }
 
 /// A platform the evidence allows, with the best evidence for it.
@@ -289,6 +298,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
     if let Some(manual) = request.manual_platform.and_then(canonical_id) {
         evidence.push(DetectionEvidence {
             source: DetectionSource::ExplicitAssignment,
+            conclusive: DetectionSource::ExplicitAssignment.is_decisive(),
             platform: manual,
             detail: "a platform was assigned explicitly for this entry".to_string(),
         });
@@ -310,23 +320,34 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
     if let Some(trusted) = request.trusted_platform.and_then(canonical_id) {
         evidence.push(DetectionEvidence {
             source: DetectionSource::TrustedMetadata,
+            conclusive: DetectionSource::TrustedMetadata.is_decisive(),
             platform: trusted,
             detail: "this entry already carries trusted platform metadata".to_string(),
         });
     }
 
     // 3. Folder aliases, nearest containing folder first.
+    let mut folder_platform: Option<&'static str> = None;
     if let Some((platform, folder)) = folder_alias_evidence(request.path, request.source_root) {
+        folder_platform = Some(platform.id);
         evidence.push(DetectionEvidence {
             source: DetectionSource::FolderAlias,
+            conclusive: DetectionSource::FolderAlias.is_decisive(),
             platform: platform.id,
             detail: format!("the containing folder `{folder}` names this platform exactly"),
         });
     }
 
-    // 4. Bounded signature reads.
+    // 4. Bounded signature reads: fixed-offset magic first, then the shared
+    //    structural formats, which recognise a container by the consistency of
+    //    its header fields rather than by a constant.
     if request.read_signatures {
         evidence.extend(signature_evidence(request.path, &request.trusted_roots));
+        evidence.extend(structural_format_evidence(
+            request.path,
+            &request.trusted_roots,
+            folder_platform,
+        ));
     }
 
     // 5. Layout evidence from the containing directory.
@@ -342,6 +363,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
         {
             evidence.push(DetectionEvidence {
                 source: DetectionSource::EmulatorContext,
+                conclusive: DetectionSource::EmulatorContext.is_decisive(),
                 platform: platform.id,
                 detail: format!("the surrounding workflow is using {emulator}"),
             });
@@ -355,6 +377,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
             if platform.has_strong_extension(extension) && !is_shared_extension(extension) {
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::StrongExtension,
+                    conclusive: DetectionSource::StrongExtension.is_decisive(),
                     platform: platform.id,
                     detail: format!("`.{extension}` is specific to this platform"),
                 });
@@ -364,6 +387,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
             if platform.has_weak_extension(extension) {
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::SharedExtension,
+                    conclusive: DetectionSource::SharedExtension.is_decisive(),
                     platform: platform.id,
                     detail: format!(
                         "`.{extension}` is shared with other platforms, so it only narrows the result"
@@ -470,13 +494,27 @@ fn decide(evidence: Vec<DetectionEvidence>, extension: Option<&str>) -> Platform
     // The priority order exists to settle *conflicts*: when a folder name and a
     // signature disagree, the folder wins. When they agree, that is
     // corroboration, and reporting it as merely Probable would understate what
-    // is actually known. So the selected platform is Confirmed whenever any
-    // decisive source - a signature, or an explicit assignment - also points at
-    // it, whatever tier happened to be strongest.
-    let corroborated_by_decisive_source = evidence
+    // is actually known. So the selected platform is Confirmed whenever some
+    // fact that settles it also points at it, whatever tier was strongest.
+    //
+    // `conclusive` rather than `source.is_decisive()` is what keeps that honest
+    // for structural formats. A valid Atari ST `.st` boot sector is Signature-tier
+    // evidence, but a PC DOS floppy of the same geometry has the same structure,
+    // so it arrives non-conclusive: on its own it reaches Probable, and only a
+    // folder alias naming the same platform raises it to Confirmed. A Pasti
+    // `.stx` container, which exists only for Atari ST media, is conclusive and
+    // needs no corroboration.
+    let conclusive_for_selected = evidence
         .iter()
-        .any(|item| item.source.is_decisive() && item.platform == selected);
-    let confidence = if strongest.is_decisive() || corroborated_by_decisive_source {
+        .any(|item| item.conclusive && item.platform == selected);
+    // Strong-but-not-conclusive structure, corroborated by the folder naming the
+    // same platform: two independent kinds of evidence agreeing.
+    let structure_and_folder_agree = evidence.iter().any(|item| {
+        item.source == DetectionSource::Signature && !item.conclusive && item.platform == selected
+    }) && evidence
+        .iter()
+        .any(|item| item.source == DetectionSource::FolderAlias && item.platform == selected);
+    let confidence = if conclusive_for_selected || structure_and_folder_agree {
         DetectionConfidence::Confirmed
     } else {
         DetectionConfidence::Probable
@@ -624,6 +662,7 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
                 }
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::Signature,
+                    conclusive: DetectionSource::Signature.is_decisive(),
                     platform: platform.id,
                     detail,
                 });
@@ -657,6 +696,7 @@ fn layout_evidence(path: &Path) -> Vec<DetectionEvidence> {
             if let Some(matched) = matching_layout_file(rule, &names) {
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::Layout,
+                    conclusive: DetectionSource::Layout.is_decisive(),
                     platform: platform.id,
                     detail: format!("{} (`{matched}`)", rule.description),
                 });
@@ -697,4 +737,51 @@ pub fn is_known_platform_hint(hint: &str) -> bool {
 /// The normalised form of a hint, for callers comparing two spellings.
 pub fn normalized_hint(hint: &str) -> String {
     normalize_alias(hint)
+}
+
+/// Evidence from the shared structural-format layer.
+///
+/// Distinct from [`signature_evidence`] because a structural format is not a
+/// constant at a fixed offset: it is a set of header fields that have to agree
+/// with each other and with the file's length. That reasoning lives once, in
+/// [`crate::disk_format`], and is consumed here rather than duplicated.
+///
+/// The folder alias is passed through so the shared result can be honest about
+/// agreement and conflict; it does not change what the structure itself proves.
+fn structural_format_evidence(
+    path: &Path,
+    trusted: &TrustedRoots,
+    folder_platform: Option<&str>,
+) -> Vec<DetectionEvidence> {
+    use crate::disk_format::{DiskFormatContext, inspect_disk_format};
+
+    let inspected = inspect_disk_format(
+        path,
+        trusted,
+        DiskFormatContext { folder_platform },
+        // Detection is already bounded to a few short reads; no caller has a
+        // cancellation token to give at this point.
+        None,
+    );
+    let (Some(format), Some(platform)) = (inspected.format, inspected.platform) else {
+        // Not recognised, or refused. Either way no claim is made and detection
+        // falls back to folder and extension evidence.
+        return Vec::new();
+    };
+    // One evidence item per structural match, carrying the layer's own verdict on
+    // whether the structure settles the platform.
+    vec![DetectionEvidence {
+        source: DetectionSource::Signature,
+        conclusive: inspected.conclusive,
+        platform,
+        detail: format!(
+            "{} validated from its header structure: {}",
+            format.label(),
+            inspected
+                .evidence
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "structure is internally consistent".to_string())
+        ),
+    }]
 }

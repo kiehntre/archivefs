@@ -67,6 +67,11 @@ pub use library_views::{
 /// The one bounded, read-only file-open policy in this build, shared by
 /// platform signature detection and disc identity so the two cannot drift
 /// apart on symlink handling.
+/// The one read-only disk-image format evidence layer, shared by platform
+/// detection and disc identity so a structural format is recognised the same way
+/// wherever it is asked about.
+pub mod disk_format;
+
 pub mod safe_read;
 
 pub mod platform;
