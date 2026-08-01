@@ -20,9 +20,10 @@ or converted as part of this audit.
 
 The GUI resolution order is deterministic:
 
-1. `<canonical-id>.png` from the explicitly configured custom directory.
+1. `<canonical-id>.png` from ArchiveFS's managed user directory at
+   `~/.local/share/archivefs/platform-artwork/`.
 2. The exact canonical bundled PNG, when one exists.
-3. An intentional category custom PNG, when configured.
+3. An intentional managed category custom PNG, when present.
 4. The native category glyph corresponding to the documented SVG fallback.
 5. The native Unknown glyph.
 

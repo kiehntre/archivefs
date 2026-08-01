@@ -103,6 +103,7 @@ version = "0.7.0"
 dependencies = [
  "encoding_rs",
  "http",
+ "image",
  "libc",
  "log",
  "notify",
@@ -1373,6 +1374,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

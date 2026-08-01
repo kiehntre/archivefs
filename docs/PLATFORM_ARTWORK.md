@@ -12,12 +12,12 @@ and prompts for missing images live in
 
 Artwork resolution is deterministic and strictly ordered:
 
-1. A valid PNG in the explicitly configured custom-artwork directory, named
-   for the resolved exact asset id (or fallback category id).
+1. A valid ArchiveFS-managed custom PNG named for the canonical platform ID.
 2. The exact Platform Artwork Pack v1 PNG compiled into the GUI executable.
-3. The existing category fallback native glyph: console, handheld, computer,
+3. A valid managed custom category PNG, when present.
+4. The existing category fallback native glyph: console, handheld, computer,
    arcade, optical-disc, or cartridge.
-4. The existing Unknown native glyph.
+5. The existing Unknown native glyph.
 
 Compact game-list rows use a related three-step chain: a valid custom
 `game-<normalised-title>.png`, the resolved platform artwork above, then the
@@ -115,26 +115,43 @@ manufacturer approval, or endorsement. They are distributed under the same
 licence terms as the repository's own source unless a future provenance
 record says otherwise.
 
-## Custom artwork directory
+## User-managed artwork
 
-Advanced View → Settings → “5. Platform artwork” accepts an optional local
-directory. Custom PNGs remain higher priority than the bundled pack and
-retain the established safety limits:
+Advanced View → Settings → “5. Platform artwork” manages upgrade-stable user
+artwork under `~/.local/share/archivefs/platform-artwork/`. ArchiveFS never
+writes overrides into its installation or source tree. The manager supports
+search/filter, one explicit platform at a time, confirmed removal, folder
+preview/import, and a read-only rescan. Custom PNGs remain higher priority
+than the bundled pack.
 
-- regular files directly inside the configured directory only; symlinks,
-  invalid ids, and non-files are rejected;
-- PNG only; custom SVG is never parsed;
-- maximum encoded size 1 MiB;
-- maximum dimensions 1024×1024 and maximum decoded allocation 4 MiB;
-- malformed, oversized, missing, or unsupported files fall through safely;
-- successful textures and failed decode fingerprints are cached by directory,
-  asset id, length, and modification time;
-- custom files are read in place and never copied or modified.
+PNG and JPEG inputs are currently decoded by the built-in safe codec set.
+WebP magic is recognised but this build refuses it until the optional WebP
+decoder is available; the original is never altered and the old custom image
+is preserved. All accepted inputs use these limits:
 
-The directory preference is persisted in
-`~/.config/archivefs/platform_artwork_directory.txt` only when explicitly
-changed. Category custom filenames (`console.png`, `handheld.png`, etc.)
-continue to work for platforms without an exact bundled mapping.
+- direct regular input files only; symlinks and non-files are rejected;
+- magic bytes, not the extension, determine PNG/JPEG/WebP format;
+- animation is refused;
+- maximum encoded size 32 MiB, maximum dimension 8192px, and maximum decoded
+  area 40 million pixels;
+- images are aspect-fitted, centred, and atomically published as a clean
+  1024×1024 PNG with no imported metadata;
+- images smaller than the content area are not upscaled and produce a warning;
+- malformed or failed replacements leave the preceding custom image intact;
+- rendering caches length and modification time and is invalidated immediately
+  after a managed change.
+
+Bulk import accepts only exact lowercase canonical filenames with `.png`,
+`.jpg`, `.jpeg`, or `.webp`; unknown names and duplicate targets remain in a
+review list and are never silently assigned. Dry-run validates everything
+without creating the managed directory. Category custom filenames
+(`console.png`, `handheld.png`, etc.) remain a supported manual fallback when
+placed in the managed folder and validated by Rescan.
+
+The same operations are available through `archivefs-cli platform-artwork`.
+No artwork command uses the network, database, ROM library, or emulator
+profiles. Removing or restoring default artwork removes only ArchiveFS's
+normalised managed copy, never the source selected during import.
 
 ## SVG/category fallbacks
 

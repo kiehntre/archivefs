@@ -3533,18 +3533,41 @@ struct ArchiveFsApp {
     confirm_bulk_platform_action: Option<(Vec<PathBuf>, BulkPlatformActionKind)>,
     focus_bulk_platform_cancel: bool,
     bulk_platform_action_typed_count: String,
-    /// docs/PLATFORM_ARTWORK.md's custom-override directory - `None`
-    /// means built-in artwork only. Persisted independently (see
-    /// `load_custom_platform_artwork_directory`/
-    /// `save_custom_platform_artwork_directory`).
+    /// ArchiveFS-owned, upgrade-stable custom artwork directory. `None` is
+    /// possible only when the operating-system data root cannot be resolved.
     custom_platform_artwork_directory: Option<PathBuf>,
     /// Decoded local artwork and failed-decode fingerprints for this
     /// session. It is invalidated by directory or file-metadata changes.
     platform_artwork_cache: PlatformArtworkCache,
-    /// The Settings page's in-progress text-field value for the above -
-    /// never persisted directly; only what's confirmed via "Use this
-    /// directory" is.
-    custom_platform_artwork_directory_text: String,
+    platform_artwork_manager: PlatformArtworkManagerState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ArtworkManagerFilter {
+    #[default]
+    All,
+    Missing,
+    Custom,
+    FallbackOnly,
+}
+
+enum PlatformArtworkTaskResult {
+    Status(Result<archivefs_core::platform_artwork::PlatformArtworkStatus, String>),
+    Mutation(Result<String, String>),
+    BulkPreview(Result<archivefs_core::platform_artwork::BulkArtworkPreview, String>),
+}
+
+#[derive(Default)]
+struct PlatformArtworkManagerState {
+    search: String,
+    filter: ArtworkManagerFilter,
+    status: Option<archivefs_core::platform_artwork::PlatformArtworkStatus>,
+    bulk_preview: Option<archivefs_core::platform_artwork::BulkArtworkPreview>,
+    replace_existing: bool,
+    pending_import: Option<(String, PathBuf)>,
+    pending_remove: Option<String>,
+    message: Option<(bool, String)>,
+    task: Option<mpsc::Receiver<PlatformArtworkTaskResult>>,
 }
 
 impl ArchiveFsApp {
@@ -3696,11 +3719,10 @@ impl ArchiveFsApp {
             confirm_bulk_platform_action: None,
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
-            custom_platform_artwork_directory: load_custom_platform_artwork_directory(),
+            custom_platform_artwork_directory:
+                archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
             platform_artwork_cache: PlatformArtworkCache::default(),
-            custom_platform_artwork_directory_text: load_custom_platform_artwork_directory()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+            platform_artwork_manager: PlatformArtworkManagerState::default(),
         }
     }
 
@@ -11167,8 +11189,142 @@ impl Drop for ArchiveFsApp {
 }
 
 impl ArchiveFsApp {
+    fn start_platform_artwork_task(
+        &mut self,
+        context: egui::Context,
+        action: PlatformArtworkManagerAction,
+    ) {
+        if self.platform_artwork_manager.task.is_some() {
+            return;
+        }
+        let Some(root) = self.custom_platform_artwork_directory.clone() else {
+            self.platform_artwork_manager.message = Some((
+                false,
+                "ArchiveFS could not resolve its local data directory.".to_owned(),
+            ));
+            return;
+        };
+        if matches!(action, PlatformArtworkManagerAction::OpenFolder) {
+            if let Err(error) = std::fs::create_dir_all(&root)
+                .map_err(ArchiveFsError::from)
+                .and_then(|()| open_folder_in_file_manager(&root))
+            {
+                self.platform_artwork_manager.message = Some((false, error.to_string()));
+            }
+            return;
+        }
+        let preview = self.platform_artwork_manager.bulk_preview.clone();
+        let replace = self.platform_artwork_manager.replace_existing;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            use archivefs_core::platform_artwork as artwork;
+            let result = match action {
+                PlatformArtworkManagerAction::Rescan => PlatformArtworkTaskResult::Status(
+                    artwork::inspect_platform_artwork(&root).map_err(|error| error.to_string()),
+                ),
+                PlatformArtworkManagerAction::Import {
+                    platform_id,
+                    source,
+                } => PlatformArtworkTaskResult::Mutation(
+                    artwork::import_platform_artwork(&root, &platform_id, &source, replace)
+                        .map(|result| {
+                            format!(
+                                "Imported {} as {}{}.",
+                                platform_id,
+                                result.destination.display(),
+                                result
+                                    .warnings
+                                    .first()
+                                    .map(|warning| format!(" Warning: {warning}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .map_err(|error| error.to_string()),
+                ),
+                PlatformArtworkManagerAction::PreviewFolder(source) => {
+                    PlatformArtworkTaskResult::BulkPreview(
+                        artwork::preview_import_folder(&root, &source)
+                            .map_err(|error| error.to_string()),
+                    )
+                }
+                PlatformArtworkManagerAction::ApplyFolder => PlatformArtworkTaskResult::Mutation(
+                    preview
+                        .ok_or_else(|| "Run folder preview before importing.".to_owned())
+                        .and_then(|preview| {
+                            artwork::apply_import_folder(&root, &preview, replace)
+                                .map_err(|error| error.to_string())
+                        })
+                        .map(|result| {
+                            format!(
+                                "Imported {} image(s); {} item(s) remained for review.",
+                                result.imported.len(),
+                                result.skipped.len()
+                            )
+                        }),
+                ),
+                PlatformArtworkManagerAction::Remove(platform_id) => {
+                    PlatformArtworkTaskResult::Mutation(
+                        artwork::remove_custom_platform_artwork(&root, &platform_id, true)
+                            .map(|removed| {
+                                if removed {
+                                    format!("Restored the default artwork for {platform_id}.")
+                                } else {
+                                    format!("No custom artwork existed for {platform_id}.")
+                                }
+                            })
+                            .map_err(|error| error.to_string()),
+                    )
+                }
+                PlatformArtworkManagerAction::OpenFolder => unreachable!(),
+            };
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+        self.platform_artwork_manager.task = Some(receiver);
+    }
+
+    fn poll_platform_artwork_task(&mut self, context: &egui::Context) {
+        let Some(receiver) = &self.platform_artwork_manager.task else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.platform_artwork_manager.task = None;
+        match result {
+            PlatformArtworkTaskResult::Status(result) => match result {
+                Ok(status) => {
+                    self.platform_artwork_manager.status = Some(status);
+                }
+                Err(error) => self.platform_artwork_manager.message = Some((false, error)),
+            },
+            PlatformArtworkTaskResult::BulkPreview(result) => match result {
+                Ok(preview) => {
+                    self.platform_artwork_manager.bulk_preview = Some(preview);
+                    self.platform_artwork_manager.message = Some((
+                        true,
+                        "Folder preview complete; nothing was written.".to_owned(),
+                    ));
+                }
+                Err(error) => self.platform_artwork_manager.message = Some((false, error)),
+            },
+            PlatformArtworkTaskResult::Mutation(result) => {
+                self.platform_artwork_cache.clear();
+                self.platform_artwork_manager.message = Some(match result {
+                    Ok(message) => (true, message),
+                    Err(error) => (false, error),
+                });
+                self.start_platform_artwork_task(
+                    context.clone(),
+                    PlatformArtworkManagerAction::Rescan,
+                );
+            }
+        }
+    }
+
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.reconcile_library_tab();
+        self.poll_platform_artwork_task(context);
         self.poll_shared_history();
         // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
         // mandatory risk #2) drives this exact same `shared_rollback` state
@@ -12407,6 +12563,14 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::Settings {
+                    if self.platform_artwork_manager.status.is_none()
+                        && self.platform_artwork_manager.task.is_none()
+                    {
+                        self.start_platform_artwork_task(
+                            context.clone(),
+                            PlatformArtworkManagerAction::Rescan,
+                        );
+                    }
                     let mount_root = match &self.state {
                         LoadState::Ready(data) => Some(data.mount_root.as_path()),
                         _ => None,
@@ -12419,8 +12583,9 @@ impl ArchiveFsApp {
                         mount_root,
                         busy,
                         &mut self.clipboard,
-                        &mut self.custom_platform_artwork_directory,
-                        &mut self.custom_platform_artwork_directory_text,
+                        self.custom_platform_artwork_directory.as_deref(),
+                        &mut self.platform_artwork_cache,
+                        &mut self.platform_artwork_manager,
                     );
                     match action {
                         Some(SettingsPageAction::OpenConfigFolder) => {
@@ -12436,11 +12601,8 @@ impl ArchiveFsApp {
                         Some(SettingsPageAction::RescanRetroArchProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
                         }
-                        Some(SettingsPageAction::CustomArtworkDirectoryChanged) => {
-                            self.platform_artwork_cache.clear();
-                            save_custom_platform_artwork_directory(
-                                self.custom_platform_artwork_directory.as_deref(),
-                            );
+                        Some(SettingsPageAction::PlatformArtwork(action)) => {
+                            self.start_platform_artwork_task(context.clone(), action);
                         }
                         None => {}
                     }
@@ -28145,11 +28307,367 @@ enum SettingsPageAction {
     ValidateConfiguration,
     OpenDiagnostics,
     RescanRetroArchProfiles,
-    /// The custom platform artwork directory field changed (set or
-    /// cleared) - persist it. Never touched on any frame the field
-    /// wasn't actually edited, matching "persist only on an explicit
-    /// mode change" (the same rule `GuiMode` already follows).
-    CustomArtworkDirectoryChanged,
+    PlatformArtwork(PlatformArtworkManagerAction),
+}
+
+enum PlatformArtworkManagerAction {
+    Rescan,
+    Import {
+        platform_id: String,
+        source: PathBuf,
+    },
+    PreviewFolder(PathBuf),
+    ApplyFolder,
+    Remove(String),
+    OpenFolder,
+}
+
+fn current_artwork_source(
+    root: Option<&Path>,
+    platform_id: &str,
+    status: Option<&archivefs_core::platform_artwork::PlatformArtworkStatus>,
+) -> (&'static str, bool) {
+    let is_valid = |path: &Path| {
+        !status.is_some_and(|status| {
+            status
+                .invalid_custom_files
+                .iter()
+                .any(|invalid| invalid.path == path)
+        })
+    };
+    let asset_id = canonical_platform_asset_id(platform_id);
+    if custom_platform_artwork_path(root, &asset_id).is_some_and(|path| is_valid(&path)) {
+        return ("Custom", true);
+    }
+    if bundled_platform_artwork(&asset_id).is_some() {
+        return ("Bundled", false);
+    }
+    let category = platform_asset_category(platform_id);
+    if category != PlatformAssetCategory::Unknown
+        && custom_platform_artwork_path(root, category.asset_id())
+            .is_some_and(|path| is_valid(&path))
+    {
+        return ("Category fallback (custom)", false);
+    }
+    if category == PlatformAssetCategory::Unknown {
+        ("Unknown fallback", false)
+    } else {
+        ("Category fallback", false)
+    }
+}
+
+fn show_platform_artwork_manager(
+    ui: &mut egui::Ui,
+    root: Option<&Path>,
+    artwork_cache: &mut PlatformArtworkCache,
+    manager: &mut PlatformArtworkManagerState,
+    action: &mut Option<SettingsPageAction>,
+) {
+    let running = manager.task.is_some();
+    widgets::card(ui, |ui| {
+        ui.label(format!(
+            "Managed folder: {}",
+            root.map_or_else(
+                || "Unavailable".to_owned(),
+                |path| path.display().to_string()
+            )
+        ));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Open artwork folder"))
+                .clicked()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::OpenFolder,
+                ));
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Rescan custom artwork"))
+                .clicked()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::Rescan,
+                ));
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Preview folder import"))
+                .clicked()
+                && let Some(folder) = rfd::FileDialog::new().pick_folder()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::PreviewFolder(folder),
+                ));
+            }
+            if running {
+                ui.spinner();
+                ui.label("Validating artwork…");
+            }
+        });
+        if let Some((succeeded, message)) = &manager.message {
+            widgets::banner(
+                ui,
+                if *succeeded {
+                    "Artwork updated"
+                } else {
+                    "Artwork error"
+                },
+                message,
+                if *succeeded {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+        }
+        if let Some(status) = &manager.status {
+            ui.label(format!(
+                "{} canonical platforms · {} custom · {} bundled · {} fallback-only · {} invalid · {} unknown · {} bytes",
+                status.total_canonical_platforms,
+                status.custom_images,
+                status.bundled_images,
+                status.fallback_only_platforms,
+                status.invalid_custom_files.len(),
+                status.unknown_files.len(),
+                status.total_custom_disk_bytes
+            ));
+            if !status.invalid_custom_files.is_empty() || !status.unknown_files.is_empty() {
+                ui.collapsing("Invalid and unknown files", |ui| {
+                    for invalid in &status.invalid_custom_files {
+                        ui.label(format!(
+                            "Invalid: {} — {}",
+                            invalid.path.display(),
+                            invalid.reason
+                        ));
+                    }
+                    for unknown in &status.unknown_files {
+                        ui.label(format!("Unknown: {}", unknown.display()));
+                    }
+                    ui.weak("Rescan never deletes these files.");
+                });
+            }
+        }
+        if let Some(preview) = &manager.bulk_preview {
+            let recognised = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::Recognised
+                })
+                .count();
+            let unknown = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::UnknownFilename
+                })
+                .count();
+            let invalid = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::Invalid
+                })
+                .count();
+            let duplicates = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::DuplicateTarget
+                })
+                .count();
+            ui.separator();
+            ui.label(format!("Folder preview: {recognised} recognised · {unknown} unknown · {invalid} invalid · {duplicates} duplicate target(s)."));
+            for entry in preview.entries.iter().take(10) {
+                ui.label(format!(
+                    "{:?}: {} — {}",
+                    entry.disposition,
+                    entry.source.display(),
+                    entry.detail
+                ));
+            }
+            if preview.entries.len() > 10 {
+                ui.collapsing(
+                    format!("Show all {} reviewed files", preview.entries.len()),
+                    |ui| {
+                        for entry in &preview.entries {
+                            ui.label(format!(
+                                "{:?}: {}",
+                                entry.disposition,
+                                entry.source.display()
+                            ));
+                        }
+                    },
+                );
+            }
+            ui.checkbox(
+                &mut manager.replace_existing,
+                "Replace existing custom artwork after confirmation",
+            );
+            if ui
+                .add_enabled(
+                    !running && recognised > 0,
+                    egui::Button::new("Import recognised images"),
+                )
+                .clicked()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::ApplyFolder,
+                ));
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Search platforms:");
+        ui.text_edit_singleline(&mut manager.search);
+        egui::ComboBox::from_id_salt("platform_artwork_filter")
+            .selected_text(match manager.filter {
+                ArtworkManagerFilter::All => "All platforms",
+                ArtworkManagerFilter::Missing => "Missing artwork",
+                ArtworkManagerFilter::Custom => "Custom artwork",
+                ArtworkManagerFilter::FallbackOnly => "Fallback only",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::All,
+                    "All platforms",
+                );
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::Missing,
+                    "Missing artwork",
+                );
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::Custom,
+                    "Custom artwork",
+                );
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::FallbackOnly,
+                    "Fallback only",
+                );
+            });
+    });
+
+    let search = manager.search.trim().to_ascii_lowercase();
+    for platform in archivefs_core::platform::PLATFORMS {
+        let (source_label, custom) =
+            current_artwork_source(root, platform.id, manager.status.as_ref());
+        let fallback = source_label.contains("fallback");
+        let missing = bundled_platform_artwork(&canonical_platform_asset_id(platform.id)).is_none()
+            && !custom;
+        if !search.is_empty()
+            && !platform.display_name.to_ascii_lowercase().contains(&search)
+            && !platform.id.to_ascii_lowercase().contains(&search)
+        {
+            continue;
+        }
+        if !match manager.filter {
+            ArtworkManagerFilter::All => true,
+            ArtworkManagerFilter::Missing => missing,
+            ArtworkManagerFilter::Custom => custom,
+            ArtworkManagerFilter::FallbackOnly => fallback,
+        } {
+            continue;
+        }
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (response, _) =
+                    ui.allocate_painter(egui::vec2(72.0, 72.0), egui::Sense::hover());
+                let asset_id = canonical_platform_asset_id(platform.id);
+                paint_platform_artwork_at(
+                    ui,
+                    artwork_cache,
+                    root,
+                    PlatformArtworkPaint {
+                        center: response.rect.center(),
+                        size: 64.0,
+                        color: ui.visuals().text_color().gamma_multiply(0.8),
+                        asset_id: &asset_id,
+                        fallback_asset_id: platform_asset_category(platform.id).asset_id(),
+                    },
+                );
+                ui.vertical(|ui| {
+                    ui.heading(platform.display_name);
+                    ui.label(format!("Canonical ID: {}", platform.id));
+                    ui.label(format!("Current source: {source_label}"));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(!running, egui::Button::new("Choose image"))
+                            .clicked()
+                            && let Some(source) = rfd::FileDialog::new()
+                                .add_filter("Static image", &["png", "jpg", "jpeg", "webp"])
+                                .pick_file()
+                        {
+                            if custom {
+                                manager.pending_import = Some((platform.id.to_owned(), source));
+                            } else {
+                                manager.replace_existing = false;
+                                *action = Some(SettingsPageAction::PlatformArtwork(
+                                    PlatformArtworkManagerAction::Import {
+                                        platform_id: platform.id.to_owned(),
+                                        source,
+                                    },
+                                ));
+                            }
+                        }
+                        if let Some((pending_platform, _)) = &manager.pending_import
+                            && pending_platform == platform.id
+                        {
+                            ui.label("Replace the existing custom image?");
+                            if ui
+                                .add_enabled(!running, egui::Button::new("Confirm replacement"))
+                                .clicked()
+                                && let Some((platform_id, source)) = manager.pending_import.take()
+                            {
+                                manager.replace_existing = true;
+                                *action = Some(SettingsPageAction::PlatformArtwork(
+                                    PlatformArtworkManagerAction::Import {
+                                        platform_id,
+                                        source,
+                                    },
+                                ));
+                            }
+                            if ui.button("Cancel replacement").clicked() {
+                                manager.pending_import = None;
+                            }
+                        }
+                        if custom
+                            && manager.pending_remove.as_deref() != Some(platform.id)
+                            && ui
+                                .add_enabled(!running, egui::Button::new("Remove custom image"))
+                                .clicked()
+                        {
+                            manager.pending_remove = Some(platform.id.to_owned());
+                        }
+                        if manager.pending_remove.as_deref() == Some(platform.id) {
+                            ui.label("Remove ArchiveFS's custom copy?");
+                            if ui
+                                .add_enabled(!running, egui::Button::new("Confirm restore default"))
+                                .clicked()
+                            {
+                                manager.pending_remove = None;
+                                *action = Some(SettingsPageAction::PlatformArtwork(
+                                    PlatformArtworkManagerAction::Remove(platform.id.to_owned()),
+                                ));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                manager.pending_remove = None;
+                            }
+                        }
+                    });
+                });
+            });
+        });
+        ui.add_space(4.0);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28161,8 +28679,9 @@ fn show_settings_page(
     mount_root: Option<&Path>,
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
-    custom_artwork_directory: &mut Option<PathBuf>,
-    custom_artwork_directory_text: &mut String,
+    custom_artwork_directory: Option<&Path>,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_manager: &mut PlatformArtworkManagerState,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
     widgets::page_header(
@@ -28429,59 +28948,18 @@ fn show_settings_page(
         ui,
         "5. Platform artwork",
         Some(
-            "ArchiveFS ships its own original, offline platform artwork - no image is ever \
-             downloaded. Optionally point at a folder of your own PNG files, named by canonical \
-             platform identifier (e.g. gamecube.png); a missing or invalid file falls back to the \
-             built-in artwork. See docs/PLATFORM_ARTWORK.md.",
+            "Manage local, upgrade-stable artwork overrides. ArchiveFS never identifies a machine \
+             from its picture: choose the canonical platform explicitly. Imports are normalised \
+             off the UI thread and never overwrite the selected original.",
         ),
     );
-    widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Custom artwork directory:");
-            ui.text_edit_singleline(custom_artwork_directory_text);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Use this directory").clicked()
-                && !custom_artwork_directory_text.trim().is_empty()
-            {
-                *custom_artwork_directory =
-                    Some(PathBuf::from(custom_artwork_directory_text.trim()));
-                action = Some(SettingsPageAction::CustomArtworkDirectoryChanged);
-            }
-            if ui
-                .add_enabled(
-                    custom_artwork_directory.is_some(),
-                    egui::Button::new("Use built-in only"),
-                )
-                .clicked()
-            {
-                *custom_artwork_directory = None;
-                custom_artwork_directory_text.clear();
-                action = Some(SettingsPageAction::CustomArtworkDirectoryChanged);
-            }
-        });
-        match custom_artwork_directory {
-            Some(directory) => {
-                let gamecube_resolved =
-                    custom_platform_artwork_path(Some(directory), "gamecube").is_some();
-                ui.horizontal(|ui| {
-                    paint_platform_glyph(ui, "gamecube", 28.0);
-                    ui.label(format!(
-                        "Currently: {}. Example check (gamecube.png): {}.",
-                        directory.display(),
-                        if gamecube_resolved {
-                            "found - used in Gamer View when valid"
-                        } else {
-                            "not found - built-in artwork will be used"
-                        }
-                    ));
-                });
-            }
-            None => {
-                ui.weak("Currently: built-in artwork only.");
-            }
-        }
-    });
+    show_platform_artwork_manager(
+        ui,
+        custom_artwork_directory,
+        artwork_cache,
+        artwork_manager,
+        &mut action,
+    );
 
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(ui, "6. Intentionally unavailable", None);
@@ -33729,46 +34207,6 @@ fn save_gui_mode(mode: GuiMode) {
     let _ = std::fs::write(path, gui_mode_file_contents(mode));
 }
 
-/// The custom platform artwork directory preference - its own small file,
-/// following the exact same precedent as `gui_mode_config_path` (and, in
-/// turn, `~/.config/archivefs/emulator_profiles.toml`): a dedicated file
-/// per preference rather than a shared one, so one preference's write
-/// can never race or corrupt another's.
-fn platform_artwork_directory_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("archivefs")
-            .join("platform_artwork_directory.txt"),
-    )
-}
-
-/// A missing file, or one containing only whitespace, means "no custom
-/// directory configured" - not an error.
-fn load_custom_platform_artwork_directory() -> Option<PathBuf> {
-    let path = platform_artwork_directory_config_path()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    let trimmed = contents.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
-}
-
-/// Best-effort, matching `save_gui_mode`: a failure to persist never
-/// blocks the in-memory setting from taking effect for the rest of the
-/// session.
-fn save_custom_platform_artwork_directory(directory: Option<&Path>) {
-    let Some(path) = platform_artwork_directory_config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let contents = directory
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
-    let _ = std::fs::write(path, contents);
-}
-
 /// Gamer View's plain-language primary-action state for a selected game -
 /// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
 /// `MountState` variant name (finding #4); Advanced View keeps the
@@ -34533,7 +34971,7 @@ fn bundled_platform_artwork(asset_id: &str) -> Option<BundledPlatformArtwork> {
         .find(|artwork| artwork.asset_id == asset_id)
 }
 
-const MAX_CUSTOM_ARTWORK_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CUSTOM_ARTWORK_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CUSTOM_ARTWORK_DIMENSION: u32 = 1024;
 const MAX_CUSTOM_ARTWORK_DECODE_BYTES: u64 =
     MAX_CUSTOM_ARTWORK_DIMENSION as u64 * MAX_CUSTOM_ARTWORK_DIMENSION as u64 * 4;
@@ -34851,18 +35289,6 @@ fn inspect_platform_png(bytes: &[u8]) -> Result<PlatformPngInspection, &'static 
         has_transparent_pixel,
         warnings,
     })
-}
-
-/// Draws a small original vector fallback glyph for `asset_id` directly
-/// with egui's painter. Falls back to the Unknown glyph for any id it doesn't
-/// recognise, so a damaged or unrecognised custom-override asset id
-/// never renders as nothing at all (decision: "missing or damaged assets
-/// fail gracefully to the fallback icon").
-fn paint_platform_glyph(ui: &mut egui::Ui, asset_id: &str, size: f32) -> egui::Response {
-    let (response, painter) = ui.allocate_painter(egui::vec2(size, size), egui::Sense::hover());
-    let color = ui.visuals().text_color().gamma_multiply(0.8);
-    paint_platform_glyph_at(&painter, response.rect.center(), size, color, asset_id);
-    response
 }
 
 /// The allocation-free core of `paint_platform_glyph`, so a caller that
@@ -38001,6 +38427,31 @@ mod tests {
             "a directory with no matching file must fall back to None (built-in artwork)"
         );
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn managed_artwork_source_order_is_custom_bundled_custom_category_then_category() {
+        let temp = artwork_test_directory("source-priority");
+        assert_eq!(
+            current_artwork_source(Some(&temp), "PS2", None),
+            ("Bundled", false)
+        );
+        write_test_png(&temp.join("ps2.png"), 2, 2, [1, 2, 3, 255]);
+        assert_eq!(
+            current_artwork_source(Some(&temp), "PS2", None),
+            ("Custom", true)
+        );
+        write_test_png(&temp.join("console.png"), 2, 2, [1, 2, 3, 255]);
+        assert_eq!(
+            current_artwork_source(Some(&temp), "NES", None),
+            ("Category fallback (custom)", false)
+        );
+        std::fs::remove_file(temp.join("console.png")).unwrap();
+        assert_eq!(
+            current_artwork_source(Some(&temp), "NES", None),
+            ("Category fallback", false)
+        );
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -46624,7 +47075,7 @@ $Instant Growth [Nayr]\n";
             // this test-only constructor - never a real disk read.
             custom_platform_artwork_directory: None,
             platform_artwork_cache: PlatformArtworkCache::default(),
-            custom_platform_artwork_directory_text: String::new(),
+            platform_artwork_manager: PlatformArtworkManagerState::default(),
         }
     }
 
