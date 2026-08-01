@@ -3049,3 +3049,225 @@ fn an_endless_run_of_oversized_responses_is_abandoned() {
     );
     assert!(failure.previous_cache_preserved());
 }
+
+// --- Local presence, and explaining a stale population --------------------
+//
+// A real import produced 10,081 stale records. Grouping them showed that 79% were
+// flagged missing by RomM itself and 18% were links whose targets had gone - but
+// also that 214 were present as *directories*, and every one of those was being
+// reported as "does not exist". These tests pin the classification that fixed it.
+
+#[test]
+fn local_presence_tells_the_cases_apart() {
+    let tree = Tree::new("presence");
+    let file = tree.file("nes/game.zip", b"bytes");
+    assert_eq!(LocalPresence::observe(&file), LocalPresence::File);
+
+    let directory = tree.library().join("dc/Shenmue");
+    std::fs::create_dir_all(&directory).expect("fixture");
+    assert_eq!(
+        LocalPresence::observe(&directory),
+        LocalPresence::Directory,
+        "a folder-based game is present, not missing"
+    );
+
+    let absent = tree.library().join("nes/gone.zip");
+    assert_eq!(LocalPresence::observe(&absent), LocalPresence::Absent);
+
+    let orphan = tree.library().join("nes/no-such-folder/game.zip");
+    assert_eq!(
+        LocalPresence::observe(&orphan),
+        LocalPresence::ParentAbsent,
+        "a whole collection missing is worth telling apart from one file missing"
+    );
+
+    let dangling = tree.library().join("nes/dangling.zip");
+    std::os::unix::fs::symlink(tree.library().join("nes/nothing.zip"), &dangling).expect("fixture");
+    assert_eq!(
+        LocalPresence::observe(&dangling),
+        LocalPresence::DanglingSymlink
+    );
+
+    // A symlink is judged by what it leads to, which is what the library's own
+    // symlink farms require.
+    let to_file = tree.library().join("nes/link-to-file.zip");
+    std::os::unix::fs::symlink(&file, &to_file).expect("fixture");
+    assert_eq!(LocalPresence::observe(&to_file), LocalPresence::File);
+    let to_dir = tree.library().join("nes/link-to-dir");
+    std::os::unix::fs::symlink(&directory, &to_dir).expect("fixture");
+    assert_eq!(LocalPresence::observe(&to_dir), LocalPresence::Directory);
+}
+
+#[test]
+fn a_present_directory_is_not_described_as_missing() {
+    let path = Path::new("/mnt/games/roms/dc/Shenmue");
+    let detail = LocalPresence::Directory.stale_detail(path);
+    assert!(
+        !detail.contains("does not exist"),
+        "a directory that is right there must not be called missing: {detail}"
+    );
+    assert!(detail.contains("is a directory"), "{detail}");
+    assert!(
+        detail.contains("no single file to compare"),
+        "it should say why that stops a match: {detail}"
+    );
+
+    // The other cases still say what they always said.
+    assert!(
+        LocalPresence::Absent
+            .stale_detail(path)
+            .contains("does not exist")
+    );
+    assert!(
+        LocalPresence::DanglingSymlink
+            .stale_detail(path)
+            .contains("target no longer exists")
+    );
+    assert!(
+        LocalPresence::ParentAbsent
+            .stale_detail(path)
+            .contains("neither does the folder")
+    );
+}
+
+/// Matching a record whose local path is a directory: still stale, because no file
+/// could be compared - but the reason is now the truth.
+#[test]
+fn matching_a_directory_backed_game_reports_it_accurately() {
+    let tree = Tree::new("presence-matching");
+    let directory = tree.library().join("dc/Shenmue");
+    std::fs::create_dir_all(&directory).expect("fixture");
+    std::fs::write(directory.join("Shenmue_Disc1.cdi"), b"disc").expect("fixture");
+
+    let mut record = record_for("http://romm:8080", "1", Some(directory.clone()));
+    record.provider_path = "roms/dc/Shenmue".to_string();
+    record.file_size_bytes = Some(0);
+
+    let facts = LocalFileFacts::observe(&directory);
+    assert_eq!(facts.presence, LocalPresence::Directory);
+    assert!(!facts.exists(), "a directory yields no file fingerprint");
+
+    let outcome = match_record(
+        &record,
+        &facts,
+        &PathClaims::of(std::slice::from_ref(&record)),
+        &LocalHashCache::new(),
+    );
+    // The verdict is unchanged: no file was compared, so nothing was verified.
+    assert_eq!(outcome.verification, ExternalVerification::Stale);
+    assert!(!outcome.hash_compared);
+    let evidence = outcome.evidence.join(" | ");
+    assert!(
+        !evidence.contains("does not exist"),
+        "the old message was factually wrong here: {evidence}"
+    );
+    assert!(evidence.contains("is a directory"), "{evidence}");
+}
+
+/// A stale summary partitions the population exactly and stays bounded.
+#[test]
+fn a_stale_summary_partitions_the_population_and_stays_bounded() {
+    use crate::identity_source::stale::{MAX_GROUPS, StaleSummary};
+
+    let tree = Tree::new("stale-summary");
+    let mut records = Vec::new();
+    // Twenty platforms, so the group lists have to truncate.
+    for index in 0..20 {
+        for copy in 0..3 {
+            let mut record = record_for(
+                "http://romm:8080",
+                &format!("{index}-{copy}"),
+                Some(tree.library().join(format!("p{index}/game.zip"))),
+            );
+            record.provider_path = format!("roms/p{index}/game.zip");
+            record.platform_candidate = Some(format!("Platform {index}"));
+            record.verification = ExternalVerification::Stale;
+            if copy == 0 {
+                record
+                    .evidence
+                    .push("RomM reports this file as missing from its own filesystem".to_string());
+            }
+            if copy == 1 {
+                record.related_files = vec!["a".to_string(), "b".to_string()];
+            }
+            records.push(record);
+        }
+    }
+    // One matched record, which must be excluded entirely.
+    let mut matched = record_for("http://romm:8080", "matched", None);
+    matched.provider_path = "roms/p0/present.zip".to_string();
+    matched.verification = ExternalVerification::StrongExternal;
+    records.push(matched);
+
+    let cache = cache_with(records, "http://romm:8080");
+    let mappings = vec![("roms".to_string(), tree.library().display().to_string())];
+    // A pure probe: every path is reported absent, so no filesystem is involved.
+    let summary = StaleSummary::build(&cache, &mappings, 2, |_| LocalPresence::Absent);
+
+    assert_eq!(summary.total_in_cache, 61);
+    assert_eq!(summary.stale, 60, "the matched record must not be counted");
+    assert_eq!(
+        summary.by_reason.iter().map(|r| r.count).sum::<usize>(),
+        60,
+        "the reasons must partition the population exactly"
+    );
+    assert_eq!(summary.romm_reports_missing, 20);
+    assert_eq!(
+        summary.multi_file, 20,
+        "only records listing two or more files count as multi-file"
+    );
+    assert_eq!(summary.unmapped, 0);
+
+    // Bounded: twelve groups at most, and the tail is stated.
+    assert_eq!(summary.by_platform.len(), MAX_GROUPS);
+    assert_eq!(summary.platforms_not_listed, 20 - MAX_GROUPS);
+    assert_eq!(summary.by_romm_prefix.len(), MAX_GROUPS);
+    assert_eq!(summary.romm_prefixes_not_listed, 20 - MAX_GROUPS);
+    // Examples are bounded by the caller's limit.
+    for reason in &summary.by_reason {
+        assert!(reason.examples.len() <= 2, "{:?}", reason.examples.len());
+    }
+    // Every stale record came through the one configured mapping.
+    assert_eq!(summary.by_mapping.len(), 1);
+    assert_eq!(summary.by_mapping[0].count, 60);
+    assert!(summary.by_mapping[0].key.starts_with("roms ->"));
+}
+
+/// The drift verdict: what it says, and when it declines to say it.
+#[test]
+fn the_drift_verdict_follows_what_explains_the_population() {
+    use crate::identity_source::stale::StaleSummary;
+
+    let tree = Tree::new("stale-verdict");
+    let build = |flagged: usize, total: usize, presence: LocalPresence| {
+        let mut records = Vec::new();
+        for index in 0..total {
+            let mut record = record_for(
+                "http://romm:8080",
+                &format!("{index}"),
+                Some(tree.library().join("nes/game.zip")),
+            );
+            record.verification = ExternalVerification::Stale;
+            if index < flagged {
+                record
+                    .evidence
+                    .push("RomM reports this file as missing from its own filesystem".to_string());
+            }
+            records.push(record);
+        }
+        let cache = cache_with(records, "http://romm:8080");
+        StaleSummary::build(&cache, &[], 1, move |_| presence)
+    };
+
+    // Everything flagged by RomM: drift.
+    assert!(build(100, 100, LocalPresence::Absent).looks_like_drift());
+    // Nothing flagged, but every path a dead link: still drift, and still not a
+    // mapping fault.
+    assert!(build(0, 100, LocalPresence::DanglingSymlink).looks_like_drift());
+    // Half explained: not drift, and worth looking at the mappings.
+    assert!(!build(50, 100, LocalPresence::Absent).looks_like_drift());
+    // Nothing explained at all - the shape a real mapping fault would take.
+    assert!(!build(0, 100, LocalPresence::Absent).looks_like_drift());
+    // An empty population is not a problem to report.
+    assert!(build(0, 0, LocalPresence::Absent).looks_like_drift());
+}

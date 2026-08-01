@@ -39,6 +39,7 @@ use archivefs_core::identity_source::settings::{
     ProviderSettings, SUGGESTED_TOKEN_PATH, SettingsLocation, default_identity_root,
     load_token_file,
 };
+use archivefs_core::identity_source::stale::{DEFAULT_EXAMPLES, StaleSummary};
 use archivefs_core::identity_source::status::{IdentitySourceApi, ProviderStatus, RefreshRequest};
 use archivefs_core::safe_read::TrustedRoots;
 use serde::Serialize;
@@ -54,6 +55,7 @@ pub const COMMANDS: &[&str] = &[
     "records",
     "record",
     "conflicts",
+    "stale-summary",
     "verify-hash",
     "enable",
     "disable",
@@ -122,6 +124,7 @@ fn dispatch(
         "records" => records(&context, args),
         "record" => record(&context, args),
         "conflicts" => conflicts(&context, args),
+        "stale-summary" => stale_summary(&context, args),
         "verify-hash" => verify_hash(&context, args),
         "enable" => {
             reject_extra(&args, "enable")?;
@@ -2687,3 +2690,158 @@ pub fn run_captured(args: &[&str], source_roots: &[&std::path::Path]) -> Capture
 
 #[cfg(test)]
 mod tests;
+
+// --- stale-summary --------------------------------------------------------
+
+/// Explains the stale population rather than just counting it.
+///
+/// Reads the published cache and probes each translated path's metadata. Makes no
+/// network request, hashes nothing, and writes nothing.
+fn stale_summary(
+    context: &Context,
+    mut args: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let examples = take_number(&mut args, "--examples")?.unwrap_or(DEFAULT_EXAMPLES);
+    reject_extra(&args, "stale-summary")?;
+    let settings = context.load_settings()?;
+    let cache = open_cache_for_reading(context)?;
+
+    // The mappings as configured, so each group can name the rule that produced it.
+    let mappings: Vec<(String, String)> = settings
+        .source
+        .mappings
+        .iter()
+        .map(|mapping| {
+            (
+                mapping.provider_prefix.clone(),
+                mapping.archivefs_prefix.display().to_string(),
+            )
+        })
+        .collect();
+
+    context.progress("Checking each stale record's path (metadata only)...");
+    let summary = StaleSummary::build(
+        &cache,
+        &mappings,
+        examples,
+        archivefs_core::identity_source::matching::LocalPresence::observe,
+    );
+
+    context.emit(&summary, || {
+        let share = |count: usize| -> String {
+            if summary.stale == 0 {
+                "0%".to_string()
+            } else {
+                format!("{:.1}%", count as f64 * 100.0 / summary.stale as f64)
+            }
+        };
+        let mut lines = vec![
+            format!(
+                "{} of {} cached record(s) are stale",
+                summary.stale, summary.total_in_cache
+            ),
+            String::new(),
+            "Why each one could not be matched to a file".to_string(),
+        ];
+        for reason in &summary.by_reason {
+            lines.push(format!(
+                "  {:6} ({:>5})  {}",
+                reason.count,
+                share(reason.count),
+                reason.label
+            ));
+            lines.push(format!(
+                "                     RomM itself calls {} of these missing",
+                reason.romm_reports_missing
+            ));
+            for example in &reason.examples {
+                lines.push(format!("                     e.g. {}", example.romm_path));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("What that adds up to".to_string());
+        lines.push(format!(
+            "  {} ({}) are records RomM already reports as missing on its own filesystem",
+            summary.romm_reports_missing,
+            share(summary.romm_reports_missing)
+        ));
+        lines.push(format!(
+            "  {} ({}) are symlinks whose target has gone",
+            summary.dangling_symlinks,
+            share(summary.dangling_symlinks)
+        ));
+        lines.push(format!(
+            "  {} ({}) are present as directories - folder-based games, not missing files",
+            summary.present_as_directory,
+            share(summary.present_as_directory)
+        ));
+        lines.push(format!(
+            "  {} have no mapping to a local path",
+            summary.unmapped
+        ));
+        lines.push(format!(
+            "  {} are genuinely multi-file (RomM lists more than one file)",
+            summary.multi_file
+        ));
+        lines.push(String::new());
+        lines.push(if summary.looks_like_drift() {
+            "This looks like ordinary library drift: almost all of it is either RomM's own \
+             record of a missing file, or a link whose target has gone. Neither points at a \
+             mapping or matching fault."
+                .to_string()
+        } else {
+            "Enough of this is unexplained that it is worth checking the mappings: a large share \
+             is neither flagged missing by RomM nor a broken link."
+                .to_string()
+        });
+
+        let section = |lines: &mut Vec<String>,
+                       title: &str,
+                       groups: &[archivefs_core::identity_source::stale::StaleGroup],
+                       omitted: usize| {
+            lines.push(String::new());
+            lines.push(title.to_string());
+            for group in groups {
+                lines.push(format!(
+                    "  {:6}  {}  ({} flagged missing by RomM)",
+                    group.count, group.key, group.romm_reports_missing
+                ));
+            }
+            if omitted > 0 {
+                lines.push(format!("  and {omitted} more, not listed separately"));
+            }
+        };
+        section(
+            &mut lines,
+            "By platform",
+            &summary.by_platform,
+            summary.platforms_not_listed,
+        );
+        section(
+            &mut lines,
+            "By RomM path prefix",
+            &summary.by_romm_prefix,
+            summary.romm_prefixes_not_listed,
+        );
+        section(
+            &mut lines,
+            "By local folder",
+            &summary.by_local_prefix,
+            summary.local_prefixes_not_listed,
+        );
+        section(
+            &mut lines,
+            "By file extension",
+            &summary.by_extension,
+            summary.extensions_not_listed,
+        );
+        section(&mut lines, "By mapping used", &summary.by_mapping, 0);
+        lines.push(String::new());
+        lines.push(
+            "Nothing was changed: no file was read, no hash computed, and RomM was not contacted."
+                .to_string(),
+        );
+        lines
+    })
+}

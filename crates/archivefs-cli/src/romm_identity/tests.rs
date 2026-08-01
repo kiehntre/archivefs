@@ -3018,3 +3018,244 @@ fn the_configured_page_size_reaches_the_importer() {
     assert_eq!(result["records"], 30);
     stub.stop();
 }
+
+// --- stale-summary --------------------------------------------------------
+
+#[test]
+fn the_stale_summary_explains_the_population_and_stays_bounded() {
+    let tree = Tree::new("stale-summary");
+    let contents = b"present bytes".to_vec();
+    let hashes = true_hashes(&contents);
+    let dud = dud_hashes();
+    let mut roms = vec![
+        // One that matches, and so must be excluded from the summary.
+        relative_rom(
+            1,
+            "Present",
+            "roms/gb/present.gb",
+            contents.len() as u64,
+            [&hashes[0], &hashes[1], &hashes[2]],
+        ),
+        // One simply absent.
+        relative_rom(2, "Gone", "roms/gb/gone.gb", 4, [&dud[0], &dud[1], &dud[2]]),
+        // One that is a folder-based game, present as a directory.
+        relative_rom(
+            3,
+            "Folder",
+            "roms/dc/Shenmue",
+            0,
+            [&dud[0], &dud[1], &dud[2]],
+        ),
+        // One whose link no longer resolves.
+        relative_rom(
+            4,
+            "Orphan",
+            "roms/gb/orphan.gb",
+            4,
+            [&dud[0], &dud[1], &dud[2]],
+        ),
+        // One whose whole collection is missing.
+        relative_rom(
+            5,
+            "NoFolder",
+            "roms/nowhere/game.gb",
+            4,
+            [&dud[0], &dud[1], &dud[2]],
+        ),
+    ];
+    // RomM's own view: it knows number 2 is gone.
+    roms[1]["missing_from_fs"] = serde_json::json!(true);
+    let mut stub = StubServer::start(serde_json::json!(roms), 5);
+    ready_relative(&tree, &stub);
+
+    tree.file("gb/present.gb", &contents);
+    std::fs::create_dir_all(tree.library().join("dc/Shenmue")).expect("fixture");
+    std::fs::write(tree.library().join("dc/Shenmue/Disc1.cdi"), b"disc").expect("fixture");
+    let orphan = tree.library().join("gb/orphan.gb");
+    std::os::unix::fs::symlink(tree.library().join("gb/nothing.gb"), &orphan).expect("fixture");
+
+    assert!(tree.run(&["import"]).succeeded());
+
+    let run = tree.run(&["stale-summary", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let summary = run.json();
+    assert_eq!(summary["total_in_cache"], 5);
+    assert_eq!(summary["stale"], 4, "the matched record is not stale");
+
+    // The reasons partition the stale population exactly.
+    let reasons = summary["by_reason"].as_array().expect("reasons");
+    let counted: u64 = reasons
+        .iter()
+        .map(|reason| reason["count"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(counted, 4, "{summary:#}");
+    let by_code: std::collections::HashMap<&str, u64> = reasons
+        .iter()
+        .map(|reason| {
+            (
+                reason["code"].as_str().unwrap_or_default(),
+                reason["count"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert_eq!(by_code.get("absent"), Some(&1));
+    assert_eq!(by_code.get("directory"), Some(&1));
+    assert_eq!(by_code.get("dangling_symlink"), Some(&1));
+    assert_eq!(by_code.get("parent_absent"), Some(&1));
+
+    assert_eq!(summary["present_as_directory"], 1);
+    assert_eq!(summary["dangling_symlinks"], 1);
+    assert_eq!(summary["romm_reports_missing"], 1);
+    assert_eq!(summary["unmapped"], 0);
+
+    // Every group names the mapping that produced it.
+    let mappings = summary["by_mapping"].as_array().expect("mappings");
+    assert_eq!(mappings.len(), 1);
+    assert!(
+        mappings[0]["key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("roms ->")),
+        "{mappings:#?}"
+    );
+    stub.stop();
+}
+
+#[test]
+fn the_stale_summary_never_calls_a_present_directory_missing() {
+    let tree = Tree::new("stale-directory");
+    let dud = dud_hashes();
+    let mut stub = StubServer::start(
+        serde_json::json!([relative_rom(
+            1,
+            "Folder",
+            "roms/dc/Shenmue",
+            0,
+            [&dud[0], &dud[1], &dud[2]]
+        )]),
+        1,
+    );
+    ready_relative(&tree, &stub);
+    std::fs::create_dir_all(tree.library().join("dc/Shenmue")).expect("fixture");
+    assert!(tree.run(&["import"]).succeeded());
+
+    // The record's own evidence is accurate.
+    let record = tree.run(&["record", "1", "--json"]).json();
+    let evidence = record["evidence"]
+        .as_array()
+        .expect("evidence")
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        !evidence.contains("does not exist"),
+        "the directory is right there: {evidence}"
+    );
+    assert!(evidence.contains("is a directory"), "{evidence}");
+
+    // And the summary counts it as a directory rather than as a missing file.
+    let summary = tree.run(&["stale-summary", "--json"]).json();
+    assert_eq!(summary["present_as_directory"], 1);
+    let human = tree.run(&["stale-summary"]).stdout;
+    assert!(
+        human.contains("folder-based games, not missing files"),
+        "{human}"
+    );
+    stub.stop();
+}
+
+#[test]
+fn the_stale_summary_reports_its_verdict_on_the_population() {
+    let tree = Tree::new("stale-verdict");
+    let dud = dud_hashes();
+    // Everything absent and flagged by RomM: ordinary library drift.
+    let roms: Vec<serde_json::Value> = (0..10)
+        .map(|index| {
+            let mut rom = relative_rom(
+                index,
+                &format!("Gone {index}"),
+                &format!("roms/gb/gone-{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            );
+            rom["missing_from_fs"] = serde_json::json!(true);
+            rom
+        })
+        .collect();
+    let mut stub = StubServer::start(serde_json::json!(roms), 10);
+    ready_relative(&tree, &stub);
+    assert!(tree.run(&["import"]).succeeded());
+
+    let summary = tree.run(&["stale-summary", "--json"]).json();
+    assert_eq!(summary["stale"], 10);
+    assert_eq!(summary["romm_reports_missing"], 10);
+    assert_eq!(
+        summary["looks_like_library_drift"], true,
+        "RomM saying the files are gone is not a mapping fault: {summary:#}"
+    );
+    let human = tree.run(&["stale-summary"]).stdout;
+    assert!(human.contains("ordinary library drift"), "{human}");
+    stub.stop();
+}
+
+#[test]
+fn the_stale_summary_needs_a_cache_and_contacts_nothing() {
+    let tree = Tree::new("stale-no-cache");
+    let message = tree.run(&["stale-summary"]).error_text().to_string();
+    assert!(message.contains("import"), "{message}");
+
+    // With a cache, it makes no request at all.
+    let dud = dud_hashes();
+    let mut stub = StubServer::start(
+        serde_json::json!([relative_rom(
+            1,
+            "Gone",
+            "roms/gb/gone.gb",
+            4,
+            [&dud[0], &dud[1], &dud[2]]
+        )]),
+        1,
+    );
+    ready_relative(&tree, &stub);
+    assert!(tree.run(&["import"]).succeeded());
+    let before = stub.request_count();
+    assert!(tree.run(&["stale-summary"]).succeeded());
+    assert_eq!(
+        stub.request_count(),
+        before,
+        "a summary of the cache must not contact RomM"
+    );
+    stub.stop();
+}
+
+#[test]
+fn the_stale_summary_example_count_is_bounded() {
+    let tree = Tree::new("stale-examples");
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..40)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Gone {index}"),
+                &format!("roms/gb/gone-{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start(serde_json::json!(roms), 40);
+    ready_relative(&tree, &stub);
+    assert!(tree.run(&["import"]).succeeded());
+
+    let summary = tree
+        .run(&["stale-summary", "--examples", "100000", "--json"])
+        .json();
+    for reason in summary["by_reason"].as_array().expect("reasons") {
+        let examples = reason["examples"].as_array().expect("examples").len();
+        assert!(
+            examples <= archivefs_core::identity_source::stale::MAX_EXAMPLES,
+            "{examples} examples is over the bound"
+        );
+    }
+    stub.stop();
+}

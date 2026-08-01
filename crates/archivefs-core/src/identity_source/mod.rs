@@ -23,6 +23,7 @@ pub mod net_policy;
 pub mod path_map;
 pub mod romm;
 pub mod settings;
+pub mod stale;
 pub mod status;
 
 #[cfg(test)]

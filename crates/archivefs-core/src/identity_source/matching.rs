@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::hashing::{FileFingerprint, LocalHashCache};
 use super::model::{
@@ -49,6 +49,13 @@ use super::model::{
 pub struct LocalFileFacts {
     /// Present when the file exists and is readable.
     pub fingerprint: Option<FileFingerprint>,
+    /// What is actually at the path, when there is no fingerprint.
+    ///
+    /// A fingerprint is only produced for a regular file, so "no fingerprint"
+    /// covered three different situations and reported all of them as "does not
+    /// exist". For a folder-based game - a ScummVM directory, a PS4 game folder,
+    /// Shenmue's three discs in a directory - that was simply untrue.
+    pub presence: LocalPresence,
     /// The platform ArchiveFS itself determined, if any.
     pub local_platform: Option<String>,
     /// How strong that determination is.
@@ -60,6 +67,7 @@ impl LocalFileFacts {
     pub fn observe(path: &Path) -> Self {
         Self {
             fingerprint: FileFingerprint::observe(path),
+            presence: LocalPresence::observe(path),
             local_platform: None,
             local_strength: LocalEvidenceStrength::None,
         }
@@ -176,12 +184,11 @@ pub fn match_record(
         };
     }
 
-    // The file has to be there.
+    // There has to be a file there. A directory, a dangling symlink and nothing at
+    // all are three different findings, and saying which one it is turns "your
+    // library no longer has this" into something a person can act on.
     let Some(fingerprint) = &facts.fingerprint else {
-        evidence.push(format!(
-            "{} does not exist, so the record describes a file this library no longer has",
-            path.display()
-        ));
+        evidence.push(facts.presence.stale_detail(path));
         return MatchOutcome {
             verification: ExternalVerification::Stale,
             conflicts,
@@ -457,4 +464,112 @@ pub fn build_groups(records: &[ExternalIdentityRecord]) -> Vec<IdentityGroup> {
     }
     groups.sort_by(|left, right| left.primary_game_id.cmp(&right.primary_game_id));
     groups
+}
+
+/// What is at a local path, for the cases where no file fingerprint is possible.
+///
+/// Exists because "no fingerprint" is not the same as "nothing there". A real
+/// import produced 214 records whose path was a present directory - ScummVM games,
+/// a Dreamcast game holding three `.cdi` discs, PS4 and PS3 game folders, and
+/// RomM's own scraped-media directories - and every one of them was reported as
+/// not existing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPresence {
+    /// Nothing at the path, and its parent exists.
+    #[default]
+    Absent,
+    /// Nothing at the path, and the directory that would hold it is missing too -
+    /// usually a whole collection that was never copied to this machine.
+    ParentAbsent,
+    /// A regular file, so a fingerprint was taken.
+    File,
+    /// A directory. A folder-based game lives here, or something RomM catalogued
+    /// as a game that is really a media folder.
+    Directory,
+    /// A symlink whose target no longer resolves.
+    DanglingSymlink,
+    /// Something else entirely - a device, a socket, a fifo.
+    Other,
+}
+
+impl LocalPresence {
+    /// Classifies a path from metadata alone. No read, no hash, no canonicalise.
+    pub fn observe(path: &Path) -> Self {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => {
+                    Self::ParentAbsent
+                }
+                _ => Self::Absent,
+            };
+        };
+        if metadata.file_type().is_symlink() {
+            // The link is there; whether it leads anywhere is the question.
+            return match std::fs::metadata(path) {
+                Ok(target) if target.is_file() => Self::File,
+                Ok(target) if target.is_dir() => Self::Directory,
+                Ok(_) => Self::Other,
+                Err(_) => Self::DanglingSymlink,
+            };
+        }
+        if metadata.is_file() {
+            Self::File
+        } else if metadata.is_dir() {
+            Self::Directory
+        } else {
+            Self::Other
+        }
+    }
+
+    /// A stable code, for grouping in a diagnostic.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::ParentAbsent => "parent_absent",
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::DanglingSymlink => "dangling_symlink",
+            Self::Other => "not_a_regular_file",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "nothing at that path",
+            Self::ParentAbsent => "the folder that would hold it is missing too",
+            Self::File => "a regular file",
+            Self::Directory => "a directory, not a file",
+            Self::DanglingSymlink => "a symlink whose target is gone",
+            Self::Other => "something that is not a regular file",
+        }
+    }
+
+    /// Why this record could not be matched to a file, said accurately.
+    pub fn stale_detail(self, path: &Path) -> String {
+        let path = path.display();
+        match self {
+            Self::Absent => format!(
+                "{path} does not exist, so the record describes a file this library no longer has"
+            ),
+            Self::ParentAbsent => format!(
+                "{path} does not exist, and neither does the folder that would hold it - this \
+                 collection may not be on this machine at all"
+            ),
+            Self::Directory => format!(
+                "{path} exists but is a directory. The game is present as a folder; ArchiveFS \
+                 identifies files, so there was no single file to compare against what RomM \
+                 published"
+            ),
+            Self::DanglingSymlink => format!(
+                "{path} is a symlink whose target no longer exists, so the file it stood for is \
+                 gone even though the link remains"
+            ),
+            Self::Other => {
+                format!("{path} exists but is not a regular file, so it cannot be compared")
+            }
+            // Unreachable in practice: a fingerprint would have been produced.
+            Self::File => format!("{path} could not be measured"),
+        }
+    }
 }

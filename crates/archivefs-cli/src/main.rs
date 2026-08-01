@@ -5460,6 +5460,9 @@ fn print_help() {
         "  identity source romm verify-hash --path <file>  Hash one local file (CRC32, MD5, SHA-1 in one pass) and compare it with what RomM published for that path. Opens the file read-only through the shared trusted-root policy; refuses escaping symlinks, broken symlinks, non-regular files, paths outside the configured source folders, and files that change while being read. Never triggers whole-library hashing."
     );
     println!(
+        "  identity source romm stale-summary [--examples <n>]  Explain the stale records in the published cache instead of just counting them: grouped by why no file could be matched (nothing there, a directory, a link whose target is gone, a whole folder missing), and by platform, RomM path prefix, local folder, extension and mapping used. Says how many RomM itself already reports as missing on its own filesystem, which is what distinguishes ordinary library drift from a mapping fault. Reads the cache and file metadata only: no network request, no file contents, no hashing, and nothing written. Group and example lists are bounded, with the remainder stated as a count."
+    );
+    println!(
         "  identity source romm remove --confirm  Delete only ArchiveFS's own RomM cache and provider configuration (--keep-config keeps the latter). Never deletes your token file, never touches RomM, never touches a ROM."
     );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
