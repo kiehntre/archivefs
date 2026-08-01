@@ -80,6 +80,7 @@ use archivefs_core::{
 use serde::Serialize;
 
 mod bsfree;
+mod cheatbase;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -315,13 +316,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "cheats" => {
             let mut input_args = args.collect::<Vec<_>>();
-            if input_args.first().map(String::as_str) != Some("source")
-                || input_args.get(1).map(String::as_str) != Some("bsfree")
-            {
-                return Err("cheats currently supports only `source bsfree <command>`".into());
+            if input_args.first().map(String::as_str) != Some("source") {
+                return Err("cheats requires `source <bsfree|cheatbase> <command>`".into());
             }
+            let provider = input_args
+                .get(1)
+                .cloned()
+                .ok_or("cheats source requires a provider")?;
             input_args.drain(0..2);
-            bsfree::run(input_args)?;
+            match provider.as_str() {
+                "bsfree" => bsfree::run(input_args)?,
+                "cheatbase" => cheatbase::run(input_args)?,
+                _ => return Err(format!("unknown cheat source {provider:?}").into()),
+            }
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -5428,6 +5435,9 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
+    println!(
+        "  cheats source cheatbase <status|validate|download|import-local|enable|disable|remove|systems|devices|search|lookup-hash|lookup-serial|game>  Manage and browse the optional immutable CheatBase source; no command installs cheats"
     );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!(

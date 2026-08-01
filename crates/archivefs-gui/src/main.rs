@@ -46,40 +46,43 @@ use archivefs_core::game_identity::{
 };
 use archivefs_core::patch_manager::{
     BsFreeCatalogue, BsFreeCheat, BsFreeDownloadOptions, BsFreeGame, BsFreeGameSearchRequest,
-    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, CheatCandidate, CheatCandidateArchive,
-    CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus,
-    CheatDestinationRequest, CheatInstallPlanError, CheatInstallPreviewRequest,
-    CheatProviderSourceState, CheatSelection, CheatSourceCancellation, CheatSourceError,
-    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DeviceFormatCompatibility, DolphinCatalogue,
-    DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
-    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinCatalogueUpdateCheck,
-    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
-    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
-    EmulatorProfileSelectReason, EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
-    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
-    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
-    GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
-    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
-    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
-    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
-    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
-    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
-    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
-    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, CheatBaseCatalogue, CheatBaseCheat,
+    CheatBaseDownloadOptions, CheatBaseGame, CheatBaseGameSearchRequest, CheatBaseGameSearchResult,
+    CheatBaseHashAlgorithm, CheatBasePaths, CheatBaseSourceStatus, CheatCandidate,
+    CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions,
+    CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPreviewRequest, CheatProviderSourceState, CheatSelection, CheatSourceCancellation,
+    CheatSourceError, CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus,
+    CheatSourceFreshness, CheatSourceList, CheatSourceListEntry, CheatSourceProgress,
+    CheatSourceProgressPhase, CheatSourceProgressReporter, DeviceFormatCompatibility,
+    DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
+    DolphinCatalogueUpdateCheck, DolphinGameIniInventory, DolphinGeckoLookupResult,
+    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
+    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
+    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState, PageRequest,
+    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
+    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, ProviderGameMatchConfidence,
+    ReadOnlyCheatCatalogue, RememberedEmulatorProfile, ResolvedCheatDestination,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
@@ -95,27 +98,30 @@ use archivefs_core::patch_manager::{
     build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
     build_shared_transaction_plan, build_wii_gamehacking_install_preview, build_xenia_candidates,
     build_xenia_install_preview, check_dolphin_catalogue_update_with_transport,
-    default_bsfree_source_root, default_cheat_source_cache_root,
+    default_bsfree_source_root, default_cheat_source_cache_root, default_cheatbase_source_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
     discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
     discover_shared_apply_history, discover_xenia_profiles, download_bsfree_database,
-    execute_shared_apply, execute_shared_rollback, fetch_dolphin_catalogue_with_transport,
-    fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
-    generate_shared_operation_id, import_local_bsfree_database, inspect_bsfree_source,
-    inspect_dolphin_profile, inspect_pcsx2_profile, inspect_retroarch_cheat_library_for_game,
-    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
-    load_dolphin_catalogue, load_dolphin_catalogue_update_state, load_dolphin_destination,
+    download_cheatbase_database, execute_shared_apply, execute_shared_rollback,
+    fetch_dolphin_catalogue_with_transport, fetch_dolphin_upstream_gecko,
+    fetch_retroarch_cheat_source, fetch_xenia_provider_patches, generate_shared_operation_id,
+    import_local_bsfree_database, import_local_cheatbase_database, inspect_bsfree_source,
+    inspect_cheatbase_source, inspect_dolphin_profile, inspect_pcsx2_profile,
+    inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
+    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_catalogue,
+    load_dolphin_catalogue_update_state, load_dolphin_destination,
     load_remembered_emulator_profiles_default, load_xenia_destination, match_dolphin_inventory,
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
     parse_dolphin_ini, preview_shared_rollback, rebuild_dolphin_catalogue_index_with_transport,
     region_for_game_id, remembered_profile_for, remove_dolphin_catalogue,
-    remove_local_bsfree_source, require_dolphin_managed_gamehacking_verification,
-    resolve_cheat_destination, resolve_dolphin_gecko_lookup, select_dolphin_profile,
-    select_emulator_profile, selected_pcsx2_managed_cheats, set_bsfree_enabled,
+    remove_local_bsfree_source, remove_local_cheatbase_source,
+    require_dolphin_managed_gamehacking_verification, resolve_cheat_destination,
+    resolve_dolphin_gecko_lookup, select_dolphin_profile, select_emulator_profile,
+    selected_pcsx2_managed_cheats, set_bsfree_enabled, set_cheatbase_enabled,
     stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
     stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
-    stage_xenia_patch_file, validate_installed_bsfree_source,
+    stage_xenia_patch_file, validate_installed_bsfree_source, validate_installed_cheatbase_source,
 };
 #[cfg(test)]
 use archivefs_core::patch_manager::{
@@ -2476,6 +2482,67 @@ struct BsFreeGuiState {
     cheats: Option<Result<archivefs_core::patch_manager::ProviderPage<BsFreeCheat>, String>>,
 }
 
+#[derive(Debug)]
+enum CheatBaseManagerState {
+    NotLoaded,
+    Ready(Box<CheatBaseSourceStatus>),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+enum CheatBaseOperation {
+    LoadStatus,
+    Download,
+    Import(PathBuf),
+    Validate,
+    SetEnabled(bool),
+    Remove,
+    Search(CheatBaseGameSearchRequest),
+    LookupHash {
+        algorithm: CheatBaseHashAlgorithm,
+        hash: String,
+        platform_id: Option<String>,
+    },
+    LoadGame {
+        release_id: i64,
+        offset: u32,
+    },
+}
+
+#[derive(Debug)]
+enum CheatBaseOperationResult {
+    Status(Box<CheatBaseSourceStatus>),
+    Removed,
+    Search(CheatBaseGameSearchResult),
+    Game(
+        Box<(
+            CheatBaseGame,
+            archivefs_core::patch_manager::ProviderPage<CheatBaseCheat>,
+        )>,
+    ),
+}
+
+struct RunningCheatBaseOperation {
+    operation: CheatBaseOperation,
+    receiver: Receiver<Result<CheatBaseOperationResult, String>>,
+}
+
+#[derive(Debug, Default)]
+struct CheatBaseGuiState {
+    import_path: String,
+    download_confirm: bool,
+    remove_confirm: bool,
+    search_context: Option<PathBuf>,
+    search_title: String,
+    search_platform: String,
+    search_region: String,
+    hash_algorithm: String,
+    hash_value: String,
+    search_result: Option<Result<CheatBaseGameSearchResult, String>>,
+    selected_game: Option<CheatBaseGame>,
+    cheats: Option<Result<archivefs_core::patch_manager::ProviderPage<CheatBaseCheat>, String>>,
+}
+
 /// The "Add Folder" dialog's state - `Some` on `ArchiveFsApp` exactly
 /// while the dialog is open, mirroring how every other confirmation
 /// dialog in this app (`confirm_unmount`, `confirm_remove_missing`, ...)
@@ -3429,6 +3496,9 @@ struct ArchiveFsApp {
     bsfree_manager: BsFreeManagerState,
     bsfree_operation: Option<RunningBsFreeOperation>,
     bsfree_ui: BsFreeGuiState,
+    cheatbase_manager: CheatBaseManagerState,
+    cheatbase_operation: Option<RunningCheatBaseOperation>,
+    cheatbase_ui: CheatBaseGuiState,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -3659,6 +3729,9 @@ impl ArchiveFsApp {
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            cheatbase_manager: CheatBaseManagerState::NotLoaded,
+            cheatbase_operation: None,
+            cheatbase_ui: CheatBaseGuiState::default(),
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -5097,6 +5170,83 @@ impl ArchiveFsApp {
                         more_information: None,
                     });
                     self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
+                }
+            },
+        }
+    }
+
+    fn start_cheatbase_operation(&mut self, context: egui::Context, operation: CheatBaseOperation) {
+        if self.cheatbase_operation.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.cheatbase_operation = Some(RunningCheatBaseOperation {
+            operation: operation.clone(),
+            receiver,
+        });
+        thread::spawn(move || {
+            let result = run_cheatbase_operation(&operation).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_cheatbase_operation(&mut self, context: &egui::Context) {
+        let result = self.cheatbase_operation.as_ref().and_then(|running| {
+            running
+                .receiver
+                .try_recv()
+                .ok()
+                .map(|result| (running.operation.clone(), result))
+        });
+        let Some((operation, result)) = result else {
+            return;
+        };
+        self.cheatbase_operation = None;
+        match result {
+            Ok(CheatBaseOperationResult::Status(status)) => {
+                self.cheatbase_manager = CheatBaseManagerState::Ready(status);
+            }
+            Ok(CheatBaseOperationResult::Removed) => {
+                self.cheatbase_manager = CheatBaseManagerState::NotLoaded;
+                self.cheatbase_ui = CheatBaseGuiState::default();
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message: "Removed ArchiveFS's local CheatBase source copy only.".to_string(),
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+            }
+            Ok(CheatBaseOperationResult::Search(result)) => {
+                self.cheatbase_ui.search_result = Some(Ok(result));
+                self.cheatbase_ui.selected_game = None;
+                self.cheatbase_ui.cheats = None;
+            }
+            Ok(CheatBaseOperationResult::Game(result)) => {
+                let (game, cheats) = *result;
+                self.cheatbase_ui.selected_game = Some(game);
+                self.cheatbase_ui.cheats = Some(Ok(cheats));
+            }
+            Err(message) => match operation {
+                CheatBaseOperation::Search(_) | CheatBaseOperation::LookupHash { .. } => {
+                    self.cheatbase_ui.search_result = Some(Err(message));
+                }
+                CheatBaseOperation::LoadGame { .. } => {
+                    self.cheatbase_ui.cheats = Some(Err(message));
+                }
+                CheatBaseOperation::LoadStatus => {
+                    self.cheatbase_manager = CheatBaseManagerState::Failed(message);
+                }
+                _ => {
+                    self.feedback = Some(ActionFeedback {
+                        succeeded: false,
+                        message,
+                        cleanup: None,
+                        warning: None,
+                        more_information: None,
+                    });
+                    self.start_cheatbase_operation(context.clone(), CheatBaseOperation::LoadStatus);
                 }
             },
         }
@@ -11203,6 +11353,7 @@ impl ArchiveFsApp {
         self.poll_alias_action(context);
         self.poll_source_action(context);
         self.poll_bsfree_operation(context);
+        self.poll_cheatbase_operation(context);
         self.poll_catalogue_manager(context);
         self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
@@ -11220,6 +11371,12 @@ impl ArchiveFsApp {
             && self.bsfree_operation.is_none()
         {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
+        }
+        if matches!(self.view, MainView::Sources | MainView::CheatsMods)
+            && matches!(self.cheatbase_manager, CheatBaseManagerState::NotLoaded)
+            && self.cheatbase_operation.is_none()
+        {
+            self.start_cheatbase_operation(context.clone(), CheatBaseOperation::LoadStatus);
         }
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
@@ -11819,6 +11976,17 @@ impl ArchiveFsApp {
                     }
 
                     ui.add_space(theme::SECTION_GAP);
+                    if let Some(operation) = show_cheatbase_source_card(
+                        ui,
+                        &self.cheatbase_manager,
+                        self.cheatbase_operation.is_some(),
+                        &mut self.cheatbase_ui,
+                        &mut self.clipboard,
+                    ) {
+                        self.start_cheatbase_operation(context.clone(), operation);
+                    }
+
+                    ui.add_space(theme::SECTION_GAP);
                     show_sources_recent_activity(ui, &self.history);
                     return;
                 }
@@ -11860,7 +12028,7 @@ impl ArchiveFsApp {
                             workflow.platform.clone().unwrap_or_default(),
                         )
                     });
-                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action) = egui::ScrollArea::vertical()
+                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -11902,6 +12070,14 @@ impl ArchiveFsApp {
                                 &mut self.bsfree_ui,
                                 bsfree_context.as_ref(),
                             );
+                            ui.add_space(theme::SECTION_GAP);
+                            let cheatbase_action = show_cheatbase_game_browser(
+                                ui,
+                                &self.cheatbase_manager,
+                                self.cheatbase_operation.is_some(),
+                                &mut self.cheatbase_ui,
+                                bsfree_context.as_ref(),
+                            );
                             let catalogue_action = retroarch_route.then(|| {
                                 ui.add_space(theme::SECTION_GAP);
                                 widgets::section_header(
@@ -11920,7 +12096,7 @@ impl ArchiveFsApp {
                                     &mut self.clipboard,
                                 )
                             }).flatten();
-                            (action, catalogue_action, dolphin_catalogue_action, bsfree_action)
+                            (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action)
                         })
                         .inner;
                     let picker_rows = live
@@ -11940,6 +12116,9 @@ impl ArchiveFsApp {
                     }
                     if let Some(bsfree_action) = bsfree_action {
                         self.start_bsfree_operation(context.clone(), bsfree_action);
+                    }
+                    if let Some(cheatbase_action) = cheatbase_action {
+                        self.start_cheatbase_operation(context.clone(), cheatbase_action);
                     }
                     match action {
                         Some(CheatWorkflowAction::ChooseArchive) => {
@@ -15387,6 +15566,72 @@ fn run_bsfree_operation(
     }
 }
 
+fn run_cheatbase_operation(
+    operation: &CheatBaseOperation,
+) -> Result<CheatBaseOperationResult, archivefs_core::patch_manager::CheatBaseError> {
+    let paths = CheatBasePaths::at(default_cheatbase_source_root()?);
+    match operation {
+        CheatBaseOperation::LoadStatus => inspect_cheatbase_source(&paths)
+            .map(Box::new)
+            .map(CheatBaseOperationResult::Status),
+        CheatBaseOperation::Download => download_cheatbase_database(
+            &paths,
+            &CheatBaseDownloadOptions::default(),
+            &HttpsCheatSourceTransport::new(),
+        )
+        .map(|result| CheatBaseOperationResult::Status(Box::new(result.status))),
+        CheatBaseOperation::Import(source) => import_local_cheatbase_database(&paths, source)
+            .map(|result| CheatBaseOperationResult::Status(Box::new(result.status))),
+        CheatBaseOperation::Validate => validate_installed_cheatbase_source(&paths)
+            .map(Box::new)
+            .map(CheatBaseOperationResult::Status),
+        CheatBaseOperation::SetEnabled(enabled) => set_cheatbase_enabled(&paths, *enabled)
+            .map(Box::new)
+            .map(CheatBaseOperationResult::Status),
+        CheatBaseOperation::Remove => {
+            remove_local_cheatbase_source(&paths, true)?;
+            Ok(CheatBaseOperationResult::Removed)
+        }
+        CheatBaseOperation::Search(request) => CheatBaseCatalogue::open_installed(&paths)?
+            .search_games(request)
+            .map(CheatBaseOperationResult::Search),
+        CheatBaseOperation::LookupHash {
+            algorithm,
+            hash,
+            platform_id,
+        } => {
+            let lookup = CheatBaseCatalogue::open_installed(&paths)?.lookup_hash(
+                *algorithm,
+                hash,
+                platform_id.as_deref(),
+                PageRequest::games(0),
+            )?;
+            Ok(CheatBaseOperationResult::Search(
+                CheatBaseGameSearchResult {
+                    confidence: lookup.confidence,
+                    explanation: if lookup.evidence.is_empty() {
+                        "No exact hash match was found".to_string()
+                    } else {
+                        lookup.evidence.join("; ")
+                    },
+                    page: lookup.page,
+                },
+            ))
+        }
+        CheatBaseOperation::LoadGame { release_id, offset } => {
+            let catalogue = CheatBaseCatalogue::open_installed(&paths)?;
+            let game = catalogue.game(*release_id)?.ok_or_else(|| {
+                archivefs_core::patch_manager::CheatBaseError {
+                    kind: archivefs_core::patch_manager::CheatBaseErrorKind::Query,
+                    message: "CheatBase release is no longer present".to_string(),
+                }
+            })?;
+            let cheats = catalogue.cheats(*release_id, PageRequest::cheats(*offset))?;
+            Ok(CheatBaseOperationResult::Game(Box::new((game, cheats))))
+        }
+    }
+}
+
 fn library_view_action_log_category(action: &LibraryViewAction) -> ActivityAction {
     match action {
         LibraryViewAction::Add { .. } => ActivityAction::LibraryViewAdded,
@@ -17223,6 +17468,14 @@ fn show_bsfree_source_card(
 
 fn bsfree_match_label(confidence: ProviderGameMatchConfidence) -> &'static str {
     match confidence {
+        ProviderGameMatchConfidence::ExactHashPlatform => "Exact hash + platform",
+        ProviderGameMatchConfidence::ExactSerialPlatformRegion => {
+            "Exact serial + platform + region"
+        }
+        ProviderGameMatchConfidence::ExactUpstreamRelease => "Exact upstream release",
+        ProviderGameMatchConfidence::ExactTitlePlatformRegionRevision => {
+            "Exact title + platform + region/revision"
+        }
         ProviderGameMatchConfidence::ExactTitlePlatform => "Exact title + platform",
         ProviderGameMatchConfidence::ProbableTitlePlatform => "Probable title + platform",
         ProviderGameMatchConfidence::Ambiguous => "Ambiguous candidates",
@@ -17472,6 +17725,479 @@ fn show_bsfree_game_browser(
                                 ui.label(format!(
                                     "Provider: BSFree Archive · device: {} · row ID: {}",
                                     cheat.device.name, cheat.upstream_id
+                                ));
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    });
+    action
+}
+
+fn show_cheatbase_source_card(
+    ui: &mut egui::Ui,
+    manager: &CheatBaseManagerState,
+    busy: bool,
+    state: &mut CheatBaseGuiState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<CheatBaseOperation> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "CheatBase",
+        Some("Optional immutable ROM-identity and Nintendo DS cheat catalogue."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("CheatBase");
+            match manager {
+                CheatBaseManagerState::NotLoaded => {
+                    widgets::status_badge(ui, "Checking local state", widgets::StatusTone::Pending)
+                }
+                CheatBaseManagerState::Ready(status) => widgets::status_badge(
+                    ui,
+                    bsfree_state_label(status.state),
+                    bsfree_state_tone(status.state),
+                ),
+                CheatBaseManagerState::Failed(_) => {
+                    widgets::status_badge(ui, "Status unavailable", widgets::StatusTone::Warning)
+                }
+            }
+            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+        });
+        ui.label("Source: CheatBase/CheatBase at pinned commit 5894b60");
+        ui.label("Origin: OpenVGDB-derived ROM metadata and community cheat records");
+        widgets::banner(
+            ui,
+            "Dataset licence not established",
+            "The upstream repository declares no dataset licence. ArchiveFS keeps the database optional and does not bundle or redistribute it.",
+            widgets::StatusTone::Warning,
+        );
+        ui.label("Only Nintendo DS currently contains cheat rows. Other systems provide identity and release metadata only.");
+        ui.label(
+            "No CheatBase code is installed, converted, or written to an emulator in Stage 1.",
+        );
+        match manager {
+            CheatBaseManagerState::Ready(status) => {
+                if widgets::path_value(ui, "Local destination", &status.database_path) {
+                    let _ = clipboard.set_text(status.database_path.display().to_string());
+                }
+                if let Some(validation) = &status.validation {
+                    widgets::status_strip(
+                        ui,
+                        &[
+                            ("Immutable read-only SQLite", widgets::StatusTone::Success),
+                            ("Query-only", widgets::StatusTone::Success),
+                        ],
+                    );
+                    widgets::copyable_value(
+                        ui,
+                        "Database SHA-256",
+                        &validation.result.source_fingerprint.sha256,
+                    );
+                    ui.label(format!(
+                        "{} systems · {} releases · {} cheats · {} bytes",
+                        validation.counts.systems,
+                        validation.counts.releases,
+                        validation.counts.cheats,
+                        validation.result.source_fingerprint.size_bytes
+                    ));
+                    ui.label(format!(
+                        "Validated: {}",
+                        format_unix_timestamp_utc(
+                            validation.result.validated_at_unix_seconds as i64
+                        )
+                    ));
+                }
+                if let Some(error) = &status.last_error {
+                    widgets::banner(
+                        ui,
+                        "Last operation failed",
+                        &error.message,
+                        widgets::StatusTone::Warning,
+                    );
+                }
+            }
+            CheatBaseManagerState::Failed(message) => widgets::banner(
+                ui,
+                "Could not inspect CheatBase",
+                message,
+                widgets::StatusTone::Warning,
+            ),
+            CheatBaseManagerState::NotLoaded => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading local source metadata...");
+                });
+            }
+        }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Download database", widgets::ActionStyle::Primary, !busy).clicked() { state.download_confirm=true; }
+            if widgets::action_button(ui, "Validate", widgets::ActionStyle::Secondary, !busy && matches!(manager,CheatBaseManagerState::Ready(status) if status.fingerprint.is_some())).clicked() { action=Some(CheatBaseOperation::Validate); }
+            if let CheatBaseManagerState::Ready(status)=manager {
+                if widgets::action_button(ui,if status.enabled{"Disable"}else{"Enable"},widgets::ActionStyle::Quiet,!busy).clicked(){action=Some(CheatBaseOperation::SetEnabled(!status.enabled));}
+                if widgets::action_button(ui,"Remove local copy",widgets::ActionStyle::Destructive,!busy&&status.fingerprint.is_some()).clicked(){state.remove_confirm=true;}
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Import local CheatBase SQLite database");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.import_path)
+                    .desired_width(360.0)
+                    .hint_text("/path/to/cheatbase.sqlite"),
+            );
+            if widgets::action_button(
+                ui,
+                "Import local database",
+                widgets::ActionStyle::Secondary,
+                !busy && !state.import_path.trim().is_empty(),
+            )
+            .clicked()
+            {
+                action = Some(CheatBaseOperation::Import(PathBuf::from(
+                    state.import_path.trim(),
+                )));
+            }
+        });
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("CheatBase operation in progress...");
+            });
+        }
+        if state.download_confirm {
+            widgets::banner(
+                ui,
+                "Download optional third-party database?",
+                "Approximately 64 MiB from the exact pinned upstream GitHub commit. Network access is required. No cheats will be installed.",
+                widgets::StatusTone::Warning,
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Confirm download",
+                    widgets::ActionStyle::Primary,
+                    !busy,
+                )
+                .clicked()
+                {
+                    state.download_confirm = false;
+                    action = Some(CheatBaseOperation::Download);
+                }
+                if ui.button("Cancel").clicked() {
+                    state.download_confirm = false;
+                }
+            });
+        }
+        if state.remove_confirm {
+            widgets::banner(
+                ui,
+                "Remove ArchiveFS's local CheatBase copy?",
+                "Only ArchiveFS-owned CheatBase files are removed. ROMs, emulator profiles, BSFree, and other providers are untouched.",
+                widgets::StatusTone::Warning,
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Confirm removal",
+                    widgets::ActionStyle::Destructive,
+                    !busy,
+                )
+                .clicked()
+                {
+                    state.remove_confirm = false;
+                    action = Some(CheatBaseOperation::Remove);
+                }
+                if ui.button("Cancel").clicked() {
+                    state.remove_confirm = false;
+                }
+            });
+        }
+    });
+    action
+}
+
+fn show_cheatbase_game_browser(
+    ui: &mut egui::Ui,
+    manager: &CheatBaseManagerState,
+    busy: bool,
+    state: &mut CheatBaseGuiState,
+    context: Option<&(PathBuf, String, String)>,
+) -> Option<CheatBaseOperation> {
+    let mut action = None;
+    if let Some((path, title, platform)) = context
+        && state.search_context.as_ref() != Some(path)
+    {
+        state.search_context = Some(path.clone());
+        state.search_title.clone_from(title);
+        state.search_platform.clone_from(platform);
+        state.search_result = None;
+        state.selected_game = None;
+        state.cheats = None;
+    }
+    widgets::section_header(
+        ui,
+        "CheatBase",
+        Some("Browse exact ROM metadata and Nintendo DS cheats from the optional local source."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+            ui.label("No Install action exists for CheatBase Stage 1.");
+        });
+        let usable = matches!(manager,CheatBaseManagerState::Ready(status) if status.usable);
+        match manager {
+            CheatBaseManagerState::Ready(status) if !status.usable => widgets::banner(
+                ui,
+                "CheatBase is not ready",
+                "Download or import and validate it from Cheats → Sources.",
+                widgets::StatusTone::Pending,
+            ),
+            CheatBaseManagerState::Failed(message) => widgets::banner(
+                ui,
+                "CheatBase status unavailable",
+                message,
+                widgets::StatusTone::Warning,
+            ),
+            CheatBaseManagerState::NotLoaded => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking CheatBase...");
+                });
+            }
+            CheatBaseManagerState::Ready(_) => {}
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Platform");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search_platform)
+                    .desired_width(130.0)
+                    .hint_text("Canonical platform"),
+            );
+            ui.label("Title");
+            ui.add(egui::TextEdit::singleline(&mut state.search_title).desired_width(260.0));
+            ui.label("Region");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search_region)
+                    .desired_width(100.0)
+                    .hint_text("optional"),
+            );
+            if widgets::action_button(
+                ui,
+                "Search CheatBase",
+                widgets::ActionStyle::Secondary,
+                usable && !busy && !state.search_title.trim().is_empty(),
+            )
+            .clicked()
+            {
+                action = Some(CheatBaseOperation::Search(CheatBaseGameSearchRequest {
+                    platform_id: (!state.search_platform.trim().is_empty())
+                        .then(|| state.search_platform.trim().to_string()),
+                    title: state.search_title.trim().to_string(),
+                    region: (!state.search_region.trim().is_empty())
+                        .then(|| state.search_region.trim().to_string()),
+                    upstream_release_id: None,
+                    page: PageRequest::games(0),
+                }));
+            }
+        });
+        ui.label("Title matches do not verify a ROM revision. Use verified ROM hashes for exact identity; filenames are not hash evidence.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Exact hash");
+            egui::ComboBox::from_id_salt("cheatbase-hash-algorithm")
+                .selected_text(if state.hash_algorithm.is_empty() {
+                    "SHA-1"
+                } else {
+                    &state.hash_algorithm
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut state.hash_algorithm, "sha1".to_string(), "SHA-1");
+                    ui.selectable_value(&mut state.hash_algorithm, "md5".to_string(), "MD5");
+                    ui.selectable_value(&mut state.hash_algorithm, "crc32".to_string(), "CRC32");
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut state.hash_value)
+                    .desired_width(350.0)
+                    .hint_text("verified CRC32, MD5 or SHA-1"),
+            );
+            if widgets::action_button(
+                ui,
+                "Look up exact hash",
+                widgets::ActionStyle::Secondary,
+                usable && !busy && !state.hash_value.trim().is_empty(),
+            )
+            .clicked()
+            {
+                let algorithm = match state.hash_algorithm.as_str() {
+                    "crc32" => CheatBaseHashAlgorithm::Crc32,
+                    "md5" => CheatBaseHashAlgorithm::Md5,
+                    _ => CheatBaseHashAlgorithm::Sha1,
+                };
+                action = Some(CheatBaseOperation::LookupHash {
+                    algorithm,
+                    hash: state.hash_value.trim().to_string(),
+                    platform_id: (!state.search_platform.trim().is_empty())
+                        .then(|| state.search_platform.trim().to_string()),
+                });
+            }
+        });
+        ui.label(
+            "Exact serial + platform + region lookup is also available through the typed CLI.",
+        );
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading the local immutable CheatBase database...");
+            });
+        }
+        if let Some(result) = &state.search_result {
+            ui.separator();
+            match result {
+                Err(message) => widgets::banner(
+                    ui,
+                    "CheatBase search failed",
+                    message,
+                    widgets::StatusTone::Warning,
+                ),
+                Ok(result) => {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(
+                            ui,
+                            bsfree_match_label(result.confidence),
+                            if result.confidence == ProviderGameMatchConfidence::NoMatch {
+                                widgets::StatusTone::Pending
+                            } else {
+                                widgets::StatusTone::Info
+                            },
+                        );
+                        ui.label(format!("{} candidate(s)", result.page.total));
+                    });
+                    ui.label(&result.explanation);
+                    for game in &result.page.rows {
+                        ui.group(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(&game.title);
+                                widgets::status_badge(
+                                    ui,
+                                    game.platform
+                                        .archivefs_platform_display_name
+                                        .as_deref()
+                                        .unwrap_or(&game.upstream_system_name),
+                                    widgets::StatusTone::Info,
+                                );
+                                widgets::status_badge(
+                                    ui,
+                                    &game.release_region,
+                                    widgets::StatusTone::Pending,
+                                );
+                            });
+                            ui.label(format!(
+                                "CheatBase release {} · ROM {} · {} cheats · revision not verified",
+                                game.upstream_release_id, game.upstream_rom_id, game.cheat_count
+                            ));
+                            if let Some(serial) = &game.serial {
+                                ui.label(format!("Serial: {serial}"));
+                            }
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Browse cheats"))
+                                .clicked()
+                            {
+                                action = Some(CheatBaseOperation::LoadGame {
+                                    release_id: game.upstream_release_id,
+                                    offset: 0,
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if let (Some(game), Some(cheats)) = (&state.selected_game, &state.cheats) {
+            ui.separator();
+            ui.heading(&game.title);
+            ui.label(format!(
+                "{} · {} · Browse only",
+                game.release_region,
+                game.platform
+                    .archivefs_platform_display_name
+                    .as_deref()
+                    .unwrap_or(&game.upstream_system_name)
+            ));
+            match cheats {
+                Err(message) => widgets::banner(
+                    ui,
+                    "Could not load CheatBase cheats",
+                    message,
+                    widgets::StatusTone::Warning,
+                ),
+                Ok(page) => {
+                    ui.label(format!(
+                        "Showing {}–{} of {} cheats",
+                        page.offset.saturating_add(1),
+                        page.offset.saturating_add(page.rows.len() as u32),
+                        page.total
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !busy && page.offset > 0,
+                                egui::Button::new("Previous 100"),
+                            )
+                            .clicked()
+                        {
+                            action = Some(CheatBaseOperation::LoadGame {
+                                release_id: game.upstream_release_id,
+                                offset: page
+                                    .offset
+                                    .saturating_sub(PageRequest::DEFAULT_CHEAT_LIMIT as u32),
+                            });
+                        }
+                        if ui
+                            .add_enabled(!busy && page.has_more, egui::Button::new("Next 100"))
+                            .clicked()
+                        {
+                            action = Some(CheatBaseOperation::LoadGame {
+                                release_id: game.upstream_release_id,
+                                offset: page.offset.saturating_add(page.limit as u32),
+                            });
+                        }
+                    });
+                    for cheat in &page.rows {
+                        ui.group(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(&cheat.name);
+                                widgets::status_badge(
+                                    ui,
+                                    bsfree_compatibility_label(cheat.device.compatibility),
+                                    widgets::StatusTone::Pending,
+                                );
+                            });
+                            ui.label(format!(
+                                "Category: {} · device: {} ({})",
+                                cheat.category, cheat.device.name, cheat.device.format
+                            ));
+                            if let Some(credit) = &cheat.credit {
+                                ui.label(format!("Credit: {credit}"));
+                            }
+                            if let Some(note) = &cheat.description {
+                                ui.label(note);
+                            }
+                            if let Some(note) = &cheat.side_effect {
+                                widgets::banner(
+                                    ui,
+                                    "Side effect",
+                                    note,
+                                    widgets::StatusTone::Warning,
+                                );
+                            }
+                            ui.collapsing("Raw code and provenance", |ui| {
+                                ui.monospace(&cheat.code);
+                                ui.label(format!(
+                                    "Provider: CheatBase · cheat row ID: {} · release ID: {}",
+                                    cheat.upstream_id, game.upstream_release_id
                                 ));
                             });
                         });
@@ -38889,7 +39615,10 @@ mod tests {
         screen: egui::Vec2,
     ) -> egui::FullOutput {
         let mut output = None;
-        for _ in 0..40 {
+        // Keep this comfortably above the current page length so adding a
+        // bounded browse-only source card cannot turn the reachability test
+        // into an accidental fixed-height assertion.
+        for _ in 0..80 {
             let scroll_input = egui::RawInput {
                 events: vec![
                     egui::Event::PointerMoved(egui::pos2(screen.x / 2.0, screen.y / 2.0)),
@@ -38991,7 +39720,7 @@ mod tests {
             scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
         assert_final_content_reachable(
             &output,
-            "No related activity has been recorded in this session.",
+            "Exact serial + platform + region lookup is also available through the typed CLI.",
         );
     }
 
@@ -39011,7 +39740,7 @@ mod tests {
             scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
         assert_final_content_reachable(
             &output,
-            "No related activity has been recorded in this session.",
+            "Exact serial + platform + region lookup is also available through the typed CLI.",
         );
     }
 
@@ -39041,7 +39770,7 @@ mod tests {
             scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &small_input, small);
         assert_final_content_reachable(
             &output,
-            "No related activity has been recorded in this session.",
+            "Exact serial + platform + region lookup is also available through the typed CLI.",
         );
     }
 
@@ -46362,6 +47091,9 @@ $Instant Growth [Nayr]\n";
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            cheatbase_manager: CheatBaseManagerState::NotLoaded,
+            cheatbase_operation: None,
+            cheatbase_ui: CheatBaseGuiState::default(),
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -60147,5 +60879,53 @@ $Instant Growth [Nayr]\n";
         assert!(browser.contains("archivefs_platform_display_name"));
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
+    }
+
+    #[test]
+    fn cheatbase_gui_is_bounded_browse_only_and_has_no_install_action() {
+        let source = include_str!("main.rs");
+        let browser = source
+            .split("fn show_cheatbase_game_browser(")
+            .nth(1)
+            .unwrap()
+            .split("/// The Sources page's compact")
+            .next()
+            .unwrap();
+        assert!(browser.contains("Browse only"));
+        assert!(browser.contains("PageRequest::games(0)"));
+        assert!(browser.contains("Previous 100"));
+        assert!(browser.contains("Next 100"));
+        assert!(browser.contains("Look up exact hash"));
+        assert!(browser.contains("CheatBaseOperation::LookupHash"));
+        assert!(browser.contains("archivefs_platform_display_name"));
+        assert!(!browser.contains("Install selected"));
+        assert!(!browser.contains("CheatBaseOperation::Install"));
+    }
+
+    #[test]
+    fn cheatbase_source_card_discloses_provenance_and_licence() {
+        let source = include_str!("main.rs");
+        let card = source
+            .split("fn show_cheatbase_source_card(")
+            .nth(1)
+            .unwrap()
+            .split("fn show_cheatbase_game_browser(")
+            .next()
+            .unwrap();
+        assert!(card.contains("Dataset licence not established"));
+        assert!(card.contains("pinned upstream GitHub commit"));
+        assert!(card.contains("No CheatBase code is installed"));
+    }
+
+    #[test]
+    fn provider_match_labels_cover_exact_identity_evidence() {
+        assert_eq!(
+            bsfree_match_label(ProviderGameMatchConfidence::ExactHashPlatform),
+            "Exact hash + platform"
+        );
+        assert_eq!(
+            bsfree_match_label(ProviderGameMatchConfidence::ExactSerialPlatformRegion),
+            "Exact serial + platform + region"
+        );
     }
 }

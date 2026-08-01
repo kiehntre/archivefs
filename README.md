@@ -472,6 +472,24 @@ archivefs-cli cheats source bsfree search --platform NES --title MARIO --json
 The import/download commands are explicit. Status, search, game browsing, and
 ordinary GUI browsing do not perform network access or write emulator files.
 
+Optional CheatBase browse-only source:
+
+```sh
+archivefs-cli cheats source cheatbase status --json
+archivefs-cli cheats source cheatbase import-local /path/to/cheatbase.sqlite
+archivefs-cli cheats source cheatbase search --platform "Nintendo DS" --title Pokemon --json
+archivefs-cli cheats source cheatbase lookup-hash --algorithm sha1 --hash <40-hex-digits> --platform "Nintendo DS" --json
+archivefs-cli cheats source cheatbase game <release-id> --offset 0 --limit 100 --json
+```
+
+CheatBase is an optional immutable snapshot pinned to its upstream GitHub
+commit and SHA-256. ArchiveFS opens its owned copy with SQLite read-only,
+immutable and query-only controls. The source supplies CRC32, MD5, SHA-1,
+serial and region metadata, but only Nintendo DS has cheat rows in the
+verified snapshot. It is browse-only: there is no conversion or Install
+action. The upstream repository declares no dataset licence, so ArchiveFS does
+not bundle or redistribute the database.
+
 Use verbose or debug logging when you need more detail:
 
 ```sh

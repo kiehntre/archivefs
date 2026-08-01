@@ -31,6 +31,7 @@ mod cheat_provider;
 mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
+mod cheatbase;
 mod cht_document;
 mod destination_safety;
 mod dolphin_cheat_catalogue;
@@ -189,6 +190,20 @@ pub use cheat_sources::{
     fetch_retroarch_cheat_source, inspect_retroarch_cheat_source,
     inspect_retroarch_cheat_source_snapshot, list_retroarch_cheat_sources,
     trusted_retroarch_cheat_sources,
+};
+pub use cheatbase::{
+    CHEATBASE_DATABASE_FILE, CHEATBASE_DATABASE_URL, CHEATBASE_DOWNLOAD_HOST,
+    CHEATBASE_EXPECTED_SHA256, CHEATBASE_EXPECTED_SIZE_BYTES, CHEATBASE_MAX_DATABASE_BYTES,
+    CHEATBASE_PROVIDER_FORMAT_VERSION, CHEATBASE_PROVIDER_ID, CHEATBASE_UPSTREAM_PROJECT,
+    CheatBaseActivationResult, CheatBaseAttribution, CheatBaseCatalogue, CheatBaseCheat,
+    CheatBaseCounts, CheatBaseDevice, CheatBaseDownloadOptions, CheatBaseError, CheatBaseErrorKind,
+    CheatBaseGame, CheatBaseGameSearchRequest, CheatBaseGameSearchResult, CheatBaseHashAlgorithm,
+    CheatBaseIdentityLookup, CheatBasePaths, CheatBaseSourceStatus, CheatBaseSystem,
+    CheatBaseValidation, cheatbase_attribution, cheatbase_device_mapping, cheatbase_licence,
+    cheatbase_platform_mapping, cheatbase_provenance, cheatbase_provider_identity,
+    default_cheatbase_source_root, download_cheatbase_database, import_local_cheatbase_database,
+    inspect_cheatbase_source, remove_local_cheatbase_source, set_cheatbase_enabled,
+    validate_cheatbase_database, validate_installed_cheatbase_source,
 };
 pub use cht_document::{
     ChtDocument, ChtDocumentWarning, ChtDocumentWarningKind, ChtEntry, ChtEntryWarning,
