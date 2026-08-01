@@ -83,6 +83,7 @@ mod bsfree;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
+mod romm_identity;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -309,6 +310,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     print_doctor_report(&report);
                 }
             }
+        }
+        "identity" => {
+            // `identity source romm <command>` - the only identity source in
+            // Stage 1C. The shape mirrors `cheats source bsfree <command>`.
+            let input_args: Vec<String> = args.collect();
+            if input_args.first().map(String::as_str) != Some("source")
+                || input_args.get(1).map(String::as_str) != Some("romm")
+            {
+                return Err("identity currently supports only `source romm <command>`".into());
+            }
+            romm_identity::run(input_args[2..].to_vec())?;
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
@@ -5428,6 +5440,21 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
+    println!(
+        "  identity source romm <status|configure|test|mappings|import|refresh|records|record|conflicts|verify-hash|enable|disable|remove>  Use a local RomM server as an external identity source. Read-only towards RomM: no command writes to it, triggers a scan, edits metadata, or touches a ROM. Only loopback and private LAN addresses are accepted. The token is passed by file path with --token-file and is never printed, logged or stored in config or cache JSON. Add --json for structured output on stdout, with progress on stderr."
+    );
+    println!(
+        "  identity source romm configure --url <local-url> --token-file <path> [--page-size <n>] [--enable]  Store the RomM URL and the path to a read-only client token (suggested ~/.config/archivefs/romm-token, which ArchiveFS never creates for you). The URL is resolved and refused now if it is not local; the token file must be a regular non-symlink file with restrictive permissions. Contacts nothing."
+    );
+    println!(
+        "  identity source romm import [--sample <n>]  Import the catalogue and publish it atomically. --sample <n> fetches a bounded preview, reports what it would conclude, and publishes nothing, so an existing cache is never replaced by a partial one. A failed import always leaves the previous cache in place."
+    );
+    println!(
+        "  identity source romm verify-hash --path <file>  Hash one local file (CRC32, MD5, SHA-1 in one pass) and compare it with what RomM published for that path. Opens the file read-only through the shared trusted-root policy; refuses escaping symlinks, broken symlinks, non-regular files, paths outside the configured source folders, and files that change while being read. Never triggers whole-library hashing."
+    );
+    println!(
+        "  identity source romm remove --confirm  Delete only ArchiveFS's own RomM cache and provider configuration (--keep-config keeps the latter). Never deletes your token file, never touches RomM, never touches a ROM."
     );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!(
