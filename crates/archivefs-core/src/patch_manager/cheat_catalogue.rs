@@ -1710,7 +1710,7 @@ fn resolve_canonical_cheat_destination(
     // a safety check on a string that is *already trusted*; it is not a
     // substitute for that trust, and must never be used to launder an
     // unrecognized hint into one. Only a hint this project's own
-    // `FOLDER_PLATFORM_ALIASES` table recognizes may become a destination
+    // platform registry recognizes may become a destination
     // directory - anything else is `source_platform_unresolved`, the same
     // as no platform hint at all.
     let platform_component =

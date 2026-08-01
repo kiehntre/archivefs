@@ -61,6 +61,11 @@ pub use library_views::{
     set_library_view_enabled_default, validate_library_view_destination,
 };
 
+/// The single authoritative platform registry and the evidence-based
+/// detector built on it. Every platform alias, extension and signature this
+/// build knows lives there - nothing keeps a second copy.
+pub mod platform;
+
 pub mod patch_manager;
 
 pub mod emulator_environment;
@@ -3016,7 +3021,14 @@ impl Archive {
                     identity.platform = Some(platform.to_string());
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
                 }
-                if kind == ArchiveKind::MegaDriveRom {
+                // A Mega Drive ROM's *kind* is weak evidence: it comes from an
+                // extension. It may fill in a platform nothing else identified,
+                // but it must never replace a platform that stronger evidence
+                // already established - which is how `scummvm/laurabow2/
+                // RESOURCE.GEN` came to be labelled MegaDrive while its
+                // provenance still read `FolderAlias` for a folder named
+                // `scummvm`.
+                if kind == ArchiveKind::MegaDriveRom && identity.platform.is_none() {
                     identity.platform = Some("MegaDrive".to_string());
                     identity
                         .platform_provenance
@@ -3051,7 +3063,16 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         Some(ArchiveKind::SevenZip)
     } else if filename.ends_with(".rar") {
         Some(ArchiveKind::Rar)
-    } else if filename.ends_with(".gen") || filename.ends_with(".smd") {
+    } else if filename.ends_with(".smd") {
+        // `.smd` is a Super Magic Drive dump: Mega Drive specific, so it needs
+        // no corroboration.
+        //
+        // `.gen` deliberately does NOT appear here. It collides with Sierra
+        // SCI `RESOURCE.GEN` files, which every ScummVM game directory
+        // contains, and classifying one of those as a Mega Drive ROM is
+        // exactly the misdetection this milestone fixes. A `.gen` file is
+        // recognised as a Mega Drive ROM only once something corroborates it -
+        // see `archive_kind_in_root`.
         Some(ArchiveKind::MegaDriveRom)
     } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
         .iter()
@@ -3063,14 +3084,17 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
     }
 }
 
-fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
+pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(extension.as_str(), "md" | "bin") {
+    if !matches!(extension.as_str(), "md" | "bin" | "gen") {
         return None;
     }
+    // Corroboration, in the same priority order detection uses everywhere:
+    // the containing folder, the configured source root, or the cartridge
+    // header itself. A shared extension alone is never enough.
     let nested_match = detect_platform_from_folder_alias_with_match(path, source_root)
         .is_some_and(|(platform, _)| platform == "MegaDrive");
     let source_root_match = source_root
@@ -3078,7 +3102,16 @@ fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> 
         .and_then(|name| name.to_str())
         .and_then(folder_platform_alias)
         == Some("MegaDrive");
-    (nested_match || source_root_match).then_some(ArchiveKind::MegaDriveRom)
+    // A folder that names a *different* platform is a positive refusal, not
+    // merely an absence of support: a `.gen` inside a ScummVM game directory
+    // is a resource file, whatever its extension suggests.
+    let contradicted = detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| platform != "MegaDrive");
+    if contradicted {
+        return None;
+    }
+    let header_match = !nested_match && !source_root_match && has_mega_drive_cartridge_header(path);
+    (nested_match || source_root_match || header_match).then_some(ArchiveKind::MegaDriveRom)
 }
 
 pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
@@ -3088,21 +3121,40 @@ pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
 /// Identifies only formats whose uncompressed disc header is directly
 /// available. Compressed RVZ/GCZ images deliberately remain visible without
 /// pretending that their exact identity was extracted.
+///
+/// The GameCube and Wii magic words are no longer written out here: they are
+/// two [`platform::MagicRule`] entries in the registry, so the disc check and
+/// everything else that reasons about signatures read the same table. The
+/// behaviour is unchanged - one bounded read, `.iso`/`.gcm` only, and `None`
+/// rather than a guess when neither word matches.
 fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if !matches!(extension.as_str(), "iso" | "gcm") {
         return None;
     }
-    let mut header = [0_u8; 32];
-    let mut file = OpenOptions::new().read(true).open(path).ok()?;
-    file.read_exact(&mut header).ok()?;
-    if header[0x1c..0x20] == [0xc2, 0x33, 0x9f, 0x3d] {
-        Some("GameCube")
-    } else if header[0x18..0x1c] == [0x5d, 0x1c, 0x9e, 0xa3] {
-        Some("Wii")
-    } else {
-        None
-    }
+    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    let report = platform::detect_platform_report(&request);
+    report
+        .evidence
+        .iter()
+        .find(|item| {
+            item.source == platform::DetectionSource::Signature
+                && matches!(item.platform, "GameCube" | "Wii")
+        })
+        .map(|item| item.platform)
+}
+
+/// Whether `path` carries a real Mega Drive cartridge header, using the
+/// registry's own signature rule rather than a second copy of the offset.
+/// Bounded: one short read at a known offset, and never through a symlink.
+fn has_mega_drive_cartridge_header(path: &Path) -> bool {
+    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    platform::detect_platform_report(&request)
+        .evidence
+        .iter()
+        .any(|item| {
+            item.source == platform::DetectionSource::Signature && item.platform == "MegaDrive"
+        })
 }
 
 pub fn should_skip_split_archive_part(path: impl AsRef<Path>) -> bool {
@@ -4319,9 +4371,14 @@ impl<'a> ArchiveScanner<'a> {
                         .extension()
                         .and_then(|value| value.to_str())
                         .map(str::to_ascii_lowercase);
+                    // `.gen` joins `.md` and `.bin` here: all three are shared
+                    // extensions that only become a Mega Drive ROM once a folder
+                    // or a cartridge header corroborates them, so one that was
+                    // skipped was skipped for an ambiguous platform - not
+                    // because the extension is unsupported.
                     if extension
                         .as_deref()
-                        .is_some_and(|value| matches!(value, "md" | "bin"))
+                        .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
                     {
                         discovery.skipped_ambiguous_platform += 1;
                     } else {
@@ -4598,7 +4655,7 @@ pub enum PlatformProvenance {
     /// Filename/title/known-path-segment evidence, used only after exact
     /// folder-alias matching finds nothing.
     Heuristic,
-    /// The generic exact folder alias map (`FOLDER_PLATFORM_ALIASES`).
+    /// An exact folder-alias match in the `platform` registry.
     FolderAlias,
 }
 
@@ -4649,7 +4706,7 @@ pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) ->
 /// Detects a platform for `path` (an archive discovered under
 /// `source_root`), in priority order:
 ///
-/// 1. The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), walking
+/// 1. The folder-alias table in the `platform` registry, walking
 ///    from the archive's nearest containing directory up to (never beyond)
 ///    `source_root` - see `detect_platform_from_folder_alias`.
 /// 2. The filename/title/known-path-segment heuristic.
@@ -4740,250 +4797,19 @@ fn detect_platform_from_known_heuristics(path: &Path, source_root: &Path) -> Opt
     None
 }
 
-/// Canonical platform name for every folder alias this build recognizes,
-/// keyed by the alias already run through `normalize_path_segment` (ASCII
-/// alphanumeric only, lowercased - so separators and casing like
-/// `"MSX 2"`/`"msx_2"`/`"msx2"` all key to the same `"msx2"` entry without
-/// needing a separate row per spelling variant here). Exact match only,
-/// deliberately: a substring or prefix match would risk false positives
-/// like `"genesis".contains("nes")`. Keep entries specific and
-/// unambiguous, avoiding single common English words that are not also
-/// an explicitly requested platform alias.
-const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
-    ("msx", "MSX"),
-    ("msx1", "MSX"),
-    ("msx2", "MSX2"),
-    ("neogeo", "NeoGeo"),
-    ("neogeoaes", "NeoGeo"),
-    ("neogeomvs", "NeoGeo"),
-    ("neogeo64", "NeoGeo64"),
-    ("ngage", "NGage"),
-    ("nokiangage", "NGage"),
-    ("intellivision", "Intellivision"),
-    ("amiga", "Amiga"),
-    ("commodoreamiga", "Amiga"),
-    ("amigacd32", "AmigaCD32"),
-    ("cd32", "AmigaCD32"),
-    ("atarist", "AtariST"),
-    ("atari2600", "Atari2600"),
-    ("a2600", "Atari2600"),
-    ("atarivcs", "Atari2600"),
-    ("atari5200", "Atari5200"),
-    ("a5200", "Atari5200"),
-    ("atari7800", "Atari7800"),
-    ("a7800", "Atari7800"),
-    ("nes", "NES"),
-    ("nintendoentertainmentsystem", "NES"),
-    ("famicom", "NES"),
-    ("nintendofamicom", "NES"),
-    ("snes", "SNES"),
-    ("supernintendo", "SNES"),
-    ("supernintendoentertainmentsystem", "SNES"),
-    ("nintendosupernintendoentertainmentsystem", "SNES"),
-    ("superfamicom", "SNES"),
-    ("n64", "N64"),
-    ("nintendo64", "N64"),
-    ("gamecube", "GameCube"),
-    ("nintendogamecube", "GameCube"),
-    ("gcn", "GameCube"),
-    ("gc", "GameCube"),
-    ("ngc", "GameCube"),
-    ("wii", "Wii"),
-    ("nintendowii", "Wii"),
-    ("wiiu", "WiiU"),
-    ("nintendowiiu", "WiiU"),
-    ("switch", "Switch"),
-    ("nintendoswitch", "Switch"),
-    ("megadrive", "MegaDrive"),
-    ("genesis", "MegaDrive"),
-    ("segamegadrive", "MegaDrive"),
-    ("segagenesis", "MegaDrive"),
-    ("segamegadrivegenesis", "MegaDrive"),
-    ("smd", "MegaDrive"),
-    ("mastersystem", "MasterSystem"),
-    ("segamastersystem", "MasterSystem"),
-    ("sms", "MasterSystem"),
-    ("gamegear", "GameGear"),
-    ("segagamegear", "GameGear"),
-    ("saturn", "Saturn"),
-    ("segasaturn", "Saturn"),
-    ("dreamcast", "Dreamcast"),
-    ("segadreamcast", "Dreamcast"),
-    ("psx", "PSX"),
-    ("ps1", "PSX"),
-    ("playstation", "PSX"),
-    ("playstation1", "PSX"),
-    ("sonyplaystation", "PSX"),
-    ("sonyplaystation1", "PSX"),
-    ("ps2", "PS2"),
-    ("playstation2", "PS2"),
-    ("sonyplaystation2", "PS2"),
-    ("ps3", "PS3"),
-    ("playstation3", "PS3"),
-    ("sonyplaystation3", "PS3"),
-    ("psp", "PSP"),
-    ("playstationportable", "PSP"),
-    ("sonypsp", "PSP"),
-    ("xbox", "Xbox"),
-    ("xboxoriginal", "Xbox"),
-    ("microsoftxbox", "Xbox"),
-    ("xbox360", "Xbox360"),
-    ("x360", "Xbox360"),
-    ("microsoftxbox360", "Xbox360"),
-    ("arcade", "Arcade"),
-    ("mame", "Arcade"),
-    ("dos", "DOS"),
-    ("msdos", "DOS"),
-    ("dosgames", "DOS"),
-    ("scummvm", "ScummVM"),
-    // Conservative aliases only - see the doc comment above. Deliberately
-    // NOT included: bare "acorn" (too broad - Acorn made several distinct
-    // machines), and generic path components like "games", "software",
-    // "win", or "desktop" for PC (would false-positive on any unrelated
-    // folder using those common words).
-    ("archimedes", "Acorn Archimedes"),
-    ("acornarchimedes", "Acorn Archimedes"),
-    ("riscos", "Acorn Archimedes"),
-    ("pc", "PC"),
-    ("pcgames", "PC"),
-    ("windows", "PC"),
-    ("windowsgames", "PC"),
-    // Conservative retro-platform expansion. Deliberately NOT included:
-    // bare "handheld", "nintendo", "sega", "atari", "sony", "console",
-    // "games", or "roms" - each is broad enough to appear as an unrelated
-    // folder name and would false-positive across the whole library. Short
-    // aliases here ("gb", "ds", "lynx", "jaguar", "vita", "pce", "wsc",
-    // "32x", "c64", "tg16", "ngp", "ngpc") are safe specifically because
-    // `folder_platform_alias` only ever matches one whole, normalized path
-    // *component* (a directory name) - never a substring of a longer
-    // segment and never the archive's own filename (see
-    // `detect_platform_from_folder_alias_with_match`, which pops the
-    // filename before matching) - so a file merely named e.g. "Vita
-    // Game.zip" or a folder like "Digital" can never match "vita"/"ds".
-    ("gameboy", "Game Boy"),
-    ("gb", "Game Boy"),
-    ("gameboycolor", "Game Boy Color"),
-    ("gbc", "Game Boy Color"),
-    ("gameboyadvance", "Game Boy Advance"),
-    ("gba", "Game Boy Advance"),
-    ("nintendods", "Nintendo DS"),
-    ("nds", "Nintendo DS"),
-    ("ds", "Nintendo DS"),
-    ("commodore64", "Commodore 64"),
-    ("c64", "Commodore 64"),
-    ("zxspectrum", "ZX Spectrum"),
-    ("spectrum", "ZX Spectrum"),
-    ("sega32x", "Sega 32X"),
-    ("32x", "Sega 32X"),
-    ("segacd", "Sega CD"),
-    ("megacd", "Sega CD"),
-    ("pcengine", "PC Engine"),
-    ("pce", "PC Engine"),
-    ("turbografx16", "TurboGrafx-16"),
-    ("tg16", "TurboGrafx-16"),
-    ("atarilynx", "Atari Lynx"),
-    ("lynx", "Atari Lynx"),
-    ("atarijaguar", "Atari Jaguar"),
-    ("jaguar", "Atari Jaguar"),
-    ("neogeopocket", "Neo Geo Pocket"),
-    ("ngp", "Neo Geo Pocket"),
-    ("neogeopocketcolor", "Neo Geo Pocket Color"),
-    ("ngpc", "Neo Geo Pocket Color"),
-    ("wonderswan", "WonderSwan"),
-    ("wonderswancolor", "WonderSwan Color"),
-    ("wsc", "WonderSwan Color"),
-    ("3do", "3DO"),
-    ("panasonic3do", "3DO"),
-    ("playstationvita", "PlayStation Vita"),
-    ("psvita", "PlayStation Vita"),
-    ("vita", "PlayStation Vita"),
-    ("colecovision", "ColecoVision"),
-    ("vectrex", "Vectrex"),
-    // libretro-database names, which are the exact directory names inside a
-    // RetroArch cheat catalogue tree (`cheats/<Database Name>/<Game>.cht`).
-    // Without these, a cheat file's platform can never agree with the
-    // selected archive's, so every candidate for these systems would stay a
-    // weak title-only match and no install destination could be resolved.
-    // The forms already covered by a shorter alias above (Sega - Mega Drive
-    // - Genesis, Sony - PlayStation, Atari - 2600, ...) are not repeated.
-    ("nintendonintendoentertainmentsystem", "NES"),
-    ("nintendofamilycomputerdisksystem", "NES"),
-    ("nintendonintendo64", "N64"),
-    ("nintendogameboy", "Game Boy"),
-    ("nintendogameboycolor", "Game Boy Color"),
-    ("nintendogameboyadvance", "Game Boy Advance"),
-    ("nintendonintendods", "Nintendo DS"),
-    ("nintendonintendodsi", "Nintendo DS"),
-    ("segamastersystemmarkiii", "MasterSystem"),
-    ("segamegacdsegacd", "Sega CD"),
-    ("sega32x32x", "Sega 32X"),
-    ("sonyplaystationportable", "PSP"),
-    ("necpcenginesupergrafx", "PC Engine"),
-    ("necpcengineturbografx16", "PC Engine"),
-    ("snkneogeopocket", "Neo Geo Pocket"),
-    ("snkneogeopocketcolor", "Neo Geo Pocket Color"),
-    ("bandaiwonderswan", "WonderSwan"),
-    ("bandaiwonderswancolor", "WonderSwan Color"),
-    ("coleco", "ColecoVision"),
-    ("gcevectrex", "Vectrex"),
-    ("microsoftmsx", "MSX"),
-    ("microsoftmsx2", "MSX2"),
-    ("atarilynxlynx", "Atari Lynx"),
-    // Platform recovery expansion: folder evidence observed in real
-    // libraries for systems that previously had no canonical platform at
-    // all (so every archive under them stayed Unknown regardless of how
-    // clear the folder name was). Same conservative rule as above - exact
-    // normalized whole-component match only, no bare single-word aliases
-    // broad enough to false-positive on an unrelated folder.
-    ("virtualboy", "Virtual Boy"),
-    ("vb", "Virtual Boy"),
-    ("nintendovirtualboy", "Virtual Boy"),
-    ("nintendo3ds", "Nintendo 3DS"),
-    ("n3ds", "Nintendo 3DS"),
-    ("new3ds", "Nintendo 3DS"),
-    ("sharpx68000", "Sharp X68000"),
-    ("x68000", "Sharp X68000"),
-    ("x68k", "Sharp X68000"),
-    ("necpc8801", "NEC PC-8801"),
-    ("pc8801", "NEC PC-8801"),
-    ("necpc9801", "NEC PC-9801"),
-    ("pc9801", "NEC PC-9801"),
-    ("pcenginecd", "PC Engine CD"),
-    ("turbografxcd", "PC Engine CD"),
-    ("tgcd", "PC Engine CD"),
-    // "zxs" is a common abbreviated folder name for ZX Spectrum
-    // collections; "sinclairzxspectrum" covers the fuller libretro-style
-    // name. Both fold to the same canonical platform as the existing
-    // "zxspectrum"/"spectrum" aliases above.
-    ("zxs", "ZX Spectrum"),
-    ("sinclairzxspectrum", "ZX Spectrum"),
-    // FBNeo/MAME/FBA are emulator/core names, not hardware - they all
-    // classify as the "Arcade" hardware platform. Deliberately not treated
-    // as their own canonical platform (see `platform_preferred_emulator`
-    // for where the specific-emulator evidence is instead recorded).
-    ("fbneo", "Arcade"),
-    ("finalburnneo", "Arcade"),
-    ("fba", "Arcade"),
-    ("commodore128", "Commodore 128"),
-    ("c128", "Commodore 128"),
-    ("vic20", "VIC-20"),
-    // Deliberately absent: libretro database names whose systems this build
-    // has no canonical platform for at all (SG-1000, ...). Adding them here
-    // would silently invent a new canonical platform for the whole
-    // application, which is a much larger change than recognising an
-    // existing one under its libretro spelling.
-];
+// The folder-alias table that used to live here now lives in
+// `crate::platform::PLATFORMS`, which is the single authoritative registry for
+// every platform, alias, extension and signature this build knows. The
+// functions below are thin adapters onto it, kept so that every existing
+// caller's behaviour and signature are unchanged.
 
 /// Non-hardware "which emulator core" evidence for platforms whose folder
-/// name commonly identifies a specific emulator/core rather than the
-/// hardware itself (Arcade via FBNeo/MAME/FBA being the primary case).
-/// Kept separate from `FOLDER_PLATFORM_ALIASES` deliberately: the folder
-/// alias table's job is exactly one canonical *hardware* platform per
-/// folder name, never an emulator choice, so FBNeo is never promoted to
-/// its own canonical platform (`canonical_platform_names()` never returns
-/// "FBNeo" - the hardware label "Arcade" is always what a game.folder
-/// alias resolves to). This table answers a strictly narrower, additional
-/// question for the same normalized folder name.
+/// name commonly identifies a specific emulator/core rather than the hardware
+/// itself (Arcade via FBNeo/MAME/FBA being the primary case). Kept separate
+/// from the platform registry deliberately: the registry's job is exactly one
+/// canonical *hardware* platform per folder name, never an emulator choice, so
+/// FBNeo is never promoted to its own canonical platform - the hardware label
+/// "Arcade" is always what such a folder alias resolves to.
 const FOLDER_PREFERRED_EMULATOR_ALIASES: &[(&str, &str)] = &[
     ("fbneo", "FBNeo"),
     ("finalburnneo", "FBNeo"),
@@ -4991,11 +4817,10 @@ const FOLDER_PREFERRED_EMULATOR_ALIASES: &[(&str, &str)] = &[
     ("mame", "MAME"),
 ];
 
-/// The emulator/core a normalized folder name suggests, when the folder
-/// name itself names a specific emulator rather than only hardware (e.g. a
-/// `FBNeo`/`MAME` collection folder). Returns `None` when the folder name
-/// carries no such evidence - most platforms have no preferred-emulator
-/// folder convention at all, which is not an error.
+/// The emulator/core a normalized folder name suggests, when the folder name
+/// itself names a specific emulator rather than only hardware. Returns `None`
+/// when the folder name carries no such evidence - most platforms have no
+/// preferred-emulator folder convention at all, which is not an error.
 #[must_use]
 pub fn platform_preferred_emulator_for_alias(folder_hint: &str) -> Option<&'static str> {
     let normalized = normalize_path_segment(folder_hint);
@@ -5005,96 +4830,39 @@ pub fn platform_preferred_emulator_for_alias(folder_hint: &str) -> Option<&'stat
         .map(|(_, emulator)| *emulator)
 }
 
-/// Every canonical platform name this build recognises via the
-/// folder-alias system (`FOLDER_PLATFORM_ALIASES`), deduplicated and
-/// sorted. This is the single source of truth for "known platform" used
-/// by manual platform assignment (`Database::set_manual_platform`) and
-/// its CLI/GUI callers - neither the CLI nor the GUI maintains a second,
-/// independently-drifting platform list. Does not include platform names
-/// only ever produced by the filename/title heuristic in
-/// `detect_platform_from_known_heuristics` (for example `"Nintendo3DS"`) -
-/// those are ad hoc title matches, not part of the structured alias table
-/// this function draws from. `"PC"` is also reachable through that
-/// heuristic (see `iamjesuschrist`/`steamrip`), but is additionally a
-/// first-class folder alias below, so it does appear here.
+/// Every canonical platform name this build recognises, deduplicated and
+/// sorted. Delegates to [`crate::platform::canonical_ids`], so manual platform
+/// assignment (`Database::set_manual_platform`) and its CLI/GUI callers all
+/// draw from the one registry and cannot drift apart.
 pub fn canonical_platform_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = FOLDER_PLATFORM_ALIASES
-        .iter()
-        .map(|(_, canonical)| *canonical)
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
+    platform::canonical_ids()
 }
 
-/// Resolves one external platform hint through the same normalized,
-/// built-in folder-alias table used by archive platform detection. The
-/// original hint is never changed; callers use the returned canonical name
-/// only for comparison. If a future table edit makes one normalized alias
-/// point at more than one canonical platform, the hint is deliberately
-/// treated as ambiguous and returns `None` rather than selecting the first
-/// row and risking a false-positive match.
+/// Resolves one external platform hint through the registry's normalized
+/// folder-alias matching. The original hint is never changed; callers use the
+/// returned canonical name only for comparison. An alias claimed by more than
+/// one platform is treated as ambiguous and returns `None` rather than picking
+/// a winner - see [`crate::platform::platform_for_alias`].
 pub fn canonical_platform_for_alias(platform_hint: &str) -> Option<&'static str> {
-    canonical_platform_for_alias_in(platform_hint, FOLDER_PLATFORM_ALIASES)
+    // An exact canonical identifier resolves to itself, so a stored value round
+    // trips even when it is not also spelled as one of its own aliases.
+    platform::platform_by_id(platform_hint)
+        .or_else(|| platform::platform_for_alias(platform_hint))
+        .map(|platform| platform.id)
 }
 
-fn canonical_platform_for_alias_in<'a>(
-    platform_hint: &str,
-    aliases: &'a [(&str, &'a str)],
-) -> Option<&'a str> {
-    let normalized = normalize_path_segment(platform_hint);
-    let mut matches = aliases
-        .iter()
-        .filter(|(alias, _)| *alias == normalized)
-        .map(|(_, canonical)| *canonical);
-    let canonical = matches.next()?;
-    matches
-        .all(|candidate| candidate == canonical)
-        .then_some(canonical)
-}
-
-/// Canonical platform name for one already-lossy-stringified path
-/// component, if it exactly matches a known folder alias after
-/// normalization, or `None` if it does not.
+/// Canonical platform name for one already-lossy-stringified path component,
+/// if it exactly matches a known folder alias after normalization, tolerating
+/// the parenthesized-suffix and trailing-date conventions real collection
+/// folders use. Matching remains exact - never a substring.
 fn folder_platform_alias(segment: &str) -> Option<&'static str> {
-    canonical_platform_for_alias(segment)
-        .or_else(|| {
-            // Collection folders commonly append acquisition dates and regions,
-            // e.g. `Nintendo - GameCube (2018-08-25 ...) (America)`. Remove only
-            // parenthesized suffixes; matching remains exact after normalization.
-            let base = segment.split_once('(')?.0.trim_end();
-            canonical_platform_for_alias(base)
-        })
-        .or_else(|| {
-            let bytes = segment.as_bytes();
-            let date_start = (0..bytes.len().saturating_sub(9)).find(|&index| {
-                bytes[index..]
-                    .get(0..4)
-                    .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-                    && bytes.get(index + 4) == Some(&b'-')
-                    && bytes[index + 5..]
-                        .get(0..2)
-                        .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-                    && bytes.get(index + 7) == Some(&b'-')
-                    && bytes[index + 8..]
-                        .get(0..2)
-                        .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-            })?;
-            canonical_platform_for_alias(segment[..date_start].trim_end_matches([' ', '-', '_']))
-        })
+    platform::detect::platform_for_folder_name(segment).map(|platform| platform.id)
 }
 
-/// Infers a platform from `path`'s folder structure alone, walking
-/// directory components from the archive's nearest containing folder
-/// upward to and including `source_root` - the nearest matching
-/// folder wins. Nothing outside `source_root` participates. The archive's own
-/// filename is excluded too - this only ever looks at directory names.
-///
-/// Uses `to_string_lossy` on each component (matching
-/// `detect_platform_from_known_heuristics`'s existing convention) - this
-/// is a best-effort display guess, not an identity or reconciliation key,
-/// so a lossy conversion on a non-UTF-8 path component is safe and simply
-/// yields no match rather than panicking.
+/// Infers a platform from `path`'s folder structure alone, walking directory
+/// components from the archive's nearest containing folder upward to and
+/// including `source_root` - the nearest matching folder wins. Nothing outside
+/// `source_root` participates, and the archive's own filename is excluded.
 fn detect_platform_from_folder_alias_with_match(
     path: &Path,
     source_root: &Path,
@@ -5118,12 +4886,10 @@ fn detect_platform_from_folder_alias_with_match(
         })
 }
 
+/// Normalizes one path segment for alias matching. Delegates to the registry
+/// so there is exactly one normalization rule in the build.
 fn normalize_path_segment(segment: &str) -> String {
-    segment
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+    platform::normalize_alias(segment)
 }
 fn archive_title(path: &Path) -> String {
     let filename = path
@@ -7343,7 +7109,27 @@ mod tests {
         let discovery = ArchiveScanner::new(&config)
             .scan_archives_with_summary()
             .unwrap();
-        assert_eq!(discovery.archives.len(), 14);
+        // 13, not 14: `specific.GEN` sits at the source root, where no folder
+        // says Mega Drive, and its contents carry no cartridge header. Before
+        // this milestone a bare `.gen` was accepted on its extension alone,
+        // which is what labelled ScummVM `RESOURCE.GEN` resource files as Mega
+        // Drive ROMs. `specific.sMd` is still accepted, because `.smd` really
+        // is Mega Drive specific and needs no corroboration.
+        assert_eq!(discovery.archives.len(), 13);
+        assert!(
+            !discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("specific.GEN")),
+            "an uncorroborated `.gen` must not be taken for a Mega Drive ROM"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("specific.sMd")),
+            "`.smd` is Mega Drive specific and must still be recognised"
+        );
         assert!(discovery.archives.iter().all(|archive| {
             archive.kind == ArchiveKind::MegaDriveRom
                 && archive.identity.platform.as_deref() == Some("MegaDrive")
@@ -7351,7 +7137,10 @@ mod tests {
         assert!(!discovery.archives.iter().any(|archive| {
             archive.path.ends_with("README.md") || archive.path.ends_with("notes.md")
         }));
-        assert_eq!(discovery.skipped_ambiguous_platform, 2);
+        // 3: the two `.md` markdown files, plus the uncorroborated `.GEN`.
+        // All three are shared extensions whose platform could not be
+        // established, which is different from an unsupported extension.
+        assert_eq!(discovery.skipped_ambiguous_platform, 3);
         assert_eq!(discovery.skipped_unsupported_extension, 0);
         let mount_error = validate_archive_for_mount(&discovery.archives[0]).unwrap_err();
         assert!(mount_error.to_string().contains("not archive mount inputs"));
@@ -10459,11 +10248,24 @@ mod tests {
 
     #[test]
     fn conflicting_normalized_platform_aliases_are_rejected_as_ambiguous() {
-        let aliases = &[("atari2600", "Atari2600"), ("atari2600", "Atari5200")];
+        // The registry now owns this guarantee: `platform_for_alias` refuses to
+        // pick a winner when one normalized alias is claimed by more than one
+        // platform, and `no_alias_is_claimed_by_two_platforms` keeps the real
+        // table free of that case. Both halves are asserted here.
         assert_eq!(
-            canonical_platform_for_alias_in("Atari - 2600", aliases),
-            None
+            platform::platform_for_alias("Atari - 2600").map(|entry| entry.id),
+            Some("Atari2600"),
+            "an unambiguous alias still resolves"
         );
+        let mut seen = std::collections::BTreeMap::new();
+        for entry in platform::PLATFORMS {
+            for alias in entry.folder_aliases {
+                assert!(
+                    seen.insert(*alias, entry.id).is_none(),
+                    "alias `{alias}` is claimed twice, which would make lookup ambiguous"
+                );
+            }
+        }
     }
 
     #[test]

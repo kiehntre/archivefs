@@ -958,10 +958,26 @@ pub fn findings_from_health_issues(issues: &[HealthIssue]) -> Vec<Finding> {
         .iter()
         .map(|issue| {
             let mut evidence = vec![format!("Classification: {}", issue.category.label())];
-            if let Some(platform) = &issue.platform {
-                evidence.push(format!("Platform: {platform}"));
-            } else {
-                evidence.push("Platform: not assigned".to_string());
+            // The stored canonical identifier, shown with the registry's display
+            // name so a person reads real hardware names while still seeing
+            // exactly what the library has recorded.
+            //
+            // Deliberately no confidence and no re-detection here: this value
+            // was persisted, possibly by an older build, and running the
+            // detector against it would turn stored history into a claim about
+            // the present. Confidence is only ever shown where a *current*
+            // detection actually exists - see `platform-detect` and the library
+            // view. Nothing here rewrites the stored row.
+            match &issue.platform {
+                Some(platform) => {
+                    let display = crate::platform::display_name_for(platform);
+                    if display == platform {
+                        evidence.push(format!("Platform: {platform} (as stored)"));
+                    } else {
+                        evidence.push(format!("Platform: {display} (stored as {platform})"));
+                    }
+                }
+                None => evidence.push("Platform: not assigned".to_string()),
             }
             if let Some(state) = issue.mount_state {
                 evidence.push(format!("Mount state: {state}"));
@@ -1011,6 +1027,19 @@ pub fn findings_from_health_issues(issues: &[HealthIssue]) -> Vec<Finding> {
                     "platform",
                     Measurement::text(issue.platform.as_deref().unwrap_or("unassigned")),
                 ),
+                (
+                    "platform_display_name",
+                    Measurement::text(
+                        issue
+                            .platform
+                            .as_deref()
+                            .map(crate::platform::display_name_for)
+                            .unwrap_or("unassigned"),
+                    ),
+                ),
+                // States plainly that this platform came from the record, not
+                // from detecting anything during this scan.
+                ("platform_source_scope", Measurement::text("stored")),
             ]);
             if let Some(recovery) = health_issue_recovery(issue) {
                 finding = finding.with_recovery(recovery);

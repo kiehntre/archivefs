@@ -2001,3 +2001,128 @@ fn the_deferred_list_no_longer_claims_the_new_families_are_missing() {
         .expect("the sandbox limitation remains real");
     assert!(sandbox.reason.contains("write probe"));
 }
+
+// --- Integration: the platform registry meets Doctor ----------------------
+
+/// A stored platform is displayed with its canonical name but is never
+/// re-detected, so history cannot become a claim about the present.
+#[test]
+fn doctor_shows_the_canonical_display_name_for_a_stored_platform() {
+    let issues = vec![HealthIssue {
+        path: PathBuf::from("/roms/genesis/Sonic.md"),
+        platform: Some("MegaDrive".to_string()),
+        present: true,
+        mount_state: Some(crate::MountState::NotMountable),
+        category: HealthCategory::MountNotRequired,
+        reason: "loose ROM".to_string(),
+        retryable: false,
+        recovery_action: None,
+        last_seen_at: None,
+        size_bytes: None,
+        modified_time_unix_seconds: None,
+    }];
+    let findings = findings_from_health_issues(&issues);
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0]
+            .evidence
+            .iter()
+            .any(|item| item == "Platform: Sega Mega Drive / Genesis (stored as MegaDrive)"),
+        "the display name and the stored identifier must both be visible: {:?}",
+        findings[0].evidence
+    );
+    assert_eq!(
+        findings[0].measurements.get("platform_display_name"),
+        Some(&Measurement::Text("Sega Mega Drive / Genesis".to_string()))
+    );
+    assert_eq!(
+        findings[0].measurements.get("platform"),
+        Some(&Measurement::Text("MegaDrive".to_string())),
+        "the stored identifier must be reported unchanged"
+    );
+    assert_eq!(
+        findings[0].measurements.get("platform_source_scope"),
+        Some(&Measurement::Text("stored".to_string())),
+        "Doctor must say the value came from the record, not from detection"
+    );
+}
+
+/// A platform an older build stored that this build no longer knows must still
+/// display, and must not be silently corrected or dropped.
+#[test]
+fn doctor_never_rewrites_or_hides_an_unrecognised_stored_platform() {
+    let issues = vec![HealthIssue {
+        path: PathBuf::from("/roms/mystery/thing.zip"),
+        platform: Some("SomePlatformThisBuildRemoved".to_string()),
+        present: true,
+        mount_state: None,
+        category: HealthCategory::HistoricalMountFailure,
+        reason: "historical".to_string(),
+        retryable: false,
+        recovery_action: None,
+        last_seen_at: None,
+        size_bytes: None,
+        modified_time_unix_seconds: None,
+    }];
+    let findings = findings_from_health_issues(&issues);
+    assert!(
+        findings[0]
+            .evidence
+            .iter()
+            .any(|item| item.contains("SomePlatformThisBuildRemoved")),
+        "an unknown stored identifier must still be shown verbatim"
+    );
+    assert_eq!(
+        findings[0].measurements.get("platform"),
+        Some(&Measurement::Text(
+            "SomePlatformThisBuildRemoved".to_string()
+        ))
+    );
+    assert_eq!(
+        findings[0].measurements.get("mount_failure_scope"),
+        Some(&Measurement::Text("historical".to_string())),
+        "a historical finding must stay historical"
+    );
+}
+
+/// A historical mount failure must never be presented as a current error just
+/// because the detector would now classify the file differently.
+#[test]
+fn a_historical_finding_stays_historical_regardless_of_current_detection() {
+    let issues = vec![HealthIssue {
+        // A ScummVM resource file an older build recorded as a Mega Drive ROM.
+        path: PathBuf::from("/roms/scummvm/laurabow2/RESOURCE.GEN"),
+        platform: Some("MegaDrive".to_string()),
+        present: true,
+        mount_state: Some(crate::MountState::NotMountable),
+        category: HealthCategory::HistoricalMountFailure,
+        reason: "historical mount failure".to_string(),
+        retryable: false,
+        recovery_action: None,
+        last_seen_at: Some("2026-01-01T00:00:00Z".to_string()),
+        size_bytes: None,
+        modified_time_unix_seconds: None,
+    }];
+    let findings = findings_from_health_issues(&issues);
+    assert_eq!(
+        findings[0].measurements.get("mount_failure_scope"),
+        Some(&Measurement::Text("historical".to_string()))
+    );
+    assert_eq!(
+        findings[0].severity,
+        health_category_severity(HealthCategory::HistoricalMountFailure),
+        "the severity must come from the stored classification, not from re-detecting the file"
+    );
+    // Current detection of that same path disagrees - and that is fine, because
+    // Doctor never applies it to a stored record.
+    let current = crate::platform::detect_platform_report(&crate::platform::DetectionRequest::new(
+        Path::new("/roms/scummvm/laurabow2/RESOURCE.GEN"),
+        Path::new("/roms"),
+    ));
+    assert_eq!(current.platform, Some("ScummVM"));
+    assert_eq!(
+        findings[0].measurements.get("platform"),
+        Some(&Measurement::Text("MegaDrive".to_string())),
+        "the stored value stays stored: Doctor must not correct the database"
+    );
+}

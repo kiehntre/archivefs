@@ -13020,15 +13020,59 @@ fn platform_source_label(source: Option<&str>) -> &'static str {
     }
 }
 
+/// The confidence a stored platform source implies, using the same four-level
+/// scale as [`archivefs_core::platform::DetectionConfidence`].
+///
+/// An explicit assignment and a format/header identity are decisive; a folder
+/// alias or a filename heuristic is good evidence that could still be wrong;
+/// no platform at all is Unknown. Kept as a mapping from the stored source
+/// rather than re-running detection, so what a person sees is the confidence of
+/// the assignment that is actually recorded.
+fn platform_confidence_label(details: &PlatformProvenanceDetails) -> &'static str {
+    use archivefs_core::platform::DetectionConfidence;
+    if details.platform.is_none() {
+        return DetectionConfidence::Unknown.label();
+    }
+    match details.source.as_deref() {
+        Some(MANUAL_PLATFORM_SOURCE) | Some("header_identity") => {
+            DetectionConfidence::Confirmed.label()
+        }
+        Some(_) => DetectionConfidence::Probable.label(),
+        None => DetectionConfidence::Unknown.label(),
+    }
+}
+
 fn platform_provenance_lines(details: &PlatformProvenanceDetails) -> Vec<(&'static str, String)> {
+    // The canonical display name, with the stored identifier alongside it when
+    // the two differ - a person reads "Sega Mega Drive / Genesis" while the
+    // library stores "MegaDrive", and both matter.
+    let platform_line = match details.platform.as_deref() {
+        Some(stored) => {
+            let display = archivefs_core::platform::display_name_for(stored);
+            if display == stored {
+                stored.to_string()
+            } else {
+                format!("{display} ({stored})")
+            }
+        }
+        None => "Unknown".to_string(),
+    };
     let mut lines = vec![
-        (
-            "Platform",
-            details.platform.as_deref().unwrap_or("Unknown").to_string(),
-        ),
+        ("Platform", platform_line),
+        ("Confidence", platform_confidence_label(details).to_string()),
         (
             "Source",
             platform_source_label(details.source.as_deref()).to_string(),
+        ),
+        (
+            "Assignment",
+            if details.source.as_deref() == Some(MANUAL_PLATFORM_SOURCE) {
+                "Manually assigned".to_string()
+            } else if details.platform.is_some() {
+                "Automatically detected".to_string()
+            } else {
+                "Not assigned".to_string()
+            },
         ),
     ];
     if details.platform.is_none() {
@@ -33608,7 +33652,7 @@ impl PlatformAssetCategory {
 /// deliberately not exhaustive (an unmapped platform simply falls back to
 /// `Unknown`, which is a correct, honest answer, not a bug). Matches
 /// against `canonical_platform_names()`'s exact spellings
-/// (archivefs-core's `FOLDER_PLATFORM_ALIASES` table) case-insensitively,
+/// (archivefs-core's `platform` registry) case-insensitively,
 /// so a filter/search-derived platform string with different casing still
 /// resolves correctly.
 fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
@@ -45230,9 +45274,68 @@ $Instant Growth [Nayr]\n";
         };
 
         let lines = provenance_line_map(&details);
-        assert_eq!(lines["Platform"], "GameCube");
+        // The canonical display name is shown with the stored identifier in
+        // parentheses, so a person reads the real hardware name while still
+        // seeing exactly what the library has recorded.
+        assert_eq!(lines["Platform"], "Nintendo GameCube (GameCube)");
         assert_eq!(lines["Source"], "Manual assignment");
+        assert_eq!(lines["Assignment"], "Manually assigned");
+        assert_eq!(
+            lines["Confidence"], "Confirmed",
+            "a platform a person chose is not a guess"
+        );
         assert_eq!(lines["Automatic fallback"], "Unknown");
+    }
+
+    #[test]
+    fn an_automatically_detected_platform_is_labelled_as_such_with_its_confidence() {
+        let details = PlatformProvenanceDetails {
+            platform: Some("MegaDrive".to_string()),
+            source: Some("folder_alias".to_string()),
+            matched_component: Some("genesis".to_string()),
+            automatic_fallback: None,
+        };
+        let lines = provenance_line_map(&details);
+        assert_eq!(lines["Platform"], "Sega Mega Drive / Genesis (MegaDrive)");
+        assert_eq!(lines["Assignment"], "Automatically detected");
+        assert_eq!(
+            lines["Confidence"], "Probable",
+            "a folder name is good evidence, not proof"
+        );
+        assert_eq!(lines["Matched folder"], "genesis");
+    }
+
+    #[test]
+    fn an_unassigned_platform_reads_as_unknown_rather_than_as_a_detection() {
+        let details = PlatformProvenanceDetails {
+            platform: None,
+            source: None,
+            matched_component: None,
+            automatic_fallback: None,
+        };
+        let lines = provenance_line_map(&details);
+        assert_eq!(lines["Platform"], "Unknown");
+        assert_eq!(lines["Confidence"], "Unknown");
+        assert_eq!(lines["Assignment"], "Not assigned");
+        assert!(
+            lines["Reason"].contains("No explicit override"),
+            "a person must be told why detection found nothing"
+        );
+    }
+
+    #[test]
+    fn a_header_identified_platform_is_confirmed() {
+        let details = PlatformProvenanceDetails {
+            platform: Some("Wii".to_string()),
+            source: Some("header_identity".to_string()),
+            matched_component: None,
+            automatic_fallback: None,
+        };
+        assert_eq!(
+            provenance_line_map(&details)["Confidence"],
+            "Confirmed",
+            "a disc magic word is decisive"
+        );
     }
 
     #[test]
@@ -52204,6 +52307,55 @@ $Instant Growth [Nayr]\n";
         record
     }
 
+    /// A record for a path that is *not* a mountable archive, built without
+    /// going through `Archive::from_path`.
+    ///
+    /// Needed because a ScummVM resource file is no longer classified as an
+    /// archive at all: `.gen` only means "Mega Drive ROM" once a folder or a
+    /// cartridge header corroborates it, so `Archive::from_path` correctly
+    /// returns `None` for `RESOURCE.GEN`. A row like this can therefore only
+    /// reach the health view from a database an *older* build wrote, which is
+    /// exactly the case `HealthCategory::MountNotRequired` exists to classify -
+    /// and exactly why nothing here rewrites the stored row.
+    fn legacy_unsupported_record(
+        path: &str,
+        kind: ArchiveKind,
+        platform: Option<&str>,
+    ) -> ArchiveRecord {
+        let path = PathBuf::from(path);
+        let archive = Archive {
+            path: path.clone(),
+            kind,
+            identity: archivefs_core::ArchiveIdentity::from_path(
+                &path,
+                PathBuf::from("/roms"),
+                None,
+            ),
+            health: ArchiveHealth::Unsupported,
+        };
+        let mut record = ArchiveRecord::new(
+            MountPlan::new(archive, PathBuf::from("/mnt/archivefs/Test")),
+            MountState::NotMountable,
+            ArchiveMetadata {
+                title: None,
+                platform: platform.map(str::to_string),
+                region: None,
+                languages: None,
+                version: None,
+                disc: None,
+                publisher: None,
+                developer: None,
+                release_year: None,
+                genre: None,
+                notes: None,
+                source: None,
+            },
+            ArchiveHealth::Unsupported,
+        );
+        record.health = ArchiveHealth::Unsupported;
+        record
+    }
+
     /// Like `loaded_data_with_rows`, but populates `records` (and derives
     /// `rows`/`stats.mounted_count`/`stats.pending_count` from them) since
     /// `build_health_issues` reads the live snapshot's `records`, not its
@@ -52323,10 +52475,13 @@ $Instant Growth [Nayr]\n";
             ArchiveHealth::Unsupported,
             Some("MegaDrive"),
         );
-        let scummvm_resource = health_test_record(
+        // A row an older build persisted, when `.gen` alone was taken for a
+        // Mega Drive ROM. Current scans never produce one - see
+        // `legacy_unsupported_record` - but the row is still in real databases
+        // and must classify as "no mount required" rather than as a failure.
+        let scummvm_resource = legacy_unsupported_record(
             "/roms/scummvm/laurabow2/RESOURCE.GEN",
-            MountState::NotMountable,
-            ArchiveHealth::Unsupported,
+            ArchiveKind::MegaDriveRom,
             Some("ScummVM"),
         );
         let issues = build_health_issues(
