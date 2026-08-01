@@ -622,6 +622,7 @@ fn an_import_walks_several_pages() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         |progress| seen_progress.push(progress),
         None,
     )
@@ -648,6 +649,7 @@ fn an_empty_catalogue_imports_as_an_empty_cache() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -672,6 +674,7 @@ fn a_sample_import_stops_early() {
         &fake,
         ImportScope::Sample { max_records: 25 },
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -695,6 +698,7 @@ fn a_repeated_page_is_detected() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -724,6 +728,7 @@ fn an_invalid_pagination_envelope_is_refused() {
             &fake,
             ImportScope::Full,
             &capability(),
+            DEFAULT_PAGE_SIZE,
             no_progress,
             None,
         )
@@ -752,6 +757,7 @@ fn an_inconsistent_total_is_reported() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -780,6 +786,7 @@ fn an_inconsistent_total_is_reported() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -804,6 +811,7 @@ fn cancellation_and_mid_import_failure_stop_the_import() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         Some(&cancel),
     )
@@ -822,6 +830,7 @@ fn cancellation_and_mid_import_failure_stop_the_import() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -848,6 +857,7 @@ fn an_incapable_instance_is_refused_before_importing() {
         &fake,
         ImportScope::Full,
         &incapable,
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -873,6 +883,7 @@ fn duplicate_ids_and_duplicate_paths_are_preserved_for_inspection() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -1242,6 +1253,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
             transport: &good,
             scope: ImportScope::Full,
             capability: &capability(),
+            page_size: DEFAULT_PAGE_SIZE,
             hashes: &LocalHashCache::new(),
             cancel: None,
         },
@@ -1266,6 +1278,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         transport: &fake,
                         scope: ImportScope::Full,
                         capability: &capability(),
+                        page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
                     },
@@ -1285,6 +1298,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         transport: &fake,
                         scope: ImportScope::Full,
                         capability: &capability(),
+                        page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
                     },
@@ -1305,6 +1319,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         transport: &fake,
                         scope: ImportScope::Full,
                         capability: &capability(),
+                        page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
                     },
@@ -1325,6 +1340,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         transport: &fake,
                         scope: ImportScope::Full,
                         capability: &capability(),
+                        page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
                     },
@@ -1344,6 +1360,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         transport: &fake,
                         scope: ImportScope::Full,
                         capability: &capability(),
+                        page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: Some(&cancel),
                     },
@@ -1393,6 +1410,7 @@ fn a_first_ever_failed_import_leaves_no_fake_ready_state() {
                 transport: &fake,
                 scope: ImportScope::Full,
                 capability: &capability(),
+                page_size: DEFAULT_PAGE_SIZE,
                 hashes: &LocalHashCache::new(),
                 cancel: None,
             },
@@ -1439,6 +1457,7 @@ fn cached_identity_is_browsable_with_no_network() {
             transport: &fake,
             scope: ImportScope::Full,
             capability: &capability(),
+            page_size: DEFAULT_PAGE_SIZE,
             hashes: &LocalHashCache::new(),
             cancel: None,
         },
@@ -1966,6 +1985,7 @@ fn one_path_can_be_matched_through_the_api() {
             transport: &fake,
             scope: ImportScope::Full,
             capability: &capability(),
+            page_size: DEFAULT_PAGE_SIZE,
             hashes: &LocalHashCache::new(),
             cancel: None,
         },
@@ -2022,6 +2042,7 @@ fn an_end_to_end_import_produces_matched_records_and_a_status() {
                 transport: &fake,
                 scope: ImportScope::Full,
                 capability: &capability(),
+                page_size: DEFAULT_PAGE_SIZE,
                 hashes: &LocalHashCache::new(),
                 cancel: None,
             },
@@ -2150,6 +2171,7 @@ fn a_large_import_is_bounded_and_prompt() {
         &fake,
         ImportScope::Full,
         &capability(),
+        DEFAULT_PAGE_SIZE,
         no_progress,
         None,
     )
@@ -2177,4 +2199,853 @@ fn a_large_import_is_bounded_and_prompt() {
     );
     let reloaded = load_cache(&location, None).expect("readable");
     assert_eq!(reloaded.records.len(), 20_000);
+}
+
+// --- Adaptive page sizing -------------------------------------------------
+//
+// A real RomM 5.1.0 catalogue produced a page of 100 records larger than the
+// 8 MiB response ceiling, at offset 4400. The ceiling is not the thing to change:
+// it is what stops a server handing over an unbounded body. These tests drive the
+// alternative - retry the same offset with a smaller page - against a fake that
+// actually decides by the requested limit, so the behaviour under test is the
+// interaction between the request and the refusal, not a scripted sequence.
+
+/// Whether a request for `limit` records at `offset` would be too large.
+///
+/// The third argument is whether per-file detail was asked for: a record can be
+/// readable without its file list and unreadable with it, which is exactly the
+/// case that made a real catalogue unimportable.
+type SizePolicy = Box<dyn Fn(u32, u32, bool) -> bool + Send + Sync>;
+/// A hook run before each `/api/roms` response, given the call index. Used to
+/// trip cancellation or burn the deadline part-way through a retry sequence.
+type CallHook = Box<dyn Fn(usize) + Send + Sync>;
+
+struct AdaptiveRomm {
+    /// The catalogue, one record per entry, sliced by offset and limit.
+    catalogue: Vec<String>,
+    size_policy: SizePolicy,
+    /// Every `(offset, limit)` asked for, in order. The record of what the walk
+    /// actually did.
+    requests: Mutex<Vec<(u32, u32)>>,
+    /// Totals to report, one per successful page, cycling. A total that changes
+    /// mid-import must remain a progress hint and nothing more.
+    totals: Option<Vec<u64>>,
+    /// Report this offset instead of the real one, on the given call index.
+    offset_lie: Option<(usize, u32)>,
+    /// Report this limit instead of the requested one, on every page.
+    limit_lie: Option<u32>,
+    calls: Mutex<usize>,
+    /// How many requests came in without `with_files`.
+    files_omitted: Mutex<usize>,
+    hook: Option<CallHook>,
+}
+
+impl AdaptiveRomm {
+    /// A catalogue of `records` records, where any request for more than
+    /// `max_safe_limit` records is refused as too large.
+    fn new(records: usize, max_safe_limit: u32) -> Self {
+        Self::with_policy(
+            records,
+            Box::new(move |_offset, limit, _with_files| limit > max_safe_limit),
+        )
+    }
+
+    fn with_policy(records: usize, size_policy: SizePolicy) -> Self {
+        let catalogue = (0..records)
+            .map(|index| {
+                rom_json(
+                    index as u32 + 1,
+                    &format!("Game {index}"),
+                    &format!("game-{index}.zip"),
+                    1024,
+                    None,
+                )
+            })
+            .collect();
+        Self {
+            catalogue,
+            size_policy,
+            requests: Mutex::new(Vec::new()),
+            totals: None,
+            offset_lie: None,
+            limit_lie: None,
+            calls: Mutex::new(0),
+            files_omitted: Mutex::new(0),
+            hook: None,
+        }
+    }
+
+    fn reporting_totals(mut self, totals: Vec<u64>) -> Self {
+        self.totals = Some(totals);
+        self
+    }
+
+    fn lying_about_offset(mut self, call_index: usize, reported: u32) -> Self {
+        self.offset_lie = Some((call_index, reported));
+        self
+    }
+
+    fn lying_about_limit(mut self, reported: u32) -> Self {
+        self.limit_lie = Some(reported);
+        self
+    }
+
+    fn with_hook(mut self, hook: CallHook) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
+    fn requests(&self) -> Vec<(u32, u32)> {
+        self.requests.lock().expect("lock").clone()
+    }
+
+    /// Only the requests that were served, i.e. not refused for size. Judged with
+    /// file detail on, which is what an import asks for unless forced to drop it.
+    fn served_requests(&self) -> Vec<(u32, u32)> {
+        self.requests()
+            .into_iter()
+            .filter(|(offset, limit)| !(self.size_policy)(*offset, *limit, true))
+            .collect()
+    }
+
+    /// How many requests left the per-file detail out.
+    fn files_omitted_requests(&self) -> usize {
+        *self.files_omitted.lock().expect("lock")
+    }
+}
+
+impl RommTransport for AdaptiveRomm {
+    fn get(
+        &self,
+        url: &str,
+        _authorization: Option<&str>,
+        _max_bytes: usize,
+    ) -> Result<RommHttpResponse, RommRequestError> {
+        if url.contains("/api/platforms") {
+            return Ok(RommHttpResponse {
+                status: 200,
+                body: r#"[{"id":3,"slug":"nes","name":"Nintendo Entertainment System"}]"#
+                    .as_bytes()
+                    .to_vec(),
+                location: None,
+            });
+        }
+        if !url.contains("/api/roms") {
+            return Ok(RommHttpResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+                location: None,
+            });
+        }
+        let number = |key: &str| -> u32 {
+            url.split(&format!("{key}="))
+                .nth(1)
+                .and_then(|tail| tail.split('&').next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+        };
+        let (limit, offset) = (number("limit"), number("offset"));
+        let with_files = url.contains("with_files=true");
+        if !with_files {
+            *self.files_omitted.lock().expect("lock") += 1;
+        }
+        self.requests.lock().expect("lock").push((offset, limit));
+
+        let call_index = {
+            let mut calls = self.calls.lock().expect("lock");
+            let index = *calls;
+            *calls += 1;
+            index
+        };
+        if let Some(hook) = &self.hook {
+            hook(call_index);
+        }
+        // The refusal a real client produces when the body exceeds the ceiling:
+        // the body is never read, so nothing about its contents is knowable.
+        if (self.size_policy)(offset, limit, with_files) {
+            return Err(RommRequestError::ResponseTooLarge {
+                limit: crate::identity_source::romm::client::MAX_RESPONSE_BYTES,
+            });
+        }
+
+        let start = (offset as usize).min(self.catalogue.len());
+        let end = start
+            .saturating_add(limit as usize)
+            .min(self.catalogue.len());
+        let items = &self.catalogue[start..end];
+        let total = match &self.totals {
+            Some(totals) if !totals.is_empty() => totals[call_index.min(totals.len() - 1)],
+            _ => self.catalogue.len() as u64,
+        };
+        let reported_offset = match self.offset_lie {
+            Some((index, reported)) if index == call_index => reported,
+            _ => offset,
+        };
+        let reported_limit = self.limit_lie.unwrap_or(limit);
+        Ok(RommHttpResponse {
+            status: 200,
+            body: page_json(items, total, reported_limit, reported_offset).into_bytes(),
+            location: None,
+        })
+    }
+}
+
+/// Runs a full import against an adaptive fake, collecting progress.
+fn adaptive_import(
+    tree: &Tree,
+    fake: &AdaptiveRomm,
+    page_size: u32,
+) -> (Result<ImportOutcome, ImportFailure>, Vec<ImportProgress>) {
+    let mut seen = Vec::new();
+    let outcome = import_identity(
+        &tree.source(),
+        fake,
+        ImportScope::Full,
+        &capability(),
+        page_size,
+        |progress| seen.push(progress),
+        None,
+    );
+    (outcome, seen)
+}
+
+/// Every record id the import ended up with, in catalogue order.
+fn imported_ids(outcome: &ImportOutcome) -> Vec<String> {
+    let mut ids: Vec<String> = outcome
+        .cache
+        .records
+        .iter()
+        .map(|record| record.provider_game_id.clone())
+        .collect();
+    ids.sort_by_key(|id| id.parse::<u32>().unwrap_or(0));
+    ids
+}
+
+/// Test A1: 100 is too large, 50 succeeds.
+#[test]
+fn a_page_size_of_100_steps_down_to_50_and_completes() {
+    let tree = Tree::new("adaptive-100-to-50");
+    let fake = AdaptiveRomm::new(120, 50);
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("the import should complete at the smaller page size");
+
+    assert_eq!(outcome.cache.records.len(), 120);
+    assert_eq!(outcome.adaptive.configured_page_size, 100);
+    assert_eq!(outcome.adaptive.effective_page_size, 50);
+    assert_eq!(outcome.adaptive.smallest_page_size, 50);
+    assert_eq!(outcome.adaptive.reductions, 1);
+    assert_eq!(outcome.adaptive.oversized_retries, 1);
+    assert!(outcome.adaptive.adapted());
+
+    // The reduction was announced exactly once, naming the offset it retried.
+    let reductions: Vec<PageSizeReduction> = seen
+        .iter()
+        .filter_map(|progress| progress.reduction)
+        .collect();
+    assert_eq!(reductions.len(), 1);
+    assert_eq!(reductions[0].offset, 0);
+    assert_eq!(reductions[0].from, 100);
+    assert_eq!(reductions[0].to, 50);
+    assert_eq!(
+        reductions[0].ceiling_bytes,
+        crate::identity_source::romm::client::MAX_RESPONSE_BYTES
+    );
+
+    // The first request was the configured size; the retry was the same offset.
+    assert_eq!(fake.requests()[0], (0, 100));
+    assert_eq!(fake.requests()[1], (0, 50));
+}
+
+/// Test A2: 100 and 50 are both too large, 25 succeeds.
+#[test]
+fn the_page_size_steps_down_twice_when_it_has_to() {
+    let tree = Tree::new("adaptive-100-to-25");
+    let fake = AdaptiveRomm::new(60, 25);
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("imported");
+
+    assert_eq!(outcome.cache.records.len(), 60);
+    assert_eq!(outcome.adaptive.effective_page_size, 25);
+    assert_eq!(outcome.adaptive.reductions, 2);
+    assert_eq!(outcome.adaptive.oversized_retries, 2);
+
+    let steps: Vec<(u32, u32)> = seen
+        .iter()
+        .filter_map(|progress| progress.reduction)
+        .map(|reduction| (reduction.from, reduction.to))
+        .collect();
+    assert_eq!(steps, vec![(100, 50), (50, 25)], "the ladder is fixed");
+    // All three attempts were at offset 0.
+    assert_eq!(
+        fake.requests()[..3].to_vec(),
+        vec![(0, 100), (0, 50), (0, 25)]
+    );
+}
+
+/// Test A3: the ladder from 100 is exactly the documented sequence.
+#[test]
+fn the_ladder_from_the_default_is_the_documented_sequence() {
+    let mut sizes = vec![100];
+    while let Some(next) = next_page_size(*sizes.last().expect("non-empty")) {
+        sizes.push(next);
+    }
+    assert_eq!(sizes, vec![100, 50, 25, 10, 5, 1]);
+    assert_eq!(next_page_size(1), None, "there is nothing below one record");
+    // A configured size that is not on the ladder still steps down predictably.
+    assert_eq!(next_page_size(200), Some(100));
+    assert_eq!(next_page_size(75), Some(50));
+    assert_eq!(next_page_size(13), Some(10));
+    assert_eq!(next_page_size(3), Some(1));
+}
+
+/// Test A4: the reduction happens at a later offset, not only on page one.
+#[test]
+fn a_reduction_at_a_later_offset_retries_that_offset_only() {
+    let tree = Tree::new("adaptive-later-offset");
+    // Mirrors the real failure: fine until offset 4400, then 100 is too large.
+    let fake = AdaptiveRomm::with_policy(
+        4600,
+        Box::new(|offset, limit, _files| offset >= 4400 && limit > 50),
+    );
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("imported");
+
+    assert_eq!(outcome.cache.records.len(), 4600);
+    assert_eq!(outcome.adaptive.reductions, 1);
+    let reduction = seen
+        .iter()
+        .filter_map(|progress| progress.reduction)
+        .next()
+        .expect("a reduction should have been announced");
+    assert_eq!(
+        reduction.offset, 4400,
+        "the reduction should be reported at the offset that failed"
+    );
+    assert_eq!((reduction.from, reduction.to), (100, 50));
+
+    // Offsets before 4400 were fetched once each at the full size.
+    let served = fake.served_requests();
+    assert_eq!(served[0], (0, 100));
+    assert_eq!(served[43], (4300, 100));
+    assert_eq!(
+        served[44],
+        (4400, 50),
+        "the failed offset was retried at 50"
+    );
+}
+
+/// Test A5 and A6: no record is skipped and none arrives twice.
+#[test]
+fn an_adaptive_import_skips_no_records_and_duplicates_none() {
+    let tree = Tree::new("adaptive-no-loss");
+    let fake = AdaptiveRomm::with_policy(
+        437,
+        // Awkward on purpose: two different offsets need reductions, and the
+        // catalogue does not divide evenly by any page size on the ladder.
+        Box::new(|offset, limit, _files| {
+            (offset == 100 && limit > 25) || (offset == 300 && limit > 10)
+        }),
+    );
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("imported");
+
+    let ids = imported_ids(&outcome);
+    assert_eq!(ids.len(), 437, "every record should arrive");
+    let expected: Vec<String> = (1..=437).map(|id| id.to_string()).collect();
+    assert_eq!(ids, expected, "in order, with none missing");
+
+    let mut unique = ids.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "no record should arrive twice");
+
+    // Every served request covered the range immediately after the previous one:
+    // each offset is the previous offset plus however many records that page
+    // actually returned. Contiguous and non-overlapping is exactly "nothing
+    // skipped, nothing duplicated" stated in terms of the requests made.
+    let served = fake.served_requests();
+    let mut expected_offset = 0u32;
+    for (offset, limit) in &served {
+        assert_eq!(
+            *offset, expected_offset,
+            "offsets should advance by what arrived, not by what was asked for: {served:?}"
+        );
+        let delivered = (437u32.saturating_sub(*offset)).min(*limit);
+        expected_offset += delivered;
+    }
+    assert_eq!(
+        expected_offset, 437,
+        "the walk should have covered the whole catalogue exactly once"
+    );
+
+    // The refused attempts repeated an offset; the served ones never did.
+    let served_offsets: Vec<u32> = served.iter().map(|(offset, _)| *offset).collect();
+    let mut sorted = served_offsets.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        served_offsets.len(),
+        "no offset should be served twice: {served_offsets:?}"
+    );
+}
+
+/// Test A7: a total that changes across retries and pages stays a hint.
+#[test]
+fn a_total_that_changes_during_retries_is_only_a_hint() {
+    let tree = Tree::new("adaptive-total-changes");
+    let fake = AdaptiveRomm::new(120, 50)
+        // Wildly inconsistent totals, including a zero and a huge one.
+        .reporting_totals(vec![120, 0, 999_999, 60, 120]);
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("a changing total must not fail an import that is otherwise fine");
+
+    assert_eq!(outcome.cache.records.len(), 120);
+    // The largest claim is what is kept, and only as a hint.
+    assert_eq!(outcome.cache.server_reported_total, Some(999_999));
+    // Progress fractions stayed within range or were absent, never invented.
+    for progress in &seen {
+        if let Some(fraction) = progress.fraction() {
+            assert!(
+                (0.0..=1.0).contains(&fraction),
+                "{fraction} is not a fraction"
+            );
+        }
+    }
+}
+
+/// Test A8: a wrong offset after a retry is refused, not absorbed.
+#[test]
+fn an_offset_the_server_reports_wrongly_after_a_retry_is_refused() {
+    let tree = Tree::new("adaptive-offset-lie");
+    // Call 0 is refused for size; call 1 is the retry, and lies about its offset.
+    let fake = AdaptiveRomm::new(200, 50).lying_about_offset(1, 4242);
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    let failure = outcome.expect_err("a mismatched offset must be refused");
+    assert_eq!(failure.code(), "invalid_pagination");
+    assert!(
+        failure.detail().contains("4242"),
+        "the refusal should quote what the server said: {}",
+        failure.detail()
+    );
+    assert!(failure.previous_cache_preserved());
+}
+
+/// Test A9: the short-page end condition uses the size actually requested.
+#[test]
+fn the_short_page_end_condition_uses_the_effective_page_size() {
+    let tree = Tree::new("adaptive-short-page");
+    // 75 records with a safe size of 50: pages of 50 then 25, and the 25 must end
+    // the walk because it is short *against 50*, not against anything the server
+    // claims. The server reports a limit of 100 throughout to make the point.
+    let fake = AdaptiveRomm::new(75, 50).lying_about_limit(100);
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("imported");
+
+    assert_eq!(outcome.cache.records.len(), 75);
+    let served = fake.served_requests();
+    assert_eq!(
+        served,
+        vec![(0, 50), (50, 50)],
+        "the second page returned 25 of 50 and ended the walk"
+    );
+}
+
+/// Test A10: cancellation during the retry sequence.
+#[test]
+fn cancellation_during_a_retry_sequence_stops_the_import() {
+    let tree = Tree::new("adaptive-cancel");
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    // Cancelled on the first refused call, so the flag is set part-way through the
+    // ladder rather than between pages.
+    let fake = AdaptiveRomm::new(500, 25).with_hook(Box::new(move |index| {
+        if index == 0 {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }));
+    let failure = import_identity(
+        &tree.source(),
+        &fake,
+        ImportScope::Full,
+        &capability(),
+        100,
+        no_progress,
+        Some(&cancel),
+    )
+    .expect_err("a cancelled import must not succeed");
+    assert_eq!(failure.code(), "cancelled");
+    assert!(failure.previous_cache_preserved());
+}
+
+/// Test A11: the deadline during the retry sequence.
+#[test]
+fn the_deadline_still_applies_inside_a_retry_sequence() {
+    let tree = Tree::new("adaptive-deadline");
+    // Burns the whole deadline on the first refused call, so the next attempt in
+    // the ladder is the one that has to notice.
+    let fake = AdaptiveRomm::new(500, 25).with_hook(Box::new(|index| {
+        if index == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }));
+    // A deadline this import has already blown: the retry loop must check it, not
+    // only the outer page loop.
+    let failure = crate::identity_source::romm::import::import_identity_with_deadline(
+        &tree.source(),
+        &fake,
+        ImportScope::Full,
+        &capability(),
+        100,
+        no_progress,
+        None,
+        std::time::Duration::from_millis(1),
+    )
+    .expect_err("an import past its deadline must stop");
+    assert_eq!(failure.code(), "deadline_exceeded");
+    assert!(failure.previous_cache_preserved());
+}
+
+/// Test A12: a single record still too large fails safely.
+#[test]
+fn a_single_record_larger_than_the_ceiling_fails_with_its_offset() {
+    let tree = Tree::new("adaptive-oversized-record");
+    // Nothing is ever small enough, with or without file detail.
+    let fake = AdaptiveRomm::with_policy(400, Box::new(|_offset, _limit, _files| true));
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let failure = outcome.expect_err("no page size can get past an oversized record");
+
+    assert_eq!(failure.code(), "oversized_record");
+    let detail = failure.detail();
+    assert!(
+        detail.contains("at offset 0"),
+        "the offset should be named: {detail}"
+    );
+    assert!(
+        detail.contains("without its file list"),
+        "the detail should say the file list was already dropped: {detail}"
+    );
+    assert!(
+        detail.contains("Nothing was published"),
+        "the detail should say the cache is untouched: {detail}"
+    );
+    assert!(failure.previous_cache_preserved());
+
+    // It exhausted the ladder before giving up.
+    let steps: Vec<u32> = seen
+        .iter()
+        .filter_map(|progress| progress.reduction)
+        .map(|reduction| reduction.to)
+        .collect();
+    assert_eq!(steps, vec![50, 25, 10, 5, 1]);
+    // The ladder, then one last attempt for a single record without its file list:
+    // seven requests, every one of them at the same offset.
+    let attempts: Vec<(u32, u32)> = fake
+        .requests()
+        .into_iter()
+        .filter(|(offset, _)| *offset == 0)
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![(0, 100), (0, 50), (0, 25), (0, 10), (0, 5), (0, 1), (0, 1)]
+    );
+    assert_eq!(
+        fake.files_omitted_requests(),
+        1,
+        "dropping the file list should have been tried before giving up"
+    );
+}
+
+/// Test A18: the global caps still hold once the page size has fallen.
+#[test]
+fn the_global_caps_survive_a_page_size_reduction() {
+    // The page budget scales with the smallest page size, so a reduction cannot
+    // make the page cap the thing that fails a legitimate import...
+    // At the default size the budget is the old constant plus the one short page
+    // that detects the end of the catalogue - 2000 pages of 100 reach exactly
+    // 200,000 records, and the walk needs one more request to learn it is done.
+    assert_eq!(page_budget(MAX_CACHED_RECORDS, 100), MAX_IMPORT_PAGES + 1);
+    assert!(
+        page_budget(MAX_CACHED_RECORDS, 100) >= MAX_IMPORT_PAGES,
+        "the budget must never fall below the documented page cap"
+    );
+    assert!(page_budget(MAX_CACHED_RECORDS, 1) > MAX_IMPORT_PAGES);
+    // A small catalogue does not get a smaller budget than the documented cap.
+    assert_eq!(page_budget(10, 100), MAX_IMPORT_PAGES);
+    // ...while staying bounded however far it falls.
+    assert!(page_budget(MAX_CACHED_RECORDS, 1) <= MAX_IMPORT_PAGES_ABSOLUTE);
+    assert_eq!(page_budget(usize::MAX, 1), MAX_IMPORT_PAGES_ABSOLUTE);
+    // A sample's budget is never larger than a full import's.
+    assert!(page_budget(25, 1) <= page_budget(MAX_CACHED_RECORDS, 1));
+
+    // And the record cap remains the authority: a server offering more than the
+    // cap is refused on records, not on pages.
+    let tree = Tree::new("adaptive-record-cap");
+    let fake = AdaptiveRomm::with_policy(
+        MAX_CACHED_RECORDS + 10,
+        Box::new(|_offset, limit, _files| limit > 50),
+    );
+    // Only the arithmetic is under test here; walking 200,000 records through a
+    // fake would be slow, so the budget assertions above carry the caps and this
+    // asserts the reduction still happened on the way.
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    assert!(
+        seen.iter().any(|progress| progress.reduction.is_some()),
+        "the reduction should still occur"
+    );
+    match outcome {
+        Err(failure) => assert!(
+            matches!(failure.code(), "too_many_records" | "deadline_exceeded"),
+            "a runaway catalogue should be stopped by records or time, not by pages: {}",
+            failure.code()
+        ),
+        Ok(outcome) => assert!(outcome.cache.records.len() <= MAX_CACHED_RECORDS),
+    }
+}
+
+/// Test A17: an ordinary import that never exceeds the ceiling is unchanged.
+#[test]
+fn an_import_that_never_exceeds_the_ceiling_is_unaffected() {
+    let tree = Tree::new("adaptive-no-op");
+    // Nothing is ever too large.
+    let fake = AdaptiveRomm::with_policy(250, Box::new(|_offset, _limit, _files| false));
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("imported");
+
+    assert_eq!(outcome.cache.records.len(), 250);
+    assert_eq!(outcome.adaptive.configured_page_size, 100);
+    assert_eq!(outcome.adaptive.effective_page_size, 100);
+    assert_eq!(outcome.adaptive.reductions, 0);
+    assert_eq!(outcome.adaptive.oversized_retries, 0);
+    assert!(!outcome.adaptive.adapted());
+    assert!(
+        seen.iter().all(|progress| progress.reduction.is_none()),
+        "no reduction should be reported"
+    );
+    assert_eq!(
+        fake.served_requests(),
+        vec![(0, 100), (100, 100), (200, 100)],
+        "three pages of 100, the last one short"
+    );
+}
+
+/// A configured page size other than the default is honoured, and adapts from
+/// there rather than from 100.
+#[test]
+fn a_configured_page_size_is_the_starting_point() {
+    let tree = Tree::new("adaptive-configured-start");
+    let fake = AdaptiveRomm::new(60, 100);
+    let (outcome, _) = adaptive_import(&tree, &fake, 200);
+    let outcome = outcome.expect("imported");
+    assert_eq!(outcome.adaptive.configured_page_size, 200);
+    assert_eq!(outcome.adaptive.effective_page_size, 100);
+    assert_eq!(outcome.adaptive.reductions, 1);
+    assert_eq!(fake.requests()[0], (0, 200), "it started where it was told");
+}
+
+/// Test A15: a sample import adapts the same way and still publishes nothing.
+#[test]
+fn a_sample_import_adapts_and_publishes_nothing() {
+    let tree = Tree::new("adaptive-sample");
+    let fake = AdaptiveRomm::new(500, 25);
+    let mut seen = Vec::new();
+    let outcome = import_identity(
+        &tree.source(),
+        &fake,
+        ImportScope::Sample { max_records: 30 },
+        &capability(),
+        100,
+        |progress| seen.push(progress),
+        None,
+    )
+    .expect("a sample should complete");
+
+    assert_eq!(outcome.cache.records.len(), 30);
+    assert_eq!(outcome.adaptive.reductions, 2, "100 -> 50 -> 25");
+    assert_eq!(outcome.adaptive.effective_page_size, 25);
+    // import_identity never publishes - that is the caller's separate step - so a
+    // sample cannot have written anything.
+    assert_eq!(
+        load_cache(
+            &IdentityCacheLocation::new(&tree.identity(), IdentityProvider::Romm),
+            None
+        )
+        .expect_err("no cache")
+        .code(),
+        "missing"
+    );
+}
+
+/// The real blocker, reproduced: one record whose *file list* is what makes it
+/// too large. Dropping only that detail gets the import through.
+#[test]
+fn a_record_whose_file_list_is_too_large_is_imported_without_it() {
+    let tree = Tree::new("adaptive-files-too-large");
+    // Record 200 is readable on its own, but not with its file list - and any
+    // page containing it is too large whatever the size, exactly like the PS4
+    // game that held 28,831 file entries.
+    let fake = AdaptiveRomm::with_policy(
+        260,
+        Box::new(|offset, limit, with_files| {
+            let covers_the_fat_record = offset <= 200 && offset + limit > 200;
+            covers_the_fat_record && with_files
+        }),
+    );
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("dropping the file list should let the import finish");
+
+    assert_eq!(outcome.cache.records.len(), 260, "no record should be lost");
+    // Exactly one record lost its file detail, and it is named.
+    assert_eq!(
+        outcome.adaptive.records_without_file_detail,
+        vec!["201".to_string()],
+        "the record ids are one-based in the fixture"
+    );
+    assert!(outcome.adaptive.lost_file_detail());
+    assert_eq!(
+        fake.files_omitted_requests(),
+        1,
+        "only the one record should have been fetched without detail"
+    );
+
+    // The record itself says so, so the gap is visible per record and not only in
+    // a summary.
+    let record = outcome
+        .cache
+        .records
+        .iter()
+        .find(|record| record.provider_game_id == "201")
+        .expect("the record should still be in the cache");
+    assert!(
+        record
+            .evidence
+            .iter()
+            .any(|line| line.contains("per-file detail was not imported")),
+        "{:?}",
+        record.evidence
+    );
+    assert!(record.related_files.is_empty());
+
+    // It stepped all the way down before dropping detail, so detail is only ever
+    // the last resort.
+    let steps: Vec<u32> = seen
+        .iter()
+        .filter_map(|progress| progress.reduction)
+        .map(|reduction| reduction.to)
+        .collect();
+    assert_eq!(steps, vec![50, 25, 10, 5, 1]);
+}
+
+/// After the fat region, the page size climbs back - or a long catalogue could
+/// never finish inside the deadline.
+#[test]
+fn the_page_size_recovers_after_a_run_of_successes() {
+    let tree = Tree::new("adaptive-recovery");
+    // Only the first page is too large; everything after it is fine.
+    let fake = AdaptiveRomm::with_policy(
+        600,
+        Box::new(|offset, limit, _files| offset == 0 && limit > 50),
+    );
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("imported");
+
+    assert_eq!(outcome.cache.records.len(), 600);
+    assert_eq!(outcome.adaptive.reductions, 1);
+    assert!(
+        outcome.adaptive.recoveries >= 1,
+        "the size should climb back once pages are fitting: {:?}",
+        outcome.adaptive
+    );
+    assert_eq!(
+        outcome.adaptive.effective_page_size, 100,
+        "it should get back to the configured size"
+    );
+
+    // Recovery is gated: the first RECOVERY_STREAK pages after the reduction stay
+    // at the reduced size, so one fat page cannot start an alternation.
+    let served = fake.served_requests();
+    let sizes: Vec<u32> = served.iter().map(|(_, limit)| *limit).collect();
+    assert_eq!(
+        sizes[..RECOVERY_STREAK as usize],
+        vec![50; RECOVERY_STREAK as usize],
+        "the size should hold for a run of successes before climbing: {sizes:?}"
+    );
+    assert!(
+        sizes.windows(2).all(|pair| pair[1] <= 100),
+        "recovery must never exceed the configured size: {sizes:?}"
+    );
+    // And it climbs one rung at a time rather than jumping straight back.
+    assert!(
+        sizes.contains(&100),
+        "it should reach the configured size eventually: {sizes:?}"
+    );
+}
+
+/// Recovery never climbs above what was configured.
+#[test]
+fn recovery_is_capped_at_the_configured_page_size() {
+    assert_eq!(previous_page_size(50, 100), Some(100));
+    assert_eq!(previous_page_size(25, 100), Some(50));
+    assert_eq!(previous_page_size(100, 100), None, "already there");
+    assert_eq!(
+        previous_page_size(50, 50),
+        None,
+        "a configured 50 must not climb to 100"
+    );
+    assert_eq!(previous_page_size(1, 10), Some(5));
+}
+
+/// A server that only ever manages one record per page does not flap: the size
+/// freezes at what works and the import finishes.
+///
+/// This is what the recovery budget buys. Recovery is what makes a long catalogue
+/// possible after one fat record, and the budget is what stops it from retrying
+/// for ever on a server that will never do better.
+#[test]
+fn relentless_refusals_freeze_the_page_size_rather_than_flapping() {
+    let tree = Tree::new("adaptive-freeze");
+    // Anything above one record is too large, at every offset.
+    let fake = AdaptiveRomm::with_policy(400, Box::new(|_offset, limit, _files| limit > 1));
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("one record at a time still gets there");
+
+    assert_eq!(outcome.cache.records.len(), 400);
+    assert_eq!(outcome.adaptive.effective_page_size, 1);
+    assert!(
+        outcome.adaptive.oversized_retries <= MAX_OVERSIZED_EVENTS,
+        "refusals must stay inside the budget: {:?}",
+        outcome.adaptive
+    );
+    // Recovery stopped once the budget was spent, rather than retrying a size that
+    // never works for the remaining hundreds of records.
+    let served = fake.served_requests();
+    let late_sizes: Vec<u32> = served
+        .iter()
+        .rev()
+        .take(50)
+        .map(|(_, limit)| *limit)
+        .collect();
+    assert!(
+        late_sizes.iter().all(|size| *size == 1),
+        "the tail of the import should have stopped trying to climb: {late_sizes:?}"
+    );
+}
+
+/// A server whose every record has an unreadable file list is abandoned rather
+/// than allowed to spend the deadline on bodies that get thrown away.
+#[test]
+fn an_endless_run_of_oversized_responses_is_abandoned() {
+    let tree = Tree::new("adaptive-endless");
+    // Every request carrying file detail is refused, whatever its size, so each
+    // record costs at least one wasted read.
+    let fake =
+        AdaptiveRomm::with_policy(10_000, Box::new(|_offset, _limit, with_files| with_files));
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    let failure = outcome.expect_err("this cannot be allowed to run to the deadline");
+    assert_eq!(failure.code(), "too_many_oversized_pages");
+    assert!(
+        failure.detail().contains(&MAX_OVERSIZED_EVENTS.to_string()),
+        "the budget should be named: {}",
+        failure.detail()
+    );
+    assert!(failure.previous_cache_preserved());
 }

@@ -137,6 +137,9 @@ const STUB_TOKEN: &str = "af-stage1c-secret-token-do-not-print";
 /// unasserted here - there is nothing a write could reach.
 struct StubServer {
     port: u16,
+    /// Requests for more than this many records are answered as too large, the
+    /// way a real oversized body is refused before being read.
+    max_safe_limit: std::sync::Arc<AtomicUsize>,
     requests: std::sync::Arc<AtomicUsize>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -144,14 +147,21 @@ struct StubServer {
 
 impl StubServer {
     fn start(roms: serde_json::Value, total: u64) -> Self {
+        Self::start_with_limit(roms, total, usize::MAX)
+    }
+
+    /// A stub that refuses any page larger than `max_safe_limit` records.
+    fn start_with_limit(roms: serde_json::Value, total: u64, max_safe_limit: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("addr").port();
         listener
             .set_nonblocking(true)
             .expect("the accept loop needs to be interruptible");
         let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let ceiling = std::sync::Arc::new(AtomicUsize::new(max_safe_limit));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let counter = requests.clone();
+        let served_ceiling = ceiling.clone();
         let stopper = stop.clone();
         let handle = std::thread::spawn(move || {
             while !stopper.load(Ordering::SeqCst) {
@@ -159,7 +169,7 @@ impl StubServer {
                     Ok((stream, _)) => {
                         counter.fetch_add(1, Ordering::SeqCst);
                         let _ = stream.set_nonblocking(false);
-                        serve(stream, &roms, total);
+                        serve(stream, &roms, total, served_ceiling.load(Ordering::SeqCst));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -170,10 +180,17 @@ impl StubServer {
         });
         Self {
             port,
+            max_safe_limit: ceiling,
             requests,
             stop,
             handle: Some(handle),
         }
+    }
+
+    /// Raises the ceiling part-way through a test.
+    #[allow(dead_code)]
+    fn allow_pages_up_to(&self, limit: usize) {
+        self.max_safe_limit.store(limit, Ordering::SeqCst);
     }
 
     fn url(&self) -> String {
@@ -199,7 +216,7 @@ impl Drop for StubServer {
     }
 }
 
-fn serve(mut stream: TcpStream, roms: &serde_json::Value, total: u64) {
+fn serve(mut stream: TcpStream, roms: &serde_json::Value, total: u64, max_safe_limit: usize) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -247,14 +264,24 @@ fn serve(mut stream: TcpStream, roms: &serde_json::Value, total: u64) {
             };
             let limit = number("limit", 50);
             let offset = number("offset", 0);
-            let items = roms.as_array().cloned().unwrap_or_default();
-            let page: Vec<serde_json::Value> = items.into_iter().skip(offset).take(limit).collect();
-            (
-                200,
-                serde_json::json!({
-                    "items": page, "total": total, "limit": limit, "offset": offset
-                }),
-            )
+            if limit > max_safe_limit {
+                // Padded past the client's ceiling, so the client refuses it for
+                // its size exactly as it would a real oversized catalogue page.
+                // Declaring a huge Content-Length would do it too, but sending the
+                // bytes proves the refusal happens on the body.
+                let filler = "x".repeat(9 * 1024 * 1024);
+                (200, serde_json::json!({"items": [], "padding": filler}))
+            } else {
+                let items = roms.as_array().cloned().unwrap_or_default();
+                let page: Vec<serde_json::Value> =
+                    items.into_iter().skip(offset).take(limit).collect();
+                (
+                    200,
+                    serde_json::json!({
+                        "items": page, "total": total, "limit": limit, "offset": offset
+                    }),
+                )
+            }
         }
         _ => (404, serde_json::json!({"detail": "Not Found"})),
     };
@@ -2710,5 +2737,284 @@ fn a_configured_source_with_no_import_yet_is_not_reported_as_an_error() {
         "the state should read as a stage, not a fault: {human}"
     );
     assert!(!human.contains("State:            Error"), "{human}");
+    stub.stop();
+}
+
+// --- Adaptive page sizing, through the CLI --------------------------------
+
+/// Test A16: the JSON carries every adaptive-pagination field.
+#[test]
+fn the_import_json_reports_what_adaptive_paging_did() {
+    let tree = Tree::new("adaptive-json");
+    // 120 records, and any page above 50 comes back too large.
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..120)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Game {index}"),
+                &format!("roms/gb/{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start_with_limit(serde_json::json!(roms), 120, 50);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["import", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let result = run.json();
+    assert_eq!(result["published"], true);
+    assert_eq!(result["records"], 120, "every record should still arrive");
+    assert_eq!(result["configured_page_size"], 100);
+    assert_eq!(result["effective_page_size"], 50);
+    assert_eq!(result["smallest_page_size"], 50);
+    assert_eq!(result["page_size_reductions"], 1);
+    assert_eq!(result["oversized_page_retries"], 1);
+    assert_eq!(result["previous_cache_usable"], true);
+    // Pages: one refused attempt is not a page; 120 records at 50 is 3 pages.
+    assert_eq!(result["pages_fetched"], 3);
+    assert_eq!(result["records_fetched"], 120);
+    stub.stop();
+}
+
+/// The progress line a person sees, on stderr and only when JSON is off.
+#[test]
+fn a_reduction_is_announced_on_stderr_with_its_offset() {
+    let tree = Tree::new("adaptive-progress");
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..60)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Game {index}"),
+                &format!("roms/gb/{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start_with_limit(serde_json::json!(roms), 60, 25);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["import"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    assert!(
+        run.stderr
+            .contains("page response exceeded 8 MiB at offset 0"),
+        "the reduction should be announced with its offset: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("retrying with page size 50"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("retrying with page size 25"),
+        "the second step should be announced too: {}",
+        run.stderr
+    );
+    // The result itself says what happened, on stdout.
+    assert!(
+        run.stdout
+            .contains("2 reduction(s) down to 25, finished at 25"),
+        "{}",
+        run.stdout
+    );
+    // Exactly one page-size line, so the two branches cannot both fire.
+    assert_eq!(
+        run.stdout
+            .lines()
+            .filter(|line| line.contains("Page size:"))
+            .count(),
+        1,
+        "{}",
+        run.stdout
+    );
+    // And in JSON mode none of that reaches stdout.
+    let json_run = tree.run(&["import", "--json"]);
+    assert!(json_run.succeeded());
+    assert!(json_run.stderr.is_empty(), "{}", json_run.stderr);
+    assert!(
+        !json_run.stdout.contains("page response exceeded"),
+        "{}",
+        json_run.stdout
+    );
+    stub.stop();
+}
+
+/// Test A13: an adaptive import that fails leaves the old cache byte-identical.
+#[test]
+fn a_failed_adaptive_import_preserves_the_previous_cache_byte_for_byte() {
+    let tree = Tree::new("adaptive-preserves-cache");
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..40)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Game {index}"),
+                &format!("roms/gb/{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    // First a clean import at the full page size, to establish a good cache.
+    let mut stub = StubServer::start_with_limit(serde_json::json!(roms.clone()), 40, usize::MAX);
+    ready_relative(&tree, &stub);
+    assert!(tree.run(&["import"]).succeeded());
+    let before = std::fs::read(tree.cache_path()).expect("cache published");
+    stub.stop();
+
+    // Now a server where nothing is small enough: the ladder is exhausted and the
+    // import fails at an oversized record.
+    let mut hostile = StubServer::start_with_limit(serde_json::json!(roms), 40, 0);
+    let token = tree.token_file(STUB_TOKEN);
+    assert!(
+        tree.run(&[
+            "configure",
+            "--url",
+            &hostile.url(),
+            "--token-file",
+            &token.display().to_string(),
+        ])
+        .succeeded()
+    );
+    let run = tree.run(&["refresh", "--json"]);
+    assert!(!run.succeeded(), "an unreadable catalogue should fail");
+    let result = run.json();
+    assert_eq!(result["error_code"], "oversized_record");
+    assert_eq!(result["published"], false);
+    // The reductions it managed before giving up are still reported.
+    assert_eq!(
+        result["page_size_reductions"], 5,
+        "100 -> 50 -> 25 -> 10 -> 5 -> 1"
+    );
+    assert_eq!(result["smallest_page_size"], 1);
+
+    let after = std::fs::read(tree.cache_path()).expect("cache still there");
+    assert_eq!(
+        before, after,
+        "the previous cache was not preserved exactly"
+    );
+    hostile.stop();
+}
+
+/// Test A14: a first-ever import that fails this way publishes nothing at all.
+#[test]
+fn a_first_ever_adaptive_failure_publishes_no_cache() {
+    let tree = Tree::new("adaptive-first-failure");
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..10)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Game {index}"),
+                &format!("roms/gb/{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    // Nothing is ever small enough.
+    let mut stub = StubServer::start_with_limit(serde_json::json!(roms), 10, 0);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["import", "--json"]);
+    assert!(!run.succeeded());
+    let result = run.json();
+    assert_eq!(result["error_code"], "oversized_record");
+    assert_eq!(result["published"], false);
+    assert_eq!(result["previous_cache_usable"], false);
+    assert!(
+        !tree.cache_path().exists(),
+        "no cache should have been created"
+    );
+    // Nor a stray temporary file.
+    let leftovers: Vec<String> = std::fs::read_dir(tree.identity().join("romm"))
+        .expect("provider directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name != "config.json")
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+
+    // And the state is honest about it: nothing imported, not a fake readiness.
+    let status = tree.run(&["status", "--json"]).json();
+    assert_eq!(status["state"]["state"], "never_imported");
+    stub.stop();
+}
+
+/// Test A15 at the CLI level: a sample adapts and publishes nothing.
+#[test]
+fn a_sample_import_adapts_and_still_publishes_nothing_through_the_cli() {
+    let tree = Tree::new("adaptive-cli-sample");
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..200)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Game {index}"),
+                &format!("roms/gb/{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start_with_limit(serde_json::json!(roms), 200, 25);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["import", "--sample", "30", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let result = run.json();
+    assert_eq!(result["mode"], "sample");
+    assert_eq!(result["published"], false);
+    assert_eq!(result["records"], 30);
+    assert_eq!(result["page_size_reductions"], 2, "100 -> 50 -> 25");
+    assert_eq!(result["effective_page_size"], 25);
+    assert!(
+        !tree.cache_path().exists(),
+        "a sample must not publish, adaptive or not"
+    );
+    stub.stop();
+}
+
+/// The configured page size is actually used, not silently replaced by the
+/// module default. It was stored and displayed but never passed to the importer.
+#[test]
+fn the_configured_page_size_reaches_the_importer() {
+    let tree = Tree::new("configured-page-size");
+    let dud = dud_hashes();
+    let roms: Vec<serde_json::Value> = (0..30)
+        .map(|index| {
+            relative_rom(
+                index,
+                &format!("Game {index}"),
+                &format!("roms/gb/{index}.gb"),
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start(serde_json::json!(roms), 30);
+    ready_relative(&tree, &stub);
+    assert!(
+        tree.run(&["configure", "--page-size", "10"]).succeeded(),
+        "the page size should be configurable"
+    );
+
+    let run = tree.run(&["import", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let result = run.json();
+    assert_eq!(result["configured_page_size"], 10);
+    assert_eq!(result["effective_page_size"], 10);
+    assert_eq!(result["page_size_reductions"], 0);
+    assert_eq!(
+        result["pages_fetched"], 4,
+        "30 records at 10 per page is three full pages plus the short one"
+    );
+    assert_eq!(result["records"], 30);
     stub.stop();
 }

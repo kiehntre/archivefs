@@ -1316,6 +1316,21 @@ struct ImportResult {
     multi_file_groups: usize,
     elapsed_milliseconds: u128,
     peak_memory_kib: Option<u64>,
+    /// What the import was asked to page with.
+    configured_page_size: u32,
+    /// What it ended up paging with, after any reduction.
+    effective_page_size: u32,
+    /// The smallest page size it ever used.
+    smallest_page_size: u32,
+    /// How many times the page size stepped down.
+    page_size_reductions: u32,
+    /// How many responses were refused for exceeding the size ceiling.
+    oversized_page_retries: u32,
+    /// How many times the page size stepped back up after a run of successes.
+    page_size_recoveries: u32,
+    /// Records imported without their per-file detail, because RomM's file list
+    /// for them was too large to read.
+    records_without_file_detail: Vec<String>,
     /// On failure: whether the previous cache still serves.
     previous_cache_usable: bool,
     error: Option<String>,
@@ -1341,6 +1356,8 @@ fn import(
         return Err("the RomM source is disabled; run `identity source romm enable` first".into());
     }
     let transport = UreqTransport::new();
+    let page_size = settings.effective_page_size();
+    let paging = ObservedPaging::new(page_size);
     let mode = if is_refresh { "refresh" } else { "import" };
     // A connection failure is reported through the same result shape as any other
     // import failure, so `--json` always yields one document to read rather than
@@ -1348,7 +1365,15 @@ fn import(
     let capability = match context.api.test_connection(&source, &transport, None) {
         Ok(capability) => capability,
         Err(error) => {
-            let result = failed_import(context, mode, sample, error.code(), error.detail(), 0);
+            let result = failed_import(
+                context,
+                mode,
+                sample,
+                error.code(),
+                error.detail(),
+                0,
+                &paging,
+            );
             context.emit(&result, || render_import(&result))?;
             return Err(error.detail().into());
         }
@@ -1376,7 +1401,11 @@ fn import(
             &transport,
             scope,
             &capability,
-            |progress| report_progress(context, progress),
+            page_size,
+            |progress| {
+                paging.note(progress);
+                report_progress(context, progress);
+            },
             Some(&cancel),
         );
         let elapsed = started.elapsed().as_millis();
@@ -1412,6 +1441,16 @@ fn import(
                     multi_file_groups: groups.len(),
                     elapsed_milliseconds: elapsed,
                     peak_memory_kib: peak_memory_kib(),
+                    configured_page_size: outcome.adaptive.configured_page_size,
+                    effective_page_size: outcome.adaptive.effective_page_size,
+                    smallest_page_size: outcome.adaptive.smallest_page_size,
+                    page_size_reductions: outcome.adaptive.reductions,
+                    oversized_page_retries: outcome.adaptive.oversized_retries,
+                    page_size_recoveries: outcome.adaptive.recoveries,
+                    records_without_file_detail: outcome
+                        .adaptive
+                        .records_without_file_detail
+                        .clone(),
                     previous_cache_usable: context.api.open_cache(None).is_ok(),
                     error: None,
                     error_code: None,
@@ -1426,6 +1465,7 @@ fn import(
                     failure.code(),
                     failure.detail(),
                     elapsed,
+                    &paging,
                 );
                 context.emit(&result, || render_import(&result))?;
                 Err(failure.detail().into())
@@ -1441,10 +1481,14 @@ fn import(
             scope,
             capability: &capability,
             hashes: &hashes,
+            page_size,
             cancel: Some(&cancel),
         },
         |record| facts_for(record, &trusted),
-        |progress| report_progress(context, progress),
+        |progress| {
+            paging.note(progress);
+            report_progress(context, progress);
+        },
     );
     let elapsed = started.elapsed().as_millis();
     match outcome {
@@ -1469,6 +1513,13 @@ fn import(
                 multi_file_groups: summary.groups.len(),
                 elapsed_milliseconds: elapsed,
                 peak_memory_kib: peak_memory_kib(),
+                configured_page_size: summary.adaptive.configured_page_size,
+                effective_page_size: summary.adaptive.effective_page_size,
+                smallest_page_size: summary.adaptive.smallest_page_size,
+                page_size_reductions: summary.adaptive.reductions,
+                oversized_page_retries: summary.adaptive.oversized_retries,
+                page_size_recoveries: summary.adaptive.recoveries,
+                records_without_file_detail: summary.adaptive.records_without_file_detail.clone(),
                 previous_cache_usable: true,
                 error: None,
                 error_code: None,
@@ -1483,6 +1534,7 @@ fn import(
                 failure.code(),
                 failure.detail(),
                 elapsed,
+                &paging,
             );
             context.emit(&result, || render_import(&result))?;
             Err(failure.detail().into())
@@ -1490,6 +1542,7 @@ fn import(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn failed_import(
     context: &Context,
     mode: &'static str,
@@ -1497,6 +1550,7 @@ fn failed_import(
     code: &str,
     detail: String,
     elapsed: u128,
+    paging: &ObservedPaging,
 ) -> ImportResult {
     ImportResult {
         mode,
@@ -1518,6 +1572,16 @@ fn failed_import(
         multi_file_groups: 0,
         elapsed_milliseconds: elapsed,
         peak_memory_kib: peak_memory_kib(),
+        configured_page_size: paging.configured,
+        // Taken from what the progress stream actually showed, so an import that
+        // stepped down and then failed for another reason still says so.
+        effective_page_size: paging.smallest.get(),
+        smallest_page_size: paging.smallest.get(),
+        page_size_reductions: paging.reductions.get(),
+        oversized_page_retries: paging.oversized_retries.get(),
+        // Not knowable from the progress stream, which reports reductions only.
+        page_size_recoveries: 0,
+        records_without_file_detail: Vec::new(),
         // Asked, not assumed: the answer is whether the file on disk still loads.
         previous_cache_usable: context.api.open_cache(None).is_ok(),
         error: Some(detail),
@@ -1540,6 +1604,14 @@ fn render_import(result: &ImportResult) -> Vec<String> {
                 "none was published, and none existed before"
             }
         ));
+        if result.page_size_reductions > 0 {
+            lines.push(format!(
+                "  Paging had already reduced from {} to {} over {} oversized response(s).",
+                result.configured_page_size,
+                result.smallest_page_size,
+                result.oversized_page_retries
+            ));
+        }
         return lines;
     }
     lines.push(match result.sample_limit {
@@ -1550,6 +1622,50 @@ fn render_import(result: &ImportResult) -> Vec<String> {
         "  Pages fetched:     {} ({} record(s))",
         result.pages_fetched, result.records_fetched
     ));
+    if result.page_size_reductions > 0 {
+        // Three different numbers, and saying only two of them reads as nonsense
+        // when the size came back up: "reduced 5 times to 100" is not a reduction.
+        lines.push(format!(
+            "  Page size:         {} configured, {} reduction(s) down to {}, finished at {}",
+            result.configured_page_size,
+            result.page_size_reductions,
+            result.smallest_page_size,
+            result.effective_page_size
+        ));
+        lines.push(format!(
+            "  Oversized pages:   {} response(s) refused for size and retried at the same offset",
+            result.oversized_page_retries
+        ));
+        if result.page_size_recoveries > 0 {
+            lines.push(format!(
+                "  Recovered:         stepped back up {} time(s) once pages were fitting again",
+                result.page_size_recoveries
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "  Page size:         {} (no reduction needed)",
+            result.configured_page_size
+        ));
+    }
+    // Independent of any reduction: a record can lose its file list on the very
+    // first attempt if the ladder starts at one record.
+    if !result.records_without_file_detail.is_empty() {
+        lines.push(format!(
+            "  File detail:       {} record(s) imported without their per-file list, which RomM \
+             could not send within the size ceiling:",
+            result.records_without_file_detail.len()
+        ));
+        for id in result.records_without_file_detail.iter().take(10) {
+            lines.push(format!("                       RomM id {id}"));
+        }
+        if result.records_without_file_detail.len() > 10 {
+            lines.push(format!(
+                "                       and {} more, not listed separately",
+                result.records_without_file_detail.len() - 10
+            ));
+        }
+    }
     lines.push(format!("  Platforms:         {}", result.platforms));
     lines.push(format!("  Records:           {}", result.records));
     lines.push(format!("  Confirmed:         {}", result.confirmed));
@@ -1578,7 +1694,50 @@ fn render_import(result: &ImportResult) -> Vec<String> {
     lines
 }
 
+/// What the progress callbacks revealed about paging.
+///
+/// An [`ImportFailure`] carries no adaptive state, so an import that stepped down
+/// twice and then hit the deadline would otherwise report no reductions at all.
+/// The progress stream already says everything needed, so it is recorded as it
+/// goes past.
+struct ObservedPaging {
+    configured: u32,
+    smallest: std::cell::Cell<u32>,
+    reductions: std::cell::Cell<u32>,
+    oversized_retries: std::cell::Cell<u32>,
+}
+
+impl ObservedPaging {
+    fn new(configured: u32) -> Self {
+        Self {
+            configured,
+            smallest: std::cell::Cell::new(configured),
+            reductions: std::cell::Cell::new(0),
+            oversized_retries: std::cell::Cell::new(0),
+        }
+    }
+
+    fn note(&self, progress: ImportProgress) {
+        if let Some(reduction) = progress.reduction {
+            self.reductions.set(self.reductions.get() + 1);
+            self.oversized_retries.set(self.oversized_retries.get() + 1);
+            self.smallest.set(self.smallest.get().min(reduction.to));
+        }
+    }
+}
+
 fn report_progress(context: &Context, progress: ImportProgress) {
+    // A reduction is its own event, reported once, naming the offset being
+    // retried so it is clear no records were passed over.
+    if let Some(reduction) = progress.reduction {
+        context.progress(&format!(
+            "  page response exceeded {} at offset {}; retrying with page size {}",
+            human_bytes(reduction.ceiling_bytes),
+            reduction.offset,
+            reduction.to
+        ));
+        return;
+    }
     let fraction = progress
         .fraction()
         .map(|value| format!(" ({:.0}%)", value * 100.0))
@@ -2332,6 +2491,20 @@ fn confine_to_roots(
         return Err(format!("{} is not a regular file", path.display()).into());
     }
     Ok(resolved)
+}
+
+/// Bytes as a person would say them, for a progress line. Exact when the value
+/// is a whole number of MiB or KiB, which every ceiling in this crate is.
+fn human_bytes(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {

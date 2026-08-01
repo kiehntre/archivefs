@@ -275,6 +275,9 @@ pub struct RommRomPage {
     pub requested_offset: u32,
     pub reported_limit: Option<u32>,
     pub reported_offset: Option<u32>,
+    /// Whether this page was fetched with per-file detail. `false` means every
+    /// record on it has no file list, and the caller must say so.
+    pub with_files: bool,
 }
 
 impl RommRomPage {
@@ -390,11 +393,31 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         offset: u32,
         cancel: Option<&AtomicBool>,
     ) -> Result<RommRomPage, RommRequestError> {
+        self.roms_page_detail(limit, offset, true, cancel)
+    }
+
+    /// One page of ROMs, with the option of leaving the per-file list out.
+    ///
+    /// `with_files` is what makes multi-file and multi-disc relationships
+    /// available, and it is cheap for almost every record. It is not cheap for
+    /// all of them: one real PS4 game held 28,831 file entries, which alone made
+    /// its single-record response 17.5 MB against a 436 KB response without them.
+    /// Asking without the file list is therefore the last way to read a record
+    /// that would otherwise be unreadable - at the cost of that record's file
+    /// detail, which the caller must report rather than quietly drop.
+    pub fn roms_page_detail(
+        &self,
+        limit: u32,
+        offset: u32,
+        with_files: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<RommRomPage, RommRequestError> {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
-        // `with_files=true` is what makes multi-file and multi-disc
-        // relationships available; it is requested explicitly rather than
-        // assumed to be the default.
-        let path = format!("/api/roms?limit={limit}&offset={offset}&with_files=true");
+        let path = if with_files {
+            format!("/api/roms?limit={limit}&offset={offset}&with_files=true")
+        } else {
+            format!("/api/roms?limit={limit}&offset={offset}")
+        };
         let document = self.get_json(&path, true, cancel)?;
         let items = document
             .get("items")
@@ -426,6 +449,7 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
             requested_offset: offset,
             reported_limit,
             reported_offset,
+            with_files,
         })
     }
 

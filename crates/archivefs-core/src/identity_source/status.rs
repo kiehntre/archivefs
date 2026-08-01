@@ -210,13 +210,23 @@ impl IdentitySourceApi {
             scope,
             capability,
             hashes,
+            page_size,
             cancel,
         } = request;
         let ImportOutcome {
             mut cache,
             progress,
             normalisation,
-        } = import_identity(source, transport, scope, capability, on_progress, cancel)?;
+            adaptive,
+        } = import_identity(
+            source,
+            transport,
+            scope,
+            capability,
+            page_size,
+            on_progress,
+            cancel,
+        )?;
 
         // Matching happens before publication, so a published cache always has
         // verdicts in it and browsing never has to compute them.
@@ -236,6 +246,7 @@ impl IdentitySourceApi {
             unknown_platforms: normalisation.unknown_platforms.len(),
             groups: build_groups(&cache.records),
             progress,
+            adaptive,
         })
     }
 
@@ -396,6 +407,9 @@ pub struct RefreshRequest<'a, T: RommTransport> {
     /// Already-computed local hashes. Never added to by a refresh: matching uses
     /// what is there and does not start hashing.
     pub hashes: &'a LocalHashCache,
+    /// The page size to start with. Adaptive paging may step below it if a
+    /// response is too large; it is never exceeded.
+    pub page_size: u32,
     pub cancel: Option<&'a AtomicBool>,
 }
 
@@ -410,4 +424,6 @@ pub struct RefreshSummary {
     pub unknown_platforms: usize,
     pub groups: Vec<IdentityGroup>,
     pub progress: super::romm::import::ImportProgress,
+    /// What adaptive paging had to do to get through the catalogue.
+    pub adaptive: super::romm::import::AdaptivePagination,
 }
