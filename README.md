@@ -490,6 +490,11 @@ verified snapshot. It is browse-only: there is no conversion or Install
 action. The upstream repository declares no dataset licence, so ArchiveFS does
 not bundle or redistribute the database.
 
+**Cheat coverage: Nintendo DS only. Identity metadata: multiple systems.**
+The only populated cheat format is Action Replay DS. Other platforms can be
+searched for identity/release evidence, but their results are explicitly
+identity-only and do not imply that CheatBase contains cheats for them.
+
 Use verbose or debug logging when you need more detail:
 
 ```sh

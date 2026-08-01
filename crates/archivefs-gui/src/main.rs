@@ -17775,7 +17775,23 @@ fn show_cheatbase_source_card(
             "The upstream repository declares no dataset licence. ArchiveFS keeps the database optional and does not bundle or redistribute it.",
             widgets::StatusTone::Warning,
         );
-        ui.label("Only Nintendo DS currently contains cheat rows. Other systems provide identity and release metadata only.");
+        widgets::status_strip(
+            ui,
+            &[
+                (
+                    "Cheat coverage: Nintendo DS only",
+                    widgets::StatusTone::Warning,
+                ),
+                (
+                    "Identity metadata: multiple systems",
+                    widgets::StatusTone::Info,
+                ),
+                (
+                    "Available format: Action Replay DS",
+                    widgets::StatusTone::Info,
+                ),
+            ],
+        );
         ui.label(
             "No CheatBase code is installed, converted, or written to an emulator in Stage 1.",
         );
@@ -17946,6 +17962,16 @@ fn show_cheatbase_game_browser(
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+            widgets::status_badge(
+                ui,
+                "Cheat coverage: Nintendo DS only",
+                widgets::StatusTone::Warning,
+            );
+            widgets::status_badge(
+                ui,
+                "Identity metadata: multiple systems",
+                widgets::StatusTone::Info,
+            );
             ui.label("No Install action exists for CheatBase Stage 1.");
         });
         let usable = matches!(manager,CheatBaseManagerState::Ready(status) if status.usable);
@@ -18094,21 +18120,34 @@ fn show_cheatbase_game_browser(
                                     widgets::StatusTone::Pending,
                                 );
                             });
+                            let coverage = game.cheat_count.map_or_else(
+                                || "identity metadata only · no cheat coverage".to_string(),
+                                |count| format!("{count} Action Replay DS cheats"),
+                            );
                             ui.label(format!(
-                                "CheatBase release {} · ROM {} · {} cheats · revision not verified",
-                                game.upstream_release_id, game.upstream_rom_id, game.cheat_count
+                                "CheatBase release {} · ROM {} · {coverage} · revision not verified",
+                                game.upstream_release_id, game.upstream_rom_id
                             ));
+                            ui.label(&game.cheat_coverage_note);
                             if let Some(serial) = &game.serial {
                                 ui.label(format!("Serial: {serial}"));
                             }
-                            if ui
-                                .add_enabled(!busy, egui::Button::new("Browse cheats"))
-                                .clicked()
-                            {
-                                action = Some(CheatBaseOperation::LoadGame {
-                                    release_id: game.upstream_release_id,
-                                    offset: 0,
-                                });
+                            if game.platform_has_cheat_coverage {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("Browse cheats"))
+                                    .clicked()
+                                {
+                                    action = Some(CheatBaseOperation::LoadGame {
+                                        release_id: game.upstream_release_id,
+                                        offset: 0,
+                                    });
+                                }
+                            } else {
+                                widgets::status_badge(
+                                    ui,
+                                    "Identity only — no cheats",
+                                    widgets::StatusTone::Info,
+                                );
                             }
                         });
                     }
@@ -18126,6 +18165,7 @@ fn show_cheatbase_game_browser(
                     .as_deref()
                     .unwrap_or(&game.upstream_system_name)
             ));
+            ui.label(&game.cheat_coverage_note);
             match cheats {
                 Err(message) => widgets::banner(
                     ui,
@@ -60915,6 +60955,28 @@ $Instant Growth [Nayr]\n";
         assert!(card.contains("Dataset licence not established"));
         assert!(card.contains("pinned upstream GitHub commit"));
         assert!(card.contains("No CheatBase code is installed"));
+        assert!(card.contains("Cheat coverage: Nintendo DS only"));
+        assert!(card.contains("Identity metadata: multiple systems"));
+        assert!(card.contains("Available format: Action Replay DS"));
+        let warning = card.find("Dataset licence not established").unwrap();
+        assert!(warning < card.find("Download database").unwrap());
+        assert!(warning < card.find("Import local CheatBase SQLite database").unwrap());
+    }
+
+    #[test]
+    fn cheatbase_non_ds_candidates_are_identity_only_without_browse_action() {
+        let source = include_str!("main.rs");
+        let browser = source
+            .split("fn show_cheatbase_game_browser(")
+            .nth(1)
+            .unwrap()
+            .split("/// The Sources page's compact")
+            .next()
+            .unwrap();
+        assert!(browser.contains("identity metadata only · no cheat coverage"));
+        assert!(browser.contains("Identity only — no cheats"));
+        assert!(browser.contains("if game.platform_has_cheat_coverage"));
+        assert!(browser.contains("Action Replay DS cheats"));
     }
 
     #[test]

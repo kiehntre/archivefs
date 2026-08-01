@@ -19,6 +19,11 @@ The supported snapshot is the `cheatbase.sqlite` blob at upstream commit
 All cheat rows in this snapshot belong to Nintendo DS. Other systems remain
 useful for ROM/release identity lookup but do not expose browseable cheats.
 
+**Cheat coverage: Nintendo DS only. Identity metadata: multiple systems.**
+The populated device format is Action Replay DS. A non-Nintendo-DS result is
+therefore identity metadata only, has no cheat count, and never offers cheat
+browsing or installation.
+
 ### Verified schema and data quality
 
 The complete application schema is:
@@ -110,3 +115,28 @@ records remain ambiguous and are never resolved by selecting the first row.
 - all device formats are potentially convertible, reference-only, or unknown;
   none is directly installable;
 - the database is optional and its content licence is not established.
+
+## RomM integration-readiness note
+
+This stage deliberately does not import or anticipate code from the separate
+RomM branch. After RomM is merged, reconciliation should be limited to these
+well-defined boundaries:
+
+- identity evidence ordering: a verified local or RomM hash/serial remains the
+  authority; CheatBase is a candidate source and cannot displace stronger
+  evidence;
+- provider provenance: retain both the identity source and CheatBase row/source
+  fingerprint rather than flattening them into one label;
+- hash evidence: reuse the shared normalized algorithm/value representation,
+  while keeping malformed and duplicate CheatBase hashes non-authoritative;
+- conflicting records: surface conflicts and ambiguity instead of selecting
+  the first provider record;
+- status models and source cards: reconcile shared lifecycle vocabulary while
+  retaining CheatBase's explicit licence and Nintendo-DS-only coverage facts;
+- JSON structures: preserve the Stage 1 status fields and add shared identity
+  evidence without silently renaming or weakening them;
+- canonical platforms: continue resolving explicit CheatBase mappings through
+  the single ArchiveFS registry.
+
+No hypothetical conflict is resolved on this branch; this note identifies the
+review points for a later rebase only.

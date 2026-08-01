@@ -285,6 +285,114 @@ fn failed_replacement_preserves_known_good_database() {
 }
 
 #[test]
+fn status_json_states_nintendo_ds_only_coverage_and_browse_only_safety() {
+    let root = fixture_root("status-coverage");
+    let source = root.join("selected.sqlite");
+    create_fixture(&source);
+    let paths = CheatBasePaths::at(root.join("owned"));
+    import_local_with_expected_hash(&paths, &source, None).unwrap();
+    let status = inspect_cheatbase_source(&paths).unwrap();
+    assert_eq!(status.cheat_coverage_platforms, ["Nintendo DS"]);
+    assert_eq!(status.identity_metadata_platforms.len(), 38);
+    assert!(status.browse_only);
+    assert!(!status.install_supported);
+    assert_eq!(
+        status.licence_status,
+        CheatProviderLicenceStatus::NotEstablished
+    );
+    assert_eq!(status.source_fingerprint, status.fingerprint);
+    let json = serde_json::to_value(status).unwrap();
+    for field in [
+        "cheat_coverage_platforms",
+        "identity_metadata_platforms",
+        "browse_only",
+        "install_supported",
+        "licence_status",
+        "provenance",
+        "source_fingerprint",
+    ] {
+        assert!(json.get(field).is_some(), "missing status field {field}");
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn non_ds_results_are_identity_only_while_ds_names_action_replay() {
+    let root = fixture_root("coverage-results");
+    let database = root.join("source.sqlite");
+    create_fixture(&database);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO ROMS(romID,systemID,regionID,romFileName,romExtensionlessFileName,romDumpSource) VALUES(101,25,21,'Identity.nes','Identity','Synthetic')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO RELEASES(releaseID,romID,releaseTitleName,regionLocalizedID) VALUES(202,101,'Identity Only Game',21)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let catalogue = CheatBaseCatalogue::open_with_expected_hash(&database, None).unwrap();
+
+    let non_ds = catalogue
+        .search_games(&CheatBaseGameSearchRequest {
+            platform_id: Some("NES".to_string()),
+            title: "Identity Only Game".to_string(),
+            region: None,
+            upstream_release_id: None,
+            page: PageRequest::games(0),
+        })
+        .unwrap();
+    assert!(
+        non_ds
+            .explanation
+            .contains("identity-metadata records only")
+    );
+    let game = &non_ds.page.rows[0];
+    assert_eq!(game.cheat_count, None);
+    assert!(!game.platform_has_cheat_coverage);
+    assert!(game.cheat_coverage_note.contains("no cheat coverage"));
+
+    let ds = catalogue.game(200).unwrap().unwrap();
+    assert_eq!(ds.cheat_count, Some(2));
+    assert!(ds.platform_has_cheat_coverage);
+    assert_eq!(ds.cheat_device_formats, ["Action Replay DS"]);
+    assert!(ds.cheat_coverage_note.contains("Nintendo DS only"));
+    assert!(ds.cheat_coverage_note.contains("Action Replay DS"));
+
+    let systems = catalogue
+        .systems(PageRequest {
+            offset: 0,
+            limit: 50,
+        })
+        .unwrap();
+    let nes = systems
+        .rows
+        .iter()
+        .find(|system| system.upstream_id == 25)
+        .unwrap();
+    assert_eq!(nes.cheat_count, None);
+    assert!(nes.cheat_coverage_note.contains("Identity metadata only"));
+    let devices = catalogue
+        .devices(PageRequest {
+            offset: 0,
+            limit: 50,
+        })
+        .unwrap();
+    let action_replay = devices
+        .rows
+        .iter()
+        .find(|device| device.upstream_id == 10)
+        .unwrap();
+    assert!(action_replay.contains_cheats);
+    assert!(action_replay.coverage_note.contains("Action Replay DS"));
+    cleanup(&root);
+}
+
+#[test]
 fn malformed_and_truncated_sqlite_headers_are_rejected() {
     let root = fixture_root("headers");
     fs::create_dir_all(&root).unwrap();
@@ -443,4 +551,26 @@ fn redirects_and_cancellation_leave_no_activated_source() {
         assert!(!paths.database.exists());
         cleanup(&root);
     }
+}
+
+#[test]
+fn provider_adds_no_application_migration() {
+    assert_eq!(crate::latest_schema_version(), 6);
+    let migration_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
+    let mut migrations = fs::read_dir(migration_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    migrations.sort();
+    assert_eq!(
+        migrations,
+        [
+            "0001_initial.sql",
+            "0002_platform_aliases.sql",
+            "0003_source_folder_scan_status.sql",
+            "0004_scan_skip_counts.sql",
+            "0005_source_platform_assignment.sql",
+            "0006_game_identity_reports.sql",
+        ]
+    );
 }

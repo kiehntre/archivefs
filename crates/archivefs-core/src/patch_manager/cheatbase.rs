@@ -40,6 +40,8 @@ pub const CHEATBASE_EXPECTED_SHA256: &str =
     "917f16ce55afa1a21cfdd106239cbaa65317cef21e47152b6471eb5c017a76e3";
 pub const CHEATBASE_EXPECTED_SIZE_BYTES: u64 = 67_366_912;
 pub const CHEATBASE_MAX_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
+pub const CHEATBASE_CHEAT_COVERAGE_PLATFORM: &str = "Nintendo DS";
+pub const CHEATBASE_CHEAT_DEVICE_FORMAT: &str = "Action Replay DS";
 const SOURCE_DIRECTORY: &str = "cheatbase";
 const SOURCE_METADATA_FILE: &str = "source.json";
 const SOURCE_HASH_FILE: &str = "cheatbase.sqlite.sha256";
@@ -50,6 +52,10 @@ const MAX_TITLE: usize = 512;
 const MAX_SHORT_TEXT: usize = 1024;
 const MAX_NOTE: usize = 4096;
 const MAX_CODE_BODY: usize = 16 * 1024;
+const IDENTITY_METADATA_SYSTEM_IDS: &[i64] = &[
+    2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29,
+    30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43,
+];
 const SCHEMA_DESCRIPTION: &str = "cheatbase-v1:ROMS(romID,systemID,regionID,romHashCRC,romHashMD5,romHashSHA1,romSize,romFileName,romExtensionlessFileName,romParent,romSerial,romHeader,romLanguage,romDumpSource,lastModified);RELEASES(releaseID,romID,releaseTitleName,regionLocalizedID,releaseCoverFront,releaseCoverBack,releaseCoverCart,releaseCoverDisc,releaseDescription,releaseDeveloper,releasePublisher,releaseGenre,releaseDate,releaseReferenceURL,releaseReferenceImageURL,lastModified);REGIONS(regionID,regionName,lastModified);SYSTEMS(systemID,systemName,systemShortName,systemHeaderSizeBytes,systemHashless,systemHeader,systemSerial,systemOEID,lastModified);CHEATS(cheatID,romID,cheatName,cheatActivation,cheatDescription,cheatSideEffect,cheatFolderName,cheatCategoryID,cheatCode,cheatDeviceID,cheatCredit,lastModified);CHEAT_DEVICES(cheatDeviceID,systemID,cheatDeviceName,cheatDeviceBrandName,cheatDeviceFormat,lastModified);CHEAT_CATEGORIES(cheatCategoryID,cheatCategory,cheatCategoryDescription,lastModified)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,11 +192,18 @@ pub struct CheatBaseSourceStatus {
     pub usable: bool,
     pub database_path: PathBuf,
     pub fingerprint: Option<ImmutableSourceFingerprint>,
+    /// Stable explicit alias retained alongside `fingerprint` for typed
+    /// source-status consumers shared with other providers.
+    pub source_fingerprint: Option<ImmutableSourceFingerprint>,
     pub validation: Option<CheatBaseValidation>,
     pub last_error: Option<CheatBaseError>,
     pub provenance: CheatProviderProvenance,
     pub licence: CheatProviderLicence,
+    pub licence_status: CheatProviderLicenceStatus,
+    pub cheat_coverage_platforms: Vec<String>,
+    pub identity_metadata_platforms: Vec<String>,
     pub browse_only: bool,
+    pub install_supported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +212,11 @@ pub struct CheatBaseSystem {
     pub name: String,
     pub short_name: String,
     pub rom_count: u64,
-    pub cheat_count: u64,
+    /// `None` means this platform has identity metadata only and no CheatBase
+    /// cheat coverage. Nintendo DS releases use `Some`, including `Some(0)`.
+    pub cheat_count: Option<u64>,
+    pub platform_has_cheat_coverage: bool,
+    pub cheat_coverage_note: String,
     pub mapping: ProviderPlatformMapping,
 }
 
@@ -211,6 +228,8 @@ pub struct CheatBaseDevice {
     pub brand: Option<String>,
     pub format: String,
     pub cheat_count: u64,
+    pub contains_cheats: bool,
+    pub coverage_note: String,
     pub mapping: ProviderDeviceMapping,
 }
 
@@ -229,7 +248,12 @@ pub struct CheatBaseGame {
     pub sha1: Option<String>,
     pub rom_size: Option<u64>,
     pub release_date: Option<String>,
-    pub cheat_count: u64,
+    /// `None` means this platform has identity metadata only and no CheatBase
+    /// cheat coverage. Nintendo DS releases use `Some`, including `Some(0)`.
+    pub cheat_count: Option<u64>,
+    pub platform_has_cheat_coverage: bool,
+    pub cheat_coverage_note: String,
+    pub cheat_device_formats: Vec<String>,
     pub match_confidence: Option<ProviderGameMatchConfidence>,
     pub match_evidence: Vec<String>,
     pub revision_verified: bool,
@@ -430,6 +454,8 @@ pub fn inspect_cheatbase_source(
     } else {
         metadata.state
     };
+    let source_fingerprint = fingerprint.clone();
+    let licence = cheatbase_licence();
     Ok(CheatBaseSourceStatus {
         format_version: CHEATBASE_PROVIDER_FORMAT_VERSION,
         provider: cheatbase_provider_identity(),
@@ -438,11 +464,21 @@ pub fn inspect_cheatbase_source(
         usable,
         database_path: paths.database.clone(),
         fingerprint,
+        source_fingerprint,
         validation: metadata.validation,
         last_error: metadata.last_error,
         provenance: cheatbase_provenance(),
-        licence: cheatbase_licence(),
+        licence_status: licence.status,
+        licence,
+        cheat_coverage_platforms: vec![CHEATBASE_CHEAT_COVERAGE_PLATFORM.to_string()],
+        identity_metadata_platforms: IDENTITY_METADATA_SYSTEM_IDS
+            .iter()
+            .copied()
+            .filter_map(verified_system_name)
+            .map(str::to_string)
+            .collect(),
         browse_only: true,
+        install_supported: false,
     })
 }
 
@@ -869,19 +905,27 @@ impl CheatBaseCatalogue {
         } else {
             aggregate_confidence(&rows)
         };
+        let identity_only =
+            !rows.is_empty() && rows.iter().all(|game| !game.platform_has_cheat_coverage);
         let returned = rows.len();
+        let mut explanation = match confidence {
+            ProviderGameMatchConfidence::Ambiguous => {
+                "Multiple plausible CheatBase releases require user selection".to_string()
+            }
+            ProviderGameMatchConfidence::ExactUpstreamRelease => {
+                "Exact upstream release ID match".to_string()
+            }
+            _ => "Match based on canonical platform and title; exact revision is not verified"
+                .to_string(),
+        };
+        if identity_only {
+            explanation.push_str(
+                ". These are identity-metadata records only; CheatBase provides cheat coverage for Nintendo DS only",
+            );
+        }
         Ok(CheatBaseGameSearchResult {
             confidence,
-            explanation: match confidence {
-                ProviderGameMatchConfidence::Ambiguous => {
-                    "Multiple plausible CheatBase releases require user selection".to_string()
-                }
-                ProviderGameMatchConfidence::ExactUpstreamRelease => {
-                    "Exact upstream release ID match".to_string()
-                }
-                _ => "Match based on canonical platform and title; exact revision is not verified"
-                    .to_string(),
-            },
+            explanation,
             page: ProviderPage {
                 offset: page.offset,
                 limit: page.limit,
@@ -1089,7 +1133,19 @@ impl ReadOnlyCheatCatalogue for CheatBaseCatalogue {
                     name: bounded_required(row.get(1)?, MAX_SHORT_TEXT, "system name")?,
                     short_name: bounded_required(row.get(2)?, MAX_SHORT_TEXT, "system short name")?,
                     rom_count: row.get::<_, i64>(3)?.max(0) as u64,
-                    cheat_count: row.get::<_, i64>(4)?.max(0) as u64,
+                    cheat_count: (id == 24)
+                        .then(|| row.get::<_, i64>(4).map(|value| value.max(0) as u64))
+                        .transpose()?,
+                    platform_has_cheat_coverage: id == 24,
+                    cheat_coverage_note: if id == 24 {
+                        format!(
+                            "Cheat coverage: Nintendo DS only; available format: {CHEATBASE_CHEAT_DEVICE_FORMAT}; browse only"
+                        )
+                    } else {
+                        format!(
+                            "Identity metadata only: CheatBase has no cheat coverage for {name}"
+                        )
+                    },
                     mapping: cheatbase_platform_mapping(id, &name),
                 })
             })
@@ -1112,13 +1168,22 @@ impl ReadOnlyCheatCatalogue for CheatBaseCatalogue {
             .query_map(params![page.limit, page.offset], |row| {
                 let id = row.get(0)?;
                 let name: String = row.get(2)?;
+                let cheat_count = row.get::<_, i64>(5)?.max(0) as u64;
                 Ok(CheatBaseDevice {
                     upstream_id: id,
                     system_id: row.get(1)?,
                     name: bounded_required(name.clone(), MAX_SHORT_TEXT, "device name")?,
                     brand: bounded_optional(row.get(3)?, MAX_SHORT_TEXT, &mut Vec::new(), "brand"),
                     format: bounded_required(row.get(4)?, MAX_SHORT_TEXT, "device format")?,
-                    cheat_count: row.get::<_, i64>(5)?.max(0) as u64,
+                    cheat_count,
+                    contains_cheats: cheat_count > 0,
+                    coverage_note: if id == 10 && cheat_count > 0 {
+                        "Actual available CheatBase format: Action Replay DS; browse only"
+                            .to_string()
+                    } else {
+                        "Device metadata only; this snapshot contains no cheats using this device"
+                            .to_string()
+                    },
                     mapping: cheatbase_device_mapping(id, &name),
                 })
             })
@@ -1223,8 +1288,17 @@ impl ReadOnlyCheatCatalogue for CheatBaseCatalogue {
 }
 
 fn game_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheatBaseGame> {
-    let system_id = row.get(3)?;
+    let system_id: i64 = row.get(3)?;
     let system_name: String = row.get(4)?;
+    let platform_has_cheat_coverage = system_id == 24;
+    let raw_cheat_count = row.get::<_, i64>(14)?.max(0) as u64;
+    let cheat_coverage_note = if platform_has_cheat_coverage {
+        format!(
+            "Cheat coverage: Nintendo DS only; available format: {CHEATBASE_CHEAT_DEVICE_FORMAT}; browse only"
+        )
+    } else {
+        format!("Identity metadata only: CheatBase has no cheat coverage for {system_name}")
+    };
     Ok(CheatBaseGame {
         upstream_release_id: row.get(0)?,
         upstream_rom_id: row.get(1)?,
@@ -1243,7 +1317,14 @@ fn game_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheatBaseGame> {
             .get::<_, Option<i64>>(12)?
             .and_then(|v| u64::try_from(v).ok()),
         release_date: normalized_optional(row.get(13)?),
-        cheat_count: row.get::<_, i64>(14)?.max(0) as u64,
+        cheat_count: platform_has_cheat_coverage.then_some(raw_cheat_count),
+        platform_has_cheat_coverage,
+        cheat_coverage_note,
+        cheat_device_formats: if platform_has_cheat_coverage {
+            vec![CHEATBASE_CHEAT_DEVICE_FORMAT.to_string()]
+        } else {
+            Vec::new()
+        },
         match_confidence: None,
         match_evidence: Vec::new(),
         revision_verified: false,

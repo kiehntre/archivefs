@@ -152,6 +152,8 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             render(
                 &GameOutput {
                     provider: "CheatBase",
+                    cheat_coverage_platforms: vec!["Nintendo DS"],
+                    identity_metadata_platforms: "multiple systems",
                     browse_only: true,
                     install_supported: false,
                     revision_verified: false,
@@ -174,6 +176,8 @@ struct RemovalOutput {
 #[derive(Debug, serde::Serialize)]
 struct GameOutput<G, C> {
     provider: &'static str,
+    cheat_coverage_platforms: Vec<&'static str>,
+    identity_metadata_platforms: &'static str,
     browse_only: bool,
     install_supported: bool,
     revision_verified: bool,
@@ -261,6 +265,8 @@ mod tests {
     fn game_json_is_explicitly_browse_only() {
         let output = GameOutput {
             provider: "CheatBase",
+            cheat_coverage_platforms: vec!["Nintendo DS"],
+            identity_metadata_platforms: "multiple systems",
             browse_only: true,
             install_supported: false,
             revision_verified: false,
@@ -270,5 +276,26 @@ mod tests {
         let json = serde_json::to_value(output).unwrap();
         assert_eq!(json["browse_only"], true);
         assert_eq!(json["install_supported"], false);
+        assert_eq!(json["cheat_coverage_platforms"][0], "Nintendo DS");
+        assert_eq!(json["identity_metadata_platforms"], "multiple systems");
+    }
+
+    #[test]
+    fn release_packaging_has_no_database_input_or_database_member() {
+        let script = include_str!("../../../scripts/build-release.sh");
+        assert!(!script.contains("cheatbase.sqlite"));
+        assert!(!script.contains("bsfree.db"));
+        assert!(!script.contains("cheat-sources"));
+        for member in [
+            "archivefs-cli",
+            "archivefs-gui",
+            "install.sh",
+            "README.md",
+            "CHANGELOG.md",
+            "LICENSE",
+            "config.toml.example",
+        ] {
+            assert!(script.contains(member), "missing release member {member}");
+        }
     }
 }
