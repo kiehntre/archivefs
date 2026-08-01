@@ -33250,7 +33250,6 @@ fn show_gamer_view(
     // library. A fixed shelf height also means `available_height` below
     // is captured after a *known* amount of space is consumed, not a
     // wrapping row count that varies with window width.
-    const PLATFORM_SHELF_HEIGHT: f32 = 150.0;
     let platform_card_width = gamer_platform_card_width(ui.available_width());
     let mut shelf_artwork = PlatformShelfArtwork {
         directory: artwork_directory,
@@ -34289,6 +34288,20 @@ fn gamer_platform_card_width(viewport_width: f32) -> f32 {
 
 // --- Platform shelf horizontal navigation ---------------------------------
 
+/// The exact height of one platform card. Shared by the cards and the chevrons
+/// so a control can never be taller than the strip it sits beside.
+const PLATFORM_CARD_HEIGHT: f32 = 142.0;
+
+/// The shelf's total height: one card plus room for the horizontal scrollbar
+/// beneath it.
+///
+/// A single fixed shelf height is what makes the space below it predictable -
+/// "the platform picker must not consume most of the vertical height" is true
+/// unconditionally, not just for a typical library - and it is the boundary the
+/// game list and details pane are positioned against. Kept at module scope, next
+/// to the card height it is derived from, so the two cannot drift apart.
+const PLATFORM_SHELF_HEIGHT: f32 = 150.0;
+
 /// The chevron glyphs. Plain ASCII deliberately: egui's bundled fonts do not
 /// carry the geometric-shape triangles (U+25C0/U+25B6), so those render as
 /// nothing at all. The accessible name on each button carries the real meaning
@@ -34411,10 +34424,21 @@ struct PlatformShelfState {
     /// next frame, because that is the only place egui will bind a scroll delta
     /// to this particular scroll area.
     pending: Option<ShelfScroll>,
+    /// Where the shelf and its parts ended up, kept so a rendered test can
+    /// assert the layout without reaching into egui's widget internals.
+    geometry: ShelfGeometry,
     /// The selected platform as of the last frame, so a change can be detected
     /// and the newly selected card scrolled back into view. The outer `Option`
     /// distinguishes "not recorded yet" from "recorded as All".
     last_selected: Option<Option<String>>,
+}
+
+/// The shelf's state lives under one fixed id rather than one derived from the
+/// parent `Ui`. There is exactly one platform shelf in the application, so a
+/// stable id is both accurate and readable from a test that renders the whole
+/// window.
+fn platform_shelf_state_id() -> egui::Id {
+    egui::Id::new("gamer_platform_shelf_nav")
 }
 
 /// Reads the shelf's remembered state.
@@ -34516,6 +34540,66 @@ struct ShelfOutcome {
     /// so a caller - and a test - can see what the controls were derived from
     /// without reaching into egui's internal ids.
     metrics: PlatformShelfMetrics,
+    /// The screen rectangles the shelf occupied, so a rendered test can assert
+    /// that nothing overlaps the content below and no card hides behind a
+    /// chevron. Not used for layout - reported after the fact.
+    geometry: ShelfGeometry,
+}
+
+/// Where the shelf and its parts ended up on screen.
+#[derive(Debug, Clone, PartialEq)]
+struct ShelfGeometry {
+    /// The whole shelf row, chevrons included.
+    row: egui::Rect,
+    /// The scrolling strip itself.
+    strip: egui::Rect,
+    previous: Option<egui::Rect>,
+    next: Option<egui::Rect>,
+    /// Every card, in shelf order, in screen coordinates. A card scrolled out
+    /// of view still reports its rect, so a test can tell "off-screen" from
+    /// "hidden behind a control".
+    cards: Vec<egui::Rect>,
+}
+
+impl Default for ShelfGeometry {
+    fn default() -> Self {
+        Self {
+            row: egui::Rect::NOTHING,
+            strip: egui::Rect::NOTHING,
+            previous: None,
+            next: None,
+            cards: Vec::new(),
+        }
+    }
+}
+
+/// Layout queries used to express the shelf's visual invariants. Test-only:
+/// nothing in the rendering path needs them, and the invariants they check are
+/// what the regression test asserts.
+#[cfg(test)]
+impl ShelfGeometry {
+    /// The rightmost card that is actually visible inside the strip.
+    fn last_visible_card(&self) -> Option<egui::Rect> {
+        self.cards
+            .iter()
+            .filter(|card| card.left() < self.strip.right() && card.right() > self.strip.left())
+            .copied()
+            .reduce(|left, right| {
+                if right.right() > left.right() {
+                    right
+                } else {
+                    left
+                }
+            })
+    }
+
+    fn chevron_height(&self) -> f32 {
+        self.previous
+            .into_iter()
+            .chain(self.next)
+            .map(|rect| rect.height())
+            .fold(0.0_f32, f32::max)
+    }
 }
 
 /// One card in the platform shelf: what to draw, and what picking it selects.
@@ -34556,7 +34640,7 @@ fn show_gamer_platform_shelf(
     artwork: &mut PlatformShelfArtwork<'_>,
     shelf_height: f32,
 ) -> ShelfOutcome {
-    let state_id = ui.id().with("gamer_platform_shelf_nav");
+    let state_id = platform_shelf_state_id();
     let mut state = platform_shelf_state(ui.ctx(), state_id);
     let mut outcome = ShelfOutcome::default();
 
@@ -34578,17 +34662,42 @@ fn show_gamer_platform_shelf(
 
     let mut requested: Option<ShelfScroll> = None;
     let mut focusable: Vec<egui::Id> = Vec::new();
+    let mut card_rects: Vec<egui::Rect> = Vec::new();
 
-    ui.horizontal(|ui| {
+    // Reserve exactly the shelf's own height, then draw inside it.
+    //
+    // Both halves matter. Reserving the height up front keeps the shelf's
+    // vertical boundary exactly where it was, so nothing downstream can be
+    // pushed into or overlapped - and unlike `allocate_ui_with_layout`, which
+    // shrinks to its content, it also keeps the strip's scrollbar inside the
+    // shelf rather than letting it hang below.
+    //
+    // `Align::Min` is equally essential: `ScrollArea` builds its content `Ui`
+    // from the *parent's* layout, so a vertically centred parent made the cards
+    // centre themselves against the whole remaining page height - over 1000px at
+    // 1080p - and spill far below the strip. That is exactly how the cards came
+    // to overlap the game list.
+    let (row_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), shelf_height),
+        egui::Sense::hover(),
+    );
+    outcome.geometry.row = row_rect;
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Min)),
+    );
+    {
+        let ui = &mut row_ui;
         if show_controls {
             let response = shelf_chevron(
                 ui,
                 SHELF_PREVIOUS_GLYPH,
                 "Previous platforms",
-                shelf_height,
                 outcome.previous_enabled,
             );
             focusable.push(response.id);
+            outcome.geometry.previous = Some(response.rect);
             if response.clicked() {
                 requested = Some(ShelfScroll::PageLeft);
             }
@@ -34630,6 +34739,7 @@ fn show_gamer_platform_shelf(
                             artwork,
                         );
                         focusable.push(response.id);
+                        card_rects.push(response.rect);
                         if is_selected && selection_changed {
                             // Minimal movement: bring it just into view rather
                             // than recentring, so the shelf does not lurch.
@@ -34643,14 +34753,10 @@ fn show_gamer_platform_shelf(
             });
 
         if show_controls {
-            let response = shelf_chevron(
-                ui,
-                SHELF_NEXT_GLYPH,
-                "Next platforms",
-                shelf_height,
-                outcome.next_enabled,
-            );
+            let response =
+                shelf_chevron(ui, SHELF_NEXT_GLYPH, "Next platforms", outcome.next_enabled);
             focusable.push(response.id);
+            outcome.geometry.next = Some(response.rect);
             if response.clicked() {
                 requested = Some(ShelfScroll::PageRight);
             }
@@ -34664,13 +34770,16 @@ fn show_gamer_platform_shelf(
             viewport_width: output.inner_rect.width(),
         };
         outcome.metrics = state.metrics;
-    });
+        outcome.geometry.strip = output.inner_rect;
+    }
 
     // Keyboard and D-pad, active only while focus is inside the shelf, so these
     // keys keep their meaning everywhere else in the window.
     if let Some(scroll) = shelf_keyboard_scroll(ui.ctx(), &focusable) {
         requested = Some(scroll);
     }
+
+    outcome.geometry.cards = card_rects;
 
     if let Some(scroll) = requested
         && state.metrics.can_scroll(scroll)
@@ -34681,11 +34790,17 @@ fn show_gamer_platform_shelf(
         ui.ctx().request_repaint();
     }
     state.last_selected = Some(selected.map(str::to_owned));
+    state.geometry = outcome.geometry.clone();
     set_platform_shelf_state(ui.ctx(), state_id, state);
     outcome
 }
 
 /// One navigation chevron.
+///
+/// Sized to exactly one platform card - `PLATFORM_CARD_HEIGHT`, not the shelf
+/// height - so it lines up with the cards beside it and can never be the thing
+/// that makes the row taller. Top-aligned by the row's layout, so it shares the
+/// cards' top edge.
 ///
 /// Disabled rather than hidden at its edge: the slot stays where it is, so the
 /// strip does not resize under the pointer and a D-pad user does not lose the
@@ -34695,14 +34810,21 @@ fn shelf_chevron(
     ui: &mut egui::Ui,
     glyph: &str,
     accessible_name: &str,
-    height: f32,
     enabled: bool,
 ) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(glyph).min_size(egui::vec2(SHELF_CHEVRON_WIDTH, height)),
+    // The slot is allocated exactly, and the button is centred inside it: an
+    // `egui::Button` positions its label with the surrounding `Ui`'s alignment,
+    // so in this top-aligned row the glyph would otherwise sit against the top
+    // edge rather than beside the card artwork.
+    ui.allocate_ui_with_layout(
+        egui::vec2(SHELF_CHEVRON_WIDTH, PLATFORM_CARD_HEIGHT),
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            ui.add_enabled(enabled, egui::Button::new(glyph))
+                .on_hover_text(accessible_name)
+        },
     )
-    .on_hover_text(accessible_name)
+    .inner
 }
 
 /// The scroll a key press asks for, when focus is on one of `focusable` - the
@@ -34755,7 +34877,7 @@ fn show_platform_shelf_item(
     let response = ui
         .add(
             egui::Button::new("")
-                .min_size(egui::vec2(card_width, 142.0))
+                .min_size(egui::vec2(card_width, PLATFORM_CARD_HEIGHT))
                 .selected(selected),
         )
         .on_hover_text(accessible_name.clone());
@@ -36258,7 +36380,7 @@ mod tests {
                         selected,
                         PLATFORM_CARD_MIN_WIDTH,
                         &mut artwork,
-                        150.0,
+                        PLATFORM_SHELF_HEIGHT,
                     );
                 });
             }));
@@ -36428,7 +36550,7 @@ mod tests {
                         selected,
                         PLATFORM_CARD_MIN_WIDTH,
                         &mut artwork,
-                        150.0,
+                        PLATFORM_SHELF_HEIGHT,
                     );
                 });
             });
@@ -36645,7 +36767,7 @@ mod tests {
                     (SHELF_PREVIOUS_GLYPH, "Previous platforms"),
                     (SHELF_NEXT_GLYPH, "Next platforms"),
                 ] {
-                    let response = shelf_chevron(ui, glyph, name, 150.0, true);
+                    let response = shelf_chevron(ui, glyph, name, true);
                     // The hover text is the accessible name - see `shelf_chevron`.
                     assert!(response.enabled());
                     names.push(name.to_string());
@@ -37131,6 +37253,216 @@ mod tests {
             categories.len(),
             "labels must all be distinct"
         );
+    }
+
+    /// Renders the whole Gamer View at one window size and reports the shelf's
+    /// geometry plus every painted text rectangle, so a layout assertion can be
+    /// made against what a person would actually see.
+    fn render_gamer_view_at(
+        width: f32,
+        height: f32,
+        platform_count: usize,
+    ) -> (ShelfGeometry, Vec<(String, egui::Rect)>) {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = Vec::new();
+        for index in 0..platform_count {
+            let mut row = record(&format!("/roms/g{index:02}.zip"), MountState::Pending);
+            row.metadata.platform = Some(format!("Platform{index:02}"));
+            row.metadata.title = Some(format!("Game {index:02}"));
+            records.push(row);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        // Three passes: one to measure the strip, one for the controls to appear,
+        // one to settle the layout that follows them.
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame)));
+        }
+        let geometry = ctx
+            .data(|data| data.get_temp::<PlatformShelfState>(platform_shelf_state_id()))
+            .map(|state| state.geometry)
+            .unwrap_or_default();
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.text().replace('\n', " "),
+                    text.visual_bounding_rect(),
+                )),
+                egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &output.expect("a rendered frame").shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts.retain(|(_, rect)| rect.top().is_finite());
+        (geometry, texts)
+    }
+
+    /// The rectangle of the first painted text containing `needle`.
+    fn painted_text_rect(texts: &[(String, egui::Rect)], needle: &str) -> egui::Rect {
+        texts
+            .iter()
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("no painted text contains {needle:?}"))
+    }
+
+    /// The regression test for the broken Sunshine desktop layout: the shelf
+    /// grew, the cards spilled over the game list, and the chevrons towered over
+    /// the strip. Asserted at the real 1080p desktop size the screenshot came
+    /// from, plus a narrower and a wider window.
+    #[test]
+    fn the_platform_shelf_never_overlaps_the_content_below_it() {
+        for (width, height) in [(1920.0, 1080.0), (1280.0, 720.0), (2560.0, 1440.0)] {
+            let (geometry, texts) = render_gamer_view_at(width, height, 30);
+            let label = format!("{width}x{height}");
+
+            assert!(
+                geometry.previous.is_some() && geometry.next.is_some(),
+                "{label}: 31 cards cannot fit, so both controls should be present"
+            );
+
+            // 1. The shelf keeps its original height exactly.
+            assert_eq!(
+                geometry.row.height(),
+                PLATFORM_SHELF_HEIGHT,
+                "{label}: the shelf row must stay exactly the original height"
+            );
+
+            // 2. A chevron is never taller than the strip it sits beside.
+            assert!(
+                geometry.chevron_height() <= PLATFORM_SHELF_HEIGHT,
+                "{label}: chevrons are {} tall, over the {PLATFORM_SHELF_HEIGHT} shelf",
+                geometry.chevron_height()
+            );
+            assert_eq!(
+                geometry.chevron_height(),
+                PLATFORM_CARD_HEIGHT,
+                "{label}: chevrons should match the cards exactly"
+            );
+
+            // 3. Every card stays inside the shelf row - this is the assertion
+            //    that failed before the fix, when cards ran 58px below it.
+            for card in &geometry.cards {
+                assert!(
+                    card.bottom() <= geometry.row.bottom() + 0.5,
+                    "{label}: a card reaches {} but the shelf ends at {}",
+                    card.bottom(),
+                    geometry.row.bottom()
+                );
+                assert!(
+                    card.top() >= geometry.row.top() - 0.5,
+                    "{label}: a card starts above the shelf"
+                );
+            }
+
+            // 4. The shelf ends above the main content, and no card rectangle
+            //    intersects the "Selected game" pane or the game list.
+            let heading = painted_text_rect(&texts, "Selected game");
+            let first_game = painted_text_rect(&texts, "Game 00");
+            assert!(
+                geometry.row.bottom() <= heading.top(),
+                "{label}: the shelf ends at {} but the heading starts at {}",
+                geometry.row.bottom(),
+                heading.top()
+            );
+            assert!(
+                geometry.row.bottom() <= first_game.top(),
+                "{label}: the shelf overlaps the game list"
+            );
+            for card in &geometry.cards {
+                assert!(
+                    !card.intersects(heading),
+                    "{label}: a card overlaps the Selected game heading"
+                );
+                assert!(
+                    !card.intersects(first_game),
+                    "{label}: a card overlaps the game list"
+                );
+            }
+            for chevron in geometry.previous.into_iter().chain(geometry.next) {
+                assert!(
+                    !chevron.intersects(heading),
+                    "{label}: a chevron overlaps the heading"
+                );
+                assert!(
+                    !chevron.intersects(first_game),
+                    "{label}: a chevron overlaps the list"
+                );
+            }
+
+            // 5. Nothing can be painted under the right chevron: the strip stops
+            //    before it, and the last fully visible card stops before it too.
+            let next = geometry.next.expect("checked above");
+            assert!(
+                geometry.strip.right() <= next.left() + 0.5,
+                "{label}: the strip runs to {} but the next chevron starts at {}",
+                geometry.strip.right(),
+                next.left()
+            );
+            let last_visible = geometry
+                .last_visible_card()
+                .expect("some card is visible at every size");
+            assert!(
+                last_visible.left() < next.left(),
+                "{label}: the rightmost visible card must stay left of the chevron"
+            );
+
+            // 6. The controls are tightly bounded, not stretched.
+            for chevron in geometry.previous.into_iter().chain(geometry.next) {
+                assert_eq!(
+                    chevron.width(),
+                    SHELF_CHEVRON_WIDTH,
+                    "{label}: a chevron is not the width it reserved"
+                );
+            }
+
+            // 7. The strip uses the shelf's vertical extent, not more.
+            assert!(
+                geometry.strip.top() >= geometry.row.top() - 0.5
+                    && geometry.strip.bottom() <= geometry.row.bottom() + 0.5,
+                "{label}: the strip ({:?}) escapes the shelf row ({:?})",
+                geometry.strip,
+                geometry.row
+            );
+        }
+    }
+
+    /// A shelf that fits needs no controls, and must still not disturb the
+    /// content below it.
+    #[test]
+    fn a_fitting_shelf_keeps_the_same_boundary_and_draws_no_controls() {
+        let (geometry, texts) = render_gamer_view_at(2560.0, 1440.0, 2);
+        assert!(
+            geometry.previous.is_none() && geometry.next.is_none(),
+            "three cards fit easily in 2560px"
+        );
+        assert_eq!(
+            geometry.row.height(),
+            PLATFORM_SHELF_HEIGHT,
+            "the shelf height must not depend on whether controls are drawn"
+        );
+        let heading = painted_text_rect(&texts, "Selected game");
+        assert!(geometry.row.bottom() <= heading.top());
+        for card in &geometry.cards {
+            assert!(card.bottom() <= geometry.row.bottom() + 0.5);
+            assert!(!card.intersects(heading));
+        }
     }
 
     #[test]
