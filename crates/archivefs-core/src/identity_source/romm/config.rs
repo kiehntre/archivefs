@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use crate::identity_source::net_policy::{
     ApprovedEndpoint, EndpointRefusal, HostResolver, validate_endpoint,
 };
-use crate::identity_source::path_map::{MappingRefusal, PathMapping, PathMappings};
+use crate::identity_source::path_map::{
+    MappingRefusal, PathMapping, PathMappings, ProviderPathKind,
+};
 
 /// The longest token this will accept, so a paste accident cannot become an
 /// unbounded header.
@@ -231,6 +233,13 @@ pub struct RommSourceConfig {
     /// The address a person entered, before validation.
     pub url: String,
     pub mappings: Vec<PathMapping>,
+    /// Which shape of path this instance reports.
+    ///
+    /// Declared, never inferred per path. Absent in a configuration written
+    /// before the setting existed, which means absolute - the only shape those
+    /// mappings could have been.
+    #[serde(default)]
+    pub provider_path_kind: ProviderPathKind,
     /// Where the token was persisted, if the person chose to save it.
     pub token_path: Option<PathBuf>,
 }
@@ -288,8 +297,9 @@ impl ValidatedRommSource {
         resolver: &impl HostResolver,
     ) -> Result<Self, ConfigRefusal> {
         let endpoint = validate_endpoint(&config.url, resolver).map_err(ConfigRefusal::Endpoint)?;
-        let mappings = PathMappings::validate(&config.mappings, trusted_roots)
-            .map_err(ConfigRefusal::Mapping)?;
+        let mappings =
+            PathMappings::validate(&config.mappings, trusted_roots, config.provider_path_kind)
+                .map_err(ConfigRefusal::Mapping)?;
         Ok(Self {
             endpoint,
             mappings,

@@ -30,7 +30,7 @@ use archivefs_core::identity_source::model::{
 };
 use archivefs_core::identity_source::net_policy::SystemResolver;
 use archivefs_core::identity_source::path_map::{
-    MappingPreview, PathMapping, PathMappings, PathTranslation,
+    MappingPreview, PathMapping, PathMappings, PathTranslation, ProviderPathKind, normalise_prefix,
 };
 use archivefs_core::identity_source::romm::client::UreqTransport;
 use archivefs_core::identity_source::romm::config::ValidatedRommSource;
@@ -269,6 +269,7 @@ struct StatusReport {
     token_available: bool,
     token_problem: Option<String>,
     page_size: u32,
+    path_kind: ProviderPathKind,
     cache_format_version: Option<u32>,
     #[serde(flatten)]
     provider: ProviderStatus,
@@ -294,6 +295,7 @@ fn status(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
         token_available: token.is_ok(),
         token_problem: token.err().map(|refusal| refusal.detail()),
         page_size: settings.effective_page_size(),
+        path_kind: settings.source.provider_path_kind,
         cache_format_version,
         provider,
     };
@@ -327,6 +329,7 @@ fn status(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default()
             ),
             format!("  Page size:        {}", report.page_size),
+            format!("  Path shape:       {}", report.path_kind.label()),
         ];
         if let Some(server) = &provider.server_id {
             lines.push(format!("  Server identity:  {server}"));
@@ -416,6 +419,7 @@ struct ConfigureResult {
     token_problem: Option<String>,
     enabled: bool,
     page_size: u32,
+    path_kind: ProviderPathKind,
     /// The addresses the URL resolved to at configuration time, all approved.
     resolved_addresses: Vec<String>,
 }
@@ -424,6 +428,14 @@ fn configure(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std
     let url = take_string(&mut args, "--url")?;
     let token_file = take_path(&mut args, "--token-file")?;
     let page_size = take_number(&mut args, "--page-size")?;
+    let path_kind = match take_string(&mut args, "--path-kind")? {
+        Some(text) => Some(ProviderPathKind::parse(&text).ok_or_else(|| {
+            format!(
+                "unknown --path-kind {text:?}; use `relative` for a RomM that reports                  `roms/gb/game.gb`, or `absolute` for one that reports                  `/romm/library/gb/game.gb`"
+            )
+        })?),
+        None => None,
+    };
     let enable = take_flag(&mut args, "--enable");
     reject_extra(&args, "configure")?;
 
@@ -444,6 +456,29 @@ fn configure(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std
     }
     if let Some(size) = page_size {
         settings.page_size = Some(u32::try_from(size).map_err(|_| "--page-size is too large")?);
+    }
+    if let Some(kind) = path_kind {
+        // Changing the shape orphans every mapping written in the other one, so
+        // the switch is refused while one is still stored rather than leaving a
+        // configuration whose mappings can never match anything.
+        let stranded: Vec<String> = settings
+            .source
+            .mappings
+            .iter()
+            .filter(|mapping| normalise_prefix(&mapping.provider_prefix, kind).is_err())
+            .map(|mapping| mapping.provider_prefix.clone())
+            .collect();
+        if !stranded.is_empty() {
+            return Err(format!(
+                "{} configured mapping(s) are written for {} paths and cannot be used as {}: {}.                  Remove them first with `mappings remove --romm-root <path>`, then set the shape                  and add the replacements.",
+                stranded.len(),
+                settings.source.provider_path_kind.slug(),
+                kind.slug(),
+                stranded.join(", ")
+            )
+            .into());
+        }
+        settings.source.provider_path_kind = kind;
     }
     if enable {
         settings.source.enabled = true;
@@ -472,6 +507,7 @@ fn configure(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std
         token_problem: token.err().map(|refusal| refusal.detail()),
         enabled: settings.source.enabled,
         page_size: settings.effective_page_size(),
+        path_kind: settings.source.provider_path_kind,
         resolved_addresses: resolved,
     };
     context.emit(&result, || {
@@ -484,6 +520,7 @@ fn configure(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std
             format!("  Resolved to: {}", result.resolved_addresses.join(", ")),
             format!("  Enabled:     {}", yes_no(result.enabled)),
             format!("  Page size:   {}", result.page_size),
+            format!("  Path shape:  {}", result.path_kind.label()),
         ];
         match (&result.token_file, &result.token_problem) {
             (Some(path), None) => lines.push(format!("  Token file:  {} (usable)", path.display())),
@@ -527,6 +564,15 @@ struct TestResult {
     can_import: bool,
     blocking_reason: Option<String>,
     notes: Vec<String>,
+    /// What this source is configured to expect.
+    configured_path_kind: ProviderPathKind,
+    /// The shape the instance actually reports, from one sampled record.
+    observed_path_kind: Option<ProviderPathKind>,
+    /// That record's path, so the shape can be seen rather than taken on trust.
+    sample_provider_path: Option<String>,
+    /// Set when the two disagree: the setting needs changing before an import can
+    /// match anything.
+    path_kind_mismatch: bool,
     /// Stated explicitly, because a connection test that changed something would
     /// be a bad connection test.
     cache_modified: bool,
@@ -560,6 +606,18 @@ fn test_connection(context: &Context) -> Result<(), Box<dyn std::error::Error>> 
         ok: outcome.is_ok(),
         detail: outcome.err(),
     };
+    // One record only: enough to prove read access, small enough to be free, and
+    // enough to see which shape of path this instance reports.
+    let first_page = client.roms_page(1, 0, None);
+    let sample_provider_path = first_page
+        .as_ref()
+        .ok()
+        .and_then(|page| page.items.first())
+        .map(archivefs_core::identity_source::romm::normalise::provider_path_of)
+        .filter(|path| !path.is_empty());
+    let observed_path_kind = sample_provider_path
+        .as_deref()
+        .map(ProviderPathKind::observed_in);
     let authenticated_reads = vec![
         probe(
             "/api/platforms",
@@ -568,13 +626,9 @@ fn test_connection(context: &Context) -> Result<(), Box<dyn std::error::Error>> 
                 .map(|_| ())
                 .map_err(|error| error.detail()),
         ),
-        // One record only: enough to prove read access, small enough to be free.
         probe(
             "/api/roms",
-            client
-                .roms_page(1, 0, None)
-                .map(|_| ())
-                .map_err(|error| error.detail()),
+            first_page.map(|_| ()).map_err(|error| error.detail()),
         ),
     ];
 
@@ -596,6 +650,11 @@ fn test_connection(context: &Context) -> Result<(), Box<dyn std::error::Error>> 
         can_import: report.api.can_import() && authenticated_reads.iter().all(|read| read.ok),
         blocking_reason: report.api.blocking_reason(),
         notes: report.notes.clone(),
+        configured_path_kind: settings.source.provider_path_kind,
+        path_kind_mismatch: observed_path_kind
+            .is_some_and(|observed| observed != settings.source.provider_path_kind),
+        observed_path_kind,
+        sample_provider_path,
         cache_modified: false,
         romm_modified: false,
         authenticated_reads,
@@ -674,6 +733,29 @@ fn test_connection(context: &Context) -> Result<(), Box<dyn std::error::Error>> 
             lines.push(format!("  Note: {note}"));
         }
         lines.push(format!(
+            "  Path shape:        configured {}, reported {}",
+            result.configured_path_kind.slug(),
+            result
+                .observed_path_kind
+                .map(ProviderPathKind::slug)
+                .unwrap_or("unknown (no record to sample)")
+        ));
+        if let Some(sample) = &result.sample_provider_path {
+            lines.push(format!("  Example path:      {sample}"));
+        }
+        if result.path_kind_mismatch {
+            let observed = result
+                .observed_path_kind
+                .map(ProviderPathKind::slug)
+                .unwrap_or("relative");
+            lines.push(format!(
+                "  This server's paths are {observed}, but this source is configured for {}. Run \
+                 `identity source romm configure --path-kind {observed}` and write the mappings in \
+                 that shape, or every record will stay unmatched.",
+                result.configured_path_kind.slug()
+            ));
+        }
+        lines.push(format!(
             "  Ready to import:   {}",
             yes_no(result.can_import)
         ));
@@ -697,12 +779,20 @@ fn test_connection(context: &Context) -> Result<(), Box<dyn std::error::Error>> 
 struct MappingsList {
     mappings: Vec<MappingEntry>,
     trusted_roots: Vec<PathBuf>,
+    /// Which shape these prefixes are written in, so a listing is unambiguous.
+    path_kind: ProviderPathKind,
 }
 
 #[derive(Debug, Serialize)]
 struct MappingEntry {
     romm_root: String,
     archivefs_root: PathBuf,
+    /// Why this stored mapping cannot be used under the configured path shape.
+    ///
+    /// A listing must never fail: if a mapping and the declared shape disagree,
+    /// seeing that is exactly how someone works out what to remove.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    problem: Option<String>,
 }
 
 fn mappings(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -728,39 +818,99 @@ fn list_mappings(
     settings: &ProviderSettings,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let trusted = context.source_roots.clone();
-    // Ordered by the engine, so `list` shows the order rules are actually applied
-    // in rather than the order they were typed.
-    let ordered = PathMappings::validate(&settings.source.mappings, &[])
-        .map_err(|refusal| refusal.detail())?;
-    let list = MappingsList {
-        mappings: ordered
-            .as_slice()
-            .iter()
-            .map(|mapping| MappingEntry {
+    let kind = settings.source.provider_path_kind;
+
+    // Each mapping is judged on its own, so one bad entry cannot hide the rest.
+    // Usable ones are ordered by the engine, which is the order the rules are
+    // actually applied in rather than the order they were typed.
+    let usable: Vec<PathMapping> = settings
+        .source
+        .mappings
+        .iter()
+        .filter(|mapping| normalise_prefix(&mapping.provider_prefix, kind).is_ok())
+        .cloned()
+        .collect();
+    let ordered = PathMappings::validate(&usable, &[], kind)
+        .map(|validated| validated.as_slice().to_vec())
+        .unwrap_or(usable);
+
+    let mut entries: Vec<MappingEntry> = ordered
+        .iter()
+        .map(|mapping| MappingEntry {
+            romm_root: mapping.provider_prefix.clone(),
+            archivefs_root: mapping.archivefs_prefix.clone(),
+            problem: None,
+        })
+        .collect();
+    for mapping in &settings.source.mappings {
+        if let Err(refusal) = normalise_prefix(&mapping.provider_prefix, kind) {
+            entries.push(MappingEntry {
                 romm_root: mapping.provider_prefix.clone(),
                 archivefs_root: mapping.archivefs_prefix.clone(),
-            })
-            .collect(),
+                problem: Some(refusal.detail()),
+            });
+        }
+    }
+
+    let list = MappingsList {
+        path_kind: kind,
+        mappings: entries,
         trusted_roots: trusted,
     };
     context.emit(&list, || {
+        let usable_count = list
+            .mappings
+            .iter()
+            .filter(|entry| entry.problem.is_none())
+            .count();
         let mut lines = if list.mappings.is_empty() {
-            vec!["No path mappings are configured.".to_string(),
-                 "Add one with `identity source romm mappings add --romm-root <path> --archivefs-root <path>`.".to_string()]
+            vec![
+                "No path mappings are configured.".to_string(),
+                "Add one with `identity source romm mappings add --romm-root <path> \
+                 --archivefs-root <path>`."
+                    .to_string(),
+            ]
         } else {
             let mut lines = vec![format!(
-                "{} path mapping(s), most specific first:",
-                list.mappings.len()
+                "{usable_count} usable path mapping(s), most specific first:"
             )];
-            for mapping in &list.mappings {
+            for entry in list.mappings.iter().filter(|entry| entry.problem.is_none()) {
                 lines.push(format!(
                     "  {}  ->  {}",
-                    mapping.romm_root,
-                    mapping.archivefs_root.display()
+                    entry.romm_root,
+                    entry.archivefs_root.display()
                 ));
             }
             lines
         };
+        let unusable: Vec<&MappingEntry> = list
+            .mappings
+            .iter()
+            .filter(|entry| entry.problem.is_some())
+            .collect();
+        if !unusable.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "{} stored mapping(s) cannot be used as configured:",
+                unusable.len()
+            ));
+            for entry in unusable {
+                lines.push(format!(
+                    "  {}  ->  {}",
+                    entry.romm_root,
+                    entry.archivefs_root.display()
+                ));
+                if let Some(problem) = &entry.problem {
+                    lines.push(format!("    {problem}"));
+                }
+                lines.push(format!(
+                    "    Remove it with `mappings remove --romm-root {}`.",
+                    entry.romm_root
+                ));
+            }
+        }
+        lines.push(String::new());
+        lines.push(format!("RomM path shape: {}", list.path_kind.label()));
         if !list.trusted_roots.is_empty() {
             lines.push(String::new());
             lines.push("Destinations must sit inside a configured source folder:".to_string());
@@ -772,6 +922,30 @@ fn list_mappings(
     })
 }
 
+/// Whether a stored mapping is the one `wanted` names.
+///
+/// Compares the canonical forms when both normalise, and falls back to the text
+/// as typed. The fallback matters: a mapping stored under one path shape and then
+/// orphaned by a change of shape must still be removable, or the configuration
+/// could be edited into a state with no way out.
+fn prefix_matches(stored: &str, wanted: &str, kind: ProviderPathKind) -> bool {
+    let lenient = |text: &str| {
+        let trimmed = text.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            text.trim().to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    match (
+        normalise_prefix(stored, kind),
+        normalise_prefix(wanted, kind),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => lenient(stored) == lenient(wanted),
+    }
+}
+
 fn add_mapping(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let romm_root =
         take_string(&mut args, "--romm-root")?.ok_or("mappings add requires --romm-root <path>")?;
@@ -781,31 +955,22 @@ fn add_mapping(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn s
     reject_extra(&args, "mappings add")?;
 
     let mut settings = context.load_settings()?;
-    // Normalised by validating it alone first, so the comparison below is against
-    // the engine's own form rather than the typed text.
+    let kind = settings.source.provider_path_kind;
     let candidate = PathMapping {
         provider_prefix: romm_root.clone(),
         archivefs_prefix: archivefs_root.clone(),
     };
-    let normalised = PathMappings::validate(std::slice::from_ref(&candidate), &[])
-        .map_err(|refusal| refusal.detail())?;
-    let normalised_prefix = normalised
-        .as_slice()
-        .first()
-        .map(|mapping| mapping.provider_prefix.clone())
-        .unwrap_or(romm_root);
+    // Normalised first, so the comparison below is against the engine's own form
+    // rather than the typed text - and so a prefix of the wrong shape is refused
+    // with the shape named, rather than silently never matching anything.
+    let normalised_prefix =
+        normalise_prefix(&romm_root, kind).map_err(|refusal| refusal.detail())?;
 
-    let existing = settings.source.mappings.iter().position(|mapping| {
-        PathMappings::validate(std::slice::from_ref(mapping), &[])
-            .ok()
-            .and_then(|validated| {
-                validated
-                    .as_slice()
-                    .first()
-                    .map(|entry| entry.provider_prefix == normalised_prefix)
-            })
-            .unwrap_or(false)
-    });
+    let existing = settings
+        .source
+        .mappings
+        .iter()
+        .position(|mapping| prefix_matches(&mapping.provider_prefix, &romm_root, kind));
     if let Some(index) = existing {
         if !replace {
             return Err(format!(
@@ -821,7 +986,7 @@ fn add_mapping(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn s
 
     // Validated as a whole, with the trusted roots applied, so a duplicate
     // destination or an escaping mapping is refused before it is stored.
-    PathMappings::validate(&settings.source.mappings, &context.source_roots)
+    PathMappings::validate(&settings.source.mappings, &context.source_roots, kind)
         .map_err(|refusal| refusal.detail())?;
     context
         .settings
@@ -838,34 +1003,16 @@ fn remove_mapping(
         .ok_or("mappings remove requires --romm-root <path>")?;
     reject_extra(&args, "mappings remove")?;
     let mut settings = context.load_settings()?;
+    let kind = settings.source.provider_path_kind;
     let before = settings.source.mappings.len();
-    let target = PathMappings::validate(
-        &[PathMapping {
-            provider_prefix: romm_root.clone(),
-            archivefs_prefix: PathBuf::from("/"),
-        }],
-        &[],
-    )
-    .map(|validated| {
-        validated
-            .as_slice()
-            .first()
-            .map(|entry| entry.provider_prefix.clone())
-            .unwrap_or_else(|| romm_root.clone())
-    })
-    .unwrap_or(romm_root.clone());
+    // An unnormalisable spelling is compared as typed: removing something is not
+    // the moment to refuse over a prefix that is already stored.
+    let target = normalise_prefix(&romm_root, kind).unwrap_or_else(|_| romm_root.clone());
 
-    settings.source.mappings.retain(|mapping| {
-        PathMappings::validate(std::slice::from_ref(mapping), &[])
-            .ok()
-            .and_then(|validated| {
-                validated
-                    .as_slice()
-                    .first()
-                    .map(|entry| entry.provider_prefix != target)
-            })
-            .unwrap_or(true)
-    });
+    settings
+        .source
+        .mappings
+        .retain(|mapping| !prefix_matches(&mapping.provider_prefix, &romm_root, kind));
     if settings.source.mappings.len() == before {
         return Err(format!("no mapping starts from {target}").into());
     }
@@ -882,17 +1029,38 @@ struct PreviewReport {
     translated: usize,
     unmatched: usize,
     refused: usize,
+    /// How many of the sampled paths existed locally.
+    existing_files: usize,
     /// Where the sample paths came from - the cache, or RomM.
     sample_source: &'static str,
+    /// The shape the mappings are configured for.
+    configured_path_kind: ProviderPathKind,
+    /// The shape the samples actually had, counted.
+    observed_relative: usize,
+    observed_absolute: usize,
+    /// Set when the samples disagree with the configured shape, which is nearly
+    /// always the real cause of a preview that refuses everything.
+    suggested_path_kind: Option<ProviderPathKind>,
 }
 
 #[derive(Debug, Serialize)]
 struct PreviewExample {
+    /// The exact string RomM sent, never a cleaned-up version of it.
     romm_path: String,
-    archivefs_path: Option<PathBuf>,
+    /// The form the comparison was made against. Equal to `romm_path` unless the
+    /// provider spelled it differently, in which case seeing both is the point.
+    normalised_path: Option<String>,
+    path_kind: Option<ProviderPathKind>,
     matched_prefix: Option<String>,
+    archivefs_path: Option<PathBuf>,
+    /// Which configured source folder the result landed in.
+    trusted_root: Option<PathBuf>,
+    /// Whether the destination is inside a configured source folder. `None` when
+    /// there was no translation to check.
+    inside_trusted_root: Option<bool>,
     outcome: &'static str,
     refusal: Option<String>,
+    refusal_code: Option<String>,
     file_exists: Option<bool>,
     canonical_platform: Option<String>,
 }
@@ -906,7 +1074,8 @@ fn preview_mappings(
         .clamp(1, MAX_PREVIEW_LIMIT);
     reject_extra(&args, "mappings preview")?;
     let settings = context.load_settings()?;
-    let engine = PathMappings::validate(&settings.source.mappings, &context.source_roots)
+    let kind = settings.source.provider_path_kind;
+    let engine = PathMappings::validate(&settings.source.mappings, &context.source_roots, kind)
         .map_err(|refusal| refusal.detail())?;
 
     // Prefer paths already in the cache: previewing against real data costs
@@ -936,14 +1105,13 @@ fn preview_mappings(
             let page = client
                 .roms_page(u32::try_from(limit).unwrap_or(10), 0, None)
                 .map_err(|error| error.detail())?;
+            // The same extraction an import uses, so the preview cannot promise a
+            // translation the import would then make differently.
             let samples: Vec<String> = page
                 .items
                 .iter()
-                .filter_map(|item| {
-                    item.get("full_path")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                })
+                .map(archivefs_core::identity_source::romm::normalise::provider_path_of)
+                .filter(|path| !path.is_empty())
                 .collect();
             let platforms: Vec<Option<String>> = page
                 .items
@@ -967,24 +1135,43 @@ fn preview_mappings(
         .map(|(index, translation)| match translation {
             PathTranslation::Translated {
                 provider_path,
+                normalised_path,
+                kind,
                 archivefs_path,
                 matched_prefix,
+                trusted_root,
             } => PreviewExample {
                 romm_path: provider_path.clone(),
-                archivefs_path: Some(archivefs_path.clone()),
+                normalised_path: Some(normalised_path.clone()),
+                path_kind: Some(*kind),
                 matched_prefix: Some(matched_prefix.clone()),
+                archivefs_path: Some(archivefs_path.clone()),
+                trusted_root: trusted_root.clone(),
+                // A translation only gets this far if it is inside a root, or if
+                // no roots were configured to check against.
+                inside_trusted_root: Some(true),
                 outcome: "translated",
                 refusal: None,
-                // Metadata only. A preview never reads a file.
+                refusal_code: None,
+                // Metadata only. A preview never reads a file's contents.
                 file_exists: Some(archivefs_path.is_file()),
                 canonical_platform: platforms.get(index).cloned().flatten(),
             },
-            PathTranslation::Unmatched { provider_path } => PreviewExample {
+            PathTranslation::Unmatched {
+                provider_path,
+                normalised_path,
+                kind,
+            } => PreviewExample {
                 romm_path: provider_path.clone(),
-                archivefs_path: None,
+                normalised_path: Some(normalised_path.clone()),
+                path_kind: Some(*kind),
                 matched_prefix: None,
+                archivefs_path: None,
+                trusted_root: None,
+                inside_trusted_root: None,
                 outcome: "unmatched",
                 refusal: None,
+                refusal_code: None,
                 file_exists: None,
                 canonical_platform: platforms.get(index).cloned().flatten(),
             },
@@ -993,10 +1180,19 @@ fn preview_mappings(
                 refusal,
             } => PreviewExample {
                 romm_path: provider_path.clone(),
-                archivefs_path: None,
+                normalised_path: None,
+                path_kind: None,
                 matched_prefix: None,
+                archivefs_path: None,
+                trusted_root: None,
+                inside_trusted_root: matches!(
+                    refusal,
+                    archivefs_core::identity_source::path_map::MappingRefusal::OutsideTrustedRoots { .. }
+                )
+                .then_some(false),
                 outcome: "refused",
                 refusal: Some(refusal.detail()),
+                refusal_code: Some(refusal.code().to_string()),
                 file_exists: None,
                 canonical_platform: None,
             },
@@ -1007,41 +1203,91 @@ fn preview_mappings(
         translated: preview.translated,
         unmatched: preview.unmatched,
         refused: preview.refused,
+        existing_files: examples
+            .iter()
+            .filter(|example| example.file_exists == Some(true))
+            .count(),
         sample_source,
+        configured_path_kind: preview.configured_kind,
+        observed_relative: preview.observed_relative,
+        observed_absolute: preview.observed_absolute,
+        suggested_path_kind: preview.suggested_kind(),
         examples,
     };
     context.emit(&report, || {
-        let mut lines = vec![format!(
-            "Previewing {} path(s) from {} - nothing was imported or changed:",
-            report.examples.len(),
-            report.sample_source
-        )];
+        let mut lines = vec![
+            format!(
+                "Previewing {} path(s) from {} - nothing was imported or changed.",
+                report.examples.len(),
+                report.sample_source
+            ),
+            format!(
+                "Configured RomM path shape: {}",
+                report.configured_path_kind.label()
+            ),
+        ];
+        if let Some(suggested) = report.suggested_path_kind {
+            lines.push(String::new());
+            lines.push(format!(
+                "These paths look {}, not {}. Run `identity source romm configure --path-kind {}` \
+                 and rewrite the mappings to match, or nothing will translate.",
+                suggested.slug(),
+                report.configured_path_kind.slug(),
+                suggested.slug()
+            ));
+        }
+        lines.push(String::new());
         for example in &report.examples {
             lines.push(format!("  {}", example.romm_path));
+            // Shown only when it differs, so an identical line is not noise.
+            if let Some(normalised) = &example.normalised_path
+                && normalised != &example.romm_path
+            {
+                lines.push(format!("    compared as: {normalised}"));
+            }
             match (&example.archivefs_path, &example.refusal) {
-                (Some(path), _) => lines.push(format!(
-                    "    -> {} ({}, file {}{})",
-                    path.display(),
-                    example.matched_prefix.as_deref().unwrap_or("no mapping"),
-                    if example.file_exists == Some(true) {
-                        "present"
-                    } else {
-                        "missing"
-                    },
-                    example
-                        .canonical_platform
-                        .as_deref()
-                        .map(|platform| format!(", {platform}"))
-                        .unwrap_or_default()
+                (Some(path), _) => {
+                    lines.push(format!("    -> {}", path.display()));
+                    lines.push(format!(
+                        "       via mapping {}, file {}{}",
+                        example.matched_prefix.as_deref().unwrap_or("(none)"),
+                        if example.file_exists == Some(true) {
+                            "present"
+                        } else {
+                            "missing"
+                        },
+                        example
+                            .canonical_platform
+                            .as_deref()
+                            .map(|platform| format!(", {platform}"))
+                            .unwrap_or_default()
+                    ));
+                    lines.push(format!(
+                        "       trusted root: {}",
+                        example
+                            .trusted_root
+                            .as_ref()
+                            .map(|root| root.display().to_string())
+                            .unwrap_or_else(
+                                || "not checked (no source folders configured)".to_string()
+                            )
+                    ));
+                }
+                (None, Some(refusal)) => lines.push(format!(
+                    "    refused ({}): {refusal}",
+                    example.refusal_code.as_deref().unwrap_or("unknown")
                 )),
-                (None, Some(refusal)) => lines.push(format!("    refused: {refusal}")),
                 (None, None) => lines.push("    no mapping covers this path".to_string()),
             }
         }
         lines.push(String::new());
         lines.push(format!(
-            "{} translated, {} unmatched, {} refused",
-            report.translated, report.unmatched, report.refused
+            "{} translated ({} of those exist locally), {} unmatched, {} refused",
+            report.translated, report.existing_files, report.unmatched, report.refused
+        ));
+        lines.push(format!(
+            "Sampled path shapes: {} relative, {} absolute",
+            report.observed_relative, report.observed_absolute
         ));
         lines
     })

@@ -9,6 +9,7 @@ use super::capability::*;
 use super::client::*;
 use super::config::*;
 use crate::identity_source::net_policy::StaticResolver;
+use crate::identity_source::path_map::ProviderPathKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- Fixtures -------------------------------------------------------------
@@ -168,6 +169,7 @@ fn source() -> ValidatedRommSource {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     ValidatedRommSource::validate(&config, &token(), &[], &StaticResolver::new())
@@ -216,6 +218,7 @@ fn the_token_reaches_the_header_and_nowhere_else() {
         enabled: true,
         url: "http://127.0.0.1:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: Some(std::path::PathBuf::from("/tmp/x")),
     };
     let json = serde_json::to_string(&config).expect("serialises");
@@ -655,6 +658,7 @@ fn a_configuration_is_validated_as_a_whole() {
         enabled: true,
         url: "http://8.8.8.8:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     let refusal = ValidatedRommSource::validate(&bad_url, &token(), &[], &StaticResolver::new())
@@ -670,6 +674,7 @@ fn a_configuration_is_validated_as_a_whole() {
             provider_prefix: "/romm/library".to_string(),
             archivefs_prefix: std::path::PathBuf::from("/etc"),
         }],
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     let refusal = ValidatedRommSource::validate(

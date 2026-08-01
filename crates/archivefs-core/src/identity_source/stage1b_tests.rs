@@ -7,7 +7,7 @@ use super::cache::*;
 use super::hashing::*;
 use super::matching::*;
 use super::model::*;
-use super::path_map::{PathMapping, PathMappings};
+use super::path_map::{PathMapping, PathMappings, ProviderPathKind};
 use super::romm::capability::{RommApiCapability, RommCapabilityReport, RommHeartbeat};
 use super::romm::client::{RommHttpResponse, RommRequestError, RommTransport};
 use super::romm::config::{RommSourceConfig, RommToken, ValidatedRommSource};
@@ -76,6 +76,7 @@ impl Tree {
                 archivefs_prefix: self.library(),
             }],
             &[self.library()],
+            ProviderPathKind::AbsoluteProviderPath,
         )
         .expect("valid mappings")
     }
@@ -88,6 +89,7 @@ impl Tree {
                 provider_prefix: "/romm/library".to_string(),
                 archivefs_prefix: self.library(),
             }],
+            provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
             token_path: None,
         };
         ValidatedRommSource::validate(
@@ -1407,14 +1409,19 @@ fn a_first_ever_failed_import_leaves_no_fake_ready_state() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     let status = api.status(&config, &LocalHashCache::new(), false);
-    assert!(
-        matches!(status.state, ProviderState::Error { .. }),
-        "{:?} must not be a ready state",
-        status.state
-    );
+    // Not a ready state, and not browsable - but not an error either: being
+    // configured and not yet imported is a normal stage, and calling it a failure
+    // sent people looking for a fault that was not there.
+    assert_eq!(status.state, ProviderState::NeverImported);
+    assert!(!status.state.can_browse());
+    assert!(!matches!(
+        status.state,
+        ProviderState::Ready | ProviderState::ReadyOffline
+    ));
     assert_eq!(status.records_imported, 0);
 }
 
@@ -1452,6 +1459,7 @@ fn cached_identity_is_browsable_with_no_network() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     // `reachable: false` is the offline case and must still be browsable.
@@ -1475,6 +1483,7 @@ fn a_disabled_source_reports_disabled_and_contacts_nothing() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     api.disable(&mut config);
@@ -2031,6 +2040,7 @@ fn an_end_to_end_import_produces_matched_records_and_a_status() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
     let status = api.status(&config, &LocalHashCache::new(), true);

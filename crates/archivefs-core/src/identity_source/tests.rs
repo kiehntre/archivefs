@@ -522,6 +522,7 @@ fn the_policy_module_contains_no_write_or_process_call() {
 
 mod path_mapping {
     use super::super::path_map::*;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn mapping(provider: &str, archivefs: &str) -> PathMapping {
@@ -537,7 +538,8 @@ mod path_mapping {
             .iter()
             .map(|(provider, archivefs)| mapping(provider, archivefs))
             .collect();
-        PathMappings::validate(&list, &[]).expect("these mappings should validate")
+        PathMappings::validate(&list, &[], ProviderPathKind::AbsoluteProviderPath)
+            .expect("these mappings should validate")
     }
 
     /// Test 22: the ordinary case from the milestone.
@@ -637,9 +639,15 @@ mod path_mapping {
             maps.translate("/romm/library").archivefs_path(),
             Some(PathBuf::from("/mnt/games/roms").as_path())
         );
+        // A trailing separator on a *record* path is refused rather than trimmed.
+        // A person typing a mapping prefix gets that courtesy - see
+        // `duplicate_sources_and_destinations_are_refused`, where `/romm/a/` and
+        // `/romm/a` are still recognised as one prefix - but a path arriving over
+        // the network does not, because a spelling that needs repairing is a
+        // spelling whose meaning was never agreed.
         assert_eq!(
-            maps.translate("/romm/library/").archivefs_path(),
-            Some(PathBuf::from("/mnt/games/roms").as_path())
+            maps.translate("/romm/library/").refusal().map(|r| r.code()),
+            Some("empty_component")
         );
     }
 
@@ -661,15 +669,23 @@ mod path_mapping {
         }
         // And in a configured mapping.
         assert_eq!(
-            PathMappings::validate(&[mapping("/romm/../etc", "/mnt/games/roms")], &[])
-                .expect_err("refused")
-                .code(),
+            PathMappings::validate(
+                &[mapping("/romm/../etc", "/mnt/games/roms")],
+                &[],
+                ProviderPathKind::AbsoluteProviderPath
+            )
+            .expect_err("refused")
+            .code(),
             "non_normal_component"
         );
         assert_eq!(
-            PathMappings::validate(&[mapping("/romm/library", "/mnt/games/../../etc")], &[])
-                .expect_err("refused")
-                .code(),
+            PathMappings::validate(
+                &[mapping("/romm/library", "/mnt/games/../../etc")],
+                &[],
+                ProviderPathKind::AbsoluteProviderPath,
+            )
+            .expect_err("refused")
+            .code(),
             "non_normal_component"
         );
     }
@@ -683,13 +699,21 @@ mod path_mapping {
             PathBuf::from("/mnt/ngc-roms"),
         ];
         // Inside a root: accepted.
-        PathMappings::validate(&[mapping("/romm/library", "/mnt/games/roms/nes")], &roots)
-            .expect("a destination inside a source folder is fine");
+        PathMappings::validate(
+            &[mapping("/romm/library", "/mnt/games/roms/nes")],
+            &roots,
+            ProviderPathKind::AbsoluteProviderPath,
+        )
+        .expect("a destination inside a source folder is fine");
         // Outside every root: refused.
         for outside in ["/etc", "/home/davedap", "/mnt/games/roms-backup", "/"] {
-            let refusal = PathMappings::validate(&[mapping("/romm/library", outside)], &roots)
-                .err()
-                .unwrap_or_else(|| panic!("{outside} must be refused"));
+            let refusal = PathMappings::validate(
+                &[mapping("/romm/library", outside)],
+                &roots,
+                ProviderPathKind::AbsoluteProviderPath,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{outside} must be refused"));
             assert_eq!(refusal.code(), "outside_trusted_roots", "{outside}");
         }
     }
@@ -721,7 +745,8 @@ mod path_mapping {
                     mapping("/romm/a", "/mnt/games/roms"),
                     mapping("/romm/b", "/mnt/games/roms"),
                 ],
-                &[]
+                &[],
+                ProviderPathKind::AbsoluteProviderPath,
             )
             .expect_err("refused")
             .code(),
@@ -733,7 +758,8 @@ mod path_mapping {
                     mapping("/romm/a", "/mnt/one"),
                     mapping("/romm/a/", "/mnt/two"),
                 ],
-                &[]
+                &[],
+                ProviderPathKind::AbsoluteProviderPath,
             )
             .expect_err("refused")
             .code(),
@@ -742,38 +768,87 @@ mod path_mapping {
         );
     }
 
-    /// Test 30: Windows-style separators from a provider on Windows.
+    /// Test 30: a backslash is refused, not read as a separator.
+    ///
+    /// This reverses an earlier decision in this module, which unified `\\` to `/`
+    /// so a provider running on Windows would still map. Two things make refusing
+    /// it the better answer. On the Linux filesystems RomM actually runs on, a
+    /// backslash is a legal character *in a filename*, so reinterpreting it as a
+    /// separator invents a directory level that does not exist and points the
+    /// translation at the wrong place. And a path whose separators are ambiguous
+    /// is exactly the shape a traversal attempt takes, so the safe response is to
+    /// stop rather than to guess.
     #[test]
-    fn windows_style_provider_paths_are_understood() {
+    fn backslashes_are_refused_rather_than_treated_as_separators() {
         let maps = mappings(&[("/romm/library", "/mnt/games/roms")]);
+        // One leading backslash: a stray separator, in a path that would have
+        // mapped under the old unifying rule.
         assert_eq!(
-            maps.translate("\\romm\\library\\nes\\Metroid.zip")
-                .archivefs_path(),
-            Some(PathBuf::from("/mnt/games/roms/nes/Metroid.zip").as_path()),
-            "backslash separators should still map"
+            maps.translate(r"\romm\library\nes\Metroid.zip")
+                .refusal()
+                .map(|refusal| refusal.code()),
+            Some("windows_separator")
         );
-        // Traversal is still refused when written with backslashes.
-        assert!(matches!(
-            maps.translate("\\romm\\library\\..\\..\\etc\\passwd"),
-            PathTranslation::Refused { .. }
-        ));
+        // A backslash part-way through, which on Linux is a legal filename byte.
+        assert_eq!(
+            maps.translate(r"/romm/library/nes\Metroid.zip")
+                .refusal()
+                .map(|refusal| refusal.code()),
+            Some("windows_separator")
+        );
+        // Two leading backslashes are a UNC share, named as such.
+        assert_eq!(
+            maps.translate(r"\\server\share\game.zip")
+                .refusal()
+                .map(|refusal| refusal.code()),
+            Some("unc_path")
+        );
+        // Traversal written with backslashes is refused before any separator
+        // reinterpretation could have hidden the `..`.
+        assert!(
+            maps.translate(r"/romm/library/..\..\etc/passwd")
+                .refusal()
+                .is_some()
+        );
+        // A drive letter is named for what it is.
+        assert_eq!(
+            maps.translate("C:/romm/library/x.zip")
+                .refusal()
+                .map(|refusal| refusal.code()),
+            Some("drive_prefix")
+        );
     }
 
-    /// Test 31: redundant separators and `.` segments are tolerated.
+    /// Test 31: redundant separators and `.` segments are refused.
+    ///
+    /// Also a reversal: they used to be quietly collapsed. Collapsing means two
+    /// different strings translate to one path, which is precisely the property a
+    /// traversal attempt relies on. Outer whitespace is still trimmed, because
+    /// that cannot change which components a path has.
     #[test]
-    fn redundant_separators_are_normalised() {
+    fn redundant_separators_and_dot_segments_are_refused() {
         let maps = mappings(&[("/romm/library", "/mnt/games/roms")]);
-        for messy in [
-            "/romm//library//nes///Metroid.zip",
-            "/romm/./library/nes/Metroid.zip",
-            "  /romm/library/nes/Metroid.zip  ",
+        for (messy, expected) in [
+            ("/romm//library//nes///Metroid.zip", "empty_component"),
+            ("/romm/./library/nes/Metroid.zip", "dot_component"),
+            ("/romm/library/nes/./Metroid.zip", "dot_component"),
+            ("/romm/library/nes/Metroid.zip/", "empty_component"),
         ] {
             assert_eq!(
-                maps.translate(messy).archivefs_path(),
-                Some(PathBuf::from("/mnt/games/roms/nes/Metroid.zip").as_path()),
+                maps.translate(messy)
+                    .refusal()
+                    .map(|refusal| refusal.code()),
+                Some(expected),
                 "{messy}"
             );
         }
+        // Whitespace around the whole path is still tolerated: it cannot change
+        // the components.
+        assert_eq!(
+            maps.translate("  /romm/library/nes/Metroid.zip  ")
+                .archivefs_path(),
+            Some(PathBuf::from("/mnt/games/roms/nes/Metroid.zip").as_path())
+        );
     }
 
     /// Test 32: absurdly long and malformed inputs.
@@ -800,7 +875,7 @@ mod path_mapping {
             .map(|index| mapping(&format!("/romm/{index}"), &format!("/mnt/{index}")))
             .collect();
         assert_eq!(
-            PathMappings::validate(&many, &[])
+            PathMappings::validate(&many, &[], ProviderPathKind::AbsoluteProviderPath)
                 .expect_err("refused")
                 .code(),
             "too_many"
@@ -825,6 +900,333 @@ mod path_mapping {
         assert_eq!(preview.unmatched, 1);
         assert_eq!(preview.refused, 1);
         assert_eq!(preview.translations.len(), 4);
+    }
+
+    // --- Provider-relative paths, the shape RomM 5.1.0 actually reports ------
+
+    /// Relative mappings with the real path shapes observed from RomM 5.1.0.
+    fn relative_mappings(pairs: &[(&str, &str)]) -> PathMappings {
+        let list: Vec<PathMapping> = pairs
+            .iter()
+            .map(|(provider, archivefs)| mapping(provider, archivefs))
+            .collect();
+        PathMappings::validate(&list, &[], ProviderPathKind::ProviderRelative)
+            .expect("these relative mappings should validate")
+    }
+
+    #[test]
+    fn real_relative_paths_from_romm_translate() {
+        let maps = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        // Exactly the shapes the live server returned.
+        for (provider, expected) in [
+            ("roms/gb/game.gb", "/mnt/games/roms/gb/game.gb"),
+            ("roms/snes/game.zip", "/mnt/games/roms/snes/game.zip"),
+            (
+                "roms/atari-st/game.stx",
+                "/mnt/games/roms/atari-st/game.stx",
+            ),
+            ("roms/psx/game.cue", "/mnt/games/roms/psx/game.cue"),
+            (
+                "roms/sharp-x68000/_ReadMe_.txt",
+                "/mnt/games/roms/sharp-x68000/_ReadMe_.txt",
+            ),
+            (
+                "roms/acorn-archimedes/Coconizer (Europe) (v1.3).zip",
+                "/mnt/games/roms/acorn-archimedes/Coconizer (Europe) (v1.3).zip",
+            ),
+            (
+                "roms/amiga/Allo Allo (v1.0).hdf",
+                "/mnt/games/roms/amiga/Allo Allo (v1.0).hdf",
+            ),
+            (
+                "roms/atari-st/'Nam 1965-1975 (Europe).stx",
+                "/mnt/games/roms/atari-st/'Nam 1965-1975 (Europe).stx",
+            ),
+        ] {
+            assert_eq!(
+                maps.translate(provider).archivefs_path(),
+                Some(PathBuf::from(expected).as_path()),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_translation_keeps_the_exact_provider_string() {
+        let maps = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        let translated = maps.translate("roms/atari-st/game.stx");
+        let PathTranslation::Translated {
+            provider_path,
+            normalised_path,
+            kind,
+            matched_prefix,
+            ..
+        } = &translated
+        else {
+            panic!("expected a translation, got {translated:?}");
+        };
+        assert_eq!(
+            provider_path, "roms/atari-st/game.stx",
+            "the exact string RomM sent must survive translation"
+        );
+        assert_eq!(normalised_path, "roms/atari-st/game.stx");
+        assert_eq!(*kind, ProviderPathKind::ProviderRelative);
+        assert_eq!(matched_prefix, "roms");
+    }
+
+    #[test]
+    fn relative_mappings_use_component_boundaries_and_longest_prefix() {
+        let maps = relative_mappings(&[
+            ("roms", "/mnt/games/roms"),
+            ("roms/atari-st", "/mnt/st"),
+            ("other", "/mnt/other"),
+        ]);
+        assert_eq!(
+            maps.translate("roms/atari-st/game.stx").archivefs_path(),
+            Some(PathBuf::from("/mnt/st/game.stx").as_path()),
+            "the more specific relative mapping must win"
+        );
+        assert_eq!(
+            maps.translate("roms/gb/game.gb").archivefs_path(),
+            Some(PathBuf::from("/mnt/games/roms/gb/game.gb").as_path())
+        );
+        // A string prefix would wrongly accept these.
+        for near_miss in ["roms-backup/gb/x.gb", "romsextra/x.gb", "roms2/x.gb"] {
+            assert!(
+                !maps.translate(near_miss).is_translated(),
+                "{near_miss} must not match `roms`"
+            );
+        }
+    }
+
+    /// The two shapes are declared, so each refuses the other rather than
+    /// reinterpreting it.
+    #[test]
+    fn a_path_of_the_wrong_shape_is_refused_with_the_setting_named() {
+        let relative = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        let refusal = relative
+            .translate("/romm/library/gb/game.gb")
+            .refusal()
+            .cloned()
+            .expect("an absolute path in relative mode must be refused");
+        assert_eq!(refusal.code(), "unexpectedly_absolute");
+        assert!(
+            refusal.detail().contains("--path-kind absolute"),
+            "the refusal should say how to fix it: {}",
+            refusal.detail()
+        );
+
+        let absolute = mappings(&[("/romm/library", "/mnt/games/roms")]);
+        let refusal = absolute
+            .translate("roms/gb/game.gb")
+            .refusal()
+            .cloned()
+            .expect("a relative path in absolute mode must be refused");
+        assert_eq!(refusal.code(), "unexpectedly_relative");
+        assert!(
+            refusal.detail().contains("--path-kind relative"),
+            "the refusal should say how to fix it: {}",
+            refusal.detail()
+        );
+    }
+
+    #[test]
+    fn a_relative_mapping_prefix_must_itself_be_relative() {
+        assert_eq!(
+            PathMappings::validate(
+                &[mapping("/romm/library", "/mnt/games/roms")],
+                &[],
+                ProviderPathKind::ProviderRelative,
+            )
+            .expect_err("an absolute prefix is not a relative mapping")
+            .code(),
+            "unexpectedly_absolute"
+        );
+        assert_eq!(
+            PathMappings::validate(
+                &[mapping("roms", "/mnt/games/roms")],
+                &[],
+                ProviderPathKind::AbsoluteProviderPath,
+            )
+            .expect_err("a relative prefix is not an absolute mapping")
+            .code(),
+            "unexpectedly_relative"
+        );
+    }
+
+    /// A prefix a person typed may carry a trailing separator; a record path may
+    /// not. Both spellings of a prefix must reach the same rule.
+    #[test]
+    fn a_typed_relative_prefix_tolerates_a_trailing_separator() {
+        for spelling in ["roms", "roms/", "  roms/  "] {
+            let maps = relative_mappings(&[(spelling, "/mnt/games/roms")]);
+            assert_eq!(
+                maps.as_slice()[0].provider_prefix,
+                "roms",
+                "{spelling:?} should normalise to `roms`"
+            );
+            assert_eq!(
+                maps.translate("roms/gb/x.gb").archivefs_path(),
+                Some(PathBuf::from("/mnt/games/roms/gb/x.gb").as_path())
+            );
+        }
+        assert_eq!(
+            PathMappings::validate(
+                &[mapping("roms", "/mnt/one"), mapping("roms/", "/mnt/two")],
+                &[],
+                ProviderPathKind::ProviderRelative,
+            )
+            .expect_err("refused")
+            .code(),
+            "duplicate_source",
+            "the two spellings are one prefix"
+        );
+    }
+
+    /// Every hostile relative shape, each refused with its own reason.
+    #[test]
+    fn hostile_relative_paths_are_refused() {
+        let maps = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        for (hostile, expected) in [
+            ("../etc/passwd", "non_normal_component"),
+            ("roms/../../etc/passwd", "non_normal_component"),
+            ("roms/../etc/passwd", "non_normal_component"),
+            ("./roms/game.zip", "dot_component"),
+            ("roms/./game.zip", "dot_component"),
+            ("roms//game.zip", "empty_component"),
+            ("roms/game.zip/", "empty_component"),
+            (r"C:\roms\game.zip", "windows_separator"),
+            ("C:/roms/game.zip", "drive_prefix"),
+            (r"\\server\share\game.zip", "unc_path"),
+            ("//server/share/game.zip", "unc_path"),
+            (r"roms\..\game.zip", "windows_separator"),
+            (r"roms\game.zip", "windows_separator"),
+            ("/roms/game.zip", "unexpectedly_absolute"),
+            ("", "empty_prefix"),
+            ("   ", "empty_prefix"),
+        ] {
+            let translated = maps.translate(hostile);
+            assert_eq!(
+                translated.refusal().map(|refusal| refusal.code()),
+                Some(expected),
+                "{hostile:?} should be refused as {expected}, got {translated:?}"
+            );
+            assert!(
+                translated.archivefs_path().is_none(),
+                "{hostile:?} must not produce a local path"
+            );
+        }
+        // Over-long input is bounded in relative mode too.
+        let huge = format!("roms/{}", "a".repeat(MAX_PROVIDER_PATH_BYTES));
+        assert_eq!(
+            maps.translate(&huge).refusal().map(|r| r.code()),
+            Some("too_long")
+        );
+    }
+
+    /// Control characters, including NUL, and without echoing them back.
+    #[test]
+    fn control_characters_are_refused_without_being_quoted_back() {
+        let maps = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        for hostile in ["roms/game\u{0}.zip", "roms/ga\u{7}me.zip", "roms/a\nb.zip"] {
+            let translated = maps.translate(hostile);
+            let refusal = translated
+                .refusal()
+                .unwrap_or_else(|| panic!("{hostile:?} must be refused"));
+            assert_eq!(refusal.code(), "control_character");
+            let detail = refusal.detail();
+            assert!(
+                !detail.contains('\u{0}') && !detail.contains('\u{7}'),
+                "the refusal echoed a raw control character back: {detail:?}"
+            );
+        }
+    }
+
+    /// No layer decodes escaping, so percent-encoded traversal stays inert.
+    ///
+    /// `%2e%2e` is a perfectly ordinary filename. What must never happen is a
+    /// decode step turning it into `..` - so this asserts it translates as the
+    /// literal component it is, which is only safe *because* nothing decodes.
+    #[test]
+    fn percent_encoded_traversal_is_never_decoded() {
+        let maps = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        assert_eq!(
+            maps.translate("roms/%2e%2e/%2e%2e/etc/passwd")
+                .archivefs_path(),
+            Some(PathBuf::from("/mnt/games/roms/%2e%2e/%2e%2e/etc/passwd").as_path()),
+            "the components must stay literal, never become `..`"
+        );
+        assert_eq!(
+            maps.translate("roms/%2E%2E/passwd").archivefs_path(),
+            Some(PathBuf::from("/mnt/games/roms/%2E%2E/passwd").as_path())
+        );
+        // And a real `..` is still refused, so the pair proves the distinction.
+        assert!(maps.translate("roms/../passwd").refusal().is_some());
+    }
+
+    /// Every translation must land inside a configured source root, checked per
+    /// path and not only when the mapping was configured.
+    #[test]
+    fn a_translation_outside_the_trusted_roots_is_refused_per_path() {
+        let roots = vec![PathBuf::from("/mnt/games/roms")];
+        let maps = PathMappings::validate(
+            &[mapping("roms", "/mnt/games/roms")],
+            &roots,
+            ProviderPathKind::ProviderRelative,
+        )
+        .expect("a destination inside a source folder is fine");
+
+        let translated = maps.translate("roms/gb/game.gb");
+        let PathTranslation::Translated { trusted_root, .. } = &translated else {
+            panic!("expected a translation");
+        };
+        assert_eq!(
+            trusted_root.as_deref(),
+            Some(Path::new("/mnt/games/roms")),
+            "the preview needs to report which root it landed in"
+        );
+
+        // With no roots configured the check is not applicable, and says so
+        // rather than silently reporting a root it did not verify.
+        let unchecked = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        let PathTranslation::Translated { trusted_root, .. } = unchecked.translate("roms/gb/x.gb")
+        else {
+            panic!("expected a translation");
+        };
+        assert_eq!(trusted_root, None);
+    }
+
+    /// A preview counts the shapes it saw and says when they contradict the
+    /// setting - which is the whole diagnosis when nothing translates.
+    #[test]
+    fn a_preview_reports_a_path_shape_mismatch() {
+        let absolute = mappings(&[("/romm/library", "/mnt/games/roms")]);
+        let samples: Vec<String> = [
+            "roms/gb/game.gb",
+            "roms/snes/game.zip",
+            "roms/atari-st/game.stx",
+        ]
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+        let preview = MappingPreview::build(&absolute, &samples);
+        assert_eq!(preview.translated, 0);
+        assert_eq!(preview.refused, 3, "every path is the wrong shape");
+        assert_eq!(preview.observed_relative, 3);
+        assert_eq!(preview.observed_absolute, 0);
+        assert_eq!(
+            preview.suggested_kind(),
+            Some(ProviderPathKind::ProviderRelative),
+            "the preview should name the setting that would fix this"
+        );
+
+        // Configured correctly, the same samples translate and nothing is
+        // suggested.
+        let relative = relative_mappings(&[("roms", "/mnt/games/roms")]);
+        let preview = MappingPreview::build(&relative, &samples);
+        assert_eq!(preview.translated, 3);
+        assert_eq!(preview.refused, 0);
+        assert_eq!(preview.suggested_kind(), None);
     }
 
     /// Test 35: mapping is pure - it cannot touch the filesystem.

@@ -119,22 +119,7 @@ pub fn normalise_rom(
         report.unknown_platforms.push(slug.clone());
     }
 
-    // The provider path. RomM reports `fs_path` as the directory and `fs_name`
-    // as the file, and `full_path` when it has one - preferred, because it is
-    // the provider's own answer rather than something reassembled here.
-    let provider_path = string_field(value, "full_path").unwrap_or_else(|| {
-        match (
-            string_field(value, "fs_path"),
-            string_field(value, "fs_name"),
-        ) {
-            (Some(directory), Some(name)) => {
-                format!("{}/{name}", directory.trim_end_matches('/'))
-            }
-            (Some(directory), None) => directory,
-            (None, Some(name)) => name,
-            (None, None) => String::new(),
-        }
-    });
+    let provider_path = provider_path_of(value);
     let translation = mappings.translate(&provider_path);
     let archivefs_path = translation
         .archivefs_path()
@@ -277,6 +262,31 @@ pub fn normalise_rom(
         conflicts: Vec::new(),
         evidence,
     })
+}
+
+/// The path a RomM record describes, exactly as RomM gives it.
+///
+/// RomM reports `fs_path` as the directory and `fs_name` as the file, and
+/// `full_path` when it has one - preferred, because it is the provider's own
+/// answer rather than something reassembled here. In RomM 5.1.0 these are
+/// relative to the instance's library base, e.g. `roms/gb/game.gb`.
+///
+/// Public because a mapping preview has to sample the very same string an import
+/// would use. Two copies of this logic would let a preview show a translation the
+/// import then did differently, which is the one thing a preview must not do.
+pub fn provider_path_of(value: &Value) -> String {
+    if let Some(full) = string_field(value, "full_path") {
+        return full;
+    }
+    match (
+        string_field(value, "fs_path"),
+        string_field(value, "fs_name"),
+    ) {
+        (Some(directory), Some(name)) => format!("{}/{name}", directory.trim_end_matches('/')),
+        (Some(directory), None) => directory,
+        (None, Some(name)) => name,
+        (None, None) => String::new(),
+    }
 }
 
 /// Normalises one platform record into its canonical mapping, for a summary.

@@ -30,6 +30,12 @@ pub enum ProviderState {
     NotConfigured,
     /// Configured but switched off. Nothing connects.
     Disabled,
+    /// Configured and enabled, but no import has run yet.
+    ///
+    /// Distinct from both `Ready` and `Error`: there is no cache to serve, and
+    /// nothing has gone wrong either. Reporting this as an error told people to
+    /// go looking for a fault that did not exist.
+    NeverImported,
     /// An import is running.
     Importing,
     /// A cache is published and the instance was reachable at last check.
@@ -49,6 +55,7 @@ impl ProviderState {
         match self {
             Self::NotConfigured => "Not configured",
             Self::Disabled => "Disabled",
+            Self::NeverImported => "Enabled, nothing imported yet",
             Self::Importing => "Importing",
             Self::Ready => "Ready",
             Self::ReadyOffline => "Ready (offline)",
@@ -312,11 +319,10 @@ impl IdentitySourceApi {
             }
             Err(CacheRefusal::Missing) => {
                 let mut status = ProviderStatus::not_configured(IdentityProvider::Romm);
-                // Configured and enabled but never imported. Deliberately not
-                // `Ready`: there is no fake ready state before a first import.
-                status.state = ProviderState::Error {
-                    detail: "nothing has been imported yet".to_string(),
-                };
+                // Configured and enabled but never imported. Neither `Ready` -
+                // there is no fake ready state before a first import - nor an
+                // error, because nothing has failed.
+                status.state = ProviderState::NeverImported;
                 status
             }
             Err(refusal) => {

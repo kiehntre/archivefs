@@ -316,6 +316,64 @@ fn rom(id: u64, name: &str, file_name: &str, size: u64, hashes: [&str; 3]) -> se
     })
 }
 
+/// One ROM record in the shape RomM 5.1.0 actually returns: paths relative to
+/// the instance's own library base, with no leading separator.
+fn relative_rom(
+    id: u64,
+    name: &str,
+    relative_path: &str,
+    size: u64,
+    hashes: [&str; 3],
+) -> serde_json::Value {
+    let (directory, file_name) = relative_path
+        .rsplit_once('/')
+        .unwrap_or(("roms", relative_path));
+    serde_json::json!({
+        "id": id,
+        "platform_id": 7,
+        "platform_slug": "gb",
+        "platform_display_name": "Game Boy",
+        "name": name,
+        "fs_path": directory,
+        "fs_name": file_name,
+        "full_path": relative_path,
+        "fs_size_bytes": size,
+        "crc_hash": hashes[0],
+        "md5_hash": hashes[1],
+        "sha1_hash": hashes[2],
+        "regions": ["USA"],
+        "updated_at": "2026-07-30T12:00:00Z",
+        "missing_from_fs": false,
+        "has_multiple_files": false
+    })
+}
+
+/// A source configured for provider-relative paths, mapping `roms` at the whole
+/// fixture library, which is how the live server's shape has to be handled.
+fn ready_relative(tree: &Tree, stub: &StubServer) {
+    let token = tree.token_file(STUB_TOKEN);
+    let configured = tree.run(&[
+        "configure",
+        "--url",
+        &stub.url(),
+        "--token-file",
+        &token.display().to_string(),
+        "--path-kind",
+        "relative",
+        "--enable",
+    ]);
+    assert!(configured.succeeded(), "{:?}", configured.error);
+    let mapped = tree.run(&[
+        "mappings",
+        "add",
+        "--romm-root",
+        "roms",
+        "--archivefs-root",
+        &tree.library().display().to_string(),
+    ]);
+    assert!(mapped.succeeded(), "{:?}", mapped.error);
+}
+
 /// Placeholder hashes, well-formed but belonging to nothing.
 fn dud_hashes() -> [String; 3] {
     ["00000000".to_string(), "0".repeat(32), "0".repeat(40)]
@@ -2115,4 +2173,542 @@ fn a_cache_from_a_different_server_is_never_presented_as_current() {
         "a cache from another server was presented as current: {reported:#}"
     );
     second.stop();
+}
+
+// --- Provider-relative paths ---------------------------------------------
+
+#[test]
+fn a_relative_shape_import_matches_records_end_to_end() {
+    let tree = Tree::new("relative-import");
+    let contents = b"relative game data".to_vec();
+    let hashes = true_hashes(&contents);
+    let dud = dud_hashes();
+    let mut stub = StubServer::start(
+        serde_json::json!([
+            relative_rom(
+                1,
+                "Matched",
+                "roms/gb/matched.gb",
+                contents.len() as u64,
+                [&hashes[0], &hashes[1], &hashes[2]]
+            ),
+            relative_rom(
+                2,
+                "Missing",
+                "roms/gb/missing.gb",
+                4,
+                [&dud[0], &dud[1], &dud[2]]
+            ),
+        ]),
+        2,
+    );
+    ready_relative(&tree, &stub);
+    tree.file("gb/matched.gb", &contents);
+
+    let run = tree.run(&["import", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let result = run.json();
+    assert_eq!(result["published"], true);
+    assert_eq!(result["records"], 2);
+    assert_eq!(
+        result["unmatched"], 0,
+        "a relative mapping must translate every relative path: {result:#}"
+    );
+    assert_eq!(result["strong"], 1, "{result:#}");
+    assert_eq!(
+        result["stale"], 1,
+        "the absent file is stale, not unmatched"
+    );
+
+    // The record kept the exact relative string, and points at the local file.
+    let record = tree.run(&["record", "1", "--json"]).json();
+    assert_eq!(record["romm_path"], "roms/gb/matched.gb");
+    assert_eq!(
+        record["archivefs_path"],
+        tree.library().join("gb/matched.gb").display().to_string()
+    );
+    stub.stop();
+}
+
+/// Item 12 directly: a *sample* import with a valid relative mapping must yield
+/// matched records, and item 13: it must still publish nothing.
+#[test]
+fn a_relative_sample_import_matches_and_publishes_nothing() {
+    let tree = Tree::new("relative-sample");
+    let contents = b"sampled bytes".to_vec();
+    let hashes = true_hashes(&contents);
+    let mut stub = StubServer::start(
+        serde_json::json!([relative_rom(
+            1,
+            "Sampled",
+            "roms/gb/sampled.gb",
+            contents.len() as u64,
+            [&hashes[0], &hashes[1], &hashes[2]]
+        )]),
+        1,
+    );
+    ready_relative(&tree, &stub);
+    tree.file("gb/sampled.gb", &contents);
+
+    let run = tree.run(&["import", "--sample", "5", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let result = run.json();
+    assert_eq!(result["mode"], "sample");
+    assert_eq!(result["published"], false);
+    assert_eq!(result["records"], 1);
+    assert_eq!(result["unmatched"], 0, "{result:#}");
+    assert_eq!(result["strong"], 1, "{result:#}");
+    assert!(
+        !tree.cache_path().exists(),
+        "a sample must not publish, whatever the path shape"
+    );
+    stub.stop();
+}
+
+#[test]
+fn the_real_observed_romm_path_shapes_translate() {
+    let tree = Tree::new("relative-real-shapes");
+    let dud = dud_hashes();
+    // Exactly the paths the live RomM 5.1.0 instance reported.
+    let observed = [
+        "roms/sharp-x68000/_ReadMe_.txt",
+        "roms/acorn-archimedes/Coconizer (Europe) (v1.3).zip",
+        "roms/amiga/Allo Allo (v1.0).hdf",
+        "roms/atari-st/'Nam 1965-1975 (Europe).stx",
+        "roms/gb/game.gb",
+        "roms/snes/game.zip",
+        "roms/psx/game.cue",
+    ];
+    let roms: Vec<serde_json::Value> = observed
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            relative_rom(
+                index as u64 + 1,
+                &format!("Game {index}"),
+                path,
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start(serde_json::json!(roms), observed.len() as u64);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["import", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    assert_eq!(
+        run.json()["unmatched"],
+        0,
+        "every real observed path shape should translate: {:#}",
+        run.json()
+    );
+
+    let preview = tree
+        .run(&["mappings", "preview", "--limit", "20", "--json"])
+        .json();
+    assert_eq!(preview["translated"], observed.len());
+    assert_eq!(preview["refused"], 0);
+    assert_eq!(preview["observed_relative"], observed.len());
+    assert_eq!(preview["observed_absolute"], 0);
+    assert!(preview["suggested_path_kind"].is_null());
+    stub.stop();
+}
+
+#[test]
+fn the_preview_reports_every_stage_of_one_translation() {
+    let tree = Tree::new("preview-detail");
+    let contents = b"present".to_vec();
+    let hashes = true_hashes(&contents);
+    let dud = dud_hashes();
+    let mut stub = StubServer::start(
+        serde_json::json!([
+            relative_rom(
+                1,
+                "Present",
+                "roms/gb/present.gb",
+                contents.len() as u64,
+                [&hashes[0], &hashes[1], &hashes[2]]
+            ),
+            relative_rom(
+                2,
+                "Absent",
+                "roms/gb/absent.gb",
+                4,
+                [&dud[0], &dud[1], &dud[2]]
+            ),
+            // A path no mapping covers.
+            relative_rom(
+                3,
+                "Elsewhere",
+                "backups/gb/other.gb",
+                4,
+                [&dud[0], &dud[1], &dud[2]]
+            ),
+        ]),
+        3,
+    );
+    ready_relative(&tree, &stub);
+    tree.file("gb/present.gb", &contents);
+    assert!(tree.run(&["import"]).succeeded());
+
+    let run = tree.run(&["mappings", "preview", "--limit", "10", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let report = run.json();
+    assert_eq!(report["configured_path_kind"], "provider_relative");
+    assert_eq!(report["existing_files"], 1);
+    assert_eq!(report["unmatched"], 1);
+
+    let examples = report["examples"].as_array().expect("examples");
+    let present = examples
+        .iter()
+        .find(|example| example["romm_path"] == "roms/gb/present.gb")
+        .expect("the present record should be previewed");
+    // Item 8's list, each field asserted.
+    assert_eq!(present["romm_path"], "roms/gb/present.gb");
+    assert_eq!(present["path_kind"], "provider_relative");
+    assert_eq!(present["matched_prefix"], "roms");
+    assert_eq!(
+        present["archivefs_path"],
+        tree.library().join("gb/present.gb").display().to_string()
+    );
+    assert_eq!(present["file_exists"], true);
+    assert_eq!(
+        present["trusted_root"],
+        tree.library().display().to_string(),
+        "the source folder the result landed in should be named"
+    );
+    assert_eq!(present["inside_trusted_root"], true);
+    assert_eq!(present["outcome"], "translated");
+    assert!(present["refusal"].is_null());
+
+    let unmatched = examples
+        .iter()
+        .find(|example| example["romm_path"] == "backups/gb/other.gb")
+        .expect("the uncovered record should be previewed");
+    assert_eq!(unmatched["outcome"], "unmatched");
+    assert!(unmatched["archivefs_path"].is_null());
+    stub.stop();
+}
+
+#[test]
+fn a_shape_mismatch_is_diagnosed_by_preview_and_by_test() {
+    let tree = Tree::new("shape-mismatch");
+    let dud = dud_hashes();
+    let mut stub = StubServer::start(
+        serde_json::json!([relative_rom(
+            1,
+            "Relative",
+            "roms/gb/game.gb",
+            4,
+            [&dud[0], &dud[1], &dud[2]]
+        )]),
+        1,
+    );
+    // Configured absolute - the wrong shape for this server - which is the exact
+    // state the live smoke run was in.
+    ready(&tree, &stub);
+
+    let test = tree.run(&["test", "--json"]);
+    assert!(test.succeeded(), "{:?}", test.error);
+    let report = test.json();
+    assert_eq!(report["configured_path_kind"], "absolute_provider_path");
+    assert_eq!(report["observed_path_kind"], "provider_relative");
+    assert_eq!(report["path_kind_mismatch"], true);
+    assert_eq!(report["sample_provider_path"], "roms/gb/game.gb");
+
+    let human = tree.run(&["test"]).stdout;
+    assert!(
+        human.contains("--path-kind relative"),
+        "the test should name the fix: {human}"
+    );
+
+    // And the preview says the same thing rather than just refusing silently.
+    assert!(tree.run(&["import"]).succeeded());
+    let preview = tree.run(&["mappings", "preview", "--json"]).json();
+    assert_eq!(preview["refused"], 1);
+    assert_eq!(preview["translated"], 0);
+    assert_eq!(preview["suggested_path_kind"], "provider_relative");
+    // The path is relative where absolute was declared, so that is the refusal.
+    assert_eq!(
+        preview["examples"][0]["refusal_code"], "unexpectedly_relative",
+        "{preview:#}"
+    );
+    stub.stop();
+}
+
+#[test]
+fn an_unknown_path_kind_is_refused_with_both_spellings_offered() {
+    let tree = Tree::new("bad-path-kind");
+    let token = tree.token_file(STUB_TOKEN);
+    let message = tree
+        .run(&[
+            "configure",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token-file",
+            &token.display().to_string(),
+            "--path-kind",
+            "sideways",
+        ])
+        .error_text()
+        .to_string();
+    assert!(message.contains("sideways"), "{message}");
+    assert!(message.contains("relative"), "{message}");
+    assert!(message.contains("absolute"), "{message}");
+}
+
+#[test]
+fn changing_the_path_shape_is_refused_while_it_would_strand_a_mapping() {
+    let tree = Tree::new("strand-guard");
+    let mut stub = StubServer::start(serde_json::json!([]), 0);
+    ready(&tree, &stub); // absolute, with /romm/library/gb mapped
+
+    let message = tree
+        .run(&["configure", "--path-kind", "relative"])
+        .error_text()
+        .to_string();
+    assert!(message.contains("cannot be used as relative"), "{message}");
+    assert!(
+        message.contains("mappings remove"),
+        "the way forward should be stated: {message}"
+    );
+    // The setting was not changed behind the refusal.
+    assert_eq!(
+        tree.run(&["status", "--json"]).json()["path_kind"],
+        "absolute_provider_path"
+    );
+
+    // Remove the stale mapping, and the switch is then allowed.
+    assert!(
+        tree.run(&["mappings", "remove", "--romm-root", "/romm/library/gb"])
+            .succeeded()
+    );
+    let switched = tree.run(&["configure", "--path-kind", "relative"]);
+    assert!(switched.succeeded(), "{:?}", switched.error);
+    assert_eq!(
+        tree.run(&["status", "--json"]).json()["path_kind"],
+        "provider_relative"
+    );
+    stub.stop();
+}
+
+/// A configuration hand-edited into a mismatched state must stay inspectable and
+/// repairable: listing cannot fail, and the stranded mapping can be removed.
+#[test]
+fn a_stranded_mapping_is_listed_and_can_still_be_removed() {
+    let tree = Tree::new("stranded");
+    let token = tree.token_file(STUB_TOKEN);
+    assert!(
+        tree.run(&[
+            "configure",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token-file",
+            &token.display().to_string(),
+        ])
+        .succeeded()
+    );
+    let destination = tree.library().join("gb");
+    std::fs::create_dir_all(&destination).expect("fixture");
+    assert!(
+        tree.run(&[
+            "mappings",
+            "add",
+            "--romm-root",
+            "/romm/library/gb",
+            "--archivefs-root",
+            &destination.display().to_string(),
+        ])
+        .succeeded()
+    );
+    // Flip the declared shape directly in the stored configuration, as a hand
+    // edit would.
+    let text = std::fs::read_to_string(tree.config_path()).expect("config");
+    let flipped = text.replace(
+        "\"provider_path_kind\": \"absolute_provider_path\"",
+        "\"provider_path_kind\": \"provider_relative\"",
+    );
+    assert_ne!(text, flipped, "the field should be present to flip");
+    std::fs::write(tree.config_path(), flipped).expect("fixture");
+
+    let listed = tree.run(&["mappings", "list", "--json"]);
+    assert!(
+        listed.succeeded(),
+        "a listing must never fail, or a bad state has no way out: {:?}",
+        listed.error
+    );
+    let document = listed.json();
+    let entries = document["mappings"].as_array().expect("mappings");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0]["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("absolute")),
+        "the problem should be explained: {entries:#?}"
+    );
+    let human = tree.run(&["mappings", "list"]).stdout;
+    assert!(human.contains("cannot be used as configured"), "{human}");
+
+    assert!(
+        tree.run(&["mappings", "remove", "--romm-root", "/romm/library/gb"])
+            .succeeded(),
+        "a stranded mapping must remain removable"
+    );
+    assert!(
+        tree.run(&["mappings", "list", "--json"]).json()["mappings"]
+            .as_array()
+            .expect("mappings")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_relative_mapping_destination_must_still_be_inside_a_source_folder() {
+    let tree = Tree::new("relative-outside");
+    let token = tree.token_file(STUB_TOKEN);
+    assert!(
+        tree.run(&[
+            "configure",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token-file",
+            &token.display().to_string(),
+            "--path-kind",
+            "relative",
+        ])
+        .succeeded()
+    );
+    let message = tree
+        .run(&[
+            "mappings",
+            "add",
+            "--romm-root",
+            "roms",
+            "--archivefs-root",
+            &tree.elsewhere().display().to_string(),
+        ])
+        .error_text()
+        .to_string();
+    assert!(
+        message.contains("not inside any configured source folder"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_relative_prefix_cannot_be_added_to_an_absolute_source() {
+    let tree = Tree::new("relative-prefix-absolute-source");
+    let mut stub = StubServer::start(serde_json::json!([]), 0);
+    let token = tree.token_file(STUB_TOKEN);
+    assert!(
+        tree.run(&[
+            "configure",
+            "--url",
+            &stub.url(),
+            "--token-file",
+            &token.display().to_string(),
+        ])
+        .succeeded()
+    );
+    let message = tree
+        .run(&[
+            "mappings",
+            "add",
+            "--romm-root",
+            "roms",
+            "--archivefs-root",
+            &tree.library().display().to_string(),
+        ])
+        .error_text()
+        .to_string();
+    assert!(message.contains("--path-kind relative"), "{message}");
+    stub.stop();
+}
+
+#[test]
+fn hostile_relative_paths_from_a_server_are_refused_during_import() {
+    let tree = Tree::new("hostile-import");
+    let dud = dud_hashes();
+    let hostile = [
+        "../etc/passwd",
+        "roms/../../etc/passwd",
+        "./roms/game.zip",
+        "roms//game.zip",
+        r"C:\roms\game.zip",
+        r"\\server\share\game.zip",
+        r"roms\..\game.zip",
+        "roms/%2e%2e/%2e%2e/etc/passwd",
+    ];
+    let roms: Vec<serde_json::Value> = hostile
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            relative_rom(
+                index as u64 + 1,
+                &format!("Hostile {index}"),
+                path,
+                4,
+                [&dud[0], &dud[1], &dud[2]],
+            )
+        })
+        .collect();
+    let mut stub = StubServer::start(serde_json::json!(roms), hostile.len() as u64);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["import", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    // Every record is still imported and visible - a refused path is reported,
+    // not hidden - but none of them acquired a local path.
+    assert_eq!(run.json()["records"], hostile.len());
+
+    let records = tree.run(&["records", "--limit", "50", "--json"]).json();
+    for record in records["records"].as_array().expect("records") {
+        let romm_path = record["romm_path"].as_str().unwrap_or_default();
+        // The one exception is the percent-encoded path, which is a legitimate
+        // set of literal components and must translate as such - inside the
+        // library, never above it.
+        if romm_path.contains("%2e") {
+            let local = record["archivefs_path"]
+                .as_str()
+                .expect("a literal path should translate");
+            assert!(
+                local.starts_with(&tree.library().display().to_string()),
+                "{local} escaped the library"
+            );
+            assert!(!local.contains(".."), "{local} contains traversal");
+            continue;
+        }
+        assert!(
+            record["archivefs_path"].is_null(),
+            "{romm_path} must not have produced a local path: {record:#}"
+        );
+    }
+    stub.stop();
+}
+
+#[test]
+fn a_configured_source_with_no_import_yet_is_not_reported_as_an_error() {
+    let tree = Tree::new("never-imported");
+    let mut stub = StubServer::start(serde_json::json!([]), 0);
+    ready_relative(&tree, &stub);
+
+    let run = tree.run(&["status", "--json"]);
+    assert!(run.succeeded(), "{:?}", run.error);
+    let reported = run.json();
+    assert_eq!(
+        reported["state"]["state"], "never_imported",
+        "being set up and not yet imported is not a failure: {reported:#}"
+    );
+    assert!(
+        reported["state"].get("detail").is_none(),
+        "there is no error detail to give: {reported:#}"
+    );
+    let human = tree.run(&["status"]).stdout;
+    assert!(
+        human.contains("nothing imported yet"),
+        "the state should read as a stage, not a fault: {human}"
+    );
+    assert!(!human.contains("State:            Error"), "{human}");
+    stub.stop();
 }
