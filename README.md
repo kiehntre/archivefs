@@ -16,20 +16,13 @@ replacement. See [Current limitations](#current-limitations) and
 explicit list of what it deliberately does not do.
 
 **Release status:** `v0.5.0-alpha` is the latest tagged release. The current
-workspace is the untagged `v0.7.0-alpha` release candidate. It adds a
-default Gamer View (a single-screen, platform-first game list and
-selected-game action panel) alongside the existing Advanced View, direct
-game-image discovery, shared platform-first navigation and source platform
-assignment, a visual platform-artwork picker, and explicit Dolphin Gecko and
-Xenia Canary patch workflows. RetroArch, Dolphin, and Xenia use confirmed
-transaction paths with backup/rollback/Undo; PCSX2 now also has a
-transaction-backed install/Undo path, but no approved downloadable
-ordinary-cheat catalogue is bundled for it yet. A read-only
-`cheat-provider-coverage` audit command reports Dolphin/RetroArch catalogue
-coverage for a bounded, exact game selection. See
-[`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the full
-release notes. Manual QA and the release gate must pass before a tag is
-created.
+workspace is the untagged `v0.7.0-rc.1` candidate for manual testing. It adds
+the canonical 74-platform registry, evidence-based confidence, bounded Atari
+ST/Wii/PS2/GameCube identity, safer Dolphin profile resolution, PS2/GameCube/Wii
+GameHacking workflows, expanded Doctor diagnostics, and the optional browse-only
+BSFree Archive source. See
+[`docs/releases/v0.7.0-rc.1.md`](docs/releases/v0.7.0-rc.1.md) for the full
+release notes. No RC tag or GitHub Release exists yet.
 
 ## Principles
 
@@ -62,7 +55,15 @@ user-facing version at
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
 - Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. Catalogue reports and previews use an explicit read-only open; `database-check` additionally distinguishes hot-header evidence, zeroed/truncated non-hot journals, malformed headers, and recovery-required read-only failures without creating, migrating, repairing, or checkpointing anything.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
-- Detects platform from filenames and folder-name aliases, with manual overrides (`library-set-platform`) and persistent custom aliases (`platform-alias-*`) that outrank automatic detection.
+- Detects platforms through one canonical 74-platform/311-alias registry and
+  reports `Confirmed`, `Probable`, `Ambiguous`, or `Unknown` evidence. Manual
+  assignments (`library-set-platform`) and persistent custom aliases
+  (`platform-alias-*`) outrank automatic detection. Structurally valid evidence
+  is separately marked conclusive or non-conclusive so, for example, a valid
+  FAT12 `.st` image is not treated as uniquely Atari ST without corroboration.
+- Validates Atari ST `.st` geometry and `.stx`/Pasti containers through bounded,
+  cancellable, read-only inspection. Generic `.dsk`, `.bin`, and `.iso` remain
+  ambiguous unless their own platform evidence settles them.
 - Reports filename-based duplicate candidates (`duplicates`) - a read-only report, never an automatic cleanup.
 - Builds **managed Library Views**: named, symlink-based organized views of your catalogue (for example, grouped by platform) in a separate directory tree, without moving, copying, or extracting your archives. See [`docs/library-views.md`](docs/library-views.md).
 - Provides a **read-only PCSX2 patch-preview** (`pcsx2-patch-preview`): fetches official PCSX2 patch metadata and shows native/Flatpak installation *candidates* as a non-executable advisory plan. It does not download, verify, install, or enable any patch. PCSX2 is the only implemented `EmulatorAdapter` trait implementation - see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md).
@@ -151,19 +152,22 @@ user-facing version at
   imported; see
   [`docs/LIBRARY_SCAN_USABILITY.md`](docs/LIBRARY_SCAN_USABILITY.md).
 - Builds a JSON index and watches source folders to keep it fresh, without ever auto-mounting or auto-unmounting.
-- Includes config validation and doctor-style diagnostics.
+- Includes config validation and Doctor Stages 1A/1B/1C-A: read-only setup,
+  environment, storage, emulator-profile, and managed-cheat findings; narrowly
+  bound confirmed repairs where safe; and grouped historical mount results.
+- Offers the optional **BSFree Archive** under Cheats → Sources. Download or
+  local import is explicit; the historical third-party SQLite database is
+  validated, stored immutably, and queried read-only/query-only with bounded
+  pagination. BSFree Stage 1 is browse-only and has no Install action.
 - Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
 - Provides stable, documented JSON output for several commands - see [`docs/json-api.md`](docs/json-api.md).
 
 ## Current limitations
 
-- No automatic patch or cheat installation anywhere - `pcsx2-patch-preview`
-  and `retroarch-patch-preview` are preview only; guided cheat setup and the
-  GUI's RetroArch apply flow both require explicit confirmation and never
-  install or enable anything on their own; trusted catalogue retrieval
-  remains a separate step from installation. PCSX2 remains preview-only;
-  Dolphin's explicit Gecko flow can create or update one exact GameSettings
-  INI and roll it back.
+- No automatic patch or cheat installation. Supported RetroArch, Dolphin,
+  PCSX2, GameCube, Wii, and Xenia flows require an exact preview and explicit
+  confirmation, then use the verified transaction/History/Undo path. BSFree is
+  browse-only, and unsupported or ambiguous formats remain non-installable.
 - No broad multi-emulator support yet - PCSX2, RetroArch, Dolphin, and Xenia
   are the only emulators with patch/cheat workflows today, and ArchiveFS never
   launches an emulator.
@@ -175,6 +179,8 @@ user-facing version at
 - This is alpha software: workflows may be incomplete, and defects should
   be expected. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually
   shipped.
+- ZIP-contained identity, CHD, RVZ, and generic BIN identity remain incomplete
+  for some platforms/layouts. RomM integration is not included.
 
 ## Install from a Release
 
@@ -266,6 +272,16 @@ Manual installation remains available if you would rather control each step your
 
 Archive mounts created by ArchiveFS are always read-only; it never modifies files in your configured `source_folders`.
 
+### Upgrade from v0.6 development builds
+
+Stop ArchiveFS and back up `~/.local/share/archivefs/library.sqlite3` and
+managed cheat/history state. Installing the new binaries preserves existing
+configuration. The v0.7 candidate migrates the catalogue forward through
+schema 6 (migrations `0001`–`0006`); an older binary cannot open that database,
+so rollback requires restoring the backup rather than editing SQLite metadata.
+After upgrading, run `archivefs-cli doctor --findings` and rescan sources whose
+stored platform findings predate the canonical registry.
+
 There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pacman, Homebrew, or similar package) - the release tarball above and building from source below are the two supported ways to install it.
 
 ## Supported/tested environments and formats
@@ -276,9 +292,9 @@ There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pa
 - **Archive formats:** `.zip`, `.7z`, and `.rar` (with split-RAR
   continuation-part skipping).
 - **Direct game images:** `.iso`, `.gcm`, `.gcz`, `.rvz`, `.wbfs`, and
-  `.ciso` for GameCube/Wii, plus the existing platform-specific loose-image
-  formats. Direct images are library items; archive mounting remains limited
-  to the archive formats above.
+  `.ciso` for GameCube/Wii, Atari ST `.st`/`.stx`, plus existing
+  platform-specific loose-image formats. Direct images are library items;
+  archive mounting remains limited to the archive formats above.
 - **Mount backend:** `ratarmount` only, invoked as an external tool - not
   bundled, must be installed and on `PATH` separately.
 - **Desktop GUI:** requires a running X11 or Wayland session; there is no
@@ -404,6 +420,7 @@ archivefs-cli library-list
 archivefs-cli library-find "007 Legends"
 archivefs-cli library-set-platform "Luigi's Mansion" GameCube
 archivefs-cli platform-alias-add gc GameCube
+archivefs-cli platform-detect /data/roms/atarist/game.st
 archivefs-cli sources
 archivefs-cli source add /data/more-archives
 archivefs-cli source scan-all
@@ -445,6 +462,17 @@ archivefs-cli retroarch-cheat-history
 archivefs-cli retroarch-cheat-history --json
 archivefs-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
 ```
+
+Optional BSFree browse-only source:
+
+```sh
+archivefs-cli cheats source bsfree status --json
+archivefs-cli cheats source bsfree import-local /path/to/bsfree.db
+archivefs-cli cheats source bsfree search --platform NES --title MARIO --json
+```
+
+The import/download commands are explicit. Status, search, game browsing, and
+ordinary GUI browsing do not perform network access or write emulator files.
 
 Use verbose or debug logging when you need more detail:
 
@@ -530,6 +558,7 @@ Platforms:
 - [Architecture overview](ARCHITECTURE.md) / [full architecture reference](docs/architecture.md)
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
+- [v0.7.0-rc.1 release notes](docs/releases/v0.7.0-rc.1.md)
 - [Domain model](docs/domain-model.md)
 - [Persistent database](docs/database.md) / [database design](docs/DATABASE_DESIGN.md) / [ADR 0001](docs/adr/0001-persistent-library-database.md)
 - [Managed library views](docs/library-views.md)

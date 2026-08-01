@@ -11,7 +11,97 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## Unreleased
+## v0.7.0-rc.1 (unreleased)
+
+This is the reviewed release-candidate scope. It has not been tagged or
+published. See [`docs/releases/v0.7.0-rc.1.md`](docs/releases/v0.7.0-rc.1.md)
+for installation, upgrade, workflow, and manual-test guidance.
+
+### Added
+
+- A canonical registry of 74 platforms and 311 explicit aliases, with
+  `Confirmed`, `Probable`, `Ambiguous`, and `Unknown` evidence states and
+  manual assignments taking precedence over automatic detection.
+- Bounded Atari ST disk recognition: FAT12/geometry validation for raw `.st`
+  images and Pasti container validation for `.stx` images. Structurally valid
+  `.st` evidence remains non-conclusive unless corroborated; valid `.stx`
+  evidence is Atari ST-specific.
+- Verified Wii WBFS identity, including the embedded six-character Dolphin
+  Game ID, disc number, revision evidence, region, and persisted provenance.
+- GameHacking.org providers for PS2, GameCube, and Wii, including offline
+  browser-assisted Wii page import and partial-cache matching. The validated
+  SMNE01 fixture/page produces 121 parsed entries: 98 supported and 23 blocked
+  or unknown.
+- Optional BSFree Archive source lifecycle: explicit download or local import,
+  strict schema validation, immutable/query-only SQLite access, 44 explicit
+  system mappings through the canonical registry, 11 device classifications,
+  bounded search/pagination, GUI browsing, and typed CLI JSON.
+- Doctor Stages 1A, 1B, and 1C-A: read-only findings, narrowly bound safe
+  repairs, environment checks, storage/profile diagnostics, managed-cheat
+  diagnostics, and grouped historical mount results.
+
+### Improved
+
+- Gamer View now has a fixed-height platform shelf with Previous/Next controls,
+  wheel, trackpad, drag, keyboard, and TV/Moonlight-friendly navigation.
+- Dolphin profile resolution distinguishes running and manually selected
+  profiles, recognises AppImage `-u`/`--user` roots, and uses the Flatpak
+  data-tree `GameSettings` location.
+- Cheat installation for supported PS2, GameCube, and Wii formats uses explicit
+  preview, atomic application, verification, History, managed-only removal,
+  and Undo while preserving unrelated emulator configuration.
+- Platform detection reads signatures through symlinks only when both link and
+  resolved target satisfy the configured trusted-root policy.
+- Large repeated Doctor histories are grouped without discarding their full
+  structured CLI/JSON findings.
+
+### Fixed
+
+- `RESOURCE.GEN` in ScummVM game folders no longer becomes Mega Drive merely
+  because `.gen` is shared.
+- Loose PS2 disc images and symlinked in-root ISOs retain verified identity
+  rather than relying on filenames.
+- Wii cached matching is one-shot and generation-keyed, so repeated GUI frames
+  cannot respawn an endless high-CPU lookup.
+- Wii browser-assisted imports can bootstrap a trusted single-game partial
+  cache without requiring a complete online catalogue crawl.
+- Dolphin Flatpak targets resolve under
+  `~/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu` rather than the
+  unrelated configuration tree.
+
+### Safety
+
+- Source archives, ROMs, and disc images remain read-only. Structural disk
+  inspection is cancellable and limited to 64 KiB total, 1 KiB per read, a
+  32 KiB maximum offset, a 4 MiB raw-floppy cap, and a 32 MiB STX cap.
+- `DetectionEvidence.conclusive` explicitly separates valid structure from
+  evidence that uniquely settles a platform; valid FAT12 alone never becomes
+  an automatic exact Atari ST claim.
+- GameHacking Cloudflare/challenge responses are typed, never cached as valid
+  content, and fall back to exact cached data without retry loops.
+- BSFree performs no automatic network access, opens its database read-only and
+  query-only, never migrates it, and exposes no installation action in Stage 1.
+- Schema remains version 6 with migrations exactly `0001` through `0006`.
+
+### Known limitations
+
+- BSFree is browse-only. It neither converts nor installs codes, and its
+  platform/title matching may return several ambiguous revisions.
+- Malformed, cracked, padded, or loader-modified Atari ST `.st` images whose
+  FAT12 geometry cannot be verified remain Probable from contextual/extension
+  evidence rather than being promoted.
+- ZIP-contained identity, CHD, RVZ, and generic BIN identity remain incomplete
+  for some platforms and layouts.
+- RomM integration is not included.
+- Some emulator-specific cheat formats and destinations remain unsupported;
+  ambiguous, unknown, placeholder-bearing, revision-mismatched, or unsupported
+  master-code entries remain non-installable.
+- Stored historical platform findings may retain their old classification
+  until the relevant source is rescanned.
+- Symlink signature scanning is available only through trusted-root-aware
+  inspection paths; arbitrary or escaping symlinks remain refused.
+
+## Historical pre-RC integration notes
 
 ### Gamer View
 
@@ -68,7 +158,7 @@ guessing at intent, dates, or scope.
 - Added `docs/GAMEHACKING_PROVIDER.md` covering provider scope, identity gates,
   caching, rate limiting, provenance, native export, and future adapters.
 
-## v0.7.0-alpha (unreleased)
+## v0.7.0-alpha (historical candidate notes; not tagged)
 
 See [`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the
 full narrative release notes, installation instructions, and manual QA

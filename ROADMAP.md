@@ -186,7 +186,7 @@ These are implemented, tested, and in current use today:
 
 ## Current development
 
-The current workspace is the untagged `v0.7.0-alpha` integration candidate.
+The current workspace is the untagged `v0.7.0-rc.1` release candidate.
 Direct-image discovery, canonical platform aliases, source platform assignment,
 platform-first navigation, Dolphin installation, and Xenia Canary patch support
 are integrated. The remaining release work is validation and manual QA; this
@@ -213,7 +213,7 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **`v0.7.0-alpha` manual QA and release gate** - validate real source
+1. **`v0.7.0-rc.1` manual QA and release gate** - validate real source
    discovery, source assignment, platform navigation, Dolphin, Xenia, and the
    extracted release artifact before creating any tag.
 2. **PCSX2 provider and safe PNACH merge** - remain read-only until

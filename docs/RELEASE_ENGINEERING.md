@@ -78,7 +78,7 @@ Keep the archive and its `.sha256` file together, then run:
 
 ```sh
 scripts/verify-release-artifact.sh \
-  target/release-artifacts/archivefs-v0.7.0-alpha-x86_64-linux.tar.gz
+  target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz
 ```
 
 The verifier checks the checksum filename and record, exact root layout,
@@ -91,7 +91,7 @@ Its negative regression suite uses generated fixtures and must also pass:
 
 ```sh
 scripts/test-release-artifact-verifier.sh \
-  target/release-artifacts/archivefs-v0.7.0-alpha-x86_64-linux.tar.gz
+  target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz
 ```
 
 This proves rejection of a bad checksum, unexpected member, traversal path,
@@ -135,8 +135,8 @@ For a built artifact, also check both binaries and filenames:
 ```sh
 scripts/check-version-consistency.sh \
   --binary-dir target/release \
-  --artifact target/release-artifacts/archivefs-v0.7.0-alpha-x86_64-linux.tar.gz \
-  --checksum target/release-artifacts/archivefs-v0.7.0-alpha-x86_64-linux.tar.gz.sha256
+  --artifact target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz \
+  --checksum target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz.sha256
 ```
 
 The workspace packages, CLI output, GUI output, archive, checksum, README
@@ -225,14 +225,15 @@ release uses `vMAJOR.MINOR.PATCH` with no suffix. In both cases:
 4. create one annotated tag on that exact commit; and
 5. push only that tag, which starts the tag-only release workflow.
 
-For v0.7.0-alpha, the commands would be:
+For v0.7.0-rc.1, after every gate and explicit release authorization, the
+commands would be:
 
 ```sh
 git fetch origin
 git status --short
 git rev-parse HEAD
-git tag -a v0.7.0-alpha <VERIFIED_COMMIT_SHA> -m "ArchiveFS v0.7.0-alpha"
-git push origin v0.7.0-alpha
+git tag -a v0.7.0-rc.1 <VERIFIED_COMMIT_SHA> -m "ArchiveFS v0.7.0-rc.1"
+git push origin v0.7.0-rc.1
 ```
 
 These commands are documentation, not authorization to run them. Never move or
@@ -248,7 +249,7 @@ and checksum.
 
 Application rollback means stopping ArchiveFS and restoring the previous
 binary bundle. **In-place database downgrade is not supported.** ArchiveFS
-v0.7 uses schema 5; older binaries reject a schema-5 database. To run an older
+v0.7 uses schema 6; older binaries reject a schema-6 database. To run an older
 binary, restore the pre-upgrade database copy to a separate compatible path.
 Keep the v0.7 database and managed state untouched for later recovery. Never
 edit SQLite schema/version fields manually, and do not assume an older binary
