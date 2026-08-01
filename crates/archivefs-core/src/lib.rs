@@ -64,6 +64,11 @@ pub use library_views::{
 /// The single authoritative platform registry and the evidence-based
 /// detector built on it. Every platform alias, extension and signature this
 /// build knows lives there - nothing keeps a second copy.
+/// The one bounded, read-only file-open policy in this build, shared by
+/// platform signature detection and disc identity so the two cannot drift
+/// apart on symlink handling.
+pub mod safe_read;
+
 pub mod platform;
 
 pub mod patch_manager;
@@ -3146,7 +3151,12 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
 
 /// Whether `path` carries a real Mega Drive cartridge header, using the
 /// registry's own signature rule rather than a second copy of the offset.
-/// Bounded: one short read at a known offset, and never through a symlink.
+///
+/// Bounded: one short read at a known offset. No trusted roots are supplied, so
+/// a symlink is refused here exactly as it always was - `archive_kind_in_root`
+/// has no access to the configuration, and inventing a trusted set from a
+/// single `source_root` argument would be guessing at what the user configured.
+/// Deliberately left fail-closed; see `crate::safe_read`.
 fn has_mega_drive_cartridge_header(path: &Path) -> bool {
     let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
     platform::detect_platform_report(&request)

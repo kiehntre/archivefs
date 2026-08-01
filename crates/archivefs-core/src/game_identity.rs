@@ -4,9 +4,11 @@
 //! are `Verified`. Archive and member names can only produce `Candidate` values.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+
+use crate::safe_read::TrustedRoots;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -388,7 +390,19 @@ impl GameIdentityReport {
 }
 
 pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameIdentityReport {
-    inspect_game_identity_with_platform_trust(path, platform_hint, false)
+    inspect_game_identity_with_platform_trust(path, platform_hint, false, &TrustedRoots::none())
+}
+
+/// Like [`inspect_game_identity`], but permitted to follow a symlink whose link
+/// and canonical target both lie inside one of `trusted`'s configured source
+/// roots. Without this, a symlinked library can never be identified - see
+/// [`crate::safe_read`].
+pub fn inspect_game_identity_in_roots(
+    path: &Path,
+    platform_hint: Option<&str>,
+    trusted: &TrustedRoots,
+) -> GameIdentityReport {
+    inspect_game_identity_with_platform_trust(path, platform_hint, false, trusted)
 }
 
 /// Inspect identity using platform evidence already validated by the library
@@ -398,13 +412,25 @@ pub fn inspect_catalogued_game_identity(
     path: &Path,
     platform_hint: Option<&str>,
 ) -> GameIdentityReport {
-    inspect_game_identity_with_platform_trust(path, platform_hint, true)
+    inspect_game_identity_with_platform_trust(path, platform_hint, true, &TrustedRoots::none())
+}
+
+/// Like [`inspect_catalogued_game_identity`], but permitted to follow a symlink
+/// contained by `trusted` - see [`crate::safe_read`]. `trusted` governs only
+/// *reading*: it is never used as a write destination.
+pub fn inspect_catalogued_game_identity_in_roots(
+    path: &Path,
+    platform_hint: Option<&str>,
+    trusted: &TrustedRoots,
+) -> GameIdentityReport {
+    inspect_game_identity_with_platform_trust(path, platform_hint, true, trusted)
 }
 
 fn inspect_game_identity_with_platform_trust(
     path: &Path,
     platform_hint: Option<&str>,
     trusted_platform: bool,
+    trusted: &TrustedRoots,
 ) -> GameIdentityReport {
     let platform = IdentityPlatform::from_catalogue(platform_hint);
     let mut report = GameIdentityReport {
@@ -446,7 +472,7 @@ fn inspect_game_identity_with_platform_trust(
         platform,
         IdentityPlatform::MegaDrive | IdentityPlatform::Snes
     ) {
-        inspect_loose_rom(&mut report, trusted_platform);
+        inspect_loose_rom(&mut report, trusted_platform, trusted);
         return report;
     }
 
@@ -469,18 +495,20 @@ fn inspect_game_identity_with_platform_trust(
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
-        "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => inspect_direct_iso(&mut report),
-        "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report),
-        "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report),
-        "zip" => inspect_zip_iso(&mut report),
+        "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => {
+            inspect_direct_iso(&mut report, trusted)
+        }
+        "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report, trusted),
+        "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report, trusted),
+        "zip" => inspect_zip_iso(&mut report, trusted),
         "rvz" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
-            inspect_rvz(&mut report);
+            inspect_rvz(&mut report, trusted);
         }
         "ciso" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
-            inspect_ciso(&mut report);
+            inspect_ciso(&mut report, trusted);
         }
         "wbfs" if platform == IdentityPlatform::Wii => {
-            inspect_wbfs(&mut report);
+            inspect_wbfs(&mut report, trusted);
         }
         "chd" | "cso" | "rvz" | "wbfs" | "ciso" | "gcz" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
@@ -512,7 +540,11 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
     }
 }
 
-fn inspect_loose_rom(report: &mut GameIdentityReport, trusted_platform: bool) {
+fn inspect_loose_rom(
+    report: &mut GameIdentityReport,
+    trusted_platform: bool,
+    trusted: &TrustedRoots,
+) {
     report.format = IdentityImageFormat::LooseCartridgeRom;
     let Some(format) = supported_loose_rom_format(&report.archive_path, report.platform) else {
         add_loose_rom_unavailable(
@@ -530,7 +562,7 @@ fn inspect_loose_rom(report: &mut GameIdentityReport, trusted_platform: bool) {
         );
         return;
     }
-    let mut file = match open_read_only_regular(&report.archive_path) {
+    let mut file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_loose_rom_unavailable(report, IdentityStatus::Invalid, &message);
@@ -721,9 +753,9 @@ fn retain_warning(report: &mut GameIdentityReport, warning: &str) {
     }
 }
 
-fn inspect_direct_iso(report: &mut GameIdentityReport) {
+fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::Iso;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -746,10 +778,10 @@ fn inspect_direct_iso(report: &mut GameIdentityReport) {
     report.bytes_read = source.bytes_read;
 }
 
-fn inspect_zip_iso(report: &mut GameIdentityReport) {
+fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::ZipContainingIso;
     report.nested_container_depth = 1;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -858,9 +890,9 @@ fn inspect_zip_iso(report: &mut GameIdentityReport) {
     inspect_iso_source(report, &mut source, Some(member_path), Some(index));
 }
 
-fn inspect_direct_xex(report: &mut GameIdentityReport) {
+fn inspect_direct_xex(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::Xex;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -883,10 +915,10 @@ fn inspect_direct_xex(report: &mut GameIdentityReport) {
     report.bytes_read = source.bytes_read;
 }
 
-fn inspect_zip_xex(report: &mut GameIdentityReport) {
+fn inspect_zip_xex(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::ZipContainingXex;
     report.nested_container_depth = 1;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -1351,9 +1383,9 @@ fn inspect_dolphin_header(
 /// ("malformed format" in the beginner-facing states this maps to); a
 /// missing/unrecognised inner disc magic (checked by
 /// `inspect_dolphin_header` itself) is reported the same way.
-fn inspect_rvz(report: &mut GameIdentityReport) {
+fn inspect_rvz(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::Rvz;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -1428,9 +1460,9 @@ fn inspect_rvz(report: &mut GameIdentityReport) {
 /// first stored block - the disc header block is never compressed in this
 /// format, so no decompression is required. See the `CISO_*` constants for
 /// the exact layout and source.
-fn inspect_ciso(report: &mut GameIdentityReport) {
+fn inspect_ciso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::Ciso;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -1724,9 +1756,9 @@ fn wbfs_disc_header_offset(
 /// slot. The scrubbed disc body is never read, nothing is decompressed or
 /// mounted, no external tool is launched, and the file is opened read-only
 /// with symlinks refused by `open_read_only_regular`.
-fn inspect_wbfs(report: &mut GameIdentityReport) {
+fn inspect_wbfs(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::Wbfs;
-    let file = match open_read_only_regular(&report.archive_path) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_unavailable(report, IdentityStatus::Invalid, &message);
@@ -2308,44 +2340,19 @@ impl ByteSource for SliceSource<'_> {
     }
 }
 
-fn open_read_only_regular(path: &Path) -> Result<File, String> {
-    if !path.is_absolute() {
-        return Err("identity path must be absolute".to_string());
-    }
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => current.push(Path::new("/")),
-            Component::Normal(component) => current.push(component),
-            _ => return Err("identity path contains a non-normal component".to_string()),
-        }
-        let metadata = std::fs::symlink_metadata(&current)
-            .map_err(|error| format!("{}: {error}", current.display()))?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("symlink refused: {}", current.display()));
-        }
-    }
-    let before = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !before.is_file() {
-        return Err("identity source is not a regular file".to_string());
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let file = options.open(path).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let after = file.metadata().map_err(|error| error.to_string())?;
-        if before.dev() != after.dev() || before.ino() != after.ino() {
-            return Err("identity source changed while it was opened".to_string());
-        }
-    }
-    Ok(file)
+/// Opens one identity source read-only.
+///
+/// Delegates to [`crate::safe_read::open_bounded_read`], which is the single
+/// place this build decides what may be opened: absolute paths only, no `.` or
+/// `..`, no symlinked component, `O_NOFOLLOW`, and a device/inode re-check
+/// after opening. A symlink is followed only when `trusted` names a source root
+/// that contains both the link and its canonical target - so passing
+/// [`TrustedRoots::none`] keeps the historical behaviour of refusing every
+/// symlink outright.
+fn open_read_only_regular(path: &Path, trusted: &TrustedRoots) -> Result<File, String> {
+    crate::safe_read::open_bounded_read(path, trusted)
+        .map(crate::safe_read::SafeFile::into_file)
+        .map_err(|refusal| refusal.detail())
 }
 
 fn evidence(
@@ -3088,6 +3095,173 @@ mod tests {
         );
     }
 
+    /// A symlinked library is the normal arrangement, so bounded identity must
+    /// work through one when the roots are supplied - and keep refusing when
+    /// they are not, which is what `wbfs_symlink_is_refused` above asserts.
+    #[test]
+    fn wbfs_identity_through_a_trusted_symlink_is_verified() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("wbfs-symlink-trusted");
+        let downloads = directory.0.join("downloads");
+        let library = directory.0.join("library");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::create_dir_all(&library).unwrap();
+        let target = downloads.join("target.wbfs");
+        fs::write(&target, wbfs_fixture(b"SMNE01", 0)).unwrap();
+        let link = library.join("SMNE01.wbfs");
+        symlink(&target, &link).unwrap();
+
+        let trusted = TrustedRoots::from_paths([&library, &downloads]);
+        let report = inspect_catalogued_game_identity_in_roots(&link, Some("Wii"), &trusted);
+        assert_eq!(
+            report.verified_dolphin_game_id(),
+            Some("SMNE01"),
+            "identity must resolve through a link inside the configured roots: {:?}",
+            report.evidence
+        );
+        assert!(report.complete);
+        assert!(
+            report.bytes_read > 0 && report.bytes_read < MAX_BYTES_READ,
+            "the read must stay bounded: {} bytes",
+            report.bytes_read
+        );
+    }
+
+    #[test]
+    fn gamecube_identity_through_a_trusted_symlink_is_verified() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("gcm-symlink-trusted");
+        let downloads = directory.0.join("downloads");
+        let library = directory.0.join("library");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::create_dir_all(&library).unwrap();
+        let target = downloads.join("target.gcm");
+        fs::write(
+            &target,
+            dolphin_fixture(IdentityPlatform::GameCube, b"GALE01", 2),
+        )
+        .unwrap();
+        let link = library.join("melee.gcm");
+        symlink(&target, &link).unwrap();
+
+        let trusted = TrustedRoots::from_paths([&library, &downloads]);
+        let report = inspect_catalogued_game_identity_in_roots(&link, Some("GameCube"), &trusted);
+        assert_eq!(report.verified_dolphin_game_id(), Some("GALE01"));
+        assert!(report.bytes_read > 0);
+    }
+
+    #[test]
+    fn identity_through_a_symlink_escaping_the_trusted_roots_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("wbfs-symlink-escape");
+        let outside = directory.0.join("outside");
+        let library = directory.0.join("library");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&library).unwrap();
+        let target = outside.join("target.wbfs");
+        fs::write(&target, wbfs_fixture(b"SMNE01", 0)).unwrap();
+        let link = library.join("SMNE01.wbfs");
+        symlink(&target, &link).unwrap();
+
+        // Only the library is trusted, so the target is out of bounds.
+        let trusted = TrustedRoots::from_paths([&library]);
+        let report = inspect_catalogued_game_identity_in_roots(&link, Some("Wii"), &trusted);
+        assert_eq!(report.verified_dolphin_game_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.diagnostic.contains("symlink refused")),
+            "the refusal must be stated: {:?}",
+            report.evidence
+        );
+    }
+
+    #[test]
+    fn identity_through_a_broken_or_looping_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("wbfs-symlink-broken");
+        let library = directory.0.join("library");
+        fs::create_dir_all(&library).unwrap();
+        let broken = library.join("broken.wbfs");
+        symlink(library.join("absent.wbfs"), &broken).unwrap();
+        let first = library.join("loop-a.wbfs");
+        let second = library.join("loop-b.wbfs");
+        symlink(&second, &first).unwrap();
+        symlink(&first, &second).unwrap();
+
+        let trusted = TrustedRoots::from_paths([&library]);
+        for path in [broken, first] {
+            let report = inspect_catalogued_game_identity_in_roots(&path, Some("Wii"), &trusted);
+            assert_eq!(report.verified_dolphin_game_id(), None);
+            assert!(
+                report
+                    .evidence
+                    .iter()
+                    .any(|item| item.diagnostic.contains("symlink refused")),
+                "{} must be refused with a reason",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn identity_through_a_trusted_symlink_never_writes_to_the_tree() {
+        use std::os::unix::fs::symlink;
+
+        let directory = FixtureDir::new("wbfs-symlink-read-only");
+        let downloads = directory.0.join("downloads");
+        let library = directory.0.join("library");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::create_dir_all(&library).unwrap();
+        let target = downloads.join("target.wbfs");
+        fs::write(&target, wbfs_fixture(b"SMNE01", 0)).unwrap();
+        let link = library.join("SMNE01.wbfs");
+        symlink(&target, &link).unwrap();
+
+        let snapshot = |root: &Path| {
+            let mut entries = std::collections::BTreeMap::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(current) = stack.pop() {
+                let Ok(read_dir) = fs::read_dir(&current) else {
+                    continue;
+                };
+                for entry in read_dir.filter_map(Result::ok) {
+                    let path = entry.path();
+                    let Ok(metadata) = fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        stack.push(path.clone());
+                    }
+                    entries.insert(
+                        path.to_string_lossy().into_owned(),
+                        format!(
+                            "{:?}|{}|{:?}",
+                            metadata.file_type(),
+                            metadata.len(),
+                            metadata.modified().ok()
+                        ),
+                    );
+                }
+            }
+            entries
+        };
+        let before = snapshot(&directory.0);
+        let trusted = TrustedRoots::from_paths([&library, &downloads]);
+        let report = inspect_catalogued_game_identity_in_roots(&link, Some("Wii"), &trusted);
+        assert_eq!(report.verified_dolphin_game_id(), Some("SMNE01"));
+        assert_eq!(
+            snapshot(&directory.0),
+            before,
+            "reading identity through a link must not change anything"
+        );
+    }
+
     #[test]
     fn gcz_remains_honestly_deferred_not_unsupported() {
         let directory = FixtureDir::new("gcz");
@@ -3273,9 +3447,9 @@ mod tests {
     fn loose_rom_stability_check_rejects_file_mutation() {
         let directory = FixtureDir::new("loose-mutated");
         let path = write_fixture(&directory, "Changing.md", b"initial bytes");
-        let file = OpenOptions::new().read(true).open(&path).unwrap();
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let before = StableFileMetadata::from_file(&file).unwrap();
-        OpenOptions::new()
+        std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap()

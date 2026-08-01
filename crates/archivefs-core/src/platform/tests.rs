@@ -1444,3 +1444,310 @@ fn no_network_or_process_call_exists_anywhere_in_the_platform_module() {
         }
     }
 }
+
+// --- Signature reads through a safely resolved symlink --------------------
+
+/// The library and download trees a real setup has: game files live in the
+/// download tree and are symlinked into the library.
+struct SymlinkFixture {
+    tree: TempTree,
+}
+
+impl SymlinkFixture {
+    fn new(label: &str) -> Self {
+        let tree = TempTree::new(label);
+        for directory in ["library", "downloads", "elsewhere"] {
+            fs::create_dir_all(tree.path().join(directory)).expect("fixture");
+        }
+        Self { tree }
+    }
+
+    fn path(&self, relative: &str) -> PathBuf {
+        self.tree.path().join(relative)
+    }
+
+    fn file(&self, relative: &str, contents: &[u8]) -> PathBuf {
+        let path = self.path(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture");
+        }
+        fs::write(&path, contents).expect("fixture");
+        path
+    }
+
+    fn link(&self, from: &str, to: &Path) -> PathBuf {
+        let path = self.path(from);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(to, &path).expect("fixture");
+        path
+    }
+
+    fn trusted(&self) -> crate::safe_read::TrustedRoots {
+        crate::safe_read::TrustedRoots::from_paths([self.path("library"), self.path("downloads")])
+    }
+
+    /// Detection with content inspection and the trusted roots supplied.
+    fn detect(&self, path: &Path) -> PlatformDetectionReport {
+        detect_platform_report(
+            &DetectionRequest::new(path, &self.path("library"))
+                .inspecting_content()
+                .with_trusted_roots(self.trusted()),
+        )
+    }
+
+    /// Detection with content inspection but no trusted roots at all.
+    fn detect_without_roots(&self, path: &Path) -> PlatformDetectionReport {
+        detect_platform_report(
+            &DetectionRequest::new(path, &self.path("library")).inspecting_content(),
+        )
+    }
+}
+
+fn playstation_image() -> Vec<u8> {
+    let mut image = vec![0_u8; 0x8100];
+    image[0x8001..0x8006].copy_from_slice(b"CD001");
+    image[0x8008..0x8013].copy_from_slice(b"PLAYSTATION");
+    image
+}
+
+fn mega_drive_rom() -> Vec<u8> {
+    let mut rom = vec![0_u8; 0x200];
+    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom
+}
+
+/// Test 57
+#[test]
+fn a_ps2_signature_through_a_safe_symlink_reaches_confirmed() {
+    let fixture = SymlinkFixture::new("symlink-ps2");
+    let target = fixture.file("downloads/Silent Hill 2.iso", &playstation_image());
+    let link = fixture.link("library/ps2/Silent Hill 2.iso", &target);
+
+    let report = fixture.detect(&link);
+    assert_eq!(
+        report.platform,
+        Some("PS2"),
+        "the `ps2` folder decides, and the signature confirms it: {:?}",
+        report.evidence
+    );
+    assert_eq!(
+        report.confidence,
+        DetectionConfidence::Confirmed,
+        "a folder and a signature that agree confirm, even through a symlink"
+    );
+    assert!(
+        report.evidence.iter().any(|item| {
+            item.source == DetectionSource::Signature
+                && item
+                    .detail
+                    .contains("signature read from validated symlink target")
+        }),
+        "the evidence must say a link was followed: {:?}",
+        report.evidence
+    );
+}
+
+/// Test 58
+#[test]
+fn evidence_from_a_symlink_never_names_the_target_path() {
+    let fixture = SymlinkFixture::new("symlink-privacy");
+    let target = fixture.file("downloads/Silent Hill 2.iso", &playstation_image());
+    let link = fixture.link("library/ps2/Silent Hill 2.iso", &target);
+
+    let report = fixture.detect(&link);
+    let target_text = target.to_string_lossy().into_owned();
+    for item in &report.evidence {
+        assert!(
+            !item.detail.contains(&target_text),
+            "ordinary output must not expose where the link pointed: {}",
+            item.detail
+        );
+        assert!(!item.detail.contains("downloads"));
+    }
+}
+
+/// Test 59
+#[test]
+fn a_mega_drive_header_through_a_safe_symlink_is_detected() {
+    let fixture = SymlinkFixture::new("symlink-megadrive");
+    let target = fixture.file("downloads/mystery.bin", &mega_drive_rom());
+    // A folder that says nothing, so only the signature can identify it.
+    let link = fixture.link("library/mystery.bin", &target);
+
+    let report = fixture.detect(&link);
+    assert_eq!(report.platform, Some("MegaDrive"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+}
+
+/// Test 60
+#[test]
+fn without_trusted_roots_a_symlink_yields_no_signature_evidence() {
+    let fixture = SymlinkFixture::new("symlink-fail-closed");
+    let target = fixture.file("downloads/mystery.bin", &mega_drive_rom());
+    let link = fixture.link("library/mystery.bin", &target);
+
+    let report = fixture.detect_without_roots(&link);
+    assert!(
+        !report
+            .evidence
+            .iter()
+            .any(|item| item.source == DetectionSource::Signature),
+        "absent trusted roots must keep the historical refusal"
+    );
+    assert_ne!(report.confidence, DetectionConfidence::Confirmed);
+}
+
+/// Test 61
+#[test]
+fn a_symlink_escaping_the_trusted_roots_yields_no_signature_evidence() {
+    let fixture = SymlinkFixture::new("symlink-escape");
+    let target = fixture.file("elsewhere/mystery.bin", &mega_drive_rom());
+    let link = fixture.link("library/mystery.bin", &target);
+
+    let report = fixture.detect(&link);
+    assert!(
+        !report
+            .evidence
+            .iter()
+            .any(|item| item.source == DetectionSource::Signature),
+        "a target outside the library must not be read"
+    );
+    assert_ne!(report.platform, Some("MegaDrive"));
+}
+
+/// Test 62
+#[test]
+fn a_broken_a_looping_and_a_directory_symlink_all_fail_safely_in_detection() {
+    let fixture = SymlinkFixture::new("symlink-refusals");
+    let broken = fixture.link("library/broken.bin", &fixture.path("downloads/absent.bin"));
+    let directory = fixture.link("library/dir.bin", &fixture.path("downloads"));
+    let first = fixture.path("library/loop-a.bin");
+    let second = fixture.path("library/loop-b.bin");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&second, &first).expect("fixture");
+        std::os::unix::fs::symlink(&first, &second).expect("fixture");
+    }
+
+    for path in [broken, directory, first] {
+        let report = fixture.detect(&path);
+        assert!(
+            !report
+                .evidence
+                .iter()
+                .any(|item| item.source == DetectionSource::Signature),
+            "{} must produce no signature evidence",
+            path.display()
+        );
+        // And nothing panicked, and no platform was invented from nothing.
+        assert_ne!(report.confidence, DetectionConfidence::Confirmed);
+    }
+}
+
+/// Test 63
+#[test]
+fn a_manual_assignment_still_wins_over_a_symlink_signature() {
+    let fixture = SymlinkFixture::new("symlink-manual");
+    let target = fixture.file("downloads/mystery.bin", &mega_drive_rom());
+    let link = fixture.link("library/mystery.bin", &target);
+
+    let report = detect_platform_report(
+        &DetectionRequest::new(&link, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted())
+            .with_manual_platform(Some("ZX Spectrum")),
+    );
+    assert_eq!(report.platform, Some("ZX Spectrum"));
+    assert!(report.manually_assigned);
+    assert_eq!(
+        report.deciding_source,
+        Some(DetectionSource::ExplicitAssignment),
+        "following a symlink must not disturb the precedence order"
+    );
+}
+
+/// Test 64
+#[test]
+fn a_folder_alias_still_outranks_a_contradicting_symlink_signature() {
+    let fixture = SymlinkFixture::new("symlink-precedence");
+    let target = fixture.file("downloads/mystery.bin", &mega_drive_rom());
+    let link = fixture.link("library/mastersystem/mystery.bin", &target);
+
+    let report = fixture.detect(&link);
+    assert_eq!(
+        report.platform,
+        Some("MasterSystem"),
+        "the folder still wins over a contradicting signature"
+    );
+    assert_eq!(report.confidence, DetectionConfidence::Probable);
+    assert!(
+        report.evidence.iter().any(|item| {
+            item.source == DetectionSource::Signature && item.platform == "MegaDrive"
+        }),
+        "the contradiction must remain visible"
+    );
+}
+
+/// Test 65
+#[test]
+fn scummvm_resource_gen_stays_scummvm_even_through_a_symlink() {
+    let fixture = SymlinkFixture::new("symlink-scummvm");
+    let target = fixture.file("downloads/laurabow2/RESOURCE.GEN", b"not a rom");
+    fixture.file("downloads/laurabow2/RESOURCE.MAP", b"map");
+    fs::create_dir_all(fixture.path("library/scummvm/laurabow2")).expect("fixture");
+    let link = fixture.link("library/scummvm/laurabow2/RESOURCE.GEN", &target);
+
+    let report = fixture.detect(&link);
+    assert_eq!(report.platform, Some("ScummVM"));
+    assert_ne!(report.platform, Some("MegaDrive"));
+}
+
+/// Test 66
+#[test]
+fn following_a_symlink_during_detection_changes_nothing_on_disk() {
+    let fixture = SymlinkFixture::new("symlink-read-only");
+    let target = fixture.file("downloads/game.iso", &playstation_image());
+    let link = fixture.link("library/ps2/game.iso", &target);
+    fixture.link("library/broken.iso", &fixture.path("downloads/absent.iso"));
+    let outside = fixture.file("elsewhere/secret.iso", &playstation_image());
+    fixture.link("library/escape.iso", &outside);
+    let before = snapshot_tree(fixture.tree.path());
+
+    for path in [
+        link,
+        fixture.path("library/broken.iso"),
+        fixture.path("library/escape.iso"),
+    ] {
+        let _ = fixture.detect(&path);
+    }
+
+    assert_eq!(
+        snapshot_tree(fixture.tree.path()),
+        before,
+        "following a symlink to read 11 bytes must not change anything"
+    );
+}
+
+/// Test 67
+#[test]
+fn a_plain_file_behaves_exactly_as_it_did_before_trusted_roots_existed() {
+    let fixture = SymlinkFixture::new("symlink-unchanged");
+    let plain = fixture.file("library/mystery.bin", &mega_drive_rom());
+
+    // With roots and without roots must give the same answer for a plain file.
+    let with_roots = fixture.detect(&plain);
+    let without_roots = fixture.detect_without_roots(&plain);
+    assert_eq!(with_roots, without_roots);
+    assert_eq!(with_roots.platform, Some("MegaDrive"));
+    assert_eq!(with_roots.confidence, DetectionConfidence::Confirmed);
+    assert!(
+        with_roots
+            .evidence
+            .iter()
+            .all(|item| !item.detail.contains("symlink")),
+        "a plain file must not claim a link was followed"
+    );
+}

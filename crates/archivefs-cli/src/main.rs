@@ -27,7 +27,7 @@ use archivefs_core::emulator_environment::retroarch::{
 };
 use archivefs_core::game_identity::{
     GameIdentityReport, IdentityConfidence, IdentityKind, IdentityStatus,
-    inspect_catalogued_game_identity,
+    inspect_catalogued_game_identity, inspect_catalogued_game_identity_in_roots,
 };
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
@@ -51,6 +51,7 @@ use archivefs_core::platform::{
     DetectionConfidence, DetectionRequest, DetectionSource, PlatformDetectionReport,
     detect_platform_report,
 };
+use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
@@ -488,7 +489,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     format!("game-identity-inspect does not accept {:?}", input_args).into(),
                 );
             }
-            let report = inspect_catalogued_game_identity(&path, platform.as_deref());
+            let trusted = Config::load_default()
+                .map(|config| TrustedRoots::from_config(&config))
+                .unwrap_or_else(|_| TrustedRoots::none());
+            let report =
+                inspect_catalogued_game_identity_in_roots(&path, platform.as_deref(), &trusted);
             if json {
                 print_game_identity_report_json(&report)?;
             } else {
@@ -516,7 +521,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(cache_root) = cache_root {
                 options.cache_root = cache_root;
             }
-            let report = inspect_catalogued_game_identity(&image, Some("Wii"));
+            let trusted = Config::load_default()
+                .map(|config| TrustedRoots::from_config(&config))
+                .unwrap_or_else(|_| TrustedRoots::none());
+            let report = inspect_catalogued_game_identity_in_roots(&image, Some("Wii"), &trusted);
             let identity = WiiGameIdentity::from_report(
                 image
                     .file_stem()
@@ -1283,9 +1291,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .or_else(|| target.parent().map(Path::to_path_buf))
                         .unwrap_or_default(),
                 };
+                // Every configured source folder is a trusted root, so a game
+                // file symlinked from one source into another can have its
+                // signature read. Reading only - nothing here is ever a write
+                // destination.
+                let trusted = Config::load_default()
+                    .map(|config| TrustedRoots::from_config(&config))
+                    .unwrap_or_else(|_| TrustedRoots::from_paths([&root]));
                 let request = DetectionRequest::new(&target, &root)
                     .with_manual_platform(manual.as_deref())
-                    .inspecting_content();
+                    .inspecting_content()
+                    .with_trusted_roots(trusted);
                 let report = detect_platform_report(&request);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -9369,6 +9385,15 @@ struct PlatformAuditReport {
     /// misclassifications - the reported ScummVM `RESOURCE.GEN` case is one.
     historical_misclassifications: Vec<PlatformAuditChange>,
     historical_misclassifications_total: usize,
+    /// How many files were symlinks, and what happened to each.
+    symlinks_seen: usize,
+    /// Symlinks whose signature could be read because both the link and its
+    /// canonical target lie inside a configured source root.
+    symlinks_read: usize,
+    /// Of those, how many actually yielded signature evidence.
+    symlinks_with_signature_evidence: usize,
+    /// Symlinks that were refused, counted by reason.
+    symlink_refusals: Vec<(String, usize)>,
     /// Requested platforms with no file in this sample at all.
     requested_platforms_absent: Vec<String>,
     elapsed_milliseconds: u128,
@@ -9402,7 +9427,14 @@ fn audit_platform_detection(
     };
     let mut platform_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut ambiguous_extensions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut symlink_refusals: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_platforms: std::collections::BTreeSet<String> = Default::default();
+
+    // The configured source folders, so a symlink from one into another can be
+    // read. Falls back to the audited root alone when no config is readable.
+    let trusted = Config::load_default()
+        .map(|config| TrustedRoots::from_config(&config))
+        .unwrap_or_else(|_| TrustedRoots::from_paths([root]));
 
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
@@ -9417,16 +9449,33 @@ fn audit_platform_detection(
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            if metadata.file_type().is_symlink() {
-                // Never follow a symlink during an audit.
-                continue;
-            }
-            if metadata.is_dir() {
+            let is_symlink = metadata.file_type().is_symlink();
+            if is_symlink {
+                // Never *descend* through a symlink - that risks walking the
+                // same tree twice or leaving it entirely. The file itself is
+                // still considered, because reading its signature is now
+                // governed by the trusted-root policy rather than refused
+                // outright.
+                let Ok(resolved) = std::fs::metadata(&path) else {
+                    // Broken link: counted as a refusal below, not as a file.
+                    report.symlinks_seen += 1;
+                    *symlink_refusals
+                        .entry("unresolvable_target".to_string())
+                        .or_default() += 1;
+                    continue;
+                };
+                if !resolved.is_file() {
+                    report.symlinks_seen += 1;
+                    *symlink_refusals
+                        .entry("not_regular_file".to_string())
+                        .or_default() += 1;
+                    continue;
+                }
+            } else if metadata.is_dir() {
                 report.directories_considered += 1;
                 stack.push(path);
                 continue;
-            }
-            if !metadata.is_file() {
+            } else if !metadata.is_file() {
                 continue;
             }
             report.files_considered += 1;
@@ -9438,8 +9487,33 @@ fn audit_platform_detection(
             let before = archivefs_core::Archive::from_path_in_root(&path, root)
                 .and_then(|archive| archive.identity.platform);
 
-            let request = DetectionRequest::new(&path, root).inspecting_content();
+            let request = DetectionRequest::new(&path, root)
+                .inspecting_content()
+                .with_trusted_roots(trusted.clone());
             let detected = detect_platform_report(&request);
+
+            if is_symlink {
+                report.symlinks_seen += 1;
+                // Ask the shared policy directly what it decided, so the audit
+                // reports the real reason rather than inferring one.
+                match archivefs_core::safe_read::open_bounded_read(&path, &trusted) {
+                    Ok(_) => {
+                        report.symlinks_read += 1;
+                        if detected
+                            .evidence
+                            .iter()
+                            .any(|item| item.source == DetectionSource::Signature)
+                        {
+                            report.symlinks_with_signature_evidence += 1;
+                        }
+                    }
+                    Err(refusal) => {
+                        *symlink_refusals
+                            .entry(refusal.code().to_string())
+                            .or_default() += 1;
+                    }
+                }
+            }
             match detected.confidence {
                 DetectionConfidence::Confirmed => report.confirmed += 1,
                 DetectionConfidence::Probable => report.probable += 1,
@@ -9515,6 +9589,10 @@ fn audit_platform_detection(
     extensions.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     extensions.truncate(15);
     report.top_ambiguous_extensions = extensions;
+
+    let mut refusals: Vec<(String, usize)> = symlink_refusals.into_iter().collect();
+    refusals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    report.symlink_refusals = refusals;
 
     report.requested_platforms_absent = MILESTONE_PLATFORMS
         .iter()
@@ -9594,6 +9672,14 @@ fn format_platform_audit(report: &PlatformAuditReport) -> String {
         for (extension, count) in &report.top_ambiguous_extensions {
             lines.push(format!("  {count:>7}  .{extension}"));
         }
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Symlinked files: {} seen, {} readable under the trusted-root policy, {} produced signature evidence",
+        report.symlinks_seen, report.symlinks_read, report.symlinks_with_signature_evidence
+    ));
+    for (reason, count) in &report.symlink_refusals {
+        lines.push(format!("  refused {count:>7}  {reason}"));
     }
     lines.push(String::new());
     lines.push(format!(

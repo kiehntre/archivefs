@@ -41,6 +41,7 @@ use super::{
     LayoutRule, MAX_MAGIC_READ_BYTES, PLATFORMS, Platform, extension_of, is_shared_extension,
     normalize_alias, platform_by_id, platform_for_alias,
 };
+use crate::safe_read::TrustedRoots;
 
 /// How sure detection is. Deliberately four states: "we do not know" and "we
 /// cannot choose between these" are different answers and a person needs to
@@ -160,6 +161,13 @@ pub struct DetectionRequest<'a> {
     /// Whether bounded signature reads are allowed. Off by default for the
     /// same reason.
     pub read_signatures: bool,
+    /// The configured source roots a symlink may resolve into.
+    ///
+    /// Empty by default, which refuses every symlink - see
+    /// [`crate::safe_read`]. A library whose game files are symlinks into a
+    /// download tree needs both roots supplied before a signature can be read
+    /// through one.
+    pub trusted_roots: TrustedRoots,
 }
 
 impl<'a> DetectionRequest<'a> {
@@ -172,7 +180,16 @@ impl<'a> DetectionRequest<'a> {
             emulator_context: None,
             inspect_layout: false,
             read_signatures: false,
+            trusted_roots: TrustedRoots::none(),
         }
+    }
+
+    /// Permits signature reads through a symlink whose link and canonical
+    /// target both lie inside one of these configured source roots. Governs
+    /// reading only; nothing here is ever a write destination.
+    pub fn with_trusted_roots(mut self, roots: TrustedRoots) -> Self {
+        self.trusted_roots = roots;
+        self
     }
 
     pub fn with_manual_platform(mut self, platform: Option<&'a str>) -> Self {
@@ -309,7 +326,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
 
     // 4. Bounded signature reads.
     if request.read_signatures {
-        evidence.extend(signature_evidence(request.path));
+        evidence.extend(signature_evidence(request.path, &request.trusted_roots));
     }
 
     // 5. Layout evidence from the containing directory.
@@ -575,16 +592,17 @@ fn folder_alias_with_suffixes(segment: &str) -> Option<&'static Platform> {
 /// Bounded signature checks. One short read per distinct offset, never more
 /// than [`MAX_MAGIC_READ_BYTES`] bytes, and only on a real file that is not a
 /// symlink.
-fn signature_evidence(path: &Path) -> Vec<DetectionEvidence> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
+fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+    // One validated handle for every rule, rather than reopening per rule:
+    // fewer syscalls, and the file cannot change identity between rules.
+    let Ok(mut file) = crate::safe_read::open_bounded_read(path, trusted) else {
+        // Every refusal - a directory, a device, a broken or looping symlink,
+        // a target outside the configured roots - simply yields no signature
+        // evidence. Detection then falls back to folder and extension evidence
+        // and says honestly that it is only Probable.
         return Vec::new();
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        // Never follow a symlink to read a signature, and never try to read a
-        // directory or a device.
-        return Vec::new();
-    }
-    let length = metadata.len();
+    let through_symlink = file.resolved_via_symlink();
 
     let mut evidence = Vec::new();
     for platform in PLATFORMS {
@@ -593,37 +611,26 @@ fn signature_evidence(path: &Path) -> Vec<DetectionEvidence> {
                 rule.bytes.len() <= MAX_MAGIC_READ_BYTES,
                 "a signature rule must stay within the documented read bound"
             );
-            // Refuse before opening rather than reading and discarding.
-            if rule.offset.saturating_add(rule.bytes.len() as u64) > length {
-                continue;
-            }
-            if read_exact_at(path, rule.offset, rule.bytes.len())
+            if file
+                .read_exact_at(rule.offset, rule.bytes.len(), MAX_MAGIC_READ_BYTES)
                 .is_some_and(|actual| actual == rule.bytes)
             {
+                let mut detail = rule.description.to_string();
+                if through_symlink {
+                    // States that a link was followed, without naming where it
+                    // pointed: the target path is not the user's concern here
+                    // and does not belong in ordinary output.
+                    detail.push_str(" (signature read from validated symlink target)");
+                }
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::Signature,
                     platform: platform.id,
-                    detail: rule.description.to_string(),
+                    detail,
                 });
             }
         }
     }
     evidence
-}
-
-/// Reads exactly `length` bytes at `offset`. `length` is bounded by the
-/// caller's rule, which is itself bounded by [`MAX_MAGIC_READ_BYTES`].
-fn read_exact_at(path: &Path, offset: u64, length: usize) -> Option<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    if length > MAX_MAGIC_READ_BYTES {
-        return None;
-    }
-    let mut file = fs::File::open(path).ok()?;
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    let mut buffer = vec![0_u8; length];
-    file.read_exact(&mut buffer).ok()?;
-    Some(buffer)
 }
 
 /// Layout evidence from the file's containing directory: one bounded
