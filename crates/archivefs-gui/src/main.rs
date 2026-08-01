@@ -129,10 +129,16 @@ use archivefs_core::patch_manager::{
 };
 pub mod bulk_confirmation;
 pub mod game_presentation;
+pub(crate) mod romm_source;
 pub mod selection_guard;
 pub mod status_wording;
 mod ui;
 pub mod view_mode;
+
+use crate::romm_source::{
+    RommCardRequest, RommCardState, RommOperation, RommOperationOutcome, RommProgress,
+    RommProgressEvent, RommSnapshot,
+};
 
 #[cfg(test)]
 use archivefs_core::patch_manager::{
@@ -372,12 +378,17 @@ enum ActivityAction {
     /// from `DolphinGeckoCandidateMatch`, which covers per-game provider
     /// lookups (local or network), not the catalogue itself.
     DolphinCatalogueRetrieval,
+    /// A RomM identity-source operation: connection test, enable/disable,
+    /// sample or full import, or clearing cached cover thumbnails. Recorded
+    /// whatever the outcome, so a refused or cancelled import is as visible
+    /// as a successful one.
+    RommSource,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 41] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 42] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -419,6 +430,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 41] = [
     ActivityAction::CheatPreview,
     ActivityAction::CheatInstall,
     ActivityAction::DolphinCatalogueRetrieval,
+    ActivityAction::RommSource,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -514,6 +526,7 @@ impl std::fmt::Display for ActivityAction {
             Self::CheatPreview => "Cheats & Mods preview",
             Self::CheatInstall => "Cheats & Mods install",
             Self::DolphinCatalogueRetrieval => "Dolphin cheat catalogue retrieval",
+            Self::RommSource => "RomM identity source",
         })
     }
 }
@@ -2463,6 +2476,22 @@ struct RunningBsFreeOperation {
     receiver: Receiver<Result<BsFreeOperationResult, String>>,
 }
 
+/// One RomM operation in flight.
+///
+/// `generation` is what makes stale traffic harmless: a progress event or a result
+/// carries the generation it was started with, and anything that does not match the
+/// current one is discarded. Without it, cancelling an import and starting another
+/// would let the first one's late progress overwrite the second's.
+struct RunningRommOperation {
+    generation: u64,
+    operation: RommOperation,
+    cancellation: Arc<AtomicBool>,
+    receiver: Receiver<(u64, Result<RommOperationOutcome, String>)>,
+    progress_receiver: Receiver<(u64, RommProgressEvent)>,
+    progress: Option<RommProgress>,
+    cancellation_requested: bool,
+}
+
 #[derive(Debug, Default)]
 struct BsFreeGuiState {
     import_path: String,
@@ -3429,6 +3458,12 @@ struct ArchiveFsApp {
     bsfree_manager: BsFreeManagerState,
     bsfree_operation: Option<RunningBsFreeOperation>,
     bsfree_ui: BsFreeGuiState,
+    /// The last authoritative RomM snapshot. `None` until the first status load,
+    /// so the card shows "reading" rather than a screenful of zeroes.
+    romm_snapshot: Option<Box<RommSnapshot>>,
+    romm_operation: Option<RunningRommOperation>,
+    romm_generation: u64,
+    romm_ui: RommCardState,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -3659,6 +3694,10 @@ impl ArchiveFsApp {
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            romm_snapshot: None,
+            romm_operation: None,
+            romm_generation: 0,
+            romm_ui: RommCardState::default(),
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -5042,6 +5081,164 @@ impl ArchiveFsApp {
         thread::spawn(move || {
             let result = run_bsfree_operation(&operation).map_err(|error| error.to_string());
             let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Starts one RomM operation, or declines.
+    ///
+    /// Declining is the point: a second click while something is running must not
+    /// launch a duplicate, and a mutating operation must not overlap another. A
+    /// status load is allowed to be the exception only because it writes nothing.
+    fn start_romm_operation(&mut self, context: egui::Context, operation: RommOperation) -> bool {
+        if let Some(running) = &self.romm_operation {
+            // A status load asked for while something else runs is dropped rather
+            // than queued: the operation that finishes will refresh anyway.
+            let _ = running;
+            return false;
+        }
+        self.romm_generation = self.romm_generation.wrapping_add(1);
+        let generation = self.romm_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        // A fresh operation supersedes the previous result, so the card never shows
+        // an old outcome beside new progress.
+        self.romm_ui.last_outcome = None;
+        if operation.is_mutating() {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::RommSource,
+                None,
+                ActivityOutcome::Started,
+                format!("{}.", operation.label()),
+            ));
+        }
+        self.romm_operation = Some(RunningRommOperation {
+            generation,
+            operation: operation.clone(),
+            cancellation,
+            receiver,
+            progress_receiver,
+            progress: operation.reports_progress().then(RommProgress::default),
+            cancellation_requested: false,
+        });
+        let progress_context = context.clone();
+        thread::spawn(move || {
+            let report = |event: RommProgressEvent| {
+                let _ = progress_sender.send((generation, event));
+                progress_context.request_repaint();
+            };
+            let result = run_romm_operation(&operation, &worker_cancellation, &report);
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+        true
+    }
+
+    /// Asks the running operation to stop. Only the current one: an older
+    /// generation has already been forgotten.
+    fn cancel_romm_operation(&mut self) {
+        if let Some(running) = self.romm_operation.as_mut() {
+            running.cancellation.store(true, Ordering::Release);
+            running.cancellation_requested = true;
+        }
+    }
+
+    fn poll_romm_operation(&mut self, context: &egui::Context) {
+        // Progress first, discarding anything from a superseded generation.
+        if let Some(running) = self.romm_operation.as_mut() {
+            let current = running.generation;
+            for (generation, event) in running.progress_receiver.try_iter() {
+                if generation != current {
+                    continue;
+                }
+                let progress = running.progress.get_or_insert_with(RommProgress::default);
+                match event {
+                    RommProgressEvent::Import(import) => progress.absorb(import),
+                    RommProgressEvent::Note(note) => progress.note(note),
+                }
+            }
+        }
+
+        let Some((generation, operation, result)) =
+            self.romm_operation.as_ref().and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|(generation, result)| (generation, running.operation.clone(), result))
+            })
+        else {
+            return;
+        };
+        if generation != self.romm_generation {
+            // A result from an operation that has already been superseded. Dropping
+            // it is what stops it overwriting the current one's outcome.
+            self.romm_operation = None;
+            return;
+        }
+        self.romm_operation = None;
+
+        let previous_outcome = self.romm_ui.last_outcome.take();
+        self.romm_ui.last_outcome = Some(romm_source::build_result_view(
+            &operation,
+            result.as_ref().map_err(String::as_str),
+        ));
+        if operation.is_mutating() {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::RommSource,
+                None,
+                match &result {
+                    Ok(_) => ActivityOutcome::Completed,
+                    Err(_) => ActivityOutcome::Failed,
+                },
+                match &result {
+                    Ok(_) => format!("{} completed.", operation.label()),
+                    Err(message) => format!("{} failed: {message}", operation.label()),
+                },
+            ));
+        }
+        if let Ok(RommOperationOutcome::Snapshot(snapshot)) = &result {
+            // The one result that is not a user-visible outcome: it *is* the card's
+            // state. A snapshot never overwrites a real result view.
+            self.romm_snapshot = Some(snapshot.clone());
+            self.romm_ui.last_outcome = previous_outcome;
+            return;
+        }
+        // A mutating operation may have changed what the card shows, so the card is
+        // refreshed from authoritative state rather than from an optimistic counter.
+        // A failure leaves the previous snapshot in place until the reload replaces
+        // it, so a failed refresh never erases counts that were true.
+        if operation.is_mutating() {
+            self.start_romm_status_load(context.clone());
+        }
+    }
+
+    /// Loads the snapshot. Separate from `start_romm_operation` so it can run
+    /// straight after another operation completes.
+    fn start_romm_status_load(&mut self, context: egui::Context) {
+        if self.romm_operation.is_some() {
+            return;
+        }
+        self.romm_generation = self.romm_generation.wrapping_add(1);
+        let generation = self.romm_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        self.romm_operation = Some(RunningRommOperation {
+            generation,
+            operation: RommOperation::LoadStatus,
+            cancellation,
+            receiver,
+            progress_receiver,
+            progress: None,
+            cancellation_requested: false,
+        });
+        thread::spawn(move || {
+            let result = load_romm_snapshot()
+                .map(|snapshot| RommOperationOutcome::Snapshot(Box::new(snapshot)));
+            let _ = sender.send((generation, result));
             context.request_repaint();
         });
     }
@@ -11203,6 +11400,7 @@ impl ArchiveFsApp {
         self.poll_alias_action(context);
         self.poll_source_action(context);
         self.poll_bsfree_operation(context);
+        self.poll_romm_operation(context);
         self.poll_catalogue_manager(context);
         self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
@@ -11220,6 +11418,14 @@ impl ArchiveFsApp {
             && self.bsfree_operation.is_none()
         {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
+        }
+        // Only once the Sources page is actually open, and only local reads - so
+        // starting ArchiveFS still makes no network request of any kind.
+        if self.view == MainView::Sources
+            && self.romm_snapshot.is_none()
+            && self.romm_operation.is_none()
+        {
+            self.start_romm_status_load(context.clone());
         }
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
@@ -11816,6 +12022,35 @@ impl ArchiveFsApp {
                         &mut self.clipboard,
                     ) {
                         self.start_bsfree_operation(context.clone(), operation);
+                    }
+
+                    ui.add_space(theme::SECTION_GAP);
+                    let romm_view = romm_source::build_card_view(
+                        self.romm_snapshot.as_deref(),
+                        self.romm_operation.as_ref().map(|running| &running.operation),
+                        self.romm_operation
+                            .as_ref()
+                            .is_some_and(|running| running.cancellation_requested),
+                    );
+                    let romm_progress = self
+                        .romm_operation
+                        .as_ref()
+                        .and_then(|running| running.progress.as_ref())
+                        .cloned();
+                    if let Some(request) = romm_source::show_romm_source_card(
+                        ui,
+                        &romm_view,
+                        &mut self.romm_ui,
+                        romm_progress.as_ref(),
+                    ) {
+                        match request {
+                            RommCardRequest::Start(operation) => {
+                                // Declines when something is already running, which
+                                // is what makes a double click harmless.
+                                self.start_romm_operation(context.clone(), operation);
+                            }
+                            RommCardRequest::Cancel => self.cancel_romm_operation(),
+                        }
                     }
 
                     ui.add_space(theme::SECTION_GAP);
@@ -46264,7 +46499,7 @@ $Instant Growth [Nayr]\n";
         );
     }
 
-    fn app_for_operation_tests() -> ArchiveFsApp {
+    pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         ArchiveFsApp {
             state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
             database_state: DatabaseState::NotCreated {
@@ -46362,6 +46597,10 @@ $Instant Growth [Nayr]\n";
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            romm_snapshot: None,
+            romm_operation: None,
+            romm_generation: 0,
+            romm_ui: RommCardState::default(),
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -60147,5 +60386,744 @@ $Instant Growth [Nayr]\n";
         assert!(browser.contains("archivefs_platform_display_name"));
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
+    }
+}
+
+// --- RomM identity source: background work --------------------------------
+//
+// Everything here runs on a worker thread. Nothing in this section touches egui,
+// and nothing it returns carries a provider payload or a credential: the summaries
+// are built here precisely so the UI thread never sees either.
+
+/// Reads authoritative RomM state: settings, cache status and artwork stats.
+///
+/// Contacts nothing. `reachable: false` is passed deliberately - the card must be
+/// able to say what it knows without a network round trip, which is also why
+/// opening the Sources page cannot start one.
+fn load_romm_snapshot() -> Result<RommSnapshot, String> {
+    use archivefs_core::identity_source::artwork::ArtworkCache;
+    use archivefs_core::identity_source::hashing::LocalHashCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+    use archivefs_core::identity_source::settings::{
+        SettingsLocation, default_identity_root, load_token_file,
+    };
+    use archivefs_core::identity_source::status::IdentitySourceApi;
+
+    let identity_root = default_identity_root()?;
+    let settings = SettingsLocation::new(&identity_root, IdentityProvider::Romm)
+        .load()
+        .map_err(|error| error.detail())?;
+    let api = IdentitySourceApi::new(&identity_root, IdentityProvider::Romm);
+    let hashes = LocalHashCache::new();
+    let status = api.status(&settings.source, &hashes, false);
+    let cache_format_version = api.open_cache(None).ok().map(|cache| cache.format_version);
+    let server_id = status
+        .server_id
+        .clone()
+        .unwrap_or_else(|| settings.source.url.clone());
+    let artwork = ArtworkCache::new(&identity_root, IdentityProvider::Romm).stats(&server_id);
+    let token = load_token_file(settings.source.token_path.as_deref());
+    Ok(RommSnapshot {
+        settings,
+        status,
+        artwork,
+        token_available: token.is_ok(),
+        // The core's own refusal text, which never quotes the token.
+        token_problem: token.err().map(|refusal| refusal.detail()),
+        cache_format_version,
+    })
+}
+
+/// Runs one RomM operation to completion.
+///
+/// The error type is a plain `String` because every core refusal already renders
+/// itself redacted; passing the refusal type up would only invite a caller to
+/// format it some other way.
+fn run_romm_operation(
+    operation: &RommOperation,
+    cancellation: &Arc<AtomicBool>,
+    report: &dyn Fn(RommProgressEvent),
+) -> Result<RommOperationOutcome, String> {
+    use archivefs_core::identity_source::artwork::ArtworkCache;
+    use archivefs_core::identity_source::hashing::LocalHashCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+    use archivefs_core::identity_source::romm::client::UreqTransport;
+    use archivefs_core::identity_source::romm::import::ImportScope;
+    use archivefs_core::identity_source::settings::{
+        SettingsLocation, default_identity_root, load_token_file,
+    };
+    use archivefs_core::identity_source::status::{IdentitySourceApi, RefreshRequest};
+
+    let identity_root = default_identity_root()?;
+    let location = SettingsLocation::new(&identity_root, IdentityProvider::Romm);
+    let mut settings = location.load().map_err(|error| error.detail())?;
+    let api = IdentitySourceApi::new(&identity_root, IdentityProvider::Romm);
+
+    // Enable and disable need no network and no token, so they are handled before
+    // anything is validated.
+    if let RommOperation::SetEnabled(enabled) = operation {
+        if settings.source.url.trim().is_empty() {
+            return Err(
+                "Configure the RomM URL before enabling this source. The command line's \
+                 `identity source romm configure` does this today; the dialog arrives in the next \
+                 slice."
+                    .to_string(),
+            );
+        }
+        settings.source.enabled = *enabled;
+        location.save(&settings).map_err(|error| error.detail())?;
+        return Ok(RommOperationOutcome::Enabled(*enabled));
+    }
+
+    if let RommOperation::ClearArtwork = operation {
+        let status = api.status(&settings.source, &LocalHashCache::new(), false);
+        let server_id = status
+            .server_id
+            .clone()
+            .unwrap_or_else(|| settings.source.url.clone());
+        let cache = ArtworkCache::new(&identity_root, IdentityProvider::Romm);
+        let outcome = cache
+            .clear(&server_id, true)
+            .map_err(|refusal| refusal.detail())?;
+        return Ok(RommOperationOutcome::ArtworkCleared {
+            items: outcome.removed_items,
+            bytes: outcome.removed_bytes,
+        });
+    }
+
+    // Everything below talks to RomM, so it needs a validated source.
+    let token = load_token_file(settings.source.token_path.as_deref())
+        .map_err(|refusal| refusal.detail())?;
+    let trusted_roots = archivefs_core::Config::load_default()
+        .map(|config| config.source_folders)
+        .unwrap_or_default();
+    let source = archivefs_core::identity_source::romm::config::ValidatedRommSource::validate(
+        &settings.source,
+        &token,
+        &trusted_roots,
+        &archivefs_core::identity_source::net_policy::SystemResolver,
+    )
+    .map_err(|refusal| refusal.detail())?;
+    let transport = UreqTransport::new();
+
+    let capability = api
+        .test_connection(&source, &transport, Some(cancellation))
+        .map_err(|error| error.detail())?;
+
+    if let RommOperation::TestConnection = operation {
+        // One record: enough to prove the token reads, and to see which path shape
+        // this instance reports.
+        let client =
+            archivefs_core::identity_source::romm::client::RommClient::new(&source, &transport);
+        let first_page = client.roms_page(1, 0, Some(cancellation));
+        let observed = first_page
+            .as_ref()
+            .ok()
+            .and_then(|page| page.items.first())
+            .map(archivefs_core::identity_source::romm::normalise::provider_path_of)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                archivefs_core::identity_source::path_map::ProviderPathKind::observed_in(&path)
+            });
+        let reads = vec![
+            (
+                "/api/platforms".to_string(),
+                client.platforms(Some(cancellation)).is_ok(),
+            ),
+            ("/api/roms".to_string(), first_page.is_ok()),
+        ];
+        return Ok(RommOperationOutcome::Connection(Box::new(
+            romm_source::RommConnectionSummary::from_report(
+                &capability,
+                settings.source.provider_path_kind.slug(),
+                observed.map(|kind| kind.slug()),
+                reads,
+            ),
+        )));
+    }
+
+    let hashes = LocalHashCache::new();
+    let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(&trusted_roots);
+    let facts_for = |record: &archivefs_core::identity_source::model::ExternalIdentityRecord| {
+        romm_local_facts(record, &trusted)
+    };
+    let on_progress = |progress| report(RommProgressEvent::Import(progress));
+    let started = std::time::Instant::now();
+
+    match operation {
+        RommOperation::SampleImport { records } => {
+            // A sample never publishes, so it is imported and matched here and then
+            // simply reported. Nothing touches the live cache.
+            let mut outcome = archivefs_core::identity_source::romm::import::import_identity(
+                &source,
+                &transport,
+                ImportScope::Sample {
+                    max_records: *records,
+                },
+                &capability,
+                settings.effective_page_size(),
+                on_progress,
+                Some(cancellation),
+            )
+            .map_err(|failure| failure.detail())?;
+            archivefs_core::identity_source::matching::match_all(
+                &mut outcome.cache.records,
+                &hashes,
+                facts_for,
+                Some(cancellation),
+            )
+            .map_err(|_| "The sample import was cancelled.".to_string())?;
+            let counts = outcome.cache.counts();
+            let groups =
+                archivefs_core::identity_source::matching::build_groups(&outcome.cache.records);
+            report_file_detail_omissions(report, &outcome.adaptive);
+            Ok(RommOperationOutcome::Sample(Box::new(
+                romm_source::RommImportSummary {
+                    published: false,
+                    cache_path: None,
+                    cache_bytes: None,
+                    records: outcome.cache.records.len(),
+                    platforms: outcome.cache.platforms.len(),
+                    confirmed: counts.confirmed,
+                    strong: counts.strong,
+                    probable: counts.probable,
+                    ambiguous: counts.ambiguous,
+                    stale: counts.stale,
+                    unmatched: counts.unmatched,
+                    unknown_platforms: outcome.normalisation.unknown_platforms.len(),
+                    invalid_hashes: outcome.normalisation.rejected_hashes.len(),
+                    multi_file_groups: groups.len(),
+                    pages_fetched: outcome.progress.pages_fetched,
+                    elapsed_milliseconds: started.elapsed().as_millis(),
+                    adaptive: Some(outcome.adaptive),
+                    failure: None,
+                    failure_code: None,
+                    previous_cache_usable: api.open_cache(None).is_ok(),
+                },
+            )))
+        }
+        RommOperation::FullImport | RommOperation::Refresh => {
+            let summary = api.refresh(
+                RefreshRequest {
+                    source: &source,
+                    transport: &transport,
+                    scope: ImportScope::Full,
+                    capability: &capability,
+                    hashes: &hashes,
+                    page_size: settings.effective_page_size(),
+                    cancel: Some(cancellation),
+                },
+                facts_for,
+                on_progress,
+            );
+            match summary {
+                Ok(summary) => {
+                    report_file_detail_omissions(report, &summary.adaptive);
+                    let cache_bytes = std::fs::metadata(&summary.cache_path)
+                        .ok()
+                        .map(|metadata| metadata.len());
+                    Ok(RommOperationOutcome::Import(Box::new(
+                        romm_source::RommImportSummary {
+                            published: true,
+                            cache_path: Some(summary.cache_path.clone()),
+                            cache_bytes,
+                            records: summary.records,
+                            platforms: summary.platforms,
+                            confirmed: summary.counts.confirmed,
+                            strong: summary.counts.strong,
+                            probable: summary.counts.probable,
+                            ambiguous: summary.counts.ambiguous,
+                            stale: summary.counts.stale,
+                            unmatched: summary.counts.unmatched,
+                            unknown_platforms: summary.unknown_platforms,
+                            invalid_hashes: summary.invalid_hashes,
+                            multi_file_groups: summary.groups.len(),
+                            pages_fetched: summary.progress.pages_fetched,
+                            elapsed_milliseconds: started.elapsed().as_millis(),
+                            adaptive: Some(summary.adaptive),
+                            failure: None,
+                            failure_code: None,
+                            previous_cache_usable: true,
+                        },
+                    )))
+                }
+                Err(failure) => Err(failure.detail()),
+            }
+        }
+        // Handled above.
+        RommOperation::LoadStatus
+        | RommOperation::TestConnection
+        | RommOperation::SetEnabled(_)
+        | RommOperation::ClearArtwork => unreachable!("handled before this match"),
+    }
+}
+
+/// Turns a file-detail omission into a sentence a person can act on.
+fn report_file_detail_omissions(
+    report: &dyn Fn(RommProgressEvent),
+    adaptive: &archivefs_core::identity_source::romm::import::AdaptivePagination,
+) {
+    if adaptive.records_without_file_detail.is_empty() {
+        return;
+    }
+    report(RommProgressEvent::Note(format!(
+        "Game identity imported. Detailed file list omitted for RomM id {} because the provider \
+         response exceeded the safety limit.",
+        adaptive
+            .records_without_file_detail
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )));
+}
+
+/// Local facts for one record: metadata only, and never a hash.
+///
+/// The same shape the CLI uses, so the GUI and the command line reach the same
+/// verdicts from the same evidence.
+fn romm_local_facts(
+    record: &archivefs_core::identity_source::model::ExternalIdentityRecord,
+    _trusted: &archivefs_core::safe_read::TrustedRoots,
+) -> archivefs_core::identity_source::matching::LocalFileFacts {
+    use archivefs_core::identity_source::matching::LocalFileFacts;
+    use archivefs_core::identity_source::model::LocalEvidenceStrength;
+    match record.archivefs_path.as_deref() {
+        Some(path) => {
+            let local = archivefs_core::platform::detect::platform_for_folder_name(
+                path.parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+            .map(|platform| platform.id);
+            LocalFileFacts::observe(path).with_local_platform(
+                local,
+                if local.is_some() {
+                    LocalEvidenceStrength::Weak
+                } else {
+                    LocalEvidenceStrength::None
+                },
+            )
+        }
+        None => LocalFileFacts::default(),
+    }
+}
+
+#[cfg(test)]
+mod romm_dispatch_tests {
+    //! Operation-dispatch tests.
+    //!
+    //! These drive the real `ArchiveFsApp` methods rather than a stand-in, because
+    //! the properties under test are about the app's own bookkeeping: that a second
+    //! click cannot launch a duplicate, that a superseded operation's late traffic
+    //! is discarded, and that a failure never erases counts that were true.
+    //!
+    //! No worker is allowed to run. Each test installs the channels itself, which is
+    //! also the only way to deliver a *late* result deterministically.
+
+    use super::*;
+    use crate::romm_source::{RommImportSummary, RommProgressEvent};
+    use archivefs_core::identity_source::artwork::ArtworkCacheStats;
+    use archivefs_core::identity_source::model::{IdentityImportCounts, IdentityProvider};
+    use archivefs_core::identity_source::path_map::ProviderPathKind;
+    use archivefs_core::identity_source::romm::config::RommSourceConfig;
+    use archivefs_core::identity_source::romm::import::ImportProgress;
+    use archivefs_core::identity_source::settings::ProviderSettings;
+    use archivefs_core::identity_source::status::{ProviderState, ProviderStatus};
+
+    fn app() -> ArchiveFsApp {
+        super::tests::app_for_operation_tests()
+    }
+
+    fn snapshot(records: usize, state: ProviderState) -> RommSnapshot {
+        let mut status = ProviderStatus::not_configured(IdentityProvider::Romm);
+        status.state = state;
+        status.records_imported = records;
+        status.counts = IdentityImportCounts {
+            total: records,
+            strong: records,
+            ..IdentityImportCounts::default()
+        };
+        RommSnapshot {
+            settings: ProviderSettings {
+                source: RommSourceConfig {
+                    enabled: true,
+                    url: "http://172.19.0.20:8080".to_string(),
+                    mappings: Vec::new(),
+                    provider_path_kind: ProviderPathKind::ProviderRelative,
+                    token_path: None,
+                },
+                page_size: Some(100),
+            },
+            status,
+            artwork: ArtworkCacheStats {
+                items: 0,
+                bytes: 0,
+                maximum_bytes: 1024 * 1024 * 1024,
+                last_cleanup_unix_seconds: None,
+                directory: PathBuf::from("/tmp/artwork"),
+                format_version: 1,
+            },
+            token_available: true,
+            token_problem: None,
+            cache_format_version: Some(1),
+        }
+    }
+
+    /// Installs a running operation whose channels the test owns, so nothing is
+    /// spawned and a result can be delivered on demand.
+    #[allow(clippy::type_complexity)]
+    fn install_running(
+        app: &mut ArchiveFsApp,
+        operation: RommOperation,
+    ) -> (
+        mpsc::Sender<(u64, Result<RommOperationOutcome, String>)>,
+        mpsc::Sender<(u64, RommProgressEvent)>,
+        u64,
+    ) {
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+        let generation = app.romm_generation;
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        app.romm_operation = Some(RunningRommOperation {
+            generation,
+            operation: operation.clone(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            receiver,
+            progress_receiver,
+            progress: operation.reports_progress().then(RommProgress::default),
+            cancellation_requested: false,
+        });
+        (sender, progress_sender, generation)
+    }
+
+    fn summary(records: usize) -> RommImportSummary {
+        RommImportSummary {
+            published: true,
+            records,
+            previous_cache_usable: true,
+            ..RommImportSummary::default()
+        }
+    }
+
+    #[test]
+    fn a_second_click_while_something_runs_launches_nothing() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, _progress, generation) = install_running(&mut app, RommOperation::FullImport);
+
+        // The card asking again must be refused, and must not disturb the operation
+        // that is already running.
+        assert!(
+            !app.start_romm_operation(context.clone(), RommOperation::FullImport),
+            "a duplicate must be declined"
+        );
+        assert!(
+            !app.start_romm_operation(context.clone(), RommOperation::TestConnection),
+            "a different operation must also be declined while one runs"
+        );
+        assert_eq!(
+            app.romm_generation, generation,
+            "the generation must not move for a declined start"
+        );
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::FullImport),
+            "the running operation must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_status_load_is_declined_while_an_operation_runs() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, _progress, generation) = install_running(&mut app, RommOperation::Refresh);
+        app.start_romm_status_load(context);
+        assert_eq!(app.romm_generation, generation);
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::Refresh)
+        );
+    }
+
+    #[test]
+    fn cancellation_targets_only_the_current_operation() {
+        let mut app = app();
+        let (_sender, _progress, _generation) =
+            install_running(&mut app, RommOperation::FullImport);
+        let flag = app
+            .romm_operation
+            .as_ref()
+            .expect("running")
+            .cancellation
+            .clone();
+        assert!(!flag.load(Ordering::Acquire));
+        app.cancel_romm_operation();
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the worker should be asked to stop"
+        );
+        assert!(
+            app.romm_operation
+                .as_ref()
+                .is_some_and(|running| running.cancellation_requested),
+            "and the card should know, so Cancel stops being offered"
+        );
+
+        // Asking again is harmless.
+        app.cancel_romm_operation();
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelling_with_nothing_running_does_nothing() {
+        let mut app = app();
+        app.cancel_romm_operation();
+        assert!(app.romm_operation.is_none());
+    }
+
+    #[test]
+    fn progress_from_the_current_operation_is_absorbed() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, progress, generation) = install_running(&mut app, RommOperation::FullImport);
+        progress
+            .send((
+                generation,
+                RommProgressEvent::Import(ImportProgress {
+                    pages_fetched: 3,
+                    records_fetched: 300,
+                    reported_total: Some(1_000),
+                    page_size: 100,
+                    reduction: None,
+                }),
+            ))
+            .expect("send");
+        progress
+            .send((generation, RommProgressEvent::Note("a note".to_string())))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let running = app.romm_operation.as_ref().expect("still running");
+        let seen = running.progress.as_ref().expect("progress");
+        assert_eq!(seen.pages_fetched, 3);
+        assert_eq!(seen.records_fetched, 300);
+        assert_eq!(seen.notes, vec!["a note".to_string()]);
+    }
+
+    #[test]
+    fn progress_from_a_superseded_operation_is_discarded() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, progress, generation) = install_running(&mut app, RommOperation::FullImport);
+        // The operation is superseded, as it would be by a cancel-then-restart.
+        let stale_generation = generation;
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+        if let Some(running) = app.romm_operation.as_mut() {
+            running.generation = app.romm_generation;
+        }
+        progress
+            .send((
+                stale_generation,
+                RommProgressEvent::Import(ImportProgress {
+                    pages_fetched: 999,
+                    records_fetched: 99_999,
+                    reported_total: None,
+                    page_size: 1,
+                    reduction: None,
+                }),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let running = app.romm_operation.as_ref().expect("still running");
+        let seen = running.progress.as_ref().expect("progress");
+        assert_eq!(
+            seen.pages_fetched, 0,
+            "an older generation's progress must not be shown"
+        );
+        assert_eq!(seen.records_fetched, 0);
+    }
+
+    #[test]
+    fn a_result_from_a_superseded_operation_is_discarded() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) = install_running(&mut app, RommOperation::FullImport);
+        let stale_generation = generation;
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+
+        sender
+            .send((
+                stale_generation,
+                Ok(RommOperationOutcome::Import(Box::new(summary(1)))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a superseded result must not become the visible outcome"
+        );
+        assert_eq!(
+            app.romm_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status.records_imported),
+            Some(36_259),
+            "and must not disturb the counts"
+        );
+    }
+
+    #[test]
+    fn a_result_arriving_after_the_operation_was_cleared_is_ignored() {
+        let mut app = app();
+        let context = egui::Context::default();
+        // Nothing running: a late send has nowhere to land, and polling must be a
+        // no-op rather than a panic.
+        app.poll_romm_operation(&context);
+        assert!(app.romm_operation.is_none());
+        assert!(app.romm_ui.last_outcome.is_none());
+    }
+
+    #[test]
+    fn a_snapshot_result_sets_the_counts_without_becoming_a_visible_outcome() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (sender, _progress, generation) = install_running(&mut app, RommOperation::LoadStatus);
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Snapshot(Box::new(snapshot(
+                    36_259,
+                    ProviderState::Ready,
+                )))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_operation.is_none(), "the operation finished");
+        assert_eq!(
+            app.romm_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status.records_imported),
+            Some(36_259)
+        );
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a status load is not a result worth announcing"
+        );
+    }
+
+    #[test]
+    fn a_completed_mutating_operation_reloads_authoritative_state() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::ClearArtwork);
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::ArtworkCleared {
+                    items: 39,
+                    bytes: 1_000,
+                }),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        // The visible result is the clear...
+        assert!(
+            app.romm_ui
+                .last_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.headline.contains("39"))
+        );
+        // ...and a status load was started rather than the card being patched by
+        // hand, so what it shows next comes from disk.
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::LoadStatus),
+            "a mutating operation should be followed by an authoritative reload"
+        );
+    }
+
+    #[test]
+    fn a_failed_operation_keeps_the_counts_that_were_true() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) = install_running(&mut app, RommOperation::Refresh);
+        sender
+            .send((
+                generation,
+                Err("could not reach RomM: connection refused".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        let outcome = app.romm_ui.last_outcome.as_ref().expect("a result");
+        assert!(!outcome.succeeded);
+        assert!(outcome.headline.contains("failed"), "{}", outcome.headline);
+        // The snapshot is untouched: a failure must not blank the card.
+        assert_eq!(
+            app.romm_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status.records_imported),
+            Some(36_259)
+        );
+        assert!(matches!(
+            app.romm_snapshot.as_ref().map(|s| s.status.state.clone()),
+            Some(ProviderState::Ready)
+        ));
+    }
+
+    #[test]
+    fn a_new_operation_clears_the_previous_result_so_they_are_never_shown_together() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::TestConnection);
+        sender
+            .send((generation, Err("nope".to_string())))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_ui.last_outcome.is_some());
+
+        // Starting something else drops the old outcome.
+        app.romm_operation = None;
+        assert!(app.start_romm_operation(context, RommOperation::TestConnection));
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "an old result beside new progress would be misleading"
+        );
+        // Tidy up: the worker that start spawned owns its own channels and will end
+        // on its own; dropping the app is enough.
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn a_mutating_operation_is_recorded_in_history_and_a_status_load_is_not() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let before = app.history.entries().count();
+        app.start_romm_status_load(context.clone());
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "reading local state is not an activity worth recording"
+        );
+        app.romm_operation = None;
+
+        assert!(app.start_romm_operation(context, RommOperation::ClearArtwork));
+        assert_eq!(
+            app.history.entries().count(),
+            before + 1,
+            "a mutating operation should be auditable"
+        );
+        app.romm_operation = None;
     }
 }
