@@ -209,10 +209,12 @@ impl ExternalVerification {
 /// Kept deliberately coarse: this is only ever used to decide whether an
 /// external record may lead, and a finer scale would invite pretending to a
 /// precision the comparison does not have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalEvidenceStrength {
-    /// ArchiveFS has no identity of its own for this file.
+    /// ArchiveFS has no identity of its own for this file. The default, so a
+    /// caller that has not looked cannot accidentally claim it has.
+    #[default]
     None,
     /// A folder alias, an extension, or another non-conclusive signal.
     Weak,

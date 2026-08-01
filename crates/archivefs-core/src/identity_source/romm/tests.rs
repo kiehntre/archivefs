@@ -477,12 +477,18 @@ fn pagination_returns_bounded_pages_and_clamps_the_page_size() {
 
     let page = client.roms_page(50, 0, None).expect("a page");
     assert_eq!(page.total, 120);
-    assert_eq!(page.limit, 50);
+    assert_eq!(page.requested_limit, 50);
+    assert_eq!(
+        page.reported_limit,
+        Some(50),
+        "the server's own limit is reported"
+    );
+    assert_eq!(page.reported_offset, Some(0));
     assert_eq!(page.items.len(), 50);
 
     // A caller asking for an unbounded page is clamped.
     let clamped = client.roms_page(u32::MAX, 0, None).expect("a page");
-    assert_eq!(clamped.limit, MAX_PAGE_SIZE);
+    assert_eq!(clamped.requested_limit, MAX_PAGE_SIZE);
     // And the request really carried the clamped limit and `with_files`.
     let urls = fake.urls();
     assert!(

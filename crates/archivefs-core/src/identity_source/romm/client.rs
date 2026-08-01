@@ -258,12 +258,31 @@ fn classify_transport_error(error: &ureq::Error) -> String {
 }
 
 /// One page of ROMs, as RomM's `CustomLimitOffsetPage` envelope carries it.
+///
+/// `reported_limit` and `reported_offset` are what the *server* said, not what
+/// was asked for. Keeping them distinct from the request is the whole point: an
+/// importer can only detect a server echoing the wrong page if it can see what
+/// the server claimed. They are `Option` because an older instance might omit
+/// them, and "the server did not say" is tolerable where "the server said
+/// something wrong" is not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RommRomPage {
     pub items: Vec<serde_json::Value>,
     pub total: u64,
-    pub limit: u32,
-    pub offset: u32,
+    /// The limit this client asked for, after clamping.
+    pub requested_limit: u32,
+    /// The offset this client asked for.
+    pub requested_offset: u32,
+    pub reported_limit: Option<u32>,
+    pub reported_offset: Option<u32>,
+}
+
+impl RommRomPage {
+    /// The page size to advance by: what the server reported, or what was asked
+    /// for when it reported nothing.
+    pub fn effective_limit(&self) -> u32 {
+        self.reported_limit.unwrap_or(self.requested_limit)
+    }
 }
 
 /// The read-only client.
@@ -390,11 +409,23 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
             .ok_or(RommRequestError::MalformedResponse {
                 detail: "the ROM page had no `total`".to_string(),
             })?;
+        // Read back what the server said about the page it sent, so a caller can
+        // check it against what was requested.
+        let reported_limit = document
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let reported_offset = document
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
         Ok(RommRomPage {
             items,
             total,
-            limit,
-            offset,
+            requested_limit: limit,
+            requested_offset: offset,
+            reported_limit,
+            reported_offset,
         })
     }
 

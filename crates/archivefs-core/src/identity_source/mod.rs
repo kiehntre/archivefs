@@ -15,10 +15,16 @@
 //! 3. **Local network only.** A provider endpoint is validated by
 //!    [`net_policy`] before anything connects to it.
 
+pub mod cache;
+pub mod hashing;
+pub mod matching;
 pub mod model;
 pub mod net_policy;
 pub mod path_map;
 pub mod romm;
+pub mod status;
 
+#[cfg(test)]
+mod stage1b_tests;
 #[cfg(test)]
 mod tests;

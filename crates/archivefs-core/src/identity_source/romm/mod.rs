@@ -23,6 +23,8 @@
 pub mod capability;
 pub mod client;
 pub mod config;
+pub mod import;
+pub mod normalise;
 
 #[cfg(test)]
 mod tests;
