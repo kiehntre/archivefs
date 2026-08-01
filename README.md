@@ -15,14 +15,12 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** `v0.5.0-alpha` is the latest tagged release. The current
-workspace is the untagged `v0.7.0-rc.1` candidate for manual testing. It adds
+**Release status:** the current release is `v0.7.0`. It adds
 the canonical 74-platform registry, evidence-based confidence, bounded Atari
 ST/Wii/PS2/GameCube identity, safer Dolphin profile resolution, PS2/GameCube/Wii
 GameHacking workflows, expanded Doctor diagnostics, and the optional browse-only
 BSFree Archive source. See
-[`docs/releases/v0.7.0-rc.1.md`](docs/releases/v0.7.0-rc.1.md) for the full
-release notes. No RC tag or GitHub Release exists yet.
+[`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md) for the full release notes.
 
 ## Principles
 
@@ -558,7 +556,8 @@ Platforms:
 - [Architecture overview](ARCHITECTURE.md) / [full architecture reference](docs/architecture.md)
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
-- [v0.7.0-rc.1 release notes](docs/releases/v0.7.0-rc.1.md)
+- [v0.7.0 release notes](docs/releases/v0.7.0.md)
+- [v0.7.0-rc.1 historical candidate notes](docs/releases/v0.7.0-rc.1.md)
 - [Domain model](docs/domain-model.md)
 - [Persistent database](docs/database.md) / [database design](docs/DATABASE_DESIGN.md) / [ADR 0001](docs/adr/0001-persistent-library-database.md)
 - [Managed library views](docs/library-views.md)

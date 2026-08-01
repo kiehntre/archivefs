@@ -11,11 +11,11 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.7.0-rc.1 (unreleased)
+## v0.7.0 (unreleased)
 
-This is the reviewed release-candidate scope. It has not been tagged or
-published. See [`docs/releases/v0.7.0-rc.1.md`](docs/releases/v0.7.0-rc.1.md)
-for installation, upgrade, workflow, and manual-test guidance.
+This is the approved v0.7 release scope. See
+[`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md) for installation,
+upgrade, workflow, and validation guidance.
 
 ### Added
 
@@ -83,6 +83,16 @@ for installation, upgrade, workflow, and manual-test guidance.
   query-only, never migrates it, and exposes no installation action in Stage 1.
 - Schema remains version 6 with migrations exactly `0001` through `0006`.
 
+### Manual validation
+
+- The `v0.7.0-rc.1` artifact passed real Sunshine desktop GUI testing before
+  promotion to this stable release.
+- Gamer View's fixed-height platform shelf, card alignment, and navigation
+  controls were verified on the real desktop.
+- Atari ST presentation was verified with the integrated `.st`/`.stx`
+  detection behavior.
+- BSFree was verified as Ready and browse-only, with no BSFree Install action.
+
 ### Known limitations
 
 - BSFree is browse-only. It neither converts nor installs codes, and its
@@ -100,6 +110,12 @@ for installation, upgrade, workflow, and manual-test guidance.
   until the relevant source is rescanned.
 - Symlink signature scanning is available only through trusted-root-aware
   inspection paths; arbitrary or escaping symlinks remain refused.
+
+## v0.7.0-rc.1 (historical candidate)
+
+Commit `113b508bd6839309cfd9e25d054094cc27112860` was the manually approved
+release candidate promoted to v0.7.0. Its original candidate notes remain at
+[`docs/releases/v0.7.0-rc.1.md`](docs/releases/v0.7.0-rc.1.md).
 
 ## Historical pre-RC integration notes
 

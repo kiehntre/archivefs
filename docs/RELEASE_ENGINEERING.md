@@ -78,7 +78,7 @@ Keep the archive and its `.sha256` file together, then run:
 
 ```sh
 scripts/verify-release-artifact.sh \
-  target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz
+  target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz
 ```
 
 The verifier checks the checksum filename and record, exact root layout,
@@ -91,7 +91,7 @@ Its negative regression suite uses generated fixtures and must also pass:
 
 ```sh
 scripts/test-release-artifact-verifier.sh \
-  target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz
+  target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz
 ```
 
 This proves rejection of a bad checksum, unexpected member, traversal path,
@@ -135,8 +135,8 @@ For a built artifact, also check both binaries and filenames:
 ```sh
 scripts/check-version-consistency.sh \
   --binary-dir target/release \
-  --artifact target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz \
-  --checksum target/release-artifacts/archivefs-v0.7.0-rc.1-x86_64-linux.tar.gz.sha256
+  --artifact target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz \
+  --checksum target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz.sha256
 ```
 
 The workspace packages, CLI output, GUI output, archive, checksum, README
@@ -225,15 +225,15 @@ release uses `vMAJOR.MINOR.PATCH` with no suffix. In both cases:
 4. create one annotated tag on that exact commit; and
 5. push only that tag, which starts the tag-only release workflow.
 
-For v0.7.0-rc.1, after every gate and explicit release authorization, the
+For v0.7.0, after every gate and explicit release authorization, the
 commands would be:
 
 ```sh
 git fetch origin
 git status --short
 git rev-parse HEAD
-git tag -a v0.7.0-rc.1 <VERIFIED_COMMIT_SHA> -m "ArchiveFS v0.7.0-rc.1"
-git push origin v0.7.0-rc.1
+git tag -a v0.7.0 <VERIFIED_COMMIT_SHA> -m "ArchiveFS v0.7.0"
+git push origin v0.7.0
 ```
 
 These commands are documentation, not authorization to run them. Never move or
