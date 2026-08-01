@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-cli"
-version = "0.7.0-alpha"
+version = "0.7.0"
 dependencies = [
  "archivefs-core",
  "log",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-core"
-version = "0.7.0-alpha"
+version = "0.7.0"
 dependencies = [
  "encoding_rs",
  "http",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-gui"
-version = "0.7.0-alpha"
+version = "0.7.0"
 dependencies = [
  "arboard",
  "archivefs-core",

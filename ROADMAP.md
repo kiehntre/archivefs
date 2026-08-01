@@ -186,11 +186,11 @@ These are implemented, tested, and in current use today:
 
 ## Current development
 
-The current workspace is the untagged `v0.7.0-alpha` integration candidate.
+The current workspace is the manually approved `v0.7.0` release branch.
 Direct-image discovery, canonical platform aliases, source platform assignment,
 platform-first navigation, Dolphin installation, and Xenia Canary patch support
-are integrated. The remaining release work is validation and manual QA; this
-roadmap does not imply that a tag or published artifact already exists.
+are integrated. Release publication is handled by the tag-only workflow; this
+roadmap does not imply that later feature work is part of v0.7.0.
 
 The shared `patch_manager` orchestration layer (platform filtering,
 ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
@@ -213,15 +213,12 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **`v0.7.0-alpha` manual QA and release gate** - validate real source
-   discovery, source assignment, platform navigation, Dolphin, Xenia, and the
-   extracted release artifact before creating any tag.
-2. **PCSX2 provider and safe PNACH merge** - remain read-only until
+1. **PCSX2 provider and safe PNACH merge** - remain read-only until
    per-section selection and conservative merging are designed and reviewed.
-3. **Performance profiling beyond smoke scale** - investigate larger
+2. **Performance profiling beyond smoke scale** - investigate larger
    catalogues only if measured traces identify a concrete bottleneck.
-4. **Mods work** - no general mod installation path exists yet.
-5. **Further adapters** - PPSSPP, RPCS3, Switch, MAME, and Amiga/WHDLoad
+3. **Mods work** - no general mod installation path exists yet.
+4. **Further adapters** - PPSSPP, RPCS3, Switch, MAME, and Amiga/WHDLoad
    remain research-only candidates and are not scheduled.
 
 Release process discipline (a documented, repeatable release checklist
