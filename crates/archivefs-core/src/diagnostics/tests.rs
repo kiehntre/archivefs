@@ -493,6 +493,15 @@ fn finding_ids_are_stable_and_namespaced_by_category() {
         (HealthCategory::TerminalFailure, "mounts.terminal_failure"),
         (HealthCategory::RetryableFailure, "mounts.retryable_failure"),
         (
+            HealthCategory::HistoricalMountFailure,
+            "mounts.historical_failure",
+        ),
+        (HealthCategory::MountNotRequired, "mounts.not_required"),
+        (
+            HealthCategory::MountFailureEvidenceInsufficient,
+            "mounts.failure_evidence_incomplete",
+        ),
+        (
             HealthCategory::RecoveryAvailable,
             "mounts.recovery_available",
         ),
@@ -829,6 +838,56 @@ fn health_issues_map_their_category_severity_and_known_recovery() {
                 .any(|item| item.starts_with("Classification: "))
         );
     }
+}
+
+#[test]
+fn non_current_mount_results_are_informational_read_only_findings() {
+    let issues = vec![
+        health_issue(
+            "/roms/historical.zip",
+            HealthCategory::HistoricalMountFailure,
+        ),
+        health_issue("/roms/game.md", HealthCategory::MountNotRequired),
+        health_issue(
+            "/roms/uncertain.zip",
+            HealthCategory::MountFailureEvidenceInsufficient,
+        ),
+    ];
+    let findings = findings_from_health_issues(&issues);
+
+    assert_eq!(findings.len(), 3);
+    for finding in &findings {
+        assert_eq!(finding.severity, DoctorSeverity::Info);
+        assert!(finding.repair.is_none());
+        assert!(finding.recovery.is_none());
+        assert_ne!(finding.id, "mounts.terminal_failure");
+    }
+    assert_eq!(
+        findings[0].measurements.get("mount_failure_scope"),
+        Some(&Measurement::Text("historical".to_string()))
+    );
+    assert_eq!(
+        findings[1].measurements.get("mount_required"),
+        Some(&Measurement::Flag(false))
+    );
+}
+
+#[test]
+fn structured_doctor_output_keeps_every_grouped_mount_finding() {
+    let issues: Vec<HealthIssue> = (0..842)
+        .map(|index| {
+            health_issue(
+                &format!("/roms/history/{index}.zip"),
+                HealthCategory::HistoricalMountFailure,
+            )
+        })
+        .collect();
+    let scan = run_doctor_scan(&only!(health_issues = issues.as_slice()));
+    let json = serde_json::to_value(&scan).expect("Doctor JSON");
+
+    assert_eq!(scan.findings.len(), 842);
+    assert_eq!(json["findings"].as_array().expect("findings").len(), 842);
+    assert!(scan.findings.iter().all(|finding| finding.repair.is_none()));
 }
 
 #[test]

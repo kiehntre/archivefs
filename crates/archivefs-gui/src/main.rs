@@ -4,7 +4,7 @@
 // its changed panel semantics are reviewed independently.
 #![allow(deprecated)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,19 +56,19 @@ use archivefs_core::patch_manager::{
     DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
-    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelection,
-    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
-    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
-    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
-    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
-    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
-    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
-    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
-    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
-    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
-    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
-    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
-    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelectReason,
+    EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection,
+    GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity,
+    GameCubeInstallPlanError, GameCubeInstallPlanErrorKind, GameHackingErrorKind,
+    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
+    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
+    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
+    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
+    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
+    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
+    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
     Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
     Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
     Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
@@ -2647,6 +2647,9 @@ enum HealthIssueFilter {
     MountFailures,
     Retryable,
     Terminal,
+    Historical,
+    NoMountRequired,
+    NeedsContext,
     AwaitingValidation,
     CachedOnly,
     RecoveryAvailable,
@@ -2654,12 +2657,15 @@ enum HealthIssueFilter {
 }
 
 impl HealthIssueFilter {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 12] = [
         Self::All,
         Self::Missing,
         Self::MountFailures,
         Self::Retryable,
         Self::Terminal,
+        Self::Historical,
+        Self::NoMountRequired,
+        Self::NeedsContext,
         Self::AwaitingValidation,
         Self::CachedOnly,
         Self::RecoveryAvailable,
@@ -2673,6 +2679,9 @@ impl HealthIssueFilter {
             Self::MountFailures => "Mount failures",
             Self::Retryable => "Retryable",
             Self::Terminal => "Terminal",
+            Self::Historical => "Historical mount failures",
+            Self::NoMountRequired => "No mount required",
+            Self::NeedsContext => "Needs context",
             Self::AwaitingValidation => "Awaiting validation",
             Self::CachedOnly => "Cached-only",
             Self::RecoveryAvailable => "Recovery available",
@@ -2690,6 +2699,9 @@ impl HealthIssueFilter {
             ),
             Self::Retryable => category == HealthCategory::RetryableFailure,
             Self::Terminal => category == HealthCategory::TerminalFailure,
+            Self::Historical => category == HealthCategory::HistoricalMountFailure,
+            Self::NoMountRequired => category == HealthCategory::MountNotRequired,
+            Self::NeedsContext => category == HealthCategory::MountFailureEvidenceInsufficient,
             Self::AwaitingValidation => category == HealthCategory::AwaitingValidation,
             Self::CachedOnly => category == HealthCategory::CachedOnly,
             Self::RecoveryAvailable => category == HealthCategory::RecoveryAvailable,
@@ -13913,85 +13925,15 @@ fn show_doctor_page(
             .id_salt(("doctor-category", category.label()))
             .default_open(true)
             .show(ui, |ui| {
-                for finding in findings {
-                    let is_selected = selected.as_deref() == Some(finding.id.as_str());
-                    widgets::card(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            widgets::status_badge(
-                                ui,
-                                finding.severity.label(),
-                                doctor_severity_tone(finding.severity),
-                            );
-                            ui.label(egui::RichText::new(&finding.title).strong());
-                        });
-                        ui.add(egui::Label::new(&finding.explanation).wrap());
-                        if let Some(affected) = &finding.affected {
-                            ui.add(
-                                egui::Label::new(format!("Resource: {}", affected.display)).wrap(),
-                            );
-                            if affected.lossy {
-                                ui.weak(
-                                    "This path contains bytes that are not valid text, so it is shown approximately.",
-                                );
-                            }
+                for repeated in doctor_presentation_groups(&findings) {
+                    if repeated_doctor_group_is_compact(&repeated) {
+                        show_repeated_doctor_group(ui, &repeated, selected, &mut action);
+                    } else {
+                        for finding in repeated {
+                            show_doctor_finding_card(ui, finding, selected, &mut action);
+                            ui.add_space(6.0);
                         }
-                        if widgets::action_button(
-                            ui,
-                            if is_selected { "Hide details" } else { "Details" },
-                            widgets::ActionStyle::Quiet,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            *selected = if is_selected {
-                                None
-                            } else {
-                                Some(finding.id.clone())
-                            };
-                        }
-                        if let Some(repair) = finding.offered_repair() {
-                            ui.horizontal_wrapped(|ui| {
-                                widgets::status_badge(
-                                    ui,
-                                    "Repair available",
-                                    widgets::StatusTone::Active,
-                                );
-                                ui.label(repair.title);
-                                widgets::status_badge(
-                                    ui,
-                                    match repair.risk {
-                                        archivefs_core::diagnostics::repair::DoctorRepairRisk::Safe => {
-                                            "Safe · confirmation required"
-                                        }
-                                        archivefs_core::diagnostics::repair::DoctorRepairRisk::NeedsConfirmation => {
-                                            "Changes real state · confirmation required"
-                                        }
-                                    },
-                                    widgets::StatusTone::Warning,
-                                );
-                            });
-                            if widgets::action_button(
-                                ui,
-                                "Review repair",
-                                widgets::ActionStyle::Secondary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action = Some(DoctorPageAction::ReviewRepair {
-                                    action: repair.action,
-                                    finding_id: finding.id.clone(),
-                                    affected: finding
-                                        .affected
-                                        .as_ref()
-                                        .map(|path| path.display.clone()),
-                                });
-                            }
-                        }
-                        if is_selected {
-                            show_doctor_finding_details(ui, finding);
-                        }
-                    });
+                    }
                     ui.add_space(6.0);
                 }
             });
@@ -14000,6 +13942,191 @@ fn show_doctor_page(
     ui.add_space(theme::SECTION_GAP);
     show_doctor_coverage(ui, scan);
     action
+}
+
+const DOCTOR_REPEATED_GROUP_EXAMPLES: usize = 10;
+
+fn doctor_presentation_groups<'a>(findings: &[&'a Finding]) -> Vec<Vec<&'a Finding>> {
+    let mut positions = HashMap::<&str, usize>::new();
+    let mut groups = Vec::<Vec<&Finding>>::new();
+    for finding in findings {
+        if let Some(position) = positions.get(finding.id.as_str()).copied() {
+            groups[position].push(*finding);
+        } else {
+            positions.insert(finding.id.as_str(), groups.len());
+            groups.push(vec![*finding]);
+        }
+    }
+    groups
+}
+
+fn repeated_doctor_group_is_compact(findings: &[&Finding]) -> bool {
+    findings.len() > DOCTOR_REPEATED_GROUP_EXAMPLES
+        && findings.first().is_some_and(|finding| {
+            matches!(
+                finding.id.as_str(),
+                "mounts.historical_failure"
+                    | "mounts.not_required"
+                    | "mounts.failure_evidence_incomplete"
+            )
+        })
+}
+
+fn repeated_doctor_group_heading(finding: &Finding, count: usize) -> String {
+    let label = match finding.id.as_str() {
+        "mounts.historical_failure" => "Historical mount failures",
+        "mounts.not_required" => "Items needing no archive mount",
+        "mounts.failure_evidence_incomplete" => "Mount results with insufficient evidence",
+        _ => finding.title.as_str(),
+    };
+    format!("{label}: {count}")
+}
+
+fn repeated_doctor_group_counts(findings: &[&Finding], key: &str) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for finding in findings {
+        if let Some(value) = finding.measurements.get(key) {
+            *counts.entry(value.to_string()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(value, count)| format!("{value}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn show_repeated_doctor_group(
+    ui: &mut egui::Ui,
+    findings: &[&Finding],
+    selected: &mut Option<String>,
+    action: &mut Option<DoctorPageAction>,
+) {
+    let Some(first) = findings.first() else {
+        return;
+    };
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                first.severity.label(),
+                doctor_severity_tone(first.severity),
+            );
+            ui.label(
+                egui::RichText::new(repeated_doctor_group_heading(first, findings.len())).strong(),
+            );
+        });
+        ui.add(egui::Label::new(&first.explanation).wrap());
+        for (label, key) in [
+            ("By reason", "reason"),
+            ("By platform", "platform"),
+            ("By media kind", "media_kind"),
+            ("By evidence", "mount_failure_scope"),
+        ] {
+            let counts = repeated_doctor_group_counts(findings, key);
+            if !counts.is_empty() {
+                ui.label(format!("{label}: {counts}"));
+            }
+        }
+        ui.strong(format!(
+            "Examples (first {} of {})",
+            DOCTOR_REPEATED_GROUP_EXAMPLES,
+            findings.len()
+        ));
+        for finding in findings.iter().take(DOCTOR_REPEATED_GROUP_EXAMPLES) {
+            if let Some(affected) = &finding.affected {
+                ui.add(egui::Label::new(format!("• {}", affected.display)).wrap());
+            }
+        }
+        egui::CollapsingHeader::new(format!("Show all {} findings", findings.len()))
+            .id_salt(("doctor-repeated-group", first.id.as_str()))
+            .default_open(false)
+            .show(ui, |ui| {
+                for finding in findings {
+                    show_doctor_finding_card(ui, finding, selected, action);
+                    ui.add_space(6.0);
+                }
+            });
+        ui.weak(
+            "Copy report exports every underlying finding; grouping changes presentation only.",
+        );
+    });
+}
+
+fn show_doctor_finding_card(
+    ui: &mut egui::Ui,
+    finding: &Finding,
+    selected: &mut Option<String>,
+    action: &mut Option<DoctorPageAction>,
+) {
+    let is_selected = selected.as_deref() == Some(finding.id.as_str());
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                finding.severity.label(),
+                doctor_severity_tone(finding.severity),
+            );
+            ui.label(egui::RichText::new(&finding.title).strong());
+        });
+        ui.add(egui::Label::new(&finding.explanation).wrap());
+        if let Some(affected) = &finding.affected {
+            ui.add(egui::Label::new(format!("Resource: {}", affected.display)).wrap());
+            if affected.lossy {
+                ui.weak(
+                    "This path contains bytes that are not valid text, so it is shown approximately.",
+                );
+            }
+        }
+        if widgets::action_button(
+            ui,
+            if is_selected {
+                "Hide details"
+            } else {
+                "Details"
+            },
+            widgets::ActionStyle::Quiet,
+            true,
+        )
+        .clicked()
+        {
+            *selected = if is_selected {
+                None
+            } else {
+                Some(finding.id.clone())
+            };
+        }
+        if let Some(repair) = finding.offered_repair() {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(ui, "Repair available", widgets::StatusTone::Active);
+                ui.label(repair.title);
+                widgets::status_badge(
+                    ui,
+                    match repair.risk {
+                        archivefs_core::diagnostics::repair::DoctorRepairRisk::Safe => {
+                            "Safe · confirmation required"
+                        }
+                        archivefs_core::diagnostics::repair::DoctorRepairRisk::NeedsConfirmation => {
+                            "Changes real state · confirmation required"
+                        }
+                    },
+                    widgets::StatusTone::Warning,
+                );
+            });
+            if widgets::action_button(ui, "Review repair", widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                *action = Some(DoctorPageAction::ReviewRepair {
+                    action: repair.action,
+                    finding_id: finding.id.clone(),
+                    affected: finding.affected.as_ref().map(|path| path.display.clone()),
+                });
+            }
+        }
+        if is_selected {
+            show_doctor_finding_details(ui, finding);
+        }
+    });
 }
 
 /// The confirmation screen. The only route to executing a repair, and it
@@ -23260,6 +23387,11 @@ fn show_dolphin_profile_card(
                     == Some(profile.profile_id.as_str());
                 if ui.radio(selected, &profile.profile_id).clicked() {
                     workflow.selected_dolphin_profile_id = Some(profile.profile_id.clone());
+                    workflow.dolphin_profile_choice = Some(profile.profile_id.clone());
+                    workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+                        profile_id: profile.profile_id.clone(),
+                        reason: EmulatorProfileSelectReason::ExplicitChoice,
+                    });
                     workflow.dolphin_inventory_profile_id = None;
                     workflow.dolphin_inventory = CheatStepResource::NotLoaded;
                     workflow.dolphin_provider_selection = None;
@@ -23269,12 +23401,8 @@ fn show_dolphin_profile_card(
                     workflow.transaction = CheatTransactionState::Idle;
                     bind_dolphin_provider_to_configuration(workflow, &profile.configuration_path);
                 }
-                if selected {
-                    widgets::status_badge(
-                        ui,
-                        "Active Dolphin profile",
-                        widgets::StatusTone::Success,
-                    );
+                if let Some(label) = dolphin_profile_selection_badge(workflow, profile) {
+                    widgets::status_badge(ui, label, widgets::StatusTone::Success);
                 }
             } else {
                 widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
@@ -23329,6 +23457,35 @@ fn show_dolphin_profile_card(
             ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
         }
     });
+}
+
+/// A checked radio button only says which destination the workflow is bound
+/// to. It does not prove Dolphin is running. Runtime wording therefore needs
+/// both the selection reason and the profile's verified runtime confidence.
+fn dolphin_profile_selection_badge(
+    workflow: &CheatWorkflowState,
+    profile: &DolphinProfile,
+) -> Option<&'static str> {
+    if workflow.selected_dolphin_profile_id.as_deref() != Some(profile.profile_id.as_str()) {
+        return None;
+    }
+    match workflow.dolphin_profile_selection.as_ref() {
+        Some(EmulatorProfileSelection::Auto {
+            profile_id,
+            reason: EmulatorProfileSelectReason::StrongestEvidence,
+        }) if profile_id == &profile.profile_id
+            && profile.resolved.confidence
+                == archivefs_core::patch_manager::EmulatorProfileConfidence::RunningExplicit =>
+        {
+            Some("Running Dolphin profile")
+        }
+        Some(EmulatorProfileSelection::Auto {
+            profile_id,
+            reason:
+                EmulatorProfileSelectReason::ExplicitChoice | EmulatorProfileSelectReason::Remembered,
+        }) if profile_id == &profile.profile_id => Some("Selected Dolphin profile"),
+        _ => None,
+    }
 }
 
 fn show_dolphin_inventory(
@@ -28416,7 +28573,10 @@ fn build_health_issues(
             platform: persisted.platform.as_deref(),
             presence,
             mount_state: None,
-            archive_health: None,
+            // A database value is retained history, never proof that a
+            // failure is happening in this GUI session. Supplying no mount
+            // state lets the shared classifier preserve that distinction.
+            archive_health: persisted_failure_health(&persisted.last_known_health),
             recovery_offer: None,
             last_seen_at: Some(&persisted.last_seen_at),
             size_bytes: persisted.size_bytes,
@@ -28434,6 +28594,18 @@ fn build_health_issues(
             .then_with(|| left.path.cmp(&right.path))
     });
     issues
+}
+
+fn persisted_failure_health(value: &str) -> Option<archivefs_core::ArchiveHealth> {
+    match value {
+        "Failed" => Some(archivefs_core::ArchiveHealth::Failed),
+        "MissingParts" => Some(archivefs_core::ArchiveHealth::MissingParts),
+        "Corrupt" => Some(archivefs_core::ArchiveHealth::Corrupt),
+        "Unsupported" => Some(archivefs_core::ArchiveHealth::Unsupported),
+        "PermissionDenied" => Some(archivefs_core::ArchiveHealth::PermissionDenied),
+        "RetryAvailable" => Some(archivefs_core::ArchiveHealth::RetryAvailable),
+        _ => None,
+    }
 }
 
 /// A human-readable state label - never `MountState`'s raw `Display`
@@ -28520,6 +28692,9 @@ struct HealthOverview {
     cached_only: usize,
     retryable_failures: usize,
     terminal_failures: usize,
+    historical_mount_failures: usize,
+    no_mount_required: usize,
+    mount_results_needing_context: usize,
     unknown_platform: usize,
     recovery_available: usize,
     diagnostics_errors: usize,
@@ -28543,6 +28718,9 @@ fn health_overview(
     let cached_only = count(HealthCategory::CachedOnly);
     let retryable_failures = count(HealthCategory::RetryableFailure);
     let terminal_failures = count(HealthCategory::TerminalFailure);
+    let historical_mount_failures = count(HealthCategory::HistoricalMountFailure);
+    let no_mount_required = count(HealthCategory::MountNotRequired);
+    let mount_results_needing_context = count(HealthCategory::MountFailureEvidenceInsufficient);
     let unknown_platform = count(HealthCategory::UnknownPlatform);
     let recovery_available = count(HealthCategory::RecoveryAvailable);
     // Every `UnknownPlatform`/failure/recovery issue is a live archive -
@@ -28562,6 +28740,9 @@ fn health_overview(
         cached_only,
         retryable_failures,
         terminal_failures,
+        historical_mount_failures,
+        no_mount_required,
+        mount_results_needing_context,
         unknown_platform,
         recovery_available,
         diagnostics_errors,
@@ -28581,6 +28762,9 @@ fn health_issue_filter_for_category(category: HealthCategory) -> HealthIssueFilt
     match category {
         HealthCategory::TerminalFailure => HealthIssueFilter::Terminal,
         HealthCategory::RetryableFailure => HealthIssueFilter::Retryable,
+        HealthCategory::HistoricalMountFailure => HealthIssueFilter::Historical,
+        HealthCategory::MountNotRequired => HealthIssueFilter::NoMountRequired,
+        HealthCategory::MountFailureEvidenceInsufficient => HealthIssueFilter::NeedsContext,
         HealthCategory::RecoveryAvailable => HealthIssueFilter::RecoveryAvailable,
         HealthCategory::Missing => HealthIssueFilter::Missing,
         HealthCategory::AwaitingValidation => HealthIssueFilter::AwaitingValidation,
@@ -28686,6 +28870,21 @@ fn show_health_dashboard_panel(
             tone: widgets::StatusTone::Blocked,
         },
         SummaryMetric {
+            label: "Historical mount failures",
+            value: overview.historical_mount_failures,
+            tone: widgets::StatusTone::Info,
+        },
+        SummaryMetric {
+            label: "No mount required",
+            value: overview.no_mount_required,
+            tone: widgets::StatusTone::Info,
+        },
+        SummaryMetric {
+            label: "Mount results needing context",
+            value: overview.mount_results_needing_context,
+            tone: widgets::StatusTone::Pending,
+        },
+        SummaryMetric {
             label: "Recovery available",
             value: overview.recovery_available,
             tone: widgets::StatusTone::Info,
@@ -28714,8 +28913,9 @@ fn show_health_dashboard_panel(
     show_health_metric_cards(ui, &metrics);
     ui.label(
         "Healthy/Mounted/Pending/Retryable/Terminal/Recovery available/Unknown platform: current \
-         live snapshot. Missing/Awaiting validation/Cached-only: persisted catalogue. \
-         Diagnostics errors: last Doctor check.",
+         live snapshot. Historical: retained catalogue evidence. No mount required: loose content \
+         that bypasses the archive mount workflow. Missing/Awaiting validation/Cached-only: \
+         persisted catalogue. Diagnostics errors: last Doctor check.",
     );
     ui.add_space(4.0);
 
@@ -37525,6 +37725,112 @@ mod tests {
         profile
     }
 
+    fn set_dolphin_selection(
+        workflow: &mut CheatWorkflowState,
+        profile_id: &str,
+        reason: EmulatorProfileSelectReason,
+    ) {
+        workflow.selected_dolphin_profile_id = Some(profile_id.to_string());
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
+            profile_id: profile_id.to_string(),
+            reason,
+        });
+    }
+
+    #[test]
+    fn verified_runtime_profile_uses_running_wording() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut profile = dolphin_profile_fixture();
+        profile.resolved.confidence = EmulatorProfileConfidence::RunningExplicit;
+        set_dolphin_selection(
+            workflow,
+            &profile.profile_id,
+            EmulatorProfileSelectReason::StrongestEvidence,
+        );
+
+        assert_eq!(
+            dolphin_profile_selection_badge(workflow, &profile),
+            Some("Running Dolphin profile")
+        );
+    }
+
+    #[test]
+    fn manual_profile_uses_selected_wording_not_active_or_running() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let profile = dolphin_profile_fixture();
+        set_dolphin_selection(
+            workflow,
+            &profile.profile_id,
+            EmulatorProfileSelectReason::ExplicitChoice,
+        );
+
+        assert_eq!(
+            dolphin_profile_selection_badge(workflow, &profile),
+            Some("Selected Dolphin profile")
+        );
+
+        let ctx = egui::Context::default();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_dolphin_profile_card(ui, workflow, &profile, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Selected Dolphin profile"));
+        assert!(!rendered_text_contains(&output, "Active Dolphin profile"));
+        assert!(!rendered_text_contains(&output, "Running Dolphin profile"));
+    }
+
+    #[test]
+    fn ambiguous_unselected_profiles_have_no_profile_badge() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.selected_dolphin_profile_id = None;
+        workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::NeedsChoice {
+            candidates: Vec::new(),
+        });
+
+        assert_eq!(
+            dolphin_profile_selection_badge(workflow, &dolphin_profile_fixture()),
+            None
+        );
+    }
+
+    #[test]
+    fn remembered_explicit_profile_is_selected_not_running() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut profile = dolphin_profile_fixture();
+        profile.resolved.confidence = EmulatorProfileConfidence::RunningExplicit;
+        set_dolphin_selection(
+            workflow,
+            &profile.profile_id,
+            EmulatorProfileSelectReason::Remembered,
+        );
+
+        assert_eq!(
+            dolphin_profile_selection_badge(workflow, &profile),
+            Some("Selected Dolphin profile")
+        );
+    }
+
+    #[test]
+    fn speculative_or_only_valid_fallback_is_never_labelled_running() {
+        let mut app = app_with_cheats_mods_context();
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut profile = dolphin_profile_fixture();
+        profile.resolved.confidence = EmulatorProfileConfidence::Speculative;
+        set_dolphin_selection(
+            workflow,
+            &profile.profile_id,
+            EmulatorProfileSelectReason::OnlyValidProfile,
+        );
+
+        assert_eq!(dolphin_profile_selection_badge(workflow, &profile), None);
+    }
+
     /// Drives `poll_dolphin_profiles` to completion with a synthetic
     /// discovery result, exactly like a real background scan finishing -
     /// without touching the filesystem.
@@ -43006,6 +43312,58 @@ $Instant Growth [Nayr]\n";
                 );
             });
         })
+    }
+
+    #[test]
+    fn large_historical_mount_group_renders_summary_and_ten_examples_only() {
+        let issues: Vec<HealthIssue> = (0..12)
+            .map(|index| {
+                doctor_health_issue(
+                    &format!("/roms/history/{index:03}.zip"),
+                    HealthCategory::HistoricalMountFailure,
+                )
+            })
+            .collect();
+        let scan = doctor_scan_from(&issues);
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut None);
+
+        assert!(rendered_text_contains(
+            &output,
+            "Historical mount failures: 12"
+        ));
+        assert!(rendered_text_contains(&output, "Examples (first 10 of 12)"));
+        assert!(rendered_text_contains(&output, "/roms/history/009.zip"));
+        assert!(
+            !rendered_text_contains(&output, "/roms/history/010.zip"),
+            "the collapsed full list must not eagerly render hundreds of rows"
+        );
+        assert!(rendered_text_contains(&output, "Show all 12 findings"));
+        assert!(rendered_text_contains(
+            &output,
+            "Copy report exports every underlying finding"
+        ));
+    }
+
+    #[test]
+    fn copied_doctor_report_keeps_every_finding_hidden_by_gui_grouping() {
+        let issues: Vec<HealthIssue> = (0..12)
+            .map(|index| {
+                doctor_health_issue(
+                    &format!("/roms/history/{index:03}.zip"),
+                    HealthCategory::HistoricalMountFailure,
+                )
+            })
+            .collect();
+        let scan = doctor_scan_from(&issues);
+        let text = doctor_scan_report_text(&DoctorScanOutcome {
+            scan,
+            finished_at_unix_seconds: 1_700_000_000,
+        });
+
+        for index in 0..12 {
+            assert!(text.contains(&format!("/roms/history/{index:03}.zip")));
+        }
     }
 
     /// A storage scan built from values, so the page can be exercised without
@@ -51955,6 +52313,52 @@ $Instant Growth [Nayr]\n";
         assert_eq!(terminal_issue.category, HealthCategory::TerminalFailure);
         assert!(!terminal_issue.retryable);
         assert_eq!(terminal_issue.recovery_action, None);
+    }
+
+    #[test]
+    fn build_health_issues_marks_loose_roms_and_scummvm_gen_resources_as_no_mount_required() {
+        let loose_rom = health_test_record(
+            "/roms/genesis/3 Ninjas Kick Back (USA).md",
+            MountState::NotMountable,
+            ArchiveHealth::Unsupported,
+            Some("MegaDrive"),
+        );
+        let scummvm_resource = health_test_record(
+            "/roms/scummvm/laurabow2/RESOURCE.GEN",
+            MountState::NotMountable,
+            ArchiveHealth::Unsupported,
+            Some("ScummVM"),
+        );
+        let issues = build_health_issues(
+            &[loose_rom, scummvm_resource],
+            &cached_snapshot(Vec::new()),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(issues.len(), 2);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.category == HealthCategory::MountNotRequired)
+        );
+        assert!(issues.iter().all(|issue| !issue.retryable));
+        assert!(issues.iter().all(|issue| issue.recovery_action.is_none()));
+    }
+
+    #[test]
+    fn persisted_failure_without_a_live_record_is_historical() {
+        let mut persisted = persisted_archive(PathBuf::from("/roms/old/Game.zip"), false);
+        persisted.last_known_health = "Corrupt".to_string();
+        let issues = build_health_issues(
+            &[],
+            &cached_snapshot(vec![persisted]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].category, HealthCategory::HistoricalMountFailure);
     }
 
     #[test]

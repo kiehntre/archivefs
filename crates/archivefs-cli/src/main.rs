@@ -9081,6 +9081,37 @@ mod doctor_stage1c_tests {
         );
     }
 
+    #[test]
+    fn cli_and_json_keep_every_historical_mount_finding() {
+        let issues = (0..842)
+            .map(|index| archivefs_core::HealthIssue {
+                path: PathBuf::from(format!("/roms/history/{index:03}.zip")),
+                platform: Some("Test".to_string()),
+                present: true,
+                mount_state: None,
+                category: archivefs_core::HealthCategory::HistoricalMountFailure,
+                reason: "retained historical mount evidence".to_string(),
+                retryable: false,
+                recovery_action: None,
+                last_seen_at: Some("2025-01-01T00:00:00Z".to_string()),
+                size_bytes: None,
+                modified_time_unix_seconds: None,
+            })
+            .collect::<Vec<_>>();
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.health_issues = Gathered::Ready(&issues);
+        let scan = run_doctor_scan(&inputs);
+
+        let text = format_doctor_scan(&scan);
+        let json = serde_json::to_value(&scan).expect("serialise Doctor scan");
+
+        assert_eq!(scan.findings.len(), 842);
+        assert_eq!(json["findings"].as_array().unwrap().len(), 842);
+        for index in 0..842 {
+            assert!(text.contains(&format!("/roms/history/{index:03}.zip")));
+        }
+    }
+
     /// Test 93
     #[test]
     fn a_read_only_filesystem_is_reported_under_filesystems_with_a_flag() {

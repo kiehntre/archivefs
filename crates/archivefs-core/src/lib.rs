@@ -3398,6 +3398,16 @@ pub enum HealthCategory {
     /// A live mount attempt failed in a way [`ArchiveHealth::is_retryable`]
     /// says may succeed if retried.
     RetryableFailure,
+    /// A failure value retained from an earlier catalogue observation. It is
+    /// evidence that something failed before, not evidence of a failure in
+    /// the current process/session.
+    HistoricalMountFailure,
+    /// The item is deliberately catalogued as a loose game/resource and the
+    /// archive mount backend is not applicable to it.
+    MountNotRequired,
+    /// A failure value exists, but neither current mount state nor a retained
+    /// observation timestamp establishes when it happened.
+    MountFailureEvidenceInsufficient,
     /// A remount or lazy-unmount recovery offer is currently active for
     /// this exact archive in this session.
     RecoveryAvailable,
@@ -3422,10 +3432,13 @@ impl HealthCategory {
             Self::TerminalFailure => 1,
             Self::RetryableFailure => 2,
             Self::RecoveryAvailable => 3,
-            Self::Missing => 4,
-            Self::AwaitingValidation => 5,
-            Self::CachedOnly => 6,
-            Self::UnknownPlatform => 7,
+            Self::HistoricalMountFailure => 4,
+            Self::MountFailureEvidenceInsufficient => 5,
+            Self::MountNotRequired => 6,
+            Self::Missing => 7,
+            Self::AwaitingValidation => 8,
+            Self::CachedOnly => 9,
+            Self::UnknownPlatform => 10,
         }
     }
 
@@ -3439,6 +3452,9 @@ impl HealthCategory {
         match self {
             Self::TerminalFailure => "Terminal failure",
             Self::RetryableFailure => "Retryable failure",
+            Self::HistoricalMountFailure => "Historical mount failure",
+            Self::MountNotRequired => "No mount required",
+            Self::MountFailureEvidenceInsufficient => "Earlier mount result needs context",
             Self::RecoveryAvailable => "Recovery available",
             Self::Missing => "Missing",
             Self::AwaitingValidation => "Awaiting validation",
@@ -3502,9 +3518,11 @@ pub struct ArchiveHealthInput<'a> {
     pub path: &'a Path,
     pub platform: Option<&'a str>,
     pub presence: ArchivePresence,
-    /// `Some` only for a live, current-session mount attempt.
+    /// `Some` establishes current-session context. `None` keeps a retained
+    /// health value historical/uncertain rather than silently promoting it.
     pub mount_state: Option<MountState>,
-    /// `Some` only for a live, current-session mount attempt.
+    /// A current value when `mount_state` is present, or a retained value
+    /// when the caller supplies it without current mount state.
     pub archive_health: Option<ArchiveHealth>,
     pub recovery_offer: Option<RecoveryOffer>,
     pub last_seen_at: Option<&'a str>,
@@ -3538,8 +3556,21 @@ impl HealthIssue {
 
 fn health_issue_reason(category: HealthCategory, recovery_offer: Option<RecoveryOffer>) -> String {
     match category {
-        HealthCategory::TerminalFailure => "Mount failure requires manual review".to_string(),
+        HealthCategory::TerminalFailure => {
+            "A current mount input remains in a terminal failure state".to_string()
+        }
         HealthCategory::RetryableFailure => "Mount failed and may be retried".to_string(),
+        HealthCategory::HistoricalMountFailure => {
+            "An earlier stored observation recorded a mount failure; this is not a current failure"
+                .to_string()
+        }
+        HealthCategory::MountNotRequired => {
+            "This loose game or resource is catalogued directly and does not use the archive mount workflow"
+                .to_string()
+        }
+        HealthCategory::MountFailureEvidenceInsufficient => {
+            "A failure value was recorded without enough evidence to call it current".to_string()
+        }
         HealthCategory::RecoveryAvailable => match recovery_offer {
             Some(RecoveryOffer::Remount) => "Remount is available".to_string(),
             Some(RecoveryOffer::LazyUnmount) => "Lazy-unmount recovery is available".to_string(),
@@ -3566,13 +3597,22 @@ fn health_issue_reason(category: HealthCategory, recovery_offer: Option<Recovery
 /// archive gets exactly one category, its single most severe applicable
 /// one, never more than one.
 pub fn classify_archive_health(input: &ArchiveHealthInput<'_>) -> Option<HealthIssue> {
-    let category = input.archive_health.and_then(|health| {
-        if health.is_terminal_without_source_change() {
-            Some(HealthCategory::TerminalFailure)
-        } else if health.is_retryable() {
-            Some(HealthCategory::RetryableFailure)
+    let recorded_failure = input
+        .archive_health
+        .filter(|health| health.is_terminal_without_source_change() || health.is_retryable());
+    let category = recorded_failure.map(|health| {
+        if input.mount_state == Some(MountState::NotMountable) {
+            HealthCategory::MountNotRequired
+        } else if input.mount_state.is_some() {
+            if health.is_terminal_without_source_change() {
+                HealthCategory::TerminalFailure
+            } else {
+                HealthCategory::RetryableFailure
+            }
+        } else if input.last_seen_at.is_some() {
+            HealthCategory::HistoricalMountFailure
         } else {
-            None
+            HealthCategory::MountFailureEvidenceInsufficient
         }
     });
 
@@ -3605,7 +3645,14 @@ pub fn classify_archive_health(input: &ArchiveHealthInput<'_>) -> Option<HealthI
             Some(RecoveryOffer::LazyUnmount) => Some(RecoveryAction::LazyUnmount),
             None => None,
         },
-        _ => None,
+        HealthCategory::HistoricalMountFailure
+        | HealthCategory::MountNotRequired
+        | HealthCategory::MountFailureEvidenceInsufficient
+        | HealthCategory::TerminalFailure
+        | HealthCategory::Missing
+        | HealthCategory::AwaitingValidation
+        | HealthCategory::CachedOnly
+        | HealthCategory::UnknownPlatform => None,
     };
     let reason = health_issue_reason(category, input.recovery_offer);
 
@@ -8848,6 +8895,64 @@ mod tests {
     }
 
     #[test]
+    fn retained_mount_failures_are_historical_not_current_errors() {
+        let path = PathBuf::from("/roms/old/Game.zip");
+        let issue = classify_archive_health(&ArchiveHealthInput {
+            mount_state: None,
+            archive_health: Some(ArchiveHealth::Corrupt),
+            last_seen_at: Some("2025-01-01T00:00:00Z"),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+
+        assert_eq!(issue.category, HealthCategory::HistoricalMountFailure);
+        assert!(issue.reason.contains("not a current failure"));
+        assert_eq!(issue.recovery_action, None);
+    }
+
+    #[test]
+    fn loose_content_that_bypasses_mounting_is_not_a_terminal_failure() {
+        for path in [
+            "/roms/genesis/Wrong Filename [XXXXXX].md",
+            "/roms/scummvm/laurabow2/RESOURCE.GEN",
+        ] {
+            let path = PathBuf::from(path);
+            let issue = classify_archive_health(&ArchiveHealthInput {
+                mount_state: Some(MountState::NotMountable),
+                archive_health: Some(ArchiveHealth::Unsupported),
+                ..healthy_health_input(&path)
+            })
+            .unwrap();
+            assert_eq!(issue.category, HealthCategory::MountNotRequired);
+            assert!(
+                issue
+                    .reason
+                    .contains("does not use the archive mount workflow")
+            );
+            assert_eq!(issue.recovery_action, None);
+        }
+    }
+
+    #[test]
+    fn failure_without_current_or_historical_evidence_stays_uncertain() {
+        let path = PathBuf::from("/roms/unknown/Game.zip");
+        let issue = classify_archive_health(&ArchiveHealthInput {
+            mount_state: None,
+            archive_health: Some(ArchiveHealth::Failed),
+            last_seen_at: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+
+        assert_eq!(
+            issue.category,
+            HealthCategory::MountFailureEvidenceInsufficient
+        );
+        assert!(!issue.retryable);
+        assert_eq!(issue.recovery_action, None);
+    }
+
+    #[test]
     fn missing_and_cached_only_states_remain_distinct() {
         let path = PathBuf::from("/roms/a/Game.zip");
         let missing = classify_archive_health(&ArchiveHealthInput {
@@ -8976,6 +9081,9 @@ mod tests {
             HealthCategory::CachedOnly,
             HealthCategory::AwaitingValidation,
             HealthCategory::Missing,
+            HealthCategory::MountNotRequired,
+            HealthCategory::MountFailureEvidenceInsufficient,
+            HealthCategory::HistoricalMountFailure,
             HealthCategory::RecoveryAvailable,
             HealthCategory::RetryableFailure,
             HealthCategory::TerminalFailure,
@@ -8987,6 +9095,9 @@ mod tests {
                 HealthCategory::TerminalFailure,
                 HealthCategory::RetryableFailure,
                 HealthCategory::RecoveryAvailable,
+                HealthCategory::HistoricalMountFailure,
+                HealthCategory::MountFailureEvidenceInsufficient,
+                HealthCategory::MountNotRequired,
                 HealthCategory::Missing,
                 HealthCategory::AwaitingValidation,
                 HealthCategory::CachedOnly,

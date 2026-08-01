@@ -882,6 +882,11 @@ fn health_category_severity(category: HealthCategory) -> DoctorSeverity {
         HealthCategory::RetryableFailure => DoctorSeverity::Warning,
         HealthCategory::RecoveryAvailable => DoctorSeverity::Warning,
         HealthCategory::Missing => DoctorSeverity::Warning,
+        // Stored or incomplete evidence must never masquerade as a current
+        // emergency. A loose item that needs no mount is informational too.
+        HealthCategory::HistoricalMountFailure
+        | HealthCategory::MountNotRequired
+        | HealthCategory::MountFailureEvidenceInsufficient => DoctorSeverity::Info,
         // Both of these are ordinary transitional states, not faults.
         HealthCategory::AwaitingValidation => DoctorSeverity::Info,
         HealthCategory::CachedOnly => DoctorSeverity::Info,
@@ -894,7 +899,10 @@ fn health_issue_doctor_category(category: HealthCategory) -> DoctorCategory {
         // Live mount outcomes belong under Mounts...
         HealthCategory::TerminalFailure
         | HealthCategory::RetryableFailure
-        | HealthCategory::RecoveryAvailable => DoctorCategory::Mounts,
+        | HealthCategory::RecoveryAvailable
+        | HealthCategory::HistoricalMountFailure
+        | HealthCategory::MountNotRequired
+        | HealthCategory::MountFailureEvidenceInsufficient => DoctorCategory::Mounts,
         // ...catalogue facts belong under Library.
         HealthCategory::Missing
         | HealthCategory::AwaitingValidation
@@ -908,6 +916,9 @@ fn health_issue_id(category: HealthCategory) -> &'static str {
         HealthCategory::TerminalFailure => "mounts.terminal_failure",
         HealthCategory::RetryableFailure => "mounts.retryable_failure",
         HealthCategory::RecoveryAvailable => "mounts.recovery_available",
+        HealthCategory::HistoricalMountFailure => "mounts.historical_failure",
+        HealthCategory::MountNotRequired => "mounts.not_required",
+        HealthCategory::MountFailureEvidenceInsufficient => "mounts.failure_evidence_incomplete",
         HealthCategory::Missing => "library.archive_missing",
         HealthCategory::AwaitingValidation => "library.awaiting_validation",
         HealthCategory::CachedOnly => "library.cached_only",
@@ -938,8 +949,10 @@ fn health_issue_recovery(issue: &HealthIssue) -> Option<KnownRecovery> {
 
 /// Adapts `classify_archive_health`'s output. Both callers already produce
 /// these: the GUI via `build_health_issues` (live records + catalogue), the
-/// CLI via `catalogue_health_report` (catalogue only). Neither the
-/// classifier nor its priority rules are touched here.
+/// CLI via `catalogue_health_report` (catalogue only). The category already
+/// carries whether failure evidence was current, historical, unnecessary, or
+/// insufficient; this adapter preserves that distinction in IDs, severity,
+/// prose, and typed measurements.
 pub fn findings_from_health_issues(issues: &[HealthIssue]) -> Vec<Finding> {
     issues
         .iter()
@@ -973,6 +986,32 @@ pub fn findings_from_health_issues(issues: &[HealthIssue]) -> Vec<Finding> {
             )
             .with_affected_path(&issue.path)
             .with_evidence(evidence);
+            let failure_scope = match issue.category {
+                HealthCategory::TerminalFailure | HealthCategory::RetryableFailure => "current",
+                HealthCategory::HistoricalMountFailure => "historical",
+                HealthCategory::MountNotRequired => "not_required",
+                HealthCategory::MountFailureEvidenceInsufficient => "insufficient_evidence",
+                _ => "not_applicable",
+            };
+            let media_kind = issue
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase())
+                .unwrap_or_else(|| "unknown".to_string());
+            finding = finding.with_measurements([
+                ("mount_failure_scope", Measurement::text(failure_scope)),
+                (
+                    "mount_required",
+                    Measurement::Flag(issue.category != HealthCategory::MountNotRequired),
+                ),
+                ("media_kind", Measurement::text(media_kind)),
+                ("reason", Measurement::text(&issue.reason)),
+                (
+                    "platform",
+                    Measurement::text(issue.platform.as_deref().unwrap_or("unassigned")),
+                ),
+            ]);
             if let Some(recovery) = health_issue_recovery(issue) {
                 finding = finding.with_recovery(recovery);
             }
