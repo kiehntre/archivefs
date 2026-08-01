@@ -4,6 +4,10 @@ Status: Platform Artwork Pack v1 adds exact hardware illustrations to the
 existing Gamer View platform shelf without changing its filtering, selection,
 scrolling, or fallback model.
 
+The complete 74-platform inventory, candidate-file audit, canonical filenames,
+and prompts for missing images live in
+[`PLATFORM_ARTWORK_STATUS.md`](PLATFORM_ARTWORK_STATUS.md).
+
 ## Runtime policy
 
 Artwork resolution is deterministic and strictly ordered:
@@ -49,9 +53,9 @@ same compile-time byte registry for identical inputs.
 | `gamecube.png` | GameCube; Nintendo GameCube; Nintendo Game Cube |
 | `megadrive.png` | Mega Drive; Sega Mega Drive; Genesis; Sega Genesis |
 | `n64.png` | Nintendo 64; N64 |
-| `playstation.png` | PlayStation; PlayStation 1; PS1; PSX |
-| `playstation2.png` | PlayStation 2; PS2 |
-| `playstation3.png` | PlayStation 3; PS3 |
+| `psx.png` | PlayStation; PlayStation 1; PS1; PSX |
+| `ps2.png` | PlayStation 2; PS2 |
+| `ps3.png` | PlayStation 3; PS3 |
 | `saturn.png` | Saturn; Sega Saturn |
 | `snes.png` | Super Nintendo; Super Nintendo Entertainment System; SNES; Super Famicom |
 | `switch.png` | Nintendo Switch; Switch |
@@ -60,9 +64,10 @@ same compile-time byte registry for identical inputs.
 | `xbox.png` | Xbox; Original Xbox |
 | `xbox360.png` | Xbox 360; X360 |
 
-Aliases determine both the bundled image and the filename for a higher
-priority custom override. For example, `PSX` resolves to
-`playstation.png`, not `psx.png`.
+Aliases first resolve through the canonical platform registry. The persisted
+canonical ID then determines the bundled image and higher-priority custom
+override filename. For example, PlayStation aliases resolve to canonical
+`PSX`, then to `psx.png`; no display-name guessing is involved.
 
 ## Inspection and PNG manifest
 
@@ -81,9 +86,9 @@ pixels from the alpha-content bounds to left/top/right/bottom canvas edges.
 | `gamecube.png` | 1,594,670 | 172/142/131/89 | No visible text or logo | Readable and well centred; accepted |
 | `megadrive.png` | 1,555,855 | 85/6/3/33 | No visible text or logo | Readable; complete console; accepted |
 | `n64.png` | 1,571,533 | 44/6/3/65 | No visible text or logo | Readable; complete console/controller; accepted |
-| `playstation.png` | 1,575,183 | 111/102/3/65 | No visible text or logo | Readable; right-heavy but complete; accepted |
-| `playstation2.png` | 1,483,067 | 108/93/3/89 | No visible text or logo | Readable; slim tower remains distinct; accepted |
-| `playstation3.png` | 1,520,358 | 92/142/3/89 | No visible text or logo | Readable; complete console/controller; accepted |
+| `psx.png` | 1,575,183 | 111/102/3/65 | No visible text or logo | Readable; right-heavy but complete; accepted |
+| `ps2.png` | 1,483,067 | 108/93/3/89 | No visible text or logo | Readable; slim tower remains distinct; accepted |
+| `ps3.png` | 1,520,358 | 92/142/3/89 | No visible text or logo | Readable; complete console/controller; accepted |
 | `saturn.png` | 1,537,579 | 184/142/80/58 | No visible text or logo | Readable and complete; accepted |
 | `snes.png` | 1,633,370 | 140/102/59/58 | No visible text or logo | Readable and complete; accepted |
 | `switch.png` | 1,509,672 | 92/142/19/89 | No visible text or logo | Readable and complete; accepted |

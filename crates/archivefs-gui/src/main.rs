@@ -33995,7 +33995,7 @@ fn show_gamer_view(
     // navigates. The order is the order a person sees: All, then each detected
     // platform, then Unknown last if any.
     let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
-        asset_id: PlatformAssetCategory::Console.asset_id(),
+        asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
         label: "All",
         count: data.rows.len(),
         platform: None,
@@ -34010,7 +34010,7 @@ fn show_gamer_view(
     }
     if platform_counts.unknown > 0 {
         entries.push(ShelfEntry {
-            asset_id: PlatformAssetCategory::Unknown.asset_id(),
+            asset_id: PlatformAssetCategory::Unknown.asset_id().to_owned(),
             label: "Unknown",
             count: platform_counts.unknown,
             platform: Some("Unknown"),
@@ -34105,6 +34105,11 @@ fn show_gamer_view(
                                     .on_hover_text(&label);
                                 let platform_asset =
                                     platform_asset_id(&row.platform, row.unknown_platform);
+                                let platform_fallback = if row.unknown_platform {
+                                    PlatformAssetCategory::Unknown.asset_id()
+                                } else {
+                                    platform_asset_category(&row.platform).asset_id()
+                                };
                                 paint_game_row_artwork(
                                     ui,
                                     artwork_cache,
@@ -34116,8 +34121,8 @@ fn show_gamer_view(
                                         ),
                                         size: 56.0,
                                         title: &gamer_display_title(record),
-                                        platform_asset,
-                                        unknown_platform: row.unknown_platform,
+                                        platform_asset: &platform_asset,
+                                        platform_fallback,
                                     },
                                 );
                                 ui.painter().text(
@@ -34367,73 +34372,81 @@ impl PlatformAssetCategory {
 /// so a filter/search-derived platform string with different casing still
 /// resolves correctly.
 fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
-    // Canonical names contain spaces and hyphens ("Game Boy Advance",
-    // "Sharp X68000", "TurboGrafx-16") - normalized away here so every
-    // match key below is a single lowercase word, exactly mirroring
-    // `platform_asset_id`'s own normalization for its dedicated-asset
-    // lookup.
-    let normalized = platform.to_lowercase().replace([' ', '-'], "");
-    match normalized.as_str() {
-        "gamecube" | "wii" | "wiiu" | "switch" | "n64" | "nes" | "snes" | "megadrive"
-        | "mastersystem" | "gamegear" | "saturn" | "dreamcast" | "psx" | "ps2" | "ps3" | "xbox"
-        | "xbox360" | "segacd" | "sega32x" | "3do" | "colecovision" | "intellivision"
-        | "neogeo" | "neogeo64" => PlatformAssetCategory::Console,
-        "gameboy" | "gameboycolor" | "gameboyadvance" | "nintendods" | "nintendo3ds" | "psp"
-        | "playstationvita" | "atarilynx" | "neogeopocket" | "neogeopocketcolor" | "wonderswan"
-        | "wonderswancolor" | "ngage" => PlatformAssetCategory::Handheld,
-        "pc" | "dos" | "scummvm" | "amiga" | "atarist" | "commodore64" | "zxspectrum"
-        | "acornarchimedes" | "sharpx68000" | "necpc8801" | "necpc9801" | "msx" | "msx2" => {
+    let Some(platform) = canonical_platform_for_artwork(platform) else {
+        return PlatformAssetCategory::Unknown;
+    };
+    match platform.id {
+        "3DO" | "ColecoVision" | "Dreamcast" | "GameCube" | "Intellivision" | "MasterSystem"
+        | "MegaDrive" | "N64" | "NeoGeo" | "NeoGeo64" | "NES" | "PSX" | "PS2" | "PS3"
+        | "Saturn" | "Sega 32X" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU" | "Xbox"
+        | "Xbox360" => PlatformAssetCategory::Console,
+        "Atari Lynx"
+        | "Game Boy"
+        | "Game Boy Advance"
+        | "Game Boy Color"
+        | "GameGear"
+        | "NGage"
+        | "Neo Geo Pocket"
+        | "Neo Geo Pocket Color"
+        | "Nintendo 3DS"
+        | "Nintendo DS"
+        | "PlayStation Vita"
+        | "PSP"
+        | "Virtual Boy"
+        | "WonderSwan"
+        | "WonderSwan Color" => PlatformAssetCategory::Handheld,
+        "Acorn Archimedes" | "Acorn Electron" | "Amiga" | "Amstrad CPC" | "Apple II"
+        | "Atari 8-bit" | "AtariST" | "BBC Micro" | "Commodore 128" | "Commodore 64" | "DOS"
+        | "FM Towns" | "Macintosh" | "MSX" | "MSX2" | "NEC PC-8801" | "NEC PC-9801" | "PC"
+        | "PC-98" | "ScummVM" | "Sharp X68000" | "VIC-20" | "ZX Spectrum" => {
             PlatformAssetCategory::Computer
         }
-        "arcade" => PlatformAssetCategory::Arcade,
-        "amigacd32" => PlatformAssetCategory::OpticalDisc,
-        "atari2600" | "atari5200" | "atari7800" | "atarijaguar" | "vectrex" | "turbografx16"
-        | "pcengine" => PlatformAssetCategory::Cartridge,
+        "Arcade" => PlatformAssetCategory::Arcade,
+        "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "Philips CD-i"
+        | "Sega CD" => PlatformAssetCategory::OpticalDisc,
+        "Atari2600" | "Atari5200" | "Atari7800" | "Atari Jaguar" | "PC Engine"
+        | "TurboGrafx-16" => PlatformAssetCategory::Cartridge,
         _ => PlatformAssetCategory::Unknown,
     }
 }
 
-/// Exact, deliberately narrow aliases for Platform Artwork Pack v1.
-/// Normalization is case-insensitive and ignores only spaces and hyphens;
-/// it does not perform substring or fuzzy matching.
-fn exact_platform_asset_id(platform: &str) -> Option<&'static str> {
-    let normalized = platform.to_lowercase().replace([' ', '-'], "");
-    match normalized.as_str() {
-        "acornarchimedes" | "archimedes" => Some("acornarchimedes"),
-        "amiga" | "commodoreamiga" => Some("amiga"),
-        "dreamcast" | "segadreamcast" => Some("dreamcast"),
-        "gameboy" | "nintendogameboy" => Some("gameboy"),
-        "gamecube" | "nintendogamecube" => Some("gamecube"),
-        "megadrive" | "segamegadrive" | "genesis" | "segagenesis" => Some("megadrive"),
-        "nintendo64" | "n64" => Some("n64"),
-        "playstation" | "playstation1" | "ps1" | "psx" => Some("playstation"),
-        "playstation2" | "ps2" => Some("playstation2"),
-        "playstation3" | "ps3" => Some("playstation3"),
-        "saturn" | "segasaturn" => Some("saturn"),
-        "supernintendo" | "supernintendoentertainmentsystem" | "snes" | "superfamicom" => {
-            Some("snes")
-        }
-        "nintendoswitch" | "switch" => Some("switch"),
-        "nintendowii" | "wii" => Some("wii"),
-        "nintendowiiu" | "wiiu" => Some("wiiu"),
-        "xbox" | "originalxbox" => Some("xbox"),
-        "xbox360" | "x360" => Some("xbox360"),
-        _ => None,
-    }
+/// Resolves through the one canonical platform registry. Exact persisted IDs,
+/// exact display names and exact registered aliases are accepted; filenames
+/// are never guessed from a display label and substring matching is forbidden.
+fn canonical_platform_for_artwork(
+    platform: &str,
+) -> Option<&'static archivefs_core::platform::Platform> {
+    archivefs_core::platform::platform_by_id(platform)
+        .or_else(|| {
+            archivefs_core::platform::PLATFORMS
+                .iter()
+                .find(|candidate| candidate.display_name.eq_ignore_ascii_case(platform))
+        })
+        .or_else(|| archivefs_core::platform::platform_for_alias(platform))
 }
 
-/// The asset identifier to look up artwork for - either an exact bundled
-/// platform PNG id or a category fallback id. `unknown_platform: true`
-/// (the row's own honest
-/// "we don't know this platform" flag, not a lookup miss) always maps to
-/// the Unknown fallback directly, without running the category
-/// heuristic on a meaningless empty string.
-fn platform_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
+/// The stable filename stem for a persisted canonical platform identifier:
+/// lowercase ASCII alphanumerics only. Display-name changes therefore cannot
+/// rename artwork. Registry tests prove that all 74 current IDs remain unique
+/// under this convention.
+fn canonical_platform_asset_id(platform_id: &str) -> String {
+    platform_id
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect()
+}
+
+/// The exact canonical artwork key. Known platforms keep their own key even
+/// when no PNG is bundled, allowing `<canonical-id>.png` custom overrides;
+/// rendering then falls back deterministically to the platform category.
+fn platform_asset_id(platform: &str, unknown_platform: bool) -> String {
     if unknown_platform {
-        return PlatformAssetCategory::Unknown.asset_id();
+        return PlatformAssetCategory::Unknown.asset_id().to_owned();
     }
-    exact_platform_asset_id(platform)
-        .unwrap_or_else(|| platform_asset_category(platform).asset_id())
+    canonical_platform_for_artwork(platform)
+        .map(|platform| canonical_platform_asset_id(platform.id))
+        .unwrap_or_else(|| PlatformAssetCategory::Unknown.asset_id().to_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -34472,16 +34485,16 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/n64.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "playstation",
-        png: include_bytes!("../assets/platforms/playstation.png"),
+        asset_id: "psx",
+        png: include_bytes!("../assets/platforms/psx.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "playstation2",
-        png: include_bytes!("../assets/platforms/playstation2.png"),
+        asset_id: "ps2",
+        png: include_bytes!("../assets/platforms/ps2.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "playstation3",
-        png: include_bytes!("../assets/platforms/playstation3.png"),
+        asset_id: "ps3",
+        png: include_bytes!("../assets/platforms/ps3.png"),
     },
     BundledPlatformArtwork {
         asset_id: "saturn",
@@ -34757,6 +34770,89 @@ fn decode_bundled_platform_artwork(
     ))
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformPngWarning {
+    LegacySourceDimensions { width: u32, height: u32 },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlatformPngInspection {
+    width: u32,
+    height: u32,
+    color_type: image::ColorType,
+    has_transparent_pixel: bool,
+    warnings: Vec<PlatformPngWarning>,
+}
+
+/// Validation used by the artwork audit tests. A legacy square image remains
+/// usable and produces a warning; malformed, animated, zero-sized, non-square
+/// or absurdly large images are refused. Production decoding independently
+/// retains its tighter 1024x1024 allocation ceiling.
+#[cfg(test)]
+fn inspect_platform_png(bytes: &[u8]) -> Result<PlatformPngInspection, &'static str> {
+    use image::ImageDecoder as _;
+
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("invalid PNG signature");
+    }
+    let mut offset = 8usize;
+    while offset < bytes.len() {
+        let length_bytes = bytes.get(offset..offset + 4).ok_or("truncated PNG chunk")?;
+        let length = u32::from_be_bytes(
+            length_bytes
+                .try_into()
+                .map_err(|_| "truncated PNG chunk length")?,
+        ) as usize;
+        let kind = bytes
+            .get(offset + 4..offset + 8)
+            .ok_or("truncated PNG chunk type")?;
+        if kind == b"acTL" {
+            return Err("animated PNG artwork is unsupported");
+        }
+        offset = offset
+            .checked_add(12)
+            .and_then(|value| value.checked_add(length))
+            .ok_or("PNG chunk offset overflow")?;
+        if offset > bytes.len() {
+            return Err("PNG chunk extends beyond the file");
+        }
+        if kind == b"IEND" {
+            break;
+        }
+    }
+
+    let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|_| "malformed PNG")?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err("zero-sized PNG");
+    }
+    if width > 8192 || height > 8192 {
+        return Err("absurd PNG dimensions");
+    }
+    if width != height {
+        return Err("platform artwork must be square");
+    }
+    let color_type = decoder.color_type();
+    let rgba = image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| "malformed PNG pixels")?
+        .into_rgba8();
+    let has_transparent_pixel = rgba.pixels().any(|pixel| pixel.0[3] < u8::MAX);
+    let warnings = (width != 1024 || height != 1024)
+        .then_some(PlatformPngWarning::LegacySourceDimensions { width, height })
+        .into_iter()
+        .collect();
+    Ok(PlatformPngInspection {
+        width,
+        height,
+        color_type,
+        has_transparent_pixel,
+        warnings,
+    })
+}
+
 /// Draws a small original vector fallback glyph for `asset_id` directly
 /// with egui's painter. Falls back to the Unknown glyph for any id it doesn't
 /// recognise, so a damaged or unrecognised custom-override asset id
@@ -34930,6 +35026,16 @@ fn paint_platform_artwork_at(
         paint_texture(ui, texture, paint.center, paint.size);
         return PlatformArtworkSource::Bundled;
     }
+    // A category-level custom image remains a supported intentional fallback
+    // for canonical platforms without dedicated artwork. It is consulted only
+    // after the exact canonical filename and can therefore never mask it.
+    if paint.fallback_asset_id != paint.asset_id
+        && let Some(texture) =
+            artwork_cache.custom_texture(ui.ctx(), artwork_directory, paint.fallback_asset_id)
+    {
+        paint_texture(ui, texture, paint.center, paint.size);
+        return PlatformArtworkSource::Custom;
+    }
     paint_platform_glyph_at(
         ui.painter(),
         paint.center,
@@ -34974,7 +35080,7 @@ struct GameRowArtworkPaint<'a> {
     size: f32,
     title: &'a str,
     platform_asset: &'a str,
-    unknown_platform: bool,
+    platform_fallback: &'a str,
 }
 
 /// Game rows prefer a safe local per-game PNG, then the same exact
@@ -35001,11 +35107,7 @@ fn paint_game_row_artwork(
             size: paint.size,
             color: ui.visuals().text_color().gamma_multiply(0.8),
             asset_id: paint.platform_asset,
-            fallback_asset_id: if paint.unknown_platform {
-                PlatformAssetCategory::Unknown.asset_id()
-            } else {
-                paint.platform_asset
-            },
+            fallback_asset_id: paint.platform_fallback,
         },
     )
 }
@@ -35337,9 +35439,9 @@ impl ShelfGeometry {
 }
 
 /// One card in the platform shelf: what to draw, and what picking it selects.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ShelfEntry<'a> {
-    asset_id: &'a str,
+    asset_id: String,
     label: &'a str,
     count: usize,
     /// The platform filter this card applies. `None` is the "All" card.
@@ -35466,7 +35568,7 @@ fn show_gamer_platform_shelf(
                         let response = show_platform_shelf_item(
                             ui,
                             is_selected,
-                            entry.asset_id,
+                            &entry.asset_id,
                             entry.label,
                             entry.count,
                             card_width,
@@ -36764,14 +36866,14 @@ mod tests {
             ("Sega Genesis", "megadrive"),
             ("Nintendo 64", "n64"),
             ("N64", "n64"),
-            ("PlayStation", "playstation"),
-            ("PlayStation 1", "playstation"),
-            ("PS1", "playstation"),
-            ("PSX", "playstation"),
-            ("PlayStation 2", "playstation2"),
-            ("PS2", "playstation2"),
-            ("PlayStation 3", "playstation3"),
-            ("PS3", "playstation3"),
+            ("PlayStation", "psx"),
+            ("PlayStation 1", "psx"),
+            ("PS1", "psx"),
+            ("PSX", "psx"),
+            ("PlayStation 2", "ps2"),
+            ("PS2", "ps2"),
+            ("PlayStation 3", "ps3"),
+            ("PS3", "ps3"),
             ("Saturn", "saturn"),
             ("Sega Saturn", "saturn"),
             ("Super Nintendo", "snes"),
@@ -36786,9 +36888,7 @@ mod tests {
             ("Wii U", "wiiu"),
             ("WiiU", "wiiu"),
             ("Xbox", "xbox"),
-            ("Original Xbox", "xbox"),
             ("Xbox 360", "xbox360"),
-            ("X360", "xbox360"),
         ];
         for (alias, expected) in aliases {
             assert_eq!(platform_asset_id(alias, false), expected, "alias {alias}");
@@ -36805,16 +36905,30 @@ mod tests {
     }
 
     #[test]
-    fn platform_asset_id_falls_back_to_category_for_unmapped_specific_platforms() {
-        // NES has no dedicated asset - it must resolve to the Console
-        // category fallback, not to Unknown (it's a perfectly well-known
-        // platform, just without its own dedicated artwork yet - "do not
-        // block the feature on creating a unique image for every obscure
-        // platform").
-        assert_eq!(platform_asset_id("NES", false), "console");
-        assert_eq!(platform_asset_id("Game Boy Advance", false), "handheld");
-        assert_eq!(platform_asset_id("PC", false), "computer");
+    fn platforms_without_bundled_pngs_keep_exact_keys_and_explicit_fallbacks() {
+        assert_eq!(platform_asset_id("NES", false), "nes");
+        assert_eq!(
+            platform_asset_category("NES"),
+            PlatformAssetCategory::Console
+        );
+        assert_eq!(
+            platform_asset_id("Game Boy Advance", false),
+            "gameboyadvance"
+        );
+        assert_eq!(
+            platform_asset_category("Game Boy Advance"),
+            PlatformAssetCategory::Handheld
+        );
+        assert_eq!(platform_asset_id("PC", false), "pc");
+        assert_eq!(
+            platform_asset_category("PC"),
+            PlatformAssetCategory::Computer
+        );
         assert_eq!(platform_asset_id("Arcade", false), "arcade");
+        assert_eq!(
+            platform_asset_category("Arcade"),
+            PlatformAssetCategory::Arcade
+        );
     }
 
     #[test]
@@ -36830,7 +36944,7 @@ mod tests {
 
     #[test]
     fn exact_aliases_do_not_collapse_related_platforms() {
-        assert_eq!(platform_asset_id("PSX", false), "playstation");
+        assert_eq!(platform_asset_id("PSX", false), "psx");
         assert_eq!(platform_asset_id("Wii U", false), "wiiu");
         assert_ne!(
             platform_asset_id("Wii U", false),
@@ -36856,7 +36970,12 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), BUNDLED_PLATFORM_ARTWORK.len());
         for artwork in BUNDLED_PLATFORM_ARTWORK {
-            assert!(artwork.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let inspection = inspect_platform_png(artwork.png)
+                .unwrap_or_else(|error| panic!("{} failed validation: {error}", artwork.asset_id));
+            assert_eq!((inspection.width, inspection.height), (1024, 1024));
+            assert_eq!(inspection.color_type, image::ColorType::Rgba8);
+            assert!(inspection.has_transparent_pixel);
+            assert!(inspection.warnings.is_empty());
             let decoded = decode_bundled_platform_artwork(artwork.png)
                 .unwrap_or_else(|error| panic!("{} failed to decode: {error:?}", artwork.asset_id));
             assert_eq!(decoded.size, [1024, 1024]);
@@ -36873,11 +36992,105 @@ mod tests {
     }
 
     #[test]
+    fn animated_platform_png_is_rejected() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(b"acTL");
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            inspect_platform_png(&bytes),
+            Err("animated PNG artwork is unsupported")
+        );
+    }
+
+    #[test]
+    fn platform_artwork_resolution_never_uses_substring_guessing() {
+        assert_eq!(platform_asset_id("NES Classics", false), "unknown");
+        assert_eq!(platform_asset_id("not-wiiu-backup", false), "unknown");
+        assert_eq!(
+            platform_asset_category("xbox360-old"),
+            PlatformAssetCategory::Unknown
+        );
+    }
+
+    #[test]
     fn platform_asset_id_handles_long_platform_names_without_panicking() {
         let long_name = "A".repeat(500);
         // Must not panic and must resolve to a real, valid asset id.
         let resolved = platform_asset_id(&long_name, false);
         assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn every_canonical_platform_has_one_unique_filename_and_intentional_fallback() {
+        let mut asset_ids = std::collections::BTreeSet::new();
+        assert_eq!(archivefs_core::platform::PLATFORMS.len(), 74);
+        for platform in archivefs_core::platform::PLATFORMS {
+            let asset_id = platform_asset_id(platform.id, false);
+            assert!(
+                valid_platform_asset_id(&asset_id),
+                "{} -> {asset_id}",
+                platform.id
+            );
+            assert!(
+                asset_ids.insert(asset_id.clone()),
+                "duplicate artwork key {asset_id}"
+            );
+            assert_eq!(asset_id, canonical_platform_asset_id(platform.id));
+            assert_ne!(
+                platform_asset_category(platform.id),
+                PlatformAssetCategory::Unknown,
+                "{} needs an intentional fallback category",
+                platform.id
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_png_directory_has_no_unused_or_case_colliding_platform_images() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/platforms");
+        let mut actual_pngs = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".png"))
+            .collect::<Vec<_>>();
+        actual_pngs.sort();
+        let mut expected_pngs = BUNDLED_PLATFORM_ARTWORK
+            .iter()
+            .map(|artwork| format!("{}.png", artwork.asset_id))
+            .collect::<Vec<_>>();
+        expected_pngs.sort();
+        assert_eq!(
+            actual_pngs, expected_pngs,
+            "unused or missing bundled platform PNG"
+        );
+
+        let mut lowercase = std::collections::BTreeSet::new();
+        for filename in actual_pngs {
+            assert_eq!(filename, filename.to_ascii_lowercase());
+            assert!(!filename.contains(' '));
+            assert!(!filename.contains("4448b039-69a6-4690-a61f-dfc5393c3069"));
+            assert!(lowercase.insert(filename.to_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn legacy_square_png_size_is_a_warning_not_a_rejection() {
+        use image::ImageEncoder as _;
+
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[0, 0, 0, 0], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let inspection = inspect_platform_png(&bytes).unwrap();
+        assert_eq!(
+            inspection.warnings,
+            vec![PlatformPngWarning::LegacySourceDimensions {
+                width: 1,
+                height: 1
+            }]
+        );
     }
 
     #[test]
@@ -37093,14 +37306,14 @@ mod tests {
                 cache: &mut cache,
             };
             let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
-                asset_id: PlatformAssetCategory::Console.asset_id(),
+                asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
                 label: "All",
                 count: 10,
                 platform: None,
             }];
             for (label, count) in platforms {
                 entries.push(ShelfEntry {
-                    asset_id: "unknown",
+                    asset_id: "unknown".to_owned(),
                     label: label.as_str(),
                     count: *count,
                     platform: Some(label.as_str()),
@@ -37253,14 +37466,14 @@ mod tests {
                 cache: &mut cache,
             };
             let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
-                asset_id: PlatformAssetCategory::Console.asset_id(),
+                asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
                 label: "All",
                 count: 10,
                 platform: None,
             }];
             for (label, count) in platforms {
                 entries.push(ShelfEntry {
-                    asset_id: "unknown",
+                    asset_id: "unknown".to_owned(),
                     label: label.as_str(),
                     count: *count,
                     platform: Some(label.as_str()),

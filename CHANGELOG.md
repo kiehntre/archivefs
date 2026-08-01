@@ -194,7 +194,7 @@ tag peels to source commit `908c00da23303216cd28563a00b4ec835bc87207`.
   cartridge, unknown) for platforms without dedicated artwork.
 - An optional custom-artwork directory can override built-in artwork with
   the user's own local PNG files, matched by canonical platform id
-  (`gamecube.png`, `playstation2.png`, etc.); bounded decode limits (1 MiB
+  (`gamecube.png`, `ps2.png`, etc.); bounded decode limits (1 MiB
   file size, 1024x1024 pixels) and safe fallback to the built-in glyph on
   any rejection or malformed file.
 - The game list uses the full remaining window height and scrolls
