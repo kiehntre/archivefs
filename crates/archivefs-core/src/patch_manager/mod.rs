@@ -17,6 +17,7 @@
 //! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
+mod bsfree;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -26,6 +27,7 @@ mod cheat_history;
 mod cheat_install_plan;
 mod cheat_install_result;
 mod cheat_installer;
+mod cheat_provider;
 mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_sources;
@@ -77,6 +79,19 @@ use crate::{Database, PersistedArchive};
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
     HypotheticalDestination, InstallationCandidate,
+};
+pub use bsfree::{
+    BSFREE_DATABASE_FILE, BSFREE_DATABASE_URL, BSFREE_DOWNLOAD_HOST, BSFREE_EXPECTED_SHA256,
+    BSFREE_EXPECTED_SIZE_BYTES, BSFREE_MAX_DATABASE_BYTES, BSFREE_PROVIDER_FORMAT_VERSION,
+    BSFREE_PROVIDER_ID, BSFREE_UPSTREAM_PROJECT, BsFreeActivationResult, BsFreeAttribution,
+    BsFreeCatalogue, BsFreeCheat, BsFreeCounts, BsFreeDevice, BsFreeDeviceSummary,
+    BsFreeDownloadOptions, BsFreeError, BsFreeErrorKind, BsFreeGame, BsFreeGameSearchRequest,
+    BsFreeGameSearchResult, BsFreeNamedRow, BsFreePaths, BsFreeSourceStatus, BsFreeSystem,
+    BsFreeSystemSummary, BsFreeValidation, bsfree_attribution, bsfree_device_mapping,
+    bsfree_licence, bsfree_platform_mapping, bsfree_provenance, bsfree_provider_identity,
+    default_bsfree_source_root, download_bsfree_database, import_local_bsfree_database,
+    inspect_bsfree_source, remove_local_bsfree_source, set_bsfree_enabled,
+    validate_bsfree_database, validate_installed_bsfree_source,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
@@ -136,6 +151,13 @@ pub use cheat_install_result::{
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
     CheatInstallRunOutcome, execute_cheat_install_run,
+};
+pub use cheat_provider::{
+    CheatProviderIdentity, CheatProviderLicence, CheatProviderLicenceStatus,
+    CheatProviderProvenance, CheatProviderSourceState, DeviceFormatCompatibility,
+    ImmutableSourceFingerprint, PageRequest, PlatformMappingStatus, ProviderDeviceMapping,
+    ProviderGameMatchConfidence, ProviderPage, ProviderPlatformMapping, ProviderValidationResult,
+    ProviderValidationStatus, ReadOnlyCheatCatalogue,
 };
 pub use cheat_rollback::{
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatRollbackOptions, CheatRollbackRunOutcome,
