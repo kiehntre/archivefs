@@ -172,8 +172,7 @@ fn metadata_endpoints_are_rejected() {
     let resolver = resolving("metadata.internal", &[v4(169, 254, 169, 254)]);
     assert_eq!(
         validate_endpoint("http://metadata.internal", &resolver)
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
         "metadata_endpoint"
     );
@@ -187,8 +186,7 @@ fn a_host_resolving_to_any_public_address_is_rejected() {
     let public = resolving("romm.example.com", &[v4(93, 184, 216, 34)]);
     assert_eq!(
         validate_endpoint("http://romm.example.com", &public)
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
         "not_private_address"
     );
@@ -197,8 +195,7 @@ fn a_host_resolving_to_any_public_address_is_rejected() {
     // address would let this through.
     let mixed = resolving("rebind.local", &[v4(192, 168, 1, 10), v4(8, 8, 8, 8)]);
     let refusal = validate_endpoint("http://rebind.local:8080", &mixed)
-        .err()
-        .expect("a mixed resolution must be refused");
+        .expect_err("a mixed resolution must be refused");
     assert_eq!(refusal.code(), "not_private_address");
     assert!(
         refusal.detail().contains("8.8.8.8"),
@@ -219,8 +216,7 @@ fn a_host_resolving_to_too_many_addresses_is_rejected() {
     let resolver = resolving("many.local", &many);
     assert_eq!(
         validate_endpoint("http://many.local", &resolver)
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
         "too_many_addresses"
     );
@@ -231,16 +227,14 @@ fn a_host_resolving_to_too_many_addresses_is_rejected() {
 fn an_unresolvable_host_is_refused_rather_than_assumed_local() {
     assert_eq!(
         validate_endpoint("http://nowhere.invalid", &StaticResolver::new())
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
         "unresolvable_host"
     );
     let empty = resolving("empty.local", &[]);
     assert_eq!(
         validate_endpoint("http://empty.local", &empty)
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
         "no_addresses"
     );
@@ -668,15 +662,13 @@ mod path_mapping {
         // And in a configured mapping.
         assert_eq!(
             PathMappings::validate(&[mapping("/romm/../etc", "/mnt/games/roms")], &[])
-                .err()
-                .expect("refused")
+                .expect_err("refused")
                 .code(),
             "non_normal_component"
         );
         assert_eq!(
             PathMappings::validate(&[mapping("/romm/library", "/mnt/games/../../etc")], &[])
-                .err()
-                .expect("refused")
+                .expect_err("refused")
                 .code(),
             "non_normal_component"
         );
@@ -731,8 +723,7 @@ mod path_mapping {
                 ],
                 &[]
             )
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
             "duplicate_destination"
         );
@@ -744,8 +735,7 @@ mod path_mapping {
                 ],
                 &[]
             )
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .code(),
             "duplicate_source",
             "the two spellings normalise to the same prefix"
@@ -811,8 +801,7 @@ mod path_mapping {
             .collect();
         assert_eq!(
             PathMappings::validate(&many, &[])
-                .err()
-                .expect("refused")
+                .expect_err("refused")
                 .code(),
             "too_many"
         );

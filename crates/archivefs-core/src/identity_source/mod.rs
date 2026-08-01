@@ -18,6 +18,7 @@
 pub mod model;
 pub mod net_policy;
 pub mod path_map;
+pub mod romm;
 
 #[cfg(test)]
 mod tests;
