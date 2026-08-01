@@ -56,6 +56,22 @@ pub(crate) enum RommOperation {
     Preview {
         limit: usize,
     },
+    /// One bounded page of cached records, under the given filters.
+    LoadRecords {
+        filters: Box<crate::romm_browse::RecordFilters>,
+        offset: usize,
+        limit: usize,
+    },
+    /// One record's full evidence.
+    LoadRecordDetail {
+        romm_game_id: String,
+    },
+    /// One bounded page of conflicting records.
+    LoadConflicts {
+        offset: usize,
+    },
+    /// Group the stale population by what is at each path.
+    StaleSummary,
 }
 
 impl RommOperation {
@@ -64,7 +80,17 @@ impl RommOperation {
     /// A status load does not, which is what makes it safe to run while a mutating
     /// operation is in flight.
     pub(crate) fn is_mutating(&self) -> bool {
-        !matches!(self, Self::LoadStatus | Self::Preview { .. })
+        // Browsing the published cache changes nothing, so none of it is recorded as
+        // an activity or followed by a status reload.
+        !matches!(
+            self,
+            Self::LoadStatus
+                | Self::Preview { .. }
+                | Self::LoadRecords { .. }
+                | Self::LoadRecordDetail { .. }
+                | Self::LoadConflicts { .. }
+                | Self::StaleSummary
+        )
     }
 
     /// Whether this should disable the card's actions while it runs.
@@ -91,7 +117,7 @@ impl RommOperation {
     pub(crate) fn reports_progress(&self) -> bool {
         matches!(
             self,
-            Self::SampleImport { .. } | Self::FullImport | Self::Refresh
+            Self::SampleImport { .. } | Self::FullImport | Self::Refresh | Self::StaleSummary
         )
     }
 
@@ -107,6 +133,10 @@ impl RommOperation {
             Self::ClearArtwork => "Clearing cover thumbnails",
             Self::SaveConfiguration(_) => "Saving the RomM configuration",
             Self::Preview { .. } => "Previewing path mappings",
+            Self::LoadRecords { .. } => "Reading cached records",
+            Self::LoadRecordDetail { .. } => "Reading one record",
+            Self::LoadConflicts { .. } => "Looking for conflicts",
+            Self::StaleSummary => "Grouping stale records",
         }
     }
 }
@@ -142,6 +172,10 @@ pub(crate) enum RommOperationOutcome {
     },
     Saved(Box<archivefs_core::identity_source::settings::ProviderSettings>),
     Preview(Box<crate::romm_config::RommPreviewSummary>),
+    Records(Box<crate::romm_browse::RecordPageView>),
+    RecordDetail(Box<Option<crate::romm_browse::RecordDetailView>>),
+    Conflicts(Box<crate::romm_browse::ConflictPageView>),
+    Stale(Box<crate::romm_browse::StaleSummaryView>),
 }
 
 /// The connection test, reduced to what the card shows. Built in the worker so no
@@ -663,18 +697,17 @@ fn build_actions(
         coming_next: false,
     });
 
-    // Later slices. Present, honestly labelled, and impossible to click.
-    for label in ["Browse records", "View stale summary"] {
+    // Browsing needs a published cache and nothing else - no token, no network.
+    let browse_reason = "Import the catalogue first: there is nothing cached to browse.";
+    for label in ["Browse records", "View conflicts", "View stale summary"] {
+        let (enabled, reason) = gate(has_cache, browse_reason);
         actions.push(CardAction {
-            label: format!("{label} (coming next)"),
+            label: label.to_string(),
             operation: None,
-            enabled: false,
-            disabled_reason: Some(
-                "This arrives in the next slice of RomM GUI work. The command line already has it."
-                    .to_string(),
-            ),
-            style: CardActionStyle::Quiet,
-            coming_next: true,
+            enabled,
+            disabled_reason: reason,
+            style: CardActionStyle::Secondary,
+            coming_next: false,
         });
     }
 
@@ -822,6 +855,32 @@ pub(crate) fn build_result_view(
                 summary.examples.len(),
                 summary.sample_source
             )],
+        },
+        // Browsing results are the views' own state rather than a card result, so
+        // these only ever render if one leaks - which is worth being able to see.
+        Ok(RommOperationOutcome::Records(page)) => RommResultView {
+            succeeded: true,
+            headline: format!("{} cached record(s) match", page.matching),
+            rows: Vec::new(),
+            notes: Vec::new(),
+        },
+        Ok(RommOperationOutcome::RecordDetail(_)) => RommResultView {
+            succeeded: true,
+            headline: "Record loaded".to_string(),
+            rows: Vec::new(),
+            notes: Vec::new(),
+        },
+        Ok(RommOperationOutcome::Conflicts(page)) => RommResultView {
+            succeeded: true,
+            headline: format!("{} conflicting record(s)", page.matching),
+            rows: Vec::new(),
+            notes: Vec::new(),
+        },
+        Ok(RommOperationOutcome::Stale(view)) => RommResultView {
+            succeeded: true,
+            headline: format!("{} stale record(s) grouped", view.summary.stale),
+            rows: Vec::new(),
+            notes: Vec::new(),
         },
         Ok(RommOperationOutcome::Connection(summary)) => build_connection_result(summary),
         Ok(RommOperationOutcome::Sample(summary)) => build_import_result(summary, true),
@@ -1059,6 +1118,12 @@ fn yes_no(value: bool) -> String {
 #[derive(Clone, Debug)]
 pub(crate) enum RommProgressEvent {
     Import(ImportProgress),
+    /// How far the stale summary has got through its metadata probes. Batched by the
+    /// worker, so this is not one event per path.
+    StaleProgress {
+        probed: usize,
+        total: usize,
+    },
     /// A note the core cannot phrase itself, such as which record lost its file
     /// list. Already free of provider payloads.
     Note(String),
@@ -1071,6 +1136,8 @@ pub(crate) enum RommCardRequest {
     Cancel,
     /// Open the configuration and mappings dialog.
     OpenConfigure,
+    /// Open one of the browsing views.
+    OpenBrowse(crate::romm_browse::BrowseView),
 }
 
 /// Draws the card. Thin by design: every decision was made in
@@ -1231,6 +1298,21 @@ pub(crate) fn show_romm_source_card(
                         }
                         None if action.label == "Configure" => {
                             request = Some(RommCardRequest::OpenConfigure);
+                        }
+                        None if action.label == "Browse records" => {
+                            request = Some(RommCardRequest::OpenBrowse(
+                                crate::romm_browse::BrowseView::Records,
+                            ));
+                        }
+                        None if action.label == "View conflicts" => {
+                            request = Some(RommCardRequest::OpenBrowse(
+                                crate::romm_browse::BrowseView::Conflicts,
+                            ));
+                        }
+                        None if action.label == "View stale summary" => {
+                            request = Some(RommCardRequest::OpenBrowse(
+                                crate::romm_browse::BrowseView::StaleSummary,
+                            ));
                         }
                         None => {}
                     }

@@ -204,6 +204,19 @@ fn a_not_configured_source_says_what_to_do() {
         action_named(&view, "Configure").enabled,
         "an unconfigured source must still be configurable"
     );
+    // Browsing needs something cached to browse.
+    for prefix in ["Browse records", "View conflicts", "View stale summary"] {
+        let action = action_named(&view, prefix);
+        assert!(!action.enabled, "{prefix} has nothing to show yet");
+        assert!(
+            action
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("nothing cached to browse")),
+            "{prefix}: {:?}",
+            action.disabled_reason
+        );
+    }
     // Nothing that talks to RomM can be started.
     for prefix in ["Test connection", "Import sample", "Import full"] {
         let action = action_named(&view, prefix);
@@ -437,24 +450,29 @@ fn unfinished_actions_are_present_disabled_and_honestly_labelled() {
         None,
         false,
     );
-    for prefix in ["Browse records", "View stale summary"] {
+    // Slice 3 finished the browse actions, so nothing on the card is deferred any
+    // more. Each of these opens a panel rather than starting an operation, which is
+    // why it dispatches no operation of its own.
+    assert!(
+        view.actions.iter().all(|action| !action.coming_next),
+        "no action should still be labelled as coming next: {:?}",
+        view.actions
+            .iter()
+            .filter(|action| action.coming_next)
+            .map(|action| action.label.clone())
+            .collect::<Vec<_>>()
+    );
+    for prefix in [
+        "Configure",
+        "Browse records",
+        "View conflicts",
+        "View stale summary",
+    ] {
         let action = action_named(&view, prefix);
-        assert!(action.coming_next, "{prefix} belongs to a later slice");
-        assert!(!action.enabled, "{prefix} must not look functional");
-        assert!(action.operation.is_none(), "{prefix} must dispatch nothing");
-        assert!(
-            action.label.contains("coming next"),
-            "the label should say so: {}",
-            action.label
-        );
+        assert!(action.enabled, "{prefix} should be available with a cache");
+        assert!(action.operation.is_none(), "{prefix} opens a panel");
+        assert!(!action.label.contains("coming next"), "{}", action.label);
     }
-    // Configure arrived in slice 2: enabled, and dispatching nothing itself because
-    // it opens a dialog rather than starting an operation.
-    let configure = action_named(&view, "Configure");
-    assert!(!configure.coming_next);
-    assert!(configure.enabled);
-    assert!(configure.operation.is_none());
-    assert!(!configure.label.contains("coming next"));
 }
 
 // --- Secrecy --------------------------------------------------------------

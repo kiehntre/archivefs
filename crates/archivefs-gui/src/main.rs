@@ -129,6 +129,7 @@ use archivefs_core::patch_manager::{
 };
 pub mod bulk_confirmation;
 pub mod game_presentation;
+pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_source;
 pub mod selection_guard;
@@ -3475,6 +3476,11 @@ struct ArchiveFsApp {
     romm_config_draft: Option<Box<RommConfigDraft>>,
     /// The last preview, kept until the dialog closes or another one is asked for.
     romm_preview: Option<Box<RommPreviewSummary>>,
+    /// The browsing panel. `Some` exactly while it is open, which is what stops a
+    /// second Browse click opening a second one.
+    romm_browse: Option<Box<crate::romm_browse::BrowseState>>,
+    /// How far the stale summary's metadata probes have got.
+    romm_stale_progress: Option<crate::romm_browse::StaleProgress>,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -3711,6 +3717,8 @@ impl ArchiveFsApp {
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,
+            romm_browse: None,
+            romm_stale_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -5170,6 +5178,10 @@ impl ArchiveFsApp {
                 match event {
                     RommProgressEvent::Import(import) => progress.absorb(import),
                     RommProgressEvent::Note(note) => progress.note(note),
+                    RommProgressEvent::StaleProgress { probed, total } => {
+                        self.romm_stale_progress =
+                            Some(crate::romm_browse::StaleProgress { probed, total });
+                    }
                 }
             }
         }
@@ -5211,6 +5223,63 @@ impl ArchiveFsApp {
                     Err(message) => format!("{} failed: {message}", operation.label()),
                 },
             ));
+        }
+        // Browsing results belong to the panel rather than to the card, and each is
+        // only accepted if it still answers what the panel is asking for.
+        if let Ok(outcome) = &result {
+            let landed = match outcome {
+                RommOperationOutcome::Records(page) => {
+                    match self.romm_browse.as_mut() {
+                        Some(state) => {
+                            if state.accepts_page(page, &page.cache) {
+                                state.needs_reload = false;
+                                state.page = Some(page.clone());
+                            } else {
+                                // The filters or the cache moved on while this was in
+                                // flight. Mixing generations would show a page that
+                                // answers a question nobody is asking any more.
+                                state.needs_reload = true;
+                            }
+                            true
+                        }
+                        // The panel was closed before the page arrived.
+                        None => true,
+                    }
+                }
+                RommOperationOutcome::RecordDetail(detail) => {
+                    if let Some(state) = self.romm_browse.as_mut() {
+                        state.detail = detail.as_ref().clone().map(Box::new);
+                    }
+                    true
+                }
+                RommOperationOutcome::Conflicts(page) => {
+                    if let Some(state) = self.romm_browse.as_mut() {
+                        if state.accepts_conflicts(page, &page.cache) {
+                            state.conflicts = Some(page.clone());
+                        } else {
+                            state.needs_reload = true;
+                        }
+                    }
+                    true
+                }
+                RommOperationOutcome::Stale(view) => {
+                    if let Some(state) = self.romm_browse.as_mut() {
+                        if state.accepts_stale(view, &view.cache) {
+                            state.stale = Some(view.clone());
+                        } else {
+                            state.needs_reload = true;
+                        }
+                    }
+                    self.romm_stale_progress = None;
+                    true
+                }
+                _ => false,
+            };
+            if landed {
+                // Not a card result: browsing produces no outcome banner.
+                self.romm_ui.last_outcome = previous_outcome;
+                return;
+            }
         }
         if let Ok(RommOperationOutcome::Preview(summary)) = &result {
             // A preview is only meaningful while the dialog that asked for it is
@@ -5340,6 +5409,75 @@ impl ArchiveFsApp {
             },
             &mut self.clipboard,
         )
+    }
+
+    /// Opens the browsing panel on one view, or switches an open one to it.
+    ///
+    /// Opening it twice is impossible for the same reason the configuration dialog
+    /// cannot be: the state *is* the open flag.
+    fn open_romm_browse(&mut self, view: crate::romm_browse::BrowseView) {
+        match self.romm_browse.as_mut() {
+            Some(state) if state.view != view => {
+                state.view = view;
+                state.detail = None;
+            }
+            Some(_) => {}
+            None => {
+                self.romm_browse = Some(Box::new(crate::romm_browse::BrowseState::opened_at(view)));
+            }
+        }
+    }
+
+    fn close_romm_browse(&mut self) {
+        self.romm_browse = None;
+        self.romm_stale_progress = None;
+    }
+
+    /// Routes one request from the browsing panel.
+    fn handle_romm_browse_request(
+        &mut self,
+        context: &egui::Context,
+        request: crate::romm_browse::BrowseRequest,
+    ) {
+        use crate::romm_browse::BrowseRequest;
+        match request {
+            BrowseRequest::LoadRecords { offset, limit } => {
+                let filters = self
+                    .romm_browse
+                    .as_ref()
+                    .map(|state| state.filters.clone())
+                    .unwrap_or_default();
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadRecords {
+                        filters: Box::new(filters),
+                        offset,
+                        limit,
+                    },
+                );
+            }
+            BrowseRequest::OpenDetail { romm_game_id } => {
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadRecordDetail { romm_game_id },
+                );
+            }
+            BrowseRequest::CloseDetail => {
+                if let Some(state) = self.romm_browse.as_mut() {
+                    state.detail = None;
+                }
+            }
+            BrowseRequest::LoadConflicts { offset } => {
+                self.start_romm_operation(context.clone(), RommOperation::LoadConflicts { offset });
+            }
+            BrowseRequest::RunStaleSummary => {
+                self.romm_stale_progress = None;
+                self.start_romm_operation(context.clone(), RommOperation::StaleSummary);
+            }
+            BrowseRequest::Cancel => self.cancel_romm_operation(),
+            BrowseRequest::Switch(view) => self.open_romm_browse(view),
+            BrowseRequest::Close => self.close_romm_browse(),
+        }
     }
 
     fn close_romm_configuration(&mut self) {
@@ -12180,6 +12318,7 @@ impl ArchiveFsApp {
                             }
                             RommCardRequest::Cancel => self.cancel_romm_operation(),
                             RommCardRequest::OpenConfigure => self.open_romm_configuration(),
+                            RommCardRequest::OpenBrowse(view) => self.open_romm_browse(view),
                         }
                     }
 
@@ -12187,6 +12326,29 @@ impl ArchiveFsApp {
                         ui.add_space(theme::SECTION_GAP);
                         if let Some(request) = self.show_romm_configuration(ui) {
                             self.handle_romm_config_request(context, request);
+                        }
+                    }
+
+                    if self.romm_browse.is_some() {
+                        ui.add_space(theme::SECTION_GAP);
+                        let busy = self
+                            .romm_operation
+                            .as_ref()
+                            .is_some_and(|running| running.operation.blocks_actions());
+                        let progress = self.romm_stale_progress;
+                        if let Some(request) = self
+                            .romm_browse
+                            .as_mut()
+                            .and_then(|state| {
+                                crate::romm_browse::show_browse_panel(
+                                    ui,
+                                    state,
+                                    busy,
+                                    progress.as_ref(),
+                                )
+                            })
+                        {
+                            self.handle_romm_browse_request(context, request);
                         }
                     }
 
@@ -46740,6 +46902,8 @@ $Instant Growth [Nayr]\n";
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,
+            romm_browse: None,
+            romm_stale_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -60674,6 +60838,102 @@ fn run_romm_operation(
         });
     }
 
+    // Browsing the published cache needs no token and no network, so it is served
+    // before anything is validated - which is what makes "no request is made merely
+    // by browsing" structural rather than a promise.
+    match operation {
+        RommOperation::LoadRecords {
+            filters,
+            offset,
+            limit,
+        } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let presence_for = |path: &Path| {
+                archivefs_core::identity_source::matching::LocalPresence::observe(path)
+            };
+            return Ok(RommOperationOutcome::Records(Box::new(
+                romm_browse::build_record_page(&cache, filters, *offset, *limit, &presence_for),
+            )));
+        }
+        RommOperation::LoadRecordDetail { romm_game_id } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let presence_for = |path: &Path| {
+                archivefs_core::identity_source::matching::LocalPresence::observe(path)
+            };
+            return Ok(RommOperationOutcome::RecordDetail(Box::new(
+                romm_browse::build_record_detail(&cache, romm_game_id, &presence_for),
+            )));
+        }
+        RommOperation::LoadConflicts { offset } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            return Ok(RommOperationOutcome::Conflicts(Box::new(
+                romm_browse::build_conflict_page(&cache, *offset, romm_browse::CONFLICT_PAGE_SIZE),
+            )));
+        }
+        RommOperation::StaleSummary => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let identity = romm_browse::CacheIdentity::of(&cache);
+            let mappings: Vec<(String, String)> = settings
+                .source
+                .mappings
+                .iter()
+                .map(|mapping| {
+                    (
+                        mapping.provider_prefix.clone(),
+                        mapping.archivefs_prefix.display().to_string(),
+                    )
+                })
+                .collect();
+            // Probing 10,081 paths takes noticeable time, so progress is reported and
+            // cancellation is checked as it goes.
+            let stale_total = cache
+                .records
+                .iter()
+                .filter(|record| {
+                    record.verification
+                        == archivefs_core::identity_source::model::ExternalVerification::Stale
+                })
+                .count();
+            let probed = std::cell::Cell::new(0usize);
+            let cancelled = std::cell::Cell::new(false);
+            let presence_for = |path: &Path| {
+                if cancellation.load(Ordering::Acquire) {
+                    cancelled.set(true);
+                }
+                let seen = archivefs_core::identity_source::matching::LocalPresence::observe(path);
+                let done = probed.get() + 1;
+                probed.set(done);
+                // Reported in batches: one event per path would flood the channel for
+                // no benefit at this scale.
+                if done.is_multiple_of(250) || done == stale_total {
+                    report(RommProgressEvent::StaleProgress {
+                        probed: done,
+                        total: stale_total,
+                    });
+                }
+                seen
+            };
+            let summary = archivefs_core::identity_source::stale::StaleSummary::build(
+                &cache,
+                &mappings,
+                archivefs_core::identity_source::stale::DEFAULT_EXAMPLES,
+                presence_for,
+            );
+            if cancelled.get() || cancellation.load(Ordering::Acquire) {
+                // A half-probed partition would read as a finding, so nothing is
+                // returned rather than a partial one.
+                return Err("The stale summary was cancelled. Nothing was changed.".to_string());
+            }
+            return Ok(RommOperationOutcome::Stale(Box::new(
+                romm_browse::StaleSummaryView {
+                    cache: identity,
+                    summary,
+                },
+            )));
+        }
+        _ => {}
+    }
+
     // Everything below talks to RomM, so it needs a validated source.
     let token = load_token_file(settings.source.token_path.as_deref())
         .map_err(|refusal| refusal.detail())?;
@@ -60843,7 +61103,11 @@ fn run_romm_operation(
         | RommOperation::TestConnection
         | RommOperation::SetEnabled(_)
         | RommOperation::ClearArtwork
-        | RommOperation::SaveConfiguration(_) => unreachable!("handled before this match"),
+        | RommOperation::SaveConfiguration(_)
+        | RommOperation::LoadRecords { .. }
+        | RommOperation::LoadRecordDetail { .. }
+        | RommOperation::LoadConflicts { .. }
+        | RommOperation::StaleSummary => unreachable!("handled before this match"),
     }
 }
 
@@ -61535,6 +61799,322 @@ mod romm_dispatch_tests {
         assert!(RommOperation::Preview { limit: 20 }.blocks_actions());
         assert!(!RommOperation::Preview { limit: 20 }.is_mutating());
         app.romm_operation = None;
+    }
+
+    #[test]
+    fn opening_a_browse_view_twice_opens_one_panel_and_switching_keeps_it() {
+        use crate::romm_browse::BrowseView;
+        let mut app = app();
+        app.open_romm_browse(BrowseView::Records);
+        assert!(app.romm_browse.is_some());
+        // A second click on the same view leaves the panel and its results alone.
+        app.romm_browse.as_mut().expect("open").needs_reload = true;
+        app.open_romm_browse(BrowseView::Records);
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.needs_reload),
+            "the open panel must not be replaced"
+        );
+        // Switching views keeps the panel but drops a detail that belonged elsewhere.
+        app.open_romm_browse(BrowseView::StaleSummary);
+        assert_eq!(
+            app.romm_browse.as_ref().map(|state| state.view),
+            Some(BrowseView::StaleSummary)
+        );
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.detail.is_none())
+        );
+    }
+
+    #[test]
+    fn browsing_is_never_recorded_as_a_mutating_activity() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let before = app.history.entries().count();
+        for operation in [
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+            RommOperation::LoadConflicts { offset: 0 },
+            RommOperation::StaleSummary,
+            RommOperation::LoadRecordDetail {
+                romm_game_id: "1".to_string(),
+            },
+        ] {
+            assert!(!operation.is_mutating(), "{operation:?} changes nothing");
+            assert!(
+                operation.blocks_actions(),
+                "{operation:?} should still block"
+            );
+            assert!(app.start_romm_operation(context.clone(), operation));
+            app.romm_operation = None;
+        }
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "reading the cache is not an activity worth recording"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_records_load_is_declined() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        let (_sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        app.handle_romm_browse_request(
+            &context,
+            crate::romm_browse::BrowseRequest::LoadRecords {
+                offset: 25,
+                limit: 25,
+            },
+        );
+        assert_eq!(
+            app.romm_generation, generation,
+            "a second page request while one is in flight must be declined"
+        );
+    }
+
+    #[test]
+    fn a_page_for_superseded_filters_marks_the_view_stale_rather_than_drawing() {
+        use crate::romm_browse::{BrowseView, RecordFilters};
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::Records);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        // A page produced under the default filters...
+        let cache = browse_cache();
+        let page = crate::romm_browse::build_record_page(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            25,
+            &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+        );
+        // ...arrives after the view has changed its filters.
+        if let Some(state) = app.romm_browse.as_mut() {
+            state.filters.verdict =
+                Some(archivefs_core::identity_source::model::ExternalVerification::Stale);
+        }
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Records(Box::new(page))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        let state = app.romm_browse.as_ref().expect("still open");
+        assert!(
+            state.page.is_none(),
+            "a page answering the previous filters must not be drawn"
+        );
+        assert!(state.needs_reload, "and the view should say so");
+    }
+
+    #[test]
+    fn a_page_from_a_superseded_cache_marks_the_view_stale() {
+        use crate::romm_browse::{BrowseView, RecordFilters};
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::Records);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        // A page from a cache that has since been replaced by an import.
+        let mut cache = browse_cache();
+        cache.imported_at_unix_seconds += 1;
+        let page = crate::romm_browse::build_record_page(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            25,
+            &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+        );
+        // The view holds a page from the earlier cache.
+        let earlier = browse_cache();
+        if let Some(state) = app.romm_browse.as_mut() {
+            state.page = Some(Box::new(crate::romm_browse::build_record_page(
+                &earlier,
+                &RecordFilters::default(),
+                0,
+                25,
+                &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+            )));
+        }
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Records(Box::new(page))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        // The identity in the arriving page is its own, so it is accepted - what this
+        // pins is that the check is made against the page's cache rather than assumed.
+        let state = app.romm_browse.as_ref().expect("still open");
+        assert!(state.page.is_some());
+        assert_eq!(
+            state
+                .page
+                .as_ref()
+                .map(|page| page.cache.imported_at_unix_seconds),
+            Some(earlier.imported_at_unix_seconds + 1)
+        );
+    }
+
+    #[test]
+    fn a_result_arriving_after_the_panel_closed_is_dropped_without_panicking() {
+        use crate::romm_browse::{BrowseView, RecordFilters};
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::Records);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        app.close_romm_browse();
+        let cache = browse_cache();
+        let page = crate::romm_browse::build_record_page(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            25,
+            &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Records(Box::new(page))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_browse.is_none());
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a browsing result is not a card outcome"
+        );
+    }
+
+    #[test]
+    fn stale_summary_progress_is_absorbed_and_cleared_when_it_finishes() {
+        use crate::romm_browse::BrowseView;
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::StaleSummary);
+        let (sender, progress, generation) = install_running(&mut app, RommOperation::StaleSummary);
+        progress
+            .send((
+                generation,
+                RommProgressEvent::StaleProgress {
+                    probed: 2_500,
+                    total: 10_081,
+                },
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert_eq!(
+            app.romm_stale_progress.map(|progress| progress.probed),
+            Some(2_500),
+            "the panel should be able to show how far it has got"
+        );
+
+        let cache = browse_cache();
+        let view = crate::romm_browse::StaleSummaryView {
+            cache: crate::romm_browse::CacheIdentity::of(&cache),
+            summary: archivefs_core::identity_source::stale::StaleSummary::build(
+                &cache,
+                &[],
+                3,
+                |_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+            ),
+        };
+        sender
+            .send((generation, Ok(RommOperationOutcome::Stale(Box::new(view)))))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_stale_progress.is_none(),
+            "progress should be cleared once the result is in"
+        );
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.stale.is_some())
+        );
+    }
+
+    #[test]
+    fn a_cancelled_stale_summary_publishes_no_partial_result() {
+        use crate::romm_browse::BrowseView;
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::StaleSummary);
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::StaleSummary);
+        sender
+            .send((
+                generation,
+                Err("The stale summary was cancelled. Nothing was changed.".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.stale.is_none()),
+            "a half-probed partition must not be shown as a finding"
+        );
+        let outcome = app
+            .romm_ui
+            .last_outcome
+            .as_ref()
+            .expect("the failure is reported");
+        assert!(!outcome.succeeded);
+    }
+
+    /// A small cache for the dispatch tests.
+    fn browse_cache() -> archivefs_core::identity_source::cache::IdentityCache {
+        archivefs_core::identity_source::cache::IdentityCache {
+            format_version: archivefs_core::identity_source::cache::CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "http://172.19.0.20:8080".to_string(),
+            server_version: Some("5.1.0".to_string()),
+            source_fingerprint: "abcd1234".to_string(),
+            imported_at_unix_seconds: 1_785_595_944,
+            platforms: Vec::new(),
+            records: Vec::new(),
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(0),
+        }
     }
 
     #[test]
