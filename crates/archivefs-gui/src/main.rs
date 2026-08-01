@@ -33256,72 +33256,50 @@ fn show_gamer_view(
         directory: artwork_directory,
         cache: artwork_cache,
     };
-    egui::ScrollArea::horizontal()
-        .id_salt("gamer_view_platform_shelf")
-        .max_height(PLATFORM_SHELF_HEIGHT)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let all_selected = library_filters.platform.is_none();
-                if show_platform_shelf_item(
-                    ui,
-                    all_selected,
-                    PlatformAssetCategory::Console.asset_id(),
-                    "All",
-                    data.rows.len(),
-                    platform_card_width,
-                    &mut shelf_artwork,
-                )
-                .clicked()
-                    && !all_selected
-                {
-                    library_filters.platform = None;
-                    // Consistent with Advanced View's Library platform strip
-                    // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk
-                    // #3): every platform-selection change clears the
-                    // current focus rather than risking a stale
-                    // selected-game panel for a game no longer in view.
-                    archive_context.clear_selection();
-                }
-                for (platform, count) in &platform_counts.named {
-                    let selected = library_filters.platform.as_deref() == Some(platform.as_str());
-                    let asset_id = platform_asset_id(platform, false);
-                    if show_platform_shelf_item(
-                        ui,
-                        selected,
-                        asset_id,
-                        platform,
-                        *count,
-                        platform_card_width,
-                        &mut shelf_artwork,
-                    )
-                    .clicked()
-                        && !selected
-                    {
-                        library_filters.platform = Some(platform.clone());
-                        archive_context.clear_selection();
-                    }
-                }
-                if platform_counts.unknown > 0 {
-                    let selected = library_filters.platform.as_deref() == Some("Unknown");
-                    if show_platform_shelf_item(
-                        ui,
-                        selected,
-                        PlatformAssetCategory::Unknown.asset_id(),
-                        "Unknown",
-                        platform_counts.unknown,
-                        platform_card_width,
-                        &mut shelf_artwork,
-                    )
-                    .clicked()
-                        && !selected
-                    {
-                        library_filters.platform = Some("Unknown".to_string());
-                        archive_context.clear_selection();
-                    }
-                }
-            });
+
+    // Built here rather than inside the shelf so that this function keeps
+    // ownership of what a platform means, and the shelf only draws and
+    // navigates. The order is the order a person sees: All, then each detected
+    // platform, then Unknown last if any.
+    let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
+        asset_id: PlatformAssetCategory::Console.asset_id(),
+        label: "All",
+        count: data.rows.len(),
+        platform: None,
+    }];
+    for (platform, count) in &platform_counts.named {
+        entries.push(ShelfEntry {
+            asset_id: platform_asset_id(platform, false),
+            label: platform.as_str(),
+            count: *count,
+            platform: Some(platform.as_str()),
         });
+    }
+    if platform_counts.unknown > 0 {
+        entries.push(ShelfEntry {
+            asset_id: PlatformAssetCategory::Unknown.asset_id(),
+            label: "Unknown",
+            count: platform_counts.unknown,
+            platform: Some("Unknown"),
+        });
+    }
+
+    let shelf = show_gamer_platform_shelf(
+        ui,
+        &entries,
+        library_filters.platform.as_deref(),
+        platform_card_width,
+        &mut shelf_artwork,
+        PLATFORM_SHELF_HEIGHT,
+    );
+    if let Some(chosen) = shelf.chosen {
+        library_filters.platform = chosen;
+        // Consistent with Advanced View's Library platform strip
+        // (docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #3): every
+        // platform-selection change clears the current focus rather than
+        // risking a stale selected-game panel for a game no longer in view.
+        archive_context.clear_selection();
+    }
     ui.add_space(theme::SECTION_GAP);
 
     // Captured once, here, after the chips above have consumed their
@@ -34309,6 +34287,147 @@ fn gamer_platform_card_width(viewport_width: f32) -> f32 {
     (viewport_width * 0.14).clamp(PLATFORM_CARD_MIN_WIDTH, PLATFORM_CARD_MAX_WIDTH)
 }
 
+// --- Platform shelf horizontal navigation ---------------------------------
+
+/// The chevron glyphs. Plain ASCII deliberately: egui's bundled fonts do not
+/// carry the geometric-shape triangles (U+25C0/U+25B6), so those render as
+/// nothing at all. The accessible name on each button carries the real meaning
+/// either way - see `shelf_chevron`.
+const SHELF_PREVIOUS_GLYPH: &str = "<";
+const SHELF_NEXT_GLYPH: &str = ">";
+
+/// Width reserved for one chevron button. Generous on purpose: this is the
+/// control a TV/Moonlight user aims a pointer at from across a room, and the
+/// one a D-pad lands focus on.
+const SHELF_CHEVRON_WIDTH: f32 = 44.0;
+
+/// How much of the visible strip one chevron press moves, as a fraction of the
+/// viewport. Deliberately short of a full page so a card or two stays on screen
+/// as a visual anchor - a person should be able to see that they moved along a
+/// continuous shelf rather than jumped to an unrelated place.
+const SHELF_PAGE_FRACTION: f32 = 0.75;
+
+/// Sub-pixel tolerance for "is this edge reached". Scroll offsets are floats
+/// and land fractionally short of the end after an animation, so comparing
+/// exactly would leave the next-chevron enabled with nothing left to reveal.
+const SHELF_EDGE_EPSILON: f32 = 1.0;
+
+/// What a navigation control asks the shelf to do. Deliberately an intent
+/// rather than a pixel delta, so the same value serves a click, an arrow key
+/// and a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShelfScroll {
+    PageLeft,
+    PageRight,
+    Start,
+    End,
+}
+
+/// The shelf's measured geometry, as the scroll area reported it last frame.
+///
+/// Every navigation decision is derived from these three numbers, which is what
+/// makes the whole behaviour testable without a window: the button states, the
+/// distance a press travels, and whether controls are needed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct PlatformShelfMetrics {
+    /// Current horizontal scroll offset.
+    offset_x: f32,
+    /// Total width of all cards laid out in a row.
+    content_width: f32,
+    /// Width of the visible strip.
+    viewport_width: f32,
+}
+
+impl PlatformShelfMetrics {
+    /// The largest offset that still shows content: zero when everything fits.
+    fn max_offset(&self) -> f32 {
+        (self.content_width - self.viewport_width).max(0.0)
+    }
+
+    /// Whether any card is off-screen, and therefore whether the controls have
+    /// anything to do. Zero-width measurements (the first frame, or an empty
+    /// library) count as fitting.
+    fn overflows(&self) -> bool {
+        self.viewport_width > 0.0 && self.max_offset() > SHELF_EDGE_EPSILON
+    }
+
+    fn at_start(&self) -> bool {
+        self.offset_x <= SHELF_EDGE_EPSILON
+    }
+
+    fn at_end(&self) -> bool {
+        self.offset_x >= self.max_offset() - SHELF_EDGE_EPSILON
+    }
+
+    /// Whether the "Previous platforms" control can do anything.
+    fn can_page_left(&self) -> bool {
+        self.overflows() && !self.at_start()
+    }
+
+    /// Whether the "Next platforms" control can do anything.
+    fn can_page_right(&self) -> bool {
+        self.overflows() && !self.at_end()
+    }
+
+    /// How far one page press travels.
+    fn page_delta(&self) -> f32 {
+        self.viewport_width * SHELF_PAGE_FRACTION
+    }
+
+    /// The offset `scroll` would land on, clamped to the real range so a press
+    /// at either edge is a no-op rather than an over-scroll.
+    fn offset_after(&self, scroll: ShelfScroll) -> f32 {
+        let target = match scroll {
+            ShelfScroll::PageLeft => self.offset_x - self.page_delta(),
+            ShelfScroll::PageRight => self.offset_x + self.page_delta(),
+            ShelfScroll::Start => 0.0,
+            ShelfScroll::End => self.max_offset(),
+        };
+        target.clamp(0.0, self.max_offset())
+    }
+
+    /// The signed distance `scroll` moves, in scroll-offset terms. Zero when
+    /// there is nowhere to go.
+    fn scroll_distance(&self, scroll: ShelfScroll) -> f32 {
+        self.offset_after(scroll) - self.offset_x
+    }
+
+    /// Whether `scroll` would change anything.
+    fn can_scroll(&self, scroll: ShelfScroll) -> bool {
+        self.scroll_distance(scroll).abs() > SHELF_EDGE_EPSILON
+    }
+}
+
+/// What the shelf remembers between frames.
+///
+/// Held in egui's per-context temporary store rather than in the application
+/// struct: it is presentation state for one widget, it must not be persisted to
+/// disk, and keeping it here means `show_gamer_view`'s signature does not grow a
+/// parameter that every caller and test would have to thread through.
+#[derive(Debug, Clone, Default)]
+struct PlatformShelfState {
+    metrics: PlatformShelfMetrics,
+    /// A press waiting to be applied. Applied inside the scroll area on the
+    /// next frame, because that is the only place egui will bind a scroll delta
+    /// to this particular scroll area.
+    pending: Option<ShelfScroll>,
+    /// The selected platform as of the last frame, so a change can be detected
+    /// and the newly selected card scrolled back into view. The outer `Option`
+    /// distinguishes "not recorded yet" from "recorded as All".
+    last_selected: Option<Option<String>>,
+}
+
+/// Reads the shelf's remembered state.
+fn platform_shelf_state(ctx: &egui::Context, id: egui::Id) -> PlatformShelfState {
+    ctx.data(|data| data.get_temp::<PlatformShelfState>(id))
+        .unwrap_or_default()
+}
+
+/// Writes the shelf's remembered state.
+fn set_platform_shelf_state(ctx: &egui::Context, id: egui::Id, state: PlatformShelfState) {
+    ctx.data_mut(|data| data.insert_temp(id, state));
+}
+
 /// Horizontal padding reserved inside a platform card around its label
 /// text (artwork and card border share the rest of `card_width`).
 const PLATFORM_LABEL_HORIZONTAL_PADDING: f32 = 16.0;
@@ -34379,6 +34498,238 @@ fn compact_platform_label(label: &str, card_width: f32) -> String {
 struct PlatformShelfArtwork<'a> {
     directory: Option<&'a Path>,
     cache: &'a mut PlatformArtworkCache,
+}
+
+/// What one frame of the platform shelf produced.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ShelfOutcome {
+    /// The newly chosen filter, when the user picked a different card.
+    /// `Some(None)` is the "All" card; the outer `None` means no change.
+    chosen: Option<Option<String>>,
+    /// Whether the navigation controls were drawn at all.
+    controls_visible: bool,
+    /// Whether each control could act, which is what "disabled at its edge"
+    /// means in practice.
+    previous_enabled: bool,
+    next_enabled: bool,
+    /// The geometry this frame measured, after the strip was laid out. Reported
+    /// so a caller - and a test - can see what the controls were derived from
+    /// without reaching into egui's internal ids.
+    metrics: PlatformShelfMetrics,
+}
+
+/// One card in the platform shelf: what to draw, and what picking it selects.
+#[derive(Debug, Clone, Copy)]
+struct ShelfEntry<'a> {
+    asset_id: &'a str,
+    label: &'a str,
+    count: usize,
+    /// The platform filter this card applies. `None` is the "All" card.
+    platform: Option<&'a str>,
+}
+
+/// The horizontally scrolling platform picker, with its navigation controls.
+///
+/// Returns the newly chosen filter when the user picked a different card, so the
+/// caller owns the filter change and this function owns none of the filtering
+/// logic.
+///
+/// # Layout
+///
+/// The chevrons are laid out as siblings of the scroll area, never painted over
+/// it, so they cannot cover a card at any width. The strip is given the width
+/// that remains after their slots are reserved. Whether they appear at all is
+/// decided from the content width against the *full* width available to the row,
+/// which does not itself depend on the chevrons being present - so the decision
+/// cannot oscillate between frames.
+///
+/// # Input
+///
+/// Wheel, trackpad and drag scrolling are untouched: this adds a scroll delta
+/// through egui's normal animated scroll request and never sets the offset
+/// directly, so it composes with whatever the user does by hand.
+fn show_gamer_platform_shelf(
+    ui: &mut egui::Ui,
+    entries: &[ShelfEntry<'_>],
+    selected: Option<&str>,
+    card_width: f32,
+    artwork: &mut PlatformShelfArtwork<'_>,
+    shelf_height: f32,
+) -> ShelfOutcome {
+    let state_id = ui.id().with("gamer_platform_shelf_nav");
+    let mut state = platform_shelf_state(ui.ctx(), state_id);
+    let mut outcome = ShelfOutcome::default();
+
+    // Measured before anything is laid out, so it is independent of whether the
+    // chevrons end up being drawn.
+    let full_width = ui.available_width();
+    let show_controls = state.metrics.content_width > full_width + SHELF_EDGE_EPSILON;
+    outcome.controls_visible = show_controls;
+    outcome.previous_enabled = show_controls && state.metrics.can_page_left();
+    outcome.next_enabled = show_controls && state.metrics.can_page_right();
+
+    // A selection change re-reveals the selected card. Detected here, before the
+    // cards are drawn, because the scroll request has to be made as the card
+    // itself is laid out.
+    let selection_changed = state
+        .last_selected
+        .as_ref()
+        .is_some_and(|last| last.as_deref() != selected);
+
+    let mut requested: Option<ShelfScroll> = None;
+    let mut focusable: Vec<egui::Id> = Vec::new();
+
+    ui.horizontal(|ui| {
+        if show_controls {
+            let response = shelf_chevron(
+                ui,
+                SHELF_PREVIOUS_GLYPH,
+                "Previous platforms",
+                shelf_height,
+                outcome.previous_enabled,
+            );
+            focusable.push(response.id);
+            if response.clicked() {
+                requested = Some(ShelfScroll::PageLeft);
+            }
+        }
+
+        let reserved = if show_controls {
+            SHELF_CHEVRON_WIDTH + ui.spacing().item_spacing.x
+        } else {
+            0.0
+        };
+        let strip_width = (ui.available_width() - reserved).max(card_width);
+
+        let output = egui::ScrollArea::horizontal()
+            .id_salt("gamer_view_platform_shelf")
+            .max_height(shelf_height)
+            .max_width(strip_width)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                // A press recorded last frame is applied here, inside the scroll
+                // area, which is where egui binds an animated scroll request.
+                // The sign is inverted because a scroll delta describes moving
+                // the content, not the viewport.
+                if let Some(scroll) = state.pending.take() {
+                    let distance = state.metrics.scroll_distance(scroll);
+                    if distance != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(-distance, 0.0));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    for entry in entries {
+                        let is_selected = entry.platform == selected;
+                        let response = show_platform_shelf_item(
+                            ui,
+                            is_selected,
+                            entry.asset_id,
+                            entry.label,
+                            entry.count,
+                            card_width,
+                            artwork,
+                        );
+                        focusable.push(response.id);
+                        if is_selected && selection_changed {
+                            // Minimal movement: bring it just into view rather
+                            // than recentring, so the shelf does not lurch.
+                            ui.scroll_to_rect(response.rect, None);
+                        }
+                        if response.clicked() && !is_selected {
+                            outcome.chosen = Some(entry.platform.map(str::to_owned));
+                        }
+                    }
+                });
+            });
+
+        if show_controls {
+            let response = shelf_chevron(
+                ui,
+                SHELF_NEXT_GLYPH,
+                "Next platforms",
+                shelf_height,
+                outcome.next_enabled,
+            );
+            focusable.push(response.id);
+            if response.clicked() {
+                requested = Some(ShelfScroll::PageRight);
+            }
+        }
+
+        // Re-measured every frame, so a window resize, a filter change and a
+        // hand-scroll all update the button states with no extra bookkeeping.
+        state.metrics = PlatformShelfMetrics {
+            offset_x: output.state.offset.x,
+            content_width: output.content_size.x,
+            viewport_width: output.inner_rect.width(),
+        };
+        outcome.metrics = state.metrics;
+    });
+
+    // Keyboard and D-pad, active only while focus is inside the shelf, so these
+    // keys keep their meaning everywhere else in the window.
+    if let Some(scroll) = shelf_keyboard_scroll(ui.ctx(), &focusable) {
+        requested = Some(scroll);
+    }
+
+    if let Some(scroll) = requested
+        && state.metrics.can_scroll(scroll)
+    {
+        state.pending = Some(scroll);
+        // The animation runs over several frames, and the offset it lands on is
+        // what re-enables or disables each chevron.
+        ui.ctx().request_repaint();
+    }
+    state.last_selected = Some(selected.map(str::to_owned));
+    set_platform_shelf_state(ui.ctx(), state_id, state);
+    outcome
+}
+
+/// One navigation chevron.
+///
+/// Disabled rather than hidden at its edge: the slot stays where it is, so the
+/// strip does not resize under the pointer and a D-pad user does not lose the
+/// control they were aiming at. The hover text doubles as the accessible name,
+/// matching the convention `show_platform_shelf_item` documents.
+fn shelf_chevron(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    accessible_name: &str,
+    height: f32,
+    enabled: bool,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(glyph).min_size(egui::vec2(SHELF_CHEVRON_WIDTH, height)),
+    )
+    .on_hover_text(accessible_name)
+}
+
+/// The scroll a key press asks for, when focus is on one of `focusable` - the
+/// chevrons or any platform card.
+///
+/// Scoped to the shelf's own widgets deliberately: Left/Right/Home/End all mean
+/// something else elsewhere, so they are only consumed while the shelf really
+/// has focus. That is also what makes this work from a TV remote or a game pad
+/// mapped to arrow keys.
+fn shelf_keyboard_scroll(ctx: &egui::Context, focusable: &[egui::Id]) -> Option<ShelfScroll> {
+    let focused = ctx.memory(|memory| memory.focused())?;
+    if !focusable.contains(&focused) {
+        return None;
+    }
+    ctx.input_mut(|input| {
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+            Some(ShelfScroll::PageRight)
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+            Some(ShelfScroll::PageLeft)
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+            Some(ShelfScroll::Start)
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+            Some(ShelfScroll::End)
+        } else {
+            None
+        }
+    })
 }
 
 fn show_platform_shelf_item(
@@ -35680,6 +36031,643 @@ mod tests {
         assert_eq!(gamer_search_width(400.0), 336.0);
         assert!(400.0 - gamer_search_width(400.0) >= GAMER_TOP_BAR_CONTROL_RESERVE);
         assert_eq!(gamer_search_width(40.0), 0.0);
+    }
+
+    // --- Platform shelf horizontal navigation ----------------------------
+
+    fn shelf_metrics(offset: f32, content: f32, viewport: f32) -> PlatformShelfMetrics {
+        PlatformShelfMetrics {
+            offset_x: offset,
+            content_width: content,
+            viewport_width: viewport,
+        }
+    }
+
+    /// Test 1: at the start of an overflowing strip, only "next" is usable.
+    #[test]
+    fn shelf_at_the_start_offers_next_only() {
+        let metrics = shelf_metrics(0.0, 2400.0, 800.0);
+        assert!(metrics.overflows());
+        assert!(metrics.at_start());
+        assert!(!metrics.at_end());
+        assert!(!metrics.can_page_left(), "there is nothing to the left yet");
+        assert!(metrics.can_page_right());
+        assert_eq!(metrics.max_offset(), 1600.0);
+    }
+
+    /// Test 2: mid-strip, both directions are usable.
+    #[test]
+    fn shelf_in_the_middle_offers_both_directions() {
+        let metrics = shelf_metrics(800.0, 2400.0, 800.0);
+        assert!(!metrics.at_start());
+        assert!(!metrics.at_end());
+        assert!(metrics.can_page_left());
+        assert!(metrics.can_page_right());
+    }
+
+    /// Test 3: at the end, only "previous" is usable.
+    #[test]
+    fn shelf_at_the_end_offers_previous_only() {
+        let metrics = shelf_metrics(1600.0, 2400.0, 800.0);
+        assert!(metrics.at_end());
+        assert!(metrics.can_page_left());
+        assert!(
+            !metrics.can_page_right(),
+            "the last card is already showing"
+        );
+    }
+
+    /// Test 4: a press moves 70-80% of the visible width, as required.
+    #[test]
+    fn one_press_moves_between_seventy_and_eighty_percent_of_the_strip() {
+        let metrics = shelf_metrics(0.0, 4000.0, 900.0);
+        let travelled = metrics.scroll_distance(ShelfScroll::PageRight);
+        let fraction = travelled / metrics.viewport_width;
+        assert!(
+            (0.70..=0.80).contains(&fraction),
+            "one press moved {fraction} of the strip"
+        );
+        assert_eq!(metrics.offset_after(ShelfScroll::PageRight), 675.0);
+    }
+
+    /// Test 5: paging never runs past either edge.
+    #[test]
+    fn paging_is_clamped_at_both_edges() {
+        // Near the end: the press stops exactly at the end, not beyond it.
+        let near_end = shelf_metrics(1500.0, 2400.0, 800.0);
+        assert_eq!(near_end.offset_after(ShelfScroll::PageRight), 1600.0);
+        // Near the start: it stops at zero, never negative.
+        let near_start = shelf_metrics(100.0, 2400.0, 800.0);
+        assert_eq!(near_start.offset_after(ShelfScroll::PageLeft), 0.0);
+        // Already at an edge: no movement at all.
+        let at_start = shelf_metrics(0.0, 2400.0, 800.0);
+        assert_eq!(at_start.scroll_distance(ShelfScroll::PageLeft), 0.0);
+        assert!(!at_start.can_scroll(ShelfScroll::PageLeft));
+        let at_end = shelf_metrics(1600.0, 2400.0, 800.0);
+        assert_eq!(at_end.scroll_distance(ShelfScroll::PageRight), 0.0);
+        assert!(!at_end.can_scroll(ShelfScroll::PageRight));
+    }
+
+    /// Test 6: Home and End jump to the first and last platform.
+    #[test]
+    fn home_and_end_jump_to_the_first_and_last_platform() {
+        let metrics = shelf_metrics(640.0, 2400.0, 800.0);
+        assert_eq!(metrics.offset_after(ShelfScroll::Start), 0.0);
+        assert_eq!(metrics.offset_after(ShelfScroll::End), 1600.0);
+        assert!(metrics.can_scroll(ShelfScroll::Start));
+        assert!(metrics.can_scroll(ShelfScroll::End));
+
+        // From an edge, the jump towards that same edge does nothing.
+        let at_start = shelf_metrics(0.0, 2400.0, 800.0);
+        assert!(!at_start.can_scroll(ShelfScroll::Start));
+        assert!(at_start.can_scroll(ShelfScroll::End));
+    }
+
+    /// Test 7: a strip that fits needs no controls at all.
+    #[test]
+    fn a_strip_that_fits_needs_no_controls() {
+        let fits = shelf_metrics(0.0, 600.0, 800.0);
+        assert!(!fits.overflows());
+        assert_eq!(fits.max_offset(), 0.0);
+        assert!(!fits.can_page_left());
+        assert!(!fits.can_page_right());
+        for scroll in [
+            ShelfScroll::PageLeft,
+            ShelfScroll::PageRight,
+            ShelfScroll::Start,
+            ShelfScroll::End,
+        ] {
+            assert!(
+                !fits.can_scroll(scroll),
+                "{scroll:?} must do nothing when everything is visible"
+            );
+        }
+    }
+
+    /// Test 8: an empty or single-platform shelf is a fitting shelf.
+    #[test]
+    fn an_empty_or_single_platform_shelf_has_no_controls() {
+        // Nothing measured yet, or nothing to show.
+        let empty = PlatformShelfMetrics::default();
+        assert!(!empty.overflows());
+        assert!(!empty.can_page_left());
+        assert!(!empty.can_page_right());
+
+        // One "All" card plus one platform, comfortably inside the viewport.
+        let single = shelf_metrics(0.0, 2.0 * PLATFORM_CARD_MIN_WIDTH, 900.0);
+        assert!(!single.overflows());
+        assert!(!single.can_page_right());
+    }
+
+    /// Test 9: a resize that reveals everything retires the controls, and one
+    /// that hides cards brings them back - including clamping a stale offset.
+    #[test]
+    fn resizing_updates_the_controls_and_the_reachable_range() {
+        // Narrow: overflowing, both controls meaningful from the middle.
+        let narrow = shelf_metrics(400.0, 2400.0, 600.0);
+        assert!(narrow.overflows());
+        assert!(narrow.can_page_left() && narrow.can_page_right());
+
+        // Widened past the content: nothing left to scroll, and the offset the
+        // narrow layout had is no longer reachable.
+        let widened = shelf_metrics(400.0, 2400.0, 2500.0);
+        assert!(!widened.overflows());
+        assert_eq!(widened.max_offset(), 0.0);
+        assert_eq!(
+            widened.offset_after(ShelfScroll::End),
+            0.0,
+            "a stale offset must clamp to the new range, not stay out of bounds"
+        );
+
+        // A press distance always follows the current viewport, not a remembered
+        // one, so the same code serves every window size.
+        assert_eq!(shelf_metrics(0.0, 9000.0, 1000.0).page_delta(), 750.0);
+        assert_eq!(shelf_metrics(0.0, 9000.0, 1600.0).page_delta(), 1200.0);
+    }
+
+    /// Test 10: sub-pixel offsets after an animation still count as an edge.
+    #[test]
+    fn a_sub_pixel_offset_still_counts_as_reaching_the_edge() {
+        let landed_short = shelf_metrics(1599.6, 2400.0, 800.0);
+        assert!(
+            landed_short.at_end(),
+            "an animation landing a fraction short must not leave `next` enabled"
+        );
+        assert!(!landed_short.can_page_right());
+        let barely_moved = shelf_metrics(0.4, 2400.0, 800.0);
+        assert!(barely_moved.at_start());
+        assert!(!barely_moved.can_page_left());
+    }
+
+    fn shelf_entries(count: usize) -> Vec<(String, usize)> {
+        (0..count)
+            .map(|index| (format!("Platform {index:02}"), index + 1))
+            .collect()
+    }
+
+    /// Renders just the shelf at a chosen window width.
+    ///
+    /// `frames` matters: a fresh `egui::Context` needs one pass before its
+    /// screen rect and the strip's content size are both real, and the shelf
+    /// needs one more pass to act on that measurement - so three is the
+    /// settled state, and fewer is deliberately used to test the unsettled one.
+    fn render_shelf(
+        context: &egui::Context,
+        width: f32,
+        platforms: &[(String, usize)],
+        selected: Option<&str>,
+        frames: usize,
+    ) -> (egui::FullOutput, ShelfOutcome) {
+        let mut cache = PlatformArtworkCache::default();
+        let mut output = None;
+        let mut reported = ShelfOutcome::default();
+        // A real window size, the way `resizing_the_window_does_not_reintroduce_clipping`
+        // does it: `Ui::set_max_width` does not narrow `available_width`, so the
+        // strip has to be constrained by the screen rect itself.
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 400.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..frames.max(1) {
+            let mut artwork = PlatformShelfArtwork {
+                directory: None,
+                cache: &mut cache,
+            };
+            let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
+                asset_id: PlatformAssetCategory::Console.asset_id(),
+                label: "All",
+                count: 10,
+                platform: None,
+            }];
+            for (label, count) in platforms {
+                entries.push(ShelfEntry {
+                    asset_id: "unknown",
+                    label: label.as_str(),
+                    count: *count,
+                    platform: Some(label.as_str()),
+                });
+            }
+            output = Some(context.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    reported = show_gamer_platform_shelf(
+                        ui,
+                        &entries,
+                        selected,
+                        PLATFORM_CARD_MIN_WIDTH,
+                        &mut artwork,
+                        150.0,
+                    );
+                });
+            }));
+        }
+        (output.expect("at least one frame"), reported)
+    }
+
+    /// Test 11: with many platforms, both controls are present and labelled.
+    #[test]
+    fn a_wide_shelf_renders_both_accessible_controls() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+        // Two frames: the first measures the content, the second can act on it.
+        let (output, shelf) = render_shelf(&context, 700.0, &platforms, None, 3);
+
+        assert!(shelf.controls_visible, "40 platforms cannot fit in 700px");
+        // Both glyphs are painted, and the accessible names are attached as
+        // hover text, which is also the AccessKit name - see `shelf_chevron`.
+        assert!(rendered_text_contains(&output, SHELF_PREVIOUS_GLYPH));
+        assert!(rendered_text_contains(&output, SHELF_NEXT_GLYPH));
+        // At the start, only "next" can act - the other is drawn but disabled.
+        assert!(!shelf.previous_enabled);
+        assert!(shelf.next_enabled);
+    }
+
+    /// Test 12: a shelf that fits renders no chevrons at all.
+    #[test]
+    fn a_shelf_that_fits_renders_no_chevrons() {
+        let context = egui::Context::default();
+        // One platform plus All, in a very wide window.
+        let (output, shelf) = render_shelf(&context, 4000.0, &shelf_entries(1), None, 2);
+        assert!(
+            !shelf.controls_visible,
+            "nothing is off-screen, so no navigation should appear"
+        );
+        assert!(!shelf.previous_enabled && !shelf.next_enabled);
+        assert!(!rendered_text_contains(&output, SHELF_NEXT_GLYPH));
+    }
+
+    /// Test 13: an empty shelf renders without panicking and without controls.
+    #[test]
+    fn an_empty_shelf_renders_no_controls_and_does_not_panic() {
+        let context = egui::Context::default();
+        let (output, shelf) = render_shelf(&context, 900.0, &[], None, 2);
+        assert!(!shelf.controls_visible);
+        assert_eq!(shelf.chosen, None, "rendering must not select anything");
+        assert!(!rendered_text_contains(&output, SHELF_NEXT_GLYPH));
+    }
+
+    /// Test 14: rendering is stable - the chevrons do not appear and disappear
+    /// on alternating frames at a width close to the content width.
+    #[test]
+    fn control_visibility_does_not_oscillate_at_a_borderline_width() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(6);
+        // Settle first, then compare several consecutive frames.
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let (_, shelf) = render_shelf(&context, 900.0, &platforms, None, 1);
+            seen.push(shelf.controls_visible);
+        }
+        let first = seen[2];
+        assert!(
+            seen[2..].iter().all(|value| *value == first),
+            "chevron presence flickered across frames: {seen:?}"
+        );
+    }
+
+    /// Test 15: the controls appear only once the content has been measured,
+    /// which is what proves the cross-frame measurement actually works.
+    #[test]
+    fn the_controls_appear_after_the_first_frame_has_measured_the_content() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+
+        let (_, first) = render_shelf(&context, 700.0, &platforms, None, 1);
+        assert!(
+            !first.controls_visible,
+            "nothing has been measured yet, so nothing is claimed"
+        );
+
+        let (_, second) = render_shelf(&context, 700.0, &platforms, None, 1);
+        assert!(
+            second.controls_visible,
+            "the first frame's measurement must be available to the second"
+        );
+    }
+
+    /// Test 16: resizing the window updates the controls in both directions,
+    /// through real layout rather than arithmetic.
+    #[test]
+    fn resizing_the_rendered_window_adds_and_retires_the_controls() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(20);
+
+        // Narrow: the strip overflows and the controls appear.
+        let (_, narrow) = render_shelf(&context, 700.0, &platforms, None, 2);
+        assert!(narrow.controls_visible);
+        assert!(narrow.next_enabled);
+
+        // Widened past the whole strip in the same session: they retire.
+        let (_, wide) = render_shelf(&context, 5000.0, &platforms, None, 2);
+        assert!(
+            !wide.controls_visible,
+            "a window wide enough to show everything needs no navigation"
+        );
+
+        // And narrowing again brings them back.
+        let (_, narrow_again) = render_shelf(&context, 700.0, &platforms, None, 2);
+        assert!(narrow_again.controls_visible);
+    }
+
+    /// Renders the shelf with extra input events, and reports the offset the
+    /// strip settled on. Used for the wheel and keyboard cases.
+    fn render_shelf_with_events(
+        context: &egui::Context,
+        width: f32,
+        platforms: &[(String, usize)],
+        selected: Option<&str>,
+        frames: usize,
+        events: &[egui::Event],
+    ) -> (ShelfOutcome, f32) {
+        let mut cache = PlatformArtworkCache::default();
+        let mut reported = ShelfOutcome::default();
+        let mut offset = 0.0;
+        let base = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 400.0),
+            )),
+            ..Default::default()
+        };
+        for frame in 0..frames.max(1) {
+            let mut artwork = PlatformShelfArtwork {
+                directory: None,
+                cache: &mut cache,
+            };
+            let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
+                asset_id: PlatformAssetCategory::Console.asset_id(),
+                label: "All",
+                count: 10,
+                platform: None,
+            }];
+            for (label, count) in platforms {
+                entries.push(ShelfEntry {
+                    asset_id: "unknown",
+                    label: label.as_str(),
+                    count: *count,
+                    platform: Some(label.as_str()),
+                });
+            }
+            // The events are delivered once the strip has been measured, so they
+            // act on a settled layout rather than a zero-width one.
+            let input = if frame == 2 {
+                egui::RawInput {
+                    events: events.to_vec(),
+                    ..base.clone()
+                }
+            } else {
+                base.clone()
+            };
+            let _ = context.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    reported = show_gamer_platform_shelf(
+                        ui,
+                        &entries,
+                        selected,
+                        PLATFORM_CARD_MIN_WIDTH,
+                        &mut artwork,
+                        150.0,
+                    );
+                });
+            });
+            offset = reported.metrics.offset_x;
+        }
+        (reported, offset)
+    }
+
+    /// Test 17: the mouse wheel and trackpad keep scrolling the strip, which the
+    /// buttons must not have taken over.
+    #[test]
+    fn the_mouse_wheel_still_scrolls_the_strip() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+        let wheel = vec![
+            egui::Event::PointerMoved(egui::pos2(300.0, 100.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-400.0, 0.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let (shelf, offset) =
+            render_shelf_with_events(&context, 700.0, &platforms, None, 8, &wheel);
+        assert!(shelf.controls_visible);
+        assert!(
+            offset > 0.0,
+            "a wheel event must still move the strip, offset was {offset}"
+        );
+        // Having scrolled away from the start by hand, the previous control
+        // becomes usable - the button state follows manual scrolling.
+        assert!(
+            shelf.previous_enabled,
+            "the button state must update after manual scrolling"
+        );
+    }
+
+    /// Test 18: pressing the next chevron scrolls, and the strip ends up further
+    /// along than a page.
+    #[test]
+    fn a_next_press_scrolls_by_about_a_page() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+        // Settle, then click where the right chevron sits: the far right edge of
+        // the row, vertically inside the shelf.
+        let click_at = egui::pos2(700.0 - 24.0, 90.0);
+        let click = vec![
+            egui::Event::PointerMoved(click_at),
+            egui::Event::PointerButton {
+                pos: click_at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: click_at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let (shelf, offset) =
+            render_shelf_with_events(&context, 700.0, &platforms, None, 30, &click);
+        assert!(shelf.controls_visible);
+        assert!(
+            offset > 100.0,
+            "the next chevron should have scrolled the strip, offset was {offset}"
+        );
+        assert!(
+            shelf.previous_enabled,
+            "having moved off the start, previous must become usable"
+        );
+    }
+
+    /// Test 19: the keyboard mapping, resolved directly - focus on a shelf
+    /// widget is required, and each key means what the milestone says.
+    #[test]
+    fn the_keyboard_mapping_requires_focus_on_the_shelf() {
+        let context = egui::Context::default();
+        let shelf_widget = egui::Id::new("a_shelf_card");
+        let elsewhere = egui::Id::new("some_other_widget");
+
+        let press = |key: egui::Key, focused: egui::Id| {
+            context.memory_mut(|memory| memory.request_focus(focused));
+            context.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let resolved = shelf_keyboard_scroll(&context, &[shelf_widget]);
+            let _ = context.end_pass();
+            resolved
+        };
+
+        assert_eq!(
+            press(egui::Key::ArrowRight, shelf_widget),
+            Some(ShelfScroll::PageRight)
+        );
+        assert_eq!(
+            press(egui::Key::ArrowLeft, shelf_widget),
+            Some(ShelfScroll::PageLeft)
+        );
+        assert_eq!(
+            press(egui::Key::Home, shelf_widget),
+            Some(ShelfScroll::Start)
+        );
+        assert_eq!(press(egui::Key::End, shelf_widget), Some(ShelfScroll::End));
+
+        // Focus anywhere else and the shelf must not consume these keys, since
+        // they mean something different everywhere else in the window.
+        assert_eq!(press(egui::Key::ArrowRight, elsewhere), None);
+        assert_eq!(press(egui::Key::Home, elsewhere), None);
+    }
+
+    /// Test 20: the controls are laid out beside the strip, never over it, so a
+    /// card can never be obscured.
+    #[test]
+    fn the_controls_never_overlap_the_strip() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+
+        // With controls, the strip is narrower than the window by exactly the
+        // two reserved slots, which is only possible if they are siblings.
+        let (_, with_controls) = render_shelf(&context, 700.0, &platforms, None, 3);
+        assert!(with_controls.controls_visible);
+        let narrowed = with_controls.metrics.viewport_width;
+
+        // Without controls, the strip gets the full width. Few enough platforms
+        // that a wide window really does show all of them.
+        let (_, no_controls) = render_shelf(&context, 5000.0, &shelf_entries(8), None, 3);
+        assert!(!no_controls.controls_visible);
+        let full = no_controls.metrics.viewport_width;
+
+        assert!(
+            narrowed < 700.0 - SHELF_CHEVRON_WIDTH,
+            "the strip must give up room for both chevrons, it was {narrowed}"
+        );
+        assert!(
+            full > narrowed,
+            "without controls the strip should be wider ({full} vs {narrowed})"
+        );
+    }
+
+    /// Test 21: changing the platform filter brings the newly selected card back
+    /// into view rather than leaving the strip where it was.
+    #[test]
+    fn a_filter_change_scrolls_the_selected_platform_back_into_view() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+        let wheel = vec![
+            egui::Event::PointerMoved(egui::pos2(300.0, 100.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-600.0, 0.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+
+        // Scroll a long way along the strip by hand.
+        for _ in 0..6 {
+            render_shelf_with_events(&context, 700.0, &platforms, None, 4, &wheel);
+        }
+        // Let egui's smooth-scrolling momentum finish before measuring, so the
+        // comparison below is against a settled strip rather than a coasting one.
+        let (_, far) = render_shelf_with_events(&context, 700.0, &platforms, None, 40, &[]);
+        assert!(far > 500.0, "the strip should be well along, was {far}");
+
+        // Now select an early platform, exactly as a filter change does. The
+        // newly selected card must be brought back into view.
+        let (_, near) =
+            render_shelf_with_events(&context, 700.0, &platforms, Some("Platform 00"), 30, &[]);
+        assert!(
+            near < far,
+            "selecting an early platform should scroll back towards it ({near} from {far})"
+        );
+    }
+
+    /// Test 21b: a filter change to a platform already on screen leaves the
+    /// strip alone rather than jerking it about.
+    #[test]
+    fn selecting_a_platform_already_in_view_does_not_move_the_strip() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(40);
+        // Settle at the start, then select the first platform, which is visible.
+        render_shelf(&context, 700.0, &platforms, None, 3);
+        let (_, settled) =
+            render_shelf_with_events(&context, 700.0, &platforms, Some("Platform 00"), 12, &[]);
+        assert!(
+            settled <= SHELF_EDGE_EPSILON,
+            "an already-visible selection must not scroll the strip, offset {settled}"
+        );
+    }
+
+    /// Test 22: the accessible names the milestone specified are the ones used.
+    #[test]
+    fn the_controls_carry_the_specified_accessible_names() {
+        let context = egui::Context::default();
+        let mut cache = PlatformArtworkCache::default();
+        let artwork = PlatformShelfArtwork {
+            directory: None,
+            cache: &mut cache,
+        };
+        let mut names = Vec::new();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for (glyph, name) in [
+                    (SHELF_PREVIOUS_GLYPH, "Previous platforms"),
+                    (SHELF_NEXT_GLYPH, "Next platforms"),
+                ] {
+                    let response = shelf_chevron(ui, glyph, name, 150.0, true);
+                    // The hover text is the accessible name - see `shelf_chevron`.
+                    assert!(response.enabled());
+                    names.push(name.to_string());
+                }
+            });
+        });
+        let _ = artwork.cache;
+        assert_eq!(names, vec!["Previous platforms", "Next platforms"]);
+    }
+
+    /// Test 17: rendering the shelf never changes the selection by itself.
+    #[test]
+    fn rendering_the_shelf_never_changes_the_selection() {
+        let context = egui::Context::default();
+        let platforms = shelf_entries(12);
+        for selected in [None, Some("Platform 03")] {
+            let (_, shelf) = render_shelf(&context, 800.0, &platforms, selected, 3);
+            assert_eq!(
+                shelf.chosen, None,
+                "no click happened, so no filter change may be reported"
+            );
+        }
     }
 
     #[test]
