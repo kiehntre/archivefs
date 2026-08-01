@@ -17363,7 +17363,10 @@ fn show_bsfree_game_browser(
                                 ui.strong(&game.name);
                                 widgets::status_badge(
                                     ui,
-                                    &game.system.name,
+                                    game.system
+                                        .archivefs_platform_display_name
+                                        .as_deref()
+                                        .unwrap_or(&game.system.name),
                                     widgets::StatusTone::Info,
                                 );
                                 widgets::status_badge(
@@ -17399,7 +17402,10 @@ fn show_bsfree_game_browser(
             ui.heading(&game.name);
             ui.label(format!(
                 "{} · {} · {}",
-                game.system.name,
+                game.system
+                    .archivefs_platform_display_name
+                    .as_deref()
+                    .unwrap_or(&game.system.name),
                 game.device.name,
                 game.version.as_deref().unwrap_or("version not supplied")
             ));
@@ -60138,6 +60144,7 @@ $Instant Growth [Nayr]\n";
         assert!(browser.contains("PageRequest::games(0)"));
         assert!(browser.contains("Previous 100"));
         assert!(browser.contains("Next 100"));
+        assert!(browser.contains("archivefs_platform_display_name"));
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
     }

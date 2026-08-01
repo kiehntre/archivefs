@@ -222,6 +222,7 @@ pub struct BsFreeSystemSummary {
     pub upstream_id: i64,
     pub name: String,
     pub archivefs_platform_id: Option<String>,
+    pub archivefs_platform_display_name: Option<String>,
     pub mapping_status: PlatformMappingStatus,
 }
 
@@ -1044,13 +1045,29 @@ pub fn bsfree_platform_mapping(upstream_id: i64, name: &str) -> ProviderPlatform
         "3D0" => Some(("3DO", PlatformMappingStatus::Alias)),
         _ => None,
     };
-    let (archivefs_platform_id, status, explanation) = match mapped {
-        Some((platform, status)) => (
-            Some(platform.to_string()),
-            status,
-            format!("Explicit BSFree mapping from {name} to ArchiveFS {platform}"),
-        ),
+    let (archivefs_platform_id, archivefs_platform_display_name, status, explanation) = match mapped
+    {
+        Some((platform_id, status)) => match crate::platform::platform_by_id(platform_id) {
+            Some(platform) => (
+                Some(platform.id.to_string()),
+                Some(platform.display_name.to_string()),
+                status,
+                format!(
+                    "Explicit BSFree mapping from {name} to ArchiveFS {} ({})",
+                    platform.id, platform.display_name
+                ),
+            ),
+            None => (
+                None,
+                None,
+                PlatformMappingStatus::Unknown,
+                format!(
+                    "Explicit BSFree mapping target {platform_id} is absent from the canonical platform registry"
+                ),
+            ),
+        },
         None => (
+            None,
             None,
             PlatformMappingStatus::Unknown,
             "No explicit BSFree-to-ArchiveFS platform mapping exists".to_string(),
@@ -1060,6 +1077,7 @@ pub fn bsfree_platform_mapping(upstream_id: i64, name: &str) -> ProviderPlatform
         upstream_id,
         upstream_name: name.to_string(),
         archivefs_platform_id,
+        archivefs_platform_display_name,
         status,
         explanation,
     }
@@ -1185,6 +1203,7 @@ fn game_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BsFreeGame> {
             upstream_id: system_id,
             name: system_name,
             archivefs_platform_id: platform.archivefs_platform_id,
+            archivefs_platform_display_name: platform.archivefs_platform_display_name,
             mapping_status: platform.status,
         },
         device: BsFreeDeviceSummary {
@@ -2119,16 +2138,16 @@ mod tests {
 
     #[test]
     fn platform_and_device_mappings_are_explicit_and_unknowns_remain_visible() {
+        let nes = bsfree_platform_mapping(2, "Nintendo Entertainment System");
+        assert_eq!(nes.archivefs_platform_id.as_deref(), Some("NES"));
         assert_eq!(
-            bsfree_platform_mapping(2, "Nintendo Entertainment System")
-                .archivefs_platform_id
-                .as_deref(),
-            Some("NES")
+            nes.archivefs_platform_display_name.as_deref(),
+            Some("Nintendo Entertainment System")
         );
-        assert_eq!(
-            bsfree_platform_mapping(999, "Mystery System").status,
-            PlatformMappingStatus::Unknown
-        );
+        let unknown = bsfree_platform_mapping(999, "Mystery System");
+        assert_eq!(unknown.status, PlatformMappingStatus::Unknown);
+        assert!(unknown.archivefs_platform_id.is_none());
+        assert!(unknown.archivefs_platform_display_name.is_none());
         assert_eq!(
             bsfree_device_mapping(2, "Game Genie").compatibility,
             DeviceFormatCompatibility::PotentiallyConvertible
@@ -2141,6 +2160,52 @@ mod tests {
             bsfree_device_mapping(6, "Action Replay").compatibility,
             DeviceFormatCompatibility::DirectlyInstallable
         );
+    }
+
+    #[test]
+    fn all_verified_bsfree_targets_resolve_through_the_one_canonical_registry() {
+        assert_eq!(crate::platform::canonical_ids().len(), 74);
+        for upstream_id in 1..=44 {
+            let upstream_name = verified_system_name(upstream_id).unwrap();
+            let mapping = bsfree_platform_mapping(upstream_id, upstream_name);
+            let canonical_id = mapping.archivefs_platform_id.as_deref().unwrap_or_else(|| {
+                panic!("BSFree system {upstream_id} {upstream_name:?} has no canonical target")
+            });
+            let platform = crate::platform::platform_by_id(canonical_id).unwrap_or_else(|| {
+                panic!("BSFree target {canonical_id:?} is absent from the canonical registry")
+            });
+            assert_eq!(
+                mapping.archivefs_platform_display_name.as_deref(),
+                Some(platform.display_name)
+            );
+        }
+        let provider_source = include_str!("bsfree.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!provider_source.contains("const PLATFORMS"));
+    }
+
+    #[test]
+    fn all_verified_devices_remain_browse_only_and_none_are_directly_installable() {
+        let devices = [
+            (1, "Game Busters"),
+            (2, "Game Genie"),
+            (3, "Red Dragon"),
+            (4, "CWCheats"),
+            (5, "Pro Action Replay"),
+            (6, "Action Replay"),
+            (7, "Xploder"),
+            (8, "GameShark"),
+            (9, "CodeBreaker"),
+            (10, "Action Replay Max"),
+            (11, "GameGuru"),
+        ];
+        assert_eq!(devices.len(), 11);
+        assert!(devices.iter().all(|(id, name)| {
+            bsfree_device_mapping(*id, name).compatibility
+                != DeviceFormatCompatibility::DirectlyInstallable
+        }));
     }
 
     #[test]
