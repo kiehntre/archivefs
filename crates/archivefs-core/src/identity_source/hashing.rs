@@ -258,6 +258,39 @@ pub fn hash_file(
     trusted: &TrustedRoots,
     cancel: Option<&AtomicBool>,
 ) -> Result<LocalHashes, HashRefusal> {
+    hash_file_reporting(path, trusted, cancel, &|_| {})
+}
+
+/// How far through a file a hash has read.
+///
+/// Reported per chunk so a caller can show real progress for a multi-gigabyte disc
+/// image rather than an unbounded spinner. `total_bytes` is the size observed before
+/// reading started; if the file changes underneath, the hash is refused rather than
+/// reported, so a total that stops matching is a refusal and not a progress bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashProgress {
+    pub bytes_read: u64,
+    pub total_bytes: u64,
+}
+
+impl HashProgress {
+    /// Fraction read, or `None` for an empty file where there is nothing to divide.
+    pub fn fraction(&self) -> Option<f32> {
+        (self.total_bytes > 0)
+            .then(|| (self.bytes_read as f64 / self.total_bytes as f64).clamp(0.0, 1.0) as f32)
+    }
+}
+
+/// [`hash_file`], reporting progress as it reads.
+///
+/// The callback runs on the hashing thread between chunks, so it must not block; the
+/// GUI sends one channel message and returns.
+pub fn hash_file_reporting(
+    path: &Path,
+    trusted: &TrustedRoots,
+    cancel: Option<&AtomicBool>,
+    on_progress: &dyn Fn(HashProgress),
+) -> Result<LocalHashes, HashRefusal> {
     use md5::Md5;
     use sha1::Sha1;
     use sha1::digest::Digest;
@@ -291,6 +324,12 @@ pub fn hash_file(
     let mut sha1 = Sha1::new();
     let mut buffer = vec![0_u8; HASH_CHUNK_BYTES];
     let mut total: u64 = 0;
+    // Reported before the first chunk so a caller can name the file and its size
+    // immediately, rather than showing nothing until 256 KB has been read.
+    on_progress(HashProgress {
+        bytes_read: 0,
+        total_bytes: before.size_bytes,
+    });
 
     loop {
         // Checked every chunk, so cancelling a multi-gigabyte hash takes effect
@@ -311,6 +350,10 @@ pub fn hash_file(
         md5.update(chunk);
         sha1.update(chunk);
         total = total.saturating_add(read as u64);
+        on_progress(HashProgress {
+            bytes_read: total,
+            total_bytes: before.size_bytes,
+        });
     }
 
     // If the file changed underneath us the digests describe neither version, so

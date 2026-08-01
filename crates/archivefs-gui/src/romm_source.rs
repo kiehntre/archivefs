@@ -72,6 +72,26 @@ pub(crate) enum RommOperation {
     },
     /// Group the stale population by what is at each path.
     StaleSummary,
+    /// Work out what RomM says about one selected local file. Cache and metadata
+    /// only: no network, no hashing, no writes.
+    ResolveGame {
+        local_path: std::path::PathBuf,
+        local_platform: Box<crate::romm_game::LocalPlatformClaim>,
+        chosen_game_id: Option<String>,
+    },
+    /// Hash one local file and compare it with one RomM record. Only ever started by
+    /// someone pressing the button.
+    VerifyLocalFile {
+        local_path: std::path::PathBuf,
+        romm_game_id: String,
+        local_platform: Box<crate::romm_game::LocalPlatformClaim>,
+        chosen_game_id: Option<String>,
+    },
+    /// Read or fetch one record's small cover.
+    LoadCover {
+        local_path: std::path::PathBuf,
+        romm_game_id: String,
+    },
 }
 
 impl RommOperation {
@@ -90,6 +110,11 @@ impl RommOperation {
                 | Self::LoadRecordDetail { .. }
                 | Self::LoadConflicts { .. }
                 | Self::StaleSummary
+                // Resolving reads the cache and metadata, and a cover fetch writes
+                // only into the artwork cache, which is derived data the card
+                // reports separately. Neither changes identity.
+                | Self::ResolveGame { .. }
+                | Self::LoadCover { .. }
         )
     }
 
@@ -110,6 +135,7 @@ impl RommOperation {
                 | Self::FullImport
                 | Self::Refresh
                 | Self::Preview { .. }
+                | Self::LoadCover { .. }
         )
     }
 
@@ -117,7 +143,11 @@ impl RommOperation {
     pub(crate) fn reports_progress(&self) -> bool {
         matches!(
             self,
-            Self::SampleImport { .. } | Self::FullImport | Self::Refresh | Self::StaleSummary
+            Self::SampleImport { .. }
+                | Self::FullImport
+                | Self::Refresh
+                | Self::StaleSummary
+                | Self::VerifyLocalFile { .. }
         )
     }
 
@@ -137,6 +167,9 @@ impl RommOperation {
             Self::LoadRecordDetail { .. } => "Reading one record",
             Self::LoadConflicts { .. } => "Looking for conflicts",
             Self::StaleSummary => "Grouping stale records",
+            Self::ResolveGame { .. } => "Looking up the selected game in RomM",
+            Self::VerifyLocalFile { .. } => "Verifying the local file",
+            Self::LoadCover { .. } => "Loading a cover",
         }
     }
 }
@@ -176,6 +209,9 @@ pub(crate) enum RommOperationOutcome {
     RecordDetail(Box<Option<crate::romm_browse::RecordDetailView>>),
     Conflicts(Box<crate::romm_browse::ConflictPageView>),
     Stale(Box<crate::romm_browse::StaleSummaryView>),
+    GameIdentity(Box<crate::romm_game::GameIdentityPanel>),
+    Verified(Box<crate::romm_game::VerificationOutcomeView>),
+    Cover(Box<crate::romm_game::CoverOutcome>),
 }
 
 /// The connection test, reduced to what the card shows. Built in the worker so no
@@ -882,6 +918,32 @@ pub(crate) fn build_result_view(
             rows: Vec::new(),
             notes: Vec::new(),
         },
+        Ok(RommOperationOutcome::GameIdentity(panel)) => RommResultView {
+            succeeded: true,
+            headline: format!("RomM verdict: {}", panel.verdict_explanation),
+            rows: Vec::new(),
+            notes: Vec::new(),
+        },
+        // A verification *is* a card result: it changed ArchiveFS-owned state, so it
+        // is worth a line even though the panel shows the detail.
+        Ok(RommOperationOutcome::Verified(outcome)) => RommResultView {
+            succeeded: outcome.all_agree && !outcome.comparisons.is_empty(),
+            headline: format!("Verified {}", outcome.compact_label),
+            rows: vec![
+                row("Read", human_bytes(outcome.bytes_hashed)),
+                row(
+                    "Verdict",
+                    crate::romm_browse::verdict_label(outcome.verdict_after),
+                ),
+            ],
+            notes: vec![outcome.conclusion()],
+        },
+        Ok(RommOperationOutcome::Cover(outcome)) => RommResultView {
+            succeeded: matches!(outcome.state, crate::romm_game::CoverState::Ready(_)),
+            headline: "Cover loaded".to_string(),
+            rows: Vec::new(),
+            notes: vec![outcome.state.line()],
+        },
         Ok(RommOperationOutcome::Connection(summary)) => build_connection_result(summary),
         Ok(RommOperationOutcome::Sample(summary)) => build_import_result(summary, true),
         Ok(RommOperationOutcome::Import(summary)) => build_import_result(summary, false),
@@ -1127,6 +1189,8 @@ pub(crate) enum RommProgressEvent {
     /// A note the core cannot phrase itself, such as which record lost its file
     /// list. Already free of provider payloads.
     Note(String),
+    /// How far an explicit hash verification has read. One file only.
+    Hashing(crate::romm_game::HashProgressView),
 }
 
 /// What the card wants the application to do.

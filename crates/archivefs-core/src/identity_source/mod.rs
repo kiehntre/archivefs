@@ -26,6 +26,7 @@ pub mod romm;
 pub mod settings;
 pub mod stale;
 pub mod status;
+pub mod verification;
 
 #[cfg(test)]
 mod stage1b_tests;

@@ -201,6 +201,21 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
+    /// Where explicit verifications are remembered.
+    ///
+    /// Its own small file rather than a field in the identity cache, so recording one
+    /// neither rewrites a 52 MB document nor loses everything on the next refresh.
+    fn verification_store(
+        &self,
+    ) -> archivefs_core::identity_source::verification::VerificationStore {
+        archivefs_core::identity_source::verification::VerificationStore::new(
+            &self.identity_root,
+            archivefs_core::identity_source::model::IdentityProvider::Romm,
+        )
+    }
+}
+
+impl Context<'_> {
     fn load_settings(&self) -> Result<ProviderSettings, Box<dyn std::error::Error>> {
         self.settings.load().map_err(|error| error.detail().into())
     }
@@ -286,7 +301,9 @@ struct StatusReport {
 
 fn status(context: &Context) -> Result<(), Box<dyn std::error::Error>> {
     let settings = context.load_settings()?;
-    let hashes = LocalHashCache::new();
+    // Explicit verifications count towards the reported verdicts; a file that was
+    // hashed and agreed is Confirmed here too, not only where it was hashed.
+    let hashes = context.verification_store().load();
     // `reachable: false` - status never contacts anything, which is what makes it
     // safe to run offline and at any time.
     let provider = context.api.status(&settings.source, &hashes, false);
@@ -1395,7 +1412,8 @@ fn import(
         None => ImportScope::Full,
     };
     let trusted = TrustedRoots::from_paths(&context.source_roots);
-    let hashes = LocalHashCache::new();
+    // A re-import must not undo a verification, so stored hashes take part in matching.
+    let hashes = context.verification_store().load();
     let cancel = AtomicBool::new(false);
     let started = std::time::Instant::now();
 
@@ -2151,6 +2169,11 @@ struct HashVerification {
     any_disagree: Option<bool>,
     verification_after: Option<ExternalVerification>,
     file_modified: bool,
+    /// Where the verification was recorded. `None` when it could not be.
+    stored_at: Option<PathBuf>,
+    /// Why it could not be recorded, when that happened. The hashes are still
+    /// reported: failing to remember a fact does not make it untrue.
+    store_problem: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2209,11 +2232,28 @@ fn verify_hash(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn s
         })
         .unwrap_or_default();
 
-    // Re-match with the freshly computed hash, so the reported verdict is what a
-    // refresh would now conclude.
+    // Recorded before the re-match, so the verdict reported is the one a refresh would
+    // now reach - and so a later import cannot undo it. Stored whether or not the
+    // comparison agreed: the hash is a fact about the file, and keeping a disagreement
+    // is what makes it visible instead of inviting a second read.
+    let server_id = cache
+        .as_ref()
+        .map(|cache| cache.server_id.clone())
+        .unwrap_or_default();
+    let store = context.verification_store();
+    let stored = store.record(&server_id, hashes.clone());
+    let stored_at = match &stored {
+        Ok(_) => Some(store.path()),
+        Err(_) => None,
+    };
+    let store_problem = stored.as_ref().err().map(|error| error.detail());
+
     let verification_after = record.map(|record| {
-        let mut local_cache = LocalHashCache::new();
-        local_cache.insert(hashes.clone());
+        let local_cache = stored.clone().unwrap_or_else(|_| {
+            let mut fallback = LocalHashCache::new();
+            fallback.insert(hashes.clone());
+            fallback
+        });
         let claims = cache
             .as_ref()
             .map(|cache| PathClaims::of(&cache.records))
@@ -2242,6 +2282,8 @@ fn verify_hash(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn s
         // Hashing opens the file read-only through the shared policy.
         file_modified: false,
         comparisons,
+        stored_at,
+        store_problem,
     };
     context.emit(&result, || {
         let mut lines = vec![
@@ -2307,6 +2349,17 @@ fn verify_hash(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn s
                 "  No cached RomM record claims this path, so there was nothing to compare."
                     .to_string(),
             ),
+        }
+        match (&result.stored_at, &result.store_problem) {
+            (Some(path), _) => lines.push(format!(
+                "Recorded in {}. The imported catalogue was not rewritten, so a refresh will not \
+                 undo this.",
+                path.display()
+            )),
+            (None, Some(problem)) => lines.push(format!(
+                "The hashes above are correct but could not be remembered: {problem}"
+            )),
+            (None, None) => {}
         }
         lines.push("The file was opened read-only and not changed.".to_string());
         lines

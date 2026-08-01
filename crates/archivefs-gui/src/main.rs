@@ -131,6 +131,7 @@ pub mod bulk_confirmation;
 pub mod game_presentation;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
+pub(crate) mod romm_game;
 pub(crate) mod romm_source;
 pub mod selection_guard;
 pub mod status_wording;
@@ -3481,6 +3482,11 @@ struct ArchiveFsApp {
     romm_browse: Option<Box<crate::romm_browse::BrowseState>>,
     /// How far the stale summary's metadata probes have got.
     romm_stale_progress: Option<crate::romm_browse::StaleProgress>,
+    /// The selected game's RomM identity panel. Reset whenever the selection moves,
+    /// so one game's cover or verification can never appear beside another's.
+    romm_game: crate::romm_game::GamePanelState,
+    /// Progress from a running hash verification, if one is running.
+    romm_hash_progress: Option<crate::romm_game::HashProgressView>,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -3719,6 +3725,8 @@ impl ArchiveFsApp {
             romm_preview: None,
             romm_browse: None,
             romm_stale_progress: None,
+            romm_game: crate::romm_game::GamePanelState::default(),
+            romm_hash_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -5182,6 +5190,9 @@ impl ArchiveFsApp {
                         self.romm_stale_progress =
                             Some(crate::romm_browse::StaleProgress { probed, total });
                     }
+                    RommProgressEvent::Hashing(hashing) => {
+                        self.romm_hash_progress = Some(hashing);
+                    }
                 }
             }
         }
@@ -5204,6 +5215,7 @@ impl ArchiveFsApp {
             return;
         }
         self.romm_operation = None;
+        self.romm_hash_progress = None;
 
         let previous_outcome = self.romm_ui.last_outcome.take();
         self.romm_ui.last_outcome = Some(romm_source::build_result_view(
@@ -5273,6 +5285,29 @@ impl ArchiveFsApp {
                     self.romm_stale_progress = None;
                     true
                 }
+                RommOperationOutcome::GameIdentity(panel) => {
+                    if self.romm_game.accepts_panel(panel) {
+                        self.romm_game.panel = Some(panel.clone());
+                        self.romm_game.needs_reload = false;
+                    } else {
+                        // The selection moved while this was in flight. Drawing it
+                        // would attach one game's evidence to another's file.
+                        self.romm_game.needs_reload = true;
+                    }
+                    true
+                }
+                RommOperationOutcome::Cover(outcome) => {
+                    if self.romm_game.accepts_cover(outcome) {
+                        // The texture is dropped here rather than in the renderer, so
+                        // a cover cleared mid-fetch cannot leave the old pixels up.
+                        self.romm_game.cover_texture = None;
+                        self.romm_game.cover_key = None;
+                        self.romm_game.cover = outcome.state.clone();
+                        self.romm_game.cover_cache =
+                            Some((outcome.cached_items, outcome.cached_bytes));
+                    }
+                    true
+                }
                 _ => false,
             };
             if landed {
@@ -5280,6 +5315,17 @@ impl ArchiveFsApp {
                 self.romm_ui.last_outcome = previous_outcome;
                 return;
             }
+        }
+        if let Ok(RommOperationOutcome::Verified(outcome)) = &result {
+            // Both a card result and panel state: the panel inside it was rebuilt
+            // from the verification that was just stored, so the verdict on screen is
+            // recomputed rather than assumed.
+            if self.romm_game.accepts_verification(outcome) {
+                self.romm_game.panel = Some(outcome.panel.clone());
+                self.romm_game.verification = Some(outcome.clone());
+                self.romm_game.needs_reload = false;
+            }
+            self.romm_hash_progress = None;
         }
         if let Ok(RommOperationOutcome::Preview(summary)) = &result {
             // A preview is only meaningful while the dialog that asked for it is
@@ -5477,6 +5523,132 @@ impl ArchiveFsApp {
             BrowseRequest::Cancel => self.cancel_romm_operation(),
             BrowseRequest::Switch(view) => self.open_romm_browse(view),
             BrowseRequest::Close => self.close_romm_browse(),
+        }
+    }
+
+    /// What ArchiveFS itself says the selected archive's platform is.
+    ///
+    /// Read from the catalogue the GUI already holds. `manual` is the whole point: it
+    /// makes the assignment count as verified local evidence, which is what stops a
+    /// disagreeing RomM record from being presented as a correction.
+    fn romm_local_platform(&self, path: &Path) -> crate::romm_game::LocalPlatformClaim {
+        let persisted = self.database_state.snapshot().and_then(|snapshot| {
+            snapshot
+                .archives
+                .iter()
+                .find(|archive| archive.absolute_path == path)
+        });
+        match persisted {
+            Some(archive) => crate::romm_game::LocalPlatformClaim {
+                platform: archive.platform.clone(),
+                manual: archive.platform_source.as_deref() == Some(MANUAL_PLATFORM_SOURCE),
+            },
+            None => crate::romm_game::LocalPlatformClaim::default(),
+        }
+    }
+
+    /// Draws the selected game's RomM panel, and follows the selection.
+    fn show_romm_game_panel(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
+        // Following the selection discards the previous game's panel, cover and
+        // verification, but starts nothing: a lookup is a button press.
+        self.romm_game
+            .focus(self.archive_context.focused.as_deref());
+        let running = self
+            .romm_operation
+            .as_ref()
+            .map(|running| &running.operation);
+        let busy = running.is_some_and(RommOperation::blocks_actions);
+        let busy_reason = running.map(|operation| operation.label());
+        let cache_present = self
+            .romm_snapshot
+            .as_deref()
+            .is_some_and(|snapshot| snapshot.status.records_imported > 0);
+        let hash_progress = self.romm_hash_progress.clone();
+        let request = crate::romm_game::show_game_identity_panel(
+            ui,
+            &mut self.romm_game,
+            &crate::romm_game::GamePanelInputs {
+                busy,
+                busy_reason,
+                hash_progress: hash_progress.as_ref(),
+                cache_present,
+            },
+        );
+        if let Some(request) = request {
+            self.handle_romm_game_request(context, request);
+        }
+    }
+
+    fn handle_romm_game_request(
+        &mut self,
+        context: &egui::Context,
+        request: crate::romm_game::GamePanelRequest,
+    ) {
+        use crate::romm_game::GamePanelRequest;
+
+        let Some(local_path) = self.romm_game.local_path.clone() else {
+            return;
+        };
+        let local_platform = Box::new(self.romm_local_platform(&local_path));
+        match request {
+            GamePanelRequest::Resolve => {
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::ResolveGame {
+                        local_path,
+                        local_platform,
+                        chosen_game_id: self.romm_game.chosen_game_id.clone(),
+                    },
+                );
+            }
+            GamePanelRequest::Choose { romm_game_id } => {
+                // A choice is recorded and then re-resolved, so the verdict on screen
+                // is the one that record actually earns rather than a relabelling.
+                self.romm_game.chosen_game_id = Some(romm_game_id.clone());
+                self.romm_game.verification = None;
+                self.romm_game.cover = crate::romm_game::CoverState::Idle;
+                self.romm_game.cover_texture = None;
+                self.romm_game.cover_key = None;
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::ResolveGame {
+                        local_path,
+                        local_platform,
+                        chosen_game_id: Some(romm_game_id),
+                    },
+                );
+            }
+            GamePanelRequest::Verify { romm_game_id } => {
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::VerifyLocalFile {
+                        local_path,
+                        romm_game_id,
+                        local_platform,
+                        chosen_game_id: self.romm_game.chosen_game_id.clone(),
+                    },
+                );
+            }
+            GamePanelRequest::LoadCover { romm_game_id } => {
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadCover {
+                        local_path,
+                        romm_game_id,
+                    },
+                ) {
+                    self.romm_game.cover = crate::romm_game::CoverState::Loading;
+                }
+            }
+            GamePanelRequest::Cancel => self.cancel_romm_operation(),
+            GamePanelRequest::Close => {
+                // Closed for this selection only. Choosing a different archive brings
+                // it back, which is what someone expects from a per-game panel.
+                self.romm_game.dismissed = true;
+            }
+            GamePanelRequest::Reopen => {
+                self.romm_game.dismissed = false;
+            }
         }
     }
 
@@ -12827,6 +12999,8 @@ impl ArchiveFsApp {
                             block_reason: archive_action_block_reason,
                         },
                     );
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    self.show_romm_game_panel(context, ui);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -46904,6 +47078,8 @@ $Instant Growth [Nayr]\n";
             romm_preview: None,
             romm_browse: None,
             romm_stale_progress: None,
+            romm_game: crate::romm_game::GamePanelState::default(),
+            romm_hash_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -60705,7 +60881,6 @@ $Instant Growth [Nayr]\n";
 /// opening the Sources page cannot start one.
 fn load_romm_snapshot() -> Result<RommSnapshot, String> {
     use archivefs_core::identity_source::artwork::ArtworkCache;
-    use archivefs_core::identity_source::hashing::LocalHashCache;
     use archivefs_core::identity_source::model::IdentityProvider;
     use archivefs_core::identity_source::settings::{
         SettingsLocation, default_identity_root, load_token_file,
@@ -60717,7 +60892,13 @@ fn load_romm_snapshot() -> Result<RommSnapshot, String> {
         .load()
         .map_err(|error| error.detail())?;
     let api = IdentitySourceApi::new(&identity_root, IdentityProvider::Romm);
-    let hashes = LocalHashCache::new();
+    // Explicit verifications, so a file that was hashed reads as Confirmed here and
+    // not only in the panel that hashed it.
+    let hashes = archivefs_core::identity_source::verification::VerificationStore::new(
+        &identity_root,
+        IdentityProvider::Romm,
+    )
+    .load();
     let status = api.status(&settings.source, &hashes, false);
     let cache_format_version = api.open_cache(None).ok().map(|cache| cache.format_version);
     let server_id = status
@@ -60756,6 +60937,7 @@ fn run_romm_operation(
         SettingsLocation, default_identity_root, load_token_file,
     };
     use archivefs_core::identity_source::status::{IdentitySourceApi, RefreshRequest};
+    use archivefs_core::identity_source::verification::VerificationStore;
 
     let identity_root = default_identity_root()?;
     let location = SettingsLocation::new(&identity_root, IdentityProvider::Romm);
@@ -60931,6 +61113,58 @@ fn run_romm_operation(
                 },
             )));
         }
+        RommOperation::ResolveGame {
+            local_path,
+            local_platform,
+            chosen_game_id,
+        } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let verified = VerificationStore::new(&identity_root, IdentityProvider::Romm).load();
+            // Metadata only: no read, no hash. `observe` is the same call the import
+            // makes, so the panel and the catalogue agree about what is at the path.
+            let facts_for = |path: &Path| {
+                archivefs_core::identity_source::matching::LocalFileFacts::observe(path)
+            };
+            return Ok(RommOperationOutcome::GameIdentity(Box::new(
+                crate::romm_game::resolve_selected_game(
+                    &cache,
+                    local_path,
+                    &verified,
+                    local_platform,
+                    chosen_game_id.as_deref(),
+                    &facts_for,
+                ),
+            )));
+        }
+        RommOperation::VerifyLocalFile {
+            local_path,
+            romm_game_id,
+            local_platform,
+            chosen_game_id,
+        } => {
+            return verify_local_file(
+                &api,
+                &identity_root,
+                local_path,
+                romm_game_id,
+                local_platform,
+                chosen_game_id.as_deref(),
+                cancellation,
+                report,
+            );
+        }
+        RommOperation::LoadCover {
+            local_path,
+            romm_game_id,
+        } => {
+            // A cover already in the cache needs no token and no request, so that case
+            // is answered here, before anything is validated.
+            if let Some(outcome) =
+                cover_from_cache(&api, &identity_root, &settings, local_path, romm_game_id)?
+            {
+                return Ok(RommOperationOutcome::Cover(Box::new(outcome)));
+            }
+        }
         _ => {}
     }
 
@@ -60948,6 +61182,24 @@ fn run_romm_operation(
     )
     .map_err(|refusal| refusal.detail())?;
     let transport = UreqTransport::new();
+
+    // Placed before the connection pre-flight deliberately: fetching one cover should
+    // cost one request, not two.
+    if let RommOperation::LoadCover {
+        local_path,
+        romm_game_id,
+    } = operation
+    {
+        return Ok(RommOperationOutcome::Cover(Box::new(fetch_cover(
+            &api,
+            &identity_root,
+            &source,
+            &transport,
+            local_path,
+            romm_game_id,
+            cancellation,
+        )?)));
+    }
 
     let capability = api
         .test_connection(&source, &transport, Some(cancellation))
@@ -60985,7 +61237,9 @@ fn run_romm_operation(
         )));
     }
 
-    let hashes = LocalHashCache::new();
+    // A re-import must not undo a verification, so the stored hashes are fed into
+    // matching exactly as a freshly computed one would be.
+    let hashes = VerificationStore::new(&identity_root, IdentityProvider::Romm).load();
     let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(&trusted_roots);
     let facts_for = |record: &archivefs_core::identity_source::model::ExternalIdentityRecord| {
         romm_local_facts(record, &trusted)
@@ -61107,7 +61361,10 @@ fn run_romm_operation(
         | RommOperation::LoadRecords { .. }
         | RommOperation::LoadRecordDetail { .. }
         | RommOperation::LoadConflicts { .. }
-        | RommOperation::StaleSummary => unreachable!("handled before this match"),
+        | RommOperation::StaleSummary
+        | RommOperation::ResolveGame { .. }
+        | RommOperation::VerifyLocalFile { .. }
+        | RommOperation::LoadCover { .. } => unreachable!("handled before this match"),
     }
 }
 
@@ -61136,6 +61393,313 @@ fn report_file_detail_omissions(
 ///
 /// The same shape the CLI uses, so the GUI and the command line reach the same
 /// verdicts from the same evidence.
+/// Refuses a path that is not a regular file inside a configured source folder.
+///
+/// `TrustedRoots` governs what a symlink may point *at*, not which path may be named,
+/// so this is the check that stops an explicit verification reading a file outside the
+/// library. Both the named path and its resolved form must be inside a root.
+fn confine_to_source_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{} is not an absolute path, so which file is meant is not certain.",
+            path.display()
+        ));
+    }
+    // Canonical roots, so a symlinked source folder does not defeat the comparison. A
+    // root that cannot be resolved is dropped rather than trusted.
+    let canonical_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    let inside = |candidate: &Path| {
+        canonical_roots
+            .iter()
+            .any(|root| candidate.starts_with(root))
+    };
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{} cannot be examined: {error}", path.display()))?;
+    // Checked before resolution, so the verdict describes the path that was named.
+    let lexical = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .map(|parent| parent.join(path.file_name().unwrap_or_default()));
+    if !lexical.as_deref().is_some_and(&inside) {
+        return Err(format!(
+            "{} is not inside a configured source folder, so ArchiveFS will not read it.",
+            path.display()
+        ));
+    }
+    let resolved = path.canonicalize().map_err(|error| {
+        if metadata.file_type().is_symlink() {
+            format!(
+                "{} is a symbolic link whose target cannot be resolved: {error}",
+                path.display()
+            )
+        } else {
+            format!("{} cannot be resolved: {error}", path.display())
+        }
+    })?;
+    if !inside(&resolved) {
+        return Err(format!(
+            "{} leads out of your configured source folders; ArchiveFS will not follow it.",
+            path.display()
+        ));
+    }
+    if !resolved.is_file() {
+        return Err(format!(
+            "{} is not a regular file, so there are no bytes to hash.",
+            path.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Hashes one local file, compares it with one RomM record, and records the result.
+///
+/// The verdict is recomputed by the same matcher the import uses, before and after the
+/// hash is stored - so Confirmed is something the comparison earned rather than a
+/// label this function applies.
+#[allow(clippy::too_many_arguments)]
+fn verify_local_file(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    local_path: &Path,
+    romm_game_id: &str,
+    local_platform: &crate::romm_game::LocalPlatformClaim,
+    chosen_game_id: Option<&str>,
+    cancellation: &Arc<AtomicBool>,
+    report: &dyn Fn(RommProgressEvent),
+) -> Result<RommOperationOutcome, String> {
+    use archivefs_core::identity_source::hashing::hash_file_reporting;
+    use archivefs_core::identity_source::model::IdentityProvider;
+    use archivefs_core::identity_source::verification::VerificationStore;
+    use archivefs_core::safe_read::TrustedRoots;
+
+    let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+    let record = cache
+        .records
+        .iter()
+        .find(|record| {
+            record.provider_game_id == romm_game_id
+                && record.archivefs_path.as_deref() == Some(local_path)
+        })
+        .ok_or_else(|| {
+            "That RomM record no longer maps to this file. Look the game up again.".to_string()
+        })?
+        .clone();
+    if record.hashes.is_empty() {
+        return Err(
+            "RomM published no hash for this game, so hashing the file would produce nothing to \
+             compare it against."
+                .to_string(),
+        );
+    }
+
+    let roots = archivefs_core::Config::load_default()
+        .map(|config| config.source_folders)
+        .unwrap_or_default();
+    // Both checks: this one decides which path may be named, `TrustedRoots` below
+    // decides what a symlink may point at.
+    confine_to_source_roots(local_path, &roots)?;
+    let trusted = TrustedRoots::from_paths(&roots);
+
+    let store = VerificationStore::new(identity_root, IdentityProvider::Romm);
+    let before_hashes = store.load();
+    let facts_for =
+        |path: &Path| archivefs_core::identity_source::matching::LocalFileFacts::observe(path);
+    let before = crate::romm_game::resolve_selected_game(
+        &cache,
+        local_path,
+        &before_hashes,
+        local_platform,
+        chosen_game_id.or(Some(romm_game_id)),
+        &facts_for,
+    );
+    let verdict_before = before
+        .chosen_candidate()
+        .map(|candidate| candidate.verdict)
+        .unwrap_or(before.verdict);
+
+    let started = std::time::Instant::now();
+    let file_label = local_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| local_path.display().to_string());
+    let progress_label = file_label.clone();
+    let on_progress = |progress: archivefs_core::identity_source::hashing::HashProgress| {
+        report(RommProgressEvent::Hashing(
+            crate::romm_game::HashProgressView {
+                file_label: progress_label.clone(),
+                bytes_read: progress.bytes_read,
+                total_bytes: progress.total_bytes,
+                elapsed_seconds: started.elapsed().as_secs(),
+                cancellation_requested: cancellation.load(Ordering::Acquire),
+            },
+        ));
+    };
+    let hashes = hash_file_reporting(local_path, &trusted, Some(cancellation), &on_progress)
+        .map_err(|refusal| refusal.detail())?;
+    let elapsed_seconds = started.elapsed().as_secs();
+
+    let comparisons = crate::romm_game::compare_hashes(&record, &hashes);
+    let all_agree = !comparisons.is_empty() && comparisons.iter().all(|line| line.agrees);
+    let any_disagree = comparisons.iter().any(|line| !line.agrees);
+
+    // Stored whether or not it agreed: the hash is a fact about the file, and storing a
+    // disagreement is what keeps it visible instead of inviting a second read.
+    let after_hashes = store
+        .record(&record.server_id, hashes.clone())
+        .map_err(|error| error.detail())?;
+    let stored_at = Some(store.path());
+
+    let after = crate::romm_game::resolve_selected_game(
+        &cache,
+        local_path,
+        &after_hashes,
+        local_platform,
+        chosen_game_id.or(Some(romm_game_id)),
+        &facts_for,
+    );
+    let verdict_after = after
+        .chosen_candidate()
+        .map(|candidate| candidate.verdict)
+        .unwrap_or(after.verdict);
+    let compact_label = after
+        .chosen_candidate()
+        .map(crate::romm_game::CandidateView::compact_label)
+        .unwrap_or_else(|| file_label.clone());
+
+    Ok(RommOperationOutcome::Verified(Box::new(
+        crate::romm_game::VerificationOutcomeView {
+            local_path: local_path.to_path_buf(),
+            file_label,
+            compact_label,
+            romm_game_id: romm_game_id.to_string(),
+            comparisons,
+            all_agree,
+            any_disagree,
+            verdict_before,
+            verdict_after,
+            bytes_hashed: hashes.bytes_hashed,
+            elapsed_seconds,
+            stored_at,
+            panel: Box::new(after),
+        },
+    )))
+}
+
+/// The record one cover request is about, and its artwork request.
+fn cover_record(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    local_path: &Path,
+    romm_game_id: &str,
+) -> Result<archivefs_core::identity_source::model::ExternalIdentityRecord, String> {
+    let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+    cache
+        .records
+        .iter()
+        .find(|record| {
+            record.provider_game_id == romm_game_id
+                && record.archivefs_path.as_deref() == Some(local_path)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            "That RomM record no longer maps to this file. Look the game up again.".to_string()
+        })
+}
+
+/// Answers a cover request without contacting anything, when it can.
+///
+/// Returns `None` only when a real fetch is needed.
+fn cover_from_cache(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    settings: &archivefs_core::identity_source::settings::ProviderSettings,
+    local_path: &Path,
+    romm_game_id: &str,
+) -> Result<Option<crate::romm_game::CoverOutcome>, String> {
+    use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
+    use archivefs_core::identity_source::hashing::LocalHashCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let availability = crate::romm_game::availability_of(&record);
+    let cache = ArtworkCache::new(identity_root, IdentityProvider::Romm);
+    let status = api.status(&settings.source, &LocalHashCache::new(), false);
+    let server_id = status
+        .server_id
+        .clone()
+        .unwrap_or_else(|| settings.source.url.clone());
+    let stats = cache.stats(&server_id);
+    let finish = |state: crate::romm_game::CoverState| crate::romm_game::CoverOutcome {
+        local_path: local_path.to_path_buf(),
+        romm_game_id: romm_game_id.to_string(),
+        state,
+        cached_items: stats.items as u64,
+        cached_bytes: stats.bytes,
+    };
+
+    if availability != crate::romm_game::ArtworkAvailability::Fetchable {
+        // RomM recorded no cover of its own. `url_cover` points at IGDB or
+        // RetroAchievements, and this build does not fetch from public hosts.
+        return Ok(Some(finish(crate::romm_game::CoverState::Unavailable(
+            availability,
+        ))));
+    }
+    let request = ArtworkRequest::from_record(&record);
+    match cache.lookup(&server_id, &request) {
+        Some(thumbnail) => {
+            let state = match crate::romm_game::decode_thumbnail(&thumbnail, true) {
+                Ok(image) => crate::romm_game::CoverState::Ready(Box::new(image)),
+                Err(detail) => crate::romm_game::CoverState::Refused(detail),
+            };
+            Ok(Some(finish(state)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Fetches one cover from RomM's own small-cover path.
+fn fetch_cover(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    source: &archivefs_core::identity_source::romm::config::ValidatedRommSource,
+    transport: &archivefs_core::identity_source::romm::client::UreqTransport,
+    local_path: &Path,
+    romm_game_id: &str,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<crate::romm_game::CoverOutcome, String> {
+    use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRefusal, ArtworkRequest};
+    use archivefs_core::identity_source::model::IdentityProvider;
+
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let cache = ArtworkCache::new(identity_root, IdentityProvider::Romm);
+    let request = ArtworkRequest::from_record(&record);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default();
+    let state = match cache.fetch(source, transport, &request, now, Some(cancellation)) {
+        Ok(thumbnail) => match crate::romm_game::decode_thumbnail(&thumbnail, false) {
+            Ok(image) => crate::romm_game::CoverState::Ready(Box::new(image)),
+            Err(detail) => crate::romm_game::CoverState::Refused(detail),
+        },
+        Err(ArtworkRefusal::Cancelled) => crate::romm_game::CoverState::Cancelled,
+        // The core's own wording, which never contains a URL or a token.
+        Err(refusal) => crate::romm_game::CoverState::Refused(refusal.detail()),
+    };
+    // Read after the fetch rather than incremented, so a clear that ran alongside it
+    // cannot leave a figure on screen that was never true.
+    let stats = cache.stats(source.server_id());
+    Ok(crate::romm_game::CoverOutcome {
+        local_path: local_path.to_path_buf(),
+        romm_game_id: romm_game_id.to_string(),
+        state,
+        cached_items: stats.items as u64,
+        cached_bytes: stats.bytes,
+    })
+}
+
 fn romm_local_facts(
     record: &archivefs_core::identity_source::model::ExternalIdentityRecord,
     _trusted: &archivefs_core::safe_read::TrustedRoots,
@@ -62137,6 +62701,274 @@ mod romm_dispatch_tests {
             "a mutating operation should be auditable"
         );
         app.romm_operation = None;
+    }
+
+    // --- Selected-game panel -------------------------------------------
+
+    fn game_panel_app(path: &str) -> ArchiveFsApp {
+        let mut app = app();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        app.archive_context.focused = Some(PathBuf::from(path));
+        app.romm_game.focus(Some(Path::new(path)));
+        app
+    }
+
+    fn panel_for(path: &str, game_id: &str) -> crate::romm_game::GameIdentityPanel {
+        use archivefs_core::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
+        use archivefs_core::identity_source::hashing::LocalHashCache;
+        use archivefs_core::identity_source::matching::LocalFileFacts;
+        use archivefs_core::identity_source::model::{
+            ExternalIdentityRecord, ExternalVerification,
+        };
+
+        let record = ExternalIdentityRecord {
+            provider: IdentityProvider::Romm,
+            server_id: "http://172.19.0.20:8080".to_string(),
+            provider_platform_id: Some("7".to_string()),
+            provider_game_id: game_id.to_string(),
+            provider_file_id: None,
+            provider_path: "roms/gb/game.gb".to_string(),
+            archivefs_path: Some(PathBuf::from(path)),
+            title: Some("Game".to_string()),
+            platform_candidate: Some("Game Boy".to_string()),
+            provider_platform_name: Some("gb".to_string()),
+            regions: Vec::new(),
+            revision: None,
+            hashes: Vec::new(),
+            file_size_bytes: None,
+            metadata_provider_ids: Vec::new(),
+            artwork: None,
+            related_files: Vec::new(),
+            sibling_game_ids: Vec::new(),
+            imported_at_unix_seconds: 1_785_595_944,
+            provider_updated_at: None,
+            verification: ExternalVerification::StrongExternal,
+            conflicts: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let cache = IdentityCache {
+            format_version: CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "http://172.19.0.20:8080".to_string(),
+            server_version: None,
+            source_fingerprint: "abcd".to_string(),
+            imported_at_unix_seconds: 1_785_595_944,
+            platforms: Vec::new(),
+            records: vec![record],
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(1),
+        };
+        crate::romm_game::resolve_selected_game(
+            &cache,
+            Path::new(path),
+            &LocalHashCache::new(),
+            &crate::romm_game::LocalPlatformClaim::default(),
+            None,
+            &|probe: &Path| LocalFileFacts::observe(probe),
+        )
+    }
+
+    #[test]
+    fn a_second_lookup_while_one_runs_is_declined() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let operation = RommOperation::ResolveGame {
+            local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+            local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+            chosen_game_id: None,
+        };
+        let (_sender, _progress, generation) = install_running(&mut app, operation.clone());
+        assert!(!app.start_romm_operation(context, operation));
+        assert_eq!(app.romm_generation, generation, "nothing was superseded");
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn looking_up_the_selected_game_is_not_recorded_as_an_activity() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let before = app.history.entries().count();
+        assert!(app.start_romm_operation(
+            context,
+            RommOperation::ResolveGame {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            }
+        ));
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "reading the cache changes nothing, so there is nothing to audit"
+        );
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn verifying_a_local_file_is_recorded_as_an_activity_without_the_path() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let before = app.history.entries().count();
+        assert!(app.start_romm_operation(
+            context,
+            RommOperation::VerifyLocalFile {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                romm_game_id: "1".to_string(),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            }
+        ));
+        assert_eq!(app.history.entries().count(), before + 1);
+        let entry = app.history.entries().next().expect("an entry");
+        assert!(
+            !entry.message.contains("/mnt/games"),
+            "a private path must not reach the activity list: {}",
+            entry.message
+        );
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn a_resolved_panel_for_the_current_selection_lands() {
+        let context = egui::Context::default();
+        let path = "/mnt/games/roms/gb/game.gb";
+        let mut app = game_panel_app(path);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::ResolveGame {
+                local_path: PathBuf::from(path),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            },
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::GameIdentity(Box::new(panel_for(
+                    path, "1",
+                )))),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_game.panel.is_some());
+        assert!(!app.romm_game.needs_reload);
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a lookup is panel state, not a card banner"
+        );
+    }
+
+    #[test]
+    fn a_panel_that_arrives_after_the_selection_moved_is_not_drawn() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::ResolveGame {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            },
+        );
+        // The person clicked a different archive while the lookup was in flight.
+        app.romm_game
+            .focus(Some(Path::new("/mnt/games/roms/gb/other.gb")));
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::GameIdentity(Box::new(panel_for(
+                    "/mnt/games/roms/gb/game.gb",
+                    "1",
+                )))),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_game.panel.is_none(),
+            "one game's evidence must not attach to another's file"
+        );
+        assert!(app.romm_game.needs_reload, "and it says so");
+    }
+
+    #[test]
+    fn hash_progress_from_a_superseded_generation_is_discarded() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let (_sender, progress, generation) = install_running(
+            &mut app,
+            RommOperation::VerifyLocalFile {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                romm_game_id: "1".to_string(),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            },
+        );
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+        if let Some(running) = app.romm_operation.as_mut() {
+            running.generation = app.romm_generation;
+        }
+        progress
+            .send((
+                generation,
+                RommProgressEvent::Hashing(crate::romm_game::HashProgressView {
+                    file_label: "stale.gb".to_string(),
+                    bytes_read: 1,
+                    total_bytes: 2,
+                    elapsed_seconds: 0,
+                    cancellation_requested: false,
+                }),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_hash_progress.is_none(),
+            "progress from an operation nobody is waiting for must not be shown"
+        );
+    }
+
+    #[test]
+    fn a_cover_for_a_record_that_is_no_longer_chosen_does_not_land() {
+        let context = egui::Context::default();
+        let path = "/mnt/games/roms/gb/game.gb";
+        let mut app = game_panel_app(path);
+        app.romm_game.panel = Some(Box::new(panel_for(path, "1")));
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadCover {
+                local_path: PathBuf::from(path),
+                romm_game_id: "999".to_string(),
+            },
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Cover(Box::new(
+                    crate::romm_game::CoverOutcome {
+                        local_path: PathBuf::from(path),
+                        romm_game_id: "999".to_string(),
+                        state: crate::romm_game::CoverState::Unavailable(
+                            crate::romm_game::ArtworkAvailability::None,
+                        ),
+                        cached_items: 5,
+                        cached_bytes: 500,
+                    },
+                ))),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert_eq!(app.romm_game.cover, crate::romm_game::CoverState::Idle);
+        assert!(app.romm_game.cover_cache.is_none());
+    }
+
+    #[test]
+    fn moving_the_selection_between_frames_clears_the_panel() {
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        app.romm_game.panel = Some(Box::new(panel_for("/mnt/games/roms/gb/game.gb", "1")));
+        app.archive_context.focused = Some(PathBuf::from("/mnt/games/roms/gb/other.gb"));
+        // The renderer follows the selection at the top of every frame.
+        app.romm_game.focus(app.archive_context.focused.as_deref());
+        assert!(app.romm_game.panel.is_none());
     }
 }
 

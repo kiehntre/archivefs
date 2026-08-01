@@ -332,6 +332,78 @@ fn hashing_is_cancellable() {
     assert!(hash_file(&path, &tree.trusted(), Some(&cancel)).is_ok());
 }
 
+/// Progress is reported as the hash reads, so a multi-gigabyte image shows real
+/// movement rather than an unbounded spinner.
+#[test]
+fn hashing_reports_progress_as_it_reads() {
+    use crate::identity_source::hashing::{HashProgress, hash_file_reporting};
+    use std::cell::RefCell;
+
+    let tree = Tree::new("hash-progress");
+    let contents: Vec<u8> = (0..(HASH_CHUNK_BYTES * 3 + 7))
+        .map(|index| (index % 253) as u8)
+        .collect();
+    let path = tree.file("big.bin", &contents);
+    let seen: RefCell<Vec<HashProgress>> = RefCell::new(Vec::new());
+    let hashes = hash_file_reporting(&path, &tree.trusted(), None, &|progress| {
+        seen.borrow_mut().push(progress);
+    })
+    .expect("hashed");
+
+    let seen = seen.into_inner();
+    // One before the first chunk, so the file and its size can be named immediately.
+    assert_eq!(seen.first().expect("an opening report").bytes_read, 0);
+    assert!(seen.len() >= 5, "{} reports for four chunks", seen.len());
+    // Monotonic, and every report agrees about the total.
+    for pair in seen.windows(2) {
+        assert!(pair[1].bytes_read >= pair[0].bytes_read);
+        assert_eq!(pair[0].total_bytes, contents.len() as u64);
+    }
+    let last = seen.last().expect("a closing report");
+    assert_eq!(last.bytes_read, contents.len() as u64);
+    assert_eq!(last.fraction(), Some(1.0));
+    assert_eq!(hashes.bytes_hashed, contents.len() as u64);
+}
+
+/// An empty file has no fraction to report rather than a division by zero.
+#[test]
+fn hashing_an_empty_file_reports_no_fraction() {
+    use crate::identity_source::hashing::{HashProgress, hash_file_reporting};
+    use std::cell::RefCell;
+
+    let tree = Tree::new("hash-progress-empty");
+    let path = tree.file("empty.bin", b"");
+    let seen: RefCell<Vec<HashProgress>> = RefCell::new(Vec::new());
+    hash_file_reporting(&path, &tree.trusted(), None, &|progress| {
+        seen.borrow_mut().push(progress);
+    })
+    .expect("hashed");
+    let seen = seen.into_inner();
+    assert_eq!(seen.len(), 1, "nothing to read, so one opening report");
+    assert!(seen[0].fraction().is_none());
+}
+
+/// A cancelled hash reports nothing beyond where it stopped, and yields no hashes.
+#[test]
+fn a_cancelled_hash_reports_no_completion() {
+    use crate::identity_source::hashing::{HashProgress, hash_file_reporting};
+    use std::cell::RefCell;
+
+    let tree = Tree::new("hash-progress-cancel");
+    let path = tree.file("game.bin", &vec![3_u8; HASH_CHUNK_BYTES * 2]);
+    let cancel = AtomicBool::new(true);
+    let seen: RefCell<Vec<HashProgress>> = RefCell::new(Vec::new());
+    let refusal = hash_file_reporting(&path, &tree.trusted(), Some(&cancel), &|progress| {
+        seen.borrow_mut().push(progress);
+    })
+    .expect_err("cancelled");
+    assert_eq!(refusal.code(), "cancelled");
+    assert!(
+        seen.into_inner().is_empty(),
+        "cancelled before the file was opened, so nothing was reported"
+    );
+}
+
 /// Test 71: the hash cache is keyed on metadata and invalidated by a change.
 #[test]
 fn a_changed_file_invalidates_its_cached_hash() {
