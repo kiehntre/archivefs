@@ -47,6 +47,11 @@ const PCSX2_MAX_RETAINED_COMMENTS_PER_FILE: usize = 32;
 #[serde(rename_all = "snake_case")]
 pub enum Pcsx2InstallationType {
     Native,
+    /// A documented but non-primary native data location observed in the
+    /// wild for Linux AppImage builds (for example `~/.local/share/PCSX2`
+    /// or `~/Documents/PCSX2`), reported alongside the primary XDG
+    /// configuration directory rather than in place of it.
+    NativeAlternate,
     FlatpakUser,
     FlatpakSystem,
     Portable,
@@ -139,7 +144,16 @@ pub struct Pcsx2ProfileDiscoveryRoots {
     pub home: PathBuf,
     pub xdg_config_home: PathBuf,
     pub xdg_data_home: PathBuf,
+    /// `~/Documents/PCSX2` on Linux, observed as a data location chosen by
+    /// some manually configured or migrated PCSX2 AppImage setups.
+    pub documents_home: PathBuf,
     pub flatpak_system_root: PathBuf,
+    /// The directory containing the currently running AppImage, taken only
+    /// from the `APPIMAGE` environment variable that the AppImage runtime
+    /// itself sets. This is the documented location for PCSX2 "portable
+    /// mode" (a `portable.ini` file placed beside the executable), so it is
+    /// checked as a candidate profile directly, never guessed by searching.
+    pub appimage_directory: Option<PathBuf>,
     /// Portable roots must come from an already known PCSX2 configuration,
     /// never from blind filesystem searching.
     pub portable_configuration_roots: Vec<PathBuf>,
@@ -156,11 +170,17 @@ impl Pcsx2ProfileDiscoveryRoots {
         let xdg_data_home = env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
+        let documents_home = home.join("Documents");
+        let appimage_directory = env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .and_then(|appimage| appimage.parent().map(Path::to_path_buf));
         Ok(Self {
             home,
             xdg_config_home,
             xdg_data_home,
+            documents_home,
             flatpak_system_root: PathBuf::from("/var/lib/flatpak"),
+            appimage_directory,
             portable_configuration_roots: Vec::new(),
         })
     }
@@ -350,6 +370,20 @@ pub fn discover_pcsx2_profiles(
             report_missing: false,
         },
         ProfileCandidate {
+            installation_type: Pcsx2InstallationType::NativeAlternate,
+            scope: Pcsx2ProfileScope::User,
+            configuration_path: roots.xdg_data_home.join("PCSX2"),
+            provenance: "XDG data-home PCSX2 directory (observed with some AppImage builds)",
+            report_missing: false,
+        },
+        ProfileCandidate {
+            installation_type: Pcsx2InstallationType::NativeAlternate,
+            scope: Pcsx2ProfileScope::User,
+            configuration_path: roots.documents_home.join("PCSX2"),
+            provenance: "Documents PCSX2 directory (observed with some AppImage builds)",
+            report_missing: false,
+        },
+        ProfileCandidate {
             installation_type: flatpak_kind,
             scope: flatpak_scope,
             configuration_path: flatpak_config,
@@ -357,6 +391,15 @@ pub fn discover_pcsx2_profiles(
             report_missing: false,
         },
     ];
+    if let Some(appimage_directory) = &roots.appimage_directory {
+        candidates.push(ProfileCandidate {
+            installation_type: Pcsx2InstallationType::Portable,
+            scope: Pcsx2ProfileScope::Portable,
+            configuration_path: appimage_directory.clone(),
+            provenance: "Portable mode beside the running AppImage (from $APPIMAGE)",
+            report_missing: false,
+        });
+    }
     candidates.extend(
         roots
             .portable_configuration_roots
@@ -601,6 +644,7 @@ fn profile_id(kind: Pcsx2InstallationType, path: &Path) -> String {
     digest.update(path.as_os_str().to_string_lossy().as_bytes());
     let kind = match kind {
         Pcsx2InstallationType::Native => "native",
+        Pcsx2InstallationType::NativeAlternate => "native-alt",
         Pcsx2InstallationType::FlatpakUser => "flatpak-user",
         Pcsx2InstallationType::FlatpakSystem => "flatpak-system",
         Pcsx2InstallationType::Portable => "portable",
@@ -1312,7 +1356,9 @@ mod tests {
             home: root.join("home"),
             xdg_config_home: root.join("config"),
             xdg_data_home: root.join("data"),
+            documents_home: root.join("home/Documents"),
             flatpak_system_root: root.join("system-flatpak"),
+            appimage_directory: None,
             portable_configuration_roots: Vec::new(),
         }
     }
@@ -1354,6 +1400,121 @@ mod tests {
                 .profiles
                 .iter()
                 .any(|profile| { profile.installation_type == Pcsx2InstallationType::FlatpakUser })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovers_appimage_adjacent_portable_profile() {
+        let root = fixture_root("appimage-portable");
+        make_profile(&root.join("appimage-dir"));
+        fs::write(root.join("appimage-dir/portable.ini"), b"").unwrap();
+        let mut discovery_roots = roots(&root);
+        discovery_roots.appimage_directory = Some(root.join("appimage-dir"));
+        let discovery = discover_pcsx2_profiles(&discovery_roots).unwrap();
+        let profile = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_path == root.join("appimage-dir"))
+            .expect("appimage-adjacent portable profile discovered");
+        assert!(profile.eligible);
+        assert_eq!(profile.installation_type, Pcsx2InstallationType::Portable);
+        assert_eq!(profile.scope, Pcsx2ProfileScope::Portable);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appimage_directory_without_pcsx2_evidence_is_blocked_not_guessed() {
+        let root = fixture_root("appimage-no-evidence");
+        fs::create_dir_all(root.join("appimage-dir")).unwrap();
+        let mut discovery_roots = roots(&root);
+        discovery_roots.appimage_directory = Some(root.join("appimage-dir"));
+        let discovery = discover_pcsx2_profiles(&discovery_roots).unwrap();
+        let profile = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_path == root.join("appimage-dir"))
+            .expect("directory beside the AppImage is reported, even though it is not eligible");
+        assert!(!profile.eligible);
+        assert_eq!(
+            profile.blockers[0].kind,
+            Pcsx2ProfileBlockerKind::MissingPcsx2Evidence
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_appimage_directory_is_silently_absent() {
+        let root = fixture_root("appimage-missing-dir");
+        fs::create_dir_all(&root).unwrap();
+        let mut discovery_roots = roots(&root);
+        discovery_roots.appimage_directory = Some(root.join("does-not-exist"));
+        let discovery = discover_pcsx2_profiles(&discovery_roots).unwrap();
+        assert!(
+            discovery
+                .profiles
+                .iter()
+                .all(|profile| profile.configuration_path != root.join("does-not-exist"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovers_native_alternate_data_home_and_documents_profiles() {
+        let root = fixture_root("native-alternate");
+        make_profile(&root.join("data/PCSX2"));
+        make_profile(&root.join("home/Documents/PCSX2"));
+        let discovery = discover_pcsx2_profiles(&roots(&root)).unwrap();
+        let alternates: Vec<_> = discovery
+            .profiles
+            .iter()
+            .filter(|profile| profile.installation_type == Pcsx2InstallationType::NativeAlternate)
+            .collect();
+        assert_eq!(alternates.len(), 2);
+        assert!(alternates.iter().all(|profile| profile.eligible));
+        assert!(
+            alternates
+                .iter()
+                .any(|profile| profile.configuration_path == root.join("data/PCSX2"))
+        );
+        assert!(
+            alternates
+                .iter()
+                .any(|profile| profile.configuration_path == root.join("home/Documents/PCSX2"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multiple_discovered_profiles_require_explicit_confirmation_not_a_guess() {
+        use super::super::pcsx2_identity::{Pcsx2ProfileChoiceError, confirmed_pcsx2_profile};
+
+        let root = fixture_root("ambiguous-discovery");
+        make_profile(&root.join("config/PCSX2"));
+        make_profile(&root.join("appimage-dir"));
+        let mut discovery_roots = roots(&root);
+        discovery_roots.appimage_directory = Some(root.join("appimage-dir"));
+        let discovery = discover_pcsx2_profiles(&discovery_roots).unwrap();
+        assert_eq!(discovery.profiles.iter().filter(|p| p.eligible).count(), 2);
+        let choice = confirmed_pcsx2_profile(&discovery, None);
+        match choice {
+            Err(Pcsx2ProfileChoiceError::ConfirmationRequired {
+                eligible_profile_ids,
+            }) => assert_eq!(eligible_profile_ids.len(), 2),
+            other => panic!("expected ConfirmationRequired, got {other:?}"),
+        }
+        let native_id = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.installation_type == Pcsx2InstallationType::Native)
+            .unwrap()
+            .profile_id
+            .clone();
+        assert_eq!(
+            confirmed_pcsx2_profile(&discovery, Some(&native_id))
+                .unwrap()
+                .profile_id,
+            native_id
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1651,7 +1812,15 @@ mod tests {
         )
         .unwrap();
         let socket_path = profile_root.join("cheats/socket.pnach");
-        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let _listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("Unix socket creation is not permitted in this test environment");
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            Err(error) => panic!("failed to create special-file fixture: {error}"),
+        };
         let inventory = inspect_pcsx2_profile(&eligible_profile(&profile_root)).unwrap();
         assert!(inventory.files.is_empty());
         assert!(

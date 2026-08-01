@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Luigi's Mansion Cheats - GameHacking.org</title></head>
+<body>
+<form id="siteSearch" method="get" action="/search.php">
+	<input type="hidden" name="unrelated" value="not-the-export-form"/>
+</form>
+<h1>Luigi's Mansion</h1>
+<form id="exportCodes" name="exportCodes" method="post" action="/inc/sub.exportCodes.php">
+	<div class="row">
+		<div class="col-sm-6">
+			<div class="input-group">
+				<span class="input-group-addon">
+					<label for="format">Format</label>
+				</span>
+				<select id="format" class="form-control chosen-select" name="format">
+					<option value="Gecko">Gecko  (.gct)</option>
+					<option value="Mednafen">Mednafen  (.cht)</option>
+					<option value="Text">Plain Text  (.txt)</option>
+				</select>
+			</div>
+		</div>
+		<div class="col-sm-2">
+			<div class="input-group">
+				<span class="input-group-addon">
+					<input id="codID" name="codID" type="radio" value="" checked="checked"/>
+				</span>
+				<label class="form-control" for="codID">All</label>
+			</div>
+		</div>
+		<div class="col-sm-4">
+			<div class="input-group">
+				<span class="input-group-addon">
+					<input id="dlCodID" name="codID" type="radio" value=""/>
+				</span>
+				<label class="form-control" for="dlCodID">Checked</label>
+			</div>
+		</div>
+	</div>
+	<div class="input-group">
+		<span class="input-group-addon">
+			<label for="filename">Filename</label>
+		</span>
+		<select id="filename" class="form-control chosen-select" name="filename">
+			<option value="Luigi&#39;s Mansion (USA)">Luigi&#39;s Mansion (USA)</option>
+			<option value="GLME01">GLME01</option>
+		</select>
+	</div>
+	<input type="hidden" name="sysID" value="13"/>
+	<input type="hidden" name="gamID" value="54172"/>
+	<input id="dlDownload" type="hidden" name="download" value="true"/>
+</form>
+</body>
+</html>

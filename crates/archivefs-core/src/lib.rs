@@ -3,7 +3,7 @@ use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,10 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 mod database;
+/// Read-only Doctor diagnostics: one shared finding model plus adapters
+/// over the existing per-subsystem reports. See the module documentation
+/// for the read-only contract.
+pub mod diagnostics;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -26,10 +30,10 @@ pub use database::{
     DatabaseHealthReport, DatabaseOpenOutcome, DatabaseSidecarFinding, DatabaseSidecarKind,
     MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, PersistedArchive, PlatformAlias,
     PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions,
-    RegisteredSourceFolder, ScanPersistSummary, ScanRunCounts, SourceFolderRecord,
-    SourceScanStatus, check_database_health, default_database_path, diagnose_database,
-    format_unix_timestamp_utc, latest_schema_version, persisted_archive_has_unknown_platform,
-    scan_and_persist,
+    RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE, ScanPersistSummary, ScanRunCounts,
+    SourceFolderRecord, SourceScanStatus, check_database_health, default_database_path,
+    diagnose_database, format_unix_timestamp_utc, latest_schema_version,
+    persisted_archive_has_unknown_platform, scan_and_persist,
 };
 
 mod inspector;
@@ -56,6 +60,16 @@ pub use library_views::{
     save_library_view_configs_default, save_library_view_configs_to,
     set_library_view_enabled_default, validate_library_view_destination,
 };
+
+/// The single authoritative platform registry and the evidence-based
+/// detector built on it. Every platform alias, extension and signature this
+/// build knows lives there - nothing keeps a second copy.
+/// The one bounded, read-only file-open policy in this build, shared by
+/// platform signature detection and disc identity so the two cannot drift
+/// apart on symlink handling.
+pub mod safe_read;
+
+pub mod platform;
 
 pub mod patch_manager;
 
@@ -297,6 +311,11 @@ pub struct ConfigCheckReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupDiagnosticStatus {
     Ready,
+    /// The check did not run, so its answer is unknown. Never a pass and
+    /// never a problem - a gap. Used by
+    /// [`run_setup_diagnostics_read_only`] for mount-root writability,
+    /// which can only be established by writing.
+    NotChecked,
     Warning,
     Error,
 }
@@ -773,6 +792,22 @@ fn run_setup_diagnostics_default_with_path(config_path: Result<PathBuf>) -> Setu
     }
 }
 
+/// Setup diagnostics that never write.
+///
+/// Identical to [`run_setup_diagnostics`] except that mount-root
+/// writability is reported as [`SetupDiagnosticStatus::NotChecked`] instead
+/// of being probed. The probe used by the normal path
+/// ([`directory_is_writable`]) creates and removes a file inside the mount
+/// root, which changes that directory's modification time - unacceptable
+/// for a strictly read-only diagnostic.
+///
+/// `ready_for_actions` is therefore always `false` here: ArchiveFS cannot
+/// honestly assert that mount and unmount actions are usable without having
+/// established writability.
+pub fn run_setup_diagnostics_read_only(config_path: impl AsRef<Path>) -> SetupDiagnostics {
+    run_setup_diagnostics_with_command_check_and_probe(config_path, command_available, false)
+}
+
 pub fn run_setup_diagnostics(config_path: impl AsRef<Path>) -> SetupDiagnostics {
     run_setup_diagnostics_with_command_check(config_path, command_available)
 }
@@ -826,12 +861,21 @@ fn run_setup_diagnostics_with_command_check(
     config_path: impl AsRef<Path>,
     command_check: impl Fn(&str) -> bool,
 ) -> SetupDiagnostics {
+    run_setup_diagnostics_with_command_check_and_probe(config_path, command_check, true)
+}
+
+fn run_setup_diagnostics_with_command_check_and_probe(
+    config_path: impl AsRef<Path>,
+    command_check: impl Fn(&str) -> bool,
+    probe_writability: bool,
+) -> SetupDiagnostics {
     let config_path = config_path.as_ref().to_path_buf();
     run_setup_diagnostics_with_checks(
         config_path,
         |path| fs::read_to_string(path),
         inspect_path,
         command_check,
+        probe_writability,
     )
 }
 
@@ -840,6 +884,7 @@ fn run_setup_diagnostics_with_checks(
     read_config: impl Fn(&Path) -> io::Result<String>,
     inspect: impl Fn(&Path) -> PathInspection,
     command_check: impl Fn(&str) -> bool,
+    probe_writability: bool,
 ) -> SetupDiagnostics {
     let (config_missing, config_read_ok, config_read_detail, contents) =
         match read_config(&config_path) {
@@ -923,10 +968,18 @@ fn run_setup_diagnostics_with_checks(
     let mount_root_ready = mount_root_state
         .as_ref()
         .is_some_and(PathInspection::is_directory);
-    let mount_root_writable = mount_root_ready
-        && mount_root
-            .as_ref()
-            .is_some_and(|root| directory_is_writable(root));
+    // `None` when writability was deliberately not established. Never
+    // `Some(true)` unless a real probe ran and succeeded.
+    let mount_root_writable: Option<bool> = if probe_writability {
+        Some(
+            mount_root_ready
+                && mount_root
+                    .as_ref()
+                    .is_some_and(|root| directory_is_writable(root)),
+        )
+    } else {
+        None
+    };
     let ratarmount_name = fields
         .as_ref()
         .and_then(|fields| fields.ratarmount_bin.as_deref())
@@ -934,9 +987,11 @@ fn run_setup_diagnostics_with_checks(
     let ratarmount_ready = command_check(ratarmount_name);
     let unmount_ready = command_check("fusermount3") || command_check("umount");
     let ready_for_scanning = config_valid && sources_ready;
+    // An unprobed mount root can never make actions "ready": ArchiveFS has
+    // not established that it can create mount points there.
     let ready_for_actions = ready_for_scanning
         && mount_root_ready
-        && mount_root_writable
+        && mount_root_writable == Some(true)
         && ratarmount_ready
         && unmount_ready;
     let mut checks = Vec::new();
@@ -1020,18 +1075,41 @@ fn run_setup_diagnostics_with_checks(
         "Mount and unmount actions require a safe dedicated root.",
         "Use Create Mount Root when offered, or correct its parent path.",
     );
-    setup_check_with_warning(
-        &mut checks,
-        "Mount root is writable",
-        mount_root_writable,
-        can_create_mount_root,
-        mount_root.as_ref().map_or_else(
-            || "No mount root is available to test.".to_string(),
-            |root| format!("Writable directory required: {}", root.display()),
+    match mount_root_writable {
+        Some(writable) => setup_check_with_warning(
+            &mut checks,
+            "Mount root is writable",
+            writable,
+            can_create_mount_root,
+            mount_root.as_ref().map_or_else(
+                || "No mount root is available to test.".to_string(),
+                |root| format!("Writable directory required: {}", root.display()),
+            ),
+            "ArchiveFS must create mount-point directories below mount_root.",
+            "Grant the current user write access or choose another mount_root.",
         ),
-        "ArchiveFS must create mount-point directories below mount_root.",
-        "Grant the current user write access or choose another mount_root.",
-    );
+        // Deliberately not probed - see `run_setup_diagnostics_read_only`.
+        // Reported as unknown rather than as a pass or a failure.
+        None => checks.push(SetupDiagnostic {
+            name: "Mount root is writable".to_string(),
+            status: SetupDiagnosticStatus::NotChecked,
+            detail: mount_root.as_ref().map_or_else(
+                || "Not probed: no mount root is configured.".to_string(),
+                |root| {
+                    format!(
+                        "Not probed: establishing write access means creating and removing a file in {}, which a read-only check never does.",
+                        root.display()
+                    )
+                },
+            ),
+            why_it_matters:
+                "ArchiveFS must create mount-point directories below mount_root before it can mount anything."
+                    .to_string(),
+            next_step:
+                "Run `archivefs config-check`, or use Settings -> Validate configuration, to test write access."
+                    .to_string(),
+        }),
+    }
     setup_check(
         &mut checks,
         "ratarmount is available",
@@ -2121,6 +2199,8 @@ pub struct SourceFolderView {
     pub last_scan_at: Option<String>,
     pub last_successful_scan_at: Option<String>,
     pub last_archive_count: Option<i64>,
+    pub assigned_platform: Option<String>,
+    pub unknown_archive_count: i64,
 }
 
 /// Joins the config's per-source list against the database's per-source
@@ -2152,6 +2232,8 @@ pub fn build_source_folder_views(
                 last_successful_scan_at: record
                     .and_then(|record| record.last_successful_scan_at.clone()),
                 last_archive_count: record.and_then(|record| record.last_archive_count),
+                assigned_platform: record.and_then(|record| record.assigned_platform.clone()),
+                unknown_archive_count: record.map_or(0, |record| record.unknown_archive_count),
             }
         })
         .collect()
@@ -2169,6 +2251,60 @@ pub fn list_source_folder_views_at(
     let database = Database::open_read_only(database_path)?;
     let records = database.list_source_folders()?;
     Ok(build_source_folder_views(&sources, &records))
+}
+
+/// Saves an explicit platform default for a configured source. The returned
+/// count is the number of currently visible Unknown rows that a subsequent
+/// rescan may safely recover; callers must show it before invoking this
+/// mutating action.
+pub fn preview_source_platform_assignment_at(database_path: &Path, target: &Path) -> Result<i64> {
+    let database = Database::open_or_create(database_path)?;
+    let record = database
+        .list_source_folders()?
+        .into_iter()
+        .find(|record| record.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "source folder {} is not registered",
+                target.display()
+            ))
+        })?;
+    Ok(record.unknown_archive_count)
+}
+
+pub fn assign_source_platform_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    platform: &str,
+    triggered_by: &str,
+) -> Result<ScanPersistSummary> {
+    let canonical = canonical_platform_for_alias(platform).ok_or_else(|| {
+        ArchiveFsError::Config(format!("unknown platform assignment '{platform}'"))
+    })?;
+    let sources = load_source_folder_configs_from(config_path)?;
+    if !sources.iter().any(|source| source.path == target) {
+        return Err(ArchiveFsError::Config(format!(
+            "source folder {} is not configured",
+            target.display()
+        )));
+    }
+    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let mut database = Database::open_or_create(database_path)?;
+    database.register_source_folders(&all_paths)?;
+    database.set_source_platform_assignment(target, Some(canonical))?;
+    drop(database);
+    scan_source_folder_at(config_path, database_path, target, triggered_by)
+}
+
+pub fn assign_source_platform_default(target: &Path, platform: &str) -> Result<ScanPersistSummary> {
+    assign_source_platform_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        platform,
+        "gui-assign-source-platform",
+    )
 }
 
 /// Adds `candidate` as a new, enabled source folder: validates it against
@@ -2664,6 +2800,9 @@ pub enum ArchiveKind {
     /// A loose Mega Drive/Genesis ROM. It is catalogued but deliberately
     /// marked unsupported for ArchiveFS's archive-mount backend.
     MegaDriveRom,
+    /// A supported game image that is catalogued directly rather than
+    /// requiring an archive wrapper. Scanning never mounts or modifies it.
+    DirectGameImage,
 }
 
 impl ArchiveKind {
@@ -2671,7 +2810,7 @@ impl ArchiveKind {
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
     pub fn is_mount_input(self) -> bool {
-        !matches!(self, Self::MegaDriveRom)
+        !matches!(self, Self::MegaDriveRom | Self::DirectGameImage)
     }
 }
 
@@ -2843,7 +2982,11 @@ impl MetadataProvider for FilenameMetadataProvider {
     fn metadata_for(&self, archive: &Archive) -> ArchiveMetadata {
         let mut metadata = ArchiveMetadata::empty();
         metadata.title = Some(archive_title(&archive.path));
-        metadata.platform = detect_platform(&archive.path, &archive.identity.source_root);
+        metadata.platform = archive
+            .identity
+            .platform
+            .clone()
+            .or_else(|| detect_platform(&archive.path, &archive.identity.source_root));
         metadata.region = archive.identity.region.clone();
         metadata
     }
@@ -2877,7 +3020,20 @@ impl Archive {
             kind,
             identity: {
                 let mut identity = ArchiveIdentity::from_path(path, source_root, metadata.as_ref());
-                if kind == ArchiveKind::MegaDriveRom {
+                if kind == ArchiveKind::DirectGameImage
+                    && let Some(platform) = detect_direct_image_header_platform(path)
+                {
+                    identity.platform = Some(platform.to_string());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
+                // A Mega Drive ROM's *kind* is weak evidence: it comes from an
+                // extension. It may fill in a platform nothing else identified,
+                // but it must never replace a platform that stronger evidence
+                // already established - which is how `scummvm/laurabow2/
+                // RESOURCE.GEN` came to be labelled MegaDrive while its
+                // provenance still read `FolderAlias` for a folder named
+                // `scummvm`.
+                if kind == ArchiveKind::MegaDriveRom && identity.platform.is_none() {
                     identity.platform = Some("MegaDrive".to_string());
                     identity
                         .platform_provenance
@@ -2912,21 +3068,38 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         Some(ArchiveKind::SevenZip)
     } else if filename.ends_with(".rar") {
         Some(ArchiveKind::Rar)
-    } else if filename.ends_with(".gen") || filename.ends_with(".smd") {
+    } else if filename.ends_with(".smd") {
+        // `.smd` is a Super Magic Drive dump: Mega Drive specific, so it needs
+        // no corroboration.
+        //
+        // `.gen` deliberately does NOT appear here. It collides with Sierra
+        // SCI `RESOURCE.GEN` files, which every ScummVM game directory
+        // contains, and classifying one of those as a Mega Drive ROM is
+        // exactly the misdetection this milestone fixes. A `.gen` file is
+        // recognised as a Mega Drive ROM only once something corroborates it -
+        // see `archive_kind_in_root`.
         Some(ArchiveKind::MegaDriveRom)
+    } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
+        .iter()
+        .any(|extension| filename.ends_with(extension))
+    {
+        Some(ArchiveKind::DirectGameImage)
     } else {
         None
     }
 }
 
-fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
+pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(extension.as_str(), "md" | "bin") {
+    if !matches!(extension.as_str(), "md" | "bin" | "gen") {
         return None;
     }
+    // Corroboration, in the same priority order detection uses everywhere:
+    // the containing folder, the configured source root, or the cartridge
+    // header itself. A shared extension alone is never enough.
     let nested_match = detect_platform_from_folder_alias_with_match(path, source_root)
         .is_some_and(|(platform, _)| platform == "MegaDrive");
     let source_root_match = source_root
@@ -2934,11 +3107,64 @@ fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> 
         .and_then(|name| name.to_str())
         .and_then(folder_platform_alias)
         == Some("MegaDrive");
-    (nested_match || source_root_match).then_some(ArchiveKind::MegaDriveRom)
+    // A folder that names a *different* platform is a positive refusal, not
+    // merely an absence of support: a `.gen` inside a ScummVM game directory
+    // is a resource file, whatever its extension suggests.
+    let contradicted = detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| platform != "MegaDrive");
+    if contradicted {
+        return None;
+    }
+    let header_match = !nested_match && !source_root_match && has_mega_drive_cartridge_header(path);
+    (nested_match || source_root_match || header_match).then_some(ArchiveKind::MegaDriveRom)
 }
 
 pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
     archive_kind(path).is_some()
+}
+
+/// Identifies only formats whose uncompressed disc header is directly
+/// available. Compressed RVZ/GCZ images deliberately remain visible without
+/// pretending that their exact identity was extracted.
+///
+/// The GameCube and Wii magic words are no longer written out here: they are
+/// two [`platform::MagicRule`] entries in the registry, so the disc check and
+/// everything else that reasons about signatures read the same table. The
+/// behaviour is unchanged - one bounded read, `.iso`/`.gcm` only, and `None`
+/// rather than a guess when neither word matches.
+fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "iso" | "gcm") {
+        return None;
+    }
+    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    let report = platform::detect_platform_report(&request);
+    report
+        .evidence
+        .iter()
+        .find(|item| {
+            item.source == platform::DetectionSource::Signature
+                && matches!(item.platform, "GameCube" | "Wii")
+        })
+        .map(|item| item.platform)
+}
+
+/// Whether `path` carries a real Mega Drive cartridge header, using the
+/// registry's own signature rule rather than a second copy of the offset.
+///
+/// Bounded: one short read at a known offset. No trusted roots are supplied, so
+/// a symlink is refused here exactly as it always was - `archive_kind_in_root`
+/// has no access to the configuration, and inventing a trusted set from a
+/// single `source_root` argument would be guessing at what the user configured.
+/// Deliberately left fail-closed; see `crate::safe_read`.
+fn has_mega_drive_cartridge_header(path: &Path) -> bool {
+    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    platform::detect_platform_report(&request)
+        .evidence
+        .iter()
+        .any(|item| {
+            item.source == platform::DetectionSource::Signature && item.platform == "MegaDrive"
+        })
 }
 
 pub fn should_skip_split_archive_part(path: impl AsRef<Path>) -> bool {
@@ -3234,6 +3460,16 @@ pub enum HealthCategory {
     /// A live mount attempt failed in a way [`ArchiveHealth::is_retryable`]
     /// says may succeed if retried.
     RetryableFailure,
+    /// A failure value retained from an earlier catalogue observation. It is
+    /// evidence that something failed before, not evidence of a failure in
+    /// the current process/session.
+    HistoricalMountFailure,
+    /// The item is deliberately catalogued as a loose game/resource and the
+    /// archive mount backend is not applicable to it.
+    MountNotRequired,
+    /// A failure value exists, but neither current mount state nor a retained
+    /// observation timestamp establishes when it happened.
+    MountFailureEvidenceInsufficient,
     /// A remount or lazy-unmount recovery offer is currently active for
     /// this exact archive in this session.
     RecoveryAvailable,
@@ -3258,10 +3494,13 @@ impl HealthCategory {
             Self::TerminalFailure => 1,
             Self::RetryableFailure => 2,
             Self::RecoveryAvailable => 3,
-            Self::Missing => 4,
-            Self::AwaitingValidation => 5,
-            Self::CachedOnly => 6,
-            Self::UnknownPlatform => 7,
+            Self::HistoricalMountFailure => 4,
+            Self::MountFailureEvidenceInsufficient => 5,
+            Self::MountNotRequired => 6,
+            Self::Missing => 7,
+            Self::AwaitingValidation => 8,
+            Self::CachedOnly => 9,
+            Self::UnknownPlatform => 10,
         }
     }
 
@@ -3275,6 +3514,9 @@ impl HealthCategory {
         match self {
             Self::TerminalFailure => "Terminal failure",
             Self::RetryableFailure => "Retryable failure",
+            Self::HistoricalMountFailure => "Historical mount failure",
+            Self::MountNotRequired => "No mount required",
+            Self::MountFailureEvidenceInsufficient => "Earlier mount result needs context",
             Self::RecoveryAvailable => "Recovery available",
             Self::Missing => "Missing",
             Self::AwaitingValidation => "Awaiting validation",
@@ -3338,9 +3580,11 @@ pub struct ArchiveHealthInput<'a> {
     pub path: &'a Path,
     pub platform: Option<&'a str>,
     pub presence: ArchivePresence,
-    /// `Some` only for a live, current-session mount attempt.
+    /// `Some` establishes current-session context. `None` keeps a retained
+    /// health value historical/uncertain rather than silently promoting it.
     pub mount_state: Option<MountState>,
-    /// `Some` only for a live, current-session mount attempt.
+    /// A current value when `mount_state` is present, or a retained value
+    /// when the caller supplies it without current mount state.
     pub archive_health: Option<ArchiveHealth>,
     pub recovery_offer: Option<RecoveryOffer>,
     pub last_seen_at: Option<&'a str>,
@@ -3374,8 +3618,21 @@ impl HealthIssue {
 
 fn health_issue_reason(category: HealthCategory, recovery_offer: Option<RecoveryOffer>) -> String {
     match category {
-        HealthCategory::TerminalFailure => "Mount failure requires manual review".to_string(),
+        HealthCategory::TerminalFailure => {
+            "A current mount input remains in a terminal failure state".to_string()
+        }
         HealthCategory::RetryableFailure => "Mount failed and may be retried".to_string(),
+        HealthCategory::HistoricalMountFailure => {
+            "An earlier stored observation recorded a mount failure; this is not a current failure"
+                .to_string()
+        }
+        HealthCategory::MountNotRequired => {
+            "This loose game or resource is catalogued directly and does not use the archive mount workflow"
+                .to_string()
+        }
+        HealthCategory::MountFailureEvidenceInsufficient => {
+            "A failure value was recorded without enough evidence to call it current".to_string()
+        }
         HealthCategory::RecoveryAvailable => match recovery_offer {
             Some(RecoveryOffer::Remount) => "Remount is available".to_string(),
             Some(RecoveryOffer::LazyUnmount) => "Lazy-unmount recovery is available".to_string(),
@@ -3402,13 +3659,22 @@ fn health_issue_reason(category: HealthCategory, recovery_offer: Option<Recovery
 /// archive gets exactly one category, its single most severe applicable
 /// one, never more than one.
 pub fn classify_archive_health(input: &ArchiveHealthInput<'_>) -> Option<HealthIssue> {
-    let category = input.archive_health.and_then(|health| {
-        if health.is_terminal_without_source_change() {
-            Some(HealthCategory::TerminalFailure)
-        } else if health.is_retryable() {
-            Some(HealthCategory::RetryableFailure)
+    let recorded_failure = input
+        .archive_health
+        .filter(|health| health.is_terminal_without_source_change() || health.is_retryable());
+    let category = recorded_failure.map(|health| {
+        if input.mount_state == Some(MountState::NotMountable) {
+            HealthCategory::MountNotRequired
+        } else if input.mount_state.is_some() {
+            if health.is_terminal_without_source_change() {
+                HealthCategory::TerminalFailure
+            } else {
+                HealthCategory::RetryableFailure
+            }
+        } else if input.last_seen_at.is_some() {
+            HealthCategory::HistoricalMountFailure
         } else {
-            None
+            HealthCategory::MountFailureEvidenceInsufficient
         }
     });
 
@@ -3441,7 +3707,14 @@ pub fn classify_archive_health(input: &ArchiveHealthInput<'_>) -> Option<HealthI
             Some(RecoveryOffer::LazyUnmount) => Some(RecoveryAction::LazyUnmount),
             None => None,
         },
-        _ => None,
+        HealthCategory::HistoricalMountFailure
+        | HealthCategory::MountNotRequired
+        | HealthCategory::MountFailureEvidenceInsufficient
+        | HealthCategory::TerminalFailure
+        | HealthCategory::Missing
+        | HealthCategory::AwaitingValidation
+        | HealthCategory::CachedOnly
+        | HealthCategory::UnknownPlatform => None,
     };
     let reason = health_issue_reason(category, input.recovery_offer);
 
@@ -4108,9 +4381,14 @@ impl<'a> ArchiveScanner<'a> {
                         .extension()
                         .and_then(|value| value.to_str())
                         .map(str::to_ascii_lowercase);
+                    // `.gen` joins `.md` and `.bin` here: all three are shared
+                    // extensions that only become a Mega Drive ROM once a folder
+                    // or a cartridge header corroborates them, so one that was
+                    // skipped was skipped for an ambiguous platform - not
+                    // because the extension is unsupported.
                     if extension
                         .as_deref()
-                        .is_some_and(|value| matches!(value, "md" | "bin"))
+                        .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
                     {
                         discovery.skipped_ambiguous_platform += 1;
                     } else {
@@ -4382,12 +4660,12 @@ fn normalized_title(path: &Path) -> String {
 /// [`Database::assign_platform`](crate::database::Database::assign_platform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlatformProvenance {
-    /// The existing filename/title/known-path-segment heuristic below
-    /// (`detect_platform_from_known_heuristics`) - unchanged from before
-    /// this enum existed, and always tried first.
+    /// A bounded, read-only format/header check identified the platform.
+    HeaderIdentity,
+    /// Filename/title/known-path-segment evidence, used only after exact
+    /// folder-alias matching finds nothing.
     Heuristic,
-    /// The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), used only
-    /// as a fallback when the heuristic above finds nothing.
+    /// An exact folder-alias match in the `platform` registry.
     FolderAlias,
 }
 
@@ -4397,6 +4675,7 @@ impl PlatformProvenance {
     /// before this enum existed; `"folder_alias"` is new.
     pub fn as_source_str(self) -> &'static str {
         match self {
+            Self::HeaderIdentity => "header_identity",
             Self::Heuristic => "heuristic-path-detector",
             Self::FolderAlias => "folder_alias",
         }
@@ -4437,13 +4716,10 @@ pub fn detect_platform(path: impl AsRef<Path>, source_root: impl AsRef<Path>) ->
 /// Detects a platform for `path` (an archive discovered under
 /// `source_root`), in priority order:
 ///
-/// 1. The existing filename/title/known-path-segment heuristic
-///    (`detect_platform_from_known_heuristics`) - unchanged, and always
-///    tried first, since it is generally more specific than a bare folder
-///    name.
-/// 2. The generic folder alias map (`FOLDER_PLATFORM_ALIASES`), walking
+/// 1. The folder-alias table in the `platform` registry, walking
 ///    from the archive's nearest containing directory up to (never beyond)
 ///    `source_root` - see `detect_platform_from_folder_alias`.
+/// 2. The filename/title/known-path-segment heuristic.
 /// 3. `None` if neither found a confident match.
 pub fn detect_platform_with_provenance(
     path: impl AsRef<Path>,
@@ -4456,9 +4732,7 @@ pub fn detect_platform_with_provenance(
 }
 
 /// Detects a platform with enough detail for a human-readable provenance
-/// explanation. This preserves [`detect_platform_with_provenance`]'s exact
-/// precedence and result while retaining the matched folder text for its
-/// built-in-alias fallback.
+/// explanation while retaining the matched folder text.
 pub fn detect_platform_with_details(
     path: impl AsRef<Path>,
     source_root: impl AsRef<Path>,
@@ -4466,21 +4740,23 @@ pub fn detect_platform_with_details(
     let path = path.as_ref();
     let source_root = source_root.as_ref();
 
-    if let Some(platform) = detect_platform_from_known_heuristics(path, source_root) {
+    if let Some((platform, matched_folder)) =
+        detect_platform_from_folder_alias_with_match(path, source_root)
+    {
         return Some(DetailedPlatformDetection {
-            platform,
-            provenance: PlatformProvenance::Heuristic,
-            matched_folder: None,
-        });
-    }
-
-    detect_platform_from_folder_alias_with_match(path, source_root).map(
-        |(platform, matched_folder)| DetailedPlatformDetection {
             platform: platform.to_string(),
             provenance: PlatformProvenance::FolderAlias,
             matched_folder: Some(matched_folder),
-        },
-    )
+        });
+    }
+
+    detect_platform_from_known_heuristics(path, source_root).map(|platform| {
+        DetailedPlatformDetection {
+            platform,
+            provenance: PlatformProvenance::Heuristic,
+            matched_folder: None,
+        }
+    })
 }
 
 /// The original `detect_platform` heuristic, unchanged: a small set of
@@ -4531,233 +4807,72 @@ fn detect_platform_from_known_heuristics(path: &Path, source_root: &Path) -> Opt
     None
 }
 
-/// Canonical platform name for every folder alias this build recognizes,
-/// keyed by the alias already run through `normalize_path_segment` (ASCII
-/// alphanumeric only, lowercased - so separators and casing like
-/// `"MSX 2"`/`"msx_2"`/`"msx2"` all key to the same `"msx2"` entry without
-/// needing a separate row per spelling variant here). Exact match only,
-/// deliberately: a substring or prefix match would risk false positives
-/// like `"genesis".contains("nes")`. Keep entries specific and
-/// unambiguous, avoiding single common English words that are not also
-/// an explicitly requested platform alias.
-const FOLDER_PLATFORM_ALIASES: &[(&str, &str)] = &[
-    ("msx", "MSX"),
-    ("msx1", "MSX"),
-    ("msx2", "MSX2"),
-    ("neogeo", "NeoGeo"),
-    ("neogeoaes", "NeoGeo"),
-    ("neogeomvs", "NeoGeo"),
-    ("neogeo64", "NeoGeo64"),
-    ("ngage", "NGage"),
-    ("nokiangage", "NGage"),
-    ("intellivision", "Intellivision"),
-    ("amiga", "Amiga"),
-    ("commodoreamiga", "Amiga"),
-    ("amigacd32", "AmigaCD32"),
-    ("cd32", "AmigaCD32"),
-    ("atarist", "AtariST"),
-    ("atari2600", "Atari2600"),
-    ("a2600", "Atari2600"),
-    ("atarivcs", "Atari2600"),
-    ("atari5200", "Atari5200"),
-    ("a5200", "Atari5200"),
-    ("atari7800", "Atari7800"),
-    ("a7800", "Atari7800"),
-    ("nes", "NES"),
-    ("nintendoentertainmentsystem", "NES"),
-    ("famicom", "NES"),
-    ("nintendofamicom", "NES"),
-    ("snes", "SNES"),
-    ("supernintendo", "SNES"),
-    ("supernintendoentertainmentsystem", "SNES"),
-    ("nintendosupernintendoentertainmentsystem", "SNES"),
-    ("superfamicom", "SNES"),
-    ("n64", "N64"),
-    ("nintendo64", "N64"),
-    ("gamecube", "GameCube"),
-    ("nintendogamecube", "GameCube"),
-    ("gcn", "GameCube"),
-    ("ngc", "GameCube"),
-    ("wii", "Wii"),
-    ("nintendowii", "Wii"),
-    ("wiiu", "WiiU"),
-    ("nintendowiiu", "WiiU"),
-    ("switch", "Switch"),
-    ("nintendoswitch", "Switch"),
-    ("megadrive", "MegaDrive"),
-    ("genesis", "MegaDrive"),
-    ("segamegadrive", "MegaDrive"),
-    ("segagenesis", "MegaDrive"),
-    ("segamegadrivegenesis", "MegaDrive"),
-    ("smd", "MegaDrive"),
-    ("mastersystem", "MasterSystem"),
-    ("segamastersystem", "MasterSystem"),
-    ("sms", "MasterSystem"),
-    ("gamegear", "GameGear"),
-    ("segagamegear", "GameGear"),
-    ("saturn", "Saturn"),
-    ("segasaturn", "Saturn"),
-    ("dreamcast", "Dreamcast"),
-    ("segadreamcast", "Dreamcast"),
-    ("psx", "PSX"),
-    ("ps1", "PSX"),
-    ("playstation", "PSX"),
-    ("playstation1", "PSX"),
-    ("sonyplaystation", "PSX"),
-    ("sonyplaystation1", "PSX"),
-    ("ps2", "PS2"),
-    ("playstation2", "PS2"),
-    ("sonyplaystation2", "PS2"),
-    ("ps3", "PS3"),
-    ("playstation3", "PS3"),
-    ("sonyplaystation3", "PS3"),
-    ("psp", "PSP"),
-    ("playstationportable", "PSP"),
-    ("sonypsp", "PSP"),
-    ("xbox", "Xbox"),
-    ("microsoftxbox", "Xbox"),
-    ("xbox360", "Xbox360"),
-    ("microsoftxbox360", "Xbox360"),
-    ("arcade", "Arcade"),
-    ("mame", "Arcade"),
-    ("dos", "DOS"),
-    ("msdos", "DOS"),
-    ("dosgames", "DOS"),
-    ("scummvm", "ScummVM"),
-    // Conservative aliases only - see the doc comment above. Deliberately
-    // NOT included: bare "acorn" (too broad - Acorn made several distinct
-    // machines), and generic path components like "games", "software",
-    // "win", or "desktop" for PC (would false-positive on any unrelated
-    // folder using those common words).
-    ("archimedes", "Acorn Archimedes"),
-    ("acornarchimedes", "Acorn Archimedes"),
-    ("riscos", "Acorn Archimedes"),
-    ("pc", "PC"),
-    ("pcgames", "PC"),
-    ("windows", "PC"),
-    ("windowsgames", "PC"),
-    // Conservative retro-platform expansion. Deliberately NOT included:
-    // bare "handheld", "nintendo", "sega", "atari", "sony", "console",
-    // "games", or "roms" - each is broad enough to appear as an unrelated
-    // folder name and would false-positive across the whole library. Short
-    // aliases here ("gb", "ds", "lynx", "jaguar", "vita", "pce", "wsc",
-    // "32x", "c64", "tg16", "ngp", "ngpc") are safe specifically because
-    // `folder_platform_alias` only ever matches one whole, normalized path
-    // *component* (a directory name) - never a substring of a longer
-    // segment and never the archive's own filename (see
-    // `detect_platform_from_folder_alias_with_match`, which pops the
-    // filename before matching) - so a file merely named e.g. "Vita
-    // Game.zip" or a folder like "Digital" can never match "vita"/"ds".
-    ("gameboy", "Game Boy"),
-    ("gb", "Game Boy"),
-    ("gameboycolor", "Game Boy Color"),
-    ("gbc", "Game Boy Color"),
-    ("gameboyadvance", "Game Boy Advance"),
-    ("gba", "Game Boy Advance"),
-    ("nintendods", "Nintendo DS"),
-    ("nds", "Nintendo DS"),
-    ("ds", "Nintendo DS"),
-    ("commodore64", "Commodore 64"),
-    ("c64", "Commodore 64"),
-    ("zxspectrum", "ZX Spectrum"),
-    ("spectrum", "ZX Spectrum"),
-    ("sega32x", "Sega 32X"),
-    ("32x", "Sega 32X"),
-    ("segacd", "Sega CD"),
-    ("megacd", "Sega CD"),
-    ("pcengine", "PC Engine"),
-    ("pce", "PC Engine"),
-    ("turbografx16", "TurboGrafx-16"),
-    ("tg16", "TurboGrafx-16"),
-    ("atarilynx", "Atari Lynx"),
-    ("lynx", "Atari Lynx"),
-    ("atarijaguar", "Atari Jaguar"),
-    ("jaguar", "Atari Jaguar"),
-    ("neogeopocket", "Neo Geo Pocket"),
-    ("ngp", "Neo Geo Pocket"),
-    ("neogeopocketcolor", "Neo Geo Pocket Color"),
-    ("ngpc", "Neo Geo Pocket Color"),
-    ("wonderswan", "WonderSwan"),
-    ("wonderswancolor", "WonderSwan Color"),
-    ("wsc", "WonderSwan Color"),
-    ("3do", "3DO"),
-    ("panasonic3do", "3DO"),
-    ("playstationvita", "PlayStation Vita"),
-    ("psvita", "PlayStation Vita"),
-    ("vita", "PlayStation Vita"),
-    ("colecovision", "ColecoVision"),
-    ("vectrex", "Vectrex"),
+// The folder-alias table that used to live here now lives in
+// `crate::platform::PLATFORMS`, which is the single authoritative registry for
+// every platform, alias, extension and signature this build knows. The
+// functions below are thin adapters onto it, kept so that every existing
+// caller's behaviour and signature are unchanged.
+
+/// Non-hardware "which emulator core" evidence for platforms whose folder
+/// name commonly identifies a specific emulator/core rather than the hardware
+/// itself (Arcade via FBNeo/MAME/FBA being the primary case). Kept separate
+/// from the platform registry deliberately: the registry's job is exactly one
+/// canonical *hardware* platform per folder name, never an emulator choice, so
+/// FBNeo is never promoted to its own canonical platform - the hardware label
+/// "Arcade" is always what such a folder alias resolves to.
+const FOLDER_PREFERRED_EMULATOR_ALIASES: &[(&str, &str)] = &[
+    ("fbneo", "FBNeo"),
+    ("finalburnneo", "FBNeo"),
+    ("fba", "FBNeo"),
+    ("mame", "MAME"),
 ];
 
-/// Every canonical platform name this build recognises via the
-/// folder-alias system (`FOLDER_PLATFORM_ALIASES`), deduplicated and
-/// sorted. This is the single source of truth for "known platform" used
-/// by manual platform assignment (`Database::set_manual_platform`) and
-/// its CLI/GUI callers - neither the CLI nor the GUI maintains a second,
-/// independently-drifting platform list. Does not include platform names
-/// only ever produced by the filename/title heuristic in
-/// `detect_platform_from_known_heuristics` (for example `"Nintendo3DS"`) -
-/// those are ad hoc title matches, not part of the structured alias table
-/// this function draws from. `"PC"` is also reachable through that
-/// heuristic (see `iamjesuschrist`/`steamrip`), but is additionally a
-/// first-class folder alias below, so it does appear here.
+/// The emulator/core a normalized folder name suggests, when the folder name
+/// itself names a specific emulator rather than only hardware. Returns `None`
+/// when the folder name carries no such evidence - most platforms have no
+/// preferred-emulator folder convention at all, which is not an error.
+#[must_use]
+pub fn platform_preferred_emulator_for_alias(folder_hint: &str) -> Option<&'static str> {
+    let normalized = normalize_path_segment(folder_hint);
+    FOLDER_PREFERRED_EMULATOR_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+        .map(|(_, emulator)| *emulator)
+}
+
+/// Every canonical platform name this build recognises, deduplicated and
+/// sorted. Delegates to [`crate::platform::canonical_ids`], so manual platform
+/// assignment (`Database::set_manual_platform`) and its CLI/GUI callers all
+/// draw from the one registry and cannot drift apart.
 pub fn canonical_platform_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = FOLDER_PLATFORM_ALIASES
-        .iter()
-        .map(|(_, canonical)| *canonical)
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
+    platform::canonical_ids()
 }
 
-/// Resolves one external platform hint through the same normalized,
-/// built-in folder-alias table used by archive platform detection. The
-/// original hint is never changed; callers use the returned canonical name
-/// only for comparison. If a future table edit makes one normalized alias
-/// point at more than one canonical platform, the hint is deliberately
-/// treated as ambiguous and returns `None` rather than selecting the first
-/// row and risking a false-positive match.
+/// Resolves one external platform hint through the registry's normalized
+/// folder-alias matching. The original hint is never changed; callers use the
+/// returned canonical name only for comparison. An alias claimed by more than
+/// one platform is treated as ambiguous and returns `None` rather than picking
+/// a winner - see [`crate::platform::platform_for_alias`].
 pub fn canonical_platform_for_alias(platform_hint: &str) -> Option<&'static str> {
-    canonical_platform_for_alias_in(platform_hint, FOLDER_PLATFORM_ALIASES)
+    // An exact canonical identifier resolves to itself, so a stored value round
+    // trips even when it is not also spelled as one of its own aliases.
+    platform::platform_by_id(platform_hint)
+        .or_else(|| platform::platform_for_alias(platform_hint))
+        .map(|platform| platform.id)
 }
 
-fn canonical_platform_for_alias_in<'a>(
-    platform_hint: &str,
-    aliases: &'a [(&str, &'a str)],
-) -> Option<&'a str> {
-    let normalized = normalize_path_segment(platform_hint);
-    let mut matches = aliases
-        .iter()
-        .filter(|(alias, _)| *alias == normalized)
-        .map(|(_, canonical)| *canonical);
-    let canonical = matches.next()?;
-    matches
-        .all(|candidate| candidate == canonical)
-        .then_some(canonical)
-}
-
-/// Canonical platform name for one already-lossy-stringified path
-/// component, if it exactly matches a known folder alias after
-/// normalization, or `None` if it does not.
+/// Canonical platform name for one already-lossy-stringified path component,
+/// if it exactly matches a known folder alias after normalization, tolerating
+/// the parenthesized-suffix and trailing-date conventions real collection
+/// folders use. Matching remains exact - never a substring.
 fn folder_platform_alias(segment: &str) -> Option<&'static str> {
-    canonical_platform_for_alias(segment)
+    platform::detect::platform_for_folder_name(segment).map(|platform| platform.id)
 }
 
-/// Infers a platform from `path`'s folder structure alone, walking
-/// directory components from the archive's nearest containing folder
-/// upward to (but never beyond) `source_root` - the nearest matching
-/// folder wins. Only components strictly inside `source_root` ever
-/// participate: `source_root`'s own components (`/home/davedap/Archives`
-/// in the example from the platform-detection task) never do, and neither
-/// does anything outside `source_root` altogether. The archive's own
-/// filename is excluded too - this only ever looks at directory names.
-///
-/// Uses `to_string_lossy` on each component (matching
-/// `detect_platform_from_known_heuristics`'s existing convention) - this
-/// is a best-effort display guess, not an identity or reconciliation key,
-/// so a lossy conversion on a non-UTF-8 path component is safe and simply
-/// yields no match rather than panicking.
+/// Infers a platform from `path`'s folder structure alone, walking directory
+/// components from the archive's nearest containing folder upward to and
+/// including `source_root` - the nearest matching folder wins. Nothing outside
+/// `source_root` participates, and the archive's own filename is excluded.
 fn detect_platform_from_folder_alias_with_match(
     path: &Path,
     source_root: &Path,
@@ -4766,19 +4881,25 @@ fn detect_platform_from_folder_alias_with_match(
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components.iter().rev().find_map(|component| {
-        let matched_folder = component.as_os_str().to_string_lossy();
-        folder_platform_alias(&matched_folder)
-            .map(|platform| (platform, matched_folder.into_owned()))
-    })
+    components
+        .iter()
+        .rev()
+        .find_map(|component| {
+            let matched_folder = component.as_os_str().to_string_lossy();
+            folder_platform_alias(&matched_folder)
+                .map(|platform| (platform, matched_folder.into_owned()))
+        })
+        .or_else(|| {
+            let matched_folder = source_root.file_name()?.to_string_lossy();
+            folder_platform_alias(&matched_folder)
+                .map(|platform| (platform, matched_folder.into_owned()))
+        })
 }
 
+/// Normalizes one path segment for alias matching. Delegates to the registry
+/// so there is exactly one normalization rule in the build.
 fn normalize_path_segment(segment: &str) -> String {
-    segment
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+    platform::normalize_alias(segment)
 }
 fn archive_title(path: &Path) -> String {
     let filename = path
@@ -4799,7 +4920,9 @@ fn archive_title(path: &Path) -> String {
         return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
     }
 
-    for extension in [".zip", ".7z", ".rar"] {
+    for extension in [
+        ".zip", ".7z", ".rar", ".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso",
+    ] {
         if lower.ends_with(extension) {
             return filename[..filename.len() - extension.len()].to_string();
         }
@@ -4992,22 +5115,60 @@ pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
     })
 }
 
+/// Publishes the index atomically: the JSON is written to a temporary file
+/// beside the destination, fsynced, and only then renamed into place.
+///
+/// This matters because the index is a derived cache that readers parse
+/// wholesale. A direct `fs::write` truncates first, so an interrupted write
+/// would leave a half-written index that parses as an empty or partial
+/// library. With a rename, a reader ever only sees the complete previous
+/// index or the complete new one, and a failed write leaves the previous
+/// index exactly as it was.
 pub fn write_archive_index(index: &ArchiveIndex, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
     }
-    fs::write(path, archive_index_to_json(index))
-        .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))
+    let temporary = path.with_extension(format!("partial-{}", std::process::id()));
+    let json = archive_index_to_json(index);
+    let write = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if let Err(source) = write {
+        let _ = fs::remove_file(&temporary);
+        return Err(ArchiveFsError::io(path.to_path_buf(), source));
+    }
+    Ok(())
 }
 
 pub fn build_and_write_archive_index(config: &Config) -> Result<ArchiveIndex> {
-    let index_path = default_index_path()?;
+    build_and_write_archive_index_to(config, &default_index_path()?)
+}
+
+/// Same as [`build_and_write_archive_index`], with the destination supplied
+/// rather than derived from `$HOME`. Exists so callers - including tests -
+/// can rebuild a specific index without depending on the invoking user's
+/// home directory.
+///
+/// The index is built completely *before* anything is written, so a scan
+/// failure leaves the existing index untouched, and publication itself is
+/// atomic (see [`write_archive_index`]).
+pub fn build_and_write_archive_index_to(
+    config: &Config,
+    index_path: &Path,
+) -> Result<ArchiveIndex> {
     info!("starting index rebuild");
     debug!("index path {}", index_path.display());
     let index = build_archive_index(config)?;
-    write_archive_index(&index, &index_path)?;
+    write_archive_index(&index, index_path)?;
     info!(
         "index rebuild complete: {} archive(s) written to {}",
         index.archives.len(),
@@ -6512,10 +6673,21 @@ pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result
     Ok(removed)
 }
 
-fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<bool> {
+/// The exact conditions that must hold before an empty mount directory may
+/// be removed: it exists, it is not a symlink, it is a directory, it is not
+/// an active mount point, and it is empty.
+///
+/// Extracted so a read-only *plan* ([`plan_stale_mount_directories`]) and
+/// the actual removal ([`remove_empty_unmounted_dir`]) can never disagree
+/// about what is removable. Returns the observed metadata on success so the
+/// remover can re-stat and compare identity before acting.
+fn empty_unmounted_dir_is_removable(
+    path: &Path,
+    mounted_paths: &HashSet<PathBuf>,
+) -> Result<Option<fs::Metadata>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(ArchiveFsError::io(path.to_path_buf(), source)),
     };
     if metadata.file_type().is_symlink()
@@ -6523,8 +6695,78 @@ fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> 
         || mounted_paths.contains(path)
         || !directory_is_empty(path)?
     {
-        return Ok(false);
+        return Ok(None);
     }
+    Ok(Some(metadata))
+}
+
+/// Lists the empty, unmounted directories beneath the configured mount root
+/// that [`cleanup_selected_mount_tree`] would remove - **without removing
+/// anything**.
+///
+/// Read-only by construction: it walks only ArchiveFS's own mount root (not
+/// the library, and never an archive), applies exactly the same predicate the
+/// remover applies via [`empty_unmounted_dir_is_removable`], refuses to
+/// follow symlinks, and never descends into an active mount point. The walk
+/// is bounded by `MAX_MOUNT_ROOT_PLAN_DEPTH` and
+/// `MAX_MOUNT_ROOT_PLAN_ENTRIES` so a pathological tree cannot make a
+/// diagnostic hang.
+///
+/// Deterministically sorted, deepest path first, matching the order
+/// `clean_mount_root` removes in.
+pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
+    const MAX_MOUNT_ROOT_PLAN_DEPTH: usize = 6;
+    const MAX_MOUNT_ROOT_PLAN_ENTRIES: usize = 4096;
+
+    if !config.mount_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    ensure_no_symlink_components(&config.mount_root)?;
+    let mounted_paths = mounted_paths_under(&config.mount_root)?;
+    let mut stale = Vec::new();
+    let mut inspected = 0usize;
+    let mut queue = vec![(config.mount_root.clone(), 0usize)];
+    while let Some((directory, depth)) = queue.pop() {
+        if depth >= MAX_MOUNT_ROOT_PLAN_DEPTH || inspected >= MAX_MOUNT_ROOT_PLAN_ENTRIES {
+            continue;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(ArchiveFsError::io(directory.clone(), source)),
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            inspected += 1;
+            if inspected > MAX_MOUNT_ROOT_PLAN_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Never follow a symlink and never enter an active mount.
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || mounted_paths.contains(&path)
+            {
+                continue;
+            }
+            if empty_unmounted_dir_is_removable(&path, &mounted_paths)?.is_some() {
+                stale.push(path);
+            } else {
+                queue.push((path, depth + 1));
+            }
+        }
+    }
+    stale.sort_by(|left, right| right.cmp(left));
+    stale.dedup();
+    Ok(stale)
+}
+
+fn remove_empty_unmounted_dir(path: &Path, mounted_paths: &HashSet<PathBuf>) -> Result<bool> {
+    let Some(metadata) = empty_unmounted_dir_is_removable(path, mounted_paths)? else {
+        return Ok(false);
+    };
     let revalidated = fs::symlink_metadata(path)
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     if revalidated.file_type().is_symlink()
@@ -6634,6 +6876,16 @@ fn mount_path_from_mountinfo_line(line: &[u8]) -> Option<PathBuf> {
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|field| !field.is_empty())
         .nth(4)?;
+    mountinfo_path_from_bytes(&unescape_mountinfo_path(field))
+}
+
+/// Decodes one `/proc/self/mountinfo` path field, applying the same octal
+/// unescaping the mount code itself uses.
+///
+/// Exposed to `crate::diagnostics` so the read-only mount-state check cannot
+/// drift from how mounts are actually matched - see
+/// `diagnostics::environment::parse_mount_table`.
+pub(crate) fn mountinfo_path_for_diagnostics(field: &[u8]) -> Option<PathBuf> {
     mountinfo_path_from_bytes(&unescape_mountinfo_path(field))
 }
 
@@ -6867,7 +7119,27 @@ mod tests {
         let discovery = ArchiveScanner::new(&config)
             .scan_archives_with_summary()
             .unwrap();
-        assert_eq!(discovery.archives.len(), 14);
+        // 13, not 14: `specific.GEN` sits at the source root, where no folder
+        // says Mega Drive, and its contents carry no cartridge header. Before
+        // this milestone a bare `.gen` was accepted on its extension alone,
+        // which is what labelled ScummVM `RESOURCE.GEN` resource files as Mega
+        // Drive ROMs. `specific.sMd` is still accepted, because `.smd` really
+        // is Mega Drive specific and needs no corroboration.
+        assert_eq!(discovery.archives.len(), 13);
+        assert!(
+            !discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("specific.GEN")),
+            "an uncorroborated `.gen` must not be taken for a Mega Drive ROM"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("specific.sMd")),
+            "`.smd` is Mega Drive specific and must still be recognised"
+        );
         assert!(discovery.archives.iter().all(|archive| {
             archive.kind == ArchiveKind::MegaDriveRom
                 && archive.identity.platform.as_deref() == Some("MegaDrive")
@@ -6875,7 +7147,10 @@ mod tests {
         assert!(!discovery.archives.iter().any(|archive| {
             archive.path.ends_with("README.md") || archive.path.ends_with("notes.md")
         }));
-        assert_eq!(discovery.skipped_ambiguous_platform, 2);
+        // 3: the two `.md` markdown files, plus the uncorroborated `.GEN`.
+        // All three are shared extensions whose platform could not be
+        // established, which is different from an unsupported extension.
+        assert_eq!(discovery.skipped_ambiguous_platform, 3);
         assert_eq!(discovery.skipped_unsupported_extension, 0);
         let mount_error = validate_archive_for_mount(&discovery.archives[0]).unwrap_err();
         assert!(mount_error.to_string().contains("not archive mount inputs"));
@@ -6897,6 +7172,86 @@ mod tests {
             "an exact platform alias may itself be the configured source root"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_rvz_iso_and_zip_are_discovered_without_wrappers() {
+        let root = test_root("direct-game-images").join("gcn");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ZooCube (USA).rvz"), b"rvz fixture").unwrap();
+        fs::write(root.join("Disc.iso"), vec![0_u8; 64]).unwrap();
+        fs::write(root.join("Animal Crossing (USA).zip"), b"zip fixture").unwrap();
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+        };
+
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+        assert_eq!(discovery.archives.len(), 3);
+        assert_eq!(
+            discovery
+                .archives
+                .iter()
+                .filter(|archive| archive.kind == ArchiveKind::DirectGameImage)
+                .count(),
+            2
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| { archive.identity.platform.as_deref() == Some("GameCube") })
+        );
+        assert!(discovery.archives.iter().any(|archive| {
+            archive.path.ends_with("ZooCube (USA).rvz")
+                && archive.identity.platform_provenance == Some(PlatformProvenance::FolderAlias)
+        }));
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn dated_region_collection_root_normalizes_to_gamecube() {
+        let root = test_root("dated-gamecube-alias")
+            .join("Nintendo - GameCube (2018-08-25 20-44-48) (America)");
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("ZooCube (USA).rvz");
+        fs::write(&image, b"rvz fixture").unwrap();
+        let detection = detect_platform_with_details(&image, &root).unwrap();
+        assert_eq!(detection.platform, "GameCube");
+        assert_eq!(detection.provenance, PlatformProvenance::FolderAlias);
+        for alias in [
+            "Nintendo_GameCube 2018-08-25",
+            "NINTENDO - GAMECUBE (Europe)",
+            "g.c.n",
+        ] {
+            let alias_root = root.parent().unwrap().join(alias);
+            let candidate = alias_root.join("game.rvz");
+            assert_eq!(
+                detect_platform_with_details(&candidate, &alias_root).map(|value| value.platform),
+                Some("GameCube".to_string())
+            );
+        }
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn direct_iso_header_identity_beats_gamecube_folder_alias() {
+        let root = test_root("direct-header-precedence").join("gcn");
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("disc.iso");
+        let mut bytes = vec![0_u8; 64];
+        bytes[0x18..0x1c].copy_from_slice(&[0x5d, 0x1c, 0x9e, 0xa3]);
+        fs::write(&image, bytes).unwrap();
+        let archive = Archive::from_path_in_root(&image, &root).unwrap();
+        assert_eq!(archive.identity.platform.as_deref(), Some("Wii"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::HeaderIdentity)
+        );
+        let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[cfg(unix)]
@@ -6940,7 +7295,16 @@ mod tests {
         assert_eq!(archive_kind("game.zip"), Some(ArchiveKind::Zip));
         assert_eq!(archive_kind("game.7Z"), Some(ArchiveKind::SevenZip));
         assert_eq!(archive_kind("game.RAR"), Some(ArchiveKind::Rar));
-        assert_eq!(archive_kind("game.iso"), None);
+        for image in [
+            "game.iso",
+            "game.GCM",
+            "game.gcz",
+            "game.RVZ",
+            "game.wbfs",
+            "game.CISO",
+        ] {
+            assert_eq!(archive_kind(image), Some(ArchiveKind::DirectGameImage));
+        }
         assert_eq!(archive_kind("game.zip.tmp"), None);
     }
 
@@ -8330,6 +8694,64 @@ mod tests {
     }
 
     #[test]
+    fn retained_mount_failures_are_historical_not_current_errors() {
+        let path = PathBuf::from("/roms/old/Game.zip");
+        let issue = classify_archive_health(&ArchiveHealthInput {
+            mount_state: None,
+            archive_health: Some(ArchiveHealth::Corrupt),
+            last_seen_at: Some("2025-01-01T00:00:00Z"),
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+
+        assert_eq!(issue.category, HealthCategory::HistoricalMountFailure);
+        assert!(issue.reason.contains("not a current failure"));
+        assert_eq!(issue.recovery_action, None);
+    }
+
+    #[test]
+    fn loose_content_that_bypasses_mounting_is_not_a_terminal_failure() {
+        for path in [
+            "/roms/genesis/Wrong Filename [XXXXXX].md",
+            "/roms/scummvm/laurabow2/RESOURCE.GEN",
+        ] {
+            let path = PathBuf::from(path);
+            let issue = classify_archive_health(&ArchiveHealthInput {
+                mount_state: Some(MountState::NotMountable),
+                archive_health: Some(ArchiveHealth::Unsupported),
+                ..healthy_health_input(&path)
+            })
+            .unwrap();
+            assert_eq!(issue.category, HealthCategory::MountNotRequired);
+            assert!(
+                issue
+                    .reason
+                    .contains("does not use the archive mount workflow")
+            );
+            assert_eq!(issue.recovery_action, None);
+        }
+    }
+
+    #[test]
+    fn failure_without_current_or_historical_evidence_stays_uncertain() {
+        let path = PathBuf::from("/roms/unknown/Game.zip");
+        let issue = classify_archive_health(&ArchiveHealthInput {
+            mount_state: None,
+            archive_health: Some(ArchiveHealth::Failed),
+            last_seen_at: None,
+            ..healthy_health_input(&path)
+        })
+        .unwrap();
+
+        assert_eq!(
+            issue.category,
+            HealthCategory::MountFailureEvidenceInsufficient
+        );
+        assert!(!issue.retryable);
+        assert_eq!(issue.recovery_action, None);
+    }
+
+    #[test]
     fn missing_and_cached_only_states_remain_distinct() {
         let path = PathBuf::from("/roms/a/Game.zip");
         let missing = classify_archive_health(&ArchiveHealthInput {
@@ -8458,6 +8880,9 @@ mod tests {
             HealthCategory::CachedOnly,
             HealthCategory::AwaitingValidation,
             HealthCategory::Missing,
+            HealthCategory::MountNotRequired,
+            HealthCategory::MountFailureEvidenceInsufficient,
+            HealthCategory::HistoricalMountFailure,
             HealthCategory::RecoveryAvailable,
             HealthCategory::RetryableFailure,
             HealthCategory::TerminalFailure,
@@ -8469,6 +8894,9 @@ mod tests {
                 HealthCategory::TerminalFailure,
                 HealthCategory::RetryableFailure,
                 HealthCategory::RecoveryAvailable,
+                HealthCategory::HistoricalMountFailure,
+                HealthCategory::MountFailureEvidenceInsufficient,
+                HealthCategory::MountNotRequired,
                 HealthCategory::Missing,
                 HealthCategory::AwaitingValidation,
                 HealthCategory::CachedOnly,
@@ -9271,7 +9699,7 @@ mod tests {
         assert_eq!(archive.identity.platform, Some("Xbox360".to_string()));
         assert_eq!(
             archive.identity.platform_provenance,
-            Some(PlatformProvenance::Heuristic)
+            Some(PlatformProvenance::FolderAlias)
         );
     }
 
@@ -9417,32 +9845,27 @@ mod tests {
             Some("MSX2".to_string())
         );
 
-        // A source root that is not itself under any alias-looking
-        // ancestor must not spuriously detect one either - sanity check
-        // that stripping the root is doing real work, not accidentally
-        // matching on the full absolute path.
+        // The configured source root itself is valid evidence.
         assert_eq!(
             detect_platform("/home/davedap/msx2/game.zip", "/home/davedap/msx2"),
-            None,
-            "the source root's own name must never itself count as a folder hint"
+            Some("MSX2".to_string())
+        );
+        // Alias-looking ancestors outside that root remain excluded.
+        assert_eq!(
+            detect_platform("/home/msx2/collection/game.zip", "/home/msx2/collection"),
+            None
         );
     }
 
     #[test]
-    fn filename_detection_remains_stronger_than_the_folder_fallback() {
-        // "/incoming/Fable (USA, Europe).7z" is inside an "incoming"
-        // folder with no platform hint, but the existing title heuristic
-        // still (correctly) detects Xbox - the folder fallback must never
-        // run at all when the heuristic already found something,
-        // regardless of what the folder path would have suggested.
+    fn exact_folder_alias_remains_stronger_than_filename_similarity() {
         assert_eq!(
             detect_platform(
                 "/home/davedap/Archives/psp/007 Legends.zip",
                 "/home/davedap/Archives"
             ),
-            Some("Xbox360".to_string()),
-            "the known-title heuristic for \"007 Legends\" must win over the \
-             \"psp\" folder alias"
+            Some("PSP".to_string()),
+            "an exact folder alias must outrank weaker title similarity"
         );
     }
 
@@ -9484,8 +9907,8 @@ mod tests {
     }
 
     #[test]
-    fn provenance_is_folder_alias_for_the_fallback_and_heuristic_for_the_existing_path() {
-        let heuristic = detect_platform_with_provenance("/roms/xbox360/Halo.zip", "/roms")
+    fn provenance_distinguishes_folder_alias_from_filename_heuristic() {
+        let heuristic = detect_platform_with_provenance("/roms/incoming/007 Legends.zip", "/roms")
             .expect("known heuristic should detect Xbox360");
         assert_eq!(heuristic.provenance, PlatformProvenance::Heuristic);
         assert_eq!(
@@ -9736,6 +10159,95 @@ mod tests {
     }
 
     #[test]
+    fn platform_recovery_expansion_aliases_detect_their_canonical_platform() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/virtualboy/Game.zip"), root),
+            Some("Virtual Boy".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Virtual Boy/Game.zip"), root),
+            Some("Virtual Boy".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/sharp-x68000/Sharp X68000/Game.zip"), root),
+            Some("Sharp X68000".to_string()),
+            "the nearer, more specific folder component must win"
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Sharp X68000/Game.zip"), root),
+            Some("Sharp X68000".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/pc-8801/NEC PC-8801/Game.zip"), root),
+            Some("NEC PC-8801".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801/Game.zip"), root),
+            Some("NEC PC-8801".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/zxs/Game.zip"), root),
+            Some("ZX Spectrum".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Sinclair ZX Spectrum/Game.zip"), root),
+            Some("ZX Spectrum".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Acorn Archimedes/Game.zip"), root),
+            Some("Acorn Archimedes".to_string())
+        );
+    }
+
+    #[test]
+    fn arcade_core_folder_names_classify_as_arcade_with_preferred_emulator_evidence() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/fbneo/Game.zip"), root),
+            Some("Arcade".to_string())
+        );
+        assert_eq!(
+            platform_preferred_emulator_for_alias("fbneo"),
+            Some("FBNeo")
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/mame/Game.zip"), root),
+            Some("Arcade".to_string())
+        );
+        assert_eq!(platform_preferred_emulator_for_alias("mame"), Some("MAME"));
+        // Arcade itself (no specific emulator implied by the folder name)
+        // has no preferred-emulator evidence, which is not an error.
+        assert_eq!(platform_preferred_emulator_for_alias("arcade"), None);
+    }
+
+    #[test]
+    fn xbox_folder_never_becomes_xbox_360() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/xbox/Game.iso"), root),
+            Some("Xbox".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Xbox 360/Game.iso"), root),
+            Some("Xbox360".to_string())
+        );
+    }
+
+    #[test]
+    fn game_boy_folder_never_becomes_game_boy_advance() {
+        let root = "/home/davedap/Archives";
+        assert_eq!(
+            detect_platform(format!("{root}/Game Boy/Game.gb"), root),
+            Some("Game Boy".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Game Boy Advance/Game.gba"), root),
+            Some("Game Boy Advance".to_string())
+        );
+    }
+
+    #[test]
     fn external_platform_hint_uses_the_shared_folder_alias_table() {
         assert_eq!(
             canonical_platform_for_alias("Atari - 2600"),
@@ -9746,11 +10258,24 @@ mod tests {
 
     #[test]
     fn conflicting_normalized_platform_aliases_are_rejected_as_ambiguous() {
-        let aliases = &[("atari2600", "Atari2600"), ("atari2600", "Atari5200")];
+        // The registry now owns this guarantee: `platform_for_alias` refuses to
+        // pick a winner when one normalized alias is claimed by more than one
+        // platform, and `no_alias_is_claimed_by_two_platforms` keeps the real
+        // table free of that case. Both halves are asserted here.
         assert_eq!(
-            canonical_platform_for_alias_in("Atari - 2600", aliases),
-            None
+            platform::platform_for_alias("Atari - 2600").map(|entry| entry.id),
+            Some("Atari2600"),
+            "an unambiguous alias still resolves"
         );
+        let mut seen = std::collections::BTreeMap::new();
+        for entry in platform::PLATFORMS {
+            for alias in entry.folder_aliases {
+                assert!(
+                    seen.insert(*alias, entry.id).is_none(),
+                    "alias `{alias}` is claimed twice, which would make lookup ambiguous"
+                );
+            }
+        }
     }
 
     #[test]
@@ -9860,15 +10385,14 @@ mod tests {
             detect_platform(format!("{root}/DS/Game.zip"), root),
             Some("Nintendo DS".to_string())
         );
-        // "Nintendo 3DS" must never collide with the new bare "ds"/"nds"
-        // aliases - `normalize_path_segment` keeps the "3", so
-        // "Nintendo 3DS" normalizes to "nintendo3ds", never "ds"/"nds"/
-        // "nintendods". Nintendo3DS itself is not a folder alias at all
-        // (only reachable via the existing filename/title heuristic), so
-        // this must stay Unknown from folder detection alone.
+        // "Nintendo 3DS" must never collide with the "ds"/"nds" aliases -
+        // `normalize_path_segment` keeps the "3", so "Nintendo 3DS"
+        // normalizes to "nintendo3ds", never "ds"/"nds"/"nintendods". It is
+        // now its own first-class folder alias (platform recovery
+        // expansion), distinct from Nintendo DS.
         assert_eq!(
             detect_platform(format!("{root}/Nintendo 3DS/Game.zip"), root),
-            None,
+            Some("Nintendo 3DS".to_string()),
             "\"Nintendo 3DS\" must not become Nintendo DS"
         );
         assert_eq!(
@@ -11312,6 +11836,8 @@ mod tests {
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: Some(archive_count),
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }
     }
 
@@ -11373,6 +11899,8 @@ mod tests {
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: None,
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }];
 
         assert_eq!(
@@ -11551,6 +12079,7 @@ mod tests {
             |_| Err(io::Error::from(io::ErrorKind::NotFound)),
             |_| PathInspection::Missing,
             |_| false,
+            true,
         );
         assert!(missing.config_missing);
 
@@ -11559,6 +12088,7 @@ mod tests {
             |_| Err(io::Error::from(io::ErrorKind::NotFound)),
             |_| PathInspection::PermissionDenied("permission denied".to_string()),
             |_| false,
+            true,
         );
         assert!(!ambiguous.config_missing);
         assert!(ambiguous.checks.iter().any(|check| {
@@ -11673,6 +12203,7 @@ mod tests {
                 }
             },
             |_| true,
+            true,
         );
         assert!(missing_mount.can_create_mount_root);
 
@@ -11687,6 +12218,7 @@ mod tests {
                 }
             },
             |_| true,
+            true,
         );
         assert!(!ambiguous_mount.can_create_mount_root);
         assert!(ambiguous_mount.checks.iter().any(|check| {
@@ -11720,6 +12252,7 @@ mod tests {
             },
             |_| PathInspection::Directory,
             |_| true,
+            true,
         );
 
         assert_eq!(reads.get(), 1);
@@ -12384,6 +12917,7 @@ mod tests {
             last_known_health: "Pending".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: (!present).then(|| "2026-01-02T00:00:00Z".to_string()),
+            identity_report: None,
         }
     }
 

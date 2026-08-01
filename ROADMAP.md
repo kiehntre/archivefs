@@ -186,16 +186,11 @@ These are implemented, tested, and in current use today:
 
 ## Current development
 
-No `v0.6.0-alpha` work is currently in progress on `main` beyond release
-preparation itself. The sole remaining item before a `v0.6.0-alpha` tag is
-a real manual QA pass on Nobara against
-[`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) - see
-[`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) for the current
-go/no-go checklist. Substantial additional adapter/platform work (Dolphin
-upstream cheat catalogue, Xenia Canary provider, GameCube direct-image
-identity, a full canonical platform registry) exists on unmerged
-development branches and is explicitly out of scope for `v0.6.0-alpha`;
-it is targeted at a later release.
+The current workspace is the untagged `v0.7.0-alpha` integration candidate.
+Direct-image discovery, canonical platform aliases, source platform assignment,
+platform-first navigation, Dolphin installation, and Xenia Canary patch support
+are integrated. The remaining release work is validation and manual QA; this
+roadmap does not imply that a tag or published artifact already exists.
 
 The shared `patch_manager` orchestration layer (platform filtering,
 ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
@@ -218,61 +213,30 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **`v0.6.0-alpha` manual QA and tag** - run a real manual QA pass on
-   Nobara against `docs/MANUAL_QA_v0.6.0-alpha.md`, including a
-   live-fetched RetroArch catalogue rather than synthetic fixtures alone,
-   then tag the release once it passes.
-2. **PCSX2 official `pcsx2_patches` provider** - a reviewed provider
-   integration against the real upstream
-   [`PCSX2/pcsx2_patches`](https://github.com/PCSX2/pcsx2_patches)
-   repository, whose `patches/` directory currently holds several thousand
-   `.pnach` files named `<serial>_<CRC>.pnach` or bare `<CRC>.pnach`.
-3. **PCSX2 section selection and safe PNACH merge** - a single `.pnach`
-   file can contain multiple independently named sections (for example a
-   widescreen hack alongside unrelated cheat codes); safe apply needs
-   per-section selection and a conservative merge strategy, not
-   whole-file replacement.
-4. **Dolphin official `GameSettings` provider** - a reviewed provider
-   integration against the real upstream
-   [`dolphin-emu/dolphin` `Data/Sys/GameSettings`](https://github.com/dolphin-emu/dolphin/tree/master/Data/Sys/GameSettings)
-   tree, whose filenames vary between a base 3-character Game ID, a full
-   6-character Game ID plus region, and occasional non-standard
-   identifiers for special-case titles.
-5. **Dolphin Action Replay/Gecko/OnFrame section selection and safe INI
-   merge** - individual cheats inside a Dolphin `GameSettings/*.ini` file
-   are delimited by `$Name` entries within an `[ActionReplay]`/`[Gecko]`
-   section, a finer selection unit than the file or even the bracketed
-   section itself; safe apply needs to select and merge at that level.
-6. **Real Nobara/Saltbox QA** - a genuine manual pass on the actual target
-   hardware/distribution combination, not a substitute Linux environment.
-7. **`v0.6.0-alpha` release** - once the above are complete and the
-   go/no-go checklist in
-   [`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) is clear.
-8. **Mods work** - after v0.6.0-alpha, not before; no mod adapter or
-   installation path exists yet in any form.
-9. **Further adapters** - PPSSPP, RPCS3, Xenia, Switch, MAME, and
-   Amiga/WHDLoad remain research-only candidates, explicitly not
-   scheduled and not implemented in any form; see "Medium-term plans"
-   below for the standing pause on adapter expansion.
+1. **`v0.7.0-alpha` manual QA and release gate** - validate real source
+   discovery, source assignment, platform navigation, Dolphin, Xenia, and the
+   extracted release artifact before creating any tag.
+2. **PCSX2 provider and safe PNACH merge** - remain read-only until
+   per-section selection and conservative merging are designed and reviewed.
+3. **Performance profiling beyond smoke scale** - investigate larger
+   catalogues only if measured traces identify a concrete bottleneck.
+4. **Mods work** - no general mod installation path exists yet.
+5. **Further adapters** - PPSSPP, RPCS3, Switch, MAME, and Amiga/WHDLoad
+   remain research-only candidates and are not scheduled.
 
 Release process discipline (a documented, repeatable release checklist
 tied to the pinned toolchain) already exists at
-[`docs/release-checklist.md`](docs/release-checklist.md) and applies to
-step 7 above unchanged.
+[`docs/release-checklist.md`](docs/release-checklist.md).
 
 ## Medium-term plans
 
 Directions consistent with the architecture already in place, not yet
 scheduled:
 
-- **Emulator adapter expansion pauses after Dolphin.** With RetroArch,
-  PCSX2, and Dolphin, Cheats & Mods reaches its intended three-adapter
-  shape for now, and the immediate priority is deepening those three
-  (official providers, section-selection, real QA - see "Next milestones"
-  above) and Mods, not adding a fourth emulator. Further read-only
-  emulator adapters - PPSSPP, RPCS3, Xenia, Switch, MAME, and
-  Amiga/WHDLoad, in roughly that priority order - are not scheduled and
-  should not be implied as forthcoming; none is implemented in any form.
+- **Emulator adapter expansion pauses after Xenia.** The immediate priority
+  is hardening the existing RetroArch, PCSX2, Dolphin, and Xenia workflows,
+  not adding another emulator. Further adapters - PPSSPP, RPCS3, Switch,
+  MAME, and Amiga/WHDLoad - are not scheduled.
   Switch is additionally sensitive (keys, firmware) and would need its own
   separate policy decision before any design work, not just an
   architecture review. Each would still follow the same

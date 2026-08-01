@@ -1,7 +1,8 @@
 //! Bounded shared apply, journal, history, and rollback pipeline.
 //!
 //! Writes are available only for an explicitly confirmed, exact plan produced
-//! from the shared preview. PCSX2 and Dolphin intentionally remain preview-only
+//! from the shared preview. PCSX2, Dolphin, and Xenia use their verified
+//! transaction paths
 //! until they expose an independent, adapter-approved materialized source.
 
 use std::collections::BTreeSet;
@@ -70,6 +71,7 @@ enum FaultPoint {
     ParentCreationRace,
     SourceMutation,
     DestinationMutation,
+    RollbackRemovalVerification,
     RollbackRestore,
 }
 
@@ -102,10 +104,10 @@ pub enum SharedAdapterWriteSupport {
 
 pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSupport {
     match adapter {
-        PreviewAdapter::RetroArch => SharedAdapterWriteSupport::ApplyAndRollback,
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin => {
-            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized
-        }
+        PreviewAdapter::RetroArch
+        | PreviewAdapter::Pcsx2
+        | PreviewAdapter::Dolphin
+        | PreviewAdapter::Xenia => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -240,6 +242,18 @@ pub struct SharedPlanEntry {
     pub proposed_action: PreviewProposedAction,
     pub backup_required: bool,
     pub parent_creation_approved: bool,
+    #[serde(default)]
+    pub content_verification: Option<SharedContentVerification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedContentVerification {
+    DolphinManagedGameHacking {
+        expected_managed_names: Vec<String>,
+        require_managed_section: bool,
+        require_code_section: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +313,13 @@ pub enum SharedApplyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedApplyEntry {
     pub plan_entry: SharedPlanEntry,
+    /// Explicit filesystem facts observed under the destination lock before
+    /// apply. These are not inferred from byte length: an existing empty file
+    /// is still an existing file and must be restored, not removed.
+    #[serde(default)]
+    pub destination_existed_before_apply: Option<bool>,
+    #[serde(default)]
+    pub destination_parent_existed_before_apply: Option<bool>,
     pub observed_source_digest: Option<String>,
     pub observed_destination_digest: Option<String>,
     pub backup_path: Option<SharedTransactionPath>,
@@ -532,6 +553,7 @@ pub fn build_shared_transaction_plan(
             parent_creation_approved: entry.warnings.iter().any(|warning| {
                 warning.kind == super::shared_preview::PreviewWarningKind::DestinationParentsMissing
             }),
+            content_verification: None,
         });
     }
     if entries.is_empty() {
@@ -563,6 +585,33 @@ pub fn build_shared_transaction_plan(
     };
     plan.plan_id = plan_digest(&plan)?;
     Ok(plan)
+}
+
+/// Adds GameCube GameHacking's semantic post-write contract to an already
+/// built shared plan and re-seals its digest. The generated source remains
+/// staging; verification always reads the exact live destination.
+pub fn require_dolphin_managed_gamehacking_verification(
+    plan: &mut SharedTransactionPlan,
+    expected_managed_names: Vec<String>,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::Dolphin || plan.entries.is_empty() {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "Dolphin managed-INI verification requires a Dolphin transaction",
+        ));
+    }
+    let require_sections = !expected_managed_names.is_empty();
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::DolphinManagedGameHacking {
+            expected_managed_names: expected_managed_names.clone(),
+            require_managed_section: require_sections,
+            require_code_section: require_sections,
+        });
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
 }
 
 pub fn execute_shared_apply(
@@ -707,6 +756,13 @@ pub fn execute_shared_apply(
     }
     drop(lock);
     journal.status = derive_status(&journal.entries, effective_dry_run);
+    log::info!(
+        "shared apply {}: {:?}, {} entr(y/ies), {} byte(s) written",
+        journal.operation_id,
+        journal.status,
+        journal.entries.len(),
+        written,
+    );
     if effective_dry_run {
         return SharedApplyResult {
             journal,
@@ -715,12 +771,25 @@ pub fn execute_shared_apply(
         };
     }
     match write_journal_once(&journal, &options.history_root) {
-        Ok(path) => SharedApplyResult {
-            journal,
-            journal_path: Some(path),
-            journal_failure: None,
-        },
+        Ok(path) => {
+            log::info!(
+                "shared apply {}: journal written to {}",
+                journal.operation_id,
+                path.display(),
+            );
+            SharedApplyResult {
+                journal,
+                journal_path: Some(path),
+                journal_failure: None,
+            }
+        }
         Err(error) => {
+            log::warn!(
+                "shared apply {}: journal write failed: {:?} ({})",
+                journal.operation_id,
+                error.kind,
+                error.detail,
+            );
             let any_write = journal.entries.iter().any(|entry| {
                 matches!(
                     entry.outcome,
@@ -763,6 +832,8 @@ fn apply_one(
 ) -> SharedApplyEntry {
     let mut result = SharedApplyEntry {
         plan_entry: plan.clone(),
+        destination_existed_before_apply: None,
+        destination_parent_existed_before_apply: None,
         observed_source_digest: None,
         observed_destination_digest: None,
         backup_path: None,
@@ -870,6 +941,7 @@ fn apply_one(
         }
     };
     let destination = assessment.proposed_destination.path().to_path_buf();
+    let parent = destination.parent().unwrap_or(destination_root);
     let current = if assessment.destination_state == DestinationState::RegularFile {
         match stable_hash(&destination, SHARED_MAX_SOURCE_BYTES) {
             Ok(value) => Some(value),
@@ -886,6 +958,8 @@ fn apply_one(
     } else {
         None
     };
+    result.destination_existed_before_apply = Some(current.is_some());
+    result.destination_parent_existed_before_apply = Some(parent.exists());
     result.observed_destination_digest = current.as_ref().map(|value| value.digest.clone());
     if should_inject(FaultPoint::DestinationMutation) {
         return fail_result(
@@ -916,6 +990,15 @@ fn apply_one(
         );
     }
     if plan.proposed_action == PreviewProposedAction::Skip {
+        if let Err(detail) = verify_entry_content(plan, &destination) {
+            return fail_result(
+                result,
+                SharedApplyOutcome::VerificationFailed,
+                SharedApplyFailureKind::VerificationFailed,
+                Some(&destination),
+                &detail,
+            );
+        }
         result.outcome = SharedApplyOutcome::AlreadyInstalled;
         result.final_destination_digest = Some(source_hash.digest);
         result.verification_succeeded = true;
@@ -935,9 +1018,16 @@ fn apply_one(
         result.outcome = SharedApplyOutcome::DryRun;
         return result;
     }
-    let parent = destination.parent().unwrap_or(destination_root);
     if !parent.exists() {
-        if !plan.parent_creation_approved || plan.adapter != PreviewAdapter::RetroArch {
+        if !plan.parent_creation_approved
+            || !matches!(
+                plan.adapter,
+                PreviewAdapter::RetroArch
+                    | PreviewAdapter::Pcsx2
+                    | PreviewAdapter::Dolphin
+                    | PreviewAdapter::Xenia
+            )
+        {
             return fail_result(
                 result,
                 SharedApplyOutcome::WriteFailed,
@@ -1005,15 +1095,35 @@ fn apply_one(
     ) {
         Ok(temp) => {
             result.temporary_path = Some(SharedTransactionPath::from_path(&temp));
-            result.final_destination_digest = Some(source_hash.digest);
-            result.verification_succeeded = true;
-            result.outcome = if plan.proposed_action == PreviewProposedAction::Install {
-                SharedApplyOutcome::InstalledNew
-            } else {
-                SharedApplyOutcome::ReplacedExisting
-            };
-            result.stages.push(SharedTransactionStage::Success);
-            *written += source_hash.bytes;
+            match verify_entry_content(plan, &destination) {
+                Ok(()) => {
+                    result.final_destination_digest = Some(source_hash.digest);
+                    result.verification_succeeded = true;
+                    result.outcome = if plan.proposed_action == PreviewProposedAction::Install {
+                        SharedApplyOutcome::InstalledNew
+                    } else {
+                        SharedApplyOutcome::ReplacedExisting
+                    };
+                    result.stages.push(SharedTransactionStage::Success);
+                    *written += source_hash.bytes;
+                }
+                Err(detail) => {
+                    let restore = restore_after_failed_verification(plan, &result, &destination);
+                    let detail = match restore {
+                        Ok(()) => format!("{detail}; previous live file state restored"),
+                        Err(kind) => format!(
+                            "{detail}; restoring the previous live file state failed: {kind:?}"
+                        ),
+                    };
+                    result = fail_result(
+                        result,
+                        SharedApplyOutcome::VerificationFailed,
+                        SharedApplyFailureKind::VerificationFailed,
+                        Some(&destination),
+                        &detail,
+                    );
+                }
+            }
         }
         Err((kind, temp)) => {
             result.temporary_path = temp.as_deref().map(SharedTransactionPath::from_path);
@@ -1031,6 +1141,83 @@ fn apply_one(
         }
     }
     result
+}
+
+fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<(), String> {
+    let Some(contract) = &plan.content_verification else {
+        return Ok(());
+    };
+    let bytes = read_bounded(destination, SHARED_MAX_SOURCE_BYTES)
+        .map_err(|kind| format!("live target could not be re-read: {kind:?}"))?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| "live target is not valid UTF-8".to_string())?;
+    match contract {
+        SharedContentVerification::DolphinManagedGameHacking {
+            expected_managed_names,
+            require_managed_section,
+            require_code_section,
+        } => {
+            let document = super::gecko_document::parse_dolphin_ini(text);
+            let section_names = document.section_names();
+            let has_managed = section_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("ArchiveFS_Managed_GameHacking"));
+            if *require_managed_section && !has_managed {
+                return Err("live target is missing [ArchiveFS_Managed_GameHacking]".to_string());
+            }
+            let has_code_section = section_names.iter().any(|name| {
+                name.eq_ignore_ascii_case("ActionReplay") || name.eq_ignore_ascii_case("Gecko")
+            });
+            if *require_code_section && !has_code_section {
+                return Err("live target has neither [ActionReplay] nor [Gecko]".to_string());
+            }
+            let managed: BTreeSet<String> = document
+                .named_section_lines("ArchiveFS_Managed_GameHacking")
+                .into_iter()
+                .filter_map(|line| line.trim().strip_prefix('$').map(str::to_string))
+                .collect();
+            for expected in expected_managed_names {
+                if !managed.contains(expected) {
+                    return Err(format!(
+                        "live target managed section is missing '${expected}'"
+                    ));
+                }
+                let defined = document
+                    .action_replay_codes
+                    .iter()
+                    .chain(document.gecko_codes.iter())
+                    .any(|code| code.name == *expected);
+                if !defined {
+                    return Err(format!(
+                        "live target has no ActionReplay/Gecko definition for '${expected}'"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn restore_after_failed_verification(
+    plan: &SharedPlanEntry,
+    result: &SharedApplyEntry,
+    destination: &Path,
+) -> Result<(), SharedApplyFailureKind> {
+    if plan.proposed_action == PreviewProposedAction::Install {
+        return remove_and_verify_new_destination(destination);
+    }
+    let backup = result
+        .backup_path
+        .as_ref()
+        .ok_or(SharedApplyFailureKind::BackupMissing)?
+        .to_path_buf()?;
+    let digest = result
+        .backup_digest
+        .as_deref()
+        .ok_or(SharedApplyFailureKind::BackupChanged)?;
+    atomic_write(&backup, destination, digest, false)
+        .map(|_| ())
+        .map_err(|(kind, _)| kind)
 }
 
 pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport {
@@ -1207,15 +1394,28 @@ pub fn execute_shared_rollback(
             rollback.outcome = SharedRollbackOutcome::Failed;
             continue;
         };
-        match install.outcome {
-            SharedApplyOutcome::InstalledNew => match fs::remove_file(&destination) {
-                Ok(()) => {
-                    rollback.outcome = SharedRollbackOutcome::RemovedInstalledFile;
-                    cleanup_created_directories(install, &root);
+        let existed_before = install.destination_existed_before_apply.unwrap_or(matches!(
+            install.outcome,
+            SharedApplyOutcome::ReplacedExisting
+        ));
+        match (install.outcome, existed_before) {
+            (SharedApplyOutcome::InstalledNew, false) => {
+                match remove_and_verify_new_destination(&destination) {
+                    Ok(()) => {
+                        rollback.outcome = SharedRollbackOutcome::RemovedInstalledFile;
+                        cleanup_created_directories(install, &root);
+                    }
+                    Err(kind) => {
+                        rollback.outcome = SharedRollbackOutcome::Failed;
+                        rollback.failure = Some(failure(
+                            kind,
+                            Some(&destination),
+                            "newly installed destination could not be removed and verified absent",
+                        ));
+                    }
                 }
-                Err(_) => rollback.outcome = SharedRollbackOutcome::Failed,
-            },
-            SharedApplyOutcome::ReplacedExisting => {
+            }
+            (SharedApplyOutcome::ReplacedExisting, true) => {
                 let Some(backup) = install.backup_path.as_ref() else {
                     rollback.outcome = SharedRollbackOutcome::Failed;
                     continue;
@@ -1231,8 +1431,23 @@ pub fn execute_shared_rollback(
                 }
                 match atomic_write(&backup, &destination, expected, false) {
                     Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
-                    Err(_) => rollback.outcome = SharedRollbackOutcome::Failed,
+                    Err((kind, _)) => {
+                        rollback.outcome = SharedRollbackOutcome::Failed;
+                        rollback.failure = Some(failure(
+                            kind,
+                            Some(&destination),
+                            "previous destination bytes could not be restored and verified",
+                        ));
+                    }
                 }
+            }
+            (SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting, _) => {
+                rollback.outcome = SharedRollbackOutcome::Failed;
+                rollback.failure = Some(failure(
+                    SharedApplyFailureKind::InvalidJournal,
+                    Some(&destination),
+                    "journal outcome contradicts explicit pre-apply destination existence",
+                ));
             }
             _ => rollback.outcome = SharedRollbackOutcome::NoChangeRequired,
         }
@@ -1579,6 +1794,20 @@ fn rollback_entry_preview(
         result.outcome = SharedRollbackOutcome::NoChangeRequired;
         return result;
     }
+    if entry
+        .destination_existed_before_apply
+        .is_some_and(|existed| {
+            existed != matches!(entry.outcome, SharedApplyOutcome::ReplacedExisting)
+        })
+    {
+        result.outcome = SharedRollbackOutcome::JournalMalformed;
+        result.failure = Some(failure(
+            SharedApplyFailureKind::InvalidJournal,
+            destination.as_deref().ok(),
+            "journal outcome contradicts explicit pre-apply destination existence",
+        ));
+        return result;
+    }
     let Ok(destination) = destination else {
         result.outcome = SharedRollbackOutcome::DestinationUnsafe;
         return result;
@@ -1629,7 +1858,27 @@ fn rollback_entry_preview(
     result
 }
 
+fn remove_and_verify_new_destination(destination: &Path) -> Result<(), SharedApplyFailureKind> {
+    reject_symlink_components(destination)?;
+    fs::remove_file(destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+    if should_inject(FaultPoint::RollbackRemovalVerification) {
+        fs::write(destination, b"").map_err(|_| SharedApplyFailureKind::VerificationFailed)?;
+    }
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = destination.parent() {
+                sync_directory(parent);
+            }
+            Ok(())
+        }
+        _ => Err(SharedApplyFailureKind::VerificationFailed),
+    }
+}
+
 fn cleanup_created_directories(entry: &SharedApplyEntry, root: &Path) {
+    if entry.destination_parent_existed_before_apply == Some(true) {
+        return;
+    }
     for encoded in entry.created_directories.iter().rev() {
         let Ok(path) = encoded.to_path_buf() else {
             continue;
@@ -1875,6 +2124,8 @@ fn failed_entry(
     fail_result(
         SharedApplyEntry {
             plan_entry: plan.clone(),
+            destination_existed_before_apply: None,
+            destination_parent_existed_before_apply: None,
             observed_source_digest: None,
             observed_destination_digest: None,
             backup_path: None,
@@ -2144,6 +2395,14 @@ mod tests {
         let destination = fixture.destination_root().join("Nintendo - NES/game.cht");
         assert_eq!(fs::read(&destination).unwrap(), b"new");
         assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert_eq!(
+            result.journal.entries[0].destination_existed_before_apply,
+            Some(false)
+        );
+        assert_eq!(
+            result.journal.entries[0].destination_parent_existed_before_apply,
+            Some(false)
+        );
         let journal_path = result.journal_path.unwrap();
         assert!(journal_path.exists());
         assert_eq!(
@@ -2188,6 +2447,57 @@ mod tests {
     }
 
     #[test]
+    fn rollback_reports_verification_failure_when_a_removed_new_file_reappears() {
+        let fixture = Fixture::new("rollback-remove-verification");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "remove-verification", false, true, false),
+        );
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::RollbackRemovalVerification));
+        let failed = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "remove-verification-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_eq!(failed.status, SharedApplyStatus::Failed);
+        assert_eq!(
+            failed.preview.entries[0].outcome,
+            SharedRollbackOutcome::Failed
+        );
+        assert_eq!(
+            failed.preview.entries[0]
+                .failure
+                .as_ref()
+                .map(|failure| failure.kind),
+            Some(SharedApplyFailureKind::VerificationFailed)
+        );
+        assert!(failed.journal_path.is_none());
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .is_file()
+        );
+    }
+
+    #[test]
     fn replacement_requires_permission_creates_verified_backup_and_restores_it() {
         let fixture = Fixture::new("replace");
         let report = preview(&fixture, b"new", Some(b"old"));
@@ -2210,6 +2520,8 @@ mod tests {
         );
         let entry = &result.journal.entries[0];
         assert_eq!(entry.outcome, SharedApplyOutcome::ReplacedExisting);
+        assert_eq!(entry.destination_existed_before_apply, Some(true));
+        assert_eq!(entry.destination_parent_existed_before_apply, Some(true));
         let backup = entry.backup_path.as_ref().unwrap().to_path_buf().unwrap();
         assert_eq!(fs::read(&backup).unwrap(), b"old");
         let journal = result.journal_path.unwrap();
@@ -2339,11 +2651,12 @@ mod tests {
     fn unsupported_adapters_duplicate_paths_limits_and_lock_contention_fail_closed() {
         assert_eq!(
             adapter_write_support(PreviewAdapter::Pcsx2),
-            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized
+            SharedAdapterWriteSupport::ApplyAndRollback
         );
         assert_eq!(
             adapter_write_support(PreviewAdapter::Dolphin),
-            SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized
+            SharedAdapterWriteSupport::ApplyAndRollback,
+            "Dolphin gained apply/rollback support in the GameCube/Gecko adapter milestone"
         );
         let fixture = Fixture::new("lock");
         fs::create_dir(fixture.destination_root()).unwrap();

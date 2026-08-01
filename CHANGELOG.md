@@ -11,11 +11,226 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.6.0-alpha (unreleased)
+## Unreleased
 
-Work merged since the `v0.5.0-alpha` tag, in preparation for release as
-`v0.6.0-alpha`. The workspace version in `Cargo.toml` has not been bumped and
-no tag has been created yet. See
+### Gamer View
+
+- Platform Artwork Pack v1 replaces temporary exact-platform abstract glyphs
+  with 17 original/generated PNG hardware illustrations embedded in the GUI
+  executable. Exact, case-insensitive aliases cover Acorn Archimedes, Amiga,
+  Dreamcast, Game Boy, GameCube, Mega Drive/Genesis, Nintendo 64, PlayStation
+  1/2/3, Saturn, SNES/Super Famicom, Switch, Wii, Wii U, Xbox, and Xbox 360.
+- Artwork resolution is now valid custom local PNG, exact bundled PNG,
+  category glyph, then Unknown. Custom safety limits and precedence are
+  unchanged; bundled images require neither network access nor installed
+  source-tree files and decoded textures are cached.
+- The one-row responsive platform shelf, filtering, selected/focus states,
+  labels, counts, tooltips, and narrow-window behavior remain unchanged.
+- Platform hardware illustrations are now prominent, and compact game rows
+  again show cached artwork: local per-game PNG, platform artwork, then
+  Unknown.
+- Increased hardware illustrations to 108 pixels in 142-pixel cards and game
+  thumbnails to 56 pixels in compact 64-pixel rows after manual readability
+  testing, without cropping or stretching transparent PNGs.
+
+### Cheats & Mods
+
+- GameHacking native PCSX2 section headers, authors, and multiline
+  descriptions are now retained, so selectable entries show their real cheat
+  names and notes instead of generic `Cheat N` placeholders.
+
+- Replaced the incomplete single-page GameHacking PS2 lookup with a resumable,
+  rate-limited local index catalogue covering every numbered public PS2 index
+  page. Runtime matching now prioritizes normalized serial/CRC/region evidence;
+  title-only and ambiguous results are shown for explicit confirmation before
+  one native PCSX2 export is requested. Downloaded index/catalogue data remains
+  private cache data and is not shipped or committed.
+
+- Added the general GameHacking.org provider core with PS2/PCSX2 as its first
+  adapter. It checks one selected local-library game at a time, fails closed on
+  serial/CRC/region conflicts, caches public pages and native PNACH exports,
+  preserves author/description/source provenance, and rate-limits bounded
+  fixed-origin HTTPS requests.
+- Selected GameHacking.org cheats can be previewed and installed under the
+  verified local PCSX2 CRC through ArchiveFS's existing confirmation, backup,
+  journal, and Undo transaction flow. No crawler, automatic fetch, PNACH
+  conversion, ROM modification, or user-file overwrite without confirmation
+  was added.
+- GameHacking HTML no longer requires strict UTF-8: declared HTTP charsets are
+  honoured and other pages use safe lossy decoding while original response
+  bytes remain unchanged in the cache.
+
+### Documentation
+
+- Expanded the platform artwork manifest with every bundled filename, alias,
+  encoded size, alpha/padding inspection, runtime format, offline guarantee,
+  provenance statement, fallback behavior, and rejection record.
+- Added `docs/GAMEHACKING_PROVIDER.md` covering provider scope, identity gates,
+  caching, rate limiting, provenance, native export, and future adapters.
+
+## v0.7.0-alpha (unreleased)
+
+See [`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the
+full narrative release notes, installation instructions, and manual QA
+summary. This entry groups the same changes by area. The published annotated
+tag peels to source commit `908c00da23303216cd28563a00b4ec835bc87207`.
+
+### Gamer View
+
+- New default navigation shell: a single-screen Gamer View (search,
+  platform-first game list, selected-game action panel) alongside the
+  existing, fully-preserved Advanced View. Reached via a small gear menu
+  from Gamer View; Advanced View always shows an obvious "Return to Gamer
+  View" action.
+- A visual platform picker (small original vector glyphs, name, and game
+  count per platform) replaces the earlier plain text filter chips, with
+  category fallbacks (console, handheld, computer, arcade, optical-disc,
+  cartridge, unknown) for platforms without dedicated artwork.
+- An optional custom-artwork directory can override built-in artwork with
+  the user's own local PNG files, matched by canonical platform id
+  (`gamecube.png`, `playstation2.png`, etc.); bounded decode limits (1 MiB
+  file size, 1024x1024 pixels) and safe fallback to the built-in glyph on
+  any rejection or malformed file.
+- The game list uses the full remaining window height and scrolls
+  independently of the fixed selected-game panel; selected rows have
+  stronger visual emphasis, and the action panel visually separates the
+  primary action (Mount/Unmount) from secondary actions (Cheats & Mods,
+  Details, Open location) and Undo.
+- Selecting Cheats & Mods from Gamer View opens the existing workflow
+  already scoped to the selected game (no separate archive picker), with
+  an explicit "Back to games" action.
+
+### Cheats & Mods
+
+- Direct read-only discovery for GameCube/Wii `.iso`, `.gcm`, `.gcz`,
+  `.rvz`, `.wbfs`, and `.ciso`, preserving visibility when exact identity is
+  unavailable.
+- Canonical platform resolution and persistent source-level assignments
+  with explicit preview and safe reclassification.
+- A new read-only `cheat-provider-coverage` CLI command audits existing
+  Dolphin and RetroArch catalogue coverage for a bounded, exact selection
+  of up to 32 archive IDs, reporting compatible/rejected/duplicate/conflict
+  counts and honest no-match reasons without exposing local paths. See
+  [`docs/CHEAT_PROVIDER_COVERAGE.md`](docs/CHEAT_PROVIDER_COVERAGE.md).
+
+### Emulator adapters
+
+- Xenia Canary patch lookup and confirmed installation/rollback.
+- Dolphin Gecko definitions can be installed and rolled back through the
+  verified transaction engine; Gecko and Action Replay content are
+  distinguished, and only Gecko is ever installed through the approved
+  provider path.
+- PCSX2: core identity (verified executable CRC, optional serial/region),
+  profile discovery, a strict PNACH parser/renderer, and a
+  transaction-backed install/Undo path are now implemented in
+  `archivefs-core`, proven by an automated end-to-end test suite. **This is
+  not yet reachable from the CLI or the GUI** - the GUI's PCSX2 workflow
+  still shows "installation unavailable" (recognition-only wiring was
+  added this release), and no CLI subcommand exists for it yet. No
+  approved downloadable ordinary-cheat catalogue is bundled for PCSX2.
+
+### Safety and Undo
+
+- Every Cheats & Mods install across RetroArch, Dolphin, and Xenia goes
+  through the same shared transaction engine: explicit preview, separate
+  confirmation, verified backup before any replacement, a written journal,
+  and preview-then-confirm rollback.
+- An in-flight Cheats & Mods transaction, and a rollback preview/review in
+  progress, both now survive switching between Gamer View and Advanced
+  View or navigating away and back - neither is silently reset just
+  because a different page is rendered.
+- Selection-generation guards and consistent focused/multi-selection
+  clearing across platform-filter changes prevent an async result for one
+  game from being applied to a different, later-selected game.
+- Every bulk action (Mount All, Unmount All, missing-entry removal, "Mount
+  selected", bulk platform assignment/clear) now shows a preview and the
+  exact item count before any confirmation; 1-25 items use a normal
+  confirmation, more than 25 requires typing the exact count. Mount All is
+  not reachable from Gamer View at all.
+
+### Coverage reporting
+
+- `cheat-provider-coverage` (see "Cheats & Mods" above) is a read-only,
+  bounded audit distinct from installation: it reports what an *existing*
+  local catalogue can match today, with fail-closed region/revision
+  handling, and makes no gameplay-coverage claim. See
+  [`docs/CHEAT_PROVIDER_COVERAGE.md`](docs/CHEAT_PROVIDER_COVERAGE.md) for
+  exactly what a zero-match can mean for each provider.
+
+### Release engineering
+
+- A canonical, locally runnable release builder and independent artifact
+  verifier with deterministic archive metadata, privacy checks, malformed-
+  artifact rejection, version consistency, and two-build reproducibility
+  proof.
+- Split pull-request CI gates for formatting, Clippy, workspace tests,
+  locked release builds, dependency/security audit, artifact verification,
+  and reproducibility. CI candidates are retained for 14 days and are not
+  published as releases.
+
+### Dependency security
+
+- Updated the `eframe`/`egui` GUI dependency family from 0.32.3 to 0.34.3,
+  removing the unmaintained `ttf-parser`/`owned_ttf_parser`/`ab_glyph`
+  font-parsing chain entirely (RUSTSEC-2026-0192).
+- Updated `quick-xml` (a build-time-only transitive dependency of the
+  Wayland protocol scanner, never used on game or catalogue data at
+  runtime) from 0.39.4 to 0.41.0, resolving RUSTSEC-2026-0195 and
+  RUSTSEC-2026-0194.
+- Both online and cached `cargo audit` runs are clean with no advisory
+  ignore added. See [`docs/DEPENDENCY_SECURITY.md`](docs/DEPENDENCY_SECURITY.md).
+
+### Documentation
+
+- Added [`docs/GUI_NAVIGATION_RESET_DESIGN.md`](docs/GUI_NAVIGATION_RESET_DESIGN.md),
+  [`docs/PLATFORM_ARTWORK.md`](docs/PLATFORM_ARTWORK.md),
+  [`docs/PCSX2_CHEAT_ADAPTER.md`](docs/PCSX2_CHEAT_ADAPTER.md),
+  [`docs/CHEAT_PROVIDER_COVERAGE.md`](docs/CHEAT_PROVIDER_COVERAGE.md),
+  [`docs/DEPENDENCY_SECURITY.md`](docs/DEPENDENCY_SECURITY.md), and
+  [`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md).
+
+### Changed
+
+- Platform selection is shared by Library, Mount, and Cheats & Mods, and
+  now also drives Gamer View's platform picker.
+- Beginner-facing cheat and patch states use plain language; diagnostics
+  remain available under Details.
+
+### Known limitations
+
+- PCSX2 install/Undo exists only in `archivefs-core` today - not reachable
+  from the CLI or GUI (see "Emulator adapters" above); no approved
+  downloadable ordinary-cheat catalogue is bundled.
+- Dolphin and RetroArch catalogue coverage is not universal and varies by
+  game, platform, region, and revision evidence; ambiguous/tied RetroArch
+  matches remain fail-closed rather than guessed.
+- Custom platform artwork supports local PNG only; runtime SVG rendering of
+  the on-disk built-in `.svg` assets (and of a custom SVG override) remains
+  deferred - built-in artwork renders as a native vector glyph instead.
+- Native Wayland GUI startup has not been manually proven in the current
+  development/QA environment (only X11 was available); it is not claimed
+  as manually tested.
+- Some `egui` 0.34 deprecated compatibility entry points remain in use,
+  behind an explicit, documented allowance - migrating them to the
+  preferred native APIs is deferred to a dedicated follow-up.
+- Mount Queue's own confirmation dialog does not yet have the >25
+  typed-count escalation described above under "Safety and Undo" (Mount
+  All, Unmount All, and the other listed bulk actions do).
+- The GUI-foundation presentation/safety modules
+  (`view_mode`/`status_wording`/`game_presentation`/`bulk_confirmation`/
+  `selection_guard`) are integrated into the codebase but are not yet
+  consumed by the active, already-tested inline Gamer View implementation.
+- RVZ identity inspection is bounded and requires a readable direct header;
+  malformed or unsupported layouts remain visible with an honest terminal
+  status instead of being hidden or left loading.
+- A database opened by this build is migrated forward to schema 5. Older
+  builds reject that schema, so application downgrade requires a
+  pre-upgrade database copy; in-place downgrade is not supported.
+
+## v0.6.0-alpha (development baseline; not tagged)
+
+Historical development baseline merged after `v0.5.0-alpha`; it was not tagged
+before the v0.7 integration work began. See
 [`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md) for
 a narrative overview and
 [`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the

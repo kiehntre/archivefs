@@ -321,6 +321,32 @@ Name of the metadata provider that supplied the displayed metadata.
 
 Name of the health provider that supplied the displayed health value.
 
+## Cheat provider coverage JSON
+
+`archivefs-cli cheat-provider-coverage --id <id>... --json` emits format
+version `1` with these stable top-level keys:
+
+```text
+format_version
+read_only
+bounded_selection
+provenance
+games
+summary
+```
+
+Each `games[]` item identifies the emulator/provider, platform and game title;
+verified identity kind/value when available; region and revision; compatible,
+rejected, duplicate, conflict and unsupported counts; structured
+`rejection_reasons`; and a structured `no_match_reason`. Rejection and provider
+enums use lower-snake-case values. `provenance[]` records provider source,
+licence and local immutable revision when available.
+
+The schema intentionally contains no archive, provider-catalogue, emulator
+profile, configuration, or home-directory paths. Runs require an explicit,
+bounded selection of at most 32 persisted archive IDs. See
+[`CHEAT_PROVIDER_COVERAGE.md`](CHEAT_PROVIDER_COVERAGE.md).
+
 ## Stability Guarantees
 
 The JSON output documented here is intended for integrations, scripts, and tests.

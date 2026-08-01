@@ -5,8 +5,9 @@ edition.workspace = true
 
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }
+log = "0.4"
 eframe = {
-    version = "0.32.3",
+    version = "0.34.3",
     default-features = false,
     features = ["default_fonts", "glow", "wayland", "x11"],
 }
@@ -32,6 +33,11 @@ eframe = {
 # fallback (used only if its separate `smithay-clipboard` path fails),
 # not just this crate's direct use.
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+# Decode bounded, local-only custom platform PNGs into egui textures. This
+# exact crate/version is already present through the GUI dependency graph;
+# a direct dependency makes the deliberately limited PNG API explicit and
+# avoids adding the much larger SVG/resvg parser stack for this milestone.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 # Native folder picker for "Add Folder" on the Sources page. Default
 # features enable the "xdg-portal" backend, which talks to the
 # xdg-desktop-portal D-Bus FileChooser directly (GNOME/KDE both implement

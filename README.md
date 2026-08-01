@@ -15,27 +15,21 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** `v0.5.0-alpha` is tagged and released - a hardening
-release (mount lifecycle postcondition checks, transactional catalogue
-refresh, RetroArch cheat-source cache locking) plus a redesigned desktop
-GUI and a first-class Cheats & Mods workspace spanning **three read-only
-emulator adapters**: RetroArch, PCSX2, and Dolphin. `v0.6.0-alpha` is
-**prepared but not yet tagged**, adding a shared verified game identity
-system, a shared read-only preview/conflict model, a shared safe
-apply/backup/journal/rollback foundation, a working RetroArch GUI
-apply/history/rollback flow, RetroArch trusted-catalogue download and
-management, Recently Found, and Mega Drive loose-ROM recognition. PCSX2 and
-Dolphin remain preview-only; adapter expansion is paused after Dolphin for
-now - see [`ROADMAP.md`](ROADMAP.md#medium-term-plans). See
-[`docs/RELEASE_NOTES_v0.6.0-alpha.md`](docs/RELEASE_NOTES_v0.6.0-alpha.md)
-for what's actually new and what remains unavailable, and
-[`docs/MANUAL_QA_v0.6.0-alpha.md`](docs/MANUAL_QA_v0.6.0-alpha.md) for the
-manual acceptance checklist. The workspace version in `Cargo.toml` now
-reads `0.6.0-alpha` in preparation for tagging, but **no `v0.6.0-alpha` Git
-tag exists yet** - a real manual QA pass on Nobara against
-`docs/MANUAL_QA_v0.6.0-alpha.md` is the sole remaining blocker; see
-[`docs/V0.6_RELEASE_AUDIT.md`](docs/V0.6_RELEASE_AUDIT.md) for the current
-go/no-go checklist.
+**Release status:** `v0.5.0-alpha` is the latest tagged release. The current
+workspace is the untagged `v0.7.0-alpha` release candidate. It adds a
+default Gamer View (a single-screen, platform-first game list and
+selected-game action panel) alongside the existing Advanced View, direct
+game-image discovery, shared platform-first navigation and source platform
+assignment, a visual platform-artwork picker, and explicit Dolphin Gecko and
+Xenia Canary patch workflows. RetroArch, Dolphin, and Xenia use confirmed
+transaction paths with backup/rollback/Undo; PCSX2 now also has a
+transaction-backed install/Undo path, but no approved downloadable
+ordinary-cheat catalogue is bundled for it yet. A read-only
+`cheat-provider-coverage` audit command reports Dolphin/RetroArch catalogue
+coverage for a bounded, exact game selection. See
+[`docs/releases/v0.7.0-alpha.md`](docs/releases/v0.7.0-alpha.md) for the full
+release notes. Manual QA and the release gate must pass before a tag is
+created.
 
 ## Principles
 
@@ -61,7 +55,10 @@ user-facing version at
 
 ## What ArchiveFS does today
 
-- Safely scans absolute, non-symlinked configured source folders for supported archives: `.zip`, `.7z`, and `.rar` (skipping symlink/special-file entries and obvious split-archive continuation parts, with bounded traversal).
+- Safely scans absolute, non-symlinked configured source folders for supported
+  archives (`.zip`, `.7z`, `.rar`) and supported direct game images, including
+  GameCube/Wii `.iso`, `.gcm`, `.gcz`, `.rvz`, `.wbfs`, and `.ciso`. Scanning
+  is bounded and read-only; images are never mounted, converted, or modified.
 - Mounts archives read-only through `ratarmount`, individually or in bulk, with safe mount-name generation, lazy-unmount recovery, and cleanup of empty mount directories.
 - Maintains a persistent, local SQLite catalogue of your library (`library-scan`, `library-list`, `library-find`, `library-status`, `health`) so commands don't need to rescan the filesystem every time - this catalogue is additive and is never consulted for mount/unmount safety decisions. Catalogue reports and previews use an explicit read-only open; `database-check` additionally distinguishes hot-header evidence, zeroed/truncated non-hot journals, malformed headers, and recovery-required read-only failures without creating, migrating, repairing, or checkpointing anything.
 - Supports multiple independent source folders (`sources`, `source add/enable/disable/scan/remove`).
@@ -89,6 +86,11 @@ user-facing version at
   `retroarch-cheat-source-inspect`. Fetching produces a bounded, validated,
   immutable local snapshot and never installs cheats. See
   [`docs/RETROARCH_CHEAT_SOURCES.md`](docs/RETROARCH_CHEAT_SOURCES.md).
+- Audits existing Dolphin and RetroArch provider coverage with
+  `cheat-provider-coverage`: an exact-ID, at-most-32-game, read-only report
+  showing compatible/rejected counts, duplicates, conflicts, unsupported
+  formats, and honest no-match reasons without exposing local paths. See
+  [`docs/CHEAT_PROVIDER_COVERAGE.md`](docs/CHEAT_PROVIDER_COVERAGE.md).
 - Presents Cheats & Mods as a first-class GUI workspace while keeping profile,
   source trust, inspection, destination, and installation state distinct. Its
   in-page picker changes only workspace context; it can inventory an eligible
@@ -98,10 +100,13 @@ user-facing version at
   `cheats`, `cheats_ws`, and present `patches` PNACH files. A shared bounded
   ISO reader can derive a verified PS2 serial and, when the complete boot ELF
   fits its limit, PCSX2's executable CRC. GameCube and Wii
-  archives can use a similarly read-only Dolphin adapter to discover native or
-  Flatpak user directories and inspect bounded `GameSettings/*.ini` metadata.
-  Verified Dolphin Game IDs can establish exact INI matches. Neither adapter
-  inspects arbitrary local imports or installs content; see
+  archives can use the Dolphin adapter to discover native or Flatpak user
+  directories, inspect bounded `GameSettings/*.ini` metadata, and retrieve
+  exact-ID Gecko definitions from Dolphin's official upstream dataset.
+  Verified Dolphin Game IDs and revisions bind the provider lookup and exact
+  destination. PCSX2 does not install content; Dolphin can install selected
+  validated Gecko definitions after preview and confirmation. Neither adapter
+  inspects arbitrary local imports; see
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
   [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md),
   [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md), and
@@ -115,8 +120,8 @@ user-facing version at
   non-preselected approval before replacing different existing content),
   verify the write, and record a journal entry. History & Logs can open that
   exact operation and preview/confirm its rollback. ArchiveFS never
-  auto-applies, and PCSX2/Dolphin remain preview-only with no apply control
-  at all; see
+  auto-applies. PCSX2 remains preview-only. Dolphin uses the same transaction
+  engine for selected external Gecko definitions, including rollback; see
   [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md)
   and
   [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
@@ -156,11 +161,12 @@ user-facing version at
   and `retroarch-patch-preview` are preview only; guided cheat setup and the
   GUI's RetroArch apply flow both require explicit confirmation and never
   install or enable anything on their own; trusted catalogue retrieval
-  remains a separate step from installation. PCSX2 and Dolphin remain
-  preview-only in the GUI with no apply control at all.
-- No broad multi-emulator support yet - PCSX2, RetroArch, and Dolphin are the
-  only emulators with any patch/cheat preview or inventory today, and none is
-  launched or configured by these read-only workflows.
+  remains a separate step from installation. PCSX2 remains preview-only;
+  Dolphin's explicit Gecko flow can create or update one exact GameSettings
+  INI and roll it back.
+- No broad multi-emulator support yet - PCSX2, RetroArch, Dolphin, and Xenia
+  are the only emulators with patch/cheat workflows today, and ArchiveFS never
+  launches an emulator.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
@@ -268,8 +274,11 @@ There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pa
   facilities (`/proc/self/mountinfo`, FUSE-style mount tools, `inotify` via
   the `notify` crate). macOS and Windows are not supported.
 - **Archive formats:** `.zip`, `.7z`, and `.rar` (with split-RAR
-  continuation-part skipping). No other archive formats are currently
-  detected or mounted.
+  continuation-part skipping).
+- **Direct game images:** `.iso`, `.gcm`, `.gcz`, `.rvz`, `.wbfs`, and
+  `.ciso` for GameCube/Wii, plus the existing platform-specific loose-image
+  formats. Direct images are library items; archive mounting remains limited
+  to the archive formats above.
 - **Mount backend:** `ratarmount` only, invoked as an external tool - not
   bundled, must be installed and on `PATH` separately.
 - **Desktop GUI:** requires a running X11 or Wayland session; there is no
@@ -527,6 +536,7 @@ Platforms:
 - [Patch & cheat manager design (PCSX2 preview, adapter boundary)](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
 - [Read-only PCSX2 Cheats & Mods adapter](docs/PCSX2_READONLY_ADAPTER.md)
 - [Read-only Dolphin Cheats & Mods adapter](docs/DOLPHIN_READONLY_ADAPTER.md)
+- [Dolphin and RetroArch cheat-provider coverage](docs/CHEAT_PROVIDER_COVERAGE.md)
 - [Shared verified game identity](docs/SHARED_GAME_IDENTITY.md)
 - [Shared read-only Cheats & Mods preview](docs/SHARED_CHEAT_PREVIEW.md)
 - [Shared safe apply, journal, and rollback foundation](docs/SHARED_SAFE_APPLY_ROLLBACK.md)
@@ -547,8 +557,8 @@ Platforms:
 - [Duplicate detector](docs/duplicate-detector.md)
 - [Security model](docs/security.md)
 - [JSON API](docs/json-api.md)
-- [v0.6.0-alpha release notes (in preparation, not yet released)](docs/RELEASE_NOTES_v0.6.0-alpha.md)
-- [v0.6.0-alpha manual QA plan](docs/MANUAL_QA_v0.6.0-alpha.md)
+- [Historical untagged v0.6 development notes](docs/RELEASE_NOTES_v0.6.0-alpha.md)
+- [Historical v0.6 manual QA plan](docs/MANUAL_QA_v0.6.0-alpha.md)
 - [v0.5.0-alpha release notes](docs/RELEASE_NOTES_v0.5.0-alpha.md)
 - [v0.5.0-alpha manual QA plan](docs/MANUAL_QA_v0.5.0-alpha.md)
 - [Adapter support matrix](docs/ADAPTER_SUPPORT_MATRIX.md)

@@ -3,29 +3,140 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
+  fmt:
+    name: Formatting
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
-          components: rustfmt,clippy
+          components: rustfmt
+      - run: cargo fmt --all --check
 
-      - name: Check formatting
-        run: cargo fmt --all --check
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+  test:
+    name: Workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - run: cargo test --workspace
 
-      - name: Test
-        run: cargo test --workspace
+  release-build:
+    name: Locked release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - run: cargo build --workspace --release --locked
+      - run: scripts/check-version-consistency.sh --binary-dir target/release
 
-      - name: Build
-        run: cargo build --workspace
+  security:
+    name: Dependency and secret audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - name: Scan tracked files for credential-shaped secrets
+        run: scripts/security-scan.sh
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit resolved dependencies
+        run: cargo audit
+
+  release-artifact:
+    name: Create canonical artifact
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, release-build, security]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - name: Build and internally verify artifact
+        run: scripts/build-release.sh --output-dir "$RUNNER_TEMP/release"
+      - name: Reject representative malformed artifacts
+        run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.gz
+      - name: Check artifact and binary versions
+        run: |
+          scripts/check-version-consistency.sh \
+            --binary-dir target/release \
+            --artifact "$RUNNER_TEMP/release/"*.tar.gz \
+            --checksum "$RUNNER_TEMP/release/"*.tar.gz.sha256
+      - name: Upload untrusted CI artifact for verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: archivefs-release-candidate
+          path: |
+            ${{ runner.temp }}/release/*.tar.gz
+            ${{ runner.temp }}/release/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-artifact:
+    name: Verify downloaded artifact
+    runs-on: ubuntu-latest
+    needs: release-artifact
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/download-artifact@v5
+        with:
+          name: archivefs-release-candidate
+          path: ${{ runner.temp }}/download
+      - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.gz
+
+  reproducibility:
+    name: Reproducibility
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, release-build, security]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - name: Build twice in independent clean directories
+        run: scripts/compare-release-builds.sh --output-dir "$RUNNER_TEMP/reproducibility"

@@ -30,6 +30,7 @@ pub enum PreviewAdapter {
     RetroArch,
     Pcsx2,
     Dolphin,
+    Xenia,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,6 +39,7 @@ pub enum PreviewIdentityKind {
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
     DolphinGameId,
+    XeniaTitleId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -705,7 +707,13 @@ fn apply_eligibility_blockers(
         ),
     }
     let strength_eligible = match request.adapter {
-        PreviewAdapter::RetroArch => matches!(
+        // Xenia's `Strong` tier is a compatibility-verified-but-module-hash-
+        // unverified candidate (task-required "partially verified" state) -
+        // accepted here the same way RetroArch accepts a strong catalogue
+        // match, but gated behind an explicit user acknowledgement before
+        // the shared transaction plan is ever built (see
+        // `XeniaCodeSelection::can_apply`).
+        PreviewAdapter::RetroArch | PreviewAdapter::Xenia => matches!(
             source.match_strength,
             PreviewMatchStrength::VerifiedExact | PreviewMatchStrength::Strong
         ),
@@ -1124,6 +1132,7 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
             normalized.as_str(),
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" | "wii" | "nintendo wii"
         ),
+        PreviewAdapter::Xenia => matches!(normalized.as_str(), "xbox360" | "xbox 360"),
         PreviewAdapter::RetroArch => !normalized.is_empty(),
     }
 }
@@ -1518,7 +1527,14 @@ mod tests {
             PreviewDestinationState::Symlink
         );
         fs::remove_file(&destination).unwrap();
-        let _listener = UnixListener::bind(&destination).unwrap();
+        let _listener = match UnixListener::bind(&destination) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("Unix socket creation is not permitted in this test environment");
+                return;
+            }
+            Err(error) => panic!("failed to create special-file fixture: {error}"),
+        };
         let special_report = build_shared_preview(&request).unwrap();
         assert_eq!(
             special_report.entries[0].destination_state,

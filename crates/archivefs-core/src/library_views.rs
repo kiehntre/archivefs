@@ -1677,6 +1677,8 @@ mod tests {
             last_scan_at: None,
             last_successful_scan_at: None,
             last_archive_count: None,
+            assigned_platform: None,
+            unknown_archive_count: 0,
         }
     }
 
@@ -1706,6 +1708,7 @@ mod tests {
             last_known_health: "ok".to_string(),
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_verified_missing_at: None,
+            identity_report: None,
         }
     }
 

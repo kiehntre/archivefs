@@ -35,6 +35,9 @@ use std::{env, fs};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::emulator_environment::EncodedPath;
+use crate::game_identity::{
+    GameIdentityReport, IdentityPlatform, inspect_catalogued_game_identity,
+};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
@@ -94,6 +97,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         description: "retain unchanged, unsupported-extension, and ambiguous-platform scan counts",
         sql: include_str!("migrations/0004_scan_skip_counts.sql"),
+    },
+    Migration {
+        version: 5,
+        description: "add optional persisted source-level platform assignment",
+        sql: include_str!("migrations/0005_source_platform_assignment.sql"),
+    },
+    Migration {
+        version: 6,
+        description: "persist bounded direct-image identity reports with source metadata",
+        sql: include_str!("migrations/0006_game_identity_reports.sql"),
     },
 ];
 
@@ -1050,6 +1063,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 pub struct RegisteredSourceFolder {
     pub id: i64,
     pub path: PathBuf,
+    pub assigned_platform: Option<String>,
 }
 
 /// Whether the most recent scan attempt of one source folder succeeded or
@@ -1097,6 +1111,8 @@ pub struct SourceFolderRecord {
     pub last_scan_at: Option<String>,
     pub last_successful_scan_at: Option<String>,
     pub last_archive_count: Option<i64>,
+    pub assigned_platform: Option<String>,
+    pub unknown_archive_count: i64,
 }
 
 /// What happened to one `archives` row during [`Database::upsert_archive`].
@@ -1193,6 +1209,9 @@ pub struct ScanPersistSummary {
     /// successfully - but archives under a listed folder are guaranteed
     /// untouched by this run (see [`scan_and_persist`]).
     pub folder_errors: Vec<(PathBuf, String)>,
+    /// Direct images that stayed visible but did not receive the source's
+    /// platform because that platform/format combination is incompatible.
+    pub platform_assignment_warnings: Vec<(PathBuf, String)>,
 }
 
 /// A persisted `archives` row joined with its current platform (if any),
@@ -1223,6 +1242,9 @@ pub struct PersistedArchive {
     /// archive. Retained while the row is missing for review display.
     pub last_seen_at: String,
     pub last_verified_missing_at: Option<String>,
+    /// Bounded identity evidence captured from the exact loose image during
+    /// the last successful scan whose size and mtime matched this row.
+    pub identity_report: Option<GameIdentityReport>,
 }
 
 /// One automatically detected platform and the path evidence retained for a
@@ -1356,6 +1378,7 @@ fn archive_kind_str(kind: ArchiveKind) -> &'static str {
         ArchiveKind::SevenZip => "sevenzip",
         ArchiveKind::Rar => "rar",
         ArchiveKind::MegaDriveRom => "megadrive_rom",
+        ArchiveKind::DirectGameImage => "direct_game_image",
     }
 }
 
@@ -1391,10 +1414,11 @@ pub const MANUAL_PLATFORM_SOURCE: &str = "manual";
 /// [`MANUAL_PLATFORM_SOURCE`] (a single archive's explicit override still
 /// wins) - see [`provenance_priority`].
 pub const CUSTOM_FOLDER_ALIAS_SOURCE: &str = "custom_folder_alias";
+pub const SOURCE_PLATFORM_ASSIGNMENT_SOURCE: &str = "source_assignment";
 
 /// Relative strength of a `platform_assignments.source` value, used by
 /// [`Database::assign_platform`] to decide whether a new assignment may
-/// replace the current one, in four tiers (weakest to strongest):
+/// replace the current one, in six tiers (weakest to strongest):
 ///
 /// 1. `"folder_alias"` (the generic, code-shipped folder-name fallback in
 ///    `crate::detect_platform_with_provenance`) - weakest, since it is
@@ -1413,14 +1437,19 @@ pub const CUSTOM_FOLDER_ALIAS_SOURCE: &str = "custom_folder_alias";
 ///    between scans) - see [`Database::retire_stale_custom_alias_assignment`]
 ///    for how a stale current assignment sourced from a since-removed
 ///    alias is un-stuck, which `provenance_priority` alone cannot do.
-/// 4. [`MANUAL_PLATFORM_SOURCE`] - strongest: a deliberate user choice.
-///    Nothing in tiers 1-3 can ever silently replace it; only another
+/// 4. [`SOURCE_PLATFORM_ASSIGNMENT_SOURCE`] - an explicit default saved
+///    for one source folder.
+/// 5. `"header_identity"` - bounded exact format/header evidence.
+/// 6. [`MANUAL_PLATFORM_SOURCE`] - strongest: a deliberate per-entry choice.
+///    Nothing in tiers 1-5 can ever silently replace it; only another
 ///    manual assignment (via [`Database::set_manual_platform`]) can.
 fn provenance_priority(source: &str) -> u8 {
     match source {
         "folder_alias" => 0,
         CUSTOM_FOLDER_ALIAS_SOURCE => 2,
-        MANUAL_PLATFORM_SOURCE => 3,
+        SOURCE_PLATFORM_ASSIGNMENT_SOURCE => 3,
+        "header_identity" => 4,
+        MANUAL_PLATFORM_SOURCE => 5,
         _ => 1,
     }
 }
@@ -1489,6 +1518,13 @@ impl Database {
             registered.push(RegisteredSourceFolder {
                 id,
                 path: path.clone(),
+                assigned_platform: tx
+                    .query_row(
+                        "SELECT assigned_platform FROM source_folders WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| db_error("failed to read source platform", error))?,
             });
         }
 
@@ -1533,10 +1569,12 @@ impl Database {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, path, first_seen_at, last_scan_status, last_scan_error, \
-                 last_scan_at, last_successful_scan_at, last_archive_count \
-                 FROM source_folders WHERE removed_from_config_at IS NULL \
-                 ORDER BY first_seen_at ASC, id ASC",
+                "SELECT sf.id, sf.path, sf.first_seen_at, sf.last_scan_status, sf.last_scan_error, \
+                 sf.last_scan_at, sf.last_successful_scan_at, sf.last_archive_count, sf.assigned_platform, \
+                 (SELECT COUNT(*) FROM archives a LEFT JOIN platform_assignments pa ON pa.archive_id = a.id \
+                  WHERE a.source_folder_id = sf.id AND a.last_verified_missing_at IS NULL AND pa.platform IS NULL) \
+                 FROM source_folders sf WHERE sf.removed_from_config_at IS NULL \
+                 ORDER BY sf.first_seen_at ASC, sf.id ASC",
             )
             .map_err(|error| db_error("failed to prepare source folder listing", error))?;
 
@@ -1554,6 +1592,8 @@ impl Database {
                     last_scan_at: row.get(5)?,
                     last_successful_scan_at: row.get(6)?,
                     last_archive_count: row.get(7)?,
+                    assigned_platform: row.get(8)?,
+                    unknown_archive_count: row.get(9)?,
                 })
             })
             .map_err(|error| db_error("failed to list source folders", error))?
@@ -1561,6 +1601,30 @@ impl Database {
             .map_err(|error| db_error("failed to read source folders", error))?;
 
         Ok(rows)
+    }
+
+    /// Persists or clears a platform default for one configured source.
+    /// The caller performs the explicit preview/confirmation and rescan.
+    pub fn set_source_platform_assignment(
+        &mut self,
+        source_path: &Path,
+        platform: Option<&str>,
+    ) -> Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE source_folders SET assigned_platform = ?2 \
+                 WHERE path = ?1 AND removed_from_config_at IS NULL",
+                params![source_path.as_os_str().as_bytes(), platform],
+            )
+            .map_err(|error| db_error("failed to save source platform assignment", error))?;
+        if changed == 0 {
+            return Err(ArchiveFsError::Database(format!(
+                "source folder {} is not registered",
+                source_path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Records the outcome of one source folder's scan attempt (success or
@@ -2937,7 +3001,8 @@ impl Database {
                 "SELECT a.id, a.source_folder_id, a.relative_path, a.absolute_path_cached, \
                  a.archive_kind, a.display_name, a.normalized_name, a.size_bytes, \
                  a.modified_time_unix_seconds, p.platform, p.source, a.last_known_health, \
-                 a.last_seen_at, a.last_verified_missing_at \
+                 a.last_seen_at, a.last_verified_missing_at, a.identity_report_json, \
+                 a.identity_report_size_bytes, a.identity_report_modified_time_unix_seconds \
                  FROM archives a \
                  LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
                  ORDER BY a.id",
@@ -2949,6 +3014,18 @@ impl Database {
                 let relative_path_bytes: Vec<u8> = row.get(2)?;
                 let absolute_path_bytes: Vec<u8> = row.get(3)?;
                 let size_bytes: Option<i64> = row.get(7)?;
+                let identity_json: Option<Vec<u8>> = row.get(14)?;
+                let identity_size: Option<i64> = row.get(15)?;
+                let identity_modified: Option<i64> = row.get(16)?;
+                let identity_report = if identity_size == size_bytes
+                    && identity_modified == row.get::<_, Option<i64>>(8)?
+                {
+                    identity_json
+                        .as_deref()
+                        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                } else {
+                    None
+                };
                 Ok(PersistedArchive {
                     id: row.get(0)?,
                     source_folder_id: row.get(1)?,
@@ -2964,12 +3041,57 @@ impl Database {
                     last_known_health: row.get(11)?,
                     last_seen_at: row.get(12)?,
                     last_verified_missing_at: row.get(13)?,
+                    identity_report,
                 })
             })
             .map_err(|error| db_error("failed to query archives", error))?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| db_error("failed to read archives", error))
+    }
+
+    fn persist_identity_report(
+        &mut self,
+        archive_id: i64,
+        archive: &Archive,
+        report: Option<&GameIdentityReport>,
+    ) -> Result<()> {
+        let json = report
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "failed to serialize game identity report: {error}"
+                ))
+            })?;
+        let size = report
+            .and(archive.identity.size_bytes)
+            .map(|value| value as i64);
+        let modified = report.and_then(|_| {
+            archive
+                .identity
+                .modified_time
+                .and_then(system_time_to_unix_seconds)
+        });
+        self.connection
+            .execute(
+                "UPDATE archives SET identity_report_json = ?2, identity_report_size_bytes = ?3, \
+                 identity_report_modified_time_unix_seconds = ?4 WHERE id = ?1",
+                params![archive_id, json, size, modified],
+            )
+            .map_err(|error| db_error("failed to persist game identity report", error))?;
+        Ok(())
+    }
+
+    fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read current archive platform", error))
     }
 
     /// Builds display-oriented provenance details for already-loaded archive
@@ -3311,6 +3433,7 @@ fn scan_and_persist_folders_transaction(
 
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
+    let mut platform_assignment_warnings = Vec::new();
 
     for folder in folders {
         let folder_config = Config {
@@ -3337,6 +3460,19 @@ fn scan_and_persist_folders_transaction(
         counts.skipped_unsupported_extension += discovery.skipped_unsupported_extension as i64;
         counts.skipped_ambiguous_platform += discovery.skipped_ambiguous_platform as i64;
         let archives = discovery.archives;
+        if let Some(platform) = folder.assigned_platform.as_deref() {
+            for archive in &archives {
+                if !source_assignment_is_compatible(archive, platform) {
+                    platform_assignment_warnings.push((
+                        archive.path.clone(),
+                        format!(
+                            "{} is not compatible with the source platform {platform}; the item remains visible without that assignment",
+                            archive.path.display()
+                        ),
+                    ));
+                }
+            }
+        }
 
         database.begin_folder_refresh()?;
         match persist_one_folder(database, scan_run_id, folder, &archives) {
@@ -3393,6 +3529,7 @@ fn scan_and_persist_folders_transaction(
         scan_run_id,
         counts,
         folder_errors,
+        platform_assignment_warnings,
     })
 }
 
@@ -3441,8 +3578,8 @@ fn persist_one_folder(
                 .and_then(system_time_to_unix_seconds),
         )?;
 
-        // Required precedence: manual > custom folder alias > heuristic >
-        // built-in folder alias > unknown. `archive.identity.platform`/
+        // Required precedence: manual > header identity > source assignment
+        // > folder alias > filename heuristic > unknown. `archive.identity.platform`/
         // `platform_provenance` already resolved the heuristic/built-in
         // tiers (in `detect_platform_with_provenance`, which has no
         // database access and so cannot itself see custom aliases) - a
@@ -3450,29 +3587,80 @@ fn persist_one_folder(
         // already found. `assign_platform` still has the final say via
         // `provenance_priority` (for example, never silently replacing a
         // manual assignment).
+        let header_identity =
+            archive.identity.platform_provenance == Some(PlatformProvenance::HeaderIdentity);
         let custom_alias_platform =
             find_custom_platform_alias(database, &archive.path, &archive.identity.source_root)?;
-        let (platform, source): (Option<String>, &str) = match &custom_alias_platform {
-            Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
-            None => {
-                database.retire_stale_custom_alias_assignment(outcome.archive_id)?;
-                (
-                    archive.identity.platform.clone(),
-                    archive
-                        .identity
-                        .platform_provenance
-                        .map(PlatformProvenance::as_source_str)
-                        .unwrap_or("heuristic-path-detector"),
-                )
+        let compatible_source_platform = folder
+            .assigned_platform
+            .as_deref()
+            .filter(|platform| source_assignment_is_compatible(archive, platform));
+        let (platform, source): (Option<String>, &str) = if header_identity {
+            (
+                archive.identity.platform.clone(),
+                PlatformProvenance::HeaderIdentity.as_source_str(),
+            )
+        } else if let Some(platform) = compatible_source_platform {
+            (
+                Some(platform.to_string()),
+                SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
+            )
+        } else {
+            match &custom_alias_platform {
+                Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
+                None => {
+                    database.retire_stale_custom_alias_assignment(outcome.archive_id)?;
+                    (
+                        archive.identity.platform.clone(),
+                        archive
+                            .identity
+                            .platform_provenance
+                            .map(PlatformProvenance::as_source_str)
+                            .unwrap_or("heuristic-path-detector"),
+                    )
+                }
             }
         };
         database.assign_platform(outcome.archive_id, platform.as_deref(), source)?;
+
+        if archive.kind == ArchiveKind::DirectGameImage {
+            let effective_platform = database.current_platform_for_archive(outcome.archive_id)?;
+            let identity_platform = IdentityPlatform::from_catalogue(effective_platform.as_deref());
+            if matches!(
+                identity_platform,
+                IdentityPlatform::PlayStation2 | IdentityPlatform::Wii
+            ) {
+                let report =
+                    inspect_catalogued_game_identity(&archive.path, effective_platform.as_deref());
+                database.persist_identity_report(outcome.archive_id, archive, Some(&report))?;
+            } else {
+                // Never replay evidence after an effective platform change.
+                database.persist_identity_report(outcome.archive_id, archive, None)?;
+            }
+        }
     }
 
     counts.archives_missing =
         database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
 
     Ok(counts)
+}
+
+fn source_assignment_is_compatible(archive: &Archive, platform: &str) -> bool {
+    if archive.kind != ArchiveKind::DirectGameImage {
+        return true;
+    }
+    let extension = archive
+        .path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match platform {
+        "GameCube" => matches!(extension.as_str(), "iso" | "gcm" | "gcz" | "rvz" | "ciso"),
+        "Wii" => matches!(extension.as_str(), "iso" | "gcz" | "rvz" | "wbfs" | "ciso"),
+        _ => matches!(extension.as_str(), "iso"),
+    }
 }
 
 /// Finds the nearest custom platform alias match for `path` (an archive
@@ -3482,7 +3670,7 @@ fn persist_one_folder(
 /// built-in folder alias walk (`detect_platform_from_folder_alias`)
 /// exactly, but consulting the persisted `platform_aliases` table (via
 /// [`Database::lookup_custom_platform_alias`]) instead of the built-in
-/// `FOLDER_PLATFORM_ALIASES` table. The archive's own filename is
+/// built-in folder-alias table in the `platform` registry. The archive's own filename is
 /// excluded, same as the built-in walk.
 fn find_custom_platform_alias(
     database: &Database,
@@ -3576,6 +3764,25 @@ mod tests {
         full_path
     }
 
+    fn wii_wbfs_fixture(game_id: &[u8; 6], revision: u8) -> Vec<u8> {
+        const HD_SHIFT: u8 = 9;
+        const WBFS_SHIFT: u8 = 21;
+        let file_len = 4_usize << WBFS_SHIFT;
+        let mut bytes = vec![0_u8; file_len];
+        bytes[..4].copy_from_slice(b"WBFS");
+        bytes[4..8].copy_from_slice(&u32::try_from(file_len >> HD_SHIFT).unwrap().to_be_bytes());
+        bytes[8] = HD_SHIFT;
+        bytes[9] = WBFS_SHIFT;
+        bytes[12] = 1;
+        let disc_info = 1_usize << HD_SHIFT;
+        bytes[disc_info..disc_info + 6].copy_from_slice(game_id);
+        bytes[disc_info + 6] = 0;
+        bytes[disc_info + 7] = revision;
+        bytes[disc_info + 0x18..disc_info + 0x1c].copy_from_slice(&[0x5d, 0x1c, 0x9e, 0xa3]);
+        bytes[disc_info + 0x100..disc_info + 0x102].copy_from_slice(&1_u16.to_be_bytes());
+        bytes
+    }
+
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
             source_folders: vec![source_dir.to_path_buf()],
@@ -3592,6 +3799,85 @@ mod tests {
             .iter()
             .find(|archive| archive.relative_path == Path::new(relative_path))
             .unwrap_or_else(|| panic!("no persisted archive with relative_path {relative_path}"))
+    }
+
+    #[test]
+    fn loose_wii_wbfs_identity_survives_database_reopen() {
+        let root = temp_dir("loose-wii-wbfs-identity");
+        let source = root.join("wii");
+        let mount = root.join("mount");
+        let image = write_archive_file(
+            &source,
+            "Wrong Filename [RZDE01].wbfs",
+            &wii_wbfs_fixture(b"SMNE01", 1),
+        );
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "Wrong Filename [RZDE01].wbfs");
+        assert_eq!(archive.archive_kind, "direct_game_image");
+        let report = archive.identity_report.as_ref().unwrap();
+        assert_eq!(report.archive_path, image);
+        assert_eq!(report.verified_dolphin_game_id(), Some("SMNE01"));
+        assert_eq!(
+            report.verified_value(crate::game_identity::IdentityKind::DolphinRegion),
+            Some("E")
+        );
+        database.close().unwrap();
+
+        let database = Database::open_read_only(&database_path).unwrap();
+        let archives = database.load_archives().unwrap();
+        let archive = find_archive(&archives, "Wrong Filename [RZDE01].wbfs");
+        assert_eq!(
+            archive
+                .identity_report
+                .as_ref()
+                .and_then(GameIdentityReport::verified_dolphin_game_id),
+            Some("SMNE01")
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn create_representative_older_database(path: &Path, schema_version: usize) {
+        assert!(matches!(schema_version, 3 | 4));
+        let mut connection = open_connection(path).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..schema_version]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_folders \
+                 (id, path, first_seen_at, last_seen_in_config_at) \
+                 VALUES (1, ?1, 'old', 'old')",
+                [b"/example/roms".as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO archives \
+                 (id, source_folder_id, relative_path, absolute_path_cached, file_name_cached, \
+                  archive_kind, display_name, normalized_name, last_known_health, first_seen_at, \
+                  last_seen_at, created_at, updated_at) \
+                 VALUES (1, 1, ?1, ?2, ?3, 'rvz', 'ZooCube', 'zoocube', 'Present', \
+                         'old', 'old', 'old', 'old')",
+                params![
+                    b"ZooCube.rvz".as_slice(),
+                    b"/example/roms/ZooCube.rvz".as_slice(),
+                    b"ZooCube.rvz".as_slice()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO platform_assignments \
+                 (archive_id, platform, source, confidence, is_current, assigned_at) \
+                 VALUES (1, 'GameCube', 'manual', 'exact', 1, 'old')",
+                [],
+            )
+            .unwrap();
+        connection.close().unwrap();
     }
 
     // -----------------------------------------------------------------
@@ -3903,6 +4189,75 @@ mod tests {
         );
 
         second.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v05_schema_upgrades_additively_and_preserves_manual_platform() {
+        let root = temp_dir("v05-upgrade");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 3);
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].archive_kind, "rvz");
+        assert_eq!(archives[0].platform.as_deref(), Some("GameCube"));
+        assert_eq!(archives[0].platform_source.as_deref(), Some("manual"));
+        let sources = database.list_source_folders().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].assigned_platform, None);
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v06_schema_upgrades_additively_and_preserves_manual_platform() {
+        let root = temp_dir("v06-upgrade");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 4);
+
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        let archive = &database.load_archives().unwrap()[0];
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(archive.platform_source.as_deref(), Some("manual"));
+        assert_eq!(
+            database.list_source_folders().unwrap()[0].assigned_platform,
+            None
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_schema_contains_no_cheat_catalogue_journal_or_backup_tables() {
+        let root = temp_dir("library-schema-boundary");
+        let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let mut statement = database
+            .connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "archive_scan_observations",
+                "archives",
+                "platform_aliases",
+                "platform_assignments",
+                "scan_runs",
+                "schema_migrations",
+                "source_folders",
+            ]
+        );
+        drop(statement);
+        database.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -4623,6 +4978,88 @@ mod tests {
         assert_eq!(archive.size_bytes, Some(8));
         assert!(archive.last_verified_missing_at.is_none());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saved_source_assignment_reclassifies_unknown_rvz_on_rescan() {
+        let root = temp_dir("source-assignment-rvz");
+        let source = root.join("collection");
+        let mount = root.join("mount");
+        write_archive_file(&source, "ZooCube (USA).rvz", b"rvz fixture");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        assert_eq!(database.load_archives().unwrap()[0].platform, None);
+
+        database
+            .set_source_platform_assignment(&source, Some("GameCube"))
+            .unwrap();
+        let registered = database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        assert_eq!(registered[0].assigned_platform.as_deref(), Some("GameCube"));
+        scan_and_persist_folders(&mut database, &registered, "assigned-rescan").unwrap();
+
+        let archive = &database.load_archives().unwrap()[0];
+        assert_eq!(archive.platform.as_deref(), Some("GameCube"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(SOURCE_PLATFORM_ASSIGNMENT_SOURCE)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn header_identity_beats_saved_source_assignment() {
+        let root = temp_dir("source-assignment-header");
+        let source = root.join("collection");
+        fs::create_dir_all(&source).unwrap();
+        let mut bytes = vec![0_u8; 64];
+        bytes[0x18..0x1c].copy_from_slice(&[0x5d, 0x1c, 0x9e, 0xa3]);
+        fs::write(source.join("disc.iso"), bytes).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        database
+            .set_source_platform_assignment(&source, Some("GameCube"))
+            .unwrap();
+        scan_and_persist(&mut database, &config, "header").unwrap();
+        let archive = &database.load_archives().unwrap()[0];
+        assert_eq!(archive.platform.as_deref(), Some("Wii"));
+        assert_eq!(archive.platform_source.as_deref(), Some("header_identity"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incompatible_direct_format_stays_visible_and_unassigned() {
+        let root = temp_dir("source-assignment-incompatible");
+        let source = root.join("collection");
+        write_archive_file(&source, "Wii Game.wbfs", b"wbfs fixture");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        database
+            .set_source_platform_assignment(&source, Some("GameCube"))
+            .unwrap();
+        scan_and_persist(&mut database, &config, "incompatible").unwrap();
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].platform, None);
+        let registered = database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        let summary = scan_and_persist_folders(&mut database, &registered, "warning").unwrap();
+        assert_eq!(summary.platform_assignment_warnings.len(), 1);
+        assert!(
+            summary.platform_assignment_warnings[0]
+                .1
+                .contains("remains visible")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5361,7 +5798,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(source_column, "heuristic-path-detector");
+        assert_eq!(source_column, "folder_alias");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -7385,7 +7822,7 @@ mod tests {
 
     #[test]
     fn custom_alias_outranks_the_built_in_folder_alias_for_the_same_folder_name() {
-        // "n64" is already a built-in FOLDER_PLATFORM_ALIASES key (-> N64).
+        // "n64" is already a built-in folder alias in the platform registry (-> N64).
         // A custom alias for the exact same folder name must win instead.
         let root = temp_dir("custom-alias-outranks-built-in");
         let source = root.join("source");
@@ -7613,7 +8050,7 @@ mod tests {
         let mount = root.join("mount");
         write_archive_file(&source, "am/game.zip", b"custom");
         write_archive_file(&source, "intellivision/game.zip", b"built-in");
-        write_archive_file(&source, "xbox360/game.zip", b"heuristic");
+        write_archive_file(&source, "incoming/007 Legends.zip", b"heuristic");
         write_archive_file(&source, "mystery/game.zip", b"unknown");
         let config = config_for(&source, &mount);
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
@@ -7626,7 +8063,7 @@ mod tests {
             .unwrap();
         let custom = find_archive(&archives, "am/game.zip");
         let built_in = find_archive(&archives, "intellivision/game.zip");
-        let heuristic = find_archive(&archives, "xbox360/game.zip");
+        let heuristic = find_archive(&archives, "incoming/007 Legends.zip");
         let unknown = find_archive(&archives, "mystery/game.zip");
 
         assert_eq!(

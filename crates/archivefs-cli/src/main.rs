@@ -3,24 +3,55 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::diagnostics::environment::{
+    FreeSpacePolicy, assess_storage, mount_table, storage_resources,
+};
+use archivefs_core::diagnostics::managed::scan_managed_entries;
+use archivefs_core::diagnostics::profiles::{
+    DiscoveredProfiles, assess_emulator_profiles, managed_scan_targets,
+    profile_destination_directories,
+};
+use archivefs_core::diagnostics::repair::{
+    DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRequest,
+    DoctorRepairStatus, execute_doctor_repair,
+};
+use archivefs_core::diagnostics::{
+    CoverageStatus, DoctorScan, DoctorScanInputs, Gathered, assess_mount_root_safety,
+    run_doctor_scan,
+};
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
     ConfigAssociation, ConfigReadOutcome, CoreInfoFinding, DiscoveryEnvironment, ProfileKind,
     ProfileScope, ResolutionState, RetroArchEnvironmentReport, RetroArchProfile,
     discover_retroarch_environment,
 };
+use archivefs_core::game_identity::{
+    GameIdentityReport, IdentityConfidence, IdentityKind, IdentityStatus,
+    inspect_catalogued_game_identity, inspect_catalogued_game_identity_in_roots,
+};
 use archivefs_core::patch_manager::{
     AdvisoryPatchPlan, CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME,
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatAvailabilityReport, CheatBackupAssessment,
     CheatDestinationAssessment, CheatHistoryOptions, CheatHistoryReport, CheatInstallOptions,
     CheatInstallRunOutcome, CheatInstallRunStatus, CheatJournalInspection,
-    CheatJournalInspectionError, CheatRollbackAvailability, CheatRollbackOptions,
-    CoreSelectionSource, DestinationKind, HttpsMetadataFetcher, ProposedDestination,
-    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, build_cheat_availability_report,
-    discover_cheat_history, execute_cheat_install_run, execute_cheat_rollback_run,
+    CheatJournalInspectionError, CheatProviderCoverageReport, CheatRollbackAvailability,
+    CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
+    DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
+    GameHackingGameCubeProvider, GameHackingProvider, GameHackingWiiFetchOptions,
+    GameHackingWiiProvider, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
+    RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
+    build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
+    default_shared_history_root, discover_cheat_history, discover_shared_apply_history,
+    execute_cheat_install_run, execute_cheat_rollback_run, import_wii_game_page_bootstrap_file,
     inspect_cheat_install_journal, load_catalogue_evidence_read_only,
-    load_cheat_catalogue_snapshot, preview_retroarch_patch_and_cheat_destinations,
+    load_cheat_catalogue_snapshot, load_dolphin_catalogue, load_gamecube_catalogue,
+    preview_retroarch_patch_and_cheat_destinations, region_for_game_id,
 };
+use archivefs_core::platform::{
+    DetectionConfidence, DetectionRequest, DetectionSource, PlatformDetectionReport,
+    detect_platform_report,
+};
+use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{
     ArchiveFsError, ArchiveIndex, ArchiveIndexEntry, ArchiveIndexFreshness, ArchiveIndexSummary,
     ArchiveInfo, ArchiveScanner, ArchiveStats, ArchiveStatus, BulkPlatformAssignmentResult,
@@ -34,18 +65,21 @@ use archivefs_core::{
     apply_library_view_default, build_and_write_archive_index, canonical_platform_names,
     catalogue_health_report, check_archive_index_freshness, check_database_health,
     clean_mount_root, cleanup_selected_mount_dir, current_archive_info, current_archive_stats,
-    current_statuses, default_database_path, default_index_path, diagnose_database,
-    find_archive_index_entries, latest_schema_version, list_source_folder_views_default,
-    load_library_view_configs_default, load_source_folder_configs_default, mount_archives,
-    mount_one_archive, persisted_archive_has_unknown_platform, preview_library_view_default,
-    read_default_archive_index, remove_library_view_default, remove_source_folder_default,
-    repair_library_view_default, resolve_source_folder_identifier, run_config_check_default,
-    run_doctor_default, scan_all_enabled_sources_default, scan_and_persist,
-    scan_source_folder_default, set_source_folder_enabled_default, summarize_archive_index,
-    unmount_archives, unmount_one_archive, watch_archive_index,
+    current_statuses, default_config_path, default_database_path, default_index_path,
+    diagnose_database, find_archive_index_entries, latest_schema_version,
+    list_source_folder_views_default, load_library_view_configs_default,
+    load_source_folder_configs_default, mount_archives, mount_one_archive,
+    persisted_archive_has_unknown_platform, plan_stale_mount_directories,
+    preview_library_view_default, read_archive_index, read_default_archive_index,
+    remove_library_view_default, remove_source_folder_default, repair_library_view_default,
+    resolve_source_folder_identifier, run_config_check_default, run_doctor_default,
+    run_setup_diagnostics_read_only, scan_all_enabled_sources_default, scan_and_persist,
+    scan_source_folder_default, set_source_folder_enabled_default, source_health_issues,
+    summarize_archive_index, unmount_archives, unmount_one_archive, watch_archive_index,
 };
 use serde::Serialize;
 
+mod bsfree;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -226,16 +260,68 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "doctor" => {
-            let json = args.any(|arg| arg == "--json");
-            let report = run_doctor_default();
-            if json {
-                print_doctor_report_json(&report)?;
+            let input_args = args.collect::<Vec<_>>();
+            let json = input_args.iter().any(|arg| arg == "--json");
+            // `--findings` selects the shared read-only Doctor model. The
+            // default output is deliberately byte-identical to before, so
+            // existing scripts keep working.
+            let mut input_args = input_args;
+            let repair_action = extract_named_string_flag(&mut input_args, "--repair")?;
+            if let Some(action_id) = repair_action {
+                let action = DoctorRepairAction::from_id(&action_id).ok_or_else(|| {
+                    format!(
+                        "unknown repair action {action_id:?}; expected one of: {}",
+                        DoctorRepairAction::ALL
+                            .iter()
+                            .map(|action| action.spec().id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+                let finding_id = extract_named_string_flag(&mut input_args, "--finding")?
+                    .ok_or("doctor --repair requires --finding <finding-id>")?;
+                let affected = extract_named_string_flag(&mut input_args, "--resource")?;
+                let confirm = extract_flag(&mut input_args, "--confirm");
+                let dry_run = extract_flag(&mut input_args, "--dry-run");
+                let json = extract_flag(&mut input_args, "--json") || json;
+                if !input_args.is_empty() {
+                    return Err(format!("doctor --repair does not accept {input_args:?}").into());
+                }
+                let outcome =
+                    run_doctor_repair(action, &finding_id, affected.as_deref(), confirm, dry_run)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    print!("{}", format_doctor_repair(&outcome));
+                }
+            } else if input_args.iter().any(|arg| arg == "--findings") {
+                let scan = gather_doctor_scan();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&scan)?);
+                } else {
+                    print!("{}", format_doctor_scan(&scan));
+                }
             } else {
-                print_doctor_report(&report);
+                let report = run_doctor_default();
+                if json {
+                    print_doctor_report_json(&report)?;
+                } else {
+                    print_doctor_report(&report);
+                }
             }
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
+        }
+        "cheats" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            if input_args.first().map(String::as_str) != Some("source")
+                || input_args.get(1).map(String::as_str) != Some("bsfree")
+            {
+                return Err("cheats currently supports only `source bsfree <command>`".into());
+            }
+            input_args.drain(0..2);
+            bsfree::run(input_args)?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -254,6 +340,365 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print!("{}", format_advisory_patch_plan(&plan));
+            }
+        }
+        "gamehacking-ps2-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-ps2-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let provider = GameHackingProvider::default();
+            let result = provider.refresh_ps2_index(&options, |progress| {
+                eprintln!(
+                    "GameHacking PS2 index: {}/{} pages · {} games · page {} {}",
+                    progress.pages_complete,
+                    progress.pages_total,
+                    progress.games_collected,
+                    progress
+                        .page_number
+                        .map(|page| page.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    if progress.downloaded {
+                        "downloaded"
+                    } else {
+                        "cached"
+                    }
+                );
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking PS2 catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "gamehacking-gamecube-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let provider = GameHackingGameCubeProvider::default();
+            let result = provider.refresh_gamecube_index(&options, |progress| {
+                eprintln!(
+                    "GameHacking GameCube index: {}/{} pages · {} games · page {} {}",
+                    progress.pages_complete,
+                    progress.pages_total,
+                    progress.games_collected,
+                    progress
+                        .page_number
+                        .map(|page| page.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    if progress.downloaded {
+                        "downloaded"
+                    } else {
+                        "cached"
+                    }
+                );
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking GameCube catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "gamehacking-wii-index-refresh" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let _resume = extract_flag(&mut input_args, "--resume");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-wii-index-refresh does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingWiiFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            options.force_refresh = false;
+            options.delay = std::time::Duration::from_secs(2);
+            let result =
+                GameHackingWiiProvider::default().refresh_wii_index(&options, |progress| {
+                    eprintln!(
+                        "GameHacking Wii index: {}/{} pages · {} games · page {} {}",
+                        progress.pages_complete,
+                        progress.pages_total,
+                        progress.games_collected,
+                        progress
+                            .page_number
+                            .map(|page| page.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        if progress.downloaded {
+                            "downloaded"
+                        } else {
+                            "cached"
+                        }
+                    );
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "GameHacking Wii catalogue ready: {} games from {} pages ({} downloaded, {} cached)\n{}",
+                    result.games,
+                    result.pages_total,
+                    result.pages_downloaded,
+                    result.pages_reused,
+                    result.catalogue_path.display()
+                );
+            }
+        }
+        "game-identity-inspect" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let path = extract_named_path_flag(&mut input_args, "--path")?
+                .ok_or("game-identity-inspect requires --path <image>")?;
+            let platform = extract_named_flag(&mut input_args, "--platform")?;
+            if !input_args.is_empty() {
+                return Err(
+                    format!("game-identity-inspect does not accept {:?}", input_args).into(),
+                );
+            }
+            let trusted = Config::load_default()
+                .map(|config| TrustedRoots::from_config(&config))
+                .unwrap_or_else(|_| TrustedRoots::none());
+            let report =
+                inspect_catalogued_game_identity_in_roots(&path, platform.as_deref(), &trusted);
+            if json {
+                print_game_identity_report_json(&report)?;
+            } else {
+                print_game_identity_report(&report);
+            }
+        }
+        "gamehacking-wii-import-page" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-wii-import-page requires --game-id <id>")?;
+            let image = extract_named_path_flag(&mut input_args, "--image")?
+                .ok_or("gamehacking-wii-import-page requires --image <path>")?;
+            let file = extract_named_path_flag(&mut input_args, "--file")?
+                .ok_or("gamehacking-wii-import-page requires --file <saved-page.html>")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-wii-import-page does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingWiiFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let trusted = Config::load_default()
+                .map(|config| TrustedRoots::from_config(&config))
+                .unwrap_or_else(|_| TrustedRoots::none());
+            let report = inspect_catalogued_game_identity_in_roots(&image, Some("Wii"), &trusted);
+            let identity = WiiGameIdentity::from_report(
+                image
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Wii game"),
+                &report,
+            );
+            let outcome = import_wii_game_page_bootstrap_file(
+                &options.cache_root,
+                &identity,
+                game_id,
+                &file,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("Imported GameHacking.org Wii game {}", outcome.game_id);
+                println!("Verified Dolphin Game ID: {}", outcome.dolphin_game_id);
+                println!("Game: {}", outcome.game_title);
+                println!("Imported cheats: {}", outcome.cheats.len());
+                println!("Supported cheats: {}", outcome.supported_cheat_count);
+                println!(
+                    "Blocked or unknown cheats: {}",
+                    outcome.blocked_or_unknown_count
+                );
+                println!("Cache: {}", outcome.cache_path.display());
+                println!("Catalogue: {}", outcome.catalogue_path.display());
+                println!("Coverage: {}", outcome.coverage.label());
+                println!("Content SHA-256: {}", outcome.content_sha256);
+                println!("Provenance: {}", outcome.provenance);
+                println!(
+                    "Network used: {}",
+                    if outcome.network_used { "yes" } else { "no" }
+                );
+            }
+        }
+        "gamehacking-gamecube-sysid-diagnostic" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-gamecube-sysid-diagnostic requires --game-id <id>")?;
+            let verify_fetch = extract_flag(&mut input_args, "--verify-fetch");
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-sysid-diagnostic does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let catalogue = load_gamecube_catalogue(&options.cache_root)?;
+            let record = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| {
+                    format!(
+                        "game {game_id} was not found in the cached GameCube catalogue; run gamehacking-gamecube-index-refresh first"
+                    )
+                })?;
+            let game = record.as_game();
+            let provider = GameHackingGameCubeProvider::default();
+            let diagnostics = provider.diagnose_export_form(&game, &options)?;
+            let cheats = if verify_fetch && diagnostics.sys_id.is_some() {
+                Some(provider.fetch_cheats_for_diagnostic(&game, &options)?)
+            } else {
+                None
+            };
+            if json {
+                #[derive(serde::Serialize)]
+                struct DiagnosticOutput<'a> {
+                    #[serde(flatten)]
+                    diagnostics: &'a archivefs_core::patch_manager::GameCubeSysIdDiagnostics,
+                    cheats:
+                        Option<&'a Vec<archivefs_core::patch_manager::GameHackingGameCubeCheat>>,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&DiagnosticOutput {
+                        diagnostics: &diagnostics,
+                        cheats: cheats.as_ref(),
+                    })?
+                );
+            } else {
+                println!("Game ID: {}", diagnostics.game_id);
+                println!("Title: {}", diagnostics.title);
+                println!("Game page URL: {}", diagnostics.game_page_url);
+                println!("Export form action: {}", diagnostics.export_form_action);
+                println!("Hidden fields:");
+                for (name, value) in &diagnostics.hidden_fields {
+                    println!("  {name} = {value}");
+                }
+                match diagnostics.sys_id {
+                    Some(sys_id) => println!("Confirmed sysID: {sys_id}"),
+                    None => println!(
+                        "Confirmed sysID: none found (no hidden sysID field, or it did not parse as a number)"
+                    ),
+                }
+                if let Some(cheats) = &cheats {
+                    println!("Verified fetch: {} named cheat(s) parsed", cheats.len());
+                    for cheat in cheats {
+                        println!("  - {} [{:?}]", cheat.name, cheat.code_format);
+                    }
+                }
+            }
+        }
+        "gamehacking-gamecube-code-format-audit" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let game_id = extract_named_u64_flag(&mut input_args, "--game-id")?
+                .ok_or("gamehacking-gamecube-code-format-audit requires --game-id <id>")?;
+            let cache_root = extract_named_path_flag(&mut input_args, "--cache-root")?;
+            if !input_args.is_empty() {
+                return Err(format!(
+                    "gamehacking-gamecube-code-format-audit does not accept {:?}",
+                    input_args
+                )
+                .into());
+            }
+            let mut options = GameHackingGameCubeFetchOptions::defaults()?;
+            if let Some(cache_root) = cache_root {
+                options.cache_root = cache_root;
+            }
+            let catalogue = load_gamecube_catalogue(&options.cache_root)?;
+            let record = catalogue
+                .games
+                .iter()
+                .find(|record| record.game_id == game_id)
+                .ok_or_else(|| {
+                    format!(
+                        "game {game_id} was not found in the cached GameCube catalogue; run gamehacking-gamecube-index-refresh first"
+                    )
+                })?;
+            let game = record.as_game();
+            let provider = GameHackingGameCubeProvider::default();
+            let cheats = provider.fetch_cheats_for_diagnostic(&game, &options)?;
+            let diagnostics: Vec<_> = cheats
+                .iter()
+                .map(archivefs_core::patch_manager::diagnose_gamecube_cheat_code_format)
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+            } else {
+                println!("Game ID: {game_id}");
+                println!("Title: {}", game.title);
+                println!("Cheats: {}", diagnostics.len());
+                for cheat in &diagnostics {
+                    println!();
+                    println!("- {}", cheat.name);
+                    println!("  Author: {}", cheat.author.as_deref().unwrap_or("(none)"));
+                    println!("  Line count: {}", cheat.line_count);
+                    println!("  Opcode prefixes: {}", cheat.opcode_prefixes.join(", "));
+                    println!("  Classification: {:?}", cheat.code_format);
+                    println!("  Reason: {}", cheat.classification_reason);
+                    println!("  Raw lines:");
+                    for line in &cheat.code_lines {
+                        println!("    {line}");
+                    }
+                }
             }
         }
         "retroarch-environment" => {
@@ -327,6 +772,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_cheat_availability_report(&report));
+            }
+        }
+        "cheat-provider-coverage" => {
+            let mut input_args = args.collect::<Vec<_>>();
+            let json = extract_flag(&mut input_args, "--json");
+            let archive_ids = extract_repeated_id_flags(&mut input_args)?;
+            let dolphin_cache_root =
+                extract_named_path_flag(&mut input_args, "--dolphin-cache-root")?;
+            let retroarch_catalogue_root =
+                extract_named_path_flag(&mut input_args, "--retroarch-catalogue")?;
+            if !input_args.is_empty() {
+                return Err(
+                    format!("cheat-provider-coverage does not accept {:?}", input_args).into(),
+                );
+            }
+            if archive_ids.is_empty() {
+                return Err(
+                    "cheat-provider-coverage requires at least one exact --id <archive-id>".into(),
+                );
+            }
+            if archive_ids.len() > 32 {
+                return Err(
+                    "cheat-provider-coverage accepts at most 32 archive IDs per bounded run".into(),
+                );
+            }
+            let report = run_cheat_provider_coverage(
+                &default_database_path()?,
+                &archive_ids,
+                dolphin_cache_root.as_deref(),
+                retroarch_catalogue_root.as_deref(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_cheat_provider_coverage(&report));
             }
         }
         "retroarch-cheat-install" => {
@@ -769,6 +1249,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&saved)?);
             } else {
                 print_platform_alias_saved(&saved);
+            }
+        }
+        "platform-detect" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let audit = extract_flag(&mut input_args, "--audit");
+            let manual = extract_named_string_flag(&mut input_args, "--assume-manual")?;
+            let root_flag = extract_named_string_flag(&mut input_args, "--root")?;
+            if audit {
+                let root = root_flag
+                    .map(PathBuf::from)
+                    .ok_or("platform-detect --audit requires --root <directory>")?;
+                let limit = extract_named_string_flag(&mut input_args, "--limit")?
+                    .map(|value| value.parse::<usize>())
+                    .transpose()
+                    .map_err(|error| format!("--limit must be a number: {error}"))?;
+                if !input_args.is_empty() {
+                    return Err(format!("platform-detect does not accept {input_args:?}").into());
+                }
+                let report = audit_platform_detection(&root, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", format_platform_audit(&report));
+                }
+            } else {
+                let Some(target) = input_args.first().cloned() else {
+                    return Err(
+                        "platform-detect requires a path, e.g. archivefs-cli platform-detect /roms/scummvm/laurabow2/RESOURCE.GEN"
+                            .into(),
+                    );
+                };
+                input_args.remove(0);
+                if !input_args.is_empty() {
+                    return Err(format!("platform-detect does not accept {input_args:?}").into());
+                }
+                let target = PathBuf::from(target);
+                // The source root defaults to every configured source folder
+                // that actually contains the path, so folder-alias matching sees
+                // the same boundary a real scan would.
+                let root = match root_flag {
+                    Some(root) => PathBuf::from(root),
+                    None => Config::load_default()
+                        .ok()
+                        .and_then(|config| {
+                            config
+                                .source_folders
+                                .into_iter()
+                                .find(|folder| target.starts_with(folder))
+                        })
+                        .or_else(|| target.parent().map(Path::to_path_buf))
+                        .unwrap_or_default(),
+                };
+                // Every configured source folder is a trusted root, so a game
+                // file symlinked from one source into another can have its
+                // signature read. Reading only - nothing here is ever a write
+                // destination.
+                let trusted = Config::load_default()
+                    .map(|config| TrustedRoots::from_config(&config))
+                    .unwrap_or_else(|_| TrustedRoots::from_paths([&root]));
+                let request = DetectionRequest::new(&target, &root)
+                    .with_manual_platform(manual.as_deref())
+                    .inspecting_content()
+                    .with_trusted_roots(trusted);
+                let report = detect_platform_report(&request);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", format_platform_detection(&target, &root, &report));
+                }
             }
         }
         "platform-alias-remove" => {
@@ -1397,6 +1947,194 @@ fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
         }
     }
     format_retroarch_artifact_inventory(&mut output, &plan.artifact_inventory);
+    output
+}
+
+fn run_cheat_provider_coverage(
+    database_path: &Path,
+    archive_ids: &[i64],
+    dolphin_cache_root: Option<&Path>,
+    retroarch_catalogue_root: Option<&Path>,
+) -> Result<CheatProviderCoverageReport, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err("the ArchiveFS library database does not exist; run library-scan first".into());
+    }
+    let database = Database::open_read_only(database_path)?;
+    let archives = database.load_archives()?;
+    database.close()?;
+
+    let mut selected = Vec::with_capacity(archive_ids.len());
+    for id in archive_ids {
+        let Some(archive) = archives.iter().find(|archive| archive.id == *id) else {
+            return Err(format!("archive id {id} is not present in the library catalogue").into());
+        };
+        if selected
+            .iter()
+            .any(|existing: &&archivefs_core::PersistedArchive| existing.id == *id)
+        {
+            continue;
+        }
+        selected.push(archive);
+    }
+
+    let mut dolphin_games = Vec::new();
+    let mut retroarch_games = Vec::new();
+    for archive in selected {
+        let platform = archive
+            .platform
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let identity =
+            inspect_catalogued_game_identity(&archive.absolute_path, archive.platform.as_deref());
+        let content_basename = archive
+            .absolute_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_string);
+        let mut coverage = CoverageGameIdentity {
+            archive_id: archive.id,
+            title: archive.display_name.clone(),
+            platform: platform.clone(),
+            identity_kind: None,
+            verified_identity: None,
+            region: None,
+            revision: None,
+            serial: identity.verified_ps2_serial().map(str::to_string),
+            content_hash: identity
+                .verified_pcsx2_crc()
+                .or_else(|| identity.verified_loose_rom_sha256())
+                .map(str::to_string),
+            content_basename,
+        };
+        if platform.eq_ignore_ascii_case("GameCube") || platform.eq_ignore_ascii_case("Wii") {
+            coverage.verified_identity = identity.verified_dolphin_game_id().map(str::to_string);
+            coverage.identity_kind = coverage
+                .verified_identity
+                .as_ref()
+                .map(|_| "dolphin_game_id".to_string());
+            coverage.revision = identity
+                .verified_dolphin_revision()
+                .map(|value| value.to_string());
+            coverage.region = coverage
+                .verified_identity
+                .as_deref()
+                .and_then(region_for_game_id)
+                .map(|region| region.display_name().to_string());
+            dolphin_games.push(coverage);
+        } else if platform.eq_ignore_ascii_case("PlayStation 2")
+            || platform.eq_ignore_ascii_case("Xbox 360")
+        {
+            return Err(format!(
+                "archive id {} routes to {}, which is outside this Dolphin/RetroArch audit",
+                archive.id, platform
+            )
+            .into());
+        } else {
+            if let Some(value) = coverage.content_hash.clone() {
+                coverage.verified_identity = Some(value);
+                coverage.identity_kind = Some(
+                    if identity
+                        .verified_value(IdentityKind::Pcsx2ExecutableCrc)
+                        .is_some()
+                    {
+                        "content_crc".to_string()
+                    } else {
+                        "content_sha256".to_string()
+                    },
+                );
+            } else if let Some(value) = coverage.serial.clone() {
+                coverage.verified_identity = Some(value);
+                coverage.identity_kind = Some("serial".to_string());
+            }
+            retroarch_games.push(coverage);
+        }
+    }
+
+    let dolphin_root = dolphin_cache_root
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(default_dolphin_catalogue_cache_root)?;
+    let dolphin_catalogue = match load_dolphin_catalogue(&dolphin_root)? {
+        DolphinCatalogueLoad::NotInstalled => None,
+        DolphinCatalogueLoad::Ready(catalogue) => Some(catalogue),
+    };
+    let filesystem = HostReadOnlyFilesystem;
+    let retroarch_catalogue = retroarch_catalogue_root
+        .map(|root| load_cheat_catalogue_snapshot(&filesystem, "local-provider", root));
+
+    Ok(build_cheat_provider_coverage_report(
+        &dolphin_games,
+        dolphin_catalogue.as_deref(),
+        &retroarch_games,
+        retroarch_catalogue.as_ref(),
+    ))
+}
+
+fn format_cheat_provider_coverage(report: &CheatProviderCoverageReport) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(&mut output, "ArchiveFS Cheat Provider Coverage Audit").unwrap();
+    writeln!(
+        &mut output,
+        "Read-only bounded selection: yes | Games: {} | With compatible cheats: {} | Without: {}",
+        report.summary.games_inspected,
+        report.summary.games_with_compatible_cheats,
+        report.summary.games_without_compatible_cheats
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "Compatible cheats: {} | Rejected candidates: {} | Duplicates: {} | Conflicts: {} | Unsupported formats: {}",
+        report.summary.compatible_cheats,
+        report.summary.rejected_candidates,
+        report.summary.duplicates,
+        report.summary.conflicts,
+        report.summary.unsupported_formats
+    )
+    .unwrap();
+    for game in &report.games {
+        writeln!(
+            &mut output,
+            "\n{} / {} — {} ({})",
+            game.emulator, game.provider_name, game.game_title, game.platform
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  verified identity: {}",
+            game.verified_identity.as_deref().unwrap_or("unavailable")
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  region: {} | revision: {}",
+            game.region.as_deref().unwrap_or("unavailable"),
+            game.revision.as_deref().unwrap_or("unavailable")
+        )
+        .unwrap();
+        writeln!(
+            &mut output,
+            "  compatible cheats: {} | rejected: {} | duplicates: {} | conflicts: {} | unsupported: {}",
+            game.compatible_cheat_count,
+            game.rejected_candidate_count,
+            game.duplicate_count,
+            game.conflicting_entry_count,
+            game.unsupported_format_count
+        )
+        .unwrap();
+        for reason in &game.rejection_reasons {
+            writeln!(
+                &mut output,
+                "  rejected ({}): {}",
+                reason.count, reason.explanation
+            )
+            .unwrap();
+        }
+        if let Some(reason) = game.no_match_reason {
+            writeln!(&mut output, "  no match: {}", reason.explanation()).unwrap();
+        }
+    }
     output
 }
 
@@ -3404,6 +4142,29 @@ fn extract_cheat_destination_root_flag(
     Ok(Some(PathBuf::from(value)))
 }
 
+fn extract_named_string_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(value))
+}
+
 fn extract_named_path_flag(
     args: &mut Vec<String>,
     flag: &str,
@@ -3425,6 +4186,55 @@ fn extract_named_path_flag(
     let value = args.remove(position + 1);
     args.remove(position);
     Ok(Some(PathBuf::from(value)))
+}
+
+fn extract_named_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    Ok(Some(value))
+}
+
+fn extract_named_u64_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{flag} may be specified only once").into());
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= args.len() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    let value = args.remove(position + 1);
+    args.remove(position);
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}").into())
 }
 
 fn cheat_history_options(
@@ -3742,6 +4552,404 @@ fn print_unmount_one(plan: &MountPlan) {
     println!("  Mount:   {}", plan.mount_path.display());
 }
 
+/// Collects every read-only Doctor input this CLI can supply, then runs the
+/// pure runner over them.
+///
+/// Every gather is fallible in isolation: a subsystem that cannot be
+/// collected becomes `Gathered::Failed` (a visible finding) or
+/// `Gathered::NotLoaded` (a visible "not checked" note), never a silent gap
+/// and never an aborted command.
+///
+/// Nothing here mutates. In particular this uses `run_doctor_read_only`
+/// rather than `run_doctor`, because the latter creates a missing mount root
+/// and would make a diagnostic command change the filesystem.
+fn gather_doctor_scan() -> DoctorScan {
+    // `run_doctor_read_only_default()` is deliberately not used: it still
+    // calls `ArchiveScanner::scan_archives()`, and a diagnostic run must not
+    // scan the library.
+    //
+    // `run_setup_diagnostics_read_only` is the probe-free variant: it reports
+    // config presence, config parsing, source folders, mount-root presence
+    // and tool presence exactly as usual, and reports mount-root writability
+    // as "not probed" rather than creating and removing a file to find out.
+    let setup = match default_config_path() {
+        Ok(path) => Gathered::Ready(run_setup_diagnostics_read_only(path)),
+        Err(error) => {
+            Gathered::Failed(format!("configuration path could not be resolved: {error}"))
+        }
+    };
+
+    let config = Config::load_default();
+    let mount_root_safety = match &config {
+        Ok(config) => Gathered::Ready(assess_mount_root_safety(&config.mount_root)),
+        Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+    };
+
+    let database_path = default_database_path();
+    let database = match &database_path {
+        Ok(path) => Gathered::Ready(diagnose_database(path)),
+        Err(error) => Gathered::Failed(format!("database path could not be resolved: {error}")),
+    };
+
+    // Catalogue-only health: no live session exists in a CLI, so
+    // `catalogue_health_report` is the honest source (it never claims
+    // `AwaitingValidation` or `CachedOnly`).
+    let health = match &database_path {
+        Ok(path) => match Database::open_read_only(path).and_then(|db| db.load_archives()) {
+            Ok(archives) => Gathered::Ready(catalogue_health_report(&archives).issues),
+            Err(error) => Gathered::Failed(format!("catalogue could not be read: {error}")),
+        },
+        Err(error) => Gathered::Failed(format!("database path could not be resolved: {error}")),
+    };
+
+    let source_health = match list_source_folder_views_default() {
+        Ok(views) => Gathered::Ready(source_health_issues(&views)),
+        Err(error) => Gathered::Failed(format!("source folders could not be listed: {error}")),
+    };
+
+    let transactions = match default_shared_history_root() {
+        Ok(root) => Gathered::Ready(discover_shared_apply_history(&root)),
+        Err(error) => Gathered::Failed(format!(
+            "install history root is unavailable: {}",
+            error.detail
+        )),
+    };
+
+    let config_for_plan = Config::load_default();
+    let stale = match &config_for_plan {
+        Ok(config) => match plan_stale_mount_directories(config) {
+            Ok(stale) => Gathered::Ready(stale),
+            Err(error) => {
+                Gathered::Failed(format!("the mount root could not be inspected: {error}"))
+            }
+        },
+        Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+    };
+    let index_path = default_index_path();
+    let freshness = match &index_path {
+        Ok(path) => match read_archive_index(path) {
+            Ok(index) => Gathered::Ready(check_archive_index_freshness(&index)),
+            // A missing or unreadable index is not a gather failure: there
+            // is simply nothing to report about its freshness yet.
+            Err(_) => Gathered::NotLoaded(
+                "No archive index has been built yet, or it could not be read. Run `archivefs index-build` to create one.",
+            ),
+        },
+        Err(error) => Gathered::Failed(format!("index path could not be resolved: {error}")),
+    };
+
+    // Emulator profiles, then everything that depends on where they live.
+    // Discovery inspects documented paths only and creates nothing; Xenia has
+    // no documented native path, so it is discovered only from roots the user
+    // has already supplied - none from a CLI.
+    let mount_table = mount_table();
+    let discovered = DiscoveredProfiles::from_environment(Vec::new());
+    let profile_report = assess_emulator_profiles(&discovered.borrowed(), mount_table.as_deref());
+
+    let storage = assess_storage(&storage_resources(
+        config.as_ref().ok(),
+        database_path.as_ref().ok().map(PathBuf::as_path),
+        index_path.as_ref().ok().map(PathBuf::as_path),
+        default_shared_history_root().ok().as_deref(),
+        &profile_destination_directories(&profile_report),
+    ));
+
+    // Managed entries are accounted for against the install history. Without
+    // that history there is no ownership record, so nothing can be claimed.
+    let managed = match &transactions {
+        Gathered::Ready(history) => Gathered::Ready(scan_managed_entries(
+            history,
+            &managed_scan_targets(&profile_report),
+        )),
+        Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+        Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+    };
+
+    let inputs = DoctorScanInputs {
+        doctor_report: Gathered::NotLoaded(
+            "The archive-scan and mount-status checks need a library snapshot, which a diagnostic run never builds. Run `archivefs status` or open the GUI for those.",
+        ),
+        setup: match &setup {
+            Gathered::Ready(report) => Gathered::Ready(report),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        health_issues: match &health {
+            Gathered::Ready(issues) => Gathered::Ready(issues.as_slice()),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        source_health: match &source_health {
+            Gathered::Ready(issues) => Gathered::Ready(issues.as_slice()),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        database: match &database {
+            Gathered::Ready(report) => Gathered::Ready(report),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        mount_root_safety: match &mount_root_safety {
+            Gathered::Ready(safety) => Gathered::Ready(safety),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        // Discovering RetroArch profiles walks directories, which is a scan.
+        // Doctor never starts one; `retroarch-environment` exists for that.
+        retroarch: Gathered::NotLoaded(
+            "RetroArch discovery walks directories, so Doctor does not start it. Run `archivefs retroarch-environment` for those findings.",
+        ),
+        transactions: match &transactions {
+            Gathered::Ready(report) => Gathered::Ready(report),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        stale_mount_directories: match &stale {
+            Gathered::Ready(stale) => Gathered::Ready(stale.as_slice()),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        index_freshness: match (&freshness, &index_path) {
+            (Gathered::Ready(freshness), Ok(path)) => Gathered::Ready((freshness, path.as_path())),
+            (Gathered::Failed(reason), _) => Gathered::Failed(reason.clone()),
+            (Gathered::NotLoaded(reason), _) => Gathered::NotLoaded(reason),
+            (Gathered::Ready(_), Err(_)) => {
+                Gathered::NotLoaded("the index path could not be resolved")
+            }
+        },
+        storage: Gathered::Ready(&storage),
+        emulator_profiles: Gathered::Ready(&profile_report),
+        managed_entries: match &managed {
+            Gathered::Ready(scan) => Gathered::Ready(scan),
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+        free_space_policy: FreeSpacePolicy::default(),
+    };
+    run_doctor_scan(&inputs)
+}
+
+/// Runs one Doctor repair.
+///
+/// The target is never taken from the command line. `--finding` (and
+/// `--resource`, when several findings share an id) *selects* a finding in a
+/// freshly gathered scan; `--resource` must equal the resource that finding
+/// itself reported, so it can never introduce a target of its own. Every
+/// safety gate is then re-applied against live state inside
+/// `execute_doctor_repair`. There is no flag that accepts a filesystem path
+/// to operate on.
+fn run_doctor_repair(
+    action: DoctorRepairAction,
+    finding_id: &str,
+    affected: Option<&str>,
+    confirmed: bool,
+    dry_run: bool,
+) -> Result<DoctorRepairOutcome, Box<dyn std::error::Error>> {
+    let config = Config::load_default()?;
+    let index_path = default_index_path()?;
+    // A fresh scan, so the finding is resolved against current state rather
+    // than against whatever a previous `--findings` run reported.
+    let scan = gather_doctor_scan();
+    let request = DoctorRepairRequest {
+        action,
+        finding_id: finding_id.to_string(),
+        affected: affected.map(str::to_string),
+        confirmed,
+        dry_run,
+    };
+    Ok(execute_doctor_repair(
+        &request,
+        &DoctorRepairContext {
+            config: &config,
+            scan: &scan,
+            index_path: &index_path,
+        },
+    ))
+}
+
+/// Renders a repair outcome for a terminal.
+///
+/// Exit-status policy matches `doctor --findings`: 0 whenever the command
+/// itself ran, including when the repair was refused or failed. The outcome's
+/// `status` field (and `--json`) is the machine-readable result.
+fn format_doctor_repair(outcome: &DoctorRepairOutcome) -> String {
+    let spec = &outcome.spec;
+    let record = &outcome.record;
+    let mut lines = vec![
+        format!("Repair: {} ({})", spec.title, spec.id),
+        format!("Calls: {}", spec.invokes),
+        format!("Finding: {}", record.finding_id),
+    ];
+    if let Some(affected) = &record.affected {
+        lines.push(format!("Resource: {}", affected.display));
+    }
+    lines.push(format!("Confirmed: {}", record.confirmed));
+    lines.push(format!("Dry run: {}", record.dry_run));
+    lines.push(format!(
+        "Result: {}",
+        match record.status {
+            DoctorRepairStatus::DryRun => "dry run - validated, nothing changed",
+            DoctorRepairStatus::Rejected => "refused",
+            DoctorRepairStatus::Succeeded => "completed",
+            DoctorRepairStatus::Failed => "failed",
+        }
+    ));
+    lines.push(format!("Verification: {}", record.verification.label()));
+    lines.push(format!("Undo: {}", record.undo.label()));
+    if !record.changed_paths.is_empty() {
+        lines.push("Changed:".to_string());
+        for path in &record.changed_paths {
+            lines.push(format!("  {}", path.display));
+        }
+    }
+    if let Some(error) = &record.error {
+        lines.push(format!("Error: {error}"));
+    }
+    lines.push(record.summary.clone());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// Renders a scan for a terminal.
+///
+/// Exit-status policy: `archivefs doctor --findings` exits 0 whenever the
+/// scan itself completed, *including* when it reports critical findings.
+/// Findings describe the installation, not the command, and the existing
+/// `doctor` command behaves the same way, so scripts that only check the
+/// exit code do not silently change meaning. A non-zero exit means the
+/// command could not run at all. Callers that want to gate on severity
+/// should read `--json` and inspect `findings[].severity`.
+fn format_doctor_scan(scan: &DoctorScan) -> String {
+    let mut lines = vec![
+        "ArchiveFS Doctor - read-only diagnostic scan".to_string(),
+        "Nothing was changed, created, mounted, repaired or written.".to_string(),
+        String::new(),
+    ];
+
+    if scan.is_healthy() {
+        lines.push("No problems detected by the available read-only checks.".to_string());
+    } else {
+        lines.push(
+            scan.counts()
+                .iter()
+                .map(|(severity, count)| format!("{}: {count}", severity.label()))
+                .collect::<Vec<_>>()
+                .join("  "),
+        );
+    }
+    lines.push(String::new());
+
+    for (category, findings) in scan.by_category() {
+        lines.push(format!("{} ({})", category.label(), findings.len()));
+        for finding in findings {
+            lines.push(format!(
+                "  [{}] {} - {}",
+                finding.severity.label().to_lowercase(),
+                finding.id,
+                finding.title
+            ));
+            lines.push(format!("      {}", finding.explanation));
+            if let Some(affected) = &finding.affected {
+                lines.push(format!(
+                    "      Resource: {}{}",
+                    affected.display,
+                    if affected.lossy {
+                        " (path shown lossily; it contains non-UTF-8 bytes)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if let Some(why) = &finding.why_it_matters {
+                lines.push(format!("      Why it matters: {why}"));
+            }
+            if let Some(next) = &finding.next_step {
+                lines.push(format!("      Next step: {next}"));
+            }
+            for item in &finding.evidence {
+                lines.push(format!("      Evidence: {item}"));
+            }
+            // The same facts as the evidence above, as typed values. `--json`
+            // carries these verbatim so a script never parses prose.
+            for (key, value) in &finding.measurements {
+                lines.push(format!("      Measured: {key} = {value}"));
+            }
+            if let Some(repair) = finding.offered_repair() {
+                lines.push(format!(
+                    "      Repair available: {} (--repair {})",
+                    repair.title, repair.id
+                ));
+                lines.push(format!("      Repair calls: {}", repair.invokes));
+                lines.push(format!("      Will change: {}", repair.expected_mutation));
+                lines.push(format!("      Will not touch: {}", repair.never_touches));
+                if repair.performs_library_scan {
+                    lines.push(
+                        "      Note: this repair rescans every configured source folder."
+                            .to_string(),
+                    );
+                }
+                lines.push(format!("      Undo: {}", repair.undo.label()));
+                lines.push(
+                    "      Requires --confirm; add --dry-run to validate without changing anything."
+                        .to_string(),
+                );
+            } else if let Some(recovery) = &finding.recovery {
+                lines.push(format!("      {}", recovery.notice()));
+            }
+            lines.push(format!("      Reported by: {}", finding.subsystem.label()));
+        }
+        lines.push(String::new());
+    }
+
+    if scan.merged_duplicate_count > 0 {
+        lines.push(format!(
+            "{} duplicate finding(s) were merged.",
+            scan.merged_duplicate_count
+        ));
+        lines.push(String::new());
+    }
+
+    lines.push("Checked:".to_string());
+    for entry in scan.checked_subsystems() {
+        lines.push(format!(
+            "  {} ({})",
+            entry.category.label(),
+            entry.subsystem.label()
+        ));
+    }
+    let unavailable = scan.unavailable_subsystems();
+    if !unavailable.is_empty() {
+        lines.push(String::new());
+        lines.push("Not checked in this run:".to_string());
+        for entry in unavailable {
+            let reason = match &entry.status {
+                CoverageStatus::Unavailable { reason } => reason.as_str(),
+                CoverageStatus::Checked => "",
+            };
+            lines.push(format!(
+                "  {} ({}) - {reason}",
+                entry.category.label(),
+                entry.subsystem.label()
+            ));
+        }
+    }
+    if !scan.not_checked.is_empty() {
+        lines.push(String::new());
+        lines.push("Checks that did not run:".to_string());
+        for item in &scan.not_checked {
+            lines.push(format!("  {} - {}", item.name, item.reason));
+            lines.push(format!("      Next step: {}", item.next_step));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Not implemented yet, so not covered by any result above:".to_string());
+    for deferred in scan.deferred {
+        lines.push(format!("  {} - {}", deferred.name, deferred.reason));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 fn print_doctor_report(report: &DoctorReport) {
     print!("{}", format_doctor_report(report));
 }
@@ -3861,6 +5069,149 @@ fn push_duplicate_entry(output: &mut String, index: usize, entry: &DuplicateEntr
 
 fn print_archive_info(info: &ArchiveInfo) {
     print!("{}", format_archive_info(info));
+}
+
+/// Read-only identity diagnostic for one image. Reports exactly what the
+/// shared inspector proved, never a filename guess: values appear only
+/// when their evidence reached `Verified`, and the terminal status of the
+/// primary identity evidence is surfaced as the failure code.
+fn game_identity_report_rows(report: &GameIdentityReport) -> Vec<(&'static str, String)> {
+    let is_primary_kind = |item: &&archivefs_core::game_identity::IdentityEvidence| {
+        matches!(
+            item.kind,
+            IdentityKind::DolphinGameId | IdentityKind::Ps2Serial | IdentityKind::XexTitleId
+        )
+    };
+    // Prefer proven evidence: a filename candidate for the same kind is
+    // also present, and must never be reported as the provenance of the
+    // identity or as the reason one is missing.
+    let primary = report
+        .evidence
+        .iter()
+        .find(|item| is_primary_kind(item) && item.status == IdentityStatus::Verified)
+        .or_else(|| {
+            report
+                .evidence
+                .iter()
+                .filter(is_primary_kind)
+                .find(|item| item.confidence != IdentityConfidence::FilenameOnly)
+        });
+    let missing = || "unavailable".to_string();
+    // Wii deliberately keeps the outer-header revision as a candidate, so
+    // report it separately rather than claiming it is verified.
+    let revision = report.verified_dolphin_revision().map_or_else(
+        || {
+            report
+                .evidence
+                .iter()
+                .find(|item| {
+                    item.kind == IdentityKind::DolphinRevision
+                        && item.status == IdentityStatus::Candidate
+                })
+                .and_then(|item| item.value.as_deref())
+                .map_or_else(missing, |value| format!("{value} (candidate)"))
+        },
+        |value| value.to_string(),
+    );
+    vec![
+        ("Path", report.archive_path.display().to_string()),
+        ("Platform", report.platform.label().to_string()),
+        ("Image format", format!("{:?}", report.format)),
+        (
+            "Verified Game ID",
+            report
+                .verified_dolphin_game_id()
+                .map_or_else(missing, str::to_owned),
+        ),
+        (
+            "Disc number",
+            report
+                .verified_value(IdentityKind::DolphinDiscNumber)
+                .map_or_else(missing, str::to_owned),
+        ),
+        ("Revision", revision),
+        (
+            "Region",
+            report
+                .verified_value(IdentityKind::DolphinRegion)
+                .map_or_else(missing, str::to_owned),
+        ),
+        (
+            "Provenance",
+            primary.map_or_else(missing, |item| item.provenance.method.clone()),
+        ),
+        ("Bytes read", report.bytes_read.to_string()),
+        (
+            "Failure code",
+            primary.map_or_else(
+                || "None".to_string(),
+                |item| {
+                    if item.status == IdentityStatus::Verified {
+                        "None".to_string()
+                    } else {
+                        item.status.to_string()
+                    }
+                },
+            ),
+        ),
+        ("Complete", report.complete.to_string()),
+    ]
+}
+
+fn print_game_identity_report(report: &GameIdentityReport) {
+    println!("ArchiveFS Game Identity\n");
+    for (label, value) in game_identity_report_rows(report) {
+        println!("  {label}: {value}");
+    }
+    if !report.evidence.is_empty() {
+        println!("\nEvidence:");
+        for item in &report.evidence {
+            println!(
+                "  {} = {} [{}] ({:?}; {}; {})",
+                item.kind,
+                item.value.as_deref().unwrap_or("-"),
+                item.status,
+                item.confidence,
+                item.provenance.method,
+                item.diagnostic
+            );
+        }
+    }
+}
+
+fn print_game_identity_report_json(report: &GameIdentityReport) -> Result<(), serde_json::Error> {
+    let rows = game_identity_report_rows(report)
+        .into_iter()
+        .map(|(label, value)| {
+            (
+                label.to_ascii_lowercase().replace(' ', "_"),
+                serde_json::Value::String(value),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let evidence = report
+        .evidence
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "kind": item.kind.to_string(),
+                "status": item.status.to_string(),
+                "value": item.value,
+                "confidence": format!("{:?}", item.confidence),
+                "method": item.provenance.method,
+                "diagnostic": item.diagnostic,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "identity": rows,
+            "evidence": evidence,
+            "warnings": report.warnings,
+        }))?
+    );
+    Ok(())
 }
 
 fn print_archive_info_json(info: &ArchiveInfo) -> Result<(), serde_json::Error> {
@@ -4062,14 +5413,53 @@ fn print_help() {
     println!("Commands:");
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether ArchiveFS is ready to run");
+    println!(
+        "  platform-detect <path>  Explain how platform detection sees one path: canonical platform, confidence (confirmed/probable/ambiguous/unknown), what decided it, and the full evidence with any conflicting candidates. --json for the complete structured evidence, --root <dir> to set the source-folder boundary, --assume-manual <platform> to see how an explicit assignment would override detection. Read-only: bounded header reads and one directory listing, nothing written."
+    );
+    println!(
+        "  platform-detect --audit --root <dir>  Walk a library read-only and report how detection behaves across it: counts by confidence and platform, the extensions that stay unresolved, and every classification that differs from what this build concluded before. --limit <n> to sample, --json for the full report. Corrects nothing."
+    );
+    println!(
+        "  doctor --findings  Read-only diagnostic scan across configuration, mount root, sources, library, catalogue database and install history, grouped by category with stable finding IDs (--json accepted). Changes nothing; exits 0 whenever the scan completes, whatever it finds."
+    );
+    println!(
+        "  doctor --repair <action-id> --finding <finding-id>  Perform one existing repair on a finding from a fresh scan. Actions: clean_mount_root, clean_mount_path, retry_mount, rebuild_index. Add --resource <path> when several findings share an ID; it must exactly match the resource that finding reported, and can only pick out one of Doctor's own findings - it can never point a repair at anything else, even a path that would be a valid target on its own. --confirm to allow the change, --dry-run to validate without changing anything, --json for machine-readable output. No flag accepts an arbitrary path to operate on: the target is resolved from the finding and revalidated. Exits 0 whenever the command ran, including when the repair was refused."
+    );
     println!("  config-check   Validate ArchiveFS configuration");
+    println!(
+        "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
+    println!(
+        "  gamehacking-ps2-index-refresh  Resume the cached public PS2 index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-gamecube-index-refresh  Resume the cached public GameCube index crawl and rebuild its deterministic local catalogue (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-wii-index-refresh  Resume the cached public Wii index crawl using the shared catalogue engine (--resume/--cache-root/--json accepted)"
+    );
+    println!(
+        "  game-identity-inspect --path <image> [--platform <name>] [--json]  Report the read-only disc identity evidence for one image"
+    );
+    println!(
+        "  gamehacking-wii-import-page --game-id <id> --image <path> --file <saved-page.html>  Validate and import one saved Wii game page without network access"
+    );
+    println!(
+        "  gamehacking-gamecube-sysid-diagnostic --game-id <id>  Fetch one cached catalogue game's real page and print its cheat-export form action, hidden fields, and confirmed sysID (--cache-root/--json accepted)"
+    );
+    println!(
+        "  gamehacking-gamecube-code-format-audit --game-id <id>  Fetch one cached catalogue game's real cheat export and print, per cheat, its title/author/raw code lines/opcode prefixes/classification and why (--cache-root/--json accepted)"
+    );
     println!("  retroarch-environment  Discover the local RetroArch environment (read-only)");
     println!(
         "  retroarch-patch-preview  Preview destinations and inventory existing RetroArch cheat/patch artifacts (read-only)"
     );
     println!(
         "  retroarch-cheat-catalogue <local-path>  Discover, match, and preview staging destinations for an external cheat catalogue (read-only; --cheat-destination-root <path> overrides the destination root for isolated preview only)"
+    );
+    println!(
+        "  cheat-provider-coverage --id <archive-id>...  Audit existing Dolphin/RetroArch catalogue coverage for a bounded exact selection (read-only; --dolphin-cache-root/--retroarch-catalogue/--json accepted)"
     );
     println!(
         "  retroarch-cheat-install <local-path>  Install eligible RetroArch cheats with revalidation, atomic writes, backups, and a journal (requires --cheat-destination-root and --yes to write anything; --dry-run/--replace-different/--json also accepted)"
@@ -4166,14 +5556,29 @@ fn print_help() {
     println!("Examples:");
     println!("  archivefs --version");
     println!("  archivefs doctor");
+    println!("  archivefs doctor --findings");
+    println!("  archivefs doctor --findings --json");
+    println!(
+        "  archivefs doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --dry-run"
+    );
+    println!(
+        "  archivefs doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --confirm"
+    );
     println!("  archivefs config-check");
     println!("  archivefs pcsx2-patch-preview");
     println!("  archivefs pcsx2-patch-preview --json");
+    println!("  archivefs gamehacking-ps2-index-refresh");
+    println!("  archivefs gamehacking-gamecube-index-refresh");
+    println!("  archivefs gamehacking-gamecube-sysid-diagnostic --game-id 54172");
+    println!("  archivefs gamehacking-gamecube-code-format-audit --game-id 54172");
     println!("  archivefs retroarch-environment");
     println!("  archivefs retroarch-environment --json");
     println!("  archivefs retroarch-patch-preview");
     println!("  archivefs retroarch-patch-preview --json");
     println!("  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue");
+    println!(
+        "  archivefs cheat-provider-coverage --id 12 --id 34 --retroarch-catalogue /path/to/cht --json"
+    );
     println!("  archivefs retroarch-cheat-catalogue /path/to/manifest.json --json");
     println!(
         "  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root"
@@ -7627,5 +9032,804 @@ mod tests {
         assert_eq!(json["ok"], false);
         assert_eq!(json["error"]["code"], "malformed_journal");
         assert!(json.get("inspection").is_none());
+    }
+
+    #[test]
+    fn cheat_provider_coverage_run_is_read_only_and_omits_private_paths() {
+        let root = temp_dir("cli-cheat-provider-coverage-read-only");
+        let source = root.join("MegaDrive");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        let archive_path = write_archive_file(&source, "Sonic.md", b"fixture rom bytes");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "coverage-fixture").unwrap();
+        let database = Database::open_read_only(&database_path).unwrap();
+        let archive_id = database.load_archives().unwrap()[0].id;
+        database.close().unwrap();
+
+        let retroarch_root = root.join("provider");
+        std::fs::create_dir_all(retroarch_root.join("Sega - Mega Drive - Genesis")).unwrap();
+        let cheat_path = retroarch_root
+            .join("Sega - Mega Drive - Genesis")
+            .join("Sonic.cht");
+        std::fs::write(
+            &cheat_path,
+            b"cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"00FF\"\ncheat0_enable = false\n",
+        )
+        .unwrap();
+        let dolphin_cache = root.join("absent-dolphin-cache");
+
+        let archive_before = std::fs::read(&archive_path).unwrap();
+        let database_before = std::fs::read(&database_path).unwrap();
+        let cheat_before = std::fs::read(&cheat_path).unwrap();
+        let report = run_cheat_provider_coverage(
+            &database_path,
+            &[archive_id],
+            Some(&dolphin_cache),
+            Some(&retroarch_root),
+        )
+        .unwrap();
+
+        assert_eq!(report.summary.games_inspected, 1);
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_before);
+        assert_eq!(std::fs::read(&database_path).unwrap(), database_before);
+        assert_eq!(std::fs::read(&cheat_path).unwrap(), cheat_before);
+        assert!(!dolphin_cache.exists());
+        let human = format_cheat_provider_coverage(&report);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!human.contains(root.to_string_lossy().as_ref()));
+        assert!(!json.contains(root.to_string_lossy().as_ref()));
+        assert!(human.contains("Read-only bounded selection: yes"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod doctor_stage1c_tests {
+    use super::*;
+    use archivefs_core::diagnostics::environment::{
+        FilesystemGroup, FilesystemStat, MountMode, ResourceRole, StorageAssessment,
+    };
+    use archivefs_core::diagnostics::managed::{
+        ManagedFormat, ManagedScanTarget, scan_managed_entries,
+    };
+    use archivefs_core::emulator_environment::EncodedPath;
+    use archivefs_core::patch_manager::SharedHistoryReport;
+    use std::path::Path;
+
+    fn storage_assessment(available_bytes: u64, read_only: bool) -> StorageAssessment {
+        StorageAssessment {
+            filesystems: vec![FilesystemGroup {
+                representative_path: EncodedPath::from_path(Path::new("/var/lib/archivefs")),
+                device_id: Some(1),
+                mount_point: Some(EncodedPath::from_path(Path::new("/var"))),
+                filesystem_type: Some("ext4".to_string()),
+                mount_mode: if read_only {
+                    MountMode::ReadOnly
+                } else {
+                    MountMode::ReadWrite
+                },
+                stat: Some(FilesystemStat {
+                    available_bytes,
+                    total_bytes: 100 * 1024 * 1024 * 1024,
+                }),
+                roles: vec![ResourceRole::Database],
+                paths: vec![EncodedPath::from_path(Path::new("/var/lib/archivefs"))],
+                evidence_source: "statvfs and /proc/self/mountinfo",
+            }],
+            unassessed: Vec::new(),
+            mount_table_available: true,
+        }
+    }
+
+    fn scan_with(assessment: &StorageAssessment) -> DoctorScan {
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.storage = Gathered::Ready(assessment);
+        run_doctor_scan(&inputs)
+    }
+
+    /// Test 90
+    #[test]
+    fn the_text_report_groups_low_space_under_storage_with_a_readable_size() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(text.contains("Storage (1)"));
+        assert!(text.contains("filesystem.critically_low_space"));
+        assert!(
+            text.contains("MiB"),
+            "a size must be readable, not a raw byte count"
+        );
+    }
+
+    /// Test 91
+    #[test]
+    fn the_text_report_prints_every_measured_value() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        for expected in [
+            "Measured: available_bytes = ",
+            "Measured: total_bytes = ",
+            "Measured: available_percent = ",
+            "Measured: filesystem_read_only = false",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`");
+        }
+    }
+
+    /// Test 92
+    #[test]
+    fn the_json_output_carries_typed_values_a_script_can_read() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let scan = scan_with(&assessment);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&scan).expect("serialise"))
+                .expect("valid JSON");
+        let finding = json["findings"]
+            .as_array()
+            .expect("findings is an array")
+            .iter()
+            .find(|finding| finding["id"] == "filesystem.critically_low_space")
+            .expect("the low-space finding is present");
+        let measurements = &finding["measurements"];
+        assert_eq!(
+            measurements["available_bytes"],
+            serde_json::json!(100 * 1024 * 1024u64),
+            "a byte count must be a number, not prose"
+        );
+        assert!(measurements["available_percent"].is_f64());
+        assert_eq!(
+            measurements["filesystem_read_only"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn cli_and_json_keep_every_historical_mount_finding() {
+        let issues = (0..842)
+            .map(|index| archivefs_core::HealthIssue {
+                path: PathBuf::from(format!("/roms/history/{index:03}.zip")),
+                platform: Some("Test".to_string()),
+                present: true,
+                mount_state: None,
+                category: archivefs_core::HealthCategory::HistoricalMountFailure,
+                reason: "retained historical mount evidence".to_string(),
+                retryable: false,
+                recovery_action: None,
+                last_seen_at: Some("2025-01-01T00:00:00Z".to_string()),
+                size_bytes: None,
+                modified_time_unix_seconds: None,
+            })
+            .collect::<Vec<_>>();
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.health_issues = Gathered::Ready(&issues);
+        let scan = run_doctor_scan(&inputs);
+
+        let text = format_doctor_scan(&scan);
+        let json = serde_json::to_value(&scan).expect("serialise Doctor scan");
+
+        assert_eq!(scan.findings.len(), 842);
+        assert_eq!(json["findings"].as_array().unwrap().len(), 842);
+        for index in 0..842 {
+            assert!(text.contains(&format!("/roms/history/{index:03}.zip")));
+        }
+    }
+
+    /// Test 93
+    #[test]
+    fn a_read_only_filesystem_is_reported_under_filesystems_with_a_flag() {
+        let assessment = storage_assessment(80 * 1024 * 1024 * 1024, true);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(text.contains("Filesystems (1)"));
+        assert!(text.contains("Measured: filesystem_read_only = true"));
+    }
+
+    /// Test 94
+    #[test]
+    fn no_new_finding_advertises_a_repair_flag() {
+        let assessment = storage_assessment(100 * 1024 * 1024, true);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(
+            !text.contains("Repair available"),
+            "Stage 1C-A adds no repair, so the CLI must not offer one"
+        );
+        assert!(!text.contains("--repair"));
+    }
+
+    /// Test 95
+    #[test]
+    fn the_report_states_the_narrowed_deferred_checks_rather_than_the_old_claims() {
+        let assessment = storage_assessment(100 * 1024 * 1024, false);
+        let text = format_doctor_scan(&scan_with(&assessment));
+        assert!(text.contains("Per-directory disk quotas"));
+        assert!(text.contains("Write access inside a sandbox"));
+        assert!(text.contains("Managed entries with no install record"));
+        for stale in [
+            "Free disk space - ",
+            "Read-only filesystem detection - ",
+            "Orphaned ArchiveFS-managed cheat entries - ",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "`{stale}` is implemented now and must not be listed as missing"
+            );
+        }
+    }
+
+    /// Test 96
+    #[test]
+    fn a_managed_entry_finding_reaches_the_text_report_with_its_reason() {
+        let temporary = std::env::temp_dir().join(format!(
+            "archivefs-cli-managed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let profile = temporary.join("patches");
+        std::fs::create_dir_all(&profile).expect("fixture");
+        std::fs::write(
+            profile.join("SLUS-20946.pnach"),
+            b"// ArchiveFS managed block: op-1\npatch=1,EE,00100000,word,1\n// End ArchiveFS managed block\n",
+        )
+        .expect("fixture");
+
+        let managed = scan_managed_entries(
+            &SharedHistoryReport {
+                journals: Vec::new(),
+                warnings: Vec::new(),
+                complete: true,
+            },
+            &[ManagedScanTarget {
+                format: ManagedFormat::Pcsx2Pnach,
+                destination_root: profile,
+            }],
+        );
+        let mut inputs = DoctorScanInputs::none_loaded();
+        inputs.managed_entries = Gathered::Ready(&managed);
+        let text = format_doctor_scan(&run_doctor_scan(&inputs));
+        let _ = std::fs::remove_dir_all(&temporary);
+
+        assert!(text.contains("Managed entries (1)"));
+        assert!(text.contains("managed_entry.ownership_record_missing"));
+        assert!(text.contains("Measured: managed_format = PCSX2 PNACH"));
+        assert!(text.contains("Measured: orphan_reason = "));
+    }
+}
+
+// --- Platform detection reporting -----------------------------------------
+
+/// The human-readable form of one detection. Concise by design: the full
+/// structured evidence is what `--json` is for.
+fn format_platform_detection(path: &Path, root: &Path, report: &PlatformDetectionReport) -> String {
+    let mut lines = vec![
+        format!("Path: {}", path.display()),
+        format!("Source root: {}", root.display()),
+        String::new(),
+    ];
+    match report.platform {
+        Some(platform) => {
+            lines.push(format!(
+                "Platform: {} ({platform})",
+                report.display_name.unwrap_or(platform)
+            ));
+            lines.push(format!("Confidence: {}", report.confidence.label()));
+            lines.push(format!(
+                "Detected from: {}",
+                report
+                    .deciding_source
+                    .map(DetectionSource::label)
+                    .unwrap_or("no evidence")
+            ));
+            lines.push(format!(
+                "Assignment: {}",
+                if report.manually_assigned {
+                    "Manually assigned"
+                } else {
+                    "Automatically detected"
+                }
+            ));
+        }
+        None => {
+            lines.push("Platform unknown".to_string());
+            lines.push(format!("Confidence: {}", report.confidence.label()));
+        }
+    }
+    if let Some(reason) = &report.ambiguity_reason {
+        lines.push(format!("Reason: {reason}"));
+    }
+    if report.platform.is_none() && !report.candidates.is_empty() {
+        lines.push(format!(
+            "Possible candidates: {}",
+            report
+                .candidates
+                .iter()
+                .map(|candidate| candidate.display_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        lines.push("Action: assign platform manually".to_string());
+    }
+    if report.requires_confirmation {
+        lines.push("Confirmation: a person should confirm this before it is relied on".to_string());
+    }
+    if !report.evidence.is_empty() {
+        lines.push(String::new());
+        lines.push("Evidence (strongest first):".to_string());
+        for item in &report.evidence {
+            lines.push(format!(
+                "  [{}] {} - {}",
+                item.source.label(),
+                item.platform,
+                item.detail
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// One audit of a directory tree: how detection behaves across a real library,
+/// with nothing written and nothing corrected.
+#[derive(Debug, Default, Serialize)]
+struct PlatformAuditReport {
+    root: String,
+    files_considered: usize,
+    directories_considered: usize,
+    confirmed: usize,
+    probable: usize,
+    ambiguous: usize,
+    unknown: usize,
+    /// Detections per canonical platform, sorted by count then name.
+    platform_counts: Vec<(String, usize)>,
+    /// The extensions that most often produce an ambiguous or unknown result.
+    top_ambiguous_extensions: Vec<(String, usize)>,
+    /// Paths that previously carried a platform and now carry a different one.
+    /// This is where a historical misclassification shows up, so it is sampled
+    /// separately and never crowded out by the far more numerous cases where
+    /// nothing was classified before.
+    reclassified: Vec<PlatformAuditChange>,
+    reclassified_total: usize,
+    /// Paths that carried no platform before and carry one now.
+    newly_detected: Vec<PlatformAuditChange>,
+    newly_detected_total: usize,
+    /// Files the rule this build used before this milestone would have called
+    /// Mega Drive ROMs purely from a `.gen`/`.smd` extension, and which the
+    /// evidence-based detector now places elsewhere. These are the historical
+    /// misclassifications - the reported ScummVM `RESOURCE.GEN` case is one.
+    historical_misclassifications: Vec<PlatformAuditChange>,
+    historical_misclassifications_total: usize,
+    /// How many files were symlinks, and what happened to each.
+    symlinks_seen: usize,
+    /// Symlinks whose signature could be read because both the link and its
+    /// canonical target lie inside a configured source root.
+    symlinks_read: usize,
+    /// Of those, how many actually yielded signature evidence.
+    symlinks_with_signature_evidence: usize,
+    /// Symlinks that were refused, counted by reason.
+    symlink_refusals: Vec<(String, usize)>,
+    /// Requested platforms with no file in this sample at all.
+    requested_platforms_absent: Vec<String>,
+    elapsed_milliseconds: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct PlatformAuditChange {
+    path: String,
+    before: Option<String>,
+    after: Option<String>,
+    confidence: DetectionConfidence,
+    reason: String,
+}
+
+/// Walks `root` read-only and records what detection concludes.
+///
+/// Bounded throughout: `read_dir` and `symlink_metadata` only, signature reads
+/// are the same short positional reads detection always does, symlinked
+/// directories are never descended into, and nothing is written.
+fn audit_platform_detection(
+    root: &Path,
+    limit: Option<usize>,
+) -> Result<PlatformAuditReport, Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut report = PlatformAuditReport {
+        root: root.display().to_string(),
+        ..Default::default()
+    };
+    let mut platform_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ambiguous_extensions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut symlink_refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen_platforms: std::collections::BTreeSet<String> = Default::default();
+
+    // The configured source folders, so a symlink from one into another can be
+    // read. Falls back to the audited root alone when no config is readable.
+    let trusted = Config::load_default()
+        .map(|config| TrustedRoots::from_config(&config))
+        .unwrap_or_else(|_| TrustedRoots::from_paths([root]));
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in read_dir.filter_map(Result::ok) {
+            if limit.is_some_and(|limit| report.files_considered >= limit) {
+                break;
+            }
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let is_symlink = metadata.file_type().is_symlink();
+            if is_symlink {
+                // Never *descend* through a symlink - that risks walking the
+                // same tree twice or leaving it entirely. The file itself is
+                // still considered, because reading its signature is now
+                // governed by the trusted-root policy rather than refused
+                // outright.
+                let Ok(resolved) = std::fs::metadata(&path) else {
+                    // Broken link: counted as a refusal below, not as a file.
+                    report.symlinks_seen += 1;
+                    *symlink_refusals
+                        .entry("unresolvable_target".to_string())
+                        .or_default() += 1;
+                    continue;
+                };
+                if !resolved.is_file() {
+                    report.symlinks_seen += 1;
+                    *symlink_refusals
+                        .entry("not_regular_file".to_string())
+                        .or_default() += 1;
+                    continue;
+                }
+            } else if metadata.is_dir() {
+                report.directories_considered += 1;
+                stack.push(path);
+                continue;
+            } else if !metadata.is_file() {
+                continue;
+            }
+            report.files_considered += 1;
+
+            // What this build concluded before the registry existed: the
+            // pre-milestone path was `Archive::from_path_in_root`, whose
+            // platform came from folder alias, filename heuristic, disc header,
+            // or the `.gen`/`.smd` extension rule.
+            let before = archivefs_core::Archive::from_path_in_root(&path, root)
+                .and_then(|archive| archive.identity.platform);
+
+            let request = DetectionRequest::new(&path, root)
+                .inspecting_content()
+                .with_trusted_roots(trusted.clone());
+            let detected = detect_platform_report(&request);
+
+            if is_symlink {
+                report.symlinks_seen += 1;
+                // Ask the shared policy directly what it decided, so the audit
+                // reports the real reason rather than inferring one.
+                match archivefs_core::safe_read::open_bounded_read(&path, &trusted) {
+                    Ok(_) => {
+                        report.symlinks_read += 1;
+                        if detected
+                            .evidence
+                            .iter()
+                            .any(|item| item.source == DetectionSource::Signature)
+                        {
+                            report.symlinks_with_signature_evidence += 1;
+                        }
+                    }
+                    Err(refusal) => {
+                        *symlink_refusals
+                            .entry(refusal.code().to_string())
+                            .or_default() += 1;
+                    }
+                }
+            }
+            match detected.confidence {
+                DetectionConfidence::Confirmed => report.confirmed += 1,
+                DetectionConfidence::Probable => report.probable += 1,
+                DetectionConfidence::Ambiguous => report.ambiguous += 1,
+                DetectionConfidence::Unknown => report.unknown += 1,
+            }
+            if let Some(platform) = detected.platform {
+                *platform_counts.entry(platform.to_string()).or_default() += 1;
+                seen_platforms.insert(platform.to_string());
+            } else if let Some(extension) = archivefs_core::platform::extension_of(&path) {
+                *ambiguous_extensions.entry(extension).or_default() += 1;
+            }
+
+            // The rule this build applied before the registry existed, stated
+            // exactly: any file whose name ended in `.gen` or `.smd` became an
+            // `ArchiveKind::MegaDriveRom`, and that kind then overwrote the
+            // platform unconditionally. Reproduced here - and only here - so the
+            // audit can count what it used to get wrong.
+            let legacy_called_it_mega_drive = archivefs_core::platform::extension_of(&path)
+                .is_some_and(|extension| matches!(extension.as_str(), "gen" | "smd"));
+            if legacy_called_it_mega_drive && detected.platform != Some("MegaDrive") {
+                report.historical_misclassifications_total += 1;
+                if report.historical_misclassifications.len() < 20 {
+                    report
+                        .historical_misclassifications
+                        .push(PlatformAuditChange {
+                            path: path.display().to_string(),
+                            before: Some("MegaDrive".to_string()),
+                            after: detected.platform.map(str::to_string),
+                            confidence: detected.confidence,
+                            reason: detected
+                                .evidence
+                                .first()
+                                .map(|item| item.detail.clone())
+                                .unwrap_or_else(|| "no evidence".to_string()),
+                        });
+                }
+            }
+
+            let after = detected.platform.map(str::to_string);
+            if before != after {
+                let change = PlatformAuditChange {
+                    path: path.display().to_string(),
+                    before: before.clone(),
+                    after: after.clone(),
+                    confidence: detected.confidence,
+                    reason: detected
+                        .ambiguity_reason
+                        .clone()
+                        .or_else(|| detected.evidence.first().map(|item| item.detail.clone()))
+                        .unwrap_or_else(|| "no evidence".to_string()),
+                };
+                if before.is_some() {
+                    report.reclassified_total += 1;
+                    if report.reclassified.len() < 40 {
+                        report.reclassified.push(change);
+                    }
+                } else {
+                    report.newly_detected_total += 1;
+                    if report.newly_detected.len() < 10 {
+                        report.newly_detected.push(change);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut counts: Vec<(String, usize)> = platform_counts.into_iter().collect();
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    report.platform_counts = counts;
+
+    let mut extensions: Vec<(String, usize)> = ambiguous_extensions.into_iter().collect();
+    extensions.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    extensions.truncate(15);
+    report.top_ambiguous_extensions = extensions;
+
+    let mut refusals: Vec<(String, usize)> = symlink_refusals.into_iter().collect();
+    refusals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    report.symlink_refusals = refusals;
+
+    report.requested_platforms_absent = MILESTONE_PLATFORMS
+        .iter()
+        .filter(|id| !seen_platforms.contains(**id))
+        .map(|id| (*id).to_string())
+        .collect();
+    report.elapsed_milliseconds = started.elapsed().as_millis();
+    Ok(report)
+}
+
+/// The canonical identifiers this milestone asked for, so the audit can report
+/// which of them the sample library contains no evidence for.
+const MILESTONE_PLATFORMS: &[&str] = &[
+    "ZX Spectrum",
+    "BBC Micro",
+    "Acorn Electron",
+    "Amstrad CPC",
+    "Amiga",
+    "AmigaCD32",
+    "Commodore 64",
+    "Commodore 128",
+    "VIC-20",
+    "Atari 8-bit",
+    "AtariST",
+    "Atari Jaguar",
+    "Atari Lynx",
+    "MegaDrive",
+    "Sega CD",
+    "Sega 32X",
+    "MasterSystem",
+    "GameGear",
+    "Philips CD-i",
+    "NeoGeo",
+    "Neo Geo CD",
+    "MSX",
+    "MSX2",
+    "PC Engine",
+    "TurboGrafx-16",
+    "PC Engine CD",
+    "ColecoVision",
+    "Intellivision",
+    "Vectrex",
+    "DOS",
+    "ScummVM",
+    "Sharp X68000",
+    "FM Towns",
+    "PC-98",
+    "Apple II",
+    "Macintosh",
+    "Acorn Archimedes",
+    "3DO",
+    "Commodore CDTV",
+];
+
+fn format_platform_audit(report: &PlatformAuditReport) -> String {
+    let mut lines = vec![
+        "ArchiveFS platform-detection audit (read-only)".to_string(),
+        format!("Root: {}", report.root),
+        format!(
+            "Considered: {} files, {} directories in {} ms",
+            report.files_considered, report.directories_considered, report.elapsed_milliseconds
+        ),
+        String::new(),
+        format!(
+            "Confirmed: {}  Probable: {}  Ambiguous: {}  Unknown: {}",
+            report.confirmed, report.probable, report.ambiguous, report.unknown
+        ),
+        String::new(),
+        format!("Detections by platform ({}):", report.platform_counts.len()),
+    ];
+    for (platform, count) in &report.platform_counts {
+        lines.push(format!("  {count:>7}  {platform}"));
+    }
+    if !report.top_ambiguous_extensions.is_empty() {
+        lines.push(String::new());
+        lines.push("Top unresolved extension groups:".to_string());
+        for (extension, count) in &report.top_ambiguous_extensions {
+            lines.push(format!("  {count:>7}  .{extension}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Symlinked files: {} seen, {} readable under the trusted-root policy, {} produced signature evidence",
+        report.symlinks_seen, report.symlinks_read, report.symlinks_with_signature_evidence
+    ));
+    for (reason, count) in &report.symlink_refusals {
+        lines.push(format!("  refused {count:>7}  {reason}"));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Reclassified - a platform was previously asserted and now differs: {} (showing {})",
+        report.reclassified_total,
+        report.reclassified.len()
+    ));
+    if report.reclassified.is_empty() {
+        lines.push("  none: every platform this build previously asserted still holds".to_string());
+    }
+    for change in &report.reclassified {
+        lines.push(format!(
+            "  {} : {} -> {} [{}]",
+            change.path,
+            change.before.as_deref().unwrap_or("Unknown"),
+            change.after.as_deref().unwrap_or("Unknown"),
+            change.confidence.label()
+        ));
+        lines.push(format!("      {}", change.reason));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Newly detected - nothing was classified before: {} (showing {})",
+        report.newly_detected_total,
+        report.newly_detected.len()
+    ));
+    for change in &report.newly_detected {
+        lines.push(format!(
+            "  {} : -> {} [{}]",
+            change.path,
+            change.after.as_deref().unwrap_or("Unknown"),
+            change.confidence.label()
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Historical misclassifications - the old `.gen`/`.smd` extension rule would have called these Mega Drive ROMs: {} (showing {})",
+        report.historical_misclassifications_total,
+        report.historical_misclassifications.len()
+    ));
+    for change in &report.historical_misclassifications {
+        lines.push(format!(
+            "  {} : MegaDrive -> {} [{}]",
+            change.path,
+            change.after.as_deref().unwrap_or("Unknown"),
+            change.confidence.label()
+        ));
+        lines.push(format!("      {}", change.reason));
+    }
+    if !report.requested_platforms_absent.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Requested platforms with no detection in this sample ({}):",
+            report.requested_platforms_absent.len()
+        ));
+        lines.push(format!(
+            "  {}",
+            report.requested_platforms_absent.join(", ")
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Nothing was written, corrected, mounted or extracted.".to_string());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod platform_detect_tests {
+    use super::*;
+
+    /// The audit's scope list names canonical identifiers, so it must not be
+    /// allowed to drift away from the registry.
+    #[test]
+    fn every_milestone_platform_exists_in_the_registry() {
+        for id in MILESTONE_PLATFORMS {
+            assert!(
+                archivefs_core::platform::platform_by_id(id).is_some(),
+                "`{id}` is not a canonical platform identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn the_text_report_names_the_platform_its_confidence_and_its_evidence() {
+        let report = detect_platform_report(&DetectionRequest::new(
+            Path::new("/roms/zx-spectrum/game.tzx"),
+            Path::new("/roms"),
+        ));
+        let text = format_platform_detection(
+            Path::new("/roms/zx-spectrum/game.tzx"),
+            Path::new("/roms"),
+            &report,
+        );
+        assert!(text.contains("Platform: ZX Spectrum (ZX Spectrum)"));
+        assert!(text.contains("Confidence: Probable"));
+        assert!(text.contains("Detected from: folder name"));
+        assert!(text.contains("Assignment: Automatically detected"));
+        assert!(text.contains("Evidence (strongest first):"));
+    }
+
+    #[test]
+    fn an_unknown_platform_is_reported_with_candidates_and_an_action() {
+        let report = detect_platform_report(&DetectionRequest::new(
+            Path::new("/roms/unsorted/game.bin"),
+            Path::new("/roms"),
+        ));
+        let text = format_platform_detection(
+            Path::new("/roms/unsorted/game.bin"),
+            Path::new("/roms"),
+            &report,
+        );
+        assert!(text.contains("Platform unknown"));
+        assert!(text.contains("Possible candidates:"));
+        assert!(
+            text.contains("Action: assign platform manually"),
+            "a person must be told what to do about it"
+        );
+        assert!(
+            text.contains("Sega CD"),
+            "the real candidates must be named"
+        );
+    }
+
+    #[test]
+    fn a_manual_assignment_is_shown_as_manual_in_the_text_report() {
+        let report = detect_platform_report(
+            &DetectionRequest::new(Path::new("/roms/unsorted/game.bin"), Path::new("/roms"))
+                .with_manual_platform(Some("Amstrad CPC")),
+        );
+        let text = format_platform_detection(
+            Path::new("/roms/unsorted/game.bin"),
+            Path::new("/roms"),
+            &report,
+        );
+        assert!(text.contains("Platform: Amstrad CPC"));
+        assert!(text.contains("Confidence: Confirmed"));
+        assert!(text.contains("Assignment: Manually assigned"));
     }
 }
