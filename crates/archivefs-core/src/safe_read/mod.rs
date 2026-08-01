@@ -24,14 +24,14 @@
 //!    either, exactly as before. This is the unchanged, default behaviour.
 //! 3. If the path **is** a symlink, it may be followed only when:
 //!    a. at least one trusted root is configured (absent roots means refuse -
-//!       see [`TrustedRoots::none`]);
+//!    see [`TrustedRoots::none`]);
 //!    b. the symlink itself lies inside a trusted root;
 //!    c. the target canonicalises successfully - which is what rules out a
-//!       broken link and a symlink loop, since `canonicalize` reports both as
-//!       errors;
+//!    broken link and a symlink loop, since `canonicalize` reports both as
+//!    errors;
 //!    d. the canonical target also lies inside a trusted root;
 //!    e. the canonical target is a regular file - so a directory, FIFO, socket,
-//!       device or anything else is refused.
+//!    device or anything else is refused.
 //! 4. The file is opened `O_NOFOLLOW | O_CLOEXEC` on the already-canonical
 //!    path, and its device and inode are re-checked afterwards, so the thing
 //!    that was validated is the thing that was opened.
