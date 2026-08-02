@@ -15,6 +15,15 @@ log = "0.4"
 libc = "0.2"
 notify = "8"
 sha2 = "0.11.0"
+# RomM publishes MD5, SHA-1 and CRC32 checksums, so comparing against them needs
+# those exact algorithms. `sha1` and `md-5` are the RustCrypto crates from the
+# same family as the `sha2` already in use here - same authors, same `digest`
+# traits, so this adds no new supply-chain surface beyond what is already
+# trusted. CRC32 is implemented in-tree instead: it is twenty lines, and a third
+# dependency for that would be worse value. None of these is used as a security
+# primitive - they exist only to compare identifiers.
+sha1 = "0.11.0"
+md-5 = "0.11.0"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 http = "1"
@@ -38,6 +47,11 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Bounded decode, downscale and re-encode of RomM cover thumbnails. Exactly the
+# crate, version and feature set the GUI already resolves, so this adds no new
+# crate to the tree - and keeping it here rather than in the GUI is what lets the
+# thumbnail cache be tested without a window.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 # Same crate, fuller feature set: only test fixtures need to *write* zip

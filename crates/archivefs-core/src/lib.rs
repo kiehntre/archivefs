@@ -70,6 +70,10 @@ pub use library_views::{
 /// The one read-only disk-image format evidence layer, shared by platform
 /// detection and disc identity so a structural format is recognised the same way
 /// wherever it is asked about.
+/// Read-only external identity providers - RomM in Stage 1, with room for local
+/// DAT catalogues and Hasheous later.
+pub mod identity_source;
+
 pub mod disk_format;
 
 pub mod safe_read;

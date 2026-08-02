@@ -103,13 +103,16 @@ version = "0.7.0"
 dependencies = [
  "encoding_rs",
  "http",
+ "image",
  "libc",
  "log",
+ "md-5",
  "notify",
  "rusqlite",
  "scraper",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "toml",
  "ureq",
@@ -1651,6 +1654,16 @@ dependencies = [
  "log",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]

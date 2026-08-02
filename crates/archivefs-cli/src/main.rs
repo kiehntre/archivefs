@@ -83,6 +83,7 @@ mod bsfree;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
+mod romm_identity;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -309,6 +310,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     print_doctor_report(&report);
                 }
             }
+        }
+        "identity" => {
+            // `identity source romm <command>` - the only identity source in
+            // Stage 1C. The shape mirrors `cheats source bsfree <command>`.
+            let input_args: Vec<String> = args.collect();
+            if input_args.first().map(String::as_str) != Some("source")
+                || input_args.get(1).map(String::as_str) != Some("romm")
+            {
+                return Err("identity currently supports only `source romm <command>`".into());
+            }
+            romm_identity::run(input_args[2..].to_vec())?;
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
@@ -5428,6 +5440,33 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
+    println!(
+        "  identity source romm <status|configure|test|mappings|import|refresh|records|record|conflicts|verify-hash|enable|disable|remove>  Use a local RomM server as an external identity source. Read-only towards RomM: no command writes to it, triggers a scan, edits metadata, or touches a ROM. Only loopback and private LAN addresses are accepted. The token is passed by file path with --token-file and is never printed, logged or stored in config or cache JSON. Add --json for structured output on stdout, with progress on stderr."
+    );
+    println!(
+        "  identity source romm configure --url <local-url> --token-file <path> [--path-kind relative|absolute] [--page-size <n>] [--enable]  Store the RomM URL and the path to a read-only client token (suggested ~/.config/archivefs/romm-token, which ArchiveFS never creates for you). The URL is resolved and refused now if it is not local; the token file must be a regular non-symlink file with restrictive permissions. --path-kind declares the shape of path this instance reports: `relative` for RomM 5.1.0, which returns `roms/gb/game.gb`, or `absolute` for an installation that returns `/romm/library/gb/game.gb`. The shape is never guessed from an individual path; run `test` to see which one your server uses. Contacts nothing."
+    );
+    println!(
+        "  identity source romm mappings add --romm-root <path> --archivefs-root <path> [--replace]  Map a RomM path prefix onto a local directory, written in the source's declared path shape - `roms` when relative, `/romm/library` when absolute. Matching is on whole components with the longest prefix winning; the destination must be inside a configured source folder. A `..`, a `.`, an empty component, a backslash, a drive letter, a UNC prefix or a control character refuses the path rather than being repaired."
+    );
+    println!(
+        "  identity source romm mappings preview [--limit <n>]  Show, for each sampled path: the exact string RomM sent, the form it was compared as, its path kind, the mapping selected, the translated local path, whether that file exists, which source folder it landed in, and any refusal with its code. Reads the cache when there is one and only asks RomM otherwise. Reports the path shapes it actually saw, and names the setting to change when they disagree with the configured one."
+    );
+    println!(
+        "  identity source romm import [--sample <n>]  Import the catalogue and publish it atomically. --sample <n> fetches a bounded preview, reports what it would conclude, and publishes nothing, so an existing cache is never replaced by a partial one. A failed import always leaves the previous cache in place."
+    );
+    println!(
+        "  identity source romm verify-hash --path <file>  Hash one local file (CRC32, MD5, SHA-1 in one pass) and compare it with what RomM published for that path. Opens the file read-only through the shared trusted-root policy; refuses escaping symlinks, broken symlinks, non-regular files, paths outside the configured source folders, and files that change while being read. Never triggers whole-library hashing."
+    );
+    println!(
+        "  identity source romm stale-summary [--examples <n>]  Explain the stale records in the published cache instead of just counting them: grouped by why no file could be matched (nothing there, a directory, a link whose target is gone, a whole folder missing), and by platform, RomM path prefix, local folder, extension and mapping used. Says how many RomM itself already reports as missing on its own filesystem, which is what distinguishes ordinary library drift from a mapping fault. Reads the cache and file metadata only: no network request, no file contents, no hashing, and nothing written. Group and example lists are bounded, with the remainder stated as a count."
+    );
+    println!(
+        "  identity source romm artwork [--fetch <n>] [--clear --confirm]  Report the bounded cover-thumbnail cache: location, item count, size, its 1 GiB ceiling, thumbnail box and cache version, plus how many records have a cover on your RomM instance versus only a public scraper URL. --fetch <n> warms the first n covers, one bounded request each; --clear --confirm empties it. Thumbnails are fetched only from your RomM instance - a cover hosted on igdb.com or retroachievements.org is left as a placeholder rather than fetched from the public internet. Never touches the identity cache, RomM, or a ROM."
+    );
+    println!(
+        "  identity source romm remove --confirm  Delete only ArchiveFS's own RomM cache and provider configuration (--keep-config keeps the latter). Never deletes your token file, never touches RomM, never touches a ROM."
     );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!(
