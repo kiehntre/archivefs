@@ -44656,18 +44656,273 @@ $Instant Growth [Nayr]\n";
         std::fs::write(root.join("wii-catalogue.json"), catalogue.as_bytes()).unwrap();
     }
 
+    /// How long a test waits for a background Wii/GameCube matching task
+    /// before declaring the run stuck.
+    ///
+    /// The work itself is a cached-catalogue read and a match: single-digit
+    /// milliseconds. Thirty seconds is therefore three to four orders of
+    /// magnitude of headroom for a loaded machine, while still failing a
+    /// genuine deadlock long before an outer CI job timeout would, and with a
+    /// far better message than a killed process gives.
+    const WII_MATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Spins on `ready` until it returns true, or the deadline passes.
+    ///
+    /// Returns how long the wait took, or `Err(elapsed)` on timeout.
+    ///
+    /// # Why a deadline rather than an iteration count
+    ///
+    /// The previous version of `wait_for_wii_match_terminal` gave up after a
+    /// fixed 2,000 iterations of `poll` + `std::thread::yield_now()`. That is
+    /// not a wait at all: `yield_now` returns immediately when the calling
+    /// core has nothing else runnable, so the whole budget could be spent in
+    /// microseconds - before the worker thread had even been scheduled once.
+    /// The loop's *duration* was a function of machine load rather than a
+    /// bound anyone chose, so the busier the suite, the sooner it gave up.
+    /// That is exactly backwards, and it is why adding unrelated GUI tests
+    /// made a pre-existing race start showing.
+    ///
+    /// A wall-clock deadline inverts that: contention can only make the wait
+    /// longer, never shorter, so the only way to fail is to genuinely exceed
+    /// the timeout. The backoff below keeps the fast path fast (a ready
+    /// result is observed on the first poll, with no syscall) while making a
+    /// slow path actually yield the core to the worker rather than burning it.
+    fn wait_until<F>(
+        timeout: std::time::Duration,
+        mut ready: F,
+    ) -> Result<std::time::Duration, std::time::Duration>
+    where
+        F: FnMut() -> bool,
+    {
+        // A short spin first: the overwhelmingly common case is that the
+        // result is already there, and a sleep would add latency to every
+        // test for nothing.
+        const SPIN_POLLS: u32 = 64;
+        const MIN_SLEEP: std::time::Duration = std::time::Duration::from_micros(200);
+        const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let started = Instant::now();
+        let mut polls = 0_u32;
+        let mut sleep = MIN_SLEEP;
+        loop {
+            if ready() {
+                return Ok(started.elapsed());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(elapsed);
+            }
+            if polls < SPIN_POLLS {
+                std::thread::yield_now();
+            } else {
+                // Never sleep past the deadline: a timeout must be reported
+                // promptly rather than one whole sleep late.
+                std::thread::sleep(sleep.min(timeout - elapsed));
+                sleep = (sleep * 2).min(MAX_SLEEP);
+            }
+            polls = polls.saturating_add(1);
+        }
+    }
+
+    /// The observable state of one cheat step, for a failure message.
+    fn describe_cheat_step<T>(resource: &CheatStepResource<T>) -> String {
+        match resource {
+            CheatStepResource::NotLoaded => "NotLoaded".to_string(),
+            CheatStepResource::Loading { .. } => "Loading".to_string(),
+            CheatStepResource::Ready(_) => "Ready".to_string(),
+            CheatStepResource::Failed(message) => format!("Failed({message})"),
+        }
+    }
+
     fn wait_for_wii_match_terminal(app: &mut ArchiveFsApp, context: &egui::Context) {
-        for _ in 0..2_000 {
+        wait_for_wii_match_terminal_within(app, context, WII_MATCH_TIMEOUT);
+    }
+
+    /// Polls the workflow until its GameHacking step leaves `Loading`.
+    ///
+    /// The completion signal is the real one the application uses: the worker
+    /// sends its result down the `mpsc` channel held in
+    /// `CheatStepResource::Loading { receiver }`, and `poll_cheat_workflow`
+    /// picks it up with `try_recv` and replaces the state. This waits on that
+    /// same observable state transition rather than on a timer, so it cannot
+    /// pass before the result has actually been absorbed. The receiver is
+    /// deliberately not read directly here - doing so would consume the
+    /// message the application is supposed to see.
+    fn wait_for_wii_match_terminal_within(
+        app: &mut ArchiveFsApp,
+        context: &egui::Context,
+        timeout: std::time::Duration,
+    ) -> std::time::Duration {
+        let outcome = wait_until(timeout, || {
             app.poll_cheat_workflow(context);
-            if !matches!(
+            !matches!(
                 app.cheat_workflow.as_ref().unwrap().gamecube_gamehacking,
                 CheatStepResource::Loading { .. }
-            ) {
-                return;
+            )
+        });
+        match outcome {
+            Ok(elapsed) => elapsed,
+            Err(elapsed) => {
+                // Everything observable about why it is still stuck.
+                let workflow = app.cheat_workflow.as_ref().unwrap();
+                panic!(
+                    "the cached Wii matching task did not publish a terminal result within \
+                     {timeout:?} (waited {elapsed:?}).\n  gamecube_gamehacking: {}\n  \
+                     request: {:?}\n  generation: {}\n  cancellation outstanding: {}\n  \
+                     blocked: {}\n  platform: {:?}\n  adapter: {:?}",
+                    describe_cheat_step(&workflow.gamecube_gamehacking),
+                    workflow.gamecube_gamehacking_request,
+                    workflow.gamecube_gamehacking_generation,
+                    workflow.gamecube_gamehacking_cancellation.is_some(),
+                    workflow.gamecube_gamehacking_blocked,
+                    workflow.platform,
+                    workflow.adapter,
+                );
             }
-            std::thread::yield_now();
         }
-        panic!("bounded cached Wii matching task did not publish a terminal result");
+    }
+
+    // --- The asynchronous wait helper itself --------------------------------
+    //
+    // `wait_for_wii_match_terminal` used to give up after a fixed 2,000
+    // iterations of poll + `yield_now()`. That budget is a count, not a
+    // duration, and `yield_now` does not sleep - so on a loaded machine the
+    // whole budget could be spent before the worker thread was scheduled even
+    // once, and the test failed while the code under test was perfectly
+    // healthy. These tests pin the replacement's contract directly, without
+    // needing a background worker to misbehave.
+
+    #[test]
+    fn the_wait_helper_returns_at_once_when_the_condition_already_holds() {
+        let elapsed = wait_until(std::time::Duration::from_secs(30), || true)
+            .expect("an already-satisfied condition cannot time out");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "the fast path must not sleep; took {elapsed:?}"
+        );
+    }
+
+    /// The case the old helper got wrong: completion that arrives late still
+    /// has to be waited for, however busy the machine is.
+    #[test]
+    fn the_wait_helper_tolerates_completion_that_arrives_late() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker = flag.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            worker.store(true, Ordering::SeqCst);
+        });
+
+        let elapsed = wait_until(std::time::Duration::from_secs(30), || {
+            flag.load(Ordering::SeqCst)
+        })
+        .expect("250ms is far inside a 30s deadline");
+        handle.join().unwrap();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "it must actually have waited for the worker; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "and it must return promptly once the worker finishes; took {elapsed:?}"
+        );
+    }
+
+    /// A genuine deadlock must still fail, and fail on time rather than
+    /// hanging until an outer harness kills the process.
+    #[test]
+    fn the_wait_helper_times_out_promptly_when_nothing_ever_completes() {
+        let timeout = std::time::Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = wait_until(timeout, || false);
+        let measured = started.elapsed();
+
+        let reported = outcome.expect_err("a condition that never holds must time out");
+        assert!(
+            reported >= timeout,
+            "the deadline must be honoured, not cut short; reported {reported:?}"
+        );
+        assert!(
+            measured < timeout * 4,
+            "the timeout must be prompt, not one long sleep late; took {measured:?}"
+        );
+    }
+
+    /// The timeout message has to say what the last observed state was, or it
+    /// is no more useful than the bare panic it replaced.
+    #[test]
+    fn the_failure_description_names_the_observed_state() {
+        let loading: CheatStepResource<u8> = CheatStepResource::Loading {
+            receiver: mpsc::channel().1,
+        };
+        assert_eq!(describe_cheat_step(&loading), "Loading");
+        assert_eq!(
+            describe_cheat_step(&CheatStepResource::<u8>::NotLoaded),
+            "NotLoaded"
+        );
+        assert_eq!(
+            describe_cheat_step(&CheatStepResource::Ready(1_u8)),
+            "Ready"
+        );
+        // A failure keeps its reason: that is usually the whole answer.
+        assert_eq!(
+            describe_cheat_step(&CheatStepResource::<u8>::Failed("no catalogue".to_string())),
+            "Failed(no catalogue)"
+        );
+    }
+
+    /// End to end: a real worker made deliberately slow still reaches a
+    /// terminal result through the real polling path.
+    #[test]
+    fn a_deliberately_delayed_wii_match_still_reaches_a_terminal_result() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-wii-delayed-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_wii_match_catalogue(&root, "SMNE01", None);
+        let mut app = wii_workflow_with_matched_identity(&root, "SMNE01");
+        let context = egui::Context::default();
+        app.start_gamecube_gamehacking_fetch_with_options(
+            context.clone(),
+            WiiGameHackingFetchMode::CacheOnly,
+            GameHackingGameCubeFetchOptions {
+                cache_root: root.clone(),
+                force_refresh: false,
+                // A real delay inside the worker, so this exercises waiting
+                // rather than a result that happens to be ready already.
+                delay: std::time::Duration::from_millis(250),
+                cancellation: None,
+            },
+        );
+        // Still `Loading` immediately after starting, which is what makes the
+        // wait below meaningful rather than vacuous.
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().gamecube_gamehacking,
+            CheatStepResource::Loading { .. }
+        ));
+
+        let elapsed = wait_for_wii_match_terminal_within(
+            &mut app,
+            &context,
+            std::time::Duration::from_secs(30),
+        );
+        assert!(
+            !matches!(
+                app.cheat_workflow.as_ref().unwrap().gamecube_gamehacking,
+                CheatStepResource::Loading { .. }
+            ),
+            "the delayed worker must still have been absorbed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "a 250ms worker must not take anywhere near the deadline; took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
