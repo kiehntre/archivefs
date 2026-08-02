@@ -38,7 +38,7 @@ use archivefs_core::identity_source::stale::{StaleGroup, StaleSummary};
 use eframe::egui;
 
 use crate::romm_source::{CardRow, human_bytes};
-use crate::ui::{components as widgets, theme};
+use crate::ui::components as widgets;
 
 /// How many records a page shows by default. Small enough to read on a
 /// television, large enough that paging is not tedious.
@@ -884,6 +884,11 @@ pub(crate) struct BrowseState {
     /// The last page that arrived and still matches what is being asked for.
     pub(crate) page: Option<Box<RecordPageView>>,
     pub(crate) detail: Option<Box<RecordDetailView>>,
+    /// The exact row whose detail worker is allowed to land. This is separate from
+    /// `detail` so changing filters or switching views can invalidate an in-flight
+    /// result before it arrives.
+    pub(crate) pending_detail_id: Option<String>,
+    pub(crate) detail_problem: Option<String>,
     pub(crate) conflicts: Option<Box<ConflictPageView>>,
     pub(crate) stale: Option<Box<StaleSummaryView>>,
     /// Set when a result was discarded because the cache moved on.
@@ -899,6 +904,8 @@ impl Default for BrowseState {
             page_size: DEFAULT_PAGE_SIZE,
             page: None,
             detail: None,
+            pending_detail_id: None,
+            detail_problem: None,
             conflicts: None,
             stale: None,
             needs_reload: false,
@@ -934,6 +941,26 @@ impl BrowseState {
     /// the one most likely to be outlived by the cache it describes.
     pub(crate) fn accepts_stale(&self, view: &StaleSummaryView, cache: &CacheIdentity) -> bool {
         view.cache == *cache
+    }
+
+    pub(crate) fn begin_detail(&mut self, romm_game_id: String) {
+        self.detail = None;
+        self.detail_problem = None;
+        self.pending_detail_id = Some(romm_game_id);
+    }
+
+    pub(crate) fn invalidate_detail_request(&mut self) {
+        self.pending_detail_id = None;
+    }
+
+    pub(crate) fn accepts_detail(
+        &self,
+        requested_id: &str,
+        detail: Option<&RecordDetailView>,
+    ) -> bool {
+        self.view == BrowseView::Records
+            && self.pending_detail_id.as_deref() == Some(requested_id)
+            && detail.is_none_or(|view| view.row.romm_game_id == requested_id)
     }
 }
 
@@ -980,6 +1007,14 @@ pub(crate) fn show_browse_panel(
                 widgets::StatusTone::Warning,
             );
         }
+        if let Some(problem) = &state.detail_problem {
+            widgets::banner(
+                ui,
+                "Record details unavailable",
+                problem,
+                widgets::StatusTone::Warning,
+            );
+        }
         ui.separator();
 
         match state.view {
@@ -1000,6 +1035,22 @@ pub(crate) fn show_browse_panel(
             }
         }
     });
+    if let Some(detail) = state.detail.as_ref() {
+        let context = ui.ctx().clone();
+        egui::Window::new("RomM record details")
+            .id(egui::Id::new("romm_record_detail_dialog"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(680.0)
+            .show(&context, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(ui.ctx().screen_rect().height() * 0.78)
+                    .show(ui, |ui| show_record_detail(ui, detail, &mut request));
+            });
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            request = Some(BrowseRequest::CloseDetail);
+        }
+    }
     request
 }
 
@@ -1357,9 +1408,10 @@ fn show_records(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Optio
             if let Some(reason) = &row.stale_reason {
                 ui.add(egui::Label::new(reason).wrap());
             }
-            if widgets::action_button(ui, "Details", widgets::ActionStyle::Secondary, true)
-                .clicked()
-            {
+            let details_clicked =
+                widgets::action_button(ui, "Details", widgets::ActionStyle::Secondary, true)
+                    .clicked();
+            if details_clicked && request.is_none() {
                 request = Some(BrowseRequest::OpenDetail {
                     romm_game_id: row.romm_game_id.clone(),
                 });
@@ -1367,10 +1419,6 @@ fn show_records(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Optio
         });
     }
 
-    if let Some(detail) = state.detail.as_ref() {
-        ui.add_space(theme::SECTION_GAP / 2.0);
-        show_record_detail(ui, detail, &mut request);
-    }
     request
 }
 

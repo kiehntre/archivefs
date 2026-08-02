@@ -864,7 +864,7 @@ pub(crate) fn show_config_dialog(
                     draft.to_settings(previous),
                 )));
             }
-            if widgets::action_button(ui, "Close", widgets::ActionStyle::Quiet, true).clicked() {
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
                 if draft.dirty {
                     draft.close_confirm = true;
                 } else {

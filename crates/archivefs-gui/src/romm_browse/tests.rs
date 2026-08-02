@@ -1296,11 +1296,17 @@ fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
 fn render(state: &mut BrowseState) -> egui::FullOutput {
     let context = egui::Context::default();
     let mut state_ref = state.clone();
-    let output = context.run(egui::RawInput::default(), |context| {
-        egui::CentralPanel::default().show(context, |ui| {
-            let _ = show_browse_panel(ui, &mut state_ref, false, None);
-        });
-    });
+    let mut output = None;
+    // Floating windows are registered during their first frame and painted on the
+    // next. Two frames model the real app and prove they remain open.
+    for _ in 0..2 {
+        output = Some(context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let _ = show_browse_panel(ui, &mut state_ref, false, None);
+            });
+        }));
+    }
+    let output = output.expect("a frame was rendered");
     *state = state_ref;
     output
 }
@@ -1420,4 +1426,61 @@ fn a_stale_cache_warning_is_drawn_when_a_result_was_discarded() {
         "The identity cache changed"
     ));
     assert!(rendered_text_contains(&output, "Reload to see it"));
+}
+
+#[test]
+fn record_details_render_in_a_visible_window_instead_of_below_the_last_row() {
+    let cache = varied_cache();
+    let page = page_of(&cache, &RecordFilters::default(), 0, 2);
+    let detail = build_record_detail(&cache, "2", &all_absent).expect("second record");
+    let mut state = BrowseState {
+        page: Some(Box::new(page)),
+        detail: Some(Box::new(detail)),
+        ..BrowseState::opened_at(BrowseView::Records)
+    };
+    let output = render(&mut state);
+    assert!(rendered_text_contains(&output, "RomM record details"));
+    assert!(rendered_text_contains(&output, "Game 2"));
+    assert!(rendered_text_contains(&output, "RomM id:"));
+}
+
+#[test]
+fn detail_request_identity_rejects_another_row_and_survives_frames() {
+    let cache = varied_cache();
+    let first = build_record_detail(&cache, "1", &all_absent).expect("first");
+    let second = build_record_detail(&cache, "2", &all_absent).expect("second");
+    let mut state = BrowseState::opened_at(BrowseView::Records);
+    state.begin_detail("2".to_string());
+    assert!(!state.accepts_detail("1", Some(&first)));
+    assert!(!state.accepts_detail("2", Some(&first)));
+    assert!(state.accepts_detail("2", Some(&second)));
+    assert_eq!(state.pending_detail_id.as_deref(), Some("2"));
+}
+
+#[test]
+fn closing_details_preserves_page_and_every_filter() {
+    let cache = varied_cache();
+    let filters = RecordFilters {
+        title: "Game".to_string(),
+        verdict: Some(ExternalVerification::StrongExternal),
+        canonical_platform: Some("Game Boy".to_string()),
+        presence: Some(PresenceFilter::RegularFile),
+        ..RecordFilters::default()
+    };
+    let page = page_of(&cache, &filters, 3, 2);
+    let original_page = page.offset;
+    let mut state = BrowseState {
+        filters: filters.clone(),
+        page: Some(Box::new(page)),
+        detail: build_record_detail(&cache, "2", &all_absent).map(Box::new),
+        pending_detail_id: Some("2".to_string()),
+        ..BrowseState::opened_at(BrowseView::Records)
+    };
+    state.detail = None;
+    state.pending_detail_id = None;
+    assert_eq!(state.filters, filters);
+    assert_eq!(
+        state.page.as_ref().map(|page| page.offset),
+        Some(original_page)
+    );
 }

@@ -3298,6 +3298,95 @@ impl ArchiveContext {
     }
 }
 
+/// The one GUI-owned ArchiveFS configuration snapshot.
+///
+/// Rendering is deliberately unable to load this from disk. A failed deliberate
+/// reload keeps the last usable value, while retaining an actionable error for the
+/// configuration UI.
+#[derive(Clone, Debug)]
+struct GuiConfigSnapshot {
+    current: Option<Config>,
+    last_error: Option<String>,
+    load_attempts: u64,
+    loader: fn() -> Result<Config, String>,
+}
+
+impl GuiConfigSnapshot {
+    fn load_with(loader: fn() -> Result<Config, String>) -> Self {
+        match loader() {
+            Ok(config) => Self {
+                current: Some(config),
+                last_error: None,
+                load_attempts: 1,
+                loader,
+            },
+            Err(error) => Self {
+                current: None,
+                last_error: Some(error),
+                load_attempts: 1,
+                loader,
+            },
+        }
+    }
+
+    fn load_default() -> Self {
+        Self::load_with(load_default_gui_config)
+    }
+
+    #[cfg(test)]
+    fn from_config(config: Config) -> Self {
+        Self {
+            current: Some(config),
+            last_error: None,
+            load_attempts: 0,
+            loader: hermetic_gui_config,
+        }
+    }
+
+    fn reload_with(&mut self, loader: fn() -> Result<Config, String>) -> Result<(), String> {
+        self.load_attempts = self.load_attempts.wrapping_add(1);
+        match loader() {
+            Ok(config) => {
+                self.current = Some(config);
+                self.last_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn reload_default(&mut self) -> Result<(), String> {
+        self.reload_with(self.loader)
+    }
+
+    fn source_roots(&self) -> Result<&[PathBuf], String> {
+        self.current
+            .as_ref()
+            .map(|config| config.source_folders.as_slice())
+            .ok_or_else(|| {
+                self.last_error.clone().unwrap_or_else(|| {
+                    "ArchiveFS configuration has not been loaded yet.".to_string()
+                })
+            })
+    }
+}
+
+fn load_default_gui_config() -> Result<Config, String> {
+    Config::load_default().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn hermetic_gui_config() -> Result<Config, String> {
+    Ok(Config {
+        source_folders: vec![PathBuf::from("/library")],
+        mount_root: PathBuf::from("/mount"),
+        ratarmount_bin: "ratarmount".to_string(),
+    })
+}
+
 struct ArchiveFsApp {
     state: LoadState,
     filter: String,
@@ -3465,6 +3554,9 @@ struct ArchiveFsApp {
     bsfree_manager: BsFreeManagerState,
     bsfree_operation: Option<RunningBsFreeOperation>,
     bsfree_ui: BsFreeGuiState,
+    /// Loaded once for GUI use. RomM rendering and cached browsing borrow this
+    /// snapshot instead of reading `config.toml` on every frame.
+    gui_config: GuiConfigSnapshot,
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
     romm_snapshot: Option<Box<RommSnapshot>>,
@@ -3615,6 +3707,7 @@ impl ArchiveFsApp {
 
     fn new(context: egui::Context) -> Self {
         theme::apply(&context);
+        let gui_config = GuiConfigSnapshot::load_default();
         let generation = RefreshGeneration::INITIAL;
         let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
@@ -3717,6 +3810,7 @@ impl ArchiveFsApp {
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            gui_config,
             romm_snapshot: None,
             romm_operation: None,
             romm_generation: 0,
@@ -5059,6 +5153,15 @@ impl ArchiveFsApp {
         match result {
             Ok(outcome) => {
                 let message = source_action_success_message(&outcome);
+                // Adding, removing, enabling or disabling a source is an explicit
+                // configuration-changing event. Refresh the sole GUI snapshot once;
+                // ordinary rendering never polls the file.
+                let config_reload_warning = self.gui_config.reload_default().err().map(|error| {
+                    format!(
+                        "The source change succeeded, but config.toml could not be reloaded: \
+                         {error}. The previous in-memory configuration is still in use."
+                    )
+                });
                 self.history.record(HistoryEntry::new(
                     log_category,
                     path,
@@ -5069,7 +5172,7 @@ impl ArchiveFsApp {
                     succeeded: true,
                     message,
                     cleanup: None,
-                    warning: None,
+                    warning: config_reload_warning,
                     more_information: None,
                 });
                 if matches!(outcome, SourceActionOutcome::Added(_)) {
@@ -5152,13 +5255,15 @@ impl ArchiveFsApp {
             progress: operation.reports_progress().then(RommProgress::default),
             cancellation_requested: false,
         });
+        let trusted_roots = self.gui_config.source_roots().map(|roots| roots.to_vec());
         let progress_context = context.clone();
         thread::spawn(move || {
             let report = |event: RommProgressEvent| {
                 let _ = progress_sender.send((generation, event));
                 progress_context.request_repaint();
             };
-            let result = run_romm_operation(&operation, &worker_cancellation, &report);
+            let result =
+                run_romm_operation(&operation, &trusted_roots, &worker_cancellation, &report);
             let _ = sender.send((generation, result));
             context.request_repaint();
         });
@@ -5260,7 +5365,20 @@ impl ArchiveFsApp {
                 }
                 RommOperationOutcome::RecordDetail(detail) => {
                     if let Some(state) = self.romm_browse.as_mut() {
-                        state.detail = detail.as_ref().clone().map(Box::new);
+                        let requested_id = match &operation {
+                            RommOperation::LoadRecordDetail { romm_game_id } => romm_game_id,
+                            _ => unreachable!("a detail result must come from a detail request"),
+                        };
+                        if state.accepts_detail(requested_id, detail.as_ref().as_ref()) {
+                            state.pending_detail_id = None;
+                            state.detail = detail.as_ref().clone().map(Box::new);
+                            state.detail_problem = detail.is_none().then(|| {
+                                format!(
+                                    "RomM record {requested_id} is no longer present in the \
+                                     published cache. Refresh the records view."
+                                )
+                            });
+                        }
                     }
                     true
                 }
@@ -5316,6 +5434,14 @@ impl ArchiveFsApp {
                 return;
             }
         }
+        if let (RommOperation::LoadRecordDetail { romm_game_id }, Err(message)) =
+            (&operation, &result)
+            && let Some(state) = self.romm_browse.as_mut()
+            && state.pending_detail_id.as_deref() == Some(romm_game_id)
+        {
+            state.pending_detail_id = None;
+            state.detail_problem = Some(message.clone());
+        }
         if let Ok(RommOperationOutcome::Verified(outcome)) = &result {
             // Both a card result and panel state: the panel inside it was rebuilt
             // from the verification that was just stored, so the verdict on screen is
@@ -5338,6 +5464,23 @@ impl ArchiveFsApp {
             // Saved, so the dialog has served its purpose and the card is reloaded
             // from disk rather than from what was typed.
             self.close_romm_configuration();
+            // This is a deliberate reload boundary. Rendering never reloads the
+            // application configuration, and a failed reload retains the previous
+            // usable snapshot instead of replacing it with an empty one.
+            if let Err(error) = self.gui_config.reload_default() {
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message: format!(
+                        "RomM was saved, but ArchiveFS could not reload its main configuration: \
+                         {error}. The previous in-memory configuration is still in use."
+                    ),
+                    cleanup: None,
+                    warning: None,
+                    more_information: Some(
+                        "Fix config.toml, then use an explicit refresh or save again.".to_string(),
+                    ),
+                });
+            }
         }
         if let Ok(RommOperationOutcome::Snapshot(snapshot)) = &result {
             // The one result that is not a user-visible outcome: it *is* the card's
@@ -5407,9 +5550,8 @@ impl ArchiveFsApp {
     /// which is what lets a save or a close mutate the same state the dialog was
     /// just drawn from.
     fn show_romm_configuration(&mut self, ui: &mut egui::Ui) -> Option<ConfigDialogRequest> {
-        let source_roots = archivefs_core::Config::load_default()
-            .map(|config| config.source_folders)
-            .unwrap_or_default();
+        let source_roots_result = self.gui_config.source_roots().map(Vec::from);
+        let source_roots = source_roots_result.clone().unwrap_or_default();
         let busy = self
             .romm_operation
             .as_ref()
@@ -5442,6 +5584,17 @@ impl ArchiveFsApp {
         };
         let validation = validate_draft(draft, token_state.as_ref(), &source_roots);
         let mappings = build_mappings_view(&draft.mappings, draft.path_kind, &source_roots);
+        if let Err(problem) = source_roots_result {
+            widgets::banner(
+                ui,
+                "ArchiveFS configuration unavailable",
+                &format!(
+                    "The previous in-memory configuration is being preserved, but this dialog \
+                     cannot validate source-folder mappings: {problem}"
+                ),
+                widgets::StatusTone::Blocked,
+            );
+        }
         show_config_dialog(
             ui,
             draft,
@@ -5457,6 +5610,33 @@ impl ArchiveFsApp {
         )
     }
 
+    /// Draws the existing configuration content as an actual persistent window.
+    ///
+    /// Previously the content was appended below the source card, outside the
+    /// visible scroll position. The draft still remains the single open/closed flag;
+    /// this wrapper only gives that state a visible destination.
+    fn show_romm_configuration_window(
+        &mut self,
+        context: &egui::Context,
+    ) -> Option<ConfigDialogRequest> {
+        self.romm_config_draft.as_ref()?;
+        let mut request = None;
+        egui::Window::new("Configure RomM")
+            .id(egui::Id::new("romm_configuration_dialog"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(640.0)
+            .show(context, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(ui.ctx().screen_rect().height() * 0.78)
+                    .show(ui, |ui| request = self.show_romm_configuration(ui));
+            });
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            request = Some(ConfigDialogRequest::Close);
+        }
+        request
+    }
+
     /// Opens the browsing panel on one view, or switches an open one to it.
     ///
     /// Opening it twice is impossible for the same reason the configuration dialog
@@ -5466,6 +5646,8 @@ impl ArchiveFsApp {
             Some(state) if state.view != view => {
                 state.view = view;
                 state.detail = None;
+                state.pending_detail_id = None;
+                state.detail_problem = None;
             }
             Some(_) => {}
             None => {
@@ -5488,6 +5670,9 @@ impl ArchiveFsApp {
         use crate::romm_browse::BrowseRequest;
         match request {
             BrowseRequest::LoadRecords { offset, limit } => {
+                if let Some(state) = self.romm_browse.as_mut() {
+                    state.invalidate_detail_request();
+                }
                 let filters = self
                     .romm_browse
                     .as_ref()
@@ -5503,14 +5688,20 @@ impl ArchiveFsApp {
                 );
             }
             BrowseRequest::OpenDetail { romm_game_id } => {
-                self.start_romm_operation(
+                let requested_id = romm_game_id.clone();
+                if self.start_romm_operation(
                     context.clone(),
                     RommOperation::LoadRecordDetail { romm_game_id },
-                );
+                ) && let Some(state) = self.romm_browse.as_mut()
+                {
+                    state.begin_detail(requested_id);
+                }
             }
             BrowseRequest::CloseDetail => {
                 if let Some(state) = self.romm_browse.as_mut() {
                     state.detail = None;
+                    state.pending_detail_id = None;
+                    state.detail_problem = None;
                 }
             }
             BrowseRequest::LoadConflicts { offset } => {
@@ -12494,11 +12685,8 @@ impl ArchiveFsApp {
                         }
                     }
 
-                    if self.romm_config_draft.is_some() {
-                        ui.add_space(theme::SECTION_GAP);
-                        if let Some(request) = self.show_romm_configuration(ui) {
-                            self.handle_romm_config_request(context, request);
-                        }
+                    if let Some(request) = self.show_romm_configuration_window(context) {
+                        self.handle_romm_config_request(context, request);
                     }
 
                     if self.romm_browse.is_some() {
@@ -47070,6 +47258,11 @@ $Instant Growth [Nayr]\n";
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            gui_config: GuiConfigSnapshot::from_config(Config {
+                source_folders: vec![PathBuf::from("/library")],
+                mount_root: PathBuf::from("/mount"),
+                ratarmount_bin: "ratarmount".to_string(),
+            }),
             romm_snapshot: None,
             romm_operation: None,
             romm_generation: 0,
@@ -60925,6 +61118,7 @@ fn load_romm_snapshot() -> Result<RommSnapshot, String> {
 /// format it some other way.
 fn run_romm_operation(
     operation: &RommOperation,
+    trusted_roots: &Result<Vec<PathBuf>, String>,
     cancellation: &Arc<AtomicBool>,
     report: &dyn Fn(RommProgressEvent),
 ) -> Result<RommOperationOutcome, String> {
@@ -60964,19 +61158,25 @@ fn run_romm_operation(
         // Validated again here, not merely in the dialog: the dialog's pass cannot
         // resolve a hostname, and the token file may have changed since it was
         // typed. This is the pass that decides.
-        let mut settings = (**proposed).clone();
-        settings.source.url = settings.source.url.trim().to_string();
-        if settings.source.url.is_empty() {
+        let mut proposed_settings = (**proposed).clone();
+        proposed_settings.source.url = proposed_settings.source.url.trim().to_string();
+        // A no-op Save is answered entirely from the already-loaded settings. It
+        // neither rewrites the file nor resolves a hostname, reads a token, starts
+        // an import, or constructs a transport.
+        if proposed_settings == settings {
+            return Ok(RommOperationOutcome::Saved(Box::new(proposed_settings)));
+        }
+        if proposed_settings.source.url.is_empty() {
             return Err("A RomM address is required.".to_string());
         }
         // The full local-only policy, with real name resolution.
         let approved = archivefs_core::identity_source::net_policy::validate_endpoint(
-            &settings.source.url,
+            &proposed_settings.source.url,
             &archivefs_core::identity_source::net_policy::SystemResolver,
         )
         .map_err(|refusal| refusal.detail())?;
-        settings.source.url = approved.origin().to_string();
-        if let Some(size) = settings.page_size
+        proposed_settings.source.url = approved.origin().to_string();
+        if let Some(size) = proposed_settings.page_size
             && !(archivefs_core::identity_source::settings::MIN_CONFIGURED_PAGE_SIZE
                 ..=archivefs_core::identity_source::settings::MAX_CONFIGURED_PAGE_SIZE)
                 .contains(&size)
@@ -60986,22 +61186,22 @@ fn run_romm_operation(
             ));
         }
         // The token file is re-read, and only its verdict is kept.
-        if let Some(path) = settings.source.token_path.clone() {
+        if let Some(path) = proposed_settings.source.token_path.clone() {
             load_token_file(Some(&path)).map_err(|refusal| refusal.detail())?;
         }
-        let trusted_roots = archivefs_core::Config::load_default()
-            .map(|config| config.source_folders)
-            .unwrap_or_default();
+        let trusted_roots = trusted_roots.as_deref().map_err(Clone::clone)?;
         archivefs_core::identity_source::path_map::PathMappings::validate(
-            &settings.source.mappings,
-            &trusted_roots,
-            settings.source.provider_path_kind,
+            &proposed_settings.source.mappings,
+            trusted_roots,
+            proposed_settings.source.provider_path_kind,
         )
         .map_err(|refusal| refusal.detail())?;
         // Atomic, and only after everything above agreed - so a refused save leaves
         // the previous configuration byte-identical.
-        location.save(&settings).map_err(|error| error.detail())?;
-        return Ok(RommOperationOutcome::Saved(Box::new(settings)));
+        location
+            .save(&proposed_settings)
+            .map_err(|error| error.detail())?;
+        return Ok(RommOperationOutcome::Saved(Box::new(proposed_settings)));
     }
 
     if let RommOperation::ClearArtwork = operation {
@@ -61145,6 +61345,7 @@ fn run_romm_operation(
             return verify_local_file(
                 &api,
                 &identity_root,
+                trusted_roots.as_deref().map_err(Clone::clone)?,
                 local_path,
                 romm_game_id,
                 local_platform,
@@ -61171,13 +61372,11 @@ fn run_romm_operation(
     // Everything below talks to RomM, so it needs a validated source.
     let token = load_token_file(settings.source.token_path.as_deref())
         .map_err(|refusal| refusal.detail())?;
-    let trusted_roots = archivefs_core::Config::load_default()
-        .map(|config| config.source_folders)
-        .unwrap_or_default();
+    let trusted_roots = trusted_roots.as_deref().map_err(Clone::clone)?;
     let source = archivefs_core::identity_source::romm::config::ValidatedRommSource::validate(
         &settings.source,
         &token,
-        &trusted_roots,
+        trusted_roots,
         &archivefs_core::identity_source::net_policy::SystemResolver,
     )
     .map_err(|refusal| refusal.detail())?;
@@ -61240,7 +61439,7 @@ fn run_romm_operation(
     // A re-import must not undo a verification, so the stored hashes are fed into
     // matching exactly as a freshly computed one would be.
     let hashes = VerificationStore::new(&identity_root, IdentityProvider::Romm).load();
-    let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(&trusted_roots);
+    let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(trusted_roots);
     let facts_for = |record: &archivefs_core::identity_source::model::ExternalIdentityRecord| {
         romm_local_facts(record, &trusted)
     };
@@ -61348,8 +61547,15 @@ fn run_romm_operation(
             }
         }
         RommOperation::Preview { limit } => {
-            let summary =
-                run_romm_preview(&api, &source, &transport, &settings, *limit, cancellation)?;
+            let summary = run_romm_preview(
+                &api,
+                &source,
+                &transport,
+                &settings,
+                trusted_roots,
+                *limit,
+                cancellation,
+            )?;
             Ok(RommOperationOutcome::Preview(Box::new(summary)))
         }
         // Handled above.
@@ -61463,6 +61669,7 @@ fn confine_to_source_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, St
 fn verify_local_file(
     api: &archivefs_core::identity_source::status::IdentitySourceApi,
     identity_root: &Path,
+    roots: &[PathBuf],
     local_path: &Path,
     romm_game_id: &str,
     local_platform: &crate::romm_game::LocalPlatformClaim,
@@ -61495,13 +61702,10 @@ fn verify_local_file(
         );
     }
 
-    let roots = archivefs_core::Config::load_default()
-        .map(|config| config.source_folders)
-        .unwrap_or_default();
     // Both checks: this one decides which path may be named, `TrustedRoots` below
     // decides what a symlink may point at.
-    confine_to_source_roots(local_path, &roots)?;
-    let trusted = TrustedRoots::from_paths(&roots);
+    confine_to_source_roots(local_path, roots)?;
+    let trusted = TrustedRoots::from_paths(roots);
 
     let store = VerificationStore::new(identity_root, IdentityProvider::Romm);
     let before_hashes = store.load();
@@ -61755,6 +61959,26 @@ mod romm_dispatch_tests {
         super::tests::app_for_operation_tests()
     }
 
+    fn refused_gui_config() -> Result<Config, String> {
+        Err("config.toml is temporarily unreadable".to_string())
+    }
+
+    fn output_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => {
+                    nested.iter().any(|shape| shape_contains(shape, needle))
+                }
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains(&shape.shape, needle))
+    }
+
     fn snapshot(records: usize, state: ProviderState) -> RommSnapshot {
         let mut status = ProviderStatus::not_configured(IdentityProvider::Romm);
         status.state = state;
@@ -61852,6 +62076,47 @@ mod romm_dispatch_tests {
                 .map(|running| running.operation.clone()),
             Some(RommOperation::FullImport),
             "the running operation must be untouched"
+        );
+    }
+
+    #[test]
+    fn repeated_gui_frames_use_the_cached_config_without_reloading() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let attempts = app.gui_config.load_attempts;
+        let context = egui::Context::default();
+        let mut saw_dialog = false;
+        for _ in 0..4 {
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |_ui| {
+                    let _ = app.show_romm_configuration_window(context);
+                });
+            });
+            saw_dialog |= output_contains(&output, "Configure RomM");
+            assert!(app.romm_config_draft.is_some());
+        }
+        assert!(
+            saw_dialog,
+            "the persistent draft must have a visible window"
+        );
+        assert_eq!(
+            app.gui_config.load_attempts, attempts,
+            "rendering an idle dialog must perform no configuration I/O"
+        );
+    }
+
+    #[test]
+    fn a_failed_explicit_config_reload_preserves_the_previous_snapshot() {
+        let mut app = app();
+        let before = app.gui_config.current.clone();
+        app.gui_config.loader = refused_gui_config;
+        assert!(app.gui_config.reload_default().is_err());
+        assert_eq!(app.gui_config.current, before);
+        assert!(
+            app.gui_config
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("temporarily unreadable"))
         );
     }
 
@@ -62218,6 +62483,7 @@ mod romm_dispatch_tests {
     #[test]
     fn a_successful_save_closes_the_dialog_and_reloads_authoritative_state() {
         let mut app = app();
+        let config_attempts_before = app.gui_config.load_attempts;
         let context = egui::Context::default();
         app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
         app.open_romm_configuration();
@@ -62254,6 +62520,38 @@ mod romm_dispatch_tests {
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::LoadStatus)
+        );
+        assert_eq!(
+            app.gui_config.load_attempts,
+            config_attempts_before + 1,
+            "a successful save has one deliberate reload boundary"
+        );
+    }
+
+    #[test]
+    fn a_failed_post_save_reload_keeps_the_valid_snapshot_and_reports_it() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let previous = app.gui_config.current.clone();
+        app.gui_config.loader = refused_gui_config;
+        app.open_romm_configuration();
+        let settings = snapshot(1, ProviderState::Ready).settings;
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::SaveConfiguration(Box::new(settings.clone())),
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Saved(Box::new(settings))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert_eq!(app.gui_config.current, previous);
+        assert!(
+            app.feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.message.contains("previous in-memory"))
         );
     }
 
@@ -62423,6 +62721,72 @@ mod romm_dispatch_tests {
             before,
             "reading the cache is not an activity worth recording"
         );
+    }
+
+    #[test]
+    fn a_detail_terminal_result_is_delivered_once_to_the_requested_row() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        app.romm_browse
+            .as_mut()
+            .expect("open")
+            .begin_detail("2".to_string());
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecordDetail {
+                romm_game_id: "2".to_string(),
+            },
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::RecordDetail(Box::new(None))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let state = app.romm_browse.as_ref().expect("open");
+        assert!(state.pending_detail_id.is_none());
+        assert!(
+            state
+                .detail_problem
+                .as_deref()
+                .is_some_and(|problem| problem.contains("record 2"))
+        );
+        assert!(app.romm_operation.is_none());
+    }
+
+    #[test]
+    fn a_stale_detail_result_cannot_attach_to_a_different_row() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        app.romm_browse
+            .as_mut()
+            .expect("open")
+            .begin_detail("1".to_string());
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecordDetail {
+                romm_game_id: "1".to_string(),
+            },
+        );
+        // The selection changed before the old result arrived.
+        app.romm_browse
+            .as_mut()
+            .expect("open")
+            .begin_detail("2".to_string());
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::RecordDetail(Box::new(None))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let state = app.romm_browse.as_ref().expect("open");
+        assert_eq!(state.pending_detail_id.as_deref(), Some("2"));
+        assert!(state.detail.is_none());
+        assert!(state.detail_problem.is_none());
     }
 
     #[test]
@@ -62985,6 +63349,7 @@ fn run_romm_preview(
     source: &archivefs_core::identity_source::romm::config::ValidatedRommSource,
     transport: &archivefs_core::identity_source::romm::client::UreqTransport,
     settings: &archivefs_core::identity_source::settings::ProviderSettings,
+    trusted_roots: &[PathBuf],
     limit: usize,
     cancellation: &Arc<AtomicBool>,
 ) -> Result<romm_config::RommPreviewSummary, String> {
@@ -62992,12 +63357,9 @@ fn run_romm_preview(
     use archivefs_core::identity_source::path_map::{MappingPreview, PathMappings};
 
     let limit = limit.clamp(1, romm_config::MAX_PREVIEW_LIMIT);
-    let trusted_roots = archivefs_core::Config::load_default()
-        .map(|config| config.source_folders)
-        .unwrap_or_default();
     let engine = PathMappings::validate(
         &settings.source.mappings,
-        &trusted_roots,
+        trusted_roots,
         settings.source.provider_path_kind,
     )
     .map_err(|refusal| refusal.detail())?;
