@@ -631,7 +631,9 @@ fn the_detail_panel_carries_the_full_evidence() {
         Some("igdb".to_string())
     );
     // The artwork is recorded for provenance only; slice 4 renders it.
-    assert!(detail.artwork_reference.is_some());
+    assert!(detail.has_public_artwork_reference);
+    assert!(detail.has_romm_thumbnail);
+    assert_eq!(detail.artwork, ArtworkAvailability::Fetchable);
     let labels: Vec<String> = detail.rows.iter().map(|row| row.label.clone()).collect();
     for expected in [
         "RomM id",
@@ -1442,6 +1444,153 @@ fn record_details_render_in_a_visible_window_instead_of_below_the_last_row() {
     assert!(rendered_text_contains(&output, "RomM record details"));
     assert!(rendered_text_contains(&output, "Game 2"));
     assert!(rendered_text_contains(&output, "RomM id:"));
+    assert!(rendered_text_contains(&output, "Close"));
+    assert!(rendered_text_contains(&output, "Artwork placeholder"));
+}
+
+#[test]
+fn detail_window_is_clamped_and_reserves_a_fixed_footer() {
+    let (initial, maximum) = detail_window_sizes(egui::vec2(1280.0, 720.0));
+    assert!(initial.x <= maximum.x && initial.y <= maximum.y);
+    assert_eq!(maximum, egui::vec2(1248.0, 688.0));
+    assert_eq!(detail_body_height(688.0, 44.0), 644.0);
+    assert_eq!(detail_body_height(100.0, 44.0), 96.0);
+    let (tiny_initial, tiny_maximum) = detail_window_sizes(egui::vec2(200.0, 180.0));
+    assert!(tiny_initial.x <= 200.0 && tiny_initial.y <= 180.0);
+    assert_eq!(tiny_maximum, egui::vec2(200.0, 180.0));
+}
+
+#[test]
+fn escape_closes_the_detail_window_without_changing_browse_state() {
+    let cache = varied_cache();
+    let filters = RecordFilters {
+        title: "Game".to_string(),
+        canonical_platform: Some("Game Boy".to_string()),
+        ..RecordFilters::default()
+    };
+    let mut state = BrowseState {
+        filters: filters.clone(),
+        page: Some(Box::new(page_of(&cache, &filters, 0, 2))),
+        detail: build_record_detail(&cache, "2", &all_absent).map(Box::new),
+        ..BrowseState::opened_at(BrowseView::Records)
+    };
+    let context = egui::Context::default();
+    let _ = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_browse_panel(ui, &mut state, false, None);
+        });
+    });
+    let mut input = egui::RawInput::default();
+    input.events.push(egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    });
+    let mut request = None;
+    let _ = context.run(input, |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            request = show_browse_panel(ui, &mut state, false, None);
+        });
+    });
+    assert_eq!(request, Some(BrowseRequest::CloseDetail));
+    assert_eq!(state.filters, filters);
+    assert_eq!(state.page.as_ref().map(|page| page.offset), Some(0));
+}
+
+#[test]
+fn detail_artwork_is_typed_and_public_urls_never_enter_the_view_model() {
+    let mut public = record("public", "Public only", "public.gb");
+    public.artwork = Some(ArtworkReference {
+        reference: "https://retroachievements.org/Images/020770.png".to_string(),
+        small_reference: None,
+    });
+    let detail =
+        build_record_detail(&cache(vec![public]), "public", &all_absent).expect("record detail");
+    assert_eq!(detail.artwork, ArtworkAvailability::PublicOnly);
+    assert!(detail.has_public_artwork_reference);
+    assert!(!detail.has_romm_thumbnail);
+    let debug_rows = format!("{:?}", detail.rows);
+    assert!(!debug_rows.contains("retroachievements.org"));
+
+    let mut state = BrowseState {
+        detail: Some(Box::new(detail)),
+        ..BrowseState::opened_at(BrowseView::Records)
+    };
+    let output = render(&mut state);
+    assert!(rendered_text_contains(
+        &output,
+        "Public artwork reference recorded, but ArchiveFS does not fetch from public hosts."
+    ));
+    assert!(!rendered_text_contains(&output, "retroachievements.org"));
+}
+
+#[test]
+fn a_detail_cover_result_is_bound_to_the_exact_record_and_path() {
+    let cache = varied_cache();
+    let detail = build_record_detail(&cache, "2", &all_absent).expect("second record");
+    let path = detail.row.archivefs_path.clone().expect("mapped path");
+    let state = BrowseState {
+        detail: Some(Box::new(detail)),
+        ..BrowseState::opened_at(BrowseView::Records)
+    };
+    let outcome = CoverOutcome {
+        local_path: path,
+        romm_game_id: "2".to_string(),
+        state: CoverState::Unavailable(ArtworkAvailability::None),
+        cached_items: 0,
+        cached_bytes: 0,
+    };
+    assert!(state.accepts_cover(&outcome));
+    assert!(!state.accepts_cover(&CoverOutcome {
+        romm_game_id: "1".to_string(),
+        ..outcome.clone()
+    }));
+    assert!(!state.accepts_cover(&CoverOutcome {
+        local_path: PathBuf::from("/wrong/path.gb"),
+        ..outcome
+    }));
+}
+
+#[test]
+fn visible_detail_lazily_requests_only_a_romm_hosted_thumbnail() {
+    let cache = varied_cache();
+    let detail = build_record_detail(&cache, "100", &all_absent).expect("fetchable detail");
+    assert_eq!(detail.artwork, ArtworkAvailability::Fetchable);
+    let expected_path = detail.row.archivefs_path.clone().expect("mapped path");
+    let mut state = BrowseState {
+        page: Some(Box::new(page_of(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            DEFAULT_PAGE_SIZE,
+        ))),
+        detail: Some(Box::new(detail)),
+        ..BrowseState::opened_at(BrowseView::Records)
+    };
+    let context = egui::Context::default();
+    let mut request = None;
+    let _ = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            request = show_browse_panel(ui, &mut state, false, None);
+        });
+    });
+    assert_eq!(
+        request,
+        Some(BrowseRequest::LoadDetailCover {
+            local_path: expected_path,
+            romm_game_id: "100".to_string(),
+        })
+    );
+    state.detail_cover = CoverState::Loading;
+    request = None;
+    let _ = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            request = show_browse_panel(ui, &mut state, false, None);
+        });
+    });
+    assert!(request.is_none(), "Loading prevents duplicate requests");
 }
 
 #[test]

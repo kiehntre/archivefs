@@ -37,6 +37,7 @@ use archivefs_core::identity_source::model::{
 use archivefs_core::identity_source::stale::{StaleGroup, StaleSummary};
 use eframe::egui;
 
+use crate::romm_game::{ArtworkAvailability, CoverOutcome, CoverState, fitted_cover_size};
 use crate::romm_source::{CardRow, human_bytes};
 use crate::ui::components as widgets;
 
@@ -338,8 +339,11 @@ pub(crate) struct RecordDetailView {
     pub(crate) related_files: Vec<String>,
     pub(crate) sibling_game_ids: Vec<String>,
     pub(crate) metadata_ids: Vec<CardRow>,
-    /// The artwork reference, recorded for provenance. Never fetched here.
-    pub(crate) artwork_reference: Option<String>,
+    /// Typed artwork facts. Public references are provenance only and their raw URL
+    /// never enters this GUI model.
+    pub(crate) artwork: ArtworkAvailability,
+    pub(crate) has_romm_thumbnail: bool,
+    pub(crate) has_public_artwork_reference: bool,
     /// What this verdict means, in the project's own words.
     pub(crate) verdict_explanation: String,
     /// Why a directory stays stale, when that is the case.
@@ -600,10 +604,15 @@ pub(crate) fn build_record_detail(
                 value: entry.id.clone(),
             })
             .collect(),
-        artwork_reference: record
+        artwork: crate::romm_game::availability_of(record),
+        has_romm_thumbnail: record
             .artwork
             .as_ref()
-            .map(|artwork| artwork.reference.clone()),
+            .is_some_and(|artwork| artwork.small_reference.is_some()),
+        has_public_artwork_reference: record
+            .artwork
+            .as_ref()
+            .is_some_and(|artwork| !artwork.reference.trim().is_empty()),
         verdict_explanation: verdict_explanation(record.verification).to_string(),
         presence_explanation: presence.and_then(presence_explanation),
         row,
@@ -865,6 +874,11 @@ pub(crate) enum BrowseRequest {
     OpenDetail {
         romm_game_id: String,
     },
+    /// Load the visible detail record's RomM-hosted thumbnail.
+    LoadDetailCover {
+        local_path: PathBuf,
+        romm_game_id: String,
+    },
     CloseDetail,
     LoadConflicts {
         offset: usize,
@@ -876,7 +890,7 @@ pub(crate) enum BrowseRequest {
 }
 
 /// What the browsing panel remembers between frames.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct BrowseState {
     pub(crate) view: BrowseView,
     pub(crate) filters: RecordFilters,
@@ -889,6 +903,9 @@ pub(crate) struct BrowseState {
     /// result before it arrives.
     pub(crate) pending_detail_id: Option<String>,
     pub(crate) detail_problem: Option<String>,
+    pub(crate) detail_cover: CoverState,
+    pub(crate) detail_cover_texture: Option<egui::TextureHandle>,
+    pub(crate) detail_cover_key: Option<String>,
     pub(crate) conflicts: Option<Box<ConflictPageView>>,
     pub(crate) stale: Option<Box<StaleSummaryView>>,
     /// Set when a result was discarded because the cache moved on.
@@ -906,6 +923,9 @@ impl Default for BrowseState {
             detail: None,
             pending_detail_id: None,
             detail_problem: None,
+            detail_cover: CoverState::Idle,
+            detail_cover_texture: None,
+            detail_cover_key: None,
             conflicts: None,
             stale: None,
             needs_reload: false,
@@ -946,6 +966,9 @@ impl BrowseState {
     pub(crate) fn begin_detail(&mut self, romm_game_id: String) {
         self.detail = None;
         self.detail_problem = None;
+        self.detail_cover = CoverState::Idle;
+        self.detail_cover_texture = None;
+        self.detail_cover_key = None;
         self.pending_detail_id = Some(romm_game_id);
     }
 
@@ -961,6 +984,13 @@ impl BrowseState {
         self.view == BrowseView::Records
             && self.pending_detail_id.as_deref() == Some(requested_id)
             && detail.is_none_or(|view| view.row.romm_game_id == requested_id)
+    }
+
+    pub(crate) fn accepts_cover(&self, outcome: &CoverOutcome) -> bool {
+        self.detail.as_ref().is_some_and(|detail| {
+            detail.row.romm_game_id == outcome.romm_game_id
+                && detail.row.archivefs_path.as_deref() == Some(outcome.local_path.as_path())
+        })
     }
 }
 
@@ -1035,23 +1065,87 @@ pub(crate) fn show_browse_panel(
             }
         }
     });
-    if let Some(detail) = state.detail.as_ref() {
+    if let Some(detail) = state.detail.as_deref().cloned() {
         let context = ui.ctx().clone();
+        let viewport = context.input(|input| input.screen_rect().size());
+        let (initial, maximum) = detail_window_sizes(viewport);
+        let mut open = true;
+        let mut close_clicked = false;
         egui::Window::new("RomM record details")
             .id(egui::Id::new("romm_record_detail_dialog"))
             .collapsible(false)
             .resizable(true)
-            .default_width(680.0)
+            .open(&mut open)
+            .default_size(initial)
+            .max_size(maximum)
             .show(&context, |ui| {
+                let footer_height = 44.0;
+                let body_height = detail_body_height(ui.available_height(), footer_height);
                 egui::ScrollArea::vertical()
-                    .max_height(ui.ctx().screen_rect().height() * 0.78)
-                    .show(ui, |ui| show_record_detail(ui, detail, &mut request));
+                    .id_salt("romm_record_detail_body")
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        show_record_detail(
+                            ui,
+                            &detail,
+                            &state.detail_cover,
+                            &mut state.detail_cover_texture,
+                            &mut state.detail_cover_key,
+                        )
+                    });
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), footer_height - 4.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        close_clicked = widgets::action_button(
+                            ui,
+                            "Close",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked();
+                    },
+                );
             });
-        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if !open || close_clicked || context.input(|input| input.key_pressed(egui::Key::Escape)) {
             request = Some(BrowseRequest::CloseDetail);
+        } else if detail.artwork == ArtworkAvailability::Fetchable
+            && matches!(state.detail_cover, CoverState::Idle)
+            && !busy
+            && request.is_none()
+        {
+            if let Some(local_path) = detail.row.archivefs_path.clone() {
+                request = Some(BrowseRequest::LoadDetailCover {
+                    local_path,
+                    romm_game_id: detail.row.romm_game_id.clone(),
+                });
+            } else {
+                state.detail_cover = CoverState::Refused(
+                    "this cached record has no validated local path to bind the request to"
+                        .to_string(),
+                );
+            }
         }
     }
     request
+}
+
+fn detail_window_sizes(viewport: egui::Vec2) -> (egui::Vec2, egui::Vec2) {
+    let maximum = egui::vec2(
+        (viewport.x - 32.0).max(240.0).min(viewport.x.max(1.0)),
+        (viewport.y - 32.0).max(240.0).min(viewport.y.max(1.0)),
+    );
+    let initial = egui::vec2(680.0_f32.min(maximum.x), 720.0_f32.min(maximum.y));
+    (initial, maximum)
+}
+
+fn detail_body_height(available_height: f32, footer_height: f32) -> f32 {
+    (available_height - footer_height).max(96.0)
 }
 
 fn show_records(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Option<BrowseRequest> {
@@ -1425,7 +1519,9 @@ fn show_records(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Optio
 fn show_record_detail(
     ui: &mut egui::Ui,
     detail: &RecordDetailView,
-    request: &mut Option<BrowseRequest>,
+    cover: &CoverState,
+    cover_texture: &mut Option<egui::TextureHandle>,
+    cover_key: &mut Option<String>,
 ) {
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -1435,11 +1531,6 @@ fn show_record_detail(
                 verdict_label(detail.row.verdict),
                 verdict_tone(detail.row.verdict),
             );
-            if widgets::action_button(ui, "Close details", widgets::ActionStyle::Quiet, true)
-                .clicked()
-            {
-                *request = Some(BrowseRequest::CloseDetail);
-            }
         });
         ui.label(&detail.verdict_explanation);
         if let Some(explanation) = &detail.presence_explanation {
@@ -1495,13 +1586,70 @@ fn show_record_detail(
                     detail.sibling_game_ids.join(", ")
                 ));
             }
-            if let Some(artwork) = &detail.artwork_reference {
-                // Recorded for provenance. Slice 4 renders covers; this only says
-                // what RomM claims exists.
-                ui.add(egui::Label::new(format!("Artwork reference: {artwork}")).wrap());
-            }
         });
+        ui.separator();
+        show_record_artwork(ui, detail, cover, cover_texture, cover_key);
     });
+}
+
+fn show_record_artwork(
+    ui: &mut egui::Ui,
+    detail: &RecordDetailView,
+    cover: &CoverState,
+    cover_texture: &mut Option<egui::TextureHandle>,
+    cover_key: &mut Option<String>,
+) {
+    ui.strong("Artwork");
+    ui.label(if detail.has_romm_thumbnail {
+        "RomM-hosted path_cover_small: available"
+    } else {
+        "RomM-hosted path_cover_small: not recorded"
+    });
+    if detail.has_public_artwork_reference {
+        ui.label(
+            "Public artwork reference recorded, but ArchiveFS does not fetch from public hosts.",
+        );
+    }
+
+    let displayed = if detail.artwork == ArtworkAvailability::Fetchable {
+        cover.clone()
+    } else {
+        CoverState::Unavailable(detail.artwork)
+    };
+    ui.label(displayed.line());
+    match displayed {
+        CoverState::Ready(image) => {
+            if cover_key.as_deref() != Some(image.key.as_str()) {
+                *cover_texture = Some(ui.ctx().load_texture(
+                    format!("romm-record-cover-{}", image.key),
+                    image.image.clone(),
+                    egui::TextureOptions::LINEAR,
+                ));
+                *cover_key = Some(image.key.clone());
+            }
+            if let Some(texture) = cover_texture.as_ref() {
+                ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(fitted_cover_size(image.width, image.height))
+                        .alt_text("RomM-hosted thumbnail for this record"),
+                );
+            }
+        }
+        CoverState::Loading => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading RomM thumbnail");
+            });
+        }
+        CoverState::Idle
+        | CoverState::Unavailable(_)
+        | CoverState::Refused(_)
+        | CoverState::Offline(_)
+        | CoverState::Failed(_)
+        | CoverState::Cancelled => {
+            ui.label(egui::RichText::new("Artwork placeholder").weak());
+        }
+    }
 }
 
 fn show_conflicts(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Option<BrowseRequest> {

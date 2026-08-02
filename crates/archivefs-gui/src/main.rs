@@ -3216,7 +3216,8 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
 fn main_view_uses_page_scroll(view: MainView) -> bool {
     matches!(
         view,
-        MainView::Sources
+        MainView::Selected
+            | MainView::Sources
             | MainView::Doctor
             | MainView::HistoryLogs
             | MainView::Settings
@@ -5424,6 +5425,15 @@ impl ArchiveFsApp {
                         self.romm_game.cover_cache =
                             Some((outcome.cached_items, outcome.cached_bytes));
                     }
+                    if let Some(state) = self.romm_browse.as_mut()
+                        && state.accepts_cover(outcome)
+                    {
+                        state.detail_cover_texture = None;
+                        state.detail_cover_key = None;
+                        state.detail_cover = outcome.state.clone();
+                    }
+                    // A stale cover is deliberately discarded, but it is still a
+                    // panel result rather than a source-card outcome banner.
                     true
                 }
                 _ => false,
@@ -5702,6 +5712,24 @@ impl ArchiveFsApp {
                     state.detail = None;
                     state.pending_detail_id = None;
                     state.detail_problem = None;
+                    state.detail_cover = crate::romm_game::CoverState::Idle;
+                    state.detail_cover_texture = None;
+                    state.detail_cover_key = None;
+                }
+            }
+            BrowseRequest::LoadDetailCover {
+                local_path,
+                romm_game_id,
+            } => {
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadCover {
+                        local_path,
+                        romm_game_id,
+                    },
+                ) && let Some(state) = self.romm_browse.as_mut()
+                {
+                    state.detail_cover = crate::romm_game::CoverState::Loading;
                 }
             }
             BrowseRequest::LoadConflicts { offset } => {
@@ -47532,6 +47560,7 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn long_content_pages_use_shared_scrolling_without_changing_table_pages() {
         for view in [
+            MainView::Selected,
             MainView::Settings,
             MainView::Doctor,
             MainView::About,
@@ -61855,7 +61884,7 @@ fn cover_from_cache(
         Some(thumbnail) => {
             let state = match crate::romm_game::decode_thumbnail(&thumbnail, true) {
                 Ok(image) => crate::romm_game::CoverState::Ready(Box::new(image)),
-                Err(detail) => crate::romm_game::CoverState::Refused(detail),
+                Err(detail) => crate::romm_game::CoverState::Failed(detail),
             };
             Ok(Some(finish(state)))
         }
@@ -61886,9 +61915,23 @@ fn fetch_cover(
     let state = match cache.fetch(source, transport, &request, now, Some(cancellation)) {
         Ok(thumbnail) => match crate::romm_game::decode_thumbnail(&thumbnail, false) {
             Ok(image) => crate::romm_game::CoverState::Ready(Box::new(image)),
-            Err(detail) => crate::romm_game::CoverState::Refused(detail),
+            Err(detail) => crate::romm_game::CoverState::Failed(detail),
         },
         Err(ArtworkRefusal::Cancelled) => crate::romm_game::CoverState::Cancelled,
+        Err(ArtworkRefusal::Request(
+            archivefs_core::identity_source::romm::client::RommRequestError::Transport { detail },
+        )) => crate::romm_game::CoverState::Offline(detail),
+        Err(ArtworkRefusal::Request(
+            archivefs_core::identity_source::romm::client::RommRequestError::Timeout,
+        )) => crate::romm_game::CoverState::Offline("RomM did not answer in time".to_string()),
+        Err(
+            refusal @ (ArtworkRefusal::TooLarge { .. }
+            | ArtworkRefusal::NotAnImage { .. }
+            | ArtworkRefusal::DimensionsTooLarge { .. }
+            | ArtworkRefusal::DecodeFailed
+            | ArtworkRefusal::WriteFailed { .. }
+            | ArtworkRefusal::CacheUnusable { .. }),
+        ) => crate::romm_game::CoverState::Failed(refusal.detail()),
         // The core's own wording, which never contains a URL or a token.
         Err(refusal) => crate::romm_game::CoverState::Refused(refusal.detail()),
     };

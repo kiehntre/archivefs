@@ -110,20 +110,19 @@ pub(crate) enum ArtworkAvailability {
 impl ArtworkAvailability {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::None => "no cover recorded",
-            Self::PublicOnly => "only a public scraper link",
-            Self::Fetchable => "RomM has a small cover",
+            Self::None => "No artwork recorded",
+            Self::PublicOnly => "Public artwork reference not fetched",
+            Self::Fetchable => "RomM thumbnail available",
         }
     }
 
     /// Why no cover can be shown, in the project's own words.
     pub(crate) fn explanation(self) -> Option<&'static str> {
         match self {
-            Self::None => Some("RomM recorded no cover for this game, so there is none to show."),
+            Self::None => Some("No artwork recorded. A labelled placeholder is shown."),
             Self::PublicOnly => Some(
-                "The only cover RomM recorded is a link to a public metadata site such as IGDB or \
-                 RetroAchievements. ArchiveFS fetches covers from your RomM server only, so this \
-                 one is not requested.",
+                "Public artwork reference recorded, but ArchiveFS does not fetch from public \
+                 hosts.",
             ),
             Self::Fetchable => None,
         }
@@ -740,38 +739,40 @@ pub(crate) enum CoverState {
     /// A fetch or decode was refused. The core's own wording, which never carries a
     /// URL or a token.
     Refused(String),
+    /// RomM could not be reached and no cached copy existed.
+    Offline(String),
+    /// The request was allowed, but the returned/cached image could not be used.
+    Failed(String),
     Cancelled,
 }
 
 impl CoverState {
     pub(crate) fn line(&self) -> String {
         match self {
-            Self::Idle => "No cover requested.".to_string(),
-            Self::Loading => "Fetching the cover from your RomM server.".to_string(),
+            Self::Idle => "RomM thumbnail available.".to_string(),
+            Self::Loading => "Loading RomM thumbnail.".to_string(),
             Self::Ready(image) => format!(
-                "{}x{} cover, {}{}.",
+                "{} RomM thumbnail ({}x{}, {}).",
+                if image.from_cache { "Cached" } else { "Loaded" },
                 image.width,
                 image.height,
                 human_bytes(image.bytes),
-                if image.from_cache {
-                    ", already cached - no request was made"
-                } else {
-                    ", newly fetched"
-                }
             ),
             Self::Unavailable(availability) => availability
                 .explanation()
                 .unwrap_or("No cover is available.")
                 .to_string(),
-            Self::Refused(detail) => detail.clone(),
-            Self::Cancelled => "The cover fetch was stopped. Nothing was cached.".to_string(),
+            Self::Refused(detail) => format!("Artwork request refused: {detail}"),
+            Self::Offline(detail) => format!("Offline, no cached thumbnail: {detail}"),
+            Self::Failed(detail) => format!("Artwork load failed: {detail}"),
+            Self::Cancelled => "Cancelled. No thumbnail was cached.".to_string(),
         }
     }
 
     pub(crate) fn tone(&self) -> widgets::StatusTone {
         match self {
             Self::Ready(_) => widgets::StatusTone::Success,
-            Self::Refused(_) => widgets::StatusTone::Warning,
+            Self::Refused(_) | Self::Offline(_) | Self::Failed(_) => widgets::StatusTone::Warning,
             Self::Idle | Self::Loading | Self::Unavailable(_) | Self::Cancelled => {
                 widgets::StatusTone::Pending
             }
@@ -1381,6 +1382,13 @@ fn show_cover(
                     romm_game_id: candidate.romm_game_id.clone(),
                 });
             }
+            // Visibility is the lazy-load boundary. This is one-shot because the app
+            // changes `Idle` to `Loading` only when it accepts the operation.
+            if matches!(state.cover, CoverState::Idle) && !inputs.busy && request.is_none() {
+                request = Some(GamePanelRequest::LoadCover {
+                    romm_game_id: candidate.romm_game_id.clone(),
+                });
+            }
         }
         availability => {
             widgets::action_button(ui, "Show cover", widgets::ActionStyle::Quiet, false);
@@ -1389,7 +1397,12 @@ fn show_cover(
             }
         }
     }
-    ui.label(state.cover.line());
+    let displayed_state = if candidate.artwork == ArtworkAvailability::Fetchable {
+        state.cover.clone()
+    } else {
+        CoverState::Unavailable(candidate.artwork)
+    };
+    ui.label(displayed_state.line());
 
     // Uploading here, on the UI thread, from pixels a worker decoded. The key guards
     // it: a texture is only replaced when the cover actually changed.
@@ -1403,11 +1416,12 @@ fn show_cover(
             state.cover_key = Some(cover.key.clone());
         }
         if let Some(texture) = &state.cover_texture {
-            let size = egui::vec2(
-                cover.width.min(THUMBNAIL_MAX_WIDTH) as f32,
-                cover.height.min(THUMBNAIL_MAX_HEIGHT) as f32,
+            let size = fitted_cover_size(cover.width, cover.height);
+            ui.add(
+                egui::Image::new(texture)
+                    .fit_to_exact_size(size)
+                    .alt_text("RomM-hosted thumbnail"),
             );
-            ui.add(egui::Image::new(texture).fit_to_exact_size(size));
         }
     } else if matches!(state.cover, CoverState::Loading) {
         ui.add(egui::Spinner::new());
@@ -1422,6 +1436,17 @@ fn show_cover(
         );
     }
     request
+}
+
+/// Fits a thumbnail inside the UI's 200x280 box without changing its aspect ratio.
+pub(crate) fn fitted_cover_size(width: u32, height: u32) -> egui::Vec2 {
+    if width == 0 || height == 0 {
+        return egui::Vec2::ZERO;
+    }
+    let scale = (THUMBNAIL_MAX_WIDTH as f32 / width as f32)
+        .min(THUMBNAIL_MAX_HEIGHT as f32 / height as f32)
+        .min(1.0);
+    egui::vec2(width as f32 * scale, height as f32 * scale)
 }
 
 #[cfg(test)]

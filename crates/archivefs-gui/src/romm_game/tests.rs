@@ -774,8 +774,7 @@ fn a_record_with_only_a_public_scraper_link_is_never_fetchable() {
     let explanation = ArtworkAvailability::PublicOnly
         .explanation()
         .expect("explained");
-    assert!(explanation.contains("IGDB"), "{explanation}");
-    assert!(explanation.contains("RomM server only"), "{explanation}");
+    assert!(explanation.contains("public hosts"), "{explanation}");
 }
 
 #[test]
@@ -802,7 +801,7 @@ fn a_record_with_no_artwork_at_all_says_so() {
         ArtworkAvailability::None
             .explanation()
             .expect("explained")
-            .contains("no cover")
+            .contains("No artwork recorded")
     );
 }
 
@@ -813,12 +812,18 @@ fn every_cover_state_says_what_it_means_in_words() {
         CoverState::Loading,
         CoverState::Unavailable(ArtworkAvailability::None),
         CoverState::Refused("the response was not an image".to_string()),
+        CoverState::Offline("connection refused".to_string()),
+        CoverState::Failed("the response was not an image".to_string()),
         CoverState::Cancelled,
     ];
     for state in states {
         assert!(!state.line().is_empty(), "{state:?} says nothing");
     }
-    assert!(CoverState::Cancelled.line().contains("Nothing was cached"));
+    assert!(
+        CoverState::Cancelled
+            .line()
+            .contains("No thumbnail was cached")
+    );
 }
 
 #[test]
@@ -833,7 +838,7 @@ fn a_cover_read_from_the_cache_says_no_request_was_made() {
     };
     let line = CoverState::Ready(Box::new(cover)).line();
     assert!(line.contains("162x216"), "{line}");
-    assert!(line.contains("no request was made"), "{line}");
+    assert!(line.contains("Cached RomM thumbnail"), "{line}");
 }
 
 #[test]
@@ -842,6 +847,17 @@ fn a_thumbnail_never_exceeds_the_declared_box() {
     assert_eq!(THUMBNAIL_MAX_WIDTH, 200);
     assert_eq!(THUMBNAIL_MAX_HEIGHT, 280);
     const { assert!(MAX_THUMBNAIL_READ_BYTES <= 2 * 1024 * 1024) };
+}
+
+#[test]
+fn thumbnail_fitting_preserves_aspect_ratio_inside_the_declared_box() {
+    let wide = fitted_cover_size(1000, 500);
+    assert_eq!(wide, egui::vec2(200.0, 100.0));
+    let tall = fitted_cover_size(500, 1000);
+    assert_eq!(tall, egui::vec2(140.0, 280.0));
+    let small = fitted_cover_size(100, 140);
+    assert_eq!(small, egui::vec2(100.0, 140.0));
+    assert_eq!(fitted_cover_size(0, 100), egui::Vec2::ZERO);
 }
 
 #[test]
@@ -1420,13 +1436,55 @@ fn a_public_only_cover_is_explained_rather_than_fetched() {
     let output = render(&mut state, &ready_inputs());
     assert!(rendered_text_contains(
         &output,
-        "only a public scraper link"
+        "Public artwork reference not fetched"
     ));
-    assert!(rendered_text_contains(&output, "RomM server only"));
+    assert!(rendered_text_contains(
+        &output,
+        "does not fetch from public hosts"
+    ));
     assert!(
         !rendered_text_contains(&output, "images.igdb.com"),
         "the URL itself is never drawn"
     );
+}
+
+#[test]
+fn a_visible_romm_thumbnail_is_requested_once_but_public_artwork_is_not() {
+    let mut fetchable = record("1", "Fetchable");
+    fetchable.artwork = Some(ArtworkReference {
+        reference: "https://images.igdb.com/cover.jpg".to_string(),
+        small_reference: Some("assets/romm/resources/small.png".to_string()),
+    });
+    let mut state = GamePanelState::default();
+    state.focus(Some(Path::new(LOCAL)));
+    state.panel = Some(Box::new(resolve(
+        vec![fetchable],
+        &LocalHashCache::new(),
+        &LocalPlatformClaim::default(),
+        None,
+    )));
+    let context = egui::Context::default();
+    let mut request = None;
+    let _ = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            request = show_game_identity_panel(ui, &mut state, &ready_inputs());
+        });
+    });
+    assert_eq!(
+        request,
+        Some(GamePanelRequest::LoadCover {
+            romm_game_id: "1".to_string()
+        })
+    );
+
+    state.cover = CoverState::Loading;
+    request = None;
+    let _ = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            request = show_game_identity_panel(ui, &mut state, &ready_inputs());
+        });
+    });
+    assert!(request.is_none(), "Loading is the one-shot guard");
 }
 
 #[test]
