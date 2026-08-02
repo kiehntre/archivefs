@@ -1144,6 +1144,20 @@ fn the_dialog_draws_the_token_path_and_never_its_contents() {
                 },
                 &mut NoClipboard,
             );
+            // The window draws body and footer together; the footer is where
+            // Save, Cancel and the "contacts nothing" statement now live.
+            let _ = show_config_dialog_footer(
+                ui,
+                &mut draft,
+                &ConfigDialogInputs {
+                    validation: &validation,
+                    mappings: &mappings,
+                    preview: None,
+                    previous: None,
+                    busy: false,
+                    preview_running: false,
+                },
+            );
         });
     });
     assert!(rendered_text_contains(&output, "Configure RomM"));

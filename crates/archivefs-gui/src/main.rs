@@ -4512,7 +4512,7 @@ impl ArchiveFsApp {
             .unwrap_or(0);
         // Keep the selected finding only if it still exists.
         if let Some(selected) = &self.doctor_selected_finding
-            && scan.finding(selected).is_none()
+            && scan.finding(doctor_finding_key_id(selected)).is_none()
         {
             self.doctor_selected_finding = None;
         }
@@ -4676,7 +4676,12 @@ impl ArchiveFsApp {
                     || finding.affected.as_ref().map(|path| path.display.clone()) != affected
             });
         }
-        if self.doctor_selected_finding.as_deref() == Some(outcome.record.finding_id.as_str()) {
+        if self
+            .doctor_selected_finding
+            .as_deref()
+            .map(doctor_finding_key_id)
+            == Some(outcome.record.finding_id.as_str())
+        {
             self.doctor_selected_finding = None;
         }
         self.doctor_repair_result = Some(Box::new(outcome));
@@ -5620,28 +5625,140 @@ impl ArchiveFsApp {
         )
     }
 
+    /// The configuration dialog's fixed footer - Save and Cancel.
+    ///
+    /// Split from `show_romm_configuration` so the window wrapper can place it
+    /// outside the body's scroll area. It re-derives the same validation the
+    /// body did rather than caching it, because the body may have just changed
+    /// a field this frame and a stale `can_save` would be worse than the very
+    /// small cost of recomputing it.
+    fn show_romm_configuration_footer(&mut self, ui: &mut egui::Ui) -> Option<ConfigDialogRequest> {
+        let source_roots = self
+            .gui_config
+            .source_roots()
+            .map(Vec::from)
+            .unwrap_or_default();
+        let busy = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| running.operation.blocks_actions());
+        let preview_running = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
+        let previous = self
+            .romm_snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.settings.clone());
+        let preview = self.romm_preview.clone();
+
+        let draft = self.romm_config_draft.as_mut()?;
+        let token_state = {
+            let trimmed = draft.token_path.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(trimmed);
+                Some(token_field_state(
+                    archivefs_core::identity_source::settings::load_token_file(Some(&path))
+                        .map(|_| ()),
+                    trimmed,
+                ))
+            }
+        };
+        let validation = validate_draft(draft, token_state.as_ref(), &source_roots);
+        let mappings = build_mappings_view(&draft.mappings, draft.path_kind, &source_roots);
+        crate::romm_config::show_config_dialog_footer(
+            ui,
+            draft,
+            &crate::romm_config::ConfigDialogInputs {
+                validation: &validation,
+                mappings: &mappings,
+                preview: preview.as_deref(),
+                previous: previous.as_ref(),
+                busy,
+                preview_running,
+            },
+        )
+    }
+
     /// Draws the existing configuration content as an actual persistent window.
     ///
     /// Previously the content was appended below the source card, outside the
     /// visible scroll position. The draft still remains the single open/closed flag;
     /// this wrapper only gives that state a visible destination.
+    ///
+    /// # Window shape
+    ///
+    /// The same arrangement the RomM record Details window uses, for the same
+    /// reason: a title-bar close (`.open`), a body that scrolls within a
+    /// viewport-clamped window, and a footer holding Save and Cancel that is
+    /// drawn *after* the body's scroll area so it can never scroll away. The
+    /// previous version had none of these - the actions were the last widgets
+    /// inside the scrolling body, so at TV resolution the dialog offered no
+    /// visible exit at all and Escape was the only way out.
     fn show_romm_configuration_window(
         &mut self,
         context: &egui::Context,
     ) -> Option<ConfigDialogRequest> {
         self.romm_config_draft.as_ref()?;
         let mut request = None;
+        let viewport = context.input(|input| input.screen_rect().size());
+        let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(640.0, 760.0));
+        // egui only reports a title-bar close by clearing this flag, so it has
+        // to outlive the closure.
+        let mut open = true;
         egui::Window::new("Configure RomM")
             .id(egui::Id::new("romm_configuration_dialog"))
             .collapsible(false)
             .resizable(true)
-            .default_width(640.0)
+            .open(&mut open)
+            .default_size(initial)
+            .max_size(maximum)
+            // egui keeps a constrained window fully inside the screen, which
+            // is what guarantees the fixed footer stays reachable.
+            .constrain(true)
+            .default_pos(egui::pos2(24.0, 24.0))
             .show(context, |ui| {
+                let footer_height = crate::romm_config::CONFIG_FOOTER_HEIGHT;
+                // Bounded from both directions, and both bounds matter.
+                //
+                // `available_height` alone is not enough: with content taller
+                // than the screen it is effectively unbounded, the scroll area
+                // claimed all of it, and the window grew past its own maximum
+                // until the fixed footer sat below the bottom of the screen.
+                //
+                // The window maximum alone is not enough either: sizing the
+                // body from it consumed the whole content area, and the
+                // separator and footer were then laid out past the window's
+                // clip rect, where they were never painted at all.
+                //
+                // Taking the smaller of the two keeps the footer inside the
+                // window *and* the window inside the viewport.
+                let body_height = crate::romm_config::config_body_height(
+                    ui.available_height().min(romm_window_body_cap(maximum)),
+                    footer_height,
+                );
                 egui::ScrollArea::vertical()
-                    .max_height(ui.ctx().screen_rect().height() * 0.78)
+                    .id_salt("romm_configuration_body")
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| request = self.show_romm_configuration(ui));
+                ui.separator();
+                if let Some(found) = self.show_romm_configuration_footer(ui) {
+                    request = Some(found);
+                }
             });
-        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        // A title-bar close and Escape are both plain "leave without writing":
+        // `Close` discards the draft and performs no save, no import and no
+        // request. Neither is allowed to overwrite a Save the footer just
+        // produced in this same frame.
+        if request.is_none()
+            && (!open || context.input(|input| input.key_pressed(egui::Key::Escape)))
+        {
             request = Some(ConfigDialogRequest::Close);
         }
         request
@@ -5669,6 +5786,103 @@ impl ArchiveFsApp {
     fn close_romm_browse(&mut self) {
         self.romm_browse = None;
         self.romm_stale_progress = None;
+    }
+
+    /// Draws the RomM records browser as its own persistent window.
+    ///
+    /// # Why a window
+    ///
+    /// It used to be appended to the Sources page underneath the RomM source
+    /// card. On a page already taller than the viewport that put the browser
+    /// entirely below the fold, so one click on "Browse records" produced no
+    /// visible change whatsoever and read as a dead button. A window appears
+    /// where the user is looking, on the frame the button is pressed.
+    ///
+    /// Opening twice cannot duplicate it: `self.romm_browse` *is* the open
+    /// flag (see `open_romm_browse`), and the window carries a fixed id, so a
+    /// second click at most switches which view is shown.
+    ///
+    /// Nothing here changes what browsing *does*: it still reads the published
+    /// identity cache only. No transport is constructed, no token is read and
+    /// no request is made - that is `handle_romm_browse_request`'s business,
+    /// and it is untouched.
+    fn show_romm_browse_window(
+        &mut self,
+        context: &egui::Context,
+    ) -> Option<crate::romm_browse::BrowseRequest> {
+        self.romm_browse.as_ref()?;
+        let busy = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| running.operation.blocks_actions());
+        let progress = self.romm_stale_progress;
+        let viewport = context.input(|input| input.screen_rect().size());
+        let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(900.0, 780.0));
+        let title = self
+            .romm_browse
+            .as_ref()
+            .map(|state| state.view.title())
+            .unwrap_or("RomM records");
+        let mut request = None;
+        let mut open = true;
+        egui::Window::new(title)
+            .id(egui::Id::new("romm_browse_window"))
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .default_size(initial)
+            .max_size(maximum)
+            // egui keeps a constrained window fully inside the screen, which
+            // is what guarantees the fixed footer stays reachable.
+            .constrain(true)
+            .default_pos(egui::pos2(24.0, 24.0))
+            .show(context, |ui| {
+                let footer_height = crate::romm_browse::BROWSE_FOOTER_HEIGHT;
+                // See `show_romm_configuration_window` for why both bounds
+                // are needed. The records list is the case that proves it:
+                // its content is far taller than any screen.
+                let body_height = crate::romm_config::config_body_height(
+                    ui.available_height().min(romm_window_body_cap(maximum)),
+                    footer_height,
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("romm_browse_body")
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(found) = self.romm_browse.as_mut().and_then(|state| {
+                            crate::romm_browse::show_browse_panel(
+                                ui,
+                                state,
+                                busy,
+                                progress.as_ref(),
+                            )
+                        }) {
+                            request = Some(found);
+                        }
+                    });
+                ui.separator();
+                if let Some(found) = crate::romm_browse::show_browse_panel_footer(ui) {
+                    request = Some(found);
+                }
+            });
+        // Escape belongs to the record Details window whenever one is open -
+        // it closes that, not the browser underneath it - so the browser only
+        // consumes Escape when nothing is layered on top.
+        let detail_open = self
+            .romm_browse
+            .as_ref()
+            .is_some_and(|state| state.detail.is_some());
+        if request.is_none()
+            && (!open
+                || (!detail_open && context.input(|input| input.key_pressed(egui::Key::Escape))))
+        {
+            request = Some(crate::romm_browse::BrowseRequest::Close);
+        }
+        request
     }
 
     /// Routes one request from the browsing panel.
@@ -12717,27 +12931,12 @@ impl ArchiveFsApp {
                         self.handle_romm_config_request(context, request);
                     }
 
-                    if self.romm_browse.is_some() {
-                        ui.add_space(theme::SECTION_GAP);
-                        let busy = self
-                            .romm_operation
-                            .as_ref()
-                            .is_some_and(|running| running.operation.blocks_actions());
-                        let progress = self.romm_stale_progress;
-                        if let Some(request) = self
-                            .romm_browse
-                            .as_mut()
-                            .and_then(|state| {
-                                crate::romm_browse::show_browse_panel(
-                                    ui,
-                                    state,
-                                    busy,
-                                    progress.as_ref(),
-                                )
-                            })
-                        {
-                            self.handle_romm_browse_request(context, request);
-                        }
+                    // Drawn as a window rather than appended here - see
+                    // `show_romm_browse_window`. Appending it below the source
+                    // card put it past the bottom of the viewport, so clicking
+                    // "Browse records" looked like it did nothing at all.
+                    if let Some(request) = self.show_romm_browse_window(context) {
+                        self.handle_romm_browse_request(context, request);
                     }
 
                     ui.add_space(theme::SECTION_GAP);
@@ -15055,6 +15254,12 @@ fn show_doctor_page(
         );
     }
 
+    // Deliberately *not* a running draw-order counter: a compact group's
+    // cards only exist on frames where that group is expanded, so a draw
+    // counter would renumber every later card the moment one group opened
+    // and hand it another card's expansion state. A finding's index in the
+    // scan is fixed for as long as the scan is.
+    let ordinals = DoctorFindingOrdinals::of(scan);
     for (category, findings) in scan.by_category() {
         ui.add_space(theme::SECTION_GAP);
         egui::CollapsingHeader::new(format!("{} ({})", category.label(), findings.len()))
@@ -15063,10 +15268,10 @@ fn show_doctor_page(
             .show(ui, |ui| {
                 for repeated in doctor_presentation_groups(&findings) {
                     if repeated_doctor_group_is_compact(&repeated) {
-                        show_repeated_doctor_group(ui, &repeated, selected, &mut action);
+                        show_repeated_doctor_group(ui, &repeated, selected, &mut action, &ordinals);
                     } else {
                         for finding in repeated {
-                            show_doctor_finding_card(ui, finding, selected, &mut action);
+                            show_doctor_finding_card(ui, finding, selected, &mut action, &ordinals);
                             ui.add_space(6.0);
                         }
                     }
@@ -15132,11 +15337,72 @@ fn repeated_doctor_group_counts(findings: &[&Finding], key: &str) -> String {
         .join(", ")
 }
 
+/// A key that identifies one *rendered* finding card uniquely and stably.
+///
+/// `Finding::id` names the finding's **kind**, not the occurrence:
+/// `doctor_presentation_groups` exists precisely because a real scan
+/// produces hundreds of findings sharing one id (`library.unknown_platform`,
+/// `mounts.not_required`, ...). Using that id as the expansion key meant
+/// every card of a kind shared one piece of state, so "Details" on one card
+/// expanded all of them - and every one of those cards then built its
+/// "Measured values" disclosure with the *same* egui widget id. egui
+/// resolved that clash by reporting "First use of widget ID …" over the
+/// header and letting each colliding widget overwrite the previous one's
+/// state within the frame, which is why clicking the triangle looked
+/// completely inert.
+///
+/// The ordinal supplies the missing uniqueness. It is stable for as long as
+/// a scan result is on screen, which is exactly as long as the expansion
+/// state should survive; a new scan re-numbers, and the selection is
+/// re-validated against the new findings when that happens.
+fn doctor_finding_key(finding: &Finding, ordinal: usize) -> String {
+    format!("{}#{ordinal}", finding.id)
+}
+
+/// Each finding's index in the scan that produced it.
+///
+/// Keyed by address rather than by content because two findings of the same
+/// kind can legitimately carry identical content - and because the addresses
+/// are those of the scan's own `findings` elements, which live as long as the
+/// scan does. Nothing is ever dereferenced through these keys.
+struct DoctorFindingOrdinals(HashMap<*const Finding, usize>);
+
+impl DoctorFindingOrdinals {
+    fn of(scan: &DoctorScan) -> Self {
+        Self(
+            scan.findings
+                .iter()
+                .enumerate()
+                .map(|(index, finding)| (std::ptr::from_ref(finding), index))
+                .collect(),
+        )
+    }
+
+    /// A finding not drawn from this scan cannot collide with one that was,
+    /// because no real index reaches `usize::MAX`.
+    fn ordinal(&self, finding: &Finding) -> usize {
+        self.0
+            .get(&std::ptr::from_ref(finding))
+            .copied()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+/// The `Finding::id` part of a key built by `doctor_finding_key`.
+///
+/// The stored selection is a key, but the two places that invalidate it
+/// (a fresh scan, and a completed repair) reason about finding *kinds*, so
+/// they compare on this.
+fn doctor_finding_key_id(key: &str) -> &str {
+    key.rsplit_once('#').map_or(key, |(id, _)| id)
+}
+
 fn show_repeated_doctor_group(
     ui: &mut egui::Ui,
     findings: &[&Finding],
     selected: &mut Option<String>,
     action: &mut Option<DoctorPageAction>,
+    ordinals: &DoctorFindingOrdinals,
 ) {
     let Some(first) = findings.first() else {
         return;
@@ -15179,7 +15445,7 @@ fn show_repeated_doctor_group(
             .default_open(false)
             .show(ui, |ui| {
                 for finding in findings {
-                    show_doctor_finding_card(ui, finding, selected, action);
+                    show_doctor_finding_card(ui, finding, selected, action, ordinals);
                     ui.add_space(6.0);
                 }
             });
@@ -15194,8 +15460,12 @@ fn show_doctor_finding_card(
     finding: &Finding,
     selected: &mut Option<String>,
     action: &mut Option<DoctorPageAction>,
+    ordinals: &DoctorFindingOrdinals,
 ) {
-    let is_selected = selected.as_deref() == Some(finding.id.as_str());
+    // This card's own key, not its kind's - two findings sharing an id must
+    // open and close independently.
+    let key = doctor_finding_key(finding, ordinals.ordinal(finding));
+    let is_selected = selected.as_deref() == Some(key.as_str());
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(
@@ -15226,11 +15496,7 @@ fn show_doctor_finding_card(
         )
         .clicked()
         {
-            *selected = if is_selected {
-                None
-            } else {
-                Some(finding.id.clone())
-            };
+            *selected = if is_selected { None } else { Some(key.clone()) };
         }
         if let Some(repair) = finding.offered_repair() {
             ui.horizontal_wrapped(|ui| {
@@ -15260,7 +15526,7 @@ fn show_doctor_finding_card(
             }
         }
         if is_selected {
-            show_doctor_finding_details(ui, finding);
+            show_doctor_finding_details(ui, finding, &key);
         }
     });
 }
@@ -15388,10 +15654,13 @@ fn show_doctor_repair_result(ui: &mut egui::Ui, outcome: &DoctorRepairOutcome) {
     });
 }
 
+/// Shown in place of the disclosure when a finding measured nothing.
+const DOCTOR_NO_MEASURED_VALUES: &str = "No measured values recorded";
+
 /// The selected finding's evidence and provenance. Everything here is
 /// observed fact or existing guidance prose - no invented advice, and no
 /// control that could change anything.
-fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding) {
+fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) {
     ui.add_space(6.0);
     ui.separator();
     if let Some(why) = &finding.why_it_matters {
@@ -15408,15 +15677,30 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding) {
             ui.add(egui::Label::new(format!("• {item}")).wrap());
         }
     }
-    if !finding.measurements.is_empty() {
+    if finding.measurements.is_empty() {
+        // Plain text, not a header: a disclosure triangle that opens onto
+        // nothing is a control that lies about having something behind it.
+        ui.weak(DOCTOR_NO_MEASURED_VALUES);
+    } else {
         // The same facts as the evidence above, as values. Shown collapsed so
         // the prose stays the primary account for a person reading this.
+        //
+        // Salted with this card's unique key, never with `finding.id` alone:
+        // a scan repeats an id across hundreds of findings, and salting on it
+        // gave every one of their headers the same egui widget id. egui
+        // flagged that clash on screen ("First use of widget ID …") and the
+        // colliding widgets overwrote each other's open/closed state within
+        // the frame, so the triangle never appeared to respond.
+        //
+        // `CollapsingHeader` is a real button: it carries egui's own keyboard
+        // focus, Enter/Space activation and accessibility node. Nothing here
+        // paints a triangle by hand.
         egui::CollapsingHeader::new("Measured values")
-            .id_salt(format!("doctor-measurements-{}", finding.id))
+            .id_salt(format!("doctor-measurements-{key}"))
             .default_open(false)
             .show(ui, |ui| {
-                for (key, value) in &finding.measurements {
-                    ui.label(format!("{key}: {value}"));
+                for (name, value) in &finding.measurements {
+                    ui.label(format!("{name}: {value}"));
                 }
             });
     }
@@ -34775,6 +35059,116 @@ enum GamerViewAction {
     Undo,
 }
 
+/// The single authoritative row snapshot one Gamer View frame is built
+/// from: the shelf's counts, the "All" count and the game list all read
+/// from this one object, so they cannot disagree.
+///
+/// # Why this type exists
+///
+/// The shelf used to count every row in the library while the list below
+/// it applied `LibraryRowFilters::matches` in full. `LibraryRowFilters` is
+/// shared with Advanced View, which exposes five further checkboxes
+/// (Present / Missing / Awaiting validation / Known platform / Unknown
+/// platform) that Gamer View neither shows nor can clear. Ticking any of
+/// them in Advanced View - or opening the Health dashboard's "Review
+/// missing", which sets `missing` directly - and returning to Gamer View
+/// left every card advertising its full count while the list matched
+/// nothing, reporting "No games match the selected platform" for a
+/// platform whose card said 4023. Only a restart cleared it, because
+/// `LibraryRowFilters` is not persisted.
+///
+/// Gamer View exposes exactly two filters - the search box and the
+/// platform shelf - so those are the only two it applies. `candidates` is
+/// everything the search admits; the counts are derived from `candidates`,
+/// and `visible` is `candidates` narrowed by the platform selection. A
+/// non-zero card count therefore *is* the number of rows selecting that
+/// card produces, by construction rather than by agreement.
+struct GamerLibrarySnapshot {
+    /// Indices into the row list that pass every filter Gamer View
+    /// exposes *except* the platform selection. The "All" card's count.
+    candidates: Vec<usize>,
+    /// `candidates` narrowed by the platform selection - exactly what the
+    /// game list renders.
+    visible: Vec<usize>,
+    /// Counted over `candidates`, never over the unfiltered library.
+    platform_counts: DetectedPlatformCounts,
+    /// A platform is selected that no card in this snapshot offers, so no
+    /// card is highlighted and no click can restore the list. The caller
+    /// resets the selection to All.
+    selection_is_stale: bool,
+}
+
+impl GamerLibrarySnapshot {
+    fn build(rows: &[ArchiveRow], platform: Option<&str>, search_text: &str) -> Self {
+        let candidates: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| search_text.is_empty() || row.search_text.contains(search_text))
+            .map(|(index, _)| index)
+            .collect();
+        let platform_counts = detected_platform_counts(
+            candidates
+                .iter()
+                .map(|index| &rows[*index])
+                .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+        );
+        let visible: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|index| gamer_row_matches_platform(&rows[*index], platform))
+            .collect();
+        // Judged against the whole library, never against `candidates`.
+        // A search that currently matches nothing would otherwise make every
+        // platform look absent and silently throw the user's selection away
+        // as they typed - the search must narrow the list, not rewrite what
+        // they picked. "Unknown" is a real platform here, so it is stale on
+        // the same terms: only when nothing in the library is unclassified.
+        let selection_is_stale = match platform {
+            None => false,
+            Some("Unknown") => !rows.iter().any(|row| row.unknown_platform),
+            Some(platform) => !rows
+                .iter()
+                .any(|row| !row.unknown_platform && row.platform == platform),
+        };
+        Self {
+            candidates,
+            visible,
+            platform_counts,
+            selection_is_stale,
+        }
+    }
+}
+
+/// Why the game list is empty, in the user's terms. Search and platform
+/// compose, so when both are narrowing the message says so rather than
+/// blaming whichever one the old `else if` chain happened to test first.
+fn gamer_empty_list_guidance(
+    library_is_empty: bool,
+    searching: bool,
+    platform_selected: bool,
+) -> &'static str {
+    match (library_is_empty, searching, platform_selected) {
+        (true, _, _) => "No games are in your library yet.",
+        (false, true, true) => "No games on this platform match your search.",
+        (false, true, false) => "No games match your search.",
+        (false, false, true) => "No games match the selected platform.",
+        (false, false, false) => "No games are in your library yet.",
+    }
+}
+
+/// The platform half of Gamer View's filtering, matching
+/// `LibraryRowFilters::matches`'s own platform rule exactly - `"Unknown"`
+/// is the diagnostic selection for unclassified rows, not an empty one.
+fn gamer_row_matches_platform(row: &ArchiveRow, platform: Option<&str>) -> bool {
+    platform.is_none_or(|wanted| {
+        if wanted == "Unknown" {
+            row.unknown_platform
+        } else {
+            !row.unknown_platform && row.platform == wanted
+        }
+    })
+}
+
 struct GamerViewViewState<'a> {
     filter: &'a str,
     library_filters: &'a mut LibraryRowFilters,
@@ -34884,21 +35278,27 @@ fn show_gamer_view(
     }
 
     let search_text = filter.to_lowercase();
-    let visible: Vec<usize> = data
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            library_filters.matches(row)
-                && (search_text.is_empty() || row.search_text.contains(&search_text))
-        })
-        .map(|(index, _)| index)
-        .collect();
-    let platform_counts = detected_platform_counts(
-        data.rows
-            .iter()
-            .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+    // One authoritative snapshot for this frame - see
+    // `GamerLibrarySnapshot`. Everything below (shelf counts, the "All"
+    // count, the game list, and the empty-state wording) reads from it,
+    // so the shelf can never advertise a count the list cannot produce.
+    let snapshot = GamerLibrarySnapshot::build(
+        &data.rows,
+        library_filters.platform.as_deref(),
+        &search_text,
     );
+    // A platform that is no longer in the snapshot (library reloaded, a
+    // source removed, or a canonical id written by another page - see
+    // `open_cheat_archive_picker`) would otherwise leave Gamer View stuck
+    // on an empty list with no card highlighted and no way back except a
+    // restart. Falling back to All is the only truthful resolution, and it
+    // happens before the shelf is drawn so this frame already shows it.
+    if snapshot.selection_is_stale {
+        library_filters.platform = None;
+        archive_context.clear_selection();
+    }
+    let visible = &snapshot.visible;
+    let platform_counts = &snapshot.platform_counts;
 
     // The visual platform picker (milestone: "Gamer View Visual Platform
     // Picker and Library Layout Polish"): a single-row, horizontally
@@ -34921,7 +35321,7 @@ fn show_gamer_view(
     let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
         asset_id: PlatformAssetCategory::Console.asset_id(),
         label: "All",
-        count: data.rows.len(),
+        count: snapshot.candidates.len(),
         platform: None,
     }];
     for (platform, count) in &platform_counts.named {
@@ -34979,16 +35379,16 @@ fn show_gamer_view(
                 if visible.is_empty() {
                     // Distinguish *why* nothing is showing - a truthful,
                     // specific empty state rather than one generic
-                    // message for every cause.
-                    let guidance = if data.rows.is_empty() {
-                        "No games are in your library yet."
-                    } else if !search_text.is_empty() {
-                        "No games match your search."
-                    } else {
-                        "No games match the selected platform."
-                    };
+                    // message for every cause. Reachable now only when the
+                    // snapshot genuinely holds no such row: the shelf
+                    // counts these same candidates, so "no games match the
+                    // selected platform" cannot contradict a non-zero card.
                     ui.add_space(theme::SECTION_GAP);
-                    ui.weak(guidance);
+                    ui.weak(gamer_empty_list_guidance(
+                        data.rows.is_empty(),
+                        !search_text.is_empty(),
+                        library_filters.platform.is_some(),
+                    ));
                 } else {
                     let row_height = (ui.spacing().interact_size.y * 2.4).max(64.0);
                     egui::ScrollArea::vertical()
@@ -35972,6 +36372,60 @@ const SHELF_NEXT_GLYPH: &str = ">";
 /// one a D-pad lands focus on.
 const SHELF_CHEVRON_WIDTH: f32 = 44.0;
 
+/// How many whole cards a strip of `usable` width should show.
+///
+/// `preferred` is the width `gamer_platform_card_width` would like to use; the
+/// answer is the count whose exactly-fitting width is no wider than that, and
+/// no narrower than `PLATFORM_CARD_MIN_WIDTH`.
+fn shelf_visible_card_count(usable: f32, preferred: f32, spacing: f32) -> usize {
+    let stride = preferred + spacing;
+    if usable <= 0.0 || stride <= 0.0 {
+        return 1;
+    }
+    let fitted_at = |count: f32| (usable + spacing) / count - spacing;
+    // The count that fits at the preferred width, then one more when that
+    // count would have to stretch the cards past `preferred` to fill the strip.
+    let mut count = ((usable + spacing) / stride).floor().max(1.0);
+    if fitted_at(count) > preferred {
+        count += 1.0;
+    }
+    // Never so many that a card falls below the readable minimum.
+    while count > 1.0 && fitted_at(count) < PLATFORM_CARD_MIN_WIDTH {
+        count -= 1.0;
+    }
+    count as usize
+}
+
+/// The card width that makes a whole number of cards fill `usable` exactly.
+///
+/// Clamped to the readable range. When the clamp binds - a strip too narrow for
+/// even one minimum-width card - the cards no longer fill the strip exactly and
+/// a little unused space is left before the trailing chevron. That is the safe
+/// direction to miss in: unused space never puts a card under a control.
+fn shelf_fitted_card_width(usable: f32, preferred: f32, spacing: f32) -> f32 {
+    let count = shelf_visible_card_count(usable, preferred, spacing) as f32;
+    let fitted = (usable + spacing) / count - spacing;
+    fitted.clamp(
+        PLATFORM_CARD_MIN_WIDTH,
+        preferred.max(PLATFORM_CARD_MIN_WIDTH),
+    )
+}
+
+/// The width the scrolling strip is given: exactly the cards it shows, and
+/// never more than the space left between the chevrons.
+fn shelf_strip_width(usable: f32, card_width: f32, spacing: f32) -> f32 {
+    let count = shelf_visible_card_count(usable, card_width, spacing) as f32;
+    (count * (card_width + spacing) - spacing)
+        .min(usable)
+        .max(0.0)
+}
+
+/// The space one chevron takes out of the row: the button plus the gap that
+/// separates it from the strip.
+fn shelf_chevron_reserve(spacing: f32) -> f32 {
+    SHELF_CHEVRON_WIDTH + spacing
+}
+
 /// How much of the visible strip one chevron press moves, as a fraction of the
 /// viewport. Deliberately short of a full page so a card or two stays on screen
 /// as a visual anchor - a person should be able to see that they moved along a
@@ -36007,6 +36461,10 @@ struct PlatformShelfMetrics {
     content_width: f32,
     /// Width of the visible strip.
     viewport_width: f32,
+    /// One card plus the gap that follows it. Paging moves whole multiples of
+    /// this so an aligned shelf stays aligned. Zero means "not measured yet",
+    /// which falls back to the raw fractional page.
+    card_stride: f32,
 }
 
 impl PlatformShelfMetrics {
@@ -36040,9 +36498,19 @@ impl PlatformShelfMetrics {
         self.overflows() && !self.at_end()
     }
 
-    /// How far one page press travels.
+    /// How far one page press travels: a whole number of cards.
+    ///
+    /// Rounding down to whole cards is what keeps every resting position
+    /// card-aligned. The strip is sized to hold an exact number of cards, so
+    /// starting from the left edge - and, because the maximum offset is itself
+    /// a whole number of strides, ending at the right edge too - no press can
+    /// leave a card sliced in half against a chevron.
     fn page_delta(&self) -> f32 {
-        self.viewport_width * SHELF_PAGE_FRACTION
+        let raw = self.viewport_width * SHELF_PAGE_FRACTION;
+        if self.card_stride <= 0.0 {
+            return raw;
+        }
+        (raw / self.card_stride).floor().max(1.0) * self.card_stride
     }
 
     /// The offset `scroll` would land on, clamped to the real range so a press
@@ -36095,6 +36563,36 @@ struct PlatformShelfState {
 /// parent `Ui`. There is exactly one platform shelf in the application, so a
 /// stable id is both accurate and readable from a test that renders the whole
 /// window.
+/// The initial and maximum size for one RomM tool window, clamped to the
+/// current viewport.
+///
+/// Shared by every RomM window so none of them can open larger than the
+/// screen - the failure mode that puts a fixed footer, and therefore the
+/// only visible way out, past the bottom edge at TV resolution. `maximum`
+/// leaves a 32px margin so the title bar (and its close control) stays
+/// reachable; `preferred` is only honoured up to that maximum.
+/// The tallest a RomM window's scrolling body may be, given the window's
+/// maximum size. The remainder pays for the title bar, the frame margins,
+/// the separator and the footer itself.
+fn romm_window_body_cap(maximum: egui::Vec2) -> f32 {
+    (maximum.y - 100.0).max(120.0)
+}
+
+fn romm_dialog_sizes(viewport: egui::Vec2, preferred: egui::Vec2) -> (egui::Vec2, egui::Vec2) {
+    // The margin is the window's own chrome plus the room it needs to sit
+    // somewhere other than exactly (0, 0). A 32px margin was not enough: a
+    // window whose content filled its maximum height became as tall as the
+    // screen less 32, and egui then placed it below the top edge, pushing its
+    // fixed footer - and therefore the only visible way out - off the bottom.
+    const MARGIN: f32 = 96.0;
+    let maximum = egui::vec2(
+        (viewport.x - MARGIN).max(240.0).min(viewport.x.max(1.0)),
+        (viewport.y - MARGIN).max(240.0).min(viewport.y.max(1.0)),
+    );
+    let initial = egui::vec2(preferred.x.min(maximum.x), preferred.y.min(maximum.y));
+    (initial, maximum)
+}
+
 fn platform_shelf_state_id() -> egui::Id {
     egui::Id::new("gamer_platform_shelf_nav")
 }
@@ -36217,6 +36715,10 @@ struct ShelfGeometry {
     /// of view still reports its rect, so a test can tell "off-screen" from
     /// "hidden behind a control".
     cards: Vec<egui::Rect>,
+    /// Each card's widget id, in the same order as `cards`. Reported so a
+    /// test can drive a card through egui's own keyboard focus rather than
+    /// by synthesising a click at a coordinate.
+    card_ids: Vec<egui::Id>,
 }
 
 impl Default for ShelfGeometry {
@@ -36227,6 +36729,7 @@ impl Default for ShelfGeometry {
             previous: None,
             next: None,
             cards: Vec::new(),
+            card_ids: Vec::new(),
         }
     }
 }
@@ -36305,10 +36808,45 @@ fn show_gamer_platform_shelf(
     // Measured before anything is laid out, so it is independent of whether the
     // chevrons end up being drawn.
     let full_width = ui.available_width();
-    let show_controls = state.metrics.content_width > full_width + SHELF_EDGE_EPSILON;
+    let spacing = ui.spacing().item_spacing.x;
+
+    // Decided from what the shelf *would* be at the preferred card width,
+    // computed here rather than read back from last frame's measurement.
+    //
+    // That matters now that the card width depends on whether the chevrons are
+    // shown: a decision fed by the previous frame's `content_width` could see
+    // narrower fitted cards, conclude everything fits, hide the chevrons, widen
+    // the cards again, and flip back - a shelf that flickers forever at exactly
+    // one window width. Derived from the entry count and the preferred width,
+    // the answer is a pure function of the row's own width and cannot oscillate.
+    let preferred_card_width = card_width;
+    let content_at_preferred =
+        (entries.len() as f32 * (preferred_card_width + spacing) - spacing).max(0.0);
+    let show_controls = content_at_preferred > full_width + SHELF_EDGE_EPSILON;
     outcome.controls_visible = show_controls;
     outcome.previous_enabled = show_controls && state.metrics.can_page_left();
     outcome.next_enabled = show_controls && state.metrics.can_page_right();
+
+    // The space the strip may occupy once both chevrons have been paid for -
+    // both, not one, because the row must lay out identically whichever end it
+    // is scrolled to. From that, a card width that divides the strip exactly.
+    //
+    // This is the whole fix for the reported defect. The strip used to be given
+    // whatever width happened to remain, which almost never divided evenly by a
+    // card, so the rightmost card was sliced by the strip's clip edge with the
+    // chevron sitting 8px beyond it - measured at 14-124px of card cut off,
+    // depending on window width. A person reads a card cut off flush against a
+    // button as a card hidden *underneath* that button.
+    let usable_strip_width = if show_controls {
+        (full_width - 2.0 * shelf_chevron_reserve(spacing)).max(PLATFORM_CARD_MIN_WIDTH)
+    } else {
+        full_width
+    };
+    let card_width = if show_controls {
+        shelf_fitted_card_width(usable_strip_width, preferred_card_width, spacing)
+    } else {
+        preferred_card_width
+    };
 
     // A selection change re-reveals the selected card. Detected here, before the
     // cards are drawn, because the scroll request has to be made as the card
@@ -36321,6 +36859,7 @@ fn show_gamer_platform_shelf(
     let mut requested: Option<ShelfScroll> = None;
     let mut focusable: Vec<egui::Id> = Vec::new();
     let mut card_rects: Vec<egui::Rect> = Vec::new();
+    let mut card_ids: Vec<egui::Id> = Vec::new();
 
     // Reserve exactly the shelf's own height, then draw inside it.
     //
@@ -36361,12 +36900,19 @@ fn show_gamer_platform_shelf(
             }
         }
 
+        // The leading chevron has already consumed its own width, so only the
+        // trailing one is still to be paid for here.
         let reserved = if show_controls {
-            SHELF_CHEVRON_WIDTH + ui.spacing().item_spacing.x
+            shelf_chevron_reserve(spacing)
         } else {
             0.0
         };
-        let strip_width = (ui.available_width() - reserved).max(card_width);
+        let remaining = (ui.available_width() - reserved).max(0.0);
+        let strip_width = if show_controls {
+            shelf_strip_width(remaining, card_width, spacing)
+        } else {
+            remaining.max(card_width)
+        };
 
         let output = egui::ScrollArea::horizontal()
             .id_salt("gamer_view_platform_shelf")
@@ -36398,6 +36944,7 @@ fn show_gamer_platform_shelf(
                         );
                         focusable.push(response.id);
                         card_rects.push(response.rect);
+                        card_ids.push(response.id);
                         if is_selected && selection_changed {
                             // Minimal movement: bring it just into view rather
                             // than recentring, so the shelf does not lurch.
@@ -36411,6 +36958,11 @@ fn show_gamer_platform_shelf(
             });
 
         if show_controls {
+            // Any width the strip declined to use (only when the readable
+            // minimum clamp bound) becomes a gutter here, so the trailing
+            // chevron stays flush with the row's right edge and the gap falls
+            // between the last card and the button rather than beyond it.
+            ui.add_space((remaining - strip_width).max(0.0));
             let response =
                 shelf_chevron(ui, SHELF_NEXT_GLYPH, "Next platforms", outcome.next_enabled);
             focusable.push(response.id);
@@ -36426,6 +36978,7 @@ fn show_gamer_platform_shelf(
             offset_x: output.state.offset.x,
             content_width: output.content_size.x,
             viewport_width: output.inner_rect.width(),
+            card_stride: card_width + spacing,
         };
         outcome.metrics = state.metrics;
         outcome.geometry.strip = output.inner_rect;
@@ -36438,6 +36991,7 @@ fn show_gamer_platform_shelf(
     }
 
     outcome.geometry.cards = card_rects;
+    outcome.geometry.card_ids = card_ids;
 
     if let Some(scroll) = requested
         && state.metrics.can_scroll(scroll)
@@ -37816,10 +38370,23 @@ mod tests {
     // --- Platform shelf horizontal navigation ----------------------------
 
     fn shelf_metrics(offset: f32, content: f32, viewport: f32) -> PlatformShelfMetrics {
+        // Stride zero: these navigation tests predate card-aligned paging and
+        // are about the offset arithmetic, not the alignment. Zero selects the
+        // raw fractional page, which is exactly what they were written against.
+        shelf_metrics_with_stride(offset, content, viewport, 0.0)
+    }
+
+    fn shelf_metrics_with_stride(
+        offset: f32,
+        content: f32,
+        viewport: f32,
+        card_stride: f32,
+    ) -> PlatformShelfMetrics {
         PlatformShelfMetrics {
             offset_x: offset,
             content_width: content,
             viewport_width: viewport,
+            card_stride,
         }
     }
 
@@ -38107,24 +38674,48 @@ mod tests {
         );
     }
 
-    /// Test 15: the controls appear only once the content has been measured,
-    /// which is what proves the cross-frame measurement actually works.
+    /// Test 15: the controls are decided on the very first frame.
+    ///
+    /// This used to require two frames, because the decision was read back from
+    /// the previous frame's measured `content_width`. That is no longer safe:
+    /// the card width now depends on whether the chevrons are shown (they take
+    /// space out of the strip, and the cards are refitted to what is left), so
+    /// a decision fed by the previous frame's measurement could see the
+    /// narrower fitted cards, conclude everything fits, retire the chevrons,
+    /// widen the cards, and flip back forever at one particular width.
+    ///
+    /// The decision is now computed directly from the row's width and the
+    /// entry count at the preferred card width - a pure function of this
+    /// frame's inputs. Deciding it a frame earlier is also simply better: the
+    /// shelf no longer opens with one frame of missing controls.
     #[test]
-    fn the_controls_appear_after_the_first_frame_has_measured_the_content() {
+    fn the_controls_are_decided_on_the_first_frame_without_a_measurement() {
         let context = egui::Context::default();
         let platforms = shelf_entries(40);
 
         let (_, first) = render_shelf(&context, 700.0, &platforms, None, 1);
         assert!(
-            !first.controls_visible,
-            "nothing has been measured yet, so nothing is claimed"
+            first.controls_visible,
+            "40 platforms cannot fit in 700px, and that is knowable immediately"
         );
 
         let (_, second) = render_shelf(&context, 700.0, &platforms, None, 1);
         assert!(
             second.controls_visible,
-            "the first frame's measurement must be available to the second"
+            "and the answer must not change once measurements exist"
         );
+
+        // The converse, on a fresh context: a shelf that fits claims nothing,
+        // on the first frame and every frame after it.
+        let roomy = egui::Context::default();
+        let few = shelf_entries(3);
+        for _ in 0..3 {
+            let (_, shelf) = render_shelf(&roomy, 2560.0, &few, None, 1);
+            assert!(
+                !shelf.controls_visible,
+                "three cards fit easily and need no controls"
+            );
+        }
     }
 
     /// Test 16: resizing the window updates the controls in both directions,
@@ -39099,6 +39690,253 @@ mod tests {
                 geometry.row
             );
         }
+    }
+
+    /// Renders the shelf, presses the next chevron `pages` times, and reports
+    /// the geometry that results.
+    fn shelf_geometry_after_pages(width: f32, platforms: usize, pages: usize) -> ShelfGeometry {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = Vec::new();
+        for index in 0..platforms {
+            let mut row = record(&format!("/roms/g{index:02}.zip"), MountState::Pending);
+            row.metadata.platform = Some(format!("Platform{index:02}"));
+            records.push(row);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1080.0));
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(idle.clone(), |ctx| app.update(ctx, &mut frame));
+        }
+        let geometry = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<PlatformShelfState>(platform_shelf_state_id()))
+                .map(|state| state.geometry)
+                .unwrap_or_default()
+        };
+        for _ in 0..pages {
+            let next = geometry(&ctx).next.expect("the chevrons are shown");
+            let _ = ctx.run(click_at(screen, next.center()), |ctx| {
+                app.update(ctx, &mut frame)
+            });
+            // Let the animated scroll settle before the next press.
+            for _ in 0..60 {
+                let _ = ctx.run(idle.clone(), |ctx| app.update(ctx, &mut frame));
+            }
+        }
+        geometry(&ctx)
+    }
+
+    // --- Platform shelf: cards must never be sliced against a chevron -----
+    //
+    // Reported after the Sunshine smoke test: at some widths the rightmost
+    // card looked like it sat underneath the ">" control. Measured, the card
+    // was not painted under the button - the strip clips it - but the strip
+    // was given whatever width happened to remain after the chevrons, which
+    // almost never divided evenly by a card, so the last card was cut off by
+    // 14-124px flush against the button. These tests pin the arithmetic that
+    // fixes it, rather than a screenshot.
+
+    /// The widths worth checking: common desktop sizes plus the 1920x1080 the
+    /// Sunshine/TV session actually runs at.
+    const SHELF_TEST_WIDTHS: [f32; 6] = [1024.0, 1280.0, 1366.0, 1600.0, 1920.0, 2560.0];
+
+    #[test]
+    fn a_fitted_card_is_never_wider_than_preferred_nor_narrower_than_readable() {
+        for width in SHELF_TEST_WIDTHS {
+            let preferred = gamer_platform_card_width(width);
+            let usable = width - 2.0 * shelf_chevron_reserve(8.0);
+            let fitted = shelf_fitted_card_width(usable, preferred, 8.0);
+            assert!(
+                fitted <= preferred + 0.01,
+                "{width}: fitted {fitted} exceeds the preferred {preferred}"
+            );
+            assert!(
+                fitted >= PLATFORM_CARD_MIN_WIDTH - 0.01,
+                "{width}: fitted {fitted} is below the readable minimum"
+            );
+        }
+    }
+
+    /// The property the whole fix rests on: a whole number of cards fills the
+    /// strip exactly, so its right edge always lands on a card boundary.
+    #[test]
+    fn a_whole_number_of_cards_fills_the_strip_exactly() {
+        for width in SHELF_TEST_WIDTHS {
+            for spacing in [4.0_f32, 8.0, 12.0] {
+                let preferred = gamer_platform_card_width(width);
+                let usable = width - 2.0 * shelf_chevron_reserve(spacing);
+                let fitted = shelf_fitted_card_width(usable, preferred, spacing);
+                let count = shelf_visible_card_count(usable, fitted, spacing);
+                let strip = shelf_strip_width(usable, fitted, spacing);
+
+                assert!(count >= 1, "{width}/{spacing}: no cards fit");
+                assert!(
+                    strip <= usable + 0.01,
+                    "{width}/{spacing}: strip {strip} exceeds the usable {usable}"
+                );
+                let exact = count as f32 * (fitted + spacing) - spacing;
+                assert!(
+                    (strip - exact).abs() < 0.5,
+                    "{width}/{spacing}: strip {strip} is not {count} whole cards ({exact})"
+                );
+                // And it wastes no meaningful space: the leftover is never a
+                // whole card, or the strip should have shown one more.
+                assert!(
+                    usable - strip < fitted + spacing,
+                    "{width}/{spacing}: {} left over, enough for another card",
+                    usable - strip
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_strip_never_claims_the_space_a_chevron_needs() {
+        // Both chevrons are paid for, whichever end the shelf is scrolled to.
+        assert_eq!(shelf_chevron_reserve(8.0), SHELF_CHEVRON_WIDTH + 8.0);
+        for width in SHELF_TEST_WIDTHS {
+            let preferred = gamer_platform_card_width(width);
+            let usable = width - 2.0 * shelf_chevron_reserve(8.0);
+            let strip = shelf_strip_width(usable, preferred, 8.0);
+            assert!(
+                strip + 2.0 * shelf_chevron_reserve(8.0) <= width + 0.01,
+                "{width}: strip {strip} leaves no room for both chevrons"
+            );
+        }
+    }
+
+    /// A strip too narrow for even one readable card must still not overflow -
+    /// it gives up filling the strip rather than overlapping a control.
+    #[test]
+    fn an_impossibly_narrow_strip_underfills_rather_than_overlapping() {
+        let strip = shelf_strip_width(40.0, PLATFORM_CARD_MIN_WIDTH, 8.0);
+        assert!(
+            strip <= 40.0 + 0.01,
+            "the strip overflowed its usable width"
+        );
+        assert_eq!(
+            shelf_visible_card_count(40.0, PLATFORM_CARD_MIN_WIDTH, 8.0),
+            1
+        );
+        assert_eq!(shelf_visible_card_count(0.0, 164.0, 8.0), 1);
+        assert_eq!(shelf_visible_card_count(-10.0, 164.0, 8.0), 1);
+    }
+
+    /// Paging moves whole cards, which is what keeps an aligned shelf aligned.
+    #[test]
+    fn a_page_press_travels_a_whole_number_of_cards() {
+        let stride = 172.0;
+        let metrics = shelf_metrics_with_stride(0.0, 4000.0, 1032.0, stride);
+        let delta = metrics.page_delta();
+        assert!(delta > 0.0);
+        assert!(
+            (delta / stride - (delta / stride).round()).abs() < 0.001,
+            "a page of {delta} is not a whole number of {stride}px cards"
+        );
+        assert!(
+            delta <= 1032.0 * SHELF_PAGE_FRACTION + 0.01,
+            "a page must still stay short of a full viewport"
+        );
+        // Even a viewport narrower than one card advances by at least one.
+        let narrow = shelf_metrics_with_stride(0.0, 4000.0, 100.0, stride);
+        assert_eq!(narrow.page_delta(), stride);
+        // With no stride measured yet, the raw fractional page still applies.
+        let unmeasured = shelf_metrics_with_stride(0.0, 4000.0, 1000.0, 0.0);
+        assert_eq!(unmeasured.page_delta(), 1000.0 * SHELF_PAGE_FRACTION);
+    }
+
+    /// The rendered result, expressed as relations rather than pixel values:
+    /// at every width, no card that is actually on screen may cross either
+    /// edge of the strip, and the strip may not reach either chevron.
+    #[test]
+    fn no_visible_card_is_sliced_by_a_chevron_at_any_width() {
+        for width in SHELF_TEST_WIDTHS {
+            let (geometry, _) = render_gamer_view_at(width, 1080.0, 19);
+            let previous = geometry
+                .previous
+                .expect("19 platforms overflow every width");
+            let next = geometry.next.expect("19 platforms overflow every width");
+
+            assert!(
+                previous.right() <= geometry.strip.left() + 0.5,
+                "{width}: the previous chevron runs into the strip"
+            );
+            assert!(
+                geometry.strip.right() <= next.left() + 0.5,
+                "{width}: the strip runs into the next chevron"
+            );
+
+            for card in geometry.cards.iter().filter(|card| {
+                card.right() > geometry.strip.left() + 0.5
+                    && card.left() < geometry.strip.right() - 0.5
+            }) {
+                assert!(
+                    card.right() <= geometry.strip.right() + 1.0,
+                    "{width}: a visible card {card:?} is cut off by {} at the next chevron",
+                    card.right() - geometry.strip.right()
+                );
+                assert!(
+                    card.left() >= geometry.strip.left() - 1.0,
+                    "{width}: a visible card {card:?} is cut off at the previous chevron"
+                );
+                assert!(
+                    !card.intersects(next) && !card.intersects(previous),
+                    "{width}: a visible card overlaps a chevron"
+                );
+            }
+        }
+    }
+
+    /// And the alignment survives using the controls, which is how a shelf is
+    /// actually driven on a TV.
+    #[test]
+    fn paging_the_shelf_leaves_every_visible_card_whole() {
+        for width in [1366.0_f32, 1920.0] {
+            for pages in [1_usize, 2] {
+                let geometry = shelf_geometry_after_pages(width, 19, pages);
+                let next = geometry.next.expect("the chevrons are shown");
+                for card in geometry.cards.iter().filter(|card| {
+                    card.right() > geometry.strip.left() + 0.5
+                        && card.left() < geometry.strip.right() - 0.5
+                }) {
+                    assert!(
+                        card.right() <= geometry.strip.right() + 1.0
+                            && card.left() >= geometry.strip.left() - 1.0,
+                        "{width} after {pages} page(s): card {card:?} is sliced by the strip \
+                         edge (strip {:?})",
+                        geometry.strip
+                    );
+                    assert!(!card.intersects(next));
+                }
+            }
+        }
+    }
+
+    /// Selecting a platform must still work after all of the above - the fix
+    /// changes layout only.
+    #[test]
+    fn fitted_cards_still_select_their_platform() {
+        let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 2), ("SNES", 2)]);
+        let ctx = egui::Context::default();
+        let screen = gamer_screen();
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
+        let cards = gamer_shelf_geometry(&ctx).cards;
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[2].center()), 1);
+        assert_eq!(app.library_filters.platform.as_deref(), Some("SNES"));
+        let output = run_gamer_frames(&mut app, &ctx, idle, 1);
+        assert!(rendered_text_contains(&output, "Title0002"));
     }
 
     /// A shelf that fits needs no controls, and must still not disturb the
@@ -46451,17 +47289,773 @@ $Instant Growth [Nayr]\n";
         assert!(rendered_text_contains(&output, "mounted read-only"));
     }
 
+    // ---------------------------------------------------------------------
+    // Human-smoke regressions: Gamer View platform filtering
+    //
+    // Confirmed on a real 13,891-archive library: after ticking a state
+    // filter in Advanced View (or opening the Health dashboard's "Review
+    // missing", which sets `missing` directly) and returning to Gamer View,
+    // every platform card still showed its full count while the list said
+    // "No games match the selected platform." for all of them. Gamer View
+    // shows no such checkbox, so there was no way back except a restart -
+    // `LibraryRowFilters` is not persisted, which is exactly why restarting
+    // appeared to "fix" it.
+    // ---------------------------------------------------------------------
+
+    /// A pointer click at one position, as one frame of input.
+    fn click_at(screen: egui::Rect, position: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn gamer_app_with_platforms(platforms: &[(&str, usize)]) -> ArchiveFsApp {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = Vec::new();
+        let mut index = 0usize;
+        for (platform, count) in platforms {
+            for _ in 0..*count {
+                let mut row = record(&format!("/roms/g{index:04}.zip"), MountState::Pending);
+                row.metadata.platform = Some((*platform).to_string());
+                row.metadata.title = Some(format!("Title{index:04}"));
+                records.push(row);
+                index += 1;
+            }
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app
+    }
+
+    fn gamer_screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0))
+    }
+
+    /// Runs `frames` settling frames and returns the last output.
+    fn run_gamer_frames(
+        app: &mut ArchiveFsApp,
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        frames: usize,
+    ) -> egui::FullOutput {
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = None;
+        for _ in 0..frames {
+            output = Some(ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame)));
+        }
+        output.expect("at least one frame")
+    }
+
+    fn gamer_shelf_geometry(ctx: &egui::Context) -> ShelfGeometry {
+        ctx.data(|data| data.get_temp::<PlatformShelfState>(platform_shelf_state_id()))
+            .map(|state| state.geometry)
+            .unwrap_or_default()
+    }
+
+    /// The exact confirmed defect: an Advanced-View-only state filter must
+    /// not silently empty Gamer View's list.
+    #[test]
+    fn gamer_view_ignores_advanced_view_state_filters_it_cannot_show_or_clear() {
+        let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 3), ("SNES", 2)]);
+        // Exactly what "Review missing" in the Health dashboard does.
+        app.library_filters.missing = true;
+        app.library_filters.platform = Some("Acorn Archimedes".to_string());
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, input, 2);
+
+        assert!(
+            rendered_text_contains(&output, "Title0000"),
+            "the selected platform's games must be listed; the Missing checkbox lives in \
+             Advanced View, which Gamer View neither renders nor can clear"
+        );
+        assert!(!rendered_text_contains(
+            &output,
+            "No games match the selected platform"
+        ));
+        // The Advanced-View filter itself is preserved, not silently reset -
+        // returning to Advanced View must find it exactly as it was left.
+        assert!(app.library_filters.missing);
+    }
+
+    /// The structural guarantee, stated directly: for every card the shelf
+    /// offers, selecting it produces exactly the number of rows the card
+    /// advertised. No pairing of counts and rows can drift apart.
+    #[test]
+    fn gamer_shelf_counts_are_exactly_the_rows_selecting_that_card_produces() {
+        let rows: Vec<ArchiveRow> = {
+            let mut records = Vec::new();
+            for (index, platform) in ["SNES", "SNES", "GameCube", "MegaDrive"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut row = record(&format!("/roms/g{index}.zip"), MountState::Pending);
+                row.metadata.platform = Some(platform.to_string());
+                records.push(row);
+            }
+            let mut unknown = record("/roms/unknown.zip", MountState::Pending);
+            unknown.metadata.platform = None;
+            unknown.identity.platform = None;
+            records.push(unknown);
+            records.iter().map(row_for).collect()
+        };
+
+        let all = GamerLibrarySnapshot::build(&rows, None, "");
+        assert_eq!(all.candidates.len(), 5);
+        assert_eq!(all.visible.len(), 5, "All lists every game");
+
+        for (platform, count) in &all.platform_counts.named {
+            let selected = GamerLibrarySnapshot::build(&rows, Some(platform), "");
+            assert_eq!(
+                selected.visible.len(),
+                *count,
+                "the {platform} card advertised {count}"
+            );
+            assert!(!selected.selection_is_stale);
+        }
+        let unknown = GamerLibrarySnapshot::build(&rows, Some("Unknown"), "");
+        assert_eq!(unknown.visible.len(), all.platform_counts.unknown);
+        assert!(!unknown.visible.is_empty());
+    }
+
+    /// A card whose count is non-zero can never produce an empty list.
+    #[test]
+    fn a_non_zero_card_count_can_never_yield_a_false_empty_state() {
+        let mut records = Vec::new();
+        for (index, platform) in ["SNES", "GameCube", "GameCube"].into_iter().enumerate() {
+            let mut row = record(&format!("/roms/g{index}.zip"), MountState::Pending);
+            row.metadata.platform = Some(platform.to_string());
+            records.push(row);
+        }
+        let rows: Vec<ArchiveRow> = records.iter().map(row_for).collect();
+        for search in ["", "g1", "gamecube", "nothing-matches-this"] {
+            let snapshot = GamerLibrarySnapshot::build(&rows, None, search);
+            for (platform, count) in &snapshot.platform_counts.named {
+                let selected = GamerLibrarySnapshot::build(&rows, Some(platform), search);
+                assert_eq!(selected.visible.len(), *count);
+                assert!(
+                    *count == 0 || !selected.visible.is_empty(),
+                    "{platform} advertised {count} under search {search:?} but listed nothing"
+                );
+            }
+        }
+    }
+
+    /// Search and the platform selection compose, and the counts follow the
+    /// search rather than describing a library the list is not showing.
+    #[test]
+    fn gamer_search_and_platform_compose_and_clearing_search_restores_rows() {
+        let mut records = Vec::new();
+        for (index, platform) in ["SNES", "SNES", "GameCube"].into_iter().enumerate() {
+            let mut row = record(&format!("/roms/game{index}.zip"), MountState::Pending);
+            row.metadata.platform = Some(platform.to_string());
+            records.push(row);
+        }
+        let rows: Vec<ArchiveRow> = records.iter().map(row_for).collect();
+
+        let unfiltered = GamerLibrarySnapshot::build(&rows, Some("SNES"), "");
+        assert_eq!(unfiltered.visible.len(), 2);
+
+        let searched = GamerLibrarySnapshot::build(&rows, Some("SNES"), "game1");
+        assert_eq!(
+            searched.visible.len(),
+            1,
+            "search narrows within the platform"
+        );
+        assert_eq!(
+            searched
+                .platform_counts
+                .named
+                .iter()
+                .find(|(name, _)| name == "SNES")
+                .map(|(_, count)| *count),
+            Some(1),
+            "the card must count what the search admits, not the whole library"
+        );
+
+        let cleared = GamerLibrarySnapshot::build(&rows, Some("SNES"), "");
+        assert_eq!(
+            cleared.visible.len(),
+            2,
+            "clearing the search restores rows"
+        );
+    }
+
+    /// A selection that survives a library reload but names a platform the
+    /// new snapshot no longer has must resolve to All, not to a dead list.
+    #[test]
+    fn a_platform_missing_from_the_snapshot_falls_back_to_all() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 2)]);
+        // `open_cheat_archive_picker` writes canonical adapter ids such as
+        // this one straight into the shared filter.
+        app.library_filters.platform = Some("Xbox360".to_string());
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, input, 2);
+
+        assert_eq!(
+            app.library_filters.platform, None,
+            "a platform no card offers must fall back to All"
+        );
+        assert!(rendered_text_contains(&output, "Title0000"));
+    }
+
+    #[test]
+    fn a_platform_present_in_the_snapshot_is_never_treated_as_stale() {
+        let mut records = Vec::new();
+        let mut row = record("/roms/a.zip", MountState::Pending);
+        row.metadata.platform = Some("SNES".to_string());
+        records.push(row);
+        let mut unknown = record("/roms/b.zip", MountState::Pending);
+        unknown.metadata.platform = None;
+        unknown.identity.platform = None;
+        records.push(unknown);
+        let rows: Vec<ArchiveRow> = records.iter().map(row_for).collect();
+
+        assert!(!GamerLibrarySnapshot::build(&rows, Some("SNES"), "").selection_is_stale);
+        assert!(!GamerLibrarySnapshot::build(&rows, Some("Unknown"), "").selection_is_stale);
+        assert!(!GamerLibrarySnapshot::build(&rows, None, "").selection_is_stale);
+        assert!(GamerLibrarySnapshot::build(&rows, Some("MegaDrive"), "").selection_is_stale);
+        // "Unknown" is only a real card while something is unclassified.
+        let classified: Vec<ArchiveRow> = records[..1].iter().map(row_for).collect();
+        assert!(GamerLibrarySnapshot::build(&classified, Some("Unknown"), "").selection_is_stale);
+    }
+
+    /// Clicking a card - the real button, at its real position - lists that
+    /// platform's games, and switching to another recomputes the rows.
+    #[test]
+    fn clicking_platform_cards_lists_and_then_switches_the_visible_games() {
+        let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 2), ("SNES", 2)]);
+        let ctx = egui::Context::default();
+        let screen = gamer_screen();
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
+        let cards = gamer_shelf_geometry(&ctx).cards;
+        assert!(cards.len() >= 3, "All plus two platforms");
+
+        // Card 1 is the first named platform, in the shelf's own order.
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[1].center()), 1);
+        assert_eq!(
+            app.library_filters.platform.as_deref(),
+            Some("Acorn Archimedes")
+        );
+        let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 1);
+        assert!(rendered_text_contains(&output, "Title0000"));
+        assert!(!rendered_text_contains(&output, "Title0002"));
+
+        // Switching without a restart recomputes the rows.
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[2].center()), 1);
+        assert_eq!(app.library_filters.platform.as_deref(), Some("SNES"));
+        let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 1);
+        assert!(rendered_text_contains(&output, "Title0002"));
+        assert!(!rendered_text_contains(&output, "Title0000"));
+
+        // Back to All.
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[0].center()), 1);
+        assert_eq!(app.library_filters.platform, None);
+        let output = run_gamer_frames(&mut app, &ctx, idle, 1);
+        assert!(rendered_text_contains(&output, "Title0000"));
+        assert!(rendered_text_contains(&output, "Title0002"));
+    }
+
+    /// A platform card is a real `egui::Button`, so egui's own keyboard
+    /// focus plus Enter or Space activates it exactly as a mouse click does.
+    /// Driven through the card's real widget id and egui's real focus, not
+    /// by re-deriving key handling.
+    #[test]
+    fn platform_cards_activate_from_the_keyboard_exactly_as_from_the_mouse() {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 2), ("SNES", 2)]);
+            let ctx = egui::Context::default();
+            let screen = gamer_screen();
+            let idle = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
+            let geometry = gamer_shelf_geometry(&ctx);
+            assert_eq!(geometry.card_ids.len(), geometry.cards.len());
+
+            // The mouse baseline this comparison rests on.
+            run_gamer_frames(
+                &mut app,
+                &ctx,
+                click_at(screen, geometry.cards[1].center()),
+                1,
+            );
+            assert_eq!(
+                app.library_filters.platform.as_deref(),
+                Some("Acorn Archimedes")
+            );
+
+            // Now the same card via focus plus the key under test.
+            let snes_card = geometry.card_ids[2];
+            ctx.memory_mut(|memory| memory.request_focus(snes_card));
+            let mut activated = idle.clone();
+            activated.events = vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }];
+            run_gamer_frames(&mut app, &ctx, activated, 1);
+            assert_eq!(
+                app.library_filters.platform.as_deref(),
+                Some("SNES"),
+                "{key:?} on a focused platform card must select it, as a click does"
+            );
+            let output = run_gamer_frames(&mut app, &ctx, idle, 1);
+            assert!(rendered_text_contains(&output, "Title0002"));
+        }
+    }
+
+    /// A library reload replaces the rows; the list must follow it in the
+    /// next frame, with no restart and no manual re-selection.
+    #[test]
+    fn a_library_reload_refreshes_the_visible_rows_without_a_restart() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 2)]);
+        app.library_filters.platform = Some("SNES".to_string());
+        let ctx = egui::Context::default();
+        let idle = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 2);
+        assert!(rendered_text_contains(&output, "Title0000"));
+
+        // A completed refresh (a scan, or the reload that follows Mount All)
+        // installs a new snapshot in exactly this way.
+        let mut replacement = record("/roms/new.zip", MountState::Pending);
+        replacement.metadata.platform = Some("SNES".to_string());
+        replacement.metadata.title = Some("BrandNewTitle".to_string());
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records(
+            "/mount",
+            vec![replacement],
+        )));
+
+        let output = run_gamer_frames(&mut app, &ctx, idle, 2);
+        assert!(rendered_text_contains(&output, "BrandNewTitle"));
+        assert!(!rendered_text_contains(&output, "Title0000"));
+        assert_eq!(
+            app.library_filters.platform.as_deref(),
+            Some("SNES"),
+            "a selection the new snapshot still offers stays selected"
+        );
+    }
+
+    /// At TV resolution the list must actually occupy space and be on
+    /// screen - a correct filter is no use behind a zero-height pane.
+    #[test]
+    fn the_game_list_occupies_real_visible_space_at_tv_resolution() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 40)]);
+        let ctx = egui::Context::default();
+        let screen = gamer_screen();
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, idle, 3);
+
+        let mut texts = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_string(), text.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        let rows: Vec<egui::Rect> = texts
+            .iter()
+            .filter(|(text, _)| text.contains("Title"))
+            .map(|(_, rect)| *rect)
+            .collect();
+        assert!(rows.len() > 1, "several rows must be drawn, not one");
+        for rect in &rows {
+            assert!(
+                rect.width() > 0.0 && rect.height() > 0.0,
+                "a game row was allocated no space: {rect:?}"
+            );
+            assert!(
+                rect.right() <= screen.right(),
+                "no horizontal overflow at TV resolution: {rect:?}"
+            );
+            assert!(
+                rect.left() >= screen.left(),
+                "no row starts left of the viewport: {rect:?}"
+            );
+        }
+        // A scroll area draws one row past its bottom edge and clips it, so
+        // the useful assertion is that the *listing* starts on screen and
+        // covers real height - not that every shape is inside the viewport.
+        let top = rows
+            .iter()
+            .map(|rect| rect.top())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            top > screen.top() && top < screen.bottom(),
+            "the game list must begin inside the viewport, not below it"
+        );
+        let visible_rows = rows
+            .iter()
+            .filter(|rect| rect.bottom() <= screen.bottom())
+            .count();
+        assert!(
+            visible_rows > 3,
+            "only {visible_rows} rows fell inside a 1080p viewport"
+        );
+    }
+
+    /// Truthful wording for each distinct reason, including the composed
+    /// search-plus-platform case the old `else if` chain could not express.
+    #[test]
+    fn the_empty_list_wording_names_the_actual_reason() {
+        assert_eq!(
+            gamer_empty_list_guidance(true, false, false),
+            "No games are in your library yet."
+        );
+        assert_eq!(
+            gamer_empty_list_guidance(false, true, false),
+            "No games match your search."
+        );
+        assert_eq!(
+            gamer_empty_list_guidance(false, false, true),
+            "No games match the selected platform."
+        );
+        assert_eq!(
+            gamer_empty_list_guidance(false, true, true),
+            "No games on this platform match your search."
+        );
+    }
+
+    /// A platform genuinely holding nothing still reports so - the truthful
+    /// empty state must survive the fix that removed the false one.
+    #[test]
+    fn a_platform_with_no_games_still_reports_an_honest_empty_state() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 1)]);
+        // Force the list empty the only way that remains: a search nothing
+        // satisfies, with a platform selected.
+        app.library_filters.platform = Some("SNES".to_string());
+        app.filter = "no-such-game-anywhere".to_string();
+        let ctx = egui::Context::default();
+        let idle = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, idle, 2);
+        assert!(rendered_text_contains(
+            &output,
+            "No games on this platform match your search."
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Human-smoke regression: Doctor "Measured values"
+    //
+    // Confirmed in Sunshine on a real scan: clicking the disclosure did
+    // nothing, and egui itself painted "First use of widget ID 6819" beside
+    // it. `Finding::id` names a finding's *kind*, and a real scan produces
+    // hundreds of findings sharing one - `doctor_presentation_groups` exists
+    // precisely because it does. Salting the header with that id gave every
+    // one of those cards the same widget id, and selecting a finding by id
+    // expanded all of them at once.
+    // ---------------------------------------------------------------------
+
+    /// Two findings of the same kind, which is the situation that broke.
+    fn repeated_doctor_findings() -> DoctorScan {
+        let issues = [
+            doctor_health_issue("/roms/one.zip", HealthCategory::UnknownPlatform),
+            doctor_health_issue("/roms/two.zip", HealthCategory::UnknownPlatform),
+        ];
+        doctor_scan_from(&issues)
+    }
+
+    #[test]
+    fn findings_sharing_one_id_still_get_distinct_expansion_keys() {
+        let scan = repeated_doctor_findings();
+        assert!(scan.findings.len() >= 2);
+        assert_eq!(
+            scan.findings[0].id, scan.findings[1].id,
+            "this test is only meaningful while the ids do collide"
+        );
+
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let first = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let second = doctor_finding_key(&scan.findings[1], ordinals.ordinal(&scan.findings[1]));
+        assert_ne!(first, second, "each rendered finding needs its own key");
+
+        // Stable: rebuilding the map for the same scan yields the same keys.
+        let again = DoctorFindingOrdinals::of(&scan);
+        assert_eq!(
+            first,
+            doctor_finding_key(&scan.findings[0], again.ordinal(&scan.findings[0]))
+        );
+
+        // And the kind is still recoverable, which is what the two
+        // invalidation paths reason about.
+        assert_eq!(doctor_finding_key_id(&first), scan.findings[0].id);
+        assert_eq!(doctor_finding_key_id(&second), scan.findings[1].id);
+    }
+
+    /// Selecting one finding must not open its twin.
+    #[test]
+    fn expanding_one_finding_does_not_expand_another_of_the_same_kind() {
+        let scan = repeated_doctor_findings();
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let first = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let state = doctor_outcome(scan);
+
+        let output = render_doctor_page(&state, &mut Some(first));
+        let hide = painted_doctor_texts(&output)
+            .into_iter()
+            .filter(|text| text == "Hide details")
+            .count();
+        assert_eq!(
+            hide, 1,
+            "exactly one card may be expanded; selecting by kind expanded all of them"
+        );
+    }
+
+    fn painted_doctor_texts(output: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    /// Clicking the disclosure expands it, clicking again collapses it, and
+    /// the state survives the frames in between.
+    #[test]
+    fn the_measured_values_disclosure_expands_collapses_and_persists() {
+        let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let state = doctor_outcome(scan);
+        let mut selected = Some(key);
+        let mut clipboard = InMemoryClipboard::default();
+        let context = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
+            context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ =
+                        show_doctor_page(ui, &state, selected, None, None, None, &mut clipboard);
+                });
+            })
+        };
+
+        let output = frame(idle.clone(), &mut selected);
+        assert!(!rendered_text_contains(&output, "available_bytes"));
+        let header = find_exact_text_center(&output, "Measured values")
+            .expect("the disclosure must be rendered");
+
+        let click = |position: egui::Pos2| egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let _ = frame(click(header), &mut selected);
+        let output = frame(idle.clone(), &mut selected);
+        assert!(
+            rendered_text_contains(&output, "available_bytes"),
+            "clicking must expand the measured values"
+        );
+        // Still open several frames later - the state is not rebuilt per frame.
+        let _ = frame(idle.clone(), &mut selected);
+        let output = frame(idle.clone(), &mut selected);
+        assert!(rendered_text_contains(&output, "available_bytes"));
+
+        // Re-found rather than reused: the header may have shifted as the
+        // content above it settled.
+        let output = frame(idle.clone(), &mut selected);
+        let header = find_exact_text_center(&output, "Measured values")
+            .expect("the disclosure is still rendered while expanded");
+        let _ = frame(click(header), &mut selected);
+        // `CollapsingHeader` animates closed, so the content is still painted
+        // for a few frames after the click; the assertion is that it goes.
+        let mut collapsed = false;
+        for _ in 0..30 {
+            let output = frame(idle.clone(), &mut selected);
+            if !rendered_text_contains(&output, "available_bytes") {
+                collapsed = true;
+                break;
+            }
+        }
+        assert!(collapsed, "clicking again must collapse them");
+    }
+
+    /// A finding that measured nothing must say so in plain text, not offer a
+    /// triangle that opens onto nothing.
+    #[test]
+    fn a_finding_with_no_measurements_renders_words_not_a_disclosure() {
+        let mut scan = repeated_doctor_findings();
+        scan.findings[0].measurements.clear();
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let state = doctor_outcome(scan);
+
+        let output = render_doctor_page(&state, &mut Some(key));
+        assert!(rendered_text_contains(&output, DOCTOR_NO_MEASURED_VALUES));
+        assert_eq!(DOCTOR_NO_MEASURED_VALUES, "No measured values recorded");
+        assert!(
+            !rendered_text_contains(&output, "Measured values"),
+            "no disclosure may be offered for a finding that measured nothing"
+        );
+    }
+
+    /// The disclosure is a real `CollapsingHeader`, so it carries egui's own
+    /// focus and Enter/Space activation rather than a hand-painted triangle.
+    #[test]
+    fn the_measured_values_disclosure_activates_from_the_keyboard() {
+        for key_pressed in [egui::Key::Enter, egui::Key::Space] {
+            let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+            let ordinals = DoctorFindingOrdinals::of(&scan);
+            let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+            let state = doctor_outcome(scan);
+            let mut selected = Some(key);
+            let mut clipboard = InMemoryClipboard::default();
+            let context = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
+            let idle = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
+                context.run(input, |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let _ = show_doctor_page(
+                            ui,
+                            &state,
+                            selected,
+                            None,
+                            None,
+                            None,
+                            &mut clipboard,
+                        );
+                    });
+                })
+            };
+            let output = frame(idle.clone(), &mut selected);
+            assert!(!rendered_text_contains(&output, "available_bytes"));
+
+            // Focus it the way a keyboard user reaches it, then activate.
+            let mut tabbed = idle.clone();
+            tabbed.events = vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }];
+            let mut expanded = false;
+            for _ in 0..12 {
+                let _ = frame(tabbed.clone(), &mut selected);
+                let mut activate = idle.clone();
+                activate.events = vec![egui::Event::Key {
+                    key: key_pressed,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }];
+                let _ = frame(activate, &mut selected);
+                let output = frame(idle.clone(), &mut selected);
+                if rendered_text_contains(&output, "available_bytes") {
+                    expanded = true;
+                    break;
+                }
+            }
+            assert!(
+                expanded,
+                "{key_pressed:?} must reach and activate the disclosure by keyboard"
+            );
+        }
+    }
+
+    /// The expansion key of the first finding of a given kind.
+    ///
+    /// A finding is selected by its per-card key, not by its id: an id names
+    /// a *kind* and repeats across findings. See `doctor_finding_key`.
+    fn doctor_key_of_kind(scan: &DoctorScan, id: &str) -> String {
+        let index = scan
+            .findings
+            .iter()
+            .position(|finding| finding.id == id)
+            .unwrap_or_else(|| panic!("no finding with id {id}"));
+        doctor_finding_key(&scan.findings[index], index)
+    }
+
     /// Test 86
     #[test]
     fn doctor_page_shows_measured_values_only_for_the_selected_finding() {
         let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
-        let finding_id = scan.findings[0].id.clone();
+        let key = doctor_finding_key(&scan.findings[0], 0);
         let state = doctor_outcome(scan);
 
         let collapsed = render_doctor_page(&state, &mut None);
         assert!(!rendered_text_contains(&collapsed, "Measured values"));
 
-        let mut selected = Some(finding_id);
+        let mut selected = Some(key);
         let expanded = render_doctor_page(&state, &mut selected);
         assert!(rendered_text_contains(&expanded, "Measured values"));
     }
@@ -46580,13 +48174,15 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn doctor_page_shows_evidence_only_for_the_selected_finding() {
         let issues = vec![doctor_health_issue("/roms/a.zip", HealthCategory::Missing)];
-        let state = doctor_outcome(doctor_scan_from(&issues));
+        let scan = doctor_scan_from(&issues);
+        let key = doctor_key_of_kind(&scan, "library.archive_missing");
+        let state = doctor_outcome(scan);
 
         let collapsed = render_doctor_page(&state, &mut None);
         assert!(!rendered_text_contains(&collapsed, "Evidence"));
         assert!(rendered_text_contains(&collapsed, "Details"));
 
-        let mut selected = Some("library.archive_missing".to_string());
+        let mut selected = Some(key);
         let expanded = render_doctor_page(&state, &mut selected);
         for expected in [
             "Evidence",
@@ -46628,10 +48224,10 @@ $Instant Growth [Nayr]\n";
         let mut inputs = DoctorScanInputs::none_loaded();
         inputs.setup = Gathered::Ready(&setup);
         let scan = run_doctor_scan(&inputs);
-        let id = scan.findings[0].id.clone();
+        let key = doctor_finding_key(&scan.findings[0], 0);
         let state = doctor_outcome(scan);
 
-        let output = render_doctor_page(&state, &mut Some(id));
+        let output = render_doctor_page(&state, &mut Some(key));
         assert!(rendered_text_contains(&output, "Why it matters"));
         assert!(rendered_text_contains(
             &output,
@@ -46652,8 +48248,10 @@ $Instant Growth [Nayr]\n";
             "/roms/a.zip",
             HealthCategory::RetryableFailure,
         )];
-        let state = doctor_outcome(doctor_scan_from(&issues));
-        let output = render_doctor_page(&state, &mut Some("mounts.retryable_failure".to_string()));
+        let scan = doctor_scan_from(&issues);
+        let key = doctor_key_of_kind(&scan, "mounts.retryable_failure");
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut Some(key));
 
         assert!(rendered_text_contains(
             &output,
@@ -46729,8 +48327,10 @@ $Instant Growth [Nayr]\n";
         let long_name = "ロング".repeat(150);
         let path = format!("/roms/{long_name}/ゲーム 💾 [!].zip");
         let issues = vec![doctor_health_issue(&path, HealthCategory::Missing)];
-        let state = doctor_outcome(doctor_scan_from(&issues));
-        let output = render_doctor_page(&state, &mut Some("library.archive_missing".to_string()));
+        let scan = doctor_scan_from(&issues);
+        let key = doctor_key_of_kind(&scan, "library.archive_missing");
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut Some(key));
         assert!(rendered_text_contains(&output, "ゲーム 💾 [!].zip"));
         assert!(rendered_text_contains(&output, "Evidence"));
     }
@@ -62091,6 +63691,394 @@ mod romm_dispatch_tests {
             previous_cache_usable: true,
             ..RommImportSummary::default()
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Human-smoke regressions: RomM window navigation
+    //
+    // Confirmed in Sunshine: the Configure dialog had no visible exit (Save
+    // and Cancel were the last widgets inside its scrolling body, and the
+    // window offered no title-bar close), and "Browse records" opened the
+    // browser inline underneath the source card - below the viewport, so the
+    // click looked inert.
+    // ---------------------------------------------------------------------
+
+    fn tv_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1080.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Every text shape and its rectangle, for asserting what is on screen
+    /// and where.
+    fn painted(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_string(), text.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    fn rect_of(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        painted(output)
+            .into_iter()
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, rect)| rect)
+    }
+
+    fn run_config_window(
+        app: &mut ArchiveFsApp,
+        context: &egui::Context,
+        input: egui::RawInput,
+    ) -> (egui::FullOutput, Option<ConfigDialogRequest>) {
+        let mut request = None;
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |_ui| {
+                request = app.show_romm_configuration_window(context);
+            });
+        });
+        (output, request)
+    }
+
+    #[test]
+    fn the_configure_window_shows_both_save_and_cancel_inside_the_viewport() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let context = egui::Context::default();
+        // Two frames: the first lays the window out, the second draws it at
+        // its settled size.
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+        let (output, _) = run_config_window(&mut app, &context, tv_input());
+        let screen = tv_input().screen_rect.unwrap();
+        let save = rect_of(&output, "Save configuration").expect("a visible Save");
+        let cancel = rect_of(&output, "Cancel").expect("a visible Cancel");
+        for (label, rect) in [("Save", save), ("Cancel", cancel)] {
+            assert!(
+                screen.contains_rect(rect),
+                "{label} must be inside the viewport at TV resolution, was {rect:?}"
+            );
+        }
+        assert_ne!(save, cancel, "Save and Cancel are distinct controls");
+    }
+
+    /// The footer must not move when the body scrolls - that is the whole
+    /// point of drawing it outside the scroll area.
+    #[test]
+    fn the_configure_footer_stays_put_while_the_body_scrolls() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let context = egui::Context::default();
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+        let (before, _) = run_config_window(&mut app, &context, tv_input());
+        let footer_before = rect_of(&before, "Save configuration").expect("Save");
+
+        // Scroll the body hard, over the window's own area.
+        let mut scrolled = tv_input();
+        scrolled.events = vec![
+            egui::Event::PointerMoved(egui::pos2(600.0, 400.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -900.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            },
+        ];
+        let (_, _) = run_config_window(&mut app, &context, scrolled);
+        let (after, _) = run_config_window(&mut app, &context, tv_input());
+        let footer_after = rect_of(&after, "Save configuration").expect("Save still visible");
+
+        assert!(
+            (footer_before.top() - footer_after.top()).abs() < 1.0,
+            "the footer moved when the body scrolled: {footer_before:?} -> {footer_after:?}"
+        );
+        let screen = tv_input().screen_rect.unwrap();
+        assert!(screen.contains_rect(footer_after));
+    }
+
+    #[test]
+    fn the_configure_window_is_clamped_to_the_viewport() {
+        // A small screen must not produce a window taller than it.
+        let (initial, maximum) =
+            romm_dialog_sizes(egui::vec2(1280.0, 720.0), egui::vec2(640.0, 760.0));
+        assert!(maximum.y <= 720.0 && maximum.x <= 1280.0);
+        assert!(initial.y <= maximum.y && initial.x <= maximum.x);
+        // The preferred size is honoured when it fits.
+        let (initial, _) = romm_dialog_sizes(egui::vec2(2560.0, 1440.0), egui::vec2(640.0, 760.0));
+        assert_eq!(initial, egui::vec2(640.0, 760.0));
+    }
+
+    #[test]
+    fn escape_closes_configure_without_writing_anything() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let attempts = app.gui_config.load_attempts;
+        let context = egui::Context::default();
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+
+        let mut escaped = tv_input();
+        escaped.events = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let (_, request) = run_config_window(&mut app, &context, escaped);
+        assert_eq!(request, Some(ConfigDialogRequest::Close));
+
+        app.handle_romm_config_request(&context, request.unwrap());
+        assert!(app.romm_config_draft.is_none(), "the dialog is closed");
+        assert!(
+            app.romm_operation.is_none(),
+            "Close must start no operation - no save, no import, no request"
+        );
+        assert_eq!(
+            app.gui_config.load_attempts, attempts,
+            "Close must not rewrite or re-read configuration"
+        );
+    }
+
+    /// Cancel is a plain close: it must never write, import or contact
+    /// anything. `RommOperation` is the only route to any of those, so the
+    /// assertion is that none was started.
+    #[test]
+    fn cancel_closes_configure_without_writing_importing_or_requesting() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let context = egui::Context::default();
+        app.handle_romm_config_request(&context, ConfigDialogRequest::Close);
+        assert!(app.romm_config_draft.is_none());
+        assert!(app.romm_preview.is_none());
+        assert!(app.romm_operation.is_none());
+        assert!(app.romm_snapshot.is_none(), "no snapshot was published");
+    }
+
+    #[test]
+    fn a_duplicate_configure_request_does_not_open_a_second_window() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let first = app
+            .romm_config_draft
+            .as_ref()
+            .map(|draft| draft.url.clone());
+        app.open_romm_configuration();
+        app.open_romm_configuration();
+        assert_eq!(
+            app.romm_config_draft
+                .as_ref()
+                .map(|draft| draft.url.clone()),
+            first,
+            "the draft is the open flag, so re-requesting cannot replace it"
+        );
+
+        let context = egui::Context::default();
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+        let (output, _) = run_config_window(&mut app, &context, tv_input());
+        let saves = painted(&output)
+            .into_iter()
+            .filter(|(text, _)| text.contains("Save configuration"))
+            .count();
+        assert_eq!(saves, 1, "exactly one dialog, so exactly one Save button");
+    }
+
+    /// The token's *contents* must never reach the GUI. Only a path and a
+    /// verdict do.
+    #[test]
+    fn the_configure_draft_holds_a_token_path_but_never_a_token_value() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let draft = app.romm_config_draft.as_ref().expect("a draft");
+        let rendered = format!("{draft:?}");
+        assert!(
+            !rendered.contains("secret-token-value"),
+            "no token value can be present - none was ever read into the draft"
+        );
+        // The only token-shaped field is a path.
+        assert!(draft.token_path.is_empty() || draft.token_path.starts_with('/'));
+    }
+
+    // --- Browse records ---------------------------------------------------
+
+    fn run_browse_window(
+        app: &mut ArchiveFsApp,
+        context: &egui::Context,
+        input: egui::RawInput,
+    ) -> (egui::FullOutput, Option<crate::romm_browse::BrowseRequest>) {
+        let mut request = None;
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |_ui| {
+                request = app.show_romm_browse_window(context);
+            });
+        });
+        (output, request)
+    }
+
+    #[test]
+    fn browse_records_becomes_visible_inside_the_viewport_immediately() {
+        let mut app = app();
+        let context = egui::Context::default();
+        // Nothing before the click.
+        let (output, _) = run_browse_window(&mut app, &context, tv_input());
+        assert!(!output_contains(&output, "RomM records"));
+
+        // Exactly what the source card's button does.
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        // egui needs one frame to lay a new window out before it paints at
+        // its settled size; at 60fps that is the same moment for a person.
+        let (_, _) = run_browse_window(&mut app, &context, tv_input());
+        let (output, _) = run_browse_window(&mut app, &context, tv_input());
+        assert!(
+            output_contains(&output, "RomM records"),
+            "one click must make the browser visible, not open it below the fold"
+        );
+
+        let screen = tv_input().screen_rect.unwrap();
+        let close = rect_of(&output, "Close").expect("a visible Close");
+        assert!(
+            screen.contains_rect(close),
+            "the browser's exit must be on screen, not below the fold: {close:?}"
+        );
+        let title = rect_of(&output, "RomM records").expect("a visible title");
+        assert!(
+            screen.contains_rect(title),
+            "the window itself must open inside the viewport: {title:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_browse_click_switches_the_view_without_duplicating_the_window() {
+        let mut app = app();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        assert!(app.romm_browse.is_some());
+
+        let context = egui::Context::default();
+        let (_, _) = run_browse_window(&mut app, &context, tv_input());
+        let (output, _) = run_browse_window(&mut app, &context, tv_input());
+        let closes = painted(&output)
+            .into_iter()
+            .filter(|(text, _)| text == "Close")
+            .count();
+        assert_eq!(closes, 1, "one window, one Close");
+
+        // Switching views reuses the same window rather than stacking one.
+        app.open_romm_browse(crate::romm_browse::BrowseView::Conflicts);
+        assert_eq!(
+            app.romm_browse.as_ref().map(|state| state.view),
+            Some(crate::romm_browse::BrowseView::Conflicts)
+        );
+    }
+
+    /// Ordinary browsing is cache-only. The browser does ask for its first
+    /// page - that is a read of the published cache - but nothing it asks
+    /// for may be an operation that contacts RomM, and `uses_network` is the
+    /// codebase's own answer to which those are.
+    #[test]
+    fn browsing_reads_the_cache_and_never_contacts_romm() {
+        let mut app = app();
+        let attempts = app.gui_config.load_attempts;
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        let context = egui::Context::default();
+
+        for _ in 0..4 {
+            let (_, request) = run_browse_window(&mut app, &context, tv_input());
+            if let Some(request) = request {
+                assert!(
+                    matches!(
+                        request,
+                        crate::romm_browse::BrowseRequest::LoadRecords { .. }
+                    ),
+                    "an idle browser may only ask to read a cached page, got {request:?}"
+                );
+                app.handle_romm_browse_request(&context, request);
+            }
+            if let Some(running) = app.romm_operation.as_ref() {
+                assert!(
+                    !running.operation.uses_network(),
+                    "browsing started a network operation: {:?}",
+                    running.operation
+                );
+                assert!(
+                    !running.operation.is_mutating(),
+                    "browsing started a mutating operation: {:?}",
+                    running.operation
+                );
+            }
+        }
+        assert_eq!(
+            app.gui_config.load_attempts, attempts,
+            "browsing must not re-read configuration every frame"
+        );
+
+        app.close_romm_browse();
+        assert!(app.romm_browse.is_none());
+    }
+
+    /// Escape closes the browser. Asserted once the first page request has
+    /// been dealt with, because a pending request is what the window reports
+    /// that frame and Escape must not silently overwrite it.
+    #[test]
+    fn escape_closes_the_browser() {
+        let mut app = app();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        let context = egui::Context::default();
+        for _ in 0..3 {
+            let (_, request) = run_browse_window(&mut app, &context, tv_input());
+            if let Some(request) = request {
+                app.handle_romm_browse_request(&context, request);
+            }
+        }
+
+        let mut escaped = tv_input();
+        escaped.events = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let (_, request) = run_browse_window(&mut app, &context, escaped);
+        assert_eq!(
+            request,
+            Some(crate::romm_browse::BrowseRequest::Close),
+            "Escape closes the browser when nothing is layered over it"
+        );
+        app.handle_romm_browse_request(&context, request.unwrap());
+        assert!(app.romm_browse.is_none());
+    }
+
+    /// Closing preserves the filters and page the user had set, so reopening
+    /// is not a reset.
+    #[test]
+    fn the_browser_keeps_its_filters_and_page_while_open() {
+        let mut app = app();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        if let Some(state) = app.romm_browse.as_mut() {
+            state.filters.title = "zelda".to_string();
+            state.title_input = "zelda".to_string();
+            state.page_size = 250;
+        }
+        let context = egui::Context::default();
+        for _ in 0..3 {
+            let (_, _) = run_browse_window(&mut app, &context, tv_input());
+        }
+        let state = app.romm_browse.as_ref().expect("still open");
+        assert_eq!(state.filters.title, "zelda");
+        assert_eq!(state.title_input, "zelda");
+        assert_eq!(state.page_size, 250);
     }
 
     #[test]

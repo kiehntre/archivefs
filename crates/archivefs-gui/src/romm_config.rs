@@ -719,7 +719,9 @@ pub(crate) fn show_config_dialog(
         validation,
         mappings,
         preview,
-        previous,
+        // The body no longer builds a `Save`; the footer owns that, and with
+        // it the previous settings a save is derived from.
+        previous: _,
         busy,
         preview_running,
     } = *inputs;
@@ -840,64 +842,100 @@ pub(crate) fn show_config_dialog(
         if let Some(found) = show_preview_section(ui, draft, preview, busy, preview_running) {
             request = Some(found);
         }
+    });
+    request
+}
 
-        // --- Save / close --------------------------------------------------
-        ui.add_space(theme::SECTION_GAP);
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            let can_save = validation.can_save && !busy;
-            let mut save = widgets::action_button(
+/// Height reserved for the configuration dialog's fixed footer.
+///
+/// The footer is drawn *outside* the body's scroll area, so Save and Cancel
+/// keep their place on screen no matter how far the body is scrolled - the
+/// same arrangement the RomM record Details window uses. Previously these
+/// two buttons were the last widgets *inside* the scrolling body, which at
+/// TV resolution put the only visible way out of the dialog below the fold
+/// and made Escape the sole discoverable exit.
+pub(crate) const CONFIG_FOOTER_HEIGHT: f32 = 44.0;
+
+/// The height the scrolling body may occupy once the footer has its own.
+pub(crate) fn config_body_height(available_height: f32, footer_height: f32) -> f32 {
+    (available_height - footer_height).max(96.0)
+}
+
+/// The dialog's critical actions, drawn in a fixed footer by the window
+/// wrapper rather than at the end of the scrolling body.
+///
+/// Cancel never writes, never imports and never contacts anything: it
+/// resolves to `Close` (directly, or via the unsaved-changes confirmation),
+/// and `Close` is handled by discarding the draft.
+pub(crate) fn show_config_dialog_footer(
+    ui: &mut egui::Ui,
+    draft: &mut RommConfigDraft,
+    inputs: &ConfigDialogInputs<'_>,
+) -> Option<ConfigDialogRequest> {
+    let ConfigDialogInputs {
+        validation,
+        previous,
+        busy,
+        ..
+    } = *inputs;
+    let mut request = None;
+    // Drawn above the buttons so the confirmation cannot push them out of
+    // the footer's fixed height.
+    if draft.close_confirm {
+        widgets::banner(
+            ui,
+            "Close without saving?",
+            "The changes you made here have not been written. Your existing configuration is \
+             unchanged.",
+            widgets::StatusTone::Warning,
+        );
+        ui.horizontal(|ui| {
+            if widgets::action_button(
                 ui,
-                "Save configuration",
-                widgets::ActionStyle::Primary,
-                can_save,
-            );
-            if !can_save {
-                save = save.on_disabled_hover_text(if busy {
-                    "A RomM operation is running.".to_string()
-                } else {
-                    "Fix the problems above first.".to_string()
-                });
+                "Discard changes",
+                widgets::ActionStyle::Destructive,
+                true,
+            )
+            .clicked()
+            {
+                draft.close_confirm = false;
+                request = Some(ConfigDialogRequest::Close);
             }
-            if save.clicked() {
-                request = Some(ConfigDialogRequest::Save(Box::new(
-                    draft.to_settings(previous),
-                )));
+            if ui.button("Keep editing").clicked() {
+                draft.close_confirm = false;
             }
-            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
-                if draft.dirty {
-                    draft.close_confirm = true;
-                } else {
-                    request = Some(ConfigDialogRequest::Close);
-                }
-            }
-            ui.label("Saving writes ArchiveFS's configuration. It contacts nothing.");
         });
-        if draft.close_confirm {
-            widgets::banner(
-                ui,
-                "Close without saving?",
-                "The changes you made here have not been written. Your existing configuration is \
-                 unchanged.",
-                widgets::StatusTone::Warning,
-            );
-            ui.horizontal(|ui| {
-                if widgets::action_button(
-                    ui,
-                    "Discard changes",
-                    widgets::ActionStyle::Destructive,
-                    true,
-                )
-                .clicked()
-                {
-                    draft.close_confirm = false;
-                    request = Some(ConfigDialogRequest::Close);
-                }
-                if ui.button("Keep editing").clicked() {
-                    draft.close_confirm = false;
-                }
+    }
+    ui.horizontal(|ui| {
+        let can_save = validation.can_save && !busy;
+        let mut save = widgets::action_button(
+            ui,
+            "Save configuration",
+            widgets::ActionStyle::Primary,
+            can_save,
+        );
+        if !can_save {
+            save = save.on_disabled_hover_text(if busy {
+                "A RomM operation is running.".to_string()
+            } else {
+                "Fix the problems above first.".to_string()
             });
         }
+        if save.clicked() {
+            request = Some(ConfigDialogRequest::Save(Box::new(
+                draft.to_settings(previous),
+            )));
+        }
+        // Visually distinct from Save (Quiet against Primary) and always
+        // enabled - a way out must never depend on the draft validating.
+        if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+            if draft.dirty {
+                draft.close_confirm = true;
+            } else {
+                request = Some(ConfigDialogRequest::Close);
+            }
+        }
+        ui.label("Saving writes ArchiveFS's configuration. It contacts nothing.");
     });
     request
 }

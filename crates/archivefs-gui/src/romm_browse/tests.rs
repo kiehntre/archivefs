@@ -1452,8 +1452,11 @@ fn record_details_render_in_a_visible_window_instead_of_below_the_last_row() {
 fn detail_window_is_clamped_and_reserves_a_fixed_footer() {
     let (initial, maximum) = detail_window_sizes(egui::vec2(1280.0, 720.0));
     assert!(initial.x <= maximum.x && initial.y <= maximum.y);
-    assert_eq!(maximum, egui::vec2(1248.0, 688.0));
-    assert_eq!(detail_body_height(688.0, 44.0), 644.0);
+    // A 96px margin, not 32: the smaller one let a full-height window sit
+    // low enough that its fixed footer fell past the bottom of a 1080p
+    // screen. See `detail_window_sizes`.
+    assert_eq!(maximum, egui::vec2(1184.0, 624.0));
+    assert_eq!(detail_body_height(624.0, 44.0), 580.0);
     assert_eq!(detail_body_height(100.0, 44.0), 96.0);
     let (tiny_initial, tiny_maximum) = detail_window_sizes(egui::vec2(200.0, 180.0));
     assert!(tiny_initial.x <= 200.0 && tiny_initial.y <= 180.0);

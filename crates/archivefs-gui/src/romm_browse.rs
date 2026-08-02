@@ -1024,9 +1024,10 @@ pub(crate) fn show_browse_panel(
                     request = Some(BrowseRequest::Switch(view));
                 }
             }
-            if widgets::action_button(ui, "Close", widgets::ActionStyle::Quiet, true).clicked() {
-                request = Some(BrowseRequest::Close);
-            }
+            // Close lives in the window's fixed footer
+            // (`show_browse_panel_footer`), not here: this row is inside the
+            // scrolling body and would carry the only exit off-screen as soon
+            // as a full page of records was listed.
         });
         if state.needs_reload {
             widgets::banner(
@@ -1078,6 +1079,7 @@ pub(crate) fn show_browse_panel(
             .open(&mut open)
             .default_size(initial)
             .max_size(maximum)
+            .constrain(true)
             .show(&context, |ui| {
                 let footer_height = 44.0;
                 let body_height = detail_body_height(ui.available_height(), footer_height);
@@ -1135,10 +1137,32 @@ pub(crate) fn show_browse_panel(
     request
 }
 
+/// Height reserved for the browsing window's fixed footer.
+pub(crate) const BROWSE_FOOTER_HEIGHT: f32 = 44.0;
+
+/// The browsing window's fixed footer: its one critical action, Close.
+///
+/// Drawn outside the body's scroll area by the window wrapper, so listing a
+/// full page of records can never carry the exit off-screen.
+pub(crate) fn show_browse_panel_footer(ui: &mut egui::Ui) -> Option<BrowseRequest> {
+    let mut request = None;
+    ui.horizontal(|ui| {
+        if widgets::action_button(ui, "Close", widgets::ActionStyle::Primary, true).clicked() {
+            request = Some(BrowseRequest::Close);
+        }
+        ui.label("Browsing reads the published RomM cache only. Nothing here contacts RomM.");
+    });
+    request
+}
+
 fn detail_window_sizes(viewport: egui::Vec2) -> (egui::Vec2, egui::Vec2) {
+    // See `romm_dialog_sizes`: the margin has to leave room for the window's
+    // own chrome and its placement, or a full-height window pushes its fixed
+    // footer past the bottom edge.
+    const MARGIN: f32 = 96.0;
     let maximum = egui::vec2(
-        (viewport.x - 32.0).max(240.0).min(viewport.x.max(1.0)),
-        (viewport.y - 32.0).max(240.0).min(viewport.y.max(1.0)),
+        (viewport.x - MARGIN).max(240.0).min(viewport.x.max(1.0)),
+        (viewport.y - MARGIN).max(240.0).min(viewport.y.max(1.0)),
     );
     let initial = egui::vec2(680.0_f32.min(maximum.x), 720.0_f32.min(maximum.y));
     (initial, maximum)
