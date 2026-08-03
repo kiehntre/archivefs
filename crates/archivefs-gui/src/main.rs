@@ -5484,6 +5484,27 @@ impl ArchiveFsApp {
             }
             self.romm_hash_progress = None;
         }
+        // An import that actually *published* replaced the identity cache, so what any
+        // local path resolves to may have changed. Gamer View's worker holds its path
+        // index in memory - rebuilding it costs a full read of 36,259 records, which
+        // is why it is rebuilt on this signal rather than on a timer or per frame.
+        //
+        // `published` is the exact condition, not merely "an import finished". A
+        // sample import deliberately never publishes, and an import that failed
+        // leaves the previous cache in place; refreshing for either would withdraw
+        // every cover on screen to revalidate against a catalogue that had not
+        // changed. This is also what keeps a failed import from discarding a working
+        // index.
+        if matches!(&result, Ok(RommOperationOutcome::Import(summary)) if summary.published) {
+            // Ready covers become `Revalidating`: their textures are kept so an
+            // unchanged record costs no decode, but the placeholder is drawn until
+            // the refreshed catalogue confirms the record, so a path whose provider
+            // id moved cannot show the old cover even for one frame.
+            self.gamer_covers.identity_refreshed();
+            if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                worker.reindex();
+            }
+        }
         if let Ok(RommOperationOutcome::Preview(summary)) = &result {
             // A preview is only meaningful while the dialog that asked for it is
             // open; if it has been closed, the result is dropped.
@@ -12750,7 +12771,7 @@ impl ArchiveFsApp {
                             self.gamer_covers.absorb(ui.ctx(), reply);
                         }
                     }
-                    let mut cover_requests = Vec::new();
+                    let mut cover_requests: Vec<crate::gamer_artwork::CoverJob> = Vec::new();
                     let gamer_action = show_gamer_view(
                         ui,
                         data,
@@ -12782,8 +12803,8 @@ impl ArchiveFsApp {
                             )
                         });
                         let generation = self.gamer_covers.generation();
-                        for path in cover_requests {
-                            worker.request(generation, path);
+                        for job in cover_requests {
+                            worker.request(generation, job);
                         }
                     }
                     match gamer_action {
@@ -35243,7 +35264,7 @@ struct GamerViewViewState<'a> {
     /// never sends anything: it reports what the visible window needs and the
     /// caller hands that to the worker, which keeps this function free of
     /// threads and testable without one.
-    cover_requests: &'a mut Vec<PathBuf>,
+    cover_requests: &'a mut Vec<crate::gamer_artwork::CoverJob>,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -63188,6 +63209,14 @@ $Instant Growth [Nayr]\n";
         }
     }
 
+    /// Every image drawn for the game list, as a set of texture ids.
+    fn drawn_texture_ids(output: &egui::FullOutput) -> std::collections::HashSet<egui::TextureId> {
+        rendered_images(output)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// A decoded cover, as the worker would produce one.
     fn cover_reply(
         generation: u64,
@@ -63360,6 +63389,85 @@ $Instant Growth [Nayr]\n";
                 .slot_for(Path::new("/roms/g00000.zip"), None),
             Some(crate::gamer_artwork::CoverSlot::Ready { .. })
         ));
+    }
+
+    #[test]
+    fn an_identity_refresh_stops_drawing_a_cover_until_the_record_is_confirmed() {
+        // The frames between a successful import and its confirmation are exactly
+        // when a path whose provider id moved would still be showing the old game's
+        // art. The row keeps its height and its placeholder; it does not keep the
+        // picture.
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
+        let cover = cover_texture_id(&app, "/roms/g00000.zip").expect("a loaded cover");
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert!(drawn_texture_ids(&before).contains(&cover));
+        let title_before = find_text_position_containing(&before, "Game 00000");
+
+        app.gamer_covers.identity_refreshed();
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert!(
+            !drawn_texture_ids(&after).contains(&cover),
+            "the previous catalogue's cover was still painted after a refresh"
+        );
+        // And nothing moved while it was gone.
+        assert_eq!(
+            title_before,
+            find_text_position_containing(&after, "Game 00000"),
+            "the row shifted when its cover was withdrawn"
+        );
+        assert!(rendered_text_contains(&after, "Game 00000"));
+    }
+
+    #[test]
+    fn a_confirmed_record_gets_its_own_texture_back_without_a_new_upload() {
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
+        let cover = cover_texture_id(&app, "/roms/g00000.zip").expect("a loaded cover");
+
+        app.gamer_covers.identity_refreshed();
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        // The worker confirms the key the row offered back.
+        let confirmed = app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation: app.gamer_covers.generation(),
+                local_path: PathBuf::from("/roms/g00000.zip"),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::Unchanged {
+                    key: "101".to_string(),
+                },
+            },
+        );
+        assert!(confirmed, "the confirmation was refused");
+        assert_eq!(
+            cover_texture_id(&app, "/roms/g00000.zip"),
+            Some(cover),
+            "the retained texture was replaced rather than reused"
+        );
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert!(drawn_texture_ids(&output).contains(&cover));
+    }
+
+    #[test]
+    fn an_identity_refresh_re_asks_only_the_rows_on_screen() {
+        // A refresh over the real library must not queue work for all of it.
+        let (mut app, ctx) = gamer_cover_app(13_891);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 12);
+        let before = app.gamer_covers.tracked();
+        app.gamer_covers.identity_refreshed();
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 6);
+        let after = app.gamer_covers.tracked();
+        assert!(
+            after < 200,
+            "a refresh over a 13,891-record library tracked {after} records (was {before})"
+        );
     }
 
     #[test]
@@ -64960,6 +65068,72 @@ mod romm_dispatch_tests {
             "an older generation's progress must not be shown"
         );
         assert_eq!(seen.records_fetched, 0);
+    }
+
+    /// Delivers one finished operation through the real polling path and returns
+    /// the cover cache's generation before and after.
+    fn deliver(
+        operation: RommOperation,
+        outcome: Result<RommOperationOutcome, String>,
+    ) -> (ArchiveFsApp, u64, u64) {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) = install_running(&mut app, operation);
+        let before = app.gamer_covers.generation();
+        sender.send((generation, outcome)).expect("send");
+        app.poll_romm_operation(&context);
+        let after = app.gamer_covers.generation();
+        (app, before, after)
+    }
+
+    #[test]
+    fn a_published_import_refreshes_the_gamer_view_identity_index() {
+        // The signal that makes a game which has just gained a RomM identity
+        // eligible for artwork without restarting ArchiveFS.
+        let (_app, before, after) = deliver(
+            RommOperation::FullImport,
+            Ok(RommOperationOutcome::Import(Box::new(summary(36_259)))),
+        );
+        assert_ne!(
+            before, after,
+            "a published import did not refresh the cover cache"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_import_leaves_the_identity_index_alone() {
+        // A failed import leaves the previous cache in place. Refreshing would
+        // withdraw every cover on screen to revalidate against a catalogue that
+        // never changed - and would discard a working index for nothing.
+        let mut failed = summary(0);
+        failed.published = false;
+        failed.failure = Some("RomM did not answer in time".to_string());
+        let (_app, before, after) = deliver(
+            RommOperation::FullImport,
+            Ok(RommOperationOutcome::Import(Box::new(failed))),
+        );
+        assert_eq!(
+            before, after,
+            "a failed import discarded the current identity index"
+        );
+    }
+
+    #[test]
+    fn a_sample_import_leaves_the_identity_index_alone() {
+        // A sample deliberately never publishes: it is imported, matched and
+        // reported without touching the live cache, so nothing it produces can
+        // change what a local path resolves to.
+        let mut sample = summary(25);
+        sample.published = false;
+        let (_app, before, after) = deliver(
+            RommOperation::SampleImport { records: 25 },
+            Ok(RommOperationOutcome::Sample(Box::new(sample))),
+        );
+        assert_eq!(
+            before, after,
+            "a sample import needlessly invalidated every loaded cover"
+        );
     }
 
     #[test]

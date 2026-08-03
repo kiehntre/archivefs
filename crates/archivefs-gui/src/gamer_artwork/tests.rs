@@ -76,6 +76,10 @@ fn image(key: &str) -> Box<crate::romm_game::CoverImage> {
     })
 }
 
+fn job_paths(jobs: &[CoverJob]) -> Vec<PathBuf> {
+    jobs.iter().map(|job| job.local_path.clone()).collect()
+}
+
 fn ready(generation: u64, id: &str) -> CoverReply {
     CoverReply {
         generation,
@@ -469,4 +473,283 @@ fn a_catalogue_with_no_mapped_paths_indexes_nothing_rather_than_guessing() {
     let mut unmapped = record("100", Some(romm_hosted()));
     unmapped.archivefs_path = None;
     assert!(index_by_path(&catalogue(vec![unmapped])).is_empty());
+}
+
+// --- In-session identity refresh -----------------------------------------
+//
+// The worker's path-to-record index is built once, so before this a RomM import
+// during a session was invisible to Gamer View until a restart. The refresh has to
+// make newly matched records eligible without discarding what is still valid, and
+// without ever letting a path whose provider id moved keep the previous record's
+// cover.
+
+/// A reply confirming the caller's own key still applies.
+fn unchanged(generation: u64, id: &str, key: &str) -> CoverReply {
+    CoverReply {
+        generation,
+        local_path: path(id),
+        provider_game_id: Some(id.to_string()),
+        answer: CoverAnswer::Unchanged {
+            key: key.to_string(),
+        },
+    }
+}
+
+/// A ready reply naming an explicit cover key.
+fn ready_with_key(generation: u64, id: &str, key: &str) -> CoverReply {
+    CoverReply {
+        generation,
+        local_path: path(id),
+        provider_game_id: Some(id.to_string()),
+        answer: CoverAnswer::Ready(image(key)),
+    }
+}
+
+fn loaded(context: &egui::Context, cache: &mut GamerCoverCache, id: &str, key: &str) {
+    cache.visible(&[path(id)], &[]);
+    assert!(cache.absorb(context, ready_with_key(cache.generation(), id, key)));
+}
+
+#[test]
+fn a_row_with_no_identity_becomes_eligible_after_an_import() {
+    // The whole point: a game RomM had never heard of at start-up must be able to
+    // acquire artwork mid-session, without a restart.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    cache.visible(&[path("1")], &[]);
+    assert!(cache.absorb(
+        &context,
+        placeholder(cache.generation(), "1", NoCover::NoRommIdentity)
+    ));
+    // Settled: nothing is asked again while the catalogue says the same thing.
+    assert!(cache.visible(&[path("1")], &[]).is_empty());
+
+    cache.identity_refreshed();
+
+    let asked = cache.visible(&[path("1")], &[]);
+    assert_eq!(
+        job_paths(&asked),
+        vec![path("1")],
+        "a previously unmatched row was not re-asked after the import"
+    );
+    // And it can now be answered with a real cover.
+    assert!(cache.absorb(&context, ready_with_key(cache.generation(), "1", "k1")));
+    assert!(matches!(
+        cache.slot_for(&path("1"), None),
+        Some(CoverSlot::Ready { .. })
+    ));
+}
+
+#[test]
+fn an_unchanged_record_keeps_its_decoded_thumbnail() {
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-1");
+    let before = match cache.slot_for(&path("1"), None) {
+        Some(CoverSlot::Ready { texture, .. }) => texture.id(),
+        other => panic!("expected a ready cover, got {:?}", other.is_some()),
+    };
+
+    cache.identity_refreshed();
+    // The texture is retained, and the request offers its key back so the worker can
+    // confirm without reading or decoding anything.
+    let asked = cache.visible(&[path("1")], &[]);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        asked[0].held_key.as_deref(),
+        Some("key-1"),
+        "the held key was not offered for revalidation"
+    );
+
+    assert!(cache.absorb(&context, unchanged(cache.generation(), "1", "key-1")));
+    let after = match cache.slot_for(&path("1"), None) {
+        Some(CoverSlot::Ready { texture, .. }) => texture.id(),
+        _ => panic!("the confirmed cover was not restored"),
+    };
+    assert_eq!(
+        before, after,
+        "the thumbnail was re-uploaded rather than retained"
+    );
+}
+
+#[test]
+fn a_record_being_revalidated_draws_the_placeholder_not_the_old_cover() {
+    // The window between the import and the confirmation is exactly when a path
+    // whose provider id moved would otherwise still be showing the old game's art.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-1");
+
+    cache.identity_refreshed();
+    assert!(
+        matches!(
+            cache.slot_for(&path("1"), None),
+            Some(CoverSlot::Revalidating { .. })
+        ),
+        "a refreshed record stayed Ready, so its old cover would still be drawn"
+    );
+}
+
+#[test]
+fn a_changed_provider_id_cannot_inherit_the_former_cover() {
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-old");
+    let old_texture = match cache.slot_for(&path("1"), None) {
+        Some(CoverSlot::Ready { texture, .. }) => texture.id(),
+        _ => panic!("expected a ready cover"),
+    };
+
+    cache.identity_refreshed();
+    cache.visible(&[path("1")], &[]);
+    // The import moved this path to a different RomM record, so the worker resolves
+    // a different key and answers with real pixels rather than `Unchanged`.
+    assert!(cache.absorb(&context, ready_with_key(cache.generation(), "1", "key-new")));
+
+    let Some(CoverSlot::Ready { texture, key, .. }) = cache.slot_for(&path("1"), None) else {
+        panic!("the record did not resolve to its new cover");
+    };
+    assert_eq!(key, "key-new");
+    assert_ne!(
+        texture.id(),
+        old_texture,
+        "the new record is drawing the former identity's texture"
+    );
+}
+
+#[test]
+fn an_unchanged_reply_for_a_key_that_no_longer_matches_is_refused() {
+    // Defence in depth: the worker only ever answers `Unchanged` for the key it was
+    // offered, but a reply claiming a different one must not silently promote the
+    // wrong pixels.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-1");
+    cache.identity_refreshed();
+    cache.visible(&[path("1")], &[]);
+
+    assert!(
+        !cache.absorb(
+            &context,
+            unchanged(cache.generation(), "1", "some-other-key")
+        ),
+        "an Unchanged reply naming a different key was accepted"
+    );
+    assert!(matches!(
+        cache.slot_for(&path("1"), None),
+        Some(CoverSlot::Revalidating { .. })
+    ));
+}
+
+#[test]
+fn a_refresh_discards_replies_already_in_flight() {
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    cache.visible(&[path("1")], &[]);
+    // Resolved against the catalogue as it was before the import.
+    let in_flight = ready_with_key(cache.generation(), "1", "stale-key");
+
+    cache.identity_refreshed();
+
+    assert!(
+        !cache.absorb(&context, in_flight),
+        "a reply resolved against the previous catalogue was kept"
+    );
+}
+
+#[test]
+fn a_refresh_during_revalidation_does_not_lose_the_retained_texture() {
+    // Two imports in quick succession. The second must not throw away the texture
+    // the first was still waiting to confirm.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-1");
+    let original = match cache.slot_for(&path("1"), None) {
+        Some(CoverSlot::Ready { texture, .. }) => texture.id(),
+        _ => panic!("expected a ready cover"),
+    };
+
+    cache.identity_refreshed();
+    cache.visible(&[path("1")], &[]);
+    cache.identity_refreshed();
+
+    let asked = cache.visible(&[path("1")], &[]);
+    assert_eq!(asked[0].held_key.as_deref(), Some("key-1"));
+    assert!(cache.absorb(&context, unchanged(cache.generation(), "1", "key-1")));
+    let after = match cache.slot_for(&path("1"), None) {
+        Some(CoverSlot::Ready { texture, .. }) => texture.id(),
+        _ => panic!("the cover was not restored"),
+    };
+    assert_eq!(original, after, "the retained texture was lost");
+}
+
+#[test]
+fn repeated_refreshes_do_not_queue_unbounded_work() {
+    // A refresh re-asks only what is on screen, and still respects the per-frame
+    // ceiling, so a burst of imports cannot turn into a request storm.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    let window: Vec<PathBuf> = (0..40).map(|id| path(&id.to_string())).collect();
+    for _ in 0..8 {
+        cache.visible(&window, &[]);
+    }
+    for id in 0..40 {
+        let _ = cache.absorb(
+            &context,
+            ready_with_key(cache.generation(), &id.to_string(), &format!("k{id}")),
+        );
+    }
+
+    for _ in 0..10 {
+        cache.identity_refreshed();
+        let asked = cache.visible(&window, &[]);
+        assert!(
+            asked.len() <= MAX_REQUESTS_PER_FRAME,
+            "a refresh asked for {} records in one frame",
+            asked.len()
+        );
+    }
+    assert!(
+        cache.tracked() <= MAX_TRACKED_COVERS,
+        "repeated refreshes grew what is held"
+    );
+}
+
+#[test]
+fn a_refresh_does_not_re_ask_for_records_already_confirmed() {
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-1");
+
+    cache.identity_refreshed();
+    cache.visible(&[path("1")], &[]);
+    assert!(cache.absorb(&context, unchanged(cache.generation(), "1", "key-1")));
+
+    assert!(
+        cache.visible(&[path("1")], &[]).is_empty(),
+        "a confirmed record was asked about again"
+    );
+}
+
+#[test]
+fn a_revalidating_row_is_asked_about_once_not_once_per_frame() {
+    // A `Revalidating` slot keeps its texture rather than becoming `Loading`, so
+    // without an explicit "already asked" mark it would look unanswered on every
+    // frame and produce one request per visible row per frame.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    loaded(&context, &mut cache, "1", "key-1");
+    cache.identity_refreshed();
+
+    assert_eq!(
+        cache.visible(&[path("1")], &[]).len(),
+        1,
+        "the refreshed row was not asked about at all"
+    );
+    for frame in 0..30 {
+        assert!(
+            cache.visible(&[path("1")], &[]).is_empty(),
+            "frame {frame} asked again while the confirmation was still in flight"
+        );
+    }
 }

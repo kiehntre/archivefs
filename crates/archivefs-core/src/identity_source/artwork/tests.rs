@@ -1084,3 +1084,372 @@ fn an_index_written_by_a_newer_version_is_discarded_not_misread() {
         "a future layout is started again from empty, since thumbnails are derived"
     );
 }
+
+// --- Concurrent index updates --------------------------------------------
+//
+// The index is one shared file and the cache has several callers: the Gamer View
+// list resolves covers on its own worker while the Details panel and the record
+// browser resolve theirs through the GUI's operation queue, and the CLI can be
+// working over the same directory. Before every modification went through
+// `update_index`, two callers could each read the index, add their own entry and
+// rename their own version over the file - the rename is atomic so the file was
+// never torn, but the second writer silently reverted the first.
+//
+// Each test here constructs a *separate* `ArtworkCache` per thread, because that is
+// what the real callers do: nothing shares one instance, so anything that made
+// these pass by sharing state within a single object would be testing a fiction.
+
+/// Runs `count` closures at once, released together so they collide.
+fn in_parallel(count: usize, body: impl Fn(usize) + Send + Sync + 'static) {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
+    let body = std::sync::Arc::new(body);
+    let handles: Vec<_> = (0..count)
+        .map(|index| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let body = std::sync::Arc::clone(&body);
+            std::thread::spawn(move || {
+                barrier.wait();
+                body(index);
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("a worker panicked");
+    }
+}
+
+#[test]
+fn two_concurrent_writers_adding_different_entries_keep_both() {
+    let tree = Tree::new("concurrent-insert");
+    let root = tree.identity();
+
+    in_parallel(2, move |index| {
+        // A fresh cache per thread, exactly as the GUI's three call sites build one.
+        let cache = ArtworkCache::new(&root, IdentityProvider::Romm);
+        cache
+            .fetch(
+                &source(),
+                &FakeArtworkServer::serving(synthetic_png(40, 56)),
+                &request(
+                    &format!("game-{index}"),
+                    Some(&format!("/assets/{index}.png")),
+                    None,
+                ),
+                1_000,
+                None,
+            )
+            .expect("stored");
+    });
+
+    let cache = tree.cache();
+    assert_eq!(
+        cache.keys(SERVER).len(),
+        2,
+        "one writer's entry was lost: {:?}",
+        cache.keys(SERVER)
+    );
+}
+
+#[test]
+fn many_concurrent_writers_all_keep_their_entries() {
+    let tree = Tree::new("concurrent-insert-many");
+    let root = tree.identity();
+    const WRITERS: usize = 12;
+
+    in_parallel(WRITERS, move |index| {
+        let cache = ArtworkCache::new(&root, IdentityProvider::Romm);
+        cache
+            .fetch(
+                &source(),
+                &FakeArtworkServer::serving(synthetic_png(40, 56)),
+                &request(
+                    &format!("game-{index}"),
+                    Some(&format!("/assets/{index}.png")),
+                    None,
+                ),
+                1_000,
+                None,
+            )
+            .expect("stored");
+    });
+
+    let cache = tree.cache();
+    let keys = cache.keys(SERVER);
+    assert_eq!(keys.len(), WRITERS, "entries were lost: {keys:?}");
+    // Every recorded entry still has the file it describes.
+    assert_eq!(
+        fs::read_dir(cache.directory().join(THUMBNAIL_DIRECTORY_NAME))
+            .expect("thumbnails")
+            .count(),
+        WRITERS
+    );
+}
+
+#[test]
+fn updating_one_entry_while_another_is_inserted_keeps_both() {
+    let tree = Tree::new("concurrent-touch-insert");
+    let root = tree.identity();
+    // An entry that already exists, whose recorded use is old enough to rewrite.
+    let existing = request("existing", Some("/assets/existing.png"), None);
+    let existing_key = ArtworkCache::key_for(SERVER, &existing);
+    tree.cache()
+        .fetch(
+            &source(),
+            &FakeArtworkServer::serving(synthetic_png(40, 56)),
+            &existing,
+            1_000,
+            None,
+        )
+        .expect("stored");
+
+    let touch_key = existing_key.clone();
+    in_parallel(2, move |index| {
+        let cache = ArtworkCache::new(&root, IdentityProvider::Romm);
+        if index == 0 {
+            // Well past the write interval, so this really does rewrite the index.
+            cache.touch(
+                SERVER,
+                &touch_key,
+                1_000 + LAST_USED_WRITE_INTERVAL_SECONDS * 2,
+            );
+        } else {
+            cache
+                .fetch(
+                    &source(),
+                    &FakeArtworkServer::serving(synthetic_png(40, 56)),
+                    &request("added", Some("/assets/added.png"), None),
+                    2_000,
+                    None,
+                )
+                .expect("stored");
+        }
+    });
+
+    let cache = tree.cache();
+    let keys = cache.keys(SERVER);
+    assert_eq!(keys.len(), 2, "an entry was lost: {keys:?}");
+    assert!(keys.contains(&existing_key), "the touched entry vanished");
+    // And the touch was not reverted by the insert.
+    let entries = index_entries(&cache, SERVER);
+    let touched = entries
+        .iter()
+        .find(|entry| entry.key == existing_key)
+        .expect("the touched entry");
+    assert_eq!(
+        touched.last_used_unix_seconds,
+        1_000 + LAST_USED_WRITE_INTERVAL_SECONDS * 2,
+        "the recorded use was reverted by the concurrent insert"
+    );
+}
+
+#[test]
+fn a_gamer_view_load_and_an_explicit_detail_load_both_survive() {
+    // The exact pairing the GUI produces: the Gamer View worker resolving a row's
+    // cover at the same moment someone presses Show cover in the Details panel.
+    // Both go through `ArtworkCache`, from different threads, with their own
+    // instances - and neither may erase the other's entry.
+    let tree = Tree::new("concurrent-gamer-and-details");
+    let root = tree.identity();
+
+    in_parallel(2, move |index| {
+        let cache = ArtworkCache::new(&root, IdentityProvider::Romm);
+        let (id, reference) = if index == 0 {
+            (
+                "gamer-view-row",
+                "/assets/romm/resources/roms/149/1/cover/small.png?ts=1",
+            )
+        } else {
+            (
+                "details-panel",
+                "/assets/romm/resources/roms/149/2/cover/small.png?ts=2",
+            )
+        };
+        cache
+            .fetch(
+                &source(),
+                &FakeArtworkServer::serving(synthetic_png(162, 216)),
+                &request(id, Some(reference), None),
+                3_000,
+                None,
+            )
+            .expect("stored");
+    });
+
+    let cache = tree.cache();
+    for id in ["gamer-view-row", "details-panel"] {
+        let reference = if id == "gamer-view-row" {
+            "/assets/romm/resources/roms/149/1/cover/small.png?ts=1"
+        } else {
+            "/assets/romm/resources/roms/149/2/cover/small.png?ts=2"
+        };
+        let wanted = request(id, Some(reference), None);
+        assert!(
+            cache.lookup(SERVER, &wanted).is_some(),
+            "{id}'s thumbnail was lost to the other caller"
+        );
+    }
+}
+
+#[test]
+fn repeated_concurrent_operations_leave_parseable_json() {
+    let tree = Tree::new("concurrent-json");
+    let root = tree.identity();
+
+    for round in 0..6 {
+        let root = root.clone();
+        in_parallel(6, move |index| {
+            let cache = ArtworkCache::new(&root, IdentityProvider::Romm);
+            let id = format!("r{round}-{index}");
+            cache
+                .fetch(
+                    &source(),
+                    &FakeArtworkServer::serving(synthetic_png(40, 56)),
+                    &request(&id, Some(&format!("/assets/{id}.png")), None),
+                    4_000 + round as i64,
+                    None,
+                )
+                .expect("stored");
+            // Reads and evictions run alongside the writes.
+            let _ = cache.stats(SERVER);
+            let _ = cache.evict_to_limit(SERVER, MAX_CACHE_BYTES, 4_000);
+        });
+    }
+
+    // The file itself must still be an index, not a fragment of one.
+    let text = fs::read_to_string(tree.cache().directory().join(INDEX_FILE_NAME))
+        .expect("the index should still be readable");
+    let parsed: ArtworkIndex =
+        serde_json::from_str(&text).expect("the index should still be valid JSON");
+    assert_eq!(parsed.format_version, ARTWORK_FORMAT_VERSION);
+    assert_eq!(parsed.server_id, SERVER);
+    assert_eq!(parsed.entries.len(), 36, "entries were lost across rounds");
+    // No duplicate keys: every writer merged rather than appended blindly.
+    let mut keys: Vec<&str> = parsed.entries.iter().map(|e| e.key.as_str()).collect();
+    keys.sort_unstable();
+    let before = keys.len();
+    keys.dedup();
+    assert_eq!(before, keys.len(), "the index holds duplicate keys");
+}
+
+#[test]
+fn a_failed_index_write_leaves_the_previous_index_readable() {
+    let tree = Tree::new("failed-write");
+    let cache = tree.cache();
+    cache
+        .fetch(
+            &source(),
+            &FakeArtworkServer::serving(synthetic_png(40, 56)),
+            &request("kept", Some("/assets/kept.png"), None),
+            1_000,
+            None,
+        )
+        .expect("stored");
+    let before = fs::read_to_string(cache.directory().join(INDEX_FILE_NAME)).expect("index");
+    let keys_before = cache.keys(SERVER);
+
+    // The index path is made into a directory, so the rename that publishes a new
+    // index cannot succeed. The previous bytes are what a reader must still get.
+    fs::remove_file(cache.directory().join(INDEX_FILE_NAME)).expect("remove");
+    let index_path = cache.directory().join(INDEX_FILE_NAME);
+    fs::create_dir(&index_path).expect("occupy the index path");
+
+    let refused = cache.fetch(
+        &source(),
+        &FakeArtworkServer::serving(synthetic_png(40, 56)),
+        &request("doomed", Some("/assets/doomed.png"), None),
+        2_000,
+        None,
+    );
+    assert!(
+        matches!(refused, Err(ArtworkRefusal::WriteFailed { .. })),
+        "a failed index write should be reported: {refused:?}"
+    );
+    // No half-written index and no stray temporary file left behind.
+    let strays: Vec<_> = fs::read_dir(cache.directory())
+        .expect("directory")
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("tmp"))
+        .collect();
+    assert!(strays.is_empty(), "a temporary index file was left behind");
+
+    // Put the real index back: it was never modified, so it still reads.
+    fs::remove_dir(&index_path).expect("free the index path");
+    fs::write(&index_path, &before).expect("restore");
+    assert_eq!(
+        cache.keys(SERVER),
+        keys_before,
+        "the previous index no longer describes what it did"
+    );
+}
+
+#[test]
+fn concurrent_eviction_and_insertion_leave_the_cache_inside_its_ceiling() {
+    // Eviction decides what to remove from the index it reads. Under the lock that
+    // is the latest one, so it cannot delete a thumbnail another caller recorded a
+    // moment earlier and then leave the index claiming it is still there.
+    let tree = Tree::new("concurrent-evict");
+    let root = tree.identity();
+    for index in 0..4 {
+        tree.cache()
+            .fetch(
+                &source(),
+                &FakeArtworkServer::serving(synthetic_png(40, 56)),
+                &request(
+                    &format!("seed-{index}"),
+                    Some(&format!("/a/{index}.png")),
+                    None,
+                ),
+                1_000 + index,
+                None,
+            )
+            .expect("stored");
+    }
+    let ceiling = tree.cache().stats(SERVER).bytes / 2;
+
+    in_parallel(4, move |index| {
+        let cache = ArtworkCache::new(&root, IdentityProvider::Romm);
+        if index % 2 == 0 {
+            let _ = cache.evict_to_limit(SERVER, ceiling, 9_000);
+        } else {
+            let _ = cache.fetch(
+                &source(),
+                &FakeArtworkServer::serving(synthetic_png(40, 56)),
+                &request(
+                    &format!("late-{index}"),
+                    Some(&format!("/b/{index}.png")),
+                    None,
+                ),
+                9_000,
+                None,
+            );
+        }
+    });
+
+    let cache = tree.cache();
+    let entries = index_entries(&cache, SERVER);
+    // Every entry the index claims must have a file, and every file must be claimed.
+    let files: std::collections::HashSet<String> =
+        fs::read_dir(cache.directory().join(THUMBNAIL_DIRECTORY_NAME))
+            .expect("thumbnails")
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+    for entry in &entries {
+        assert!(
+            files.contains(&entry.key),
+            "the index claims {} but its thumbnail is gone",
+            entry.key
+        );
+    }
+    assert_eq!(
+        files.len(),
+        entries.len(),
+        "an orphaned thumbnail was left behind"
+    );
+}

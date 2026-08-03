@@ -107,7 +107,29 @@ pub(crate) enum CoverAnswer {
     /// Decoded pixels, ready for the UI thread to upload. Decoding happens on the
     /// worker: the upload is cheap, the decode is not.
     Ready(Box<crate::romm_game::CoverImage>),
+    /// The record still resolves to the cover the caller already holds decoded, so
+    /// nothing was read and nothing was decoded.
+    ///
+    /// This is what makes an identity refresh cheap. The key is a digest of the
+    /// server, the `provider_game_id` and RomM's own artwork identity, so a key that
+    /// still matches *is* proof that both the record's identity and its artwork are
+    /// unchanged - there is no way to answer `Unchanged` for a record whose provider
+    /// id moved.
+    Unchanged {
+        key: String,
+    },
     None(NoCover),
+}
+
+/// One record to resolve, and what the caller already has for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoverJob {
+    pub(crate) local_path: PathBuf,
+    /// The cover key already decoded for this record, when one is being
+    /// revalidated after an identity refresh. Lets the worker answer
+    /// [`CoverAnswer::Unchanged`] instead of reading and decoding the thumbnail
+    /// again.
+    pub(crate) held_key: Option<String>,
 }
 
 /// One answer, bound to what asked for it.
@@ -134,6 +156,25 @@ pub(crate) enum CoverSlot {
     Ready {
         texture: egui::TextureHandle,
         provider_game_id: String,
+        /// The artwork cache key these pixels came from, offered back to the worker
+        /// on revalidation so an unchanged record costs no decode.
+        key: String,
+    },
+    /// Decoded before an identity refresh, not yet confirmed against the new
+    /// catalogue.
+    ///
+    /// The texture is kept - that is what makes an unchanged record free - but the
+    /// *placeholder* is drawn until the refreshed catalogue confirms this path still
+    /// resolves to the same record. Drawing the held cover meanwhile is exactly the
+    /// thing that would show one game's art beside another after a re-import.
+    Revalidating {
+        texture: egui::TextureHandle,
+        provider_game_id: String,
+        key: String,
+        /// Whether the worker has already been asked to confirm this. Without it a
+        /// revalidating row would be re-asked on every frame until its reply
+        /// arrived, which is a request per frame per visible row.
+        requested: bool,
     },
     None(NoCover),
 }
@@ -195,6 +236,60 @@ impl GamerCoverCache {
         }
     }
 
+    /// Points the cache at a refreshed RomM catalogue.
+    ///
+    /// Called when an import or a cache replacement succeeded, so what any path
+    /// resolves to may have changed. Unlike [`Self::library_changed`] this keeps the
+    /// decoded textures: an import usually leaves most records exactly as they were,
+    /// and re-decoding thousands of thumbnails to discover that would be waste.
+    ///
+    /// What it does not keep is the *binding*. Every ready slot becomes
+    /// [`CoverSlot::Revalidating`], which draws the placeholder until the new
+    /// catalogue confirms the record, so a path whose provider id moved cannot show
+    /// the previous record's cover even for a frame. Everything else is dropped so
+    /// it is asked again - which is what lets a game that has just gained a RomM
+    /// identity acquire artwork without a restart.
+    ///
+    /// The generation bump discards replies already in flight against the old
+    /// catalogue.
+    pub(crate) fn identity_refreshed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        let mut retained = HashMap::with_capacity(self.slots.len());
+        for (path, slot) in self.slots.drain() {
+            match slot {
+                CoverSlot::Ready {
+                    texture,
+                    provider_game_id,
+                    key,
+                }
+                | CoverSlot::Revalidating {
+                    texture,
+                    provider_game_id,
+                    key,
+                    ..
+                } => {
+                    retained.insert(
+                        path,
+                        CoverSlot::Revalidating {
+                            texture,
+                            provider_game_id,
+                            key,
+                            // A second import supersedes the first, so anything
+                            // already asked is asked again against the newer
+                            // catalogue.
+                            requested: false,
+                        },
+                    );
+                }
+                // A pending request and a "no cover" answer both described the old
+                // catalogue. Dropping them is what makes a newly matched record
+                // eligible on the very next frame it is visible.
+                CoverSlot::Loading | CoverSlot::None(_) => {}
+            }
+        }
+        self.slots = retained;
+    }
+
     /// Declares the window of records on screen and returns the ones to ask about.
     ///
     /// `visible` is the rows the list is actually drawing; `look_ahead` extends it on
@@ -206,26 +301,51 @@ impl GamerCoverCache {
     /// The returned paths are marked [`CoverSlot::Loading`] before they are handed
     /// out, so the same record cannot be asked for twice while an answer is in
     /// flight.
-    pub(crate) fn visible(&mut self, window: &[PathBuf], look_ahead: &[PathBuf]) -> Vec<PathBuf> {
+    pub(crate) fn visible(&mut self, window: &[PathBuf], look_ahead: &[PathBuf]) -> Vec<CoverJob> {
         self.frame = self.frame.wrapping_add(1);
         for path in window.iter().chain(look_ahead) {
             self.last_used.insert(path.clone(), self.frame);
         }
 
-        let mut wanted = Vec::new();
+        let mut wanted: Vec<CoverJob> = Vec::new();
         // The visible rows first: what a person is looking at is worth more than what
         // they might scroll to.
         for path in window.iter().chain(look_ahead) {
             if wanted.len() >= MAX_REQUESTS_PER_FRAME {
                 break;
             }
-            if self.slots.contains_key(path) || wanted.contains(path) {
+            if wanted.iter().any(|job| &job.local_path == path) {
                 continue;
             }
-            wanted.push(path.clone());
+            let held_key = match self.slots.get(path) {
+                // Already asked, or already answered. Nothing to do.
+                Some(CoverSlot::Loading | CoverSlot::Ready { .. } | CoverSlot::None(_)) => continue,
+                // Already asked to confirm; waiting on the answer.
+                Some(CoverSlot::Revalidating {
+                    requested: true, ..
+                }) => continue,
+                // Waiting on the refreshed catalogue. Offer the key it already holds,
+                // so an unchanged record is confirmed without a decode.
+                Some(CoverSlot::Revalidating { key, .. }) => Some(key.clone()),
+                None => None,
+            };
+            wanted.push(CoverJob {
+                local_path: path.clone(),
+                held_key,
+            });
         }
-        for path in &wanted {
-            self.slots.insert(path.clone(), CoverSlot::Loading);
+        for job in &wanted {
+            match self.slots.get_mut(&job.local_path) {
+                // Marked as asked, keeping the texture that makes an unchanged
+                // record free to confirm. Replacing it with `Loading` would throw
+                // those pixels away.
+                Some(CoverSlot::Revalidating { requested, .. }) => *requested = true,
+                Some(_) => {}
+                None => {
+                    self.slots
+                        .insert(job.local_path.clone(), CoverSlot::Loading);
+                }
+            }
         }
         self.evict();
         wanted
@@ -247,6 +367,32 @@ impl GamerCoverCache {
         }
         let slot = match reply.answer {
             CoverAnswer::None(reason) => CoverSlot::None(reason),
+            CoverAnswer::Unchanged { key } => {
+                // The refreshed catalogue resolves this path to the same cover key,
+                // which by construction means the same record and the same artwork.
+                // The texture already held is promoted back to visible without a
+                // read, a decode or an upload.
+                let Some(CoverSlot::Revalidating {
+                    texture,
+                    provider_game_id,
+                    key: held,
+                    ..
+                }) = self.slots.get(&reply.local_path)
+                else {
+                    // Nothing left to confirm - evicted, or already superseded.
+                    return false;
+                };
+                if held != &key {
+                    // Should not happen: the worker only answers `Unchanged` for the
+                    // key it was offered. Refusing is the safe reading either way.
+                    return false;
+                }
+                CoverSlot::Ready {
+                    texture: texture.clone(),
+                    provider_game_id: provider_game_id.clone(),
+                    key,
+                }
+            }
             CoverAnswer::Ready(image) => {
                 let Some(provider_game_id) = reply.provider_game_id else {
                     // A cover with no record to attach it to cannot be drawn safely.
@@ -259,6 +405,7 @@ impl GamerCoverCache {
                         egui::TextureOptions::LINEAR,
                     ),
                     provider_game_id,
+                    key: image.key.clone(),
                 }
             }
         };
@@ -423,8 +570,17 @@ impl RommCoverSource {
 
     /// Resolves one record, reading the cache first and requesting only when it
     /// must.
-    pub(crate) fn resolve(&mut self, generation: u64, local_path: &Path) -> CoverReply {
-        use archivefs_core::identity_source::artwork::ArtworkRequest;
+    ///
+    /// `held_key` is the cover key the caller already has decoded. When the record
+    /// still resolves to it, the answer is [`CoverAnswer::Unchanged`] and no
+    /// thumbnail is read or decoded at all.
+    pub(crate) fn resolve(
+        &mut self,
+        generation: u64,
+        local_path: &Path,
+        held_key: Option<&str>,
+    ) -> CoverReply {
+        use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
 
         let reply = |provider_game_id: Option<String>, answer: CoverAnswer| CoverReply {
             generation,
@@ -449,6 +605,19 @@ impl RommCoverSource {
         }
 
         let request = ArtworkRequest::from_record(&record);
+        let key = ArtworkCache::key_for(&self.server_id, &request);
+        if held_key == Some(key.as_str()) {
+            // The key is a digest of the server, the provider game id and RomM's own
+            // artwork identity, so a match is proof that neither the record nor its
+            // cover moved. The caller's pixels are still the right pixels.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_secs() as i64)
+                .unwrap_or_default();
+            // Kept warm in the eviction order even though nothing was read.
+            self.artwork.touch(&self.server_id, &key, now);
+            return reply(Some(game_id), CoverAnswer::Unchanged { key });
+        }
         if let Some(thumbnail) = self.artwork.lookup(&self.server_id, &request) {
             return match crate::romm_game::decode_thumbnail(&thumbnail, true) {
                 Ok(image) => reply(Some(game_id), CoverAnswer::Ready(Box::new(image))),
@@ -485,6 +654,47 @@ impl RommCoverSource {
                 reply(Some(game_id), CoverAnswer::None(reason))
             }
         }
+    }
+
+    /// Rebuilds the path index from the published catalogue as it is now.
+    ///
+    /// Returns whether it was replaced. A catalogue that cannot be reopened - a
+    /// failed import that left no new cache, or an unreadable one - leaves the
+    /// existing index in place: a refresh that cannot find anything better must not
+    /// throw away something that works.
+    pub(crate) fn reindex(&mut self) -> bool {
+        use archivefs_core::identity_source::model::IdentityProvider;
+        use archivefs_core::identity_source::settings::{SettingsLocation, default_identity_root};
+        use archivefs_core::identity_source::status::IdentitySourceApi;
+
+        let Ok(identity_root) = default_identity_root() else {
+            return false;
+        };
+        let api = IdentitySourceApi::new(&identity_root, IdentityProvider::Romm);
+        let Ok(cache) = api.open_cache(None) else {
+            return false;
+        };
+        self.by_path = index_by_path(&cache);
+        // Settings can have moved with the import - a changed mapping is exactly the
+        // kind of thing a re-import follows - so the server identity is re-read too.
+        // A failure here leaves the previous one, which is still the one the cached
+        // thumbnails are keyed by.
+        if let Ok(settings) = SettingsLocation::new(&identity_root, IdentityProvider::Romm).load() {
+            let status = api.status(
+                &settings.source,
+                &archivefs_core::identity_source::hashing::LocalHashCache::new(),
+                false,
+            );
+            self.server_id = status
+                .server_id
+                .clone()
+                .unwrap_or_else(|| settings.source.url.clone());
+            self.settings = settings;
+            // The validated source is derived from those settings, so it is dropped
+            // and re-established lazily rather than left describing the old ones.
+            self.source = None;
+        }
+        true
     }
 
     /// Validates the source once. `None` means cache-only from here on.
@@ -527,41 +737,81 @@ impl RommCoverSource {
 /// entirely separate from `RommOperation`'s single slot, so a cover can never delay
 /// a mount and a running import can never stop covers from drawing.
 pub(crate) struct CoverWorker {
-    requests: std::sync::mpsc::Sender<(u64, PathBuf)>,
+    requests: std::sync::mpsc::Sender<WorkerMessage>,
     replies: std::sync::mpsc::Receiver<CoverReply>,
+}
+
+/// What the UI thread asks the worker to do.
+enum WorkerMessage {
+    Resolve {
+        generation: u64,
+        job: CoverJob,
+    },
+    /// Reopen the catalogue and rebuild the path index.
+    ///
+    /// Sent when a RomM import or cache replacement succeeded, and only then - the
+    /// index is not rebuilt on a timer or per frame, because on this library it is
+    /// 36,259 records and rebuilding it speculatively would be the reload storm this
+    /// message exists to avoid.
+    Reindex,
 }
 
 impl CoverWorker {
     /// Starts the worker. Opening the catalogue happens on the thread, so a large
     /// library never delays the first frame.
     pub(crate) fn start(context: egui::Context, trusted_roots: Option<Vec<PathBuf>>) -> Self {
-        let (request_sender, request_receiver) = std::sync::mpsc::channel::<(u64, PathBuf)>();
+        let (request_sender, request_receiver) = std::sync::mpsc::channel::<WorkerMessage>();
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel::<CoverReply>();
         std::thread::spawn(move || {
-            let mut source = None;
+            let mut source: Option<RommCoverSource> = None;
             let mut opened = false;
-            for (generation, local_path) in request_receiver {
-                if !opened {
-                    opened = true;
-                    source = RommCoverSource::open(trusted_roots.clone()).ok();
+            for message in request_receiver {
+                match message {
+                    WorkerMessage::Reindex => {
+                        match source.as_mut() {
+                            // Reindexed in place, keeping the current index if the
+                            // new catalogue cannot be read.
+                            Some(source) => {
+                                source.reindex();
+                            }
+                            // Never opened, or the first open failed. An import may
+                            // have created what was missing, so try again.
+                            None => {
+                                opened = true;
+                                source = RommCoverSource::open(trusted_roots.clone()).ok();
+                            }
+                        }
+                        // No reply: the UI has already moved its slots to
+                        // `Revalidating` and re-requests what is on screen.
+                        context.request_repaint();
+                    }
+                    WorkerMessage::Resolve { generation, job } => {
+                        if !opened {
+                            opened = true;
+                            source = RommCoverSource::open(trusted_roots.clone()).ok();
+                        }
+                        let reply = match source.as_mut() {
+                            Some(source) => {
+                                source.resolve(generation, &job.local_path, job.held_key.as_deref())
+                            }
+                            // The catalogue itself could not be opened - RomM has
+                            // never been imported, or the published cache is
+                            // unreadable. That is not the same as a record having no
+                            // identity, and saying so would send someone looking for
+                            // the wrong problem.
+                            None => CoverReply {
+                                generation,
+                                local_path: job.local_path,
+                                provider_game_id: None,
+                                answer: CoverAnswer::None(NoCover::Unavailable),
+                            },
+                        };
+                        if reply_sender.send(reply).is_err() {
+                            return;
+                        }
+                        context.request_repaint();
+                    }
                 }
-                let reply = match source.as_mut() {
-                    Some(source) => source.resolve(generation, &local_path),
-                    // The catalogue itself could not be opened - RomM has never
-                    // been imported, or the published cache is unreadable. That is
-                    // not the same as a record having no identity, and saying so
-                    // would send someone looking for the wrong problem.
-                    None => CoverReply {
-                        generation,
-                        local_path,
-                        provider_game_id: None,
-                        answer: CoverAnswer::None(NoCover::Unavailable),
-                    },
-                };
-                if reply_sender.send(reply).is_err() {
-                    return;
-                }
-                context.request_repaint();
             }
         });
         Self {
@@ -571,8 +821,15 @@ impl CoverWorker {
     }
 
     /// Asks about one record. Dropped silently if the worker has gone.
-    pub(crate) fn request(&self, generation: u64, local_path: PathBuf) {
-        let _ = self.requests.send((generation, local_path));
+    pub(crate) fn request(&self, generation: u64, job: CoverJob) {
+        let _ = self
+            .requests
+            .send(WorkerMessage::Resolve { generation, job });
+    }
+
+    /// Asks the worker to reopen the catalogue after a successful import.
+    pub(crate) fn reindex(&self) {
+        let _ = self.requests.send(WorkerMessage::Reindex);
     }
 
     /// Every answer that has arrived. Never blocks, so the UI thread never waits on

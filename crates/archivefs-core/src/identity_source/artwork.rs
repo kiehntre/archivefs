@@ -42,10 +42,13 @@
 //! URL at all. Artwork on the tested instance needs no authentication, so the token
 //! is only offered if a request is actually refused without it.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -308,6 +311,151 @@ pub struct ArtworkEvictionOutcome {
     pub bytes_after: u64,
 }
 
+// --- Serialising index updates -------------------------------------------
+//
+// Every entry in the index is a read-modify-write of one shared file, and the
+// cache has more than one caller: the Gamer View list resolves covers on its own
+// worker while the Details panel and the record browser resolve theirs through the
+// GUI's operation queue, and the CLI can be doing the same against the same
+// directory. Two callers that each read the index, add their own entry and rename
+// their own version over the file lose one of the two entries - the rename is
+// atomic, so the file is never torn, but the *update* is not, so the second writer
+// silently reverts the first.
+//
+// The fix is to make every modification re-read the index while holding a lock and
+// merge into whatever is there now. Reads stay unlocked: a rename is atomic, so a
+// reader sees either the whole previous index or the whole next one, never a mix.
+
+/// How long a caller waits for another process to finish its index update.
+///
+/// Long enough to outlast any write of a file this size, short enough that a stale
+/// lock from a killed process cannot wedge the UI. Timing out is not fatal - the
+/// caller reports a failed write and the thumbnail is refetched later.
+const INDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const INDEX_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// Held only while the index is being rewritten, never during a fetch or a decode.
+pub const INDEX_LOCK_FILE_NAME: &str = "index.lock";
+
+/// Whether a locked update actually changed anything.
+///
+/// [`ArtworkCache::touch`] deliberately leaves the index alone most of the time -
+/// writing on every cache hit is what this type exists to avoid - so "I looked and
+/// there was nothing to do" has to be expressible without writing the file back.
+enum IndexChange<T> {
+    /// Persist the index as the closure left it.
+    Write(T),
+    /// Nothing changed. The file is not rewritten.
+    Keep(T),
+}
+
+/// One mutex per index path, shared by every `ArtworkCache` in this process.
+///
+/// The mutex cannot live on `ArtworkCache` itself: callers construct their own with
+/// `ArtworkCache::new` whenever they need one - the GUI does it in three separate
+/// places - so a per-instance mutex would guard nothing. Keying on the path is what
+/// makes two independently constructed caches over the same directory serialise,
+/// and what lets two caches over *different* directories proceed in parallel.
+fn index_mutex(index_path: &Path) -> Arc<Mutex<()>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        registry
+            .entry(index_path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+/// An advisory cross-process lock on one artwork index.
+///
+/// Best effort by design. The process-local mutex above is the guarantee - exact,
+/// needing no filesystem support, holding on every platform. This layer covers the
+/// case the mutex cannot see: a second ArchiveFS, typically the CLI clearing
+/// thumbnails while the GUI is browsing. It works on any filesystem that
+/// implements `flock` honestly, which a local one does and a network mount may not,
+/// so a failure to acquire it is not treated as a failure to update.
+struct IndexFileLock {
+    file: fs::File,
+}
+
+impl IndexFileLock {
+    /// Returns `None` when the platform or filesystem cannot lock.
+    ///
+    /// Deliberately not an error: on a filesystem without working `flock` the
+    /// process-local mutex still holds, and refusing every write there would break
+    /// the cache for a guarantee it never had.
+    fn acquire(directory: &Path, timeout: Duration) -> Option<Self> {
+        let path = directory.join(INDEX_LOCK_FILE_NAME);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .ok()?;
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            match try_lock_exclusive(&file) {
+                Ok(true) => return Some(Self { file }),
+                Ok(false) => {
+                    if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+                        // Another process is taking an implausibly long time, or was
+                        // killed holding the lock. The process-local mutex still
+                        // orders this process's own callers, so proceeding is safer
+                        // than refusing: the worst case is the lost update this
+                        // whole mechanism exists to make rare, and the best case is
+                        // a working cache.
+                        return None;
+                    }
+                    std::thread::sleep(INDEX_LOCK_RETRY.min(timeout));
+                }
+                Err(()) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for IndexFileLock {
+    fn drop(&mut self) {
+        unlock_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(file: &fs::File) -> Result<bool, ()> {
+    use std::os::unix::io::AsRawFd as _;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    // Compared rather than matched: `EWOULDBLOCK` and `EAGAIN` are the same value on
+    // Linux and distinct elsewhere, which a match arm cannot express portably.
+    let raw = error.raw_os_error();
+    if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) || raw == Some(libc::EINTR) {
+        Ok(false)
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &fs::File) -> Result<bool, ()> {
+    Err(())
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &fs::File) {
+    use std::os::unix::io::AsRawFd as _;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[cfg(not(unix))]
+fn unlock_file(_file: &fs::File) {}
+
 /// A provider-owned thumbnail cache on disk.
 ///
 /// Separate from the identity JSON: clearing thumbnails must never risk the
@@ -391,6 +539,44 @@ impl ArtworkCache {
         Ok(())
     }
 
+    /// Runs one read-modify-write of the index under exclusive access.
+    ///
+    /// This is the only path by which the index is ever modified. The index is
+    /// re-read *inside* the lock and handed to `apply`, so a closure always merges
+    /// into whatever the latest state is rather than into a snapshot taken before
+    /// some other caller's write.
+    ///
+    /// Nothing slow belongs in `apply`. A fetch and a decode both happen before this
+    /// is called; what runs here is a vector edit and, for eviction, some file
+    /// removals - all of which are bounded and local.
+    fn update_index<R>(
+        &self,
+        server_id: &str,
+        apply: impl FnOnce(&mut ArtworkIndex) -> IndexChange<R>,
+    ) -> Result<R, ArtworkRefusal> {
+        let mutex = index_mutex(&self.index_path());
+        // A poisoned mutex means another thread panicked mid-update. The file on
+        // disk is still whole - it is only ever replaced by rename - so the right
+        // answer is to carry on and re-read it, not to refuse every write for the
+        // rest of this process's life.
+        let _process = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fs::create_dir_all(&self.directory).map_err(|error| ArtworkRefusal::CacheUnusable {
+            detail: error.to_string(),
+        })?;
+        let _file = IndexFileLock::acquire(&self.directory, INDEX_LOCK_TIMEOUT);
+
+        let mut index = self.load_index(server_id);
+        match apply(&mut index) {
+            IndexChange::Write(value) => {
+                self.save_index(&index)?;
+                Ok(value)
+            }
+            IndexChange::Keep(value) => Ok(value),
+        }
+    }
+
     /// The cache key for one request.
     ///
     /// Deterministic, and derived only from non-secret facts: the server identity,
@@ -419,7 +605,7 @@ impl ArtworkCache {
     /// corrupted entry is refetched rather than drawn as a broken image.
     pub fn lookup(&self, server_id: &str, request: &ArtworkRequest<'_>) -> Option<CachedThumbnail> {
         let key = Self::key_for(server_id, request);
-        let mut index = self.load_index(server_id);
+        let index = self.load_index(server_id);
         let entry = index.entries.iter().find(|entry| entry.key == key)?;
         let path = self.thumbnail_path(&key);
         let bytes = fs::read(&path).ok();
@@ -427,10 +613,15 @@ impl ArtworkCache {
             .as_deref()
             .is_some_and(|bytes| detect_format(bytes) == Some(ImageFormat::Png));
         if !valid {
-            // Corrupt or vanished: forget it so the next request refetches.
+            // Corrupt or vanished: forget it so the next request refetches. The read
+            // above needed no lock - a rename is atomic, so a reader sees one whole
+            // index or the other - but removing the entry is a modification, and
+            // goes through the one path that merges against the latest state.
             let _ = fs::remove_file(&path);
-            index.entries.retain(|entry| entry.key != key);
-            let _ = self.save_index(&index);
+            let _ = self.update_index(server_id, |index| {
+                index.entries.retain(|entry| entry.key != key);
+                IndexChange::Write(())
+            });
             return None;
         }
         let thumbnail = CachedThumbnail {
@@ -449,15 +640,31 @@ impl ArtworkCache {
     /// [`LAST_USED_WRITE_INTERVAL_SECONDS`], so a scrolling grid does not write on
     /// every frame.
     pub fn touch(&self, server_id: &str, key: &str, now_unix_seconds: i64) {
-        let mut index = self.load_index(server_id);
-        let Some(entry) = index.entries.iter_mut().find(|entry| entry.key == key) else {
-            return;
-        };
-        if now_unix_seconds - entry.last_used_unix_seconds <= LAST_USED_WRITE_INTERVAL_SECONDS {
+        // An unlocked pre-check first, so the overwhelmingly common case - a hit
+        // whose recorded time is still fresh - costs one read and takes no lock at
+        // all. The decision is made again inside the lock, against the real state.
+        let fresh = self
+            .load_index(server_id)
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .is_none_or(|entry| {
+                now_unix_seconds - entry.last_used_unix_seconds <= LAST_USED_WRITE_INTERVAL_SECONDS
+            });
+        if fresh {
             return;
         }
-        entry.last_used_unix_seconds = now_unix_seconds;
-        let _ = self.save_index(&index);
+        let _ = self.update_index(server_id, |index| {
+            let Some(entry) = index.entries.iter_mut().find(|entry| entry.key == key) else {
+                // Evicted between the pre-check and the lock. Nothing to record.
+                return IndexChange::Keep(());
+            };
+            if now_unix_seconds - entry.last_used_unix_seconds <= LAST_USED_WRITE_INTERVAL_SECONDS {
+                return IndexChange::Keep(());
+            }
+            entry.last_used_unix_seconds = now_unix_seconds;
+            IndexChange::Write(())
+        });
     }
 
     /// Fetches, validates, thumbnails and stores one cover.
@@ -617,9 +824,12 @@ impl ArtworkCache {
             });
         }
 
-        let mut index = self.load_index(server_id);
-        index.entries.retain(|entry| entry.key != key);
-        index.entries.push(ArtworkEntry {
+        // The fetch and the decode are already done, so the lock is taken now and
+        // held only for the vector edit and the eviction that follows it. Recording
+        // the entry and trimming to the ceiling happen in one locked update: two
+        // separate ones would leave a window in which the cache is over its limit,
+        // and would take the lock twice for one logical change.
+        let entry = ArtworkEntry {
             key: key.clone(),
             provider_game_id: request.provider_game_id.to_string(),
             artwork_identity_digest: digest_of(&artwork_identity(request)),
@@ -628,11 +838,15 @@ impl ArtworkCache {
             bytes: thumbnail.png.len() as u64,
             stored_at_unix_seconds: now_unix_seconds,
             last_used_unix_seconds: now_unix_seconds,
-        });
-        self.save_index(&index)?;
-        // Kept inside the ceiling on the way in, so the cache cannot grow past it
-        // between explicit cleanups.
-        let _ = self.evict_to_limit(server_id, MAX_CACHE_BYTES, now_unix_seconds);
+        };
+        self.update_index(server_id, |index| {
+            index.entries.retain(|held| held.key != key);
+            index.entries.push(entry);
+            // Kept inside the ceiling on the way in, so the cache cannot grow past
+            // it between explicit cleanups.
+            self.evict_within(index, MAX_CACHE_BYTES, now_unix_seconds);
+            IndexChange::Write(())
+        })?;
 
         Ok(CachedThumbnail {
             key,
@@ -650,7 +864,35 @@ impl ArtworkCache {
         maximum: u64,
         now_unix_seconds: i64,
     ) -> ArtworkEvictionOutcome {
-        let mut index = self.load_index(server_id);
+        // An eviction that decided what to remove from a stale snapshot would delete
+        // thumbnails another caller had just recorded, so the decision is made
+        // against the index as it is under the lock.
+        self.update_index(server_id, |index| {
+            let outcome = self.evict_within(index, maximum, now_unix_seconds);
+            if outcome.evicted_items == 0 {
+                IndexChange::Keep(outcome)
+            } else {
+                IndexChange::Write(outcome)
+            }
+        })
+        .unwrap_or_else(|_| ArtworkEvictionOutcome {
+            evicted_items: 0,
+            evicted_bytes: 0,
+            bytes_after: self.load_index(server_id).total_bytes(),
+        })
+    }
+
+    /// The eviction itself, against an index the caller already holds the lock for.
+    ///
+    /// Separate from [`Self::evict_to_limit`] so a fetch can record its entry and
+    /// trim to the ceiling in one locked update rather than taking the lock twice -
+    /// and so neither can deadlock by nesting the lock inside itself.
+    fn evict_within(
+        &self,
+        index: &mut ArtworkIndex,
+        maximum: u64,
+        now_unix_seconds: i64,
+    ) -> ArtworkEvictionOutcome {
         let mut total = index.total_bytes();
         if total <= maximum {
             return ArtworkEvictionOutcome {
@@ -685,7 +927,6 @@ impl ArtworkCache {
         }
         index.entries = keep;
         index.last_cleanup_unix_seconds = Some(now_unix_seconds);
-        let _ = self.save_index(&index);
         ArtworkEvictionOutcome {
             evicted_items,
             evicted_bytes,
@@ -719,16 +960,21 @@ impl ArtworkCache {
                 detail: "clearing the thumbnail cache needs confirmation".to_string(),
             });
         }
-        let index = self.load_index(server_id);
-        let outcome = ArtworkClearOutcome {
-            removed_items: index.entries.len(),
-            removed_bytes: index.total_bytes(),
-            identity_cache_touched: false,
-        };
-        // Only this provider's artwork subtree, never its parent.
-        let _ = fs::remove_dir_all(self.thumbnails_directory());
-        let _ = fs::remove_file(self.index_path());
-        Ok(outcome)
+        // Under the same lock every write takes, so a fetch that is midway through
+        // recording an entry finishes first and a clear cannot leave an index
+        // describing thumbnails it has already deleted. `Keep` because the index
+        // file is removed outright rather than rewritten.
+        self.update_index(server_id, |index| {
+            let outcome = ArtworkClearOutcome {
+                removed_items: index.entries.len(),
+                removed_bytes: index.total_bytes(),
+                identity_cache_touched: false,
+            };
+            // Only this provider's artwork subtree, never its parent.
+            let _ = fs::remove_dir_all(self.thumbnails_directory());
+            let _ = fs::remove_file(self.index_path());
+            IndexChange::Keep(outcome)
+        })
     }
 
     /// Every key currently held, for tests and diagnostics.
