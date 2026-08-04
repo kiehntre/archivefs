@@ -46,7 +46,7 @@ toml = { version = "0.8", default-features = false, features = ["parse", "displa
 # No DTD or entity expansion support is enabled; DOCTYPE and entities
 # are explicitly rejected by the parser rather than relying on the
 # crate's own limits.
-quick-xml = { version = "0.37", default-features = false }
+quick-xml = { version = "0.41", default-features = false }
 # Archive Inspector (read-only ZIP listing): a small, focused, well
 # established crate rather than hand-parsed ZIP structure or shelling out
 # to `unzip`/`7z`. Production code only ever lists entry metadata via
