@@ -4,6 +4,23 @@
 //! When the file is absent every built-in provider is enabled at its default
 //! priority. Only user overrides are persisted; entries that match defaults
 //! are omitted from save output.
+//!
+//! # Nothing the user wrote is thrown away
+//!
+//! The file is `deny_unknown_fields`, so an unrecognised *key* is a parse
+//! error and never reaches this layer. What does reach it is an entry whose
+//! shape is valid but whose *subject* this build does not know: a
+//! `[[providers]]` naming a source that is not in the registry, or a
+//! `[[platform_overrides]]` naming a platform that does not canonicalise.
+//! Those arise from a typo, from a provider that a newer build adds, or from
+//! one an older build had.
+//!
+//! Such an entry must survive a load/edit/save cycle. It previously did not:
+//! `to_config` rebuilt the provider list from live registry entries alone, so
+//! saving any unrelated change deleted the line. See
+//! [`super::CheatSourceRegistry::apply_config`] for where they are retained
+//! and [`super::CheatSourceRegistry::unresolved_preferences`] for how they are
+//! surfaced.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -250,5 +267,275 @@ extra_field = "bad"
         let cfg = CheatSourcesConfig::default();
         save_cheat_sources_config_to(&path, &cfg).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn an_unknown_provider_id_round_trips_through_the_file() {
+        // The whole-file property: what comes back out must carry what went in,
+        // including a provider no build in this workspace defines.
+        let root = test_root("unknown-provider-file");
+        let path = root.join("cheat_sources.toml");
+        let cfg = CheatSourcesConfig {
+            providers: Some(vec![
+                ProviderConfigEntry {
+                    id: "from-a-newer-build".to_string(),
+                    enabled: Some(false),
+                    priority: Some(123),
+                },
+                ProviderConfigEntry {
+                    id: "bsfree-archive".to_string(),
+                    enabled: Some(false),
+                    priority: None,
+                },
+            ]),
+            platform_overrides: None,
+        };
+        save_cheat_sources_config_to(&path, &cfg).unwrap();
+        assert_eq!(load_cheat_sources_config_from(&path).unwrap(), cfg);
+    }
+
+    #[test]
+    fn an_unresolvable_platform_round_trips_through_the_file() {
+        let root = test_root("unknown-platform-file");
+        let path = root.join("cheat_sources.toml");
+        let cfg = CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "SomePlatformThisBuildLacks".to_string(),
+                disabled_providers: Some(vec!["whoever".to_string()]),
+                priority_overrides: Some(vec![ProviderPriorityOverride {
+                    id: "whoever".to_string(),
+                    priority: 9,
+                }]),
+            }]),
+        };
+        save_cheat_sources_config_to(&path, &cfg).unwrap();
+        assert_eq!(load_cheat_sources_config_from(&path).unwrap(), cfg);
+    }
+
+    #[test]
+    fn a_second_save_of_reloaded_content_is_byte_identical() {
+        // Once written, the representation must be a fixed point. A format
+        // that drifts on every save would keep rewriting the user's file and
+        // make "did anything change?" impossible to answer.
+        let root = test_root("fixed-point");
+        let path = root.join("cheat_sources.toml");
+        let cfg = CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: "unknown-to-this-build".to_string(),
+                enabled: Some(false),
+                priority: Some(77),
+            }]),
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "AlsoUnknown".to_string(),
+                disabled_providers: Some(vec!["x".to_string()]),
+                priority_overrides: None,
+            }]),
+        };
+        save_cheat_sources_config_to(&path, &cfg).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+
+        let reloaded = load_cheat_sources_config_from(&path).unwrap();
+        save_cheat_sources_config_to(&path, &reloaded).unwrap();
+        let second = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(first, second, "saving reloaded content must not drift");
+    }
+
+    // ---- Durable write --------------------------------------------------
+
+    #[test]
+    fn a_save_leaves_no_temp_file_behind() {
+        let root = test_root("no-temp-residue");
+        let path = root.join("cheat_sources.toml");
+        save_cheat_sources_config_to(&path, &CheatSourcesConfig::default()).unwrap();
+
+        let strays: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "cheat_sources.toml")
+            .collect();
+        assert!(strays.is_empty(), "left behind: {strays:?}");
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_previous_file_intact() {
+        // The failure that matters: a write that cannot complete must never
+        // truncate or remove what was already there. Here the target path is
+        // a directory, so the rename cannot succeed.
+        let root = test_root("failed-save");
+        let good_path = root.join("cheat_sources.toml");
+        let original = CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: "bsfree-archive".to_string(),
+                enabled: Some(false),
+                priority: None,
+            }]),
+            platform_overrides: None,
+        };
+        save_cheat_sources_config_to(&good_path, &original).unwrap();
+        let before = fs::read_to_string(&good_path).unwrap();
+
+        let blocked = root.join("a-directory-not-a-file");
+        fs::create_dir_all(&blocked).unwrap();
+        let result = save_cheat_sources_config_to(&blocked, &CheatSourcesConfig::default());
+        assert!(result.is_err(), "writing over a directory must fail");
+
+        assert_eq!(
+            fs::read_to_string(&good_path).unwrap(),
+            before,
+            "an unrelated failure must not disturb a valid file"
+        );
+        assert_eq!(
+            load_cheat_sources_config_from(&good_path).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn overwriting_replaces_content_without_leaving_a_tail() {
+        // rename-based replacement, not truncate-and-write: a shorter document
+        // must not leave the tail of a longer one behind.
+        let root = test_root("no-tail");
+        let path = root.join("cheat_sources.toml");
+        let long = CheatSourcesConfig {
+            providers: Some(vec![
+                ProviderConfigEntry {
+                    id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    enabled: Some(false),
+                    priority: Some(11),
+                },
+                ProviderConfigEntry {
+                    id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    enabled: Some(false),
+                    priority: Some(22),
+                },
+            ]),
+            platform_overrides: None,
+        };
+        save_cheat_sources_config_to(&path, &long).unwrap();
+        save_cheat_sources_config_to(&path, &CheatSourcesConfig::default()).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("aaaaaaaa"), "stale tail remained: {text}");
+        assert_eq!(
+            load_cheat_sources_config_from(&path).unwrap(),
+            CheatSourcesConfig::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_files_permissions_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("perms");
+        let path = root.join("cheat_sources.toml");
+        save_cheat_sources_config_to(&path, &CheatSourcesConfig::default()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        save_cheat_sources_config_to(
+            &path,
+            &CheatSourcesConfig {
+                providers: Some(vec![ProviderConfigEntry {
+                    id: "bsfree-archive".to_string(),
+                    enabled: Some(false),
+                    priority: None,
+                }]),
+                platform_overrides: None,
+            },
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a tightened config must not be widened by a save"
+        );
+    }
+
+    #[test]
+    fn the_written_format_gains_no_new_keys() {
+        // The compatibility floor for Milestone 1: `CheatSourcesConfig` is
+        // `deny_unknown_fields`, so any key added here makes the file
+        // unreadable by every already-released build. This asserts the written
+        // vocabulary is exactly the shipped one - in particular that no
+        // `format_version` has crept in.
+        let root = test_root("format-stability");
+        let path = root.join("cheat_sources.toml");
+        save_cheat_sources_config_to(
+            &path,
+            &CheatSourcesConfig {
+                providers: Some(vec![ProviderConfigEntry {
+                    id: "bsfree-archive".to_string(),
+                    enabled: Some(false),
+                    priority: Some(42),
+                }]),
+                platform_overrides: Some(vec![PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec!["x".to_string()]),
+                    priority_overrides: Some(vec![ProviderPriorityOverride {
+                        id: "x".to_string(),
+                        priority: 5,
+                    }]),
+                }]),
+            },
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let keys: std::collections::BTreeSet<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('['))
+            .filter_map(|line| line.split('=').next())
+            .map(str::trim)
+            .collect();
+
+        let permitted: std::collections::BTreeSet<&str> = [
+            "id",
+            "enabled",
+            "priority",
+            "platform",
+            "disabled_providers",
+        ]
+        .into_iter()
+        .collect();
+        let unexpected: Vec<&&str> = keys.difference(&permitted).collect();
+        assert!(
+            unexpected.is_empty(),
+            "a new key would break every released build that reads this file: {unexpected:?}"
+        );
+        assert!(
+            !text.contains("format_version"),
+            "no version field may be written in Milestone 1"
+        );
+    }
+
+    #[test]
+    fn config_path_requires_a_home() {
+        // Guards the empty-HOME case: no home means a clear error, never a
+        // write relative to the working directory.
+        let saved_home = std::env::var_os("HOME");
+        let saved_profile = std::env::var_os("USERPROFILE");
+        // SAFETY: single-threaded test process section; restored below.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+        }
+
+        let result = default_cheat_sources_config_path();
+
+        unsafe {
+            if let Some(home) = saved_home {
+                std::env::set_var("HOME", home);
+            }
+            if let Some(profile) = saved_profile {
+                std::env::set_var("USERPROFILE", profile);
+            }
+        }
+
+        assert!(result.is_err(), "an absent HOME must not resolve to a path");
     }
 }

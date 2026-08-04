@@ -1882,11 +1882,38 @@ fn quote_config_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Writes `contents` to `path` via a same-directory temp file plus
-/// `fs::rename` - the rename is atomic on any POSIX filesystem, so a
-/// crash or power loss mid-write can never leave `path` half-written or
-/// corrupted; readers always see either the old complete file or the new
-/// complete file, never a partial one.
+/// Writes `contents` to `path` durably: a same-directory temp file, whose
+/// contents are flushed to stable storage before it is published, then an
+/// atomic `fs::rename`, then a best-effort sync of the parent directory.
+///
+/// # Why the syncs, and not just the rename
+///
+/// The rename alone is atomic on any POSIX filesystem, so a reader always
+/// sees either the old complete file or the new one - never a splice of
+/// both. That is not the same as durable. Without
+/// [`File::sync_all`] on the temp file, a crash can order the rename ahead
+/// of the data, publishing a file that is *present, named correctly and
+/// empty or truncated*. For a preferences file that is worse than losing
+/// the edit: an empty `cheat_sources.toml` still parses, as "no overrides",
+/// so every stored preference is silently discarded rather than visibly
+/// lost. Syncing the directory afterwards makes the rename itself survive
+/// the same crash.
+///
+/// Directory sync is best-effort by platform: filesystems that do not give
+/// directory handles `fsync` semantics report an error here, and that is
+/// not a failure of the write - the data is already durable and published,
+/// so the error is discarded rather than propagated.
+///
+/// # Permissions
+///
+/// When `path` already exists its permissions are copied onto the
+/// replacement before the rename, so writing a config that a user had
+/// tightened to `0600` does not silently widen it to the process umask's
+/// default.
+///
+/// These writes happen only on an explicit user action (saving settings or
+/// preferences), never in a hot loop, so the cost of two syncs is not a
+/// throughput concern.
 pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1901,12 +1928,45 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
         std::process::id(),
         TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&temp_path, contents)
-        .map_err(|source| ArchiveFsError::io(temp_path.clone(), source))?;
+
+    // Scoped so the handle is closed before the rename: on Windows a rename
+    // over an open file fails, and there is nothing to gain from holding it.
+    let write_result = (|| -> io::Result<()> {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if let Err(source) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(ArchiveFsError::io(temp_path, source));
+    }
+
+    // Carry the existing file's mode across. Failure to read it is not fatal:
+    // the write still has to happen, just with default permissions.
+    if let Ok(existing) = fs::metadata(path) {
+        let _ = fs::set_permissions(&temp_path, existing.permissions());
+    }
+
     fs::rename(&temp_path, path).map_err(|source| {
         let _ = fs::remove_file(&temp_path);
         ArchiveFsError::io(path.to_path_buf(), source)
-    })
+    })?;
+
+    sync_directory_best_effort(parent);
+    Ok(())
+}
+
+/// Flushes a directory entry change (a rename) to stable storage.
+///
+/// Best-effort on purpose - see [`atomic_write_text`]. Opening a directory
+/// for reading and syncing it is the POSIX idiom; platforms and filesystems
+/// that do not support it fail here, and the caller's write is still
+/// complete and durable, so the error is deliberately dropped.
+fn sync_directory_best_effort(dir: &Path) {
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
