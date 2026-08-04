@@ -423,7 +423,14 @@ impl CheatSourcesPageState {
                 .iter()
                 .flatten()
                 .any(|id| id == &entry.spec.id);
-            if names_this_source && !platforms.iter().any(|p| p == &block.platform) {
+            // Compared canonically: a file may name one platform in several
+            // blocks, and two rows for the same platform - showing the same
+            // value, with two controls fighting over it - is worse than one.
+            if names_this_source
+                && !platforms
+                    .iter()
+                    .any(|seen| same_platform(seen, &block.platform))
+            {
                 platforms.push(block.platform.clone());
             }
         }
@@ -439,6 +446,52 @@ impl CheatSourcesPageState {
                     participating: participation.participating,
                     overridden_by_source_level: participation.overridden_by_source_level,
                 }
+            })
+            .collect()
+    }
+
+    /// Platforms whose participation differs between draft and disk, with the
+    /// value the draft would save.
+    ///
+    /// Considers platforms named by *either* side, so removing an exception -
+    /// which takes its block away entirely, leaving nothing in the draft to
+    /// iterate - is reported just as clearly as adding one.
+    fn participation_changes(&self, id: &str) -> Vec<(String, bool)> {
+        let mentioned = |registry: &CheatSourceRegistry| -> Vec<String> {
+            registry
+                .platform_overrides()
+                .iter()
+                .filter(|block| {
+                    block
+                        .disabled_providers
+                        .iter()
+                        .flatten()
+                        .any(|entry_id| entry_id == id)
+                })
+                .map(|block| block.platform.clone())
+                .collect()
+        };
+
+        let mut platforms = mentioned(&self.draft);
+        for platform in mentioned(&self.saved) {
+            if !platforms.iter().any(|seen| same_platform(seen, &platform)) {
+                platforms.push(platform);
+            }
+        }
+        platforms.dedup_by(|a, b| same_platform(a, b));
+
+        platforms
+            .into_iter()
+            .filter_map(|platform| {
+                let now = self
+                    .draft
+                    .platform_participation(id, &platform)
+                    .participating;
+                let before = self
+                    .saved
+                    .platform_participation(id, &platform)
+                    .participating;
+                (now != before).then_some((platform, now))
             })
             .collect()
     }
@@ -494,17 +547,45 @@ impl CheatSourcesPageState {
                     ));
                 }
             }
-            for platform in row.platforms.iter().filter(|p| !p.participating) {
-                out.push(format!(
-                    "'{}' will not be used for {} games, but stays enabled elsewhere.",
-                    row.display_name, platform.platform
-                ));
+            // Only participation that actually differs from disk. Listing
+            // every non-participating platform announced exceptions the user
+            // saved long ago as though saving would newly apply them.
+            for (platform, now_participating) in self.participation_changes(&row.id) {
+                out.push(if now_participating {
+                    format!(
+                        "'{}' will be used for {} games again.",
+                        row.display_name,
+                        archivefs_core::platform::display_name_for(&platform)
+                    )
+                } else {
+                    format!(
+                        "'{}' will not be used for {} games, but stays enabled elsewhere.",
+                        row.display_name,
+                        archivefs_core::platform::display_name_for(&platform)
+                    )
+                });
             }
         }
         if out.is_empty() {
             out.push("Preferences will be rewritten with your changes.".to_string());
         }
         out
+    }
+}
+
+/// Whether two platform strings name the same platform.
+///
+/// Compared canonically, so an alias and a canonical id are recognised as one
+/// platform rather than counted twice. Unresolvable names fall back to an
+/// exact comparison, which keeps them distinct from everything else instead
+/// of silently collapsing together.
+fn same_platform(left: &str, right: &str) -> bool {
+    match (
+        archivefs_core::canonical_platform_for_alias(left),
+        archivefs_core::canonical_platform_for_alias(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
     }
 }
 

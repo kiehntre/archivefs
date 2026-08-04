@@ -22,6 +22,7 @@
 //! and [`super::CheatSourceRegistry::unresolved_preferences`] for how they are
 //! surfaced.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -71,9 +72,19 @@ pub struct ProviderPriorityOverride {
 }
 
 pub fn default_cheat_sources_config_path() -> Result<PathBuf, ArchiveFsError> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
+    cheat_sources_config_path_in(
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )
+}
+
+/// The preferences path under `home`, or an error when there is no home.
+///
+/// Split out so the no-home case can be tested without removing `HOME` from
+/// the process: these tests run in parallel with every other test in the
+/// crate, and several of those read `HOME`, so mutating it made unrelated
+/// tests fail depending on scheduling.
+fn cheat_sources_config_path_in(home: Option<OsString>) -> Result<PathBuf, ArchiveFsError> {
+    let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("archivefs")
@@ -514,28 +525,21 @@ extra_field = "bad"
     }
 
     #[test]
-    fn config_path_requires_a_home() {
-        // Guards the empty-HOME case: no home means a clear error, never a
-        // write relative to the working directory.
-        let saved_home = std::env::var_os("HOME");
-        let saved_profile = std::env::var_os("USERPROFILE");
-        // SAFETY: single-threaded test process section; restored below.
-        unsafe {
-            std::env::remove_var("HOME");
-            std::env::remove_var("USERPROFILE");
-        }
-
-        let result = default_cheat_sources_config_path();
-
-        unsafe {
-            if let Some(home) = saved_home {
-                std::env::set_var("HOME", home);
-            }
-            if let Some(profile) = saved_profile {
-                std::env::set_var("USERPROFILE", profile);
-            }
-        }
-
+    fn an_absent_home_yields_an_error_not_a_relative_path() {
+        // Tested through the seam rather than by removing HOME from the
+        // process: these tests run in parallel with others that read it, and
+        // mutating it made unrelated tests fail depending on scheduling.
+        let result = cheat_sources_config_path_in(None);
         assert!(result.is_err(), "an absent HOME must not resolve to a path");
+    }
+
+    #[test]
+    fn a_home_yields_the_documented_path() {
+        let path = cheat_sources_config_path_in(Some(OsString::from("/home/example")))
+            .expect("a home resolves");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/example/.config/archivefs/cheat_sources.toml")
+        );
     }
 }

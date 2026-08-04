@@ -462,11 +462,26 @@ impl CheatSourceRegistry {
 
     /// Turns per-platform participation for one source on or off.
     ///
-    /// Edits only the `disabled_providers` list of the matching block, leaving
-    /// that block's other fields and every other block untouched - including
-    /// blocks whose platform does not resolve. A block emptied of all content
-    /// is removed so toggling a setting on and then off again does not leave
-    /// an inert stub behind in the user's file.
+    /// Edits only the `disabled_providers` lists, leaving every block's other
+    /// fields untouched - including blocks whose platform does not resolve. A
+    /// block emptied of all content is removed so toggling a setting on and
+    /// then off again does not leave an inert stub behind in the user's file.
+    ///
+    /// # Duplicate platform blocks
+    ///
+    /// A file may name one platform in several blocks (see
+    /// `duplicate_platform_overrides_last_wins`). Resolution reads the *last*
+    /// match, so the write has to agree with it or a toggle edits a block
+    /// nobody is reading:
+    ///
+    /// - Turning participation **off** records it in the last matching block,
+    ///   which is the one [`Self::find_platform_override`] will read back.
+    /// - Turning it **on** clears the source from *every* matching block.
+    ///   Removing it from only one would leave a later block still disabling
+    ///   it, so the control would appear to do nothing.
+    ///
+    /// This makes the operation idempotent and makes the state the user sees
+    /// after it the state that actually resolves.
     pub fn set_platform_participation(
         &mut self,
         source_id: &str,
@@ -476,16 +491,36 @@ impl CheatSourceRegistry {
         let normalized = crate::canonical_platform_for_alias(platform_id)
             .unwrap_or(platform_id)
             .to_string();
-
-        let existing = self.platform_overrides.iter().position(|block| {
+        let matches_platform = |block: &PlatformOverrideEntry| {
             crate::canonical_platform_for_alias(&block.platform)
                 .map(|canon| canon == normalized)
                 .unwrap_or(false)
-        });
+        };
+
+        if participating {
+            for block in self
+                .platform_overrides
+                .iter_mut()
+                .filter(|block| matches_platform(block))
+            {
+                if let Some(disabled) = block.disabled_providers.as_mut() {
+                    disabled.retain(|id| id != source_id);
+                    if disabled.is_empty() {
+                        block.disabled_providers = None;
+                    }
+                }
+            }
+            self.platform_overrides.retain(|block| {
+                block.disabled_providers.is_some() || block.priority_overrides.is_some()
+            });
+            return;
+        }
+
+        // Last match, so the read sees what was just written.
+        let existing = self.platform_overrides.iter().rposition(matches_platform);
 
         let idx = match existing {
             Some(idx) => idx,
-            None if participating => return, // participating is the default; nothing to record
             None => {
                 self.platform_overrides.push(PlatformOverrideEntry {
                     platform: normalized,
@@ -498,9 +533,7 @@ impl CheatSourceRegistry {
 
         let block = &mut self.platform_overrides[idx];
         let mut disabled = block.disabled_providers.take().unwrap_or_default();
-        if participating {
-            disabled.retain(|id| id != source_id);
-        } else if !disabled.iter().any(|id| id == source_id) {
+        if !disabled.iter().any(|id| id == source_id) {
             disabled.push(source_id.to_string());
         }
         block.disabled_providers = if disabled.is_empty() {
@@ -1600,6 +1633,186 @@ mod tests {
             cross_platform.spec.platform_coverage().is_none(),
             "no list must not be displayed as covering nothing"
         );
+    }
+
+    #[test]
+    fn re_enabling_clears_every_duplicate_block_for_that_platform() {
+        // A file may name one platform in several blocks, and resolution reads
+        // the last match. Removing the source from only the first left a later
+        // block still disabling it, so the toggle silently did nothing: the
+        // control moved, the resolved state did not, and the GUI redrew it as
+        // still disabled.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+            ]),
+        });
+        assert!(
+            !registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating
+        );
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+
+        assert!(
+            registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating,
+            "re-enabling must actually take effect, not be masked by a later block"
+        );
+        assert!(
+            registry
+                .to_config()
+                .platform_overrides
+                .unwrap_or_default()
+                .iter()
+                .all(|block| block
+                    .disabled_providers
+                    .iter()
+                    .flatten()
+                    .all(|id| id != KNOWN_ID)),
+            "no block may still name the source after re-enabling"
+        );
+    }
+
+    #[test]
+    fn disabling_records_into_the_block_resolution_reads() {
+        // The mirror of the above: the write must land in the block that will
+        // be read back, or the new setting is invisible to resolution.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec!["gamehacking.org-ps2".to_string()]),
+                    priority_overrides: None,
+                },
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: None,
+                    priority_overrides: Some(vec![ProviderPriorityOverride {
+                        id: "gamehacking.org-ps2".to_string(),
+                        priority: 5,
+                    }]),
+                },
+            ]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", false);
+
+        assert!(
+            !registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating,
+            "the new exception must be visible to resolution immediately"
+        );
+        assert!(
+            !registry
+                .sorted_enabled_for_platform("PS2")
+                .iter()
+                .any(|e| e.spec.id == KNOWN_ID),
+            "and must actually remove the source from that platform's results"
+        );
+    }
+
+    #[test]
+    fn re_enabling_preserves_unrelated_and_unresolvable_blocks() {
+        // Cleanup must never reach past the platform being edited.
+        let unresolvable = PlatformOverrideEntry {
+            platform: "NotAPlatform".to_string(),
+            disabled_providers: Some(vec!["someone-else".to_string()]),
+            priority_overrides: None,
+        };
+        let other_platform = PlatformOverrideEntry {
+            platform: "Wii".to_string(),
+            disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+            priority_overrides: None,
+        };
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: Some(42),
+            }]),
+            platform_overrides: Some(vec![
+                unresolvable.clone(),
+                other_platform.clone(),
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+            ]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+        let saved = registry.to_config();
+        let blocks = saved.platform_overrides.expect("overrides");
+
+        assert!(
+            blocks.contains(&unresolvable),
+            "an unresolvable block must survive an unrelated removal: {blocks:?}"
+        );
+        assert!(
+            blocks.contains(&other_platform),
+            "another platform's exception must survive: {blocks:?}"
+        );
+        assert!(
+            !blocks.iter().any(|b| b.platform == "PS2"),
+            "the emptied PS2 block should be gone: {blocks:?}"
+        );
+        assert_eq!(
+            saved
+                .providers
+                .expect("providers")
+                .iter()
+                .filter(|p| p.id == UNKNOWN_ID)
+                .count(),
+            1,
+            "the unknown provider must survive a platform edit"
+        );
+    }
+
+    #[test]
+    fn a_block_kept_only_for_its_priority_overrides_is_not_deleted() {
+        // Cleanup removes blocks with nothing left in them. A block whose
+        // priority_overrides are still present has content, even if the
+        // disabled list just emptied.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "PS2".to_string(),
+                disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                priority_overrides: Some(vec![ProviderPriorityOverride {
+                    id: "gamehacking.org-ps2".to_string(),
+                    priority: 5,
+                }]),
+            }]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+        let blocks = registry
+            .to_config()
+            .platform_overrides
+            .expect("the block must remain for its priority overrides");
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].disabled_providers.is_none());
+        assert!(blocks[0].priority_overrides.is_some());
     }
 
     #[test]

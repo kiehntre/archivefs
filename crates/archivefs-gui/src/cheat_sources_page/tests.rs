@@ -813,12 +813,223 @@ fn the_consequence_of_an_exception_is_stated_before_saving() {
 
     let joined = state.view().pending_consequences.join(" ");
     assert!(
-        joined.contains("will not be used for PS2"),
-        "the affected platform must be named: {joined}"
+        joined.contains("will not be used for Sony PlayStation 2 games"),
+        "the affected platform must be named, by its display name: {joined}"
     );
     assert!(
         joined.contains("stays enabled elsewhere"),
         "the difference from a full disable must be stated: {joined}"
+    );
+}
+
+#[test]
+fn an_already_saved_exception_is_not_announced_as_a_pending_change() {
+    // The consequence list said what saving *would do*. Listing every
+    // non-participating platform on a changed row meant editing a source's
+    // priority announced an exception the user saved long ago as though
+    // saving would newly apply it.
+    let path = config_path("consequence-only-pending");
+    let mut state = CheatSourcesPageState::load(path);
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    // Now change something unrelated on the same source.
+    state.apply(CheatSourcesPageAction::SetPriority {
+        id: KNOWN_ID.to_string(),
+        priority: 7,
+    });
+
+    let lines = state.view().pending_consequences;
+    let joined = lines.join(" ");
+    assert!(
+        joined.contains("moves to priority 7"),
+        "the real pending change must be stated: {joined}"
+    );
+    assert!(
+        !joined.contains("will not be used for"),
+        "a saved exception is not a pending change: {joined}"
+    );
+}
+
+#[test]
+fn removing_a_saved_exception_is_announced() {
+    let path = config_path("consequence-removal");
+    let mut state = CheatSourcesPageState::load(path);
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: true,
+    });
+
+    let joined = state.view().pending_consequences.join(" ");
+    assert!(
+        joined.contains("will be used for Sony PlayStation 2 games again"),
+        "undoing an exception must be stated too, not left silent: {joined}"
+    );
+}
+
+#[test]
+fn a_toggle_takes_effect_even_with_duplicate_platform_blocks() {
+    // Resolution reads the last matching block. Writing to the first left a
+    // later block still disabling the source, so the checkbox moved, the
+    // resolved state did not, and the next repaint drew it as still disabled.
+    let path = config_path("duplicate-blocks");
+    write_config(
+        &path,
+        &CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+            ]),
+        },
+    );
+
+    let mut state = CheatSourcesPageState::load(path.clone());
+    let row = state
+        .view()
+        .rows
+        .into_iter()
+        .find(|r| r.id == KNOWN_ID)
+        .unwrap();
+    assert_eq!(
+        row.platforms.len(),
+        1,
+        "one platform must produce one row, not one per block: {:?}",
+        row.platforms
+    );
+    assert!(!row.platforms[0].participating);
+
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: true,
+    });
+
+    let row = state
+        .view()
+        .rows
+        .into_iter()
+        .find(|r| r.id == KNOWN_ID)
+        .unwrap();
+    assert!(
+        row.platforms.is_empty(),
+        "re-enabling must actually take effect: {:?}",
+        row.platforms
+    );
+
+    state.apply(CheatSourcesPageAction::Save);
+    let on_disk = load_cheat_sources_config_from(&path).unwrap();
+    assert!(
+        on_disk.platform_overrides.is_none(),
+        "both emptied blocks should be gone: {on_disk:?}"
+    );
+}
+
+#[test]
+fn removing_an_exception_preserves_unrelated_unknown_data() {
+    // Cleanup must not reach past the platform being edited.
+    let path = config_path("removal-preserves-unknown");
+    let unresolvable = PlatformOverrideEntry {
+        platform: "SomePlatformThisBuildLacks".to_string(),
+        disabled_providers: Some(vec!["whoever".to_string()]),
+        priority_overrides: None,
+    };
+    write_config(
+        &path,
+        &CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: Some(42),
+            }]),
+            platform_overrides: Some(vec![
+                unresolvable.clone(),
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+            ]),
+        },
+    );
+
+    let mut state = CheatSourcesPageState::load(path.clone());
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: true,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    let after = load_cheat_sources_config_from(&path).unwrap();
+    assert!(
+        after
+            .platform_overrides
+            .as_ref()
+            .expect("the unresolvable block must remain")
+            .contains(&unresolvable),
+        "removing one exception must not delete unrelated blocks: {after:?}"
+    );
+    assert_eq!(
+        after
+            .providers
+            .expect("providers")
+            .iter()
+            .filter(|p| p.id == UNKNOWN_ID)
+            .count(),
+        1,
+        "nor the unknown provider"
+    );
+}
+
+#[test]
+fn a_failed_save_keeps_the_changes_pending_and_does_not_claim_success() {
+    // A write that cannot complete must leave the user with their edits and
+    // an honest error, not a cleared dirty flag implying the work is safe.
+    let root = test_root("failed-save");
+    let blocked = root.join("cheat_sources.toml");
+    fs::create_dir_all(&blocked).expect("a directory where the file should be");
+
+    let mut state = CheatSourcesPageState::load(blocked);
+    state.apply(CheatSourcesPageAction::SetEnabled {
+        id: KNOWN_ID.to_string(),
+        enabled: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    let view = state.view();
+    assert!(
+        matches!(view.save_state, SaveState::Failed(_)),
+        "got {:?}",
+        view.save_state
+    );
+    assert!(
+        view.dirty,
+        "a failed save must leave the changes pending, not look saved"
+    );
+    assert!(
+        !view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap().enabled,
+        "and must not discard what the user edited"
     );
 }
 
