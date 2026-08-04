@@ -81,6 +81,7 @@ use serde::Serialize;
 
 mod bsfree;
 mod cheat_source;
+mod dat;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -1605,6 +1606,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             }
+        }
+        "dat" => {
+            let input_args: Vec<String> = args.collect();
+            dat::run(input_args)?;
         }
         // `--version`/`-V` are recognised only in the command position -
         // exactly the same scope `--help`/`-h` already have (neither is
