@@ -74,6 +74,14 @@ pub use library_views::{
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
 
+/// Provider-neutral DAT catalogue parsing and read-only audit.
+///
+/// Parses Logiqx XML and ClrMamePro text DAT files (No-Intro, Redump, TOSEC)
+/// into a common model, indexes their entries by hash for fast lookup, and
+/// provides a read-only audit that compares known hashes against the catalogue.
+/// Stage 1A: core model, parsers, indexes, and audit - no persistence or GUI.
+pub mod dat;
+
 pub mod disk_format;
 
 pub mod safe_read;
