@@ -41,6 +41,8 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
+use crate::ui::theme;
+
 /// How many rows beyond the visible window are asked for, on each side.
 ///
 /// Enough that a steady scroll usually finds the next cover already decoded, small
@@ -65,6 +67,38 @@ pub(crate) const MAX_TRACKED_COVERS: usize = 256;
 /// The box a row's cover is drawn inside, matching the existing artwork slot so
 /// adding covers changes no row's height.
 pub(crate) const COVER_BOX: f32 = 56.0;
+
+/// The most selected-game requests one frame may emit.
+///
+/// One, because there is only ever one selected game - and stating it as a ceiling
+/// is what makes the fairness argument checkable: a burst of selection changes can
+/// take at most one of the frame's [`MAX_REQUESTS_PER_FRAME`] slots, so visible
+/// rows always keep the rest.
+pub(crate) const MAX_SELECTED_REQUESTS_PER_FRAME: usize = 1;
+
+/// How many higher-priority jobs the worker may serve before it must take a lower
+/// one.
+///
+/// Priority alone is not fairness: a selection the user keeps changing would sit at
+/// the head of the queue forever and the visible rows behind it would never be
+/// read. After this many, the oldest lower-priority job goes next regardless.
+pub(crate) const FAIRNESS_RUN: u32 = 4;
+
+/// The most jobs the worker will hold. Beyond it the lowest-priority, oldest work
+/// is dropped - it describes rows that are no longer on screen, and the UI re-asks
+/// for anything it still wants on the next frame it draws.
+pub(crate) const MAX_QUEUED_JOBS: usize = 256;
+
+/// What a cover request is for, in the order it deserves to be served.
+///
+/// The selected game is what a person is looking at, so it goes first even when a
+/// long look-ahead backlog is already queued - which FIFO alone would not give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CoverPriority {
+    Selected,
+    Visible,
+    LookAhead,
+}
 
 /// Why a row has no cover to draw.
 ///
@@ -125,6 +159,7 @@ pub(crate) enum CoverAnswer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CoverJob {
     pub(crate) local_path: PathBuf,
+    pub(crate) priority: CoverPriority,
     /// The cover key already decoded for this record, when one is being
     /// revalidated after an identity refresh. Lets the worker answer
     /// [`CoverAnswer::Unchanged`] instead of reading and decoding the thumbnail
@@ -301,39 +336,73 @@ impl GamerCoverCache {
     /// The returned paths are marked [`CoverSlot::Loading`] before they are handed
     /// out, so the same record cannot be asked for twice while an answer is in
     /// flight.
-    pub(crate) fn visible(&mut self, window: &[PathBuf], look_ahead: &[PathBuf]) -> Vec<CoverJob> {
+    pub(crate) fn visible(
+        &mut self,
+        selected: Option<&Path>,
+        window: &[PathBuf],
+        look_ahead: &[PathBuf],
+    ) -> Vec<CoverJob> {
         self.frame = self.frame.wrapping_add(1);
-        for path in window.iter().chain(look_ahead) {
+        for path in selected
+            .into_iter()
+            .chain(window.iter().map(PathBuf::as_path))
+        {
+            self.last_used.insert(path.to_path_buf(), self.frame);
+        }
+        for path in look_ahead {
             self.last_used.insert(path.clone(), self.frame);
         }
 
         let mut wanted: Vec<CoverJob> = Vec::new();
-        // The visible rows first: what a person is looking at is worth more than what
-        // they might scroll to.
-        for path in window.iter().chain(look_ahead) {
+        // Three passes in the order the results are wanted on screen. The selected
+        // game is what a person is actually looking at, so it is asked for first
+        // even when it is also an ordinary visible row; the look-ahead is asked for
+        // last, and only with whatever is left of the frame's budget.
+        let mut consider = |cache: &mut Self, path: &Path, priority: CoverPriority| {
             if wanted.len() >= MAX_REQUESTS_PER_FRAME {
-                break;
+                return;
             }
-            if wanted.iter().any(|job| &job.local_path == path) {
-                continue;
+            if priority == CoverPriority::Selected
+                && wanted
+                    .iter()
+                    .filter(|job| job.priority == CoverPriority::Selected)
+                    .count()
+                    >= MAX_SELECTED_REQUESTS_PER_FRAME
+            {
+                return;
             }
-            let held_key = match self.slots.get(path) {
+            if wanted.iter().any(|job| job.local_path == path) {
+                return;
+            }
+            let held_key = match cache.slots.get(path) {
                 // Already asked, or already answered. Nothing to do.
-                Some(CoverSlot::Loading | CoverSlot::Ready { .. } | CoverSlot::None(_)) => continue,
+                Some(CoverSlot::Loading | CoverSlot::Ready { .. } | CoverSlot::None(_)) => return,
                 // Already asked to confirm; waiting on the answer.
                 Some(CoverSlot::Revalidating {
                     requested: true, ..
-                }) => continue,
-                // Waiting on the refreshed catalogue. Offer the key it already holds,
-                // so an unchanged record is confirmed without a decode.
+                }) => return,
+                // Waiting on the refreshed catalogue. Offer the key it already
+                // holds, so an unchanged record is confirmed without a decode.
                 Some(CoverSlot::Revalidating { key, .. }) => Some(key.clone()),
                 None => None,
             };
             wanted.push(CoverJob {
-                local_path: path.clone(),
+                local_path: path.to_path_buf(),
+                priority,
                 held_key,
             });
+        };
+
+        if let Some(path) = selected {
+            consider(self, path, CoverPriority::Selected);
         }
+        for path in window {
+            consider(self, path, CoverPriority::Visible);
+        }
+        for path in look_ahead {
+            consider(self, path, CoverPriority::LookAhead);
+        }
+
         for job in &wanted {
             match self.slots.get_mut(&job.local_path) {
                 // Marked as asked, keeping the texture that makes an unchanged
@@ -435,6 +504,71 @@ impl GamerCoverCache {
     pub(crate) fn tracked(&self) -> usize {
         self.slots.len()
     }
+}
+
+// --- The featured cover -------------------------------------------------
+
+/// How wide the featured panel's content column is allowed to get.
+///
+/// The panel itself is around 730px at 1920x1080, and a title, a status line and a
+/// Mount button stretched across all of it read as a form rather than a feature.
+/// Constraining the column keeps the block cohesive and keeps Mount emphatic
+/// without becoming a banner.
+pub(crate) const GAMER_FEATURED_CONTENT_MAX_WIDTH: f32 = 460.0;
+
+/// The tallest a featured cover is drawn, so a 1440p panel does not turn one
+/// thumbnail into a poster.
+pub(crate) const FEATURED_COVER_MAX_HEIGHT: f32 = 300.0;
+
+/// Below this there is not enough of an image left to be worth the space, and the
+/// artwork is dropped rather than the actions.
+pub(crate) const FEATURED_COVER_MIN_HEIGHT: f32 = 72.0;
+
+/// The first-frame estimate of what the title, status and actions need beneath the
+/// artwork.
+///
+/// Only an estimate, and only until the panel has drawn once: from then on the
+/// caller measures the block and reserves its real height. That is what makes
+/// "reduce the artwork before hiding the actions" true rather than hoped for - the
+/// cover only ever gets what is genuinely left over, however the title wrapped.
+pub(crate) const FEATURED_RESERVED_BELOW: f32 = 300.0;
+
+/// A cover's portrait shape. Boxes are reserved at this ratio; the image inside is
+/// fitted to it and letterboxed, never stretched or cropped.
+pub(crate) const FEATURED_COVER_ASPECT: f32 = 2.0 / 3.0;
+
+/// The box reserved for the featured cover, or `None` when there is not enough
+/// height to give it any.
+///
+/// `budget` is the height left for the artwork *after* the caller has set aside
+/// what the title, the status and the actions need - measured, not estimated. The
+/// subtraction belongs there rather than here: doing it in both places takes it
+/// twice, which shrinks the cover on a large window and hides it on a small one.
+///
+/// The box is the same size whether the artwork has loaded, failed, or does not
+/// exist, which is what stops the actions beneath it moving.
+pub(crate) fn featured_cover_box(panel_width: f32, budget: f32) -> Option<egui::Vec2> {
+    // Capped so a 1440p panel does not turn one thumbnail into a poster, and
+    // clamped to fit across the panel at its portrait ratio.
+    let by_width = (panel_width - 2.0 * theme::PAGE_GUTTER).max(0.0) / FEATURED_COVER_ASPECT;
+    let height = budget.min(by_width).min(FEATURED_COVER_MAX_HEIGHT);
+    if height < FEATURED_COVER_MIN_HEIGHT {
+        return None;
+    }
+    Some(egui::vec2(height * FEATURED_COVER_ASPECT, height))
+}
+
+/// Fits an image inside the reserved box, preserving its aspect ratio.
+///
+/// A portrait cover fills the box's height; a landscape or unusually shaped one
+/// fills its width and is letterboxed top and bottom. Nothing is ever stretched,
+/// and nothing is cropped away.
+pub(crate) fn fit_within(box_size: egui::Vec2, image: egui::Vec2) -> egui::Vec2 {
+    if image.x <= 0.0 || image.y <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    let scale = (box_size.x / image.x).min(box_size.y / image.y);
+    image * scale
 }
 
 /// Extends a visible row range with look-ahead, clamped to the list.
@@ -741,6 +875,83 @@ pub(crate) struct CoverWorker {
     replies: std::sync::mpsc::Receiver<CoverReply>,
 }
 
+/// One job waiting on the worker, with what it needs to be ordered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedJob {
+    pub(crate) generation: u64,
+    pub(crate) job: CoverJob,
+    /// Arrival order, so ties break oldest-first and the choice is deterministic.
+    pub(crate) sequence: u64,
+}
+
+/// Chooses the next job to resolve, with bounded fairness.
+///
+/// Normally the highest-priority job wins, oldest first among equals - that is what
+/// puts a freshly selected game ahead of a look-ahead backlog already queued, which
+/// plain FIFO delivery cannot do.
+///
+/// `served_high` counts how many jobs have been taken ahead of something lower.
+/// Once it reaches [`FAIRNESS_RUN`], the oldest *lower*-priority job is taken
+/// instead and the count resets. Without that, a person holding a key down to move
+/// the selection would keep a selected-priority job at the head of the queue
+/// forever and the visible rows behind it would never be read.
+pub(crate) fn next_job(queue: &mut Vec<QueuedJob>, served_high: &mut u32) -> Option<QueuedJob> {
+    if queue.is_empty() {
+        return None;
+    }
+    let best = queue
+        .iter()
+        .map(|queued| queued.job.priority)
+        .min()
+        .expect("the queue is not empty");
+    // The fairness release: something lower is waiting and the run has gone on long
+    // enough, so it goes next whatever is at the head.
+    let wanted =
+        if *served_high >= FAIRNESS_RUN && queue.iter().any(|queued| queued.job.priority > best) {
+            *served_high = 0;
+            queue
+                .iter()
+                .map(|queued| queued.job.priority)
+                .filter(|priority| *priority > best)
+                .min()
+                .expect("a lower priority was just observed")
+        } else {
+            if queue.iter().any(|queued| queued.job.priority > best) {
+                *served_high += 1;
+            } else {
+                // Nothing is being held back, so nothing is being unfair to.
+                *served_high = 0;
+            }
+            best
+        };
+    let index = queue
+        .iter()
+        .enumerate()
+        .filter(|(_, queued)| queued.job.priority == wanted)
+        .min_by_key(|(_, queued)| queued.sequence)
+        .map(|(index, _)| index)
+        .expect("a job with the chosen priority");
+    Some(queue.remove(index))
+}
+
+/// Drops the least valuable work once the queue is over its bound.
+///
+/// Lowest priority and oldest first: those describe rows that have most likely
+/// scrolled away, and the UI re-asks for anything it still wants on the next frame
+/// it draws.
+pub(crate) fn trim_queue(queue: &mut Vec<QueuedJob>) {
+    if queue.len() <= MAX_QUEUED_JOBS {
+        return;
+    }
+    queue.sort_by(|left, right| {
+        left.job
+            .priority
+            .cmp(&right.job.priority)
+            .then_with(|| right.sequence.cmp(&left.sequence))
+    });
+    queue.truncate(MAX_QUEUED_JOBS);
+}
+
 /// What the UI thread asks the worker to do.
 enum WorkerMessage {
     Resolve {
@@ -765,53 +976,86 @@ impl CoverWorker {
         std::thread::spawn(move || {
             let mut source: Option<RommCoverSource> = None;
             let mut opened = false;
-            for message in request_receiver {
-                match message {
-                    WorkerMessage::Reindex => {
-                        match source.as_mut() {
-                            // Reindexed in place, keeping the current index if the
-                            // new catalogue cannot be read.
-                            Some(source) => {
-                                source.reindex();
-                            }
-                            // Never opened, or the first open failed. An import may
-                            // have created what was missing, so try again.
-                            None => {
-                                opened = true;
-                                source = RommCoverSource::open(trusted_roots.clone()).ok();
-                            }
-                        }
-                        // No reply: the UI has already moved its slots to
-                        // `Revalidating` and re-requests what is on screen.
-                        context.request_repaint();
-                    }
-                    WorkerMessage::Resolve { generation, job } => {
-                        if !opened {
-                            opened = true;
-                            source = RommCoverSource::open(trusted_roots.clone()).ok();
-                        }
-                        let reply = match source.as_mut() {
-                            Some(source) => {
-                                source.resolve(generation, &job.local_path, job.held_key.as_deref())
-                            }
-                            // The catalogue itself could not be opened - RomM has
-                            // never been imported, or the published cache is
-                            // unreadable. That is not the same as a record having no
-                            // identity, and saying so would send someone looking for
-                            // the wrong problem.
-                            None => CoverReply {
-                                generation,
-                                local_path: job.local_path,
-                                provider_game_id: None,
-                                answer: CoverAnswer::None(NoCover::Unavailable),
-                            },
-                        };
-                        if reply_sender.send(reply).is_err() {
-                            return;
-                        }
-                        context.request_repaint();
+            let mut queue: Vec<QueuedJob> = Vec::new();
+            let mut served_high = 0_u32;
+            let mut sequence = 0_u64;
+            loop {
+                // Block for work, then take everything else that has arrived. The
+                // drain is what makes prioritising possible at all: with one job
+                // read at a time the order is whatever the channel delivered, and a
+                // freshly selected game would sit behind a look-ahead backlog.
+                let mut messages = Vec::new();
+                if queue.is_empty() {
+                    match request_receiver.recv() {
+                        Ok(message) => messages.push(message),
+                        Err(_) => return,
                     }
                 }
+                messages.extend(request_receiver.try_iter());
+
+                for message in messages {
+                    match message {
+                        WorkerMessage::Reindex => {
+                            match source.as_mut() {
+                                // Reindexed in place, keeping the current index if
+                                // the new catalogue cannot be read.
+                                Some(source) => {
+                                    source.reindex();
+                                }
+                                // Never opened, or the first open failed. An import
+                                // may have created what was missing, so try again.
+                                None => {
+                                    opened = true;
+                                    source = RommCoverSource::open(trusted_roots.clone()).ok();
+                                }
+                            }
+                            // Everything queued was resolved against the previous
+                            // catalogue's generation and has been superseded. The UI
+                            // has already moved its slots to `Revalidating` and
+                            // re-asks for what is on screen.
+                            queue.clear();
+                            context.request_repaint();
+                        }
+                        WorkerMessage::Resolve { generation, job } => {
+                            sequence = sequence.wrapping_add(1);
+                            queue.push(QueuedJob {
+                                generation,
+                                job,
+                                sequence,
+                            });
+                        }
+                    }
+                }
+                trim_queue(&mut queue);
+
+                let Some(queued) = next_job(&mut queue, &mut served_high) else {
+                    continue;
+                };
+                if !opened {
+                    opened = true;
+                    source = RommCoverSource::open(trusted_roots.clone()).ok();
+                }
+                let reply = match source.as_mut() {
+                    Some(source) => source.resolve(
+                        queued.generation,
+                        &queued.job.local_path,
+                        queued.job.held_key.as_deref(),
+                    ),
+                    // The catalogue itself could not be opened - RomM has never been
+                    // imported, or the published cache is unreadable. That is not the
+                    // same as a record having no identity, and saying so would send
+                    // someone looking for the wrong problem.
+                    None => CoverReply {
+                        generation: queued.generation,
+                        local_path: queued.job.local_path,
+                        provider_game_id: None,
+                        answer: CoverAnswer::None(NoCover::Unavailable),
+                    },
+                };
+                if reply_sender.send(reply).is_err() {
+                    return;
+                }
+                context.request_repaint();
             }
         });
         Self {

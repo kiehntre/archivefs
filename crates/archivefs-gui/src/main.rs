@@ -35245,6 +35245,103 @@ fn gamer_row_matches_platform(row: &ArchiveRow, platform: Option<&str>) -> bool 
     })
 }
 
+/// Draws the featured cover for the selected game.
+///
+/// The box is reserved at a fixed size for this frame whatever the artwork is
+/// doing, so the title and the actions beneath it never move as a cover arrives,
+/// fails, or turns out not to exist.
+///
+/// Allocated with [`egui::Sense::hover`] and painted directly: artwork is not a
+/// control, so it takes no place in the Tab order and Mount stays the first thing
+/// a keyboard reaches.
+fn show_featured_cover(
+    ui: &mut egui::Ui,
+    box_size: egui::Vec2,
+    cover: Option<&crate::gamer_artwork::CoverSlot>,
+    placeholder: GameRowArtworkPaint<'_>,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_directory: Option<&Path>,
+) {
+    let full_width = ui.available_width();
+    // Centred by allocating the panel's width and drawing into the middle of it,
+    // rather than by padding, so the box is centred at every panel width.
+    let (outer, _) =
+        ui.allocate_exact_size(egui::vec2(full_width, box_size.y), egui::Sense::hover());
+    let rect = egui::Rect::from_center_size(outer.center(), box_size);
+
+    // A restrained plate behind the artwork: it gives a letterboxed or missing
+    // cover a defined edge instead of leaving a hole in the panel, and it is the
+    // placeholder's whole visual identity.
+    ui.painter()
+        .rect_filled(rect, 10.0, ui.visuals().extreme_bg_color);
+    ui.painter()
+        .rect_stroke(rect, 10.0, theme::border(ui), egui::StrokeKind::Inside);
+
+    match cover {
+        Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
+            let drawn = crate::gamer_artwork::fit_within(box_size, texture.size_vec2());
+            ui.painter().image(
+                texture.id(),
+                egui::Rect::from_center_size(rect.center(), drawn),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        // Loading, revalidating, and "there is no cover" all draw the same thing.
+        // A spinner that becomes a picture is the same visual jump the reserved box
+        // exists to prevent, and the platform artwork is a truthful, readable image
+        // of what this game is meanwhile.
+        _ => {
+            let glyph = (box_size.y * 0.42).min(96.0);
+            paint_game_row_artwork(
+                ui,
+                artwork_cache,
+                artwork_directory,
+                GameRowArtworkPaint {
+                    center: rect.center() - egui::vec2(0.0, glyph * 0.16),
+                    size: glyph,
+                    ..placeholder
+                },
+            );
+            if matches!(cover, Some(crate::gamer_artwork::CoverSlot::None(_))) {
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.bottom() - 18.0),
+                    egui::Align2::CENTER_CENTER,
+                    "No cover available",
+                    egui::FontId::proportional(13.0),
+                    theme::muted(ui),
+                );
+            }
+        }
+    }
+}
+
+/// The featured panel's primary button: full width and taller than a secondary
+/// one, so Mount reads as the thing to do from across a room.
+///
+/// Still `widgets::action_button`'s `Primary` fill and still an ordinary
+/// `egui::Button`, so its enable/disable rules, focus behaviour and activation are
+/// exactly what they were.
+fn featured_primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let width = ui.available_width();
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(17.0).strong())
+            .fill(theme::ACCENT)
+            .min_size(egui::vec2(width, 42.0)),
+    )
+}
+
+/// One line of the featured panel's metadata block.
+fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) {
+    let text = egui::RichText::new(text).size(if strong { 16.0 } else { 14.0 });
+    ui.label(if strong {
+        text.color(ui.visuals().text_color())
+    } else {
+        text.color(theme::muted(ui))
+    });
+}
+
 struct GamerViewViewState<'a> {
     filter: &'a str,
     library_filters: &'a mut LibraryRowFilters,
@@ -35385,6 +35482,10 @@ fn show_gamer_view(
     }
     let visible = &snapshot.visible;
     let platform_counts = &snapshot.platform_counts;
+    // Captured once for this frame so the list and the featured panel agree about
+    // what is selected, and so a cover is asked for by the record's own path rather
+    // than by whichever row happens to be drawn at its position.
+    let selected_path = archive_context.focused.clone();
 
     // The visual platform picker (milestone: "Gamer View Visual Platform
     // Picker and Library Layout Polish"): a single-row, horizontally
@@ -35501,7 +35602,16 @@ fn show_gamer_view(
                                 .into_iter()
                                 .filter(|path| !on_screen.contains(path))
                                 .collect();
-                            cover_requests.extend(covers.visible(&on_screen, &ahead));
+                            // The selected game is asked for first, so the featured
+                            // panel fills before the rows a person has not looked at
+                            // yet. It takes at most one of the frame's slots, which
+                            // is what stops a held-down arrow key from starving the
+                            // list.
+                            cover_requests.extend(covers.visible(
+                                selected_path.as_deref(),
+                                &on_screen,
+                                &ahead,
+                            ));
 
                             for visible_index in row_range {
                                 let index = visible[visible_index];
@@ -35646,129 +35756,269 @@ fn show_gamer_view(
                         ui.label("Choose a game from the list on the left to see what you can do with it.");
                     }
                     Some(record) => {
+                        // The featured block lives in its own constrained column so
+                        // the title, the status and Mount stay a cohesive unit
+                        // rather than stretching the full width of the panel.
+                        let content_width = panel_width.min(crate::gamer_artwork::GAMER_FEATURED_CONTENT_MAX_WIDTH);
                         let archive_path = record.mount_plan.archive.path.clone();
-                        ui.heading(gamer_display_title(record));
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} \u{b7} {}",
-                                record
-                                    .metadata
-                                    .platform
-                                    .as_deref()
-                                    .or(record.identity.platform.as_deref())
-                                    .unwrap_or("Unknown"),
-                                archive_kind_name(record.mount_plan.archive.kind)
-                            ))
-                            .color(theme::muted(ui)),
+                        let platform = record
+                            .metadata
+                            .platform
+                            .as_deref()
+                            .or(record.identity.platform.as_deref())
+                            .unwrap_or("Unknown");
+                        let title = gamer_display_title(record);
+                        let row = data.rows.iter().find(|row| row.path == archive_path);
+                        let unknown_platform = row.is_some_and(|row| row.unknown_platform);
+
+                        // How much height everything *below* the artwork actually
+                        // took last frame: the title, the metadata, the separators
+                        // and both rows of actions.
+                        //
+                        // Measured rather than estimated, and measured as one block
+                        // rather than only the buttons. Its height depends on whether
+                        // the title wrapped to a second line, whether the primary
+                        // action carries a note, whether the secondary row wrapped
+                        // and whether Undo is offered - guessing it puts Mount below
+                        // the fold the moment any of those changes, which is exactly
+                        // what a 1280x720 window did. Stored per panel and converged
+                        // on the first frame.
+                        let actions_id = ui.id().with("gamer_featured_below_height");
+                        let measured = ui
+                            .ctx()
+                            .data(|data| data.get_temp::<f32>(actions_id))
+                            .unwrap_or(crate::gamer_artwork::FEATURED_RESERVED_BELOW);
+                        // Clamped against the physical viewport as well as the
+                        // container's own figure. The Gamer View column reports the
+                        // height it was allocated, which on a short window is more
+                        // than is actually on screen - the list beside it scrolls, so
+                        // it never notices, but this panel does not, and sizing the
+                        // artwork from the larger number is what pushed the secondary
+                        // actions off the bottom at 1280x720.
+                        let to_screen_bottom =
+                            (ui.ctx().screen_rect().bottom() - ui.cursor().top()).max(0.0);
+                        let usable = ui.available_height().min(to_screen_bottom);
+                        // The measurement covers the block itself; the gap the
+                        // artwork adds beneath it, and a couple of pixels of rounding
+                        // in the last row's spacing, come off here.
+                        let for_artwork =
+                            (usable - measured - theme::SECTION_GAP - 12.0).max(0.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(content_width, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // --- Featured artwork ---
+                                //
+                                // Reserved at a fixed size for this frame whatever
+                                // the artwork is doing, so the title and the actions
+                                // beneath it never move as a cover arrives, fails, or
+                                // turns out not to exist. Sized from what the actions
+                                // left, so the artwork is what shrinks on a short
+                                // window - never the controls.
+                                //
+                                // Looked up by the selected record's own path, which
+                                // is what a cover is keyed by, so the panel reads the
+                                // *new* selection's slot the instant the selection
+                                // changes and a late reply for the previous one has
+                                // nothing here to draw into.
+                                if let Some(box_size) = crate::gamer_artwork::featured_cover_box(
+                                    content_width,
+                                    for_artwork,
+                                ) {
+                                    let cover =
+                                        covers.slot_for(archive_path.as_path(), None).cloned();
+                                    let platform_asset =
+                                        platform_asset_id(platform, unknown_platform);
+                                    show_featured_cover(
+                                        ui,
+                                        box_size,
+                                        cover.as_ref(),
+                                        GameRowArtworkPaint {
+                                            center: egui::Pos2::ZERO,
+                                            size: 0.0,
+                                            title: &title,
+                                            platform_asset,
+                                            unknown_platform,
+                                        },
+                                        artwork_cache,
+                                        artwork_directory,
+                                    );
+                                    ui.add_space(theme::SECTION_GAP);
+                                }
+
+                                // --- Identity, status and actions ---
+                                //
+                                // Measured as one block, so the artwork above can be
+                                // sized from what everything below it really needs.
+                                let below = ui.scope(|ui| {
+                                    // The title is the strongest element; everything
+                                    // under it is one quiet line each. Deliberately
+                                    // not every field the Details screen holds - this
+                                    // is what a person needs to know they picked the
+                                    // right game, not a diagnostic dump.
+                                    ui.label(
+                                        egui::RichText::new(&title)
+                                            .size(23.0)
+                                            .strong()
+                                            .color(ui.visuals().strong_text_color()),
+                                    );
+                                    featured_meta_line(
+                                        ui,
+                                        format!(
+                                            "{platform} \u{b7} {}",
+                                            archive_kind_name(record.mount_plan.archive.kind)
+                                        ),
+                                        false,
+                                    );
+                                    featured_meta_line(
+                                        ui,
+                                        gamer_primary_action_short_label(&gamer_primary_action(
+                                            record.mount_state,
+                                        ))
+                                        .to_string(),
+                                        true,
+                                    );
+                                    if let Some(row) = row
+                                        && row.origin != RowOrigin::Live
+                                    {
+                                        // Provenance, but only when it changes what
+                                        // the buttons below can be trusted to do.
+                                        featured_meta_line(
+                                            ui,
+                                            row.origin.label().to_string(),
+                                            false,
+                                        );
+                                    }
+
+                                    ui.add_space(theme::SECTION_GAP);
+                                    ui.separator();
+                                    ui.add_space(theme::SECTION_GAP);
+
+                                    // Primary action: the one obvious, full-width,
+                                    // visually prominent button for what this game
+                                    // needs right now, and the first control a
+                                    // keyboard reaches in this panel.
+                                    match gamer_primary_action(record.mount_state) {
+                                        GamerPrimaryAction::Mount => {
+                                            if featured_primary_button(ui, "Mount", !busy).clicked()
+                                            {
+                                                action = Some(GamerViewAction::Operation(
+                                                    OperationRequest {
+                                                        action: ArchiveAction::Mount,
+                                                        archive_path: archive_path.clone(),
+                                                        cleanup_after_unmount,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                        GamerPrimaryAction::Unmount => {
+                                            if featured_primary_button(ui, "Unmount", !busy)
+                                                .clicked()
+                                            {
+                                                action = Some(GamerViewAction::Operation(
+                                                    OperationRequest {
+                                                        action: ArchiveAction::Unmount,
+                                                        archive_path: archive_path.clone(),
+                                                        cleanup_after_unmount,
+                                                    },
+                                                ));
+                                            }
+                                            ui.weak("Currently mounted.");
+                                        }
+                                        GamerPrimaryAction::NoMountingNeeded => {
+                                            ui.weak(
+                                                "No mounting needed \u{2014} ready for your \
+                                                 emulator.",
+                                            );
+                                        }
+                                        GamerPrimaryAction::Blocked(reason) => {
+                                            ui.colored_label(ui.visuals().warn_fg_color, reason);
+                                        }
+                                    }
+                                    if let Some(reason) = block_reason {
+                                        ui.weak(reason);
+                                    }
+
+                                    ui.add_space(theme::SECTION_GAP);
+                                    ui.separator();
+                                    ui.add_space(theme::SECTION_GAP);
+
+                                    // Secondary actions: kept together rather than
+                                    // scattered. One wrapping row while the panel is
+                                    // wide enough for all three, a tidy full-width
+                                    // stack once it is not.
+                                    let stacked = content_width < GAMER_SECONDARY_ROW_MIN_WIDTH;
+                                    let secondary = |ui: &mut egui::Ui, label: &str| {
+                                        if stacked {
+                                            let width = ui.available_width();
+                                            ui.add(
+                                                egui::Button::new(label)
+                                                    .min_size(egui::vec2(width, 34.0)),
+                                            )
+                                        } else {
+                                            widgets::action_button(
+                                                ui,
+                                                label,
+                                                widgets::ActionStyle::Secondary,
+                                                true,
+                                            )
+                                        }
+                                    };
+                                    let mut body = |ui: &mut egui::Ui| {
+                                        if secondary(ui, "Cheats & Mods").clicked() {
+                                            action = Some(GamerViewAction::OpenCheatsMods(
+                                                archive_path.clone(),
+                                            ));
+                                        }
+                                        if secondary(ui, "Details").clicked() {
+                                            *screen = GamerViewScreen::Details;
+                                        }
+                                        let folder =
+                                            archive_path.parent().filter(|folder| folder.is_dir());
+                                        if let Some(folder) = folder
+                                            && secondary(ui, "Open location").clicked()
+                                        {
+                                            action = Some(GamerViewAction::CopyLocation(
+                                                folder.display().to_string(),
+                                            ));
+                                        }
+                                    };
+                                    if stacked {
+                                        body(ui);
+                                    } else {
+                                        ui.horizontal_wrapped(body);
+                                    }
+
+                                    if gamer_undo_available(
+                                        cheat_workflow,
+                                        Some(archive_path.as_path()),
+                                    ) {
+                                        ui.add_space(theme::SECTION_GAP);
+                                        if widgets::action_button(
+                                            ui,
+                                            "Undo last change",
+                                            widgets::ActionStyle::Quiet,
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            action = Some(GamerViewAction::Undo);
+                                        }
+                                    }
+                                });
+
+                                // Recorded for the next frame. A changed measurement
+                                // asks for one more so the artwork settles
+                                // immediately rather than on the next input.
+                                let height = below.response.rect.height();
+                                if (height - measured).abs() > 0.5 {
+                                    ui.ctx()
+                                        .data_mut(|data| data.insert_temp(actions_id, height));
+                                    ui.ctx().request_repaint();
+                                }
+                            },
                         );
-                        ui.add_space(theme::SECTION_GAP);
-
-                        // Primary action: the one obvious, full-width,
-                        // visually prominent button for what this game
-                        // needs right now (manual QA finding: "the primary
-                        // action is obvious").
-                        match gamer_primary_action(record.mount_state) {
-                            GamerPrimaryAction::Mount => {
-                                if widgets::action_button(
-                                    ui,
-                                    "Mount",
-                                    widgets::ActionStyle::Primary,
-                                    !busy,
-                                )
-                                .clicked()
-                                {
-                                    action = Some(GamerViewAction::Operation(OperationRequest {
-                                        action: ArchiveAction::Mount,
-                                        archive_path: archive_path.clone(),
-                                        cleanup_after_unmount,
-                                    }));
-                                }
-                            }
-                            GamerPrimaryAction::Unmount => {
-                                if widgets::action_button(
-                                    ui,
-                                    "Unmount",
-                                    widgets::ActionStyle::Primary,
-                                    !busy,
-                                )
-                                .clicked()
-                                {
-                                    action = Some(GamerViewAction::Operation(OperationRequest {
-                                        action: ArchiveAction::Unmount,
-                                        archive_path: archive_path.clone(),
-                                        cleanup_after_unmount,
-                                    }));
-                                }
-                                ui.weak("Currently mounted.");
-                            }
-                            GamerPrimaryAction::NoMountingNeeded => {
-                                ui.weak("No mounting needed \u{2014} ready for your emulator.");
-                            }
-                            GamerPrimaryAction::Blocked(reason) => {
-                                ui.colored_label(ui.visuals().warn_fg_color, reason);
-                            }
-                        }
-                        if let Some(reason) = block_reason {
-                            ui.weak(reason);
-                        }
-                        ui.add_space(theme::SECTION_GAP);
-                        ui.separator();
-                        ui.add_space(theme::SECTION_GAP);
-
-                        // Secondary actions: visually separated from the
-                        // primary action by the divider above, grouped
-                        // together as one row (manual QA finding:
-                        // "secondary actions clearly separated").
-                        ui.horizontal_wrapped(|ui| {
-                            if widgets::action_button(
-                                ui,
-                                "Cheats & Mods",
-                                widgets::ActionStyle::Secondary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action =
-                                    Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
-                            }
-                            if widgets::action_button(
-                                ui,
-                                "Details",
-                                widgets::ActionStyle::Secondary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                *screen = GamerViewScreen::Details;
-                            }
-                            let folder = archive_path.parent().filter(|folder| folder.is_dir());
-                            if let Some(folder) = folder
-                                && widgets::action_button(
-                                    ui,
-                                    "Open location",
-                                    widgets::ActionStyle::Secondary,
-                                    true,
-                                )
-                                .clicked()
-                            {
-                                action = Some(GamerViewAction::CopyLocation(
-                                    folder.display().to_string(),
-                                ));
-                            }
-                        });
-                        if gamer_undo_available(cheat_workflow, Some(archive_path.as_path())) {
-                            ui.add_space(theme::SECTION_GAP);
-                            if widgets::action_button(
-                                ui,
-                                "Undo last change",
-                                widgets::ActionStyle::Quiet,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action = Some(GamerViewAction::Undo);
-                            }
-                        }
                     }
                 }
             },
@@ -36497,6 +36747,11 @@ fn paint_game_row_artwork(
         },
     )
 }
+
+/// Below this the featured panel's three secondary actions cannot share a row at
+/// all, so they become a full-width stack rather than one button per line with a
+/// ragged right edge. Above it they wrap, which degrades gracefully in between.
+const GAMER_SECONDARY_ROW_MIN_WIDTH: f32 = 300.0;
 
 const PLATFORM_CARD_MIN_WIDTH: f32 = 132.0;
 const PLATFORM_CARD_MAX_WIDTH: f32 = 164.0;
@@ -63148,7 +63403,7 @@ $Instant Growth [Nayr]\n";
         app.view = MainView::Library;
         let mut records = Vec::new();
         for index in 0..count {
-            let mut built = record(&format!("/roms/g{index:05}.zip"), MountState::Pending);
+            let mut built = record(&featured_path(index), MountState::Pending);
             built.metadata.platform = Some("SNES".to_string());
             built.metadata.title = Some(format!("Game {index:05}"));
             records.push(built);
@@ -63253,17 +63508,17 @@ $Instant Growth [Nayr]\n";
         let generation = app.gamer_covers.generation();
         assert!(
             app.gamer_covers
-                .slot_for(Path::new("/roms/g00000.zip"), None)
+                .slot_for(Path::new(&featured_path(0)), None)
                 .is_some(),
             "the visible list asked for nothing"
         );
 
         assert!(
             app.gamer_covers
-                .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101")),
+                .absorb(&ctx, cover_reply(generation, &featured_path(0), "101")),
             "the cover was refused"
         );
-        let cover = cover_texture_id(&app, "/roms/g00000.zip").expect("a loaded cover");
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
         let drawn = rendered_images(&run_frames(&mut app, &ctx, 1920.0, 1080.0, 1));
         assert!(
             drawn.iter().any(|(id, _)| *id == cover),
@@ -63284,7 +63539,7 @@ $Instant Growth [Nayr]\n";
             "Game 00000",
         );
         app.gamer_covers
-            .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
         let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
         let title_after = find_text_position_containing(&output, "Game 00000");
         assert_eq!(
@@ -63294,7 +63549,7 @@ $Instant Growth [Nayr]\n";
 
         // And the cover itself stayed inside the slot it was given: a 20x30
         // cover is scaled to fit 56, never stretched to fill it.
-        let cover = cover_texture_id(&app, "/roms/g00000.zip").expect("a loaded cover");
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
         let bounds = rendered_images(&output)
             .into_iter()
             .find(|(id, _)| *id == cover)
@@ -63329,7 +63584,7 @@ $Instant Growth [Nayr]\n";
             &ctx,
             crate::gamer_artwork::CoverReply {
                 generation,
-                local_path: PathBuf::from("/roms/g00000.zip"),
+                local_path: PathBuf::from(featured_path(0)),
                 provider_game_id: Some("101".to_string()),
                 answer: crate::gamer_artwork::CoverAnswer::None(
                     crate::gamer_artwork::NoCover::Failed,
@@ -63370,15 +63625,15 @@ $Instant Growth [Nayr]\n";
         run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
         let generation = app.gamer_covers.generation();
         app.gamer_covers
-            .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
         run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
 
-        app.filter = "g00004".to_string();
+        app.filter = "archivefs-featured-g00004".to_string();
         run_frames(&mut app, &ctx, 1920.0, 1080.0, 2);
         assert!(
             !matches!(
                 app.gamer_covers
-                    .slot_for(Path::new("/roms/g00004.zip"), None),
+                    .slot_for(Path::new(&featured_path(4)), None),
                 Some(crate::gamer_artwork::CoverSlot::Ready { .. })
             ),
             "the searched-for game inherited another record's cover"
@@ -63386,7 +63641,7 @@ $Instant Growth [Nayr]\n";
         // The loaded cover still belongs to the record it was resolved for.
         assert!(matches!(
             app.gamer_covers
-                .slot_for(Path::new("/roms/g00000.zip"), None),
+                .slot_for(Path::new(&featured_path(0)), None),
             Some(crate::gamer_artwork::CoverSlot::Ready { .. })
         ));
     }
@@ -63401,8 +63656,8 @@ $Instant Growth [Nayr]\n";
         run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
         let generation = app.gamer_covers.generation();
         app.gamer_covers
-            .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
-        let cover = cover_texture_id(&app, "/roms/g00000.zip").expect("a loaded cover");
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
         let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
         assert!(drawn_texture_ids(&before).contains(&cover));
         let title_before = find_text_position_containing(&before, "Game 00000");
@@ -63428,8 +63683,8 @@ $Instant Growth [Nayr]\n";
         run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
         let generation = app.gamer_covers.generation();
         app.gamer_covers
-            .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
-        let cover = cover_texture_id(&app, "/roms/g00000.zip").expect("a loaded cover");
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
 
         app.gamer_covers.identity_refreshed();
         run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
@@ -63438,7 +63693,7 @@ $Instant Growth [Nayr]\n";
             &ctx,
             crate::gamer_artwork::CoverReply {
                 generation: app.gamer_covers.generation(),
-                local_path: PathBuf::from("/roms/g00000.zip"),
+                local_path: PathBuf::from(featured_path(0)),
                 provider_game_id: Some("101".to_string()),
                 answer: crate::gamer_artwork::CoverAnswer::Unchanged {
                     key: "101".to_string(),
@@ -63447,7 +63702,7 @@ $Instant Growth [Nayr]\n";
         );
         assert!(confirmed, "the confirmation was refused");
         assert_eq!(
-            cover_texture_id(&app, "/roms/g00000.zip"),
+            cover_texture_id(&app, &featured_path(0)),
             Some(cover),
             "the retained texture was replaced rather than reused"
         );
@@ -63470,6 +63725,460 @@ $Instant Growth [Nayr]\n";
         );
     }
 
+    // --- The featured "Selected game" panel --------------------------------
+
+    /// The local path the featured-panel fixture uses for one of its records.
+    fn featured_path(index: usize) -> String {
+        std::env::temp_dir()
+            .join(format!("archivefs-featured-g{index:05}.zip"))
+            .display()
+            .to_string()
+    }
+
+    /// Renders Gamer View with one game selected and returns the frame.
+    fn featured_panel_frame(
+        width: f32,
+        height: f32,
+        title: &str,
+    ) -> (ArchiveFsApp, egui::Context, egui::FullOutput) {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        // Real parent directory, because "Open location" is only offered when there
+        // is somewhere to open - testing that it is present needs a path whose
+        // folder exists. No file is created: only the folder is looked at.
+        let folder = std::env::temp_dir();
+        let mut records = Vec::new();
+        for index in 0..8 {
+            let path = folder.join(format!("archivefs-featured-g{index:05}.zip"));
+            let mut built = record(&path.display().to_string(), MountState::Pending);
+            built.metadata.platform = Some("SNES".to_string());
+            built.metadata.title = Some(if index == 0 {
+                title.to_string()
+            } else {
+                format!("Game {index:05}")
+            });
+            records.push(built);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.archive_context
+            .select_only(folder.join("archivefs-featured-g00000.zip"));
+        let ctx = egui::Context::default();
+        let output = run_frames(&mut app, &ctx, width, height, 4);
+        (app, ctx, output)
+    }
+
+    /// The rect of the first widget whose text exactly matches, from the frame's
+    /// text shapes. Relational assertions use these rather than fixed pixels.
+    fn text_rect(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle && out.is_none() => {
+                    *out = Some(text.visual_bounding_rect());
+                }
+                egui::Shape::Vec(nested) => {
+                    nested.iter().for_each(|shape| walk(shape, needle, out))
+                }
+                _ => {}
+            }
+        }
+        let mut found = None;
+        for clipped in &output.shapes {
+            walk(&clipped.shape, needle, &mut found);
+        }
+        found
+    }
+
+    #[test]
+    fn the_featured_panel_shows_artwork_above_the_title_and_the_actions() {
+        // The layout contract, stated relationally rather than in pixels: artwork
+        // at the top, then the title, then Mount, then the secondary actions.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        // The featured cover is the large one; the row thumbnail is the small one.
+        let mut drawn: Vec<egui::Rect> = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .collect();
+        drawn.sort_by(|left, right| right.height().total_cmp(&left.height()));
+        assert!(
+            drawn.len() >= 2,
+            "the same cover should be drawn in the row and in the panel"
+        );
+        let featured = drawn[0];
+        let thumbnail = drawn[1];
+        assert!(
+            featured.height() > thumbnail.height() * 2.0,
+            "the featured cover ({featured:?}) is not clearly larger than the row thumbnail ({thumbnail:?})"
+        );
+
+        let title = text_rect(&output, "Featured Game").expect("the title");
+        let mount = text_rect(&output, "Mount").expect("Mount");
+        let cheats = text_rect(&output, "Cheats & Mods").expect("Cheats & Mods");
+        assert!(
+            featured.bottom() <= title.top(),
+            "artwork is not above the title"
+        );
+        assert!(
+            title.bottom() <= mount.top(),
+            "the title is not above Mount"
+        );
+        assert!(
+            mount.bottom() <= cheats.top(),
+            "Mount is not above the secondary actions"
+        );
+    }
+
+    #[test]
+    fn row_thumbnails_survive_the_featured_panel() {
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(1), "102"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let other = cover_texture_id(&app, &featured_path(1)).expect("a loaded cover");
+        let drawn: Vec<egui::Rect> = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == other)
+            .map(|(_, rect)| rect)
+            .collect();
+        assert!(
+            drawn
+                .iter()
+                .any(|rect| rect.height() <= crate::gamer_artwork::COVER_BOX + 0.5),
+            "the small row thumbnail is gone: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn every_secondary_action_is_still_present() {
+        let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        for label in ["Mount", "Cheats & Mods", "Details", "Open location"] {
+            assert!(
+                rendered_text_contains(&output, label),
+                "{label} is missing from the featured panel"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_is_the_first_actionable_widget_in_the_panel() {
+        // Artwork is painted, never allocated as a control, so the first thing a
+        // keyboard reaches inside the panel is Mount - and the order after it is
+        // the reading order.
+        let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let mut order = Vec::new();
+        for label in ["Mount", "Cheats & Mods", "Details", "Open location"] {
+            let rect =
+                text_rect(&output, label).unwrap_or_else(|| panic!("{label} should be rendered"));
+            order.push((label, rect.top(), rect.left()));
+        }
+        assert_eq!(order[0].0, "Mount");
+        assert!(
+            order[0].1 <= order[1].1,
+            "Mount is not above the secondary actions"
+        );
+        for pair in order[1..].windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1 || pair[0].2 <= pair[1].2,
+                "{} comes after {} in the reading order",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    /// Presses Tab `count` times and returns the rect of whatever holds focus.
+    fn tab_to_focused_rect(
+        app: &mut ArchiveFsApp,
+        ctx: &egui::Context,
+        width: f32,
+        height: f32,
+        count: usize,
+    ) -> Vec<egui::Rect> {
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut seen = Vec::new();
+        for _ in 0..count {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+            if let Some(id) = ctx.memory(|memory| memory.focused())
+                && let Some(rect) = ctx.read_response(id).map(|response| response.rect)
+            {
+                seen.push(rect);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn the_featured_artwork_area_is_not_keyboard_focusable() {
+        // The artwork occupies most of the panel's upper half. It is allocated with
+        // `Sense::hover` and painted, so it takes no Tab stop - if it did, it would
+        // sit between the list and Mount for no purpose and a person on a sofa
+        // would press the key an extra time for nothing.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let featured = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .max_by(|left, right| left.height().total_cmp(&right.height()))
+            .expect("the featured cover");
+
+        let focused = tab_to_focused_rect(&mut app, &ctx, 1920.0, 1080.0, 40);
+        assert!(
+            !focused.is_empty(),
+            "nothing in Gamer View took keyboard focus at all"
+        );
+        for rect in &focused {
+            assert!(
+                !featured.contains_rect(*rect),
+                "focus landed inside the featured artwork area: {rect:?} within {featured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_artwork_keeps_the_panel_geometry_exactly() {
+        // The reserved box is the same size whether a cover is loading, absent or
+        // broken, so nothing beneath it moves.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let loading = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title_loading = text_rect(&loading, "Featured Game").expect("the title");
+        let mount_loading = text_rect(&loading, "Mount").expect("Mount");
+
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation,
+                local_path: PathBuf::from(featured_path(0)),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::None(
+                    crate::gamer_artwork::NoCover::NoArtwork,
+                ),
+            },
+        );
+        let absent = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            title_loading,
+            text_rect(&absent, "Featured Game").expect("the title"),
+            "the title moved when the cover turned out not to exist"
+        );
+        assert_eq!(
+            mount_loading,
+            text_rect(&absent, "Mount").expect("Mount"),
+            "Mount moved when the cover turned out not to exist"
+        );
+        assert!(
+            rendered_text_contains(&absent, "No cover available"),
+            "the placeholder does not say why it is a placeholder"
+        );
+    }
+
+    #[test]
+    fn a_failed_cover_keeps_the_panel_geometry_exactly() {
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title = text_rect(&before, "Featured Game").expect("the title");
+        let mount = text_rect(&before, "Mount").expect("Mount");
+
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation,
+                local_path: PathBuf::from(featured_path(0)),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::None(
+                    crate::gamer_artwork::NoCover::Failed,
+                ),
+            },
+        );
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            title,
+            text_rect(&after, "Featured Game").expect("the title")
+        );
+        assert_eq!(mount, text_rect(&after, "Mount").expect("Mount"));
+    }
+
+    #[test]
+    fn a_cover_arriving_does_not_move_the_title_or_the_actions() {
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title = text_rect(&before, "Featured Game").expect("the title");
+        let mount = text_rect(&before, "Mount").expect("Mount");
+
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            title,
+            text_rect(&after, "Featured Game").expect("the title")
+        );
+        assert_eq!(mount, text_rect(&after, "Mount").expect("Mount"));
+    }
+
+    #[test]
+    fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
+        let long = "The Legend of the Extraordinarily Long Aftermarket Title (World) \
+                    (Rev 1) (Unl) (Demo) (Aftermarket) (Pirate) (Alt 3)";
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, long);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let featured = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .max_by(|left, right| left.height().total_cmp(&right.height()))
+            .expect("the featured cover");
+        let mount = text_rect(&output, "Mount").expect("Mount");
+        let title = text_rect(&output, long).expect("the title");
+
+        assert!(
+            title.top() >= featured.bottom() - 0.5,
+            "a long title rode up over the artwork"
+        );
+        assert!(
+            title.bottom() <= mount.top() + 0.5,
+            "a long title ran into Mount"
+        );
+    }
+
+    #[test]
+    fn the_panel_keeps_mount_and_the_actions_on_screen_at_every_supported_size() {
+        for (width, height) in [
+            (1280.0, 720.0),
+            (1366.0, 768.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+        ] {
+            let (_app, _ctx, output) = featured_panel_frame(width, height, "Featured Game");
+            let _ = &output;
+            for label in ["Mount", "Cheats & Mods", "Details"] {
+                let rect = text_rect(&output, label)
+                    .unwrap_or_else(|| panic!("{label} is not rendered at {width}x{height}"));
+                assert!(
+                    rect.bottom() <= height,
+                    "{label} falls below the viewport at {width}x{height}: {rect:?}"
+                );
+                assert!(
+                    rect.right() <= width,
+                    "{label} falls outside the viewport at {width}x{height}: {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_actions_survive_a_feedback_banner_and_a_wrapped_title_at_720p() {
+        // Found in Sunshine at 1280x720: an "Unmounted ..." banner takes a line
+        // above the whole view, and with the cover sized from the *outer* height
+        // the secondary actions dropped below the viewport. The cover has to yield
+        // that space, so it is measured from what is actually left.
+        let long = "Super Mario Bros. + Duck Hunt + World Class Track Meet (USA) (Rev 1)";
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let folder = std::env::temp_dir();
+        let mut records = Vec::new();
+        for index in 0..8 {
+            let path = folder.join(format!("archivefs-featured-g{index:05}.zip"));
+            let mut built = record(&path.display().to_string(), MountState::Pending);
+            built.metadata.platform = Some("SNES".to_string());
+            built.metadata.title = Some(if index == 0 {
+                long.to_string()
+            } else {
+                format!("Game {index:05}")
+            });
+            records.push(built);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.archive_context
+            .select_only(folder.join("archivefs-featured-g00000.zip"));
+        app.feedback = Some(ActionFeedback {
+            succeeded: true,
+            message: "Unmounted /mnt/virtualroms/Acorn Archimedes/ALPS_Support_Disc".to_string(),
+            cleanup: None,
+            warning: None,
+            more_information: None,
+        });
+
+        let ctx = egui::Context::default();
+        // Swept rather than fixed at 720: a real window is its nominal height minus
+        // a title bar, and the banner's own height varies with wrapping, so the
+        // exact value that used to overflow is not a number worth guessing at.
+        for height in [600.0_f32, 640.0, 660.0, 680.0, 696.0, 720.0] {
+            let output = run_frames(&mut app, &ctx, 1280.0, height, 4);
+            for label in ["Mount", "Cheats & Mods", "Details"] {
+                let rect = text_rect(&output, label).unwrap_or_else(|| {
+                    panic!("{label} is not rendered at 1280x{height} with a banner")
+                });
+                assert!(
+                    rect.bottom() <= height,
+                    "{label} fell below the viewport at 1280x{height} with a banner: {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_featured_panel_stays_balanced_at_1920x1080() {
+        // A cover that reads from a sofa, and a panel that is neither a sliver nor
+        // a slab: the artwork occupies a meaningful share of the panel's height.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let featured = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .max_by(|left, right| left.height().total_cmp(&right.height()))
+            .expect("the featured cover");
+        assert!(
+            featured.height() >= 150.0,
+            "the 1080p featured cover is only {} tall",
+            featured.height()
+        );
+        // And it sits in the right-hand panel, not over the list.
+        assert!(
+            featured.left() > 1920.0 * 0.5,
+            "the featured cover is not in the right-hand panel: {featured:?}"
+        );
+    }
+
     #[test]
     fn gamer_view_covers_behave_at_every_supported_resolution() {
         for (width, height) in [
@@ -63482,7 +64191,7 @@ $Instant Growth [Nayr]\n";
             run_frames(&mut app, &ctx, width, height, 3);
             let generation = app.gamer_covers.generation();
             app.gamer_covers
-                .absorb(&ctx, cover_reply(generation, "/roms/g00000.zip", "101"));
+                .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
             let output = run_frames(&mut app, &ctx, width, height, 1);
             assert!(
                 rendered_text_contains(&output, "Game 00000"),
