@@ -3485,10 +3485,10 @@ struct ArchiveFsApp {
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
     cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
-    /// Per-source in-progress priority text, keyed by source ID. Held here
-    /// rather than in the page state because it is unsubmitted UI text, not
-    /// policy: a half-typed "1" on the way to "15" must not be applied.
-    cheat_sources_priority_drafts: std::collections::HashMap<String, String>,
+    /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
+    /// than in the page state because none of it is policy - see
+    /// `CheatSourcesPageUi`.
+    cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi,
     /// The finding whose evidence panel is open, by stable finding id.
     doctor_selected_finding: Option<String>,
     /// The repair awaiting confirmation, if any.
@@ -3742,7 +3742,7 @@ impl ArchiveFsApp {
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
             cheat_sources_page: None,
-            cheat_sources_priority_drafts: std::collections::HashMap::new(),
+            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
@@ -4640,17 +4640,14 @@ impl ArchiveFsApp {
             return;
         };
         let view = page.view();
-        let action = cheat_sources_page::show_cheat_sources_page(
-            ui,
-            &view,
-            &mut self.cheat_sources_priority_drafts,
-        );
+        let action =
+            cheat_sources_page::show_cheat_sources_page(ui, &view, &mut self.cheat_sources_ui);
         if let Some(action) = action {
-            // Reverting throws away in-progress text too: leaving a typed
-            // priority behind after "Discard changes" would show a value that
-            // is no longer anywhere in the state.
+            // Reverting throws away in-progress text and any open picker too:
+            // leaving a typed priority behind after "Discard changes" would
+            // show a value that is no longer anywhere in the state.
             if matches!(action, cheat_sources_page::CheatSourcesPageAction::Revert) {
-                self.cheat_sources_priority_drafts.clear();
+                self.cheat_sources_ui.clear();
             }
             page.apply(action);
         }
@@ -49163,7 +49160,7 @@ $Instant Growth [Nayr]\n";
             // Left unloaded: these tests never open the Cheat Sources page,
             // and loading it here would read the real per-user preferences.
             cheat_sources_page: None,
-            cheat_sources_priority_drafts: std::collections::HashMap::new(),
+            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,

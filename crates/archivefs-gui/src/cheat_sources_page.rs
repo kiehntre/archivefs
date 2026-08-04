@@ -76,11 +76,95 @@ fn provider_kind_label(entry: &CheatSourceEntry) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlatformParticipationView {
     pub(crate) platform: String,
+    /// What the platform is called on screen. Falls back to the identifier
+    /// for a platform this build does not know, which must still display as
+    /// something rather than vanishing.
+    pub(crate) display_name: String,
     pub(crate) participating: bool,
     /// The source is off at source level, so this toggle cannot make it
     /// contribute. Shown inactive with a reason rather than hidden, so the
     /// control does not appear to have been silently ignored.
     pub(crate) overridden_by_source_level: bool,
+    /// This row exists because the user added an exception, not because the
+    /// source declares the platform. Only these can be removed - a declared
+    /// platform is a fact about the source, not a preference.
+    pub(crate) is_exception: bool,
+}
+
+/// A platform the user may add an exception for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlatformChoice {
+    pub(crate) id: &'static str,
+    pub(crate) display_name: &'static str,
+}
+
+/// How many choices the picker shows at once.
+///
+/// The registry is finite (74 today), so this is not protection against an
+/// unbounded list - it is what keeps the picker readable and forces the
+/// search box to be the way you find something, rather than scrolling.
+pub(crate) const MAX_PLATFORM_CHOICES: usize = 12;
+
+/// Canonical platforms a source could still be given an exception for.
+///
+/// Drawn strictly from [`archivefs_core::platform::canonical_ids`] - the
+/// same registry `canonical_platform_for_alias` resolves against - so the
+/// picker can only ever offer a platform the resolver will actually match.
+/// Nothing here is invented, and nothing is enumerated that the registry
+/// does not already define.
+///
+/// `existing` is excluded, which is what makes a duplicate override
+/// unreachable from the GUI: a platform already carrying one for this source
+/// is not offered a second time.
+pub(crate) fn available_platform_choices(existing: &[String], query: &str) -> Vec<PlatformChoice> {
+    let taken: Vec<&str> = existing
+        .iter()
+        .map(|platform| {
+            archivefs_core::canonical_platform_for_alias(platform).unwrap_or(platform.as_str())
+        })
+        .collect();
+    let needle = query.trim().to_lowercase();
+
+    archivefs_core::platform::canonical_ids()
+        .into_iter()
+        .filter(|id| !taken.contains(id))
+        .map(|id| PlatformChoice {
+            id,
+            display_name: archivefs_core::platform::display_name_for(id),
+        })
+        .filter(|choice| {
+            needle.is_empty()
+                || choice.display_name.to_lowercase().contains(&needle)
+                || choice.id.to_lowercase().contains(&needle)
+        })
+        .take(MAX_PLATFORM_CHOICES)
+        .collect()
+}
+
+/// How many canonical platforms match `query` and are not already taken.
+///
+/// Separate from the truncated list so the picker can say "showing 12 of 30"
+/// honestly rather than implying the 12 are all there is.
+pub(crate) fn available_platform_count(existing: &[String], query: &str) -> usize {
+    let taken: Vec<&str> = existing
+        .iter()
+        .map(|platform| {
+            archivefs_core::canonical_platform_for_alias(platform).unwrap_or(platform.as_str())
+        })
+        .collect();
+    let needle = query.trim().to_lowercase();
+
+    archivefs_core::platform::canonical_ids()
+        .into_iter()
+        .filter(|id| !taken.contains(id))
+        .filter(|id| {
+            needle.is_empty()
+                || archivefs_core::platform::display_name_for(id)
+                    .to_lowercase()
+                    .contains(&needle)
+                || id.to_lowercase().contains(&needle)
+        })
+        .count()
 }
 
 /// One source's row.
@@ -100,6 +184,10 @@ pub(crate) struct CheatSourceRowView {
     pub(crate) trust_label: &'static str,
     pub(crate) description: String,
     pub(crate) platforms: Vec<PlatformParticipationView>,
+    /// The source contributes to every platform, so exceptions are the only
+    /// way to narrow it and the picker is offered. A source that declares its
+    /// platforms already shows a toggle for each, and has nothing to add.
+    pub(crate) supports_platform_exceptions: bool,
     /// This row differs from what is on disk.
     pub(crate) changed: bool,
 }
@@ -314,19 +402,21 @@ impl CheatSourcesPageState {
             trust_label: BUILT_IN_INTEGRATION_LABEL,
             description: entry.spec.description.clone(),
             platforms: self.platform_views(entry),
+            supports_platform_exceptions: entry.spec.platforms.is_empty(),
             changed,
         }
     }
 
     /// The platforms a source offers a participation toggle for.
     ///
-    /// A platform-specific source offers its own platforms. A source with no
-    /// platform list contributes everywhere, and enumerating "everywhere"
-    /// would be an unbounded and mostly meaningless list - so it offers a
-    /// toggle only for platforms that already appear in the user's overrides,
-    /// which are exactly the ones they have expressed an opinion about.
+    /// A platform-specific source offers exactly the platforms it declares.
+    /// A source with no platform list contributes everywhere; listing all 74
+    /// canonical platforms as toggles would bury the handful that matter, so
+    /// it lists only the exceptions that exist and offers the picker
+    /// (`supports_platform_exceptions`) to add one.
     fn platform_views(&self, entry: &CheatSourceEntry) -> Vec<PlatformParticipationView> {
-        let mut platforms: Vec<String> = entry.spec.platforms.clone();
+        let declared = &entry.spec.platforms;
+        let mut platforms: Vec<String> = declared.clone();
         for block in self.draft.platform_overrides() {
             let names_this_source = block
                 .disabled_providers
@@ -343,6 +433,8 @@ impl CheatSourcesPageState {
             .map(|platform| {
                 let participation = self.draft.platform_participation(&entry.spec.id, &platform);
                 PlatformParticipationView {
+                    display_name: archivefs_core::platform::display_name_for(&platform).to_string(),
+                    is_exception: !declared.iter().any(|declared| declared == &platform),
                     platform,
                     participating: participation.participating,
                     overridden_by_source_level: participation.overridden_by_source_level,
@@ -427,11 +519,40 @@ fn unresolved_row(entry: &UnresolvedPreference) -> UnresolvedRowView {
 pub(crate) const MIN_PRIORITY: u32 = 1;
 pub(crate) const MAX_PRIORITY: u32 = 999;
 
+/// Unsubmitted UI text and which disclosure is open.
+///
+/// Deliberately not part of [`CheatSourcesPageState`]: none of it is policy.
+/// A half-typed priority on the way from "1" to "15" must not be applied,
+/// and an open picker is not a preference - neither belongs in something
+/// whose difference from disk defines the unsaved-change state.
+#[derive(Default)]
+pub(crate) struct CheatSourcesPageUi {
+    /// In-progress priority text, keyed by source ID.
+    pub(crate) priority_drafts: std::collections::HashMap<String, String>,
+    /// Which source's platform picker is open, if any. At most one, so the
+    /// page never shows two competing searches.
+    pub(crate) open_picker: Option<String>,
+    /// The picker's search text.
+    pub(crate) picker_query: String,
+}
+
+impl CheatSourcesPageUi {
+    /// Forgets every unsubmitted edit.
+    ///
+    /// Called on Discard: leaving typed text behind after "Discard changes"
+    /// would show a value that is no longer anywhere in the state.
+    pub(crate) fn clear(&mut self) {
+        self.priority_drafts.clear();
+        self.open_picker = None;
+        self.picker_query.clear();
+    }
+}
+
 /// Draws the page and returns at most one requested edit.
 pub(crate) fn show_cheat_sources_page(
     ui: &mut egui::Ui,
     view: &CheatSourcesPageView,
-    priority_drafts: &mut std::collections::HashMap<String, String>,
+    ui_state: &mut CheatSourcesPageUi,
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
 
@@ -471,7 +592,7 @@ pub(crate) fn show_cheat_sources_page(
 
     for row in &view.rows {
         if action.is_none()
-            && let Some(row_action) = show_source_row(ui, row, priority_drafts)
+            && let Some(row_action) = show_source_row(ui, row, ui_state)
         {
             action = Some(row_action);
         }
@@ -557,7 +678,7 @@ fn show_save_bar(ui: &mut egui::Ui, view: &CheatSourcesPageView) -> Option<Cheat
 fn show_source_row(
     ui: &mut egui::Ui,
     row: &CheatSourceRowView,
-    priority_drafts: &mut std::collections::HashMap<String, String>,
+    ui_state: &mut CheatSourcesPageUi,
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
@@ -603,7 +724,7 @@ fn show_source_row(
 
         ui.add_space(6.0);
         if action.is_none()
-            && let Some(priority_action) = priority_editor(ui, row, priority_drafts)
+            && let Some(priority_action) = priority_editor(ui, row, &mut ui_state.priority_drafts)
         {
             action = Some(priority_action);
         }
@@ -616,7 +737,7 @@ fn show_source_row(
                     let mut participating = platform.participating;
                     let toggle = ui.add_enabled(
                         !platform.overridden_by_source_level,
-                        egui::Checkbox::new(&mut participating, &platform.platform),
+                        egui::Checkbox::new(&mut participating, &platform.display_name),
                     );
                     if toggle.changed() && action.is_none() {
                         action = Some(CheatSourcesPageAction::SetPlatformParticipation {
@@ -638,10 +759,163 @@ fn show_source_row(
                                 .small(),
                         );
                     }
+                    // Only an exception can be removed. A platform the source
+                    // declares is a fact about the source, not a preference,
+                    // so there is nothing there to take away.
+                    if platform.is_exception
+                        && !platform.participating
+                        && widgets::action_button(
+                            ui,
+                            "Remove exception",
+                            widgets::ActionStyle::Quiet,
+                            true,
+                        )
+                        .clicked()
+                        && action.is_none()
+                    {
+                        action = Some(CheatSourcesPageAction::SetPlatformParticipation {
+                            id: row.id.clone(),
+                            platform: platform.platform.clone(),
+                            participating: true,
+                        });
+                    }
                 });
             }
         }
+
+        if row.supports_platform_exceptions
+            && action.is_none()
+            && let Some(picker_action) = platform_exception_picker(ui, row, ui_state)
+        {
+            action = Some(picker_action);
+        }
     });
+    action
+}
+
+/// Lets a source that applies everywhere be excepted from one platform.
+///
+/// # Why a search box and not a list of toggles
+///
+/// A cross-platform source contributes to all 74 canonical platforms. Drawing
+/// 74 checkboxes per source would bury the one or two a user actually cares
+/// about, and drawing none - what this page did before - left no way to
+/// create the first exception at all, so the feature was reachable only by
+/// hand-editing the file.
+///
+/// Every candidate comes from the canonical registry
+/// ([`available_platform_choices`]), so the picker cannot offer a platform
+/// the resolver would not match, and platforms already carrying an exception
+/// for this source are excluded, which is what makes a duplicate unreachable.
+fn platform_exception_picker(
+    ui: &mut egui::Ui,
+    row: &CheatSourceRowView,
+    ui_state: &mut CheatSourcesPageUi,
+) -> Option<CheatSourcesPageAction> {
+    let mut action = None;
+    let is_open = ui_state.open_picker.as_deref() == Some(row.id.as_str());
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let label = if is_open {
+            "Cancel"
+        } else {
+            "Don't use for a platform…"
+        };
+        if widgets::action_button(ui, label, widgets::ActionStyle::Secondary, true).clicked() {
+            if is_open {
+                ui_state.open_picker = None;
+            } else {
+                ui_state.open_picker = Some(row.id.clone());
+            }
+            ui_state.picker_query.clear();
+        }
+        ui.label(
+            egui::RichText::new("This source is used for every platform unless excepted.")
+                .color(theme::muted(ui))
+                .small(),
+        );
+    });
+
+    if !is_open {
+        return action;
+    }
+
+    let existing: Vec<String> = row
+        .platforms
+        .iter()
+        .map(|platform| platform.platform.clone())
+        .collect();
+
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Find a platform:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.picker_query)
+                    .hint_text("e.g. PlayStation 2")
+                    .desired_width(220.0),
+            );
+        });
+
+        let choices = available_platform_choices(&existing, &ui_state.picker_query);
+        let total = available_platform_count(&existing, &ui_state.picker_query);
+
+        if choices.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No platform matches. Platforms this source is already excepted from are not \
+                     offered again.",
+                )
+                .color(theme::muted(ui)),
+            );
+            return;
+        }
+
+        for choice in &choices {
+            ui.horizontal(|ui| {
+                // Stated per row, because the whole point of the control is
+                // to change it and the user should not have to infer it.
+                ui.label(
+                    egui::RichText::new("Currently used")
+                        .color(widgets::StatusTone::Success.color(ui))
+                        .small(),
+                );
+                if widgets::action_button(
+                    ui,
+                    format!("Stop using for {}", choice.display_name),
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(CheatSourcesPageAction::SetPlatformParticipation {
+                        id: row.id.clone(),
+                        platform: choice.id.to_string(),
+                        participating: false,
+                    });
+                }
+            });
+        }
+
+        if total > choices.len() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Showing {} of {total} matches. Type to narrow the search.",
+                    choices.len()
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
+    });
+
+    // Close the picker once it has done its job, so the page returns to the
+    // list showing the exception that was just added.
+    if action.is_some() {
+        ui_state.open_picker = None;
+        ui_state.picker_query.clear();
+    }
     action
 }
 

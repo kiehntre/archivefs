@@ -16,7 +16,6 @@ use super::*;
 use archivefs_core::patch_manager::{
     CheatSourcesConfig, PlatformOverrideEntry, ProviderConfigEntry, ProviderPriorityOverride,
 };
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -489,6 +488,516 @@ fn participation_survives_a_save_and_reload() {
     assert!(!row.platforms[0].participating);
 }
 
+// --- Platform exceptions for cross-platform sources ----------------------
+//
+// A source with no declared platforms applies everywhere. Before this, the
+// page showed platform toggles only for platforms already named in the file,
+// so the *first* exception could not be created from the GUI at all - the
+// feature existed but was reachable only by hand-editing the TOML.
+
+#[test]
+fn a_cross_platform_source_offers_the_picker_and_a_specific_one_does_not() {
+    let view = fresh("picker-offered").view();
+
+    let cross = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    assert!(
+        cross.supports_platform_exceptions,
+        "a source with no declared platforms needs a way to create the first exception"
+    );
+    assert!(
+        cross.platforms.is_empty(),
+        "with no exceptions yet there is nothing to list"
+    );
+
+    let specific = view.rows.iter().find(|r| r.id == PS2_SOURCE).unwrap();
+    assert!(
+        !specific.supports_platform_exceptions,
+        "a source that declares its platforms already shows a toggle for each"
+    );
+}
+
+#[test]
+fn the_picker_offers_only_canonical_platforms() {
+    let choices = available_platform_choices(&[], "");
+    assert!(!choices.is_empty());
+
+    let canonical = archivefs_core::platform::canonical_ids();
+    for choice in &choices {
+        assert!(
+            canonical.contains(&choice.id),
+            "{} is not in the canonical registry - nothing may be invented",
+            choice.id
+        );
+        assert!(
+            archivefs_core::canonical_platform_for_alias(choice.id).is_some(),
+            "{} must resolve, or an override built from it could never match",
+            choice.id
+        );
+    }
+}
+
+#[test]
+fn the_picker_is_bounded_and_reports_what_it_truncated() {
+    let all = available_platform_choices(&[], "");
+    assert!(
+        all.len() <= MAX_PLATFORM_CHOICES,
+        "the list shown must stay bounded, got {}",
+        all.len()
+    );
+    assert!(
+        available_platform_count(&[], "") > all.len(),
+        "the registry has more platforms than the picker shows, so the count must differ \
+         and the UI can say 'showing N of M'"
+    );
+}
+
+#[test]
+fn the_picker_searches_by_display_name_and_by_id() {
+    let by_name = available_platform_choices(&[], "PlayStation");
+    assert!(
+        !by_name.is_empty(),
+        "a search for a real platform family must match something"
+    );
+    for choice in &by_name {
+        assert!(
+            choice.display_name.to_lowercase().contains("playstation")
+                || choice.id.to_lowercase().contains("playstation"),
+            "{choice:?} does not match the query"
+        );
+    }
+
+    assert!(
+        available_platform_choices(&[], "PS2")
+            .iter()
+            .any(|c| c.id == "PS2"),
+        "searching the canonical id must find it"
+    );
+    assert!(
+        available_platform_choices(&[], "zzzz-no-such-platform").is_empty(),
+        "an unmatched query must offer nothing rather than falling back to everything"
+    );
+}
+
+#[test]
+fn creating_the_first_exception_from_the_picker_works() {
+    let mut state = fresh("first-exception");
+    // No exception recorded yet for the cross-platform source. (Sources that
+    // declare platforms legitimately list those; they are not exceptions.)
+    assert!(
+        state
+            .view()
+            .rows
+            .iter()
+            .find(|r| r.id == KNOWN_ID)
+            .unwrap()
+            .platforms
+            .is_empty()
+    );
+
+    let choice = available_platform_choices(&[], "PS2")
+        .into_iter()
+        .find(|c| c.id == "PS2")
+        .expect("PS2 is canonical");
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: choice.id.to_string(),
+        participating: false,
+    });
+
+    let view = state.view();
+    let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    assert_eq!(row.platforms.len(), 1);
+    assert_eq!(row.platforms[0].platform, "PS2");
+    assert!(!row.platforms[0].participating);
+    assert!(
+        row.platforms[0].is_exception,
+        "a platform the source does not declare is an exception, and removable"
+    );
+    assert!(
+        row.enabled,
+        "an exception must not disable the source everywhere"
+    );
+    assert!(view.dirty);
+}
+
+#[test]
+fn a_platform_already_excepted_is_not_offered_again() {
+    let mut state = fresh("no-duplicates");
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+
+    let view = state.view();
+    let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    let existing: Vec<String> = row.platforms.iter().map(|p| p.platform.clone()).collect();
+
+    assert!(
+        !available_platform_choices(&existing, "")
+            .iter()
+            .any(|c| c.id == "PS2"),
+        "an existing exception must be excluded from the picker"
+    );
+    assert!(
+        !available_platform_choices(&existing, "PS2")
+            .iter()
+            .any(|c| c.id == "PS2"),
+        "searching for it explicitly must not resurrect it either"
+    );
+}
+
+#[test]
+fn applying_the_same_exception_twice_records_it_once() {
+    // Belt and braces: the picker excludes it, and the state layer refuses to
+    // double it even if something else asked.
+    let mut state = fresh("idempotent-exception");
+    for _ in 0..3 {
+        state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+            id: KNOWN_ID.to_string(),
+            platform: "PS2".to_string(),
+            participating: false,
+        });
+    }
+    let view = state.view();
+    let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    assert_eq!(row.platforms.len(), 1, "got {:?}", row.platforms);
+}
+
+#[test]
+fn an_alias_cannot_create_a_second_exception_for_one_platform() {
+    let mut state = fresh("alias-no-duplicate");
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    let existing = vec!["PS2".to_string()];
+    // Every canonical id the picker could still offer must resolve to
+    // something other than the one already taken.
+    for choice in available_platform_choices(&existing, "") {
+        assert_ne!(
+            archivefs_core::canonical_platform_for_alias(choice.id),
+            Some("PS2"),
+            "{} canonicalises onto an exception that already exists",
+            choice.id
+        );
+    }
+}
+
+#[test]
+fn removing_an_exception_restores_participation_and_leaves_no_residue() {
+    let path = config_path("remove-exception");
+    let mut state = CheatSourcesPageState::load(path.clone());
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: true,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    let view = state.view();
+    let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    assert!(
+        row.platforms.is_empty(),
+        "removing the exception must take the row away, not leave a checked stub"
+    );
+
+    let on_disk = load_cheat_sources_config_from(&path).unwrap();
+    assert!(
+        on_disk.platform_overrides.is_none(),
+        "an emptied block must not linger in the file: {on_disk:?}"
+    );
+}
+
+#[test]
+fn an_exception_survives_save_and_reload() {
+    let path = config_path("exception-persist");
+    let mut state = CheatSourcesPageState::load(path.clone());
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "GameCube".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+    assert_eq!(state.view().save_state, SaveState::Saved);
+
+    let reloaded = CheatSourcesPageState::load(path);
+    let view = reloaded.view();
+    let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    assert_eq!(row.platforms.len(), 1);
+    assert_eq!(row.platforms[0].platform, "GameCube");
+    assert!(!row.platforms[0].participating);
+    assert!(!reloaded.is_dirty());
+}
+
+#[test]
+fn an_unsaved_exception_never_reaches_disk() {
+    let path = config_path("exception-not-saved");
+    let mut state = CheatSourcesPageState::load(path.clone());
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    assert!(state.is_dirty());
+    assert!(!path.exists(), "only Save may write");
+}
+
+#[test]
+fn discarding_removes_an_unsaved_exception() {
+    let mut state = fresh("exception-discard");
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Revert);
+
+    let view = state.view();
+    assert!(!view.dirty);
+    assert!(
+        view.rows
+            .iter()
+            .find(|r| r.id == KNOWN_ID)
+            .unwrap()
+            .platforms
+            .is_empty(),
+        "discard must return to the original state"
+    );
+}
+
+#[test]
+fn discarding_returns_to_a_saved_exception_not_to_none() {
+    let path = config_path("exception-discard-after-save");
+    let mut state = CheatSourcesPageState::load(path);
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "Wii".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Revert);
+
+    let view = state.view();
+    let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
+    assert_eq!(
+        row.platforms.len(),
+        1,
+        "discard must keep the saved exception and drop only the unsaved one"
+    );
+    assert_eq!(row.platforms[0].platform, "PS2");
+}
+
+#[test]
+fn the_consequence_of_an_exception_is_stated_before_saving() {
+    let mut state = fresh("exception-consequence");
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+
+    let joined = state.view().pending_consequences.join(" ");
+    assert!(
+        joined.contains("will not be used for PS2"),
+        "the affected platform must be named: {joined}"
+    );
+    assert!(
+        joined.contains("stays enabled elsewhere"),
+        "the difference from a full disable must be stated: {joined}"
+    );
+}
+
+#[test]
+fn adding_an_exception_preserves_unknown_entries() {
+    let path = config_path("exception-preserves-unknown");
+    let original = CheatSourcesConfig {
+        providers: Some(vec![ProviderConfigEntry {
+            id: UNKNOWN_ID.to_string(),
+            enabled: Some(false),
+            priority: Some(42),
+        }]),
+        platform_overrides: Some(vec![PlatformOverrideEntry {
+            platform: "SomePlatformThisBuildLacks".to_string(),
+            disabled_providers: Some(vec!["whoever".to_string()]),
+            priority_overrides: Some(vec![ProviderPriorityOverride {
+                id: "whoever".to_string(),
+                priority: 4,
+            }]),
+        }]),
+    };
+    write_config(&path, &original);
+
+    let mut state = CheatSourcesPageState::load(path.clone());
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    let after = load_cheat_sources_config_from(&path).unwrap();
+    let kept = after
+        .providers
+        .expect("providers")
+        .into_iter()
+        .find(|p| p.id == UNKNOWN_ID)
+        .expect("the unknown provider must survive adding an exception");
+    assert_eq!(kept.priority, Some(42));
+
+    let blocks = after.platform_overrides.expect("overrides");
+    assert!(
+        blocks.contains(&original.platform_overrides.unwrap()[0]),
+        "the unresolvable block must be re-emitted verbatim: {blocks:?}"
+    );
+    assert!(
+        blocks.iter().any(|b| b.platform == "PS2"),
+        "and the new exception must be there too"
+    );
+}
+
+#[test]
+fn an_exception_does_not_change_priority_order() {
+    let mut state = fresh("exception-keeps-order");
+    let before: Vec<(String, u32)> = state
+        .view()
+        .rows
+        .iter()
+        .map(|r| (r.id.clone(), r.priority))
+        .collect();
+
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+
+    let after: Vec<(String, u32)> = state
+        .view()
+        .rows
+        .iter()
+        .map(|r| (r.id.clone(), r.priority))
+        .collect();
+    assert_eq!(
+        before, after,
+        "a platform exception must not touch priorities or their order"
+    );
+}
+
+#[test]
+fn the_picker_writes_no_new_config_keys() {
+    // The Milestone 1 floor: this flow uses `disabled_providers`, which has
+    // always existed. It must not introduce a field.
+    let path = config_path("exception-no-new-keys");
+    let mut state = CheatSourcesPageState::load(path.clone());
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    state.apply(CheatSourcesPageAction::Save);
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("disabled_providers"));
+    assert!(!text.contains("format_version"));
+    for forbidden in ["exceptions", "participation", "trust_level", "platforms ="] {
+        assert!(
+            !text.contains(forbidden),
+            "unexpected key {forbidden:?} in:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn the_rendered_picker_lists_platforms_and_says_they_are_currently_used() {
+    let state = fresh("render-picker");
+    let view = state.view();
+    let mut ui_state = CheatSourcesPageUi {
+        open_picker: Some(KNOWN_ID.to_string()),
+        picker_query: "PlayStation".to_string(),
+        ..CheatSourcesPageUi::default()
+    };
+    let output = render_with(&view, &mut ui_state);
+
+    assert!(
+        rendered_text_contains(&output, "Find a platform:"),
+        "the search box must be drawn when the picker is open"
+    );
+    assert!(
+        rendered_text_contains(&output, "Currently used"),
+        "participation on the offered platform must be stated, not inferred"
+    );
+    assert!(
+        rendered_text_contains(&output, "Stop using for"),
+        "the action must say what it does"
+    );
+}
+
+#[test]
+fn the_picker_is_closed_by_default_and_offers_an_opener() {
+    let view = fresh("render-picker-closed").view();
+    let output = render(&view);
+
+    assert!(
+        rendered_text_contains(&output, "Don't use for a platform…"),
+        "there must be a visible way to create the first exception"
+    );
+    assert!(
+        !rendered_text_contains(&output, "Find a platform:"),
+        "the search box must stay closed until asked for"
+    );
+}
+
+#[test]
+fn the_rendered_exception_row_offers_removal() {
+    let mut state = fresh("render-exception-row");
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+    let output = render(&state.view());
+
+    assert!(rendered_text_contains(
+        &output,
+        "not used for this platform"
+    ));
+    assert!(
+        rendered_text_contains(&output, "Remove exception"),
+        "an exception the user added must be removable from the page"
+    );
+}
+
+#[test]
+fn discarding_clears_unsubmitted_picker_state() {
+    let mut ui_state = CheatSourcesPageUi {
+        open_picker: Some(KNOWN_ID.to_string()),
+        picker_query: "half typed".to_string(),
+        ..CheatSourcesPageUi::default()
+    };
+    ui_state.priority_drafts.insert("x".into(), "12".into());
+
+    ui_state.clear();
+
+    assert!(ui_state.open_picker.is_none());
+    assert!(ui_state.picker_query.is_empty());
+    assert!(ui_state.priority_drafts.is_empty());
+}
+
 // --- Unresolved entries ---------------------------------------------------
 
 #[test]
@@ -618,11 +1127,15 @@ fn an_unreadable_file_is_reported_and_never_overwritten() {
 
 /// Draws the page headlessly, the way the RomM card's tests do.
 fn render(view: &CheatSourcesPageView) -> egui::FullOutput {
-    let mut drafts: HashMap<String, String> = HashMap::new();
+    render_with(view, &mut CheatSourcesPageUi::default())
+}
+
+/// Draws with explicit UI state, for the picker's open/closed cases.
+fn render_with(view: &CheatSourcesPageView, ui_state: &mut CheatSourcesPageUi) -> egui::FullOutput {
     let context = egui::Context::default();
     context.run(egui::RawInput::default(), |context| {
         egui::CentralPanel::default().show(context, |ui| {
-            let _ = show_cheat_sources_page(ui, view, &mut drafts);
+            let _ = show_cheat_sources_page(ui, view, ui_state);
         });
     })
 }
