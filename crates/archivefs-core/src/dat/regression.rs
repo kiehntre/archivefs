@@ -764,3 +764,35 @@ fn duplicate_attribute_names_do_not_corrupt_the_parsed_rom() {
         }
     }
 }
+
+#[test]
+fn an_attribute_that_is_not_valid_utf8_is_reported_not_silently_replaced() {
+    // Decoding lossily before unescaping would swap the bad bytes for U+FFFD and
+    // then unescape cleanly, so a corrupted identifier reached the catalogue with
+    // nothing to notice. Text nodes already warned; attributes must too.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.dat");
+    let mut bytes = br#"<datafile><game name="G"><rom name="bad"#.to_vec();
+    bytes.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 inside the ROM name
+    bytes.extend_from_slice(br#".bin" size="1" crc="aabbccdd"/></game></datafile>"#);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let out = parse_logiqx(&path, DatLimits::default()).expect("parsed");
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.to_string().contains("not valid UTF-8")),
+        "invalid UTF-8 in an attribute must be reported, got {:?}",
+        out.warnings
+    );
+    // Still parsed, still usable - the point is that the loss is visible.
+    assert_eq!(out.dat.games[0].roms.len(), 1);
+}
+
+#[test]
+fn a_valid_utf8_attribute_produces_no_encoding_warning() {
+    let xml = r#"<datafile><game name="Café"><rom name="café.bin" size="1" crc="aabbccdd"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    assert_eq!(out.dat.games[0].name, "Café");
+    assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+}

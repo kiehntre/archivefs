@@ -636,7 +636,27 @@ fn attr_str_opt(
     // As for text nodes: decode, then resolve entities. `normalized_value` would
     // also apply XML attribute-value whitespace normalisation, turning a tab or a
     // newline inside a name into a space.
-    let raw = String::from_utf8_lossy(&attr.value);
+    //
+    // The decode is checked rather than lossy. Replacing invalid bytes with U+FFFD
+    // and carrying on would corrupt an identifier without a word - and because the
+    // replacement happens before unescaping, the unescape then succeeds and there
+    // is nothing left to notice. The old `unescape_value` failed on such input and
+    // warned; that is preserved here, and it matches how text nodes are handled.
+    let raw = match std::str::from_utf8(&attr.value) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(error) => {
+            record_warning(
+                warnings,
+                max_warnings,
+                format!(
+                    "attribute {} is not valid UTF-8 and was read with replacement \
+                     characters: {error}",
+                    String::from_utf8_lossy(attr_name)
+                ),
+            );
+            String::from_utf8_lossy(&attr.value)
+        }
+    };
     let value = match unescape(&raw) {
         Ok(decoded) => decoded.into_owned(),
         Err(error) => {
