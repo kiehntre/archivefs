@@ -1,9 +1,23 @@
 //! Regression tests for defects found reviewing `feature/dat-audit-stage1`.
 //!
-//! Every test here was written first against the unfixed branch, where it
-//! demonstrated the defect; each now asserts the corrected behaviour. The two
-//! entity-attack cases are the exception - they passed before the review as
-//! well, and exist to keep proving that no entity is ever expanded.
+//! Most tests here were written first against the unfixed branch, where they
+//! demonstrated a defect, and now assert the corrected behaviour. Run against
+//! `ffa66fc` they fail - three of them by refusing to compile, because the fix
+//! added an enum variant and a summary field the old code does not have.
+//!
+//! Eight are deliberately not like that, and pass on both revisions:
+//!
+//! * `billion_laughs_is_neutralised` and `external_entity_reference_reads_no_file`
+//!   record a property the branch already had. `quick-xml` performs no DTD
+//!   processing, so nothing is ever expanded; these exist so that stays true.
+//! * `a_complete_document_is_not_reported_as_truncated`,
+//!   `a_genuinely_absent_file_is_still_not_in_dat`,
+//!   `a_filename_match_is_still_reported_when_there_is_no_hash_at_all`,
+//!   `a_crc32_present_but_size_disagreeing_is_ambiguous`,
+//!   `a_cryptographic_collision_is_still_reported_as_confident` and
+//!   `a_well_formed_checksum_produces_no_warning` guard the behaviour the fixes
+//!   had to *preserve* - each names a case adjacent to something that changed,
+//!   and would have caught the fix going too far.
 
 #![cfg(test)]
 
@@ -485,4 +499,199 @@ fn the_default_rom_ceiling_clears_a_mame_sized_machine() {
             "the backstop must not be the thing that rejects a real catalogue"
         )
     };
+}
+
+#[test]
+fn an_unresolvable_entity_is_reported_the_same_way_in_an_attribute_as_in_text() {
+    // The same content must produce the same report whichever syntactic position
+    // it arrives in. Attributes used to fall back to the raw text silently while
+    // text nodes warned, so whether a malformed DAT was flagged depended on where
+    // the author happened to put the string.
+    let attribute = r#"<datafile><game name="A &myent; B"><rom name="a.bin" size="1" crc="aabbccdd"/></game></datafile>"#;
+    let from_attribute = parse(attribute).expect("parsed");
+    assert_eq!(from_attribute.dat.games[0].name, "A &myent; B");
+    assert!(
+        from_attribute
+            .warnings
+            .iter()
+            .any(|w| w.to_string().contains("unresolvable entity")),
+        "an attribute's unresolvable entity must be reported, got {:?}",
+        from_attribute.warnings
+    );
+
+    let text = r#"<datafile><header><name>A &myent; B</name></header><game name="G"><rom name="a.bin" size="1" crc="aabbccdd"/></game></datafile>"#;
+    let from_text = parse(text).expect("parsed");
+    assert!(
+        from_text
+            .warnings
+            .iter()
+            .any(|w| w.to_string().contains("unresolvable entity"))
+    );
+}
+
+#[test]
+fn a_well_formed_dat_produces_no_entity_warnings_at_all() {
+    // The counterpart: warning behaviour must be deterministic in both
+    // directions, so ordinary escaped content stays silent.
+    let xml = r#"<datafile><header><name>Tom &amp; Jerry</name></header><game name="Tom &amp; Jerry"><rom name="tom &amp; jerry.bin" size="1" crc="aabbccdd"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    assert_eq!(out.dat.games[0].name, "Tom & Jerry");
+    assert_eq!(out.dat.source.name.as_deref(), Some("Tom & Jerry"));
+    assert!(
+        out.warnings.is_empty(),
+        "a well-formed DAT must warn about nothing, got {:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn a_malformed_checksum_in_the_dat_is_reported_not_silently_dropped() {
+    // `dat validate` reports hash coverage. A typo'd checksum used to reduce that
+    // coverage with no explanation, so a broken DAT and a sparse one looked alike.
+    let xml = r#"<datafile><game name="A"><rom name="a.bin" size="1" crc="NOTHEX!!" md5="tooshort"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    assert_eq!(out.dat.games[0].roms[0].crc32, None);
+    assert_eq!(out.dat.games[0].roms[0].md5, None);
+    let text = out
+        .warnings
+        .iter()
+        .map(|w| w.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        text.contains("crc") && text.contains("md5"),
+        "both malformed checksums should be reported, got {text}"
+    );
+}
+
+#[test]
+fn a_well_formed_checksum_produces_no_warning() {
+    let xml = r#"<datafile><game name="A"><rom name="a.bin" size="1" crc="AABBCCDD" md5="d41d8cd98f00b204e9800998ecf8427e"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    assert_eq!(out.dat.games[0].roms[0].crc32.as_deref(), Some("aabbccdd"));
+    assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+}
+
+/// Exhaustive check of the one rule that stops a name collision being dressed up
+/// as evidence: once any hash has actually been compared, the filename fallback
+/// is unreachable whatever the outcome.
+#[test]
+fn the_filename_fallback_is_unreachable_after_any_real_hash_comparison() {
+    let index = no_intro_index();
+
+    // Every combination of "holds a well-formed hash", against a DAT that holds
+    // an entry whose ROM name is the same as this file's.
+    let hashes: [(&str, &str); 4] = [
+        (
+            "sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        ("sha1", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        ("md5", "11111111111111111111111111111111"),
+        ("crc32", "11111111"),
+    ];
+    for mask in 1..16u8 {
+        let mut known = KnownFileEvidence::new("a/super.bin", "super.bin");
+        for (bit, (kind, value)) in hashes.iter().enumerate() {
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            known = match *kind {
+                "sha256" => known.with_sha256(*value),
+                "sha1" => known.with_sha1(*value),
+                "md5" => known.with_md5(*value),
+                _ => known.with_crc32(*value),
+            };
+        }
+        // With and without a size, since size only qualifies the CRC32 path.
+        for sized in [false, true] {
+            let candidate = if sized {
+                known.clone().with_size(4096)
+            } else {
+                known.clone()
+            };
+            let report = audit_files(&[candidate], &index);
+            assert!(
+                !matches!(report.entries[0].verdict, AuditVerdict::FilenameOnly { .. }),
+                "mask {mask} sized={sized} fell back to the filename: {:?}",
+                report.entries[0].verdict
+            );
+        }
+    }
+}
+
+#[test]
+fn probable_multiple_candidates_serialises_under_its_own_name() {
+    let index = DatIndex::build(&dat_with(vec![
+        ("Game 0", rom("r0.bin", Some("abcdef01"), None, Some(4096))),
+        ("Game 1", rom("r1.bin", Some("abcdef01"), None, Some(4096))),
+    ]));
+    let known = KnownFileEvidence::new("a/x.bin", "x.bin")
+        .with_crc32("abcdef01")
+        .with_size(4096);
+    let report = audit_files(&[known], &index);
+    let json = serde_json::to_string(&report).expect("serialises");
+    assert!(
+        json.contains("probable_multiple_candidates"),
+        "the weak-evidence verdict must be distinguishable in JSON: {json}"
+    );
+    assert!(
+        !json.contains("exact_multiple_candidates"),
+        "it must not be reported as an exact match: {json}"
+    );
+}
+
+#[test]
+fn exactly_one_warning_for_one_unresolvable_entity_in_an_attribute() {
+    let xml = r#"<datafile><game name="A &myent; B"><rom name="a.bin" size="1" crc="aabbccdd"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    let entity_warnings = out
+        .warnings
+        .iter()
+        .filter(|w| w.to_string().contains("unresolvable entity"))
+        .count();
+    assert_eq!(
+        entity_warnings, 1,
+        "one bad entity in one attribute must produce exactly one warning, got {entity_warnings}"
+    );
+}
+
+#[test]
+fn an_unresolvable_entity_in_one_attribute_does_not_affect_others() {
+    // The game name carries an unresolvable entity; the ROM's name and CRC are
+    // ordinary. The fallback keeps the game name's raw text and the warning
+    // reports only that one failure. The ROM's attributes must parse normally.
+    let xml = r#"<datafile><game name="A &myent; B"><rom name="ok.bin" size="4096" crc="AABBCCDD" md5="d41d8cd98f00b204e9800998ecf8427e"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    assert_eq!(out.dat.games[0].name, "A &myent; B");
+    let rom = &out.dat.games[0].roms[0];
+    assert_eq!(rom.name, "ok.bin");
+    assert_eq!(rom.size_bytes, Some(4096));
+    assert_eq!(rom.crc32.as_deref(), Some("aabbccdd"));
+    assert_eq!(rom.md5.as_deref(), Some("d41d8cd98f00b204e9800998ecf8427e"));
+    let entity_warnings = out
+        .warnings
+        .iter()
+        .filter(|w| w.to_string().contains("unresolvable entity"))
+        .count();
+    assert_eq!(
+        entity_warnings, 1,
+        "only the game name's attribute had a bad entity, got {entity_warnings}"
+    );
+}
+
+#[test]
+fn json_output_is_deterministic_across_repeated_parses() {
+    let xml = r#"<datafile><header><name>Deterministic Test</name></header><game name="Tom &amp; Jerry"><rom name="t.bin" size="4096" crc="aabbccdd" md5="d41d8cd98f00b204e9800998ecf8427e"/></game></datafile>"#;
+    let (_d, p) = write(xml);
+    let limits = DatLimits::default();
+    let first = parse_logiqx(&p, limits).unwrap();
+    let limits2 = DatLimits::default();
+    let second = parse_logiqx(&p, limits2).unwrap();
+    let json1 = serde_json::to_string_pretty(&first.dat).unwrap();
+    let json2 = serde_json::to_string_pretty(&second.dat).unwrap();
+    assert_eq!(
+        json1, json2,
+        "repeated parses of the same DAT must produce byte-identical JSON"
+    );
 }

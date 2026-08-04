@@ -131,8 +131,13 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 limit: limits.max_entries,
                             });
                         }
-                        current_game_name =
-                            attr_str_checked(start_bytes, b"name", limits.max_identifier_length)?;
+                        current_game_name = attr_str_checked(
+                            start_bytes,
+                            b"name",
+                            limits.max_identifier_length,
+                            &mut warnings,
+                            limits.max_warnings,
+                        )?;
                         current_game_desc = None;
                         current_roms = Vec::new();
                     }
@@ -146,20 +151,57 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 limit: limits.max_roms_per_entry,
                             });
                         }
-                        current_rom_name =
-                            attr_str_checked(start_bytes, b"name", limits.max_identifier_length)?;
-                        current_rom_size = attr_u64(start_bytes, b"size")?;
-                        current_rom_crc =
-                            attr_str_opt(start_bytes, b"crc").and_then(|v| normalise_crc32(&v));
-                        current_rom_md5 =
-                            attr_str_opt(start_bytes, b"md5").and_then(|v| normalise_md5(&v));
-                        current_rom_sha1 =
-                            attr_str_opt(start_bytes, b"sha1").and_then(|v| normalise_sha1(&v));
-                        current_rom_sha256 =
-                            attr_str_opt(start_bytes, b"sha256").and_then(|v| normalise_sha256(&v));
-                        current_rom_status = attr_str_opt(start_bytes, b"status");
-                        current_rom_merge = attr_str_opt(start_bytes, b"merge");
-                        current_rom_date = attr_str_opt(start_bytes, b"date");
+                        current_rom_name = attr_str_checked(
+                            start_bytes,
+                            b"name",
+                            limits.max_identifier_length,
+                            &mut warnings,
+                            limits.max_warnings,
+                        )?;
+                        current_rom_size =
+                            attr_u64(start_bytes, b"size", &mut warnings, limits.max_warnings)?;
+                        current_rom_crc = checksum_attr(
+                            start_bytes,
+                            b"crc",
+                            normalise_crc32,
+                            "a rom element",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_rom_md5 = checksum_attr(
+                            start_bytes,
+                            b"md5",
+                            normalise_md5,
+                            "a rom element",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_rom_sha1 = checksum_attr(
+                            start_bytes,
+                            b"sha1",
+                            normalise_sha1,
+                            "a rom element",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_rom_sha256 = checksum_attr(
+                            start_bytes,
+                            b"sha256",
+                            normalise_sha256,
+                            "a rom element",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_rom_status = attr_str_opt(
+                            start_bytes,
+                            b"status",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_rom_merge =
+                            attr_str_opt(start_bytes, b"merge", &mut warnings, limits.max_warnings);
+                        current_rom_date =
+                            attr_str_opt(start_bytes, b"date", &mut warnings, limits.max_warnings);
                     }
                     _ => {}
                 }
@@ -277,8 +319,13 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             limit: limits.max_roms_per_entry,
                         });
                     }
-                    let rom_name =
-                        attr_str_checked(empty_bytes, b"name", limits.max_identifier_length)?;
+                    let rom_name = attr_str_checked(
+                        empty_bytes,
+                        b"name",
+                        limits.max_identifier_length,
+                        &mut warnings,
+                        limits.max_warnings,
+                    )?;
                     let rom_name = match rom_name {
                         Some(n) => n,
                         None => {
@@ -292,15 +339,45 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             continue;
                         }
                     };
-                    let size = attr_u64(empty_bytes, b"size")?;
-                    let crc = attr_str_opt(empty_bytes, b"crc").and_then(|v| normalise_crc32(&v));
-                    let md5 = attr_str_opt(empty_bytes, b"md5").and_then(|v| normalise_md5(&v));
-                    let sha1 = attr_str_opt(empty_bytes, b"sha1").and_then(|v| normalise_sha1(&v));
-                    let sha256 =
-                        attr_str_opt(empty_bytes, b"sha256").and_then(|v| normalise_sha256(&v));
-                    let status = attr_str_opt(empty_bytes, b"status");
-                    let merge = attr_str_opt(empty_bytes, b"merge");
-                    let date = attr_str_opt(empty_bytes, b"date");
+                    let size = attr_u64(empty_bytes, b"size", &mut warnings, limits.max_warnings)?;
+                    let crc = checksum_attr(
+                        empty_bytes,
+                        b"crc",
+                        normalise_crc32,
+                        "a rom element",
+                        &mut warnings,
+                        limits.max_warnings,
+                    );
+                    let md5 = checksum_attr(
+                        empty_bytes,
+                        b"md5",
+                        normalise_md5,
+                        "a rom element",
+                        &mut warnings,
+                        limits.max_warnings,
+                    );
+                    let sha1 = checksum_attr(
+                        empty_bytes,
+                        b"sha1",
+                        normalise_sha1,
+                        "a rom element",
+                        &mut warnings,
+                        limits.max_warnings,
+                    );
+                    let sha256 = checksum_attr(
+                        empty_bytes,
+                        b"sha256",
+                        normalise_sha256,
+                        "a rom element",
+                        &mut warnings,
+                        limits.max_warnings,
+                    );
+                    let status =
+                        attr_str_opt(empty_bytes, b"status", &mut warnings, limits.max_warnings);
+                    let merge =
+                        attr_str_opt(empty_bytes, b"merge", &mut warnings, limits.max_warnings);
+                    let date =
+                        attr_str_opt(empty_bytes, b"date", &mut warnings, limits.max_warnings);
 
                     current_roms.push(DatRomEntry {
                         name: rom_name,
@@ -400,6 +477,38 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     })
 }
 
+/// Normalises one checksum attribute, reporting a malformed value.
+///
+/// A checksum that is not well-formed hex of the right length cannot be indexed,
+/// so it is dropped - but dropping it silently is what makes a DAT with a typo
+/// look like a DAT that simply publishes fewer algorithms. `dat validate` reports
+/// hash coverage, and without this the missing coverage has no explanation.
+fn checksum_attr(
+    elem: &quick_xml::events::BytesStart<'_>,
+    attr_name: &[u8],
+    normalise: fn(&str) -> Option<String>,
+    context: &str,
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
+) -> Option<String> {
+    let raw = attr_str_opt(elem, attr_name, warnings, max_warnings)?;
+    match normalise(&raw) {
+        Some(value) => Some(value),
+        None => {
+            record_warning(
+                warnings,
+                max_warnings,
+                format!(
+                    "{} attribute on {context} is not a well-formed checksum and was dropped: {:?}",
+                    String::from_utf8_lossy(attr_name),
+                    raw.chars().take(32).collect::<String>()
+                ),
+            );
+            None
+        }
+    }
+}
+
 fn record_warning(warnings: &mut Vec<ParseWarning>, limit: usize, message: String) {
     if warnings.len() < limit {
         warnings.push(ParseWarning::new(message));
@@ -437,8 +546,10 @@ fn attr_str_checked(
     elem: &quick_xml::events::BytesStart<'_>,
     attr_name: &[u8],
     max_length: usize,
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
 ) -> Result<Option<String>, ParseError> {
-    let value = attr_str_opt(elem, attr_name);
+    let value = attr_str_opt(elem, attr_name, warnings, max_warnings);
     if let Some(ref v) = value
         && v.len() > max_length
     {
@@ -460,34 +571,44 @@ fn attr_str_checked(
 /// resolves the predefined entities and numeric character references.
 ///
 /// A value that cannot be unescaped - it references an entity only a DTD could
-/// define - falls back to the raw text rather than being dropped, so the name is
-/// still present and still comparable, and `attribute_unescape_failed` reports
-/// it to the caller.
-fn attr_str_opt(elem: &quick_xml::events::BytesStart<'_>, attr_name: &[u8]) -> Option<String> {
-    attr_str_reporting(elem, attr_name).map(|(value, _)| value)
-}
-
-/// As [`attr_str_opt`], but also says whether unescaping failed.
-fn attr_str_reporting(
+/// define - keeps its raw text rather than being dropped, so the name is still
+/// present and still comparable, and the failure is recorded in `warnings`. Text
+/// nodes are handled the same way, so the same content reports the same thing
+/// whether it arrived as an attribute or as element text.
+fn attr_str_opt(
     elem: &quick_xml::events::BytesStart<'_>,
     attr_name: &[u8],
-) -> Option<(String, bool)> {
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
+) -> Option<String> {
     let attr = elem.try_get_attribute(attr_name).ok().flatten()?;
-    let (value, failed) = match attr.unescape_value() {
-        Ok(decoded) => (decoded.into_owned(), false),
-        Err(_) => (String::from_utf8_lossy(&attr.value).into_owned(), true),
+    let value = match attr.unescape_value() {
+        Ok(decoded) => decoded.into_owned(),
+        Err(error) => {
+            record_warning(
+                warnings,
+                max_warnings,
+                format!(
+                    "unresolvable entity reference in attribute {} kept as written: {error}",
+                    String::from_utf8_lossy(attr_name)
+                ),
+            );
+            String::from_utf8_lossy(&attr.value).into_owned()
+        }
     };
     if value.is_empty() {
         return None;
     }
-    Some((value, failed))
+    Some(value)
 }
 
 fn attr_u64(
     elem: &quick_xml::events::BytesStart<'_>,
     attr_name: &[u8],
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
 ) -> Result<Option<u64>, ParseError> {
-    let Some(raw) = attr_str_opt(elem, attr_name) else {
+    let Some(raw) = attr_str_opt(elem, attr_name, warnings, max_warnings) else {
         return Ok(None);
     };
     raw.parse::<u64>()

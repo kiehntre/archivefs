@@ -5,9 +5,25 @@
 //! builder; the defaults are set above any known real-world DAT file.
 
 /// Maximum file size in bytes that will be processed.
+///
+/// # This is the real memory ceiling, and it is not one-to-one
+///
+/// Both parsers stream their input but keep the whole parsed catalogue: a
+/// `Vec<DatGameEntry>` of owned `String`s. Measured on this branch, a 63 MB DAT
+/// peaks at about 565 MB resident and a 32 MB one at about 251 MB - call it
+/// eight to nine times the file. So this ceiling implies roughly 2.3 GB at the
+/// default and around 18 GB if raised to [`ABSOLUTE_MAX_FILE_SIZE`].
+///
+/// Every other limit here is a backstop behind this one. Raise it only with that
+/// multiplier in mind; lowering it is the only lever that actually caps memory
+/// until the model is interned or consumed incrementally.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Upper ceiling for file size, beyond which no override is accepted.
+///
+/// At the amplification described on [`DEFAULT_MAX_FILE_SIZE`] this permits a
+/// parse that will not fit in memory on most machines. It is deliberately left
+/// as a ceiling on the *input* rather than a promise about the *process*.
 pub const ABSOLUTE_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum number of game entries.

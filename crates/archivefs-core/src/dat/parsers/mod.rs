@@ -2,6 +2,24 @@
 //!
 //! A DAT file might be Logiqx XML or ClrMamePro text. This module sniffs the
 //! first bytes of a file to decide which parser to use, then delegates.
+//!
+//! # Why this does not go through `safe_read`/`TrustedRoots`
+//!
+//! That policy exists to constrain paths ArchiveFS derives from *data* - a RomM
+//! record's `archivefs_path`, a cheat catalogue's destination - where a hostile
+//! or careless source could otherwise steer a read outside the configured source
+//! folders.
+//!
+//! A DAT path is not derived from anything: in Stage 1A it is typed on the
+//! command line by the person running the command, and DAT files normally live
+//! wherever they were downloaded rather than inside a source folder. Applying
+//! trusted-root confinement here would refuse the ordinary case while protecting
+//! against nothing the caller did not already choose.
+//!
+//! This is therefore a deliberate CLI exception, not an oversight. It stops being
+//! one the moment a DAT path arrives from configuration, a manifest or any other
+//! stored source - a later stage that feeds paths in that way must route them
+//! through the same policy the rest of the codebase uses.
 
 use std::path::Path;
 
