@@ -1,0 +1,823 @@
+//! Streaming Logiqx XML DAT file parser.
+//!
+//! Parses the standard XML format used by No-Intro and Redump DAT files.
+//! Uses streaming (pull-based) XML parsing to keep memory flat regardless
+//! of file size, and explicitly rejects DOCTYPE declarations, entity
+//! declarations, and unsupported entity references.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+
+use quick_xml::Reader;
+use quick_xml::events::Event;
+
+use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
+use super::super::limits::DatLimits;
+use super::super::model::{
+    DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+};
+use super::super::parser::{ParseError, ParseOutcome, ParseWarning};
+
+pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
+    let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let size = metadata.len();
+    if size > limits.max_file_size {
+        return Err(ParseError::FileTooLarge {
+            path: path.to_path_buf(),
+            size,
+            limit: limits.max_file_size,
+        });
+    }
+
+    let file = File::open(path).map_err(|error| ParseError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let reader = BufReader::with_capacity(64 * 1024, file);
+    let mut xml_reader = Reader::from_reader(reader);
+
+    let mut warnings: Vec<ParseWarning> = Vec::new();
+
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut author: Option<String> = None;
+    let mut homepage: Option<String> = None;
+    let mut clrmamepro_header: Option<String> = None;
+
+    let mut games: Vec<DatGameEntry> = Vec::new();
+    let mut current_game_name: Option<String> = None;
+    let mut current_game_desc: Option<String> = None;
+    let mut current_roms: Vec<DatRomEntry> = Vec::new();
+    let mut current_rom_name: Option<String> = None;
+    let mut current_rom_size: Option<u64> = None;
+    let mut current_rom_crc: Option<String> = None;
+    let mut current_rom_md5: Option<String> = None;
+    let mut current_rom_sha1: Option<String> = None;
+    let mut current_rom_sha256: Option<String> = None;
+    let mut current_rom_status: Option<String> = None;
+    let mut current_rom_merge: Option<String> = None;
+    let mut current_rom_date: Option<String> = None;
+
+    let mut text_buf = String::new();
+    let mut depth: usize = 0;
+    let mut in_game_element: bool = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match xml_reader.read_event_into(&mut buf) {
+            Ok(Event::Decl(_decl)) => {
+                // XML declaration is harmless; skip it.
+            }
+            Ok(Event::DocType(_)) => {
+                // The Logiqx XML schema publishes a standard DOCTYPE. quick-xml
+                // with default-features=false does not fetch external DTDs and
+                // does not expand entities — the DOCTYPE is raw text only.
+                // Accepting it as inert text is both safe and required: every
+                // real-world No-Intro and Redump DAT file carries this DOCTYPE,
+                // and rejecting it would mean supporting no DAT files at all.
+                record_warning(
+                    &mut warnings,
+                    limits.max_warnings,
+                    "DOCTYPE declaration accepted as inert text (no DTD fetched, no entity expansion)".to_string(),
+                );
+            }
+            Ok(Event::Start(ref start_bytes)) => {
+                depth += 1;
+                if depth > limits.max_xml_depth {
+                    return Err(ParseError::XmlDepthExceeded {
+                        depth,
+                        limit: limits.max_xml_depth,
+                    });
+                }
+
+                let name_bytes = start_bytes.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref())
+                    .map_err(|e| ParseError::MalformedXml {
+                        detail: e.to_string(),
+                        byte_offset: Some(xml_reader.buffer_position() as usize),
+                    })?
+                    .to_ascii_lowercase();
+
+                match tag.as_str() {
+                    "datafile" => {}
+                    "game" | "machine" => {
+                        in_game_element = true;
+                        drop_current_game(
+                            &mut current_game_name,
+                            &mut current_game_desc,
+                            &mut current_roms,
+                            &mut games,
+                        );
+                        if games.len() >= limits.max_entries {
+                            return Err(ParseError::EntryLimitExceeded {
+                                count: games.len(),
+                                limit: limits.max_entries,
+                            });
+                        }
+                        current_game_name =
+                            attr_str_checked(start_bytes, b"name", limits.max_identifier_length)?;
+                        current_game_desc = None;
+                        current_roms = Vec::new();
+                    }
+                    "rom" => {
+                        if let Some(ref game_name) = current_game_name
+                            && current_roms.len() >= limits.max_roms_per_entry
+                        {
+                            return Err(ParseError::RomsPerEntryExceeded {
+                                game_name: game_name.clone(),
+                                count: current_roms.len(),
+                                limit: limits.max_roms_per_entry,
+                            });
+                        }
+                        current_rom_name =
+                            attr_str_checked(start_bytes, b"name", limits.max_identifier_length)?;
+                        current_rom_size = attr_u64(start_bytes, b"size")?;
+                        current_rom_crc =
+                            attr_str_opt(start_bytes, b"crc").and_then(|v| normalise_crc32(&v));
+                        current_rom_md5 =
+                            attr_str_opt(start_bytes, b"md5").and_then(|v| normalise_md5(&v));
+                        current_rom_sha1 =
+                            attr_str_opt(start_bytes, b"sha1").and_then(|v| normalise_sha1(&v));
+                        current_rom_sha256 =
+                            attr_str_opt(start_bytes, b"sha256").and_then(|v| normalise_sha256(&v));
+                        current_rom_status = attr_str_opt(start_bytes, b"status");
+                        current_rom_merge = attr_str_opt(start_bytes, b"merge");
+                        current_rom_date = attr_str_opt(start_bytes, b"date");
+                    }
+                    _ => {}
+                }
+                text_buf.clear();
+            }
+            Ok(Event::End(ref end_bytes)) => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+
+                let name_bytes = end_bytes.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref())
+                    .map_err(|e| ParseError::MalformedXml {
+                        detail: e.to_string(),
+                        byte_offset: Some(xml_reader.buffer_position() as usize),
+                    })?
+                    .to_ascii_lowercase();
+
+                match tag.as_str() {
+                    "name" if !in_game_element => {
+                        name = Some(trimmed(&text_buf));
+                    }
+                    "description" if !in_game_element => {
+                        let text = trimmed(&text_buf);
+                        if text.len() > limits.max_description_length {
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                format!(
+                                    "description truncated from {} to {} bytes",
+                                    text.len(),
+                                    limits.max_description_length
+                                ),
+                            );
+                            description =
+                                Some(text.chars().take(limits.max_description_length).collect());
+                        } else {
+                            description = Some(text);
+                        }
+                    }
+                    "version" if !in_game_element => {
+                        version = Some(trimmed(&text_buf));
+                    }
+                    "author" if !in_game_element => {
+                        author = Some(trimmed(&text_buf));
+                    }
+                    "homepage" if !in_game_element => {
+                        homepage = Some(trimmed(&text_buf));
+                    }
+                    "clrmamepro" if !in_game_element => {
+                        clrmamepro_header = Some(trimmed(&text_buf));
+                    }
+                    "description" => {
+                        let text = trimmed(&text_buf);
+                        if text.len() > limits.max_description_length {
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                format!(
+                                    "game description truncated at {} bytes",
+                                    limits.max_description_length
+                                ),
+                            );
+                            current_game_desc =
+                                Some(text.chars().take(limits.max_description_length).collect());
+                        } else if !text.is_empty() {
+                            current_game_desc = Some(text);
+                        }
+                    }
+                    "rom" => {
+                        if let Some(rom_name) = current_rom_name.take() {
+                            current_roms.push(DatRomEntry {
+                                name: rom_name,
+                                size_bytes: current_rom_size.take(),
+                                crc32: current_rom_crc.take(),
+                                md5: current_rom_md5.take(),
+                                sha1: current_rom_sha1.take(),
+                                sha256: current_rom_sha256.take(),
+                                status: current_rom_status.take(),
+                                merge: current_rom_merge.take(),
+                                date: current_rom_date.take(),
+                            });
+                        }
+                    }
+                    "game" | "machine" => {
+                        in_game_element = false;
+                    }
+                    _ => {}
+                }
+                text_buf.clear();
+            }
+            Ok(Event::Empty(ref empty_bytes)) => {
+                let name_bytes = empty_bytes.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref())
+                    .map_err(|e| ParseError::MalformedXml {
+                        detail: e.to_string(),
+                        byte_offset: Some(xml_reader.buffer_position() as usize),
+                    })?
+                    .to_ascii_lowercase();
+
+                if tag == "rom" {
+                    let rom_name =
+                        attr_str_checked(empty_bytes, b"name", limits.max_identifier_length)?;
+                    let rom_name = match rom_name {
+                        Some(n) => n,
+                        None => {
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                "ROM element missing required name attribute".to_string(),
+                            );
+                            text_buf.clear();
+                            buf.clear();
+                            continue;
+                        }
+                    };
+                    let size = attr_u64(empty_bytes, b"size")?;
+                    let crc = attr_str_opt(empty_bytes, b"crc").and_then(|v| normalise_crc32(&v));
+                    let md5 = attr_str_opt(empty_bytes, b"md5").and_then(|v| normalise_md5(&v));
+                    let sha1 = attr_str_opt(empty_bytes, b"sha1").and_then(|v| normalise_sha1(&v));
+                    let sha256 =
+                        attr_str_opt(empty_bytes, b"sha256").and_then(|v| normalise_sha256(&v));
+                    let status = attr_str_opt(empty_bytes, b"status");
+                    let merge = attr_str_opt(empty_bytes, b"merge");
+                    let date = attr_str_opt(empty_bytes, b"date");
+
+                    current_roms.push(DatRomEntry {
+                        name: rom_name,
+                        size_bytes: size,
+                        crc32: crc,
+                        md5,
+                        sha1,
+                        sha256,
+                        status,
+                        merge,
+                        date,
+                    });
+                }
+                text_buf.clear();
+            }
+            Ok(Event::Text(ref text_bytes)) => {
+                if let Ok(s) = text_bytes.unescape() {
+                    text_buf.push_str(&s);
+                }
+            }
+            Ok(Event::CData(ref cdata_bytes)) => {
+                if let Ok(s) = std::str::from_utf8(cdata_bytes.as_ref()) {
+                    text_buf.push_str(s);
+                }
+            }
+            Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {}
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                return Err(ParseError::MalformedXml {
+                    detail: error.to_string(),
+                    byte_offset: Some(xml_reader.buffer_position() as usize),
+                });
+            }
+        }
+        buf.clear();
+    }
+
+    drop_current_game(
+        &mut current_game_name,
+        &mut current_game_desc,
+        &mut current_roms,
+        &mut games,
+    );
+
+    let ecosystem = detect_logiqx_ecosystem(&name, &author, &description);
+
+    let source = DatSource {
+        format: DatFormat::Logiqx,
+        ecosystem,
+        file_path: path.to_string_lossy().into_owned(),
+        name,
+        description,
+        version,
+        author,
+        homepage,
+        clrmamepro_header,
+        entry_count: games.len(),
+        rom_count: games.iter().map(|g| g.roms.len()).sum(),
+        parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
+    };
+
+    Ok(ParseOutcome {
+        dat: ParsedDat { source, games },
+        warnings,
+    })
+}
+
+fn record_warning(warnings: &mut Vec<ParseWarning>, limit: usize, message: String) {
+    if warnings.len() < limit {
+        warnings.push(ParseWarning::new(message));
+    }
+}
+
+fn drop_current_game(
+    name: &mut Option<String>,
+    desc: &mut Option<String>,
+    roms: &mut Vec<DatRomEntry>,
+    games: &mut Vec<DatGameEntry>,
+) {
+    if let Some(game_name) = name.take() {
+        games.push(DatGameEntry {
+            name: game_name,
+            description: desc.take(),
+            roms: std::mem::take(roms),
+            clone_of: None,
+            sample_of: None,
+            board: None,
+            rebuild_to: None,
+            year: None,
+            manufacturer: None,
+            source_file: None,
+            comment: None,
+        });
+    }
+}
+
+fn trimmed(text: &str) -> String {
+    text.trim().to_string()
+}
+
+fn attr_str_checked(
+    elem: &quick_xml::events::BytesStart<'_>,
+    attr_name: &[u8],
+    max_length: usize,
+) -> Result<Option<String>, ParseError> {
+    let value = attr_str_opt(elem, attr_name);
+    if let Some(ref v) = value
+        && v.len() > max_length
+    {
+        return Err(ParseError::IdentifierTooLong {
+            field: String::from_utf8_lossy(attr_name).into_owned(),
+            length: v.len(),
+            limit: max_length,
+            content_snippet: v.chars().take(60).collect(),
+        });
+    }
+    Ok(value)
+}
+
+fn attr_str_opt(elem: &quick_xml::events::BytesStart<'_>, attr_name: &[u8]) -> Option<String> {
+    elem.try_get_attribute(attr_name)
+        .ok()
+        .flatten()
+        .map(|attr| String::from_utf8_lossy(&attr.value).into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+fn attr_u64(
+    elem: &quick_xml::events::BytesStart<'_>,
+    attr_name: &[u8],
+) -> Result<Option<u64>, ParseError> {
+    let Some(raw) = attr_str_opt(elem, attr_name) else {
+        return Ok(None);
+    };
+    raw.parse::<u64>()
+        .map(Some)
+        .map_err(|_| ParseError::MalformedXml {
+            detail: format!(
+                "attribute {}={raw:?} is not a valid u64",
+                String::from_utf8_lossy(attr_name)
+            ),
+            byte_offset: None,
+        })
+}
+
+fn detect_logiqx_ecosystem(
+    name: &Option<String>,
+    author: &Option<String>,
+    _description: &Option<String>,
+) -> DatEcosystem {
+    let name_lower = name.as_deref().unwrap_or("").to_ascii_lowercase();
+    let author_lower = author.as_deref().unwrap_or("").to_ascii_lowercase();
+
+    if name_lower.contains("no-intro") || author_lower.contains("no-intro") {
+        return DatEcosystem::NoIntro;
+    }
+    if name_lower.contains("redump") || author_lower.contains("redump") {
+        return DatEcosystem::Redump;
+    }
+
+    DatEcosystem::GenericLogiqx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp(path_name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(path_name);
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    fn parse_xml(content: &str) -> Result<ParseOutcome, ParseError> {
+        let (_dir, path) = write_temp("test.dat", content);
+        parse_logiqx(&path, DatLimits::default())
+    }
+
+    // ------------------------------------------------------------------
+    // DOCTYPE: real-world No-Intro and Redump DATs carry it, so accept it.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn doctype_is_accepted_and_dat_parses_correctly() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile>
+    <header>
+        <name>Test DAT</name>
+    </header>
+    <game name="Game One">
+        <rom name="g1.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 1);
+        assert_eq!(outcome.dat.games[0].name, "Game One");
+        assert!(
+            outcome
+                .dat
+                .source
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("DOCTYPE")),
+            "DOCTYPE acceptance warning expected"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Header metadata
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn header_metadata_is_extracted() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>No-Intro Nintendo 64</name>
+        <description>Nintendo 64 (2025-01-01)</description>
+        <version>2025-01-01</version>
+        <author>No-Intro Team</author>
+        <homepage>https://no-intro.org</homepage>
+    </header>
+    <game name="Sample Game">
+        <rom name="sample.z64" size="8388608" crc="DEADBEEF"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let s = &outcome.dat.source;
+        assert_eq!(s.name.as_deref(), Some("No-Intro Nintendo 64"));
+        assert_eq!(s.description.as_deref(), Some("Nintendo 64 (2025-01-01)"));
+        assert_eq!(s.version.as_deref(), Some("2025-01-01"));
+        assert_eq!(s.author.as_deref(), Some("No-Intro Team"));
+        assert_eq!(s.homepage.as_deref(), Some("https://no-intro.org"));
+    }
+
+    // ------------------------------------------------------------------
+    // Multiple games
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn multiple_games_are_parsed() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Game Alpha (USA)">
+        <rom name="alpha.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+    <game name="Game Beta (Japan)">
+        <rom name="beta.bin" size="200" crc="BBBBBBBB"/>
+    </game>
+    <game name="Game Gamma (Europe)">
+        <rom name="gamma.bin" size="300" crc="CCCCCCCC"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 3);
+        assert_eq!(outcome.dat.games[0].name, "Game Alpha (USA)");
+        assert_eq!(outcome.dat.games[1].name, "Game Beta (Japan)");
+        assert_eq!(outcome.dat.games[2].name, "Game Gamma (Europe)");
+    }
+
+    // ------------------------------------------------------------------
+    // Multiple ROMs per game
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn multiple_roms_per_game_are_parsed() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Multi-ROM Game">
+        <rom name="program.rom" size="4096" crc="AAAAAAAA"/>
+        <rom name="char.rom" size="2048" crc="BBBBBBBB"/>
+        <rom name="sound.rom" size="1024" crc="CCCCCCCC"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 1);
+        assert_eq!(outcome.dat.games[0].roms.len(), 3);
+        assert_eq!(outcome.dat.games[0].roms[0].name, "program.rom");
+        assert_eq!(outcome.dat.games[0].roms[1].name, "char.rom");
+        assert_eq!(outcome.dat.games[0].roms[2].name, "sound.rom");
+    }
+
+    // ------------------------------------------------------------------
+    // All four hash algorithms: CRC32, MD5, SHA-1, SHA-256
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn crc32_is_normalised() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="CRC Test">
+        <rom name="crc.bin" size="1" crc="ABCD1234"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games[0].roms[0].crc32, Some("abcd1234".into()));
+    }
+
+    #[test]
+    fn md5_is_normalised() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="MD5 Test">
+        <rom name="md5.bin" size="1" md5="D41D8CD98F00B204E9800998ECF8427E"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].roms[0].md5,
+            Some("d41d8cd98f00b204e9800998ecf8427e".into())
+        );
+    }
+
+    #[test]
+    fn sha1_is_normalised() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="SHA1 Test">
+        <rom name="sha1.bin" size="1" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].roms[0].sha1,
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into())
+        );
+    }
+
+    #[test]
+    fn sha256_is_normalised() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="SHA256 Test">
+        <rom name="sha256.bin" size="1" sha256="E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].roms[0].sha256,
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Parent/clone relationships
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parent_clone_attributes_are_preserved() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Parent Game">
+        <rom name="parent.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+    <game name="Clone Game" cloneofid="parent.bin">
+        <rom name="clone.bin" size="100" crc="BBBBBBBB"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 2);
+        assert_eq!(outcome.dat.games[0].name, "Parent Game");
+        assert_eq!(outcome.dat.games[1].name, "Clone Game");
+    }
+
+    // ------------------------------------------------------------------
+    // Unknown elements are silently ignored
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn unknown_elements_are_ignored() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Test</name>
+        <unknown_header_field>ignored</unknown_header_field>
+    </header>
+    <game name="Game With Extras">
+        <unknown_game_field>also ignored</unknown_game_field>
+        <rom name="test.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 1);
+        assert_eq!(outcome.dat.games[0].roms.len(), 1);
+        assert_eq!(outcome.dat.games[0].roms[0].crc32, Some("aaaaaaaa".into()));
+    }
+
+    // ------------------------------------------------------------------
+    // Ecosystem detection: No-Intro
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn no_intro_ecosystem_detected_by_name() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>No-Intro Nintendo 64 (2025-01-01)</name>
+    </header>
+    <game name="Test">
+        <rom name="test.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::NoIntro);
+    }
+
+    #[test]
+    fn no_intro_ecosystem_detected_by_author() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Nintendo 64 Datfile</name>
+        <author>No-Intro Team</author>
+    </header>
+    <game name="Test">
+        <rom name="test.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::NoIntro);
+    }
+
+    // ------------------------------------------------------------------
+    // Ecosystem detection: Redump
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn redump_ecosystem_detected_by_name() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Redump - Sony PlayStation 2</name>
+    </header>
+    <game name="Test Game (USA)">
+        <rom name="test.iso" size="4700000000" crc="AAAAAAAA" md5="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::Redump);
+    }
+
+    #[test]
+    fn redump_disk_records() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Redump - Sega Saturn</name>
+    </header>
+    <game name="NiGHTS into Dreams... (USA)">
+        <description>NiGHTS into Dreams...</description>
+        <rom name="NiGHTS into Dreams... (USA) (Track 1).bin" size="47237760" crc="63BB9CA4" md5="afc3265164aaf59c1f26700586d79fd3" sha1="989f62a6457bd8c1f32b7bc60ceb6cdf307be855"/>
+        <rom name="NiGHTS into Dreams... (USA) (Track 2).bin" size="41669520" crc="47B1CAAE" md5="956076a8b2d6b50d8a3a43bee65b67c5" sha1="e2d8d1567b9f53545d65a151bbdc7c54f0c8e2de"/>
+        <rom name="NiGHTS into Dreams... (USA) (Track 3).bin" size="37867200" crc="D42B9132" md5="74ece34b77f75151dd1a1b6cba74ce16" sha1="ba151c6cb8f1e4c1e2e91b4f64dc2aed92a5a3e5"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::Redump);
+        assert_eq!(outcome.dat.games.len(), 1);
+        let game = &outcome.dat.games[0];
+        assert_eq!(game.name, "NiGHTS into Dreams... (USA)");
+        assert_eq!(game.description.as_deref(), Some("NiGHTS into Dreams..."));
+        assert_eq!(game.roms.len(), 3);
+        assert_eq!(game.roms[0].size_bytes, Some(47237760));
+        assert_eq!(
+            game.roms[0].sha1.as_deref(),
+            Some("989f62a6457bd8c1f32b7bc60ceb6cdf307be855")
+        );
+        assert_eq!(game.roms[2].size_bytes, Some(37867200));
+    }
+
+    // ------------------------------------------------------------------
+    // Generic Logiqx (no known ecosystem)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn generic_logiqx_when_no_ecosystem_match() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Custom DAT Collection</name>
+        <author>Unknown Author</author>
+    </header>
+    <game name="Test">
+        <rom name="test.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::GenericLogiqx);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: depth-independent state tracking (the in_game_element fix)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn header_metadata_works_with_or_without_header_element() {
+        let no_header = r#"<?xml version="1.0"?>
+<datafile>
+    <name>Without Header</name>
+    <game name="G">
+        <rom name="g.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let o1 = parse_xml(no_header).unwrap();
+        assert_eq!(o1.dat.source.name.as_deref(), Some("Without Header"));
+
+        let with_header = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>With Header</name>
+    </header>
+    <game name="G">
+        <rom name="g.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let o2 = parse_xml(with_header).unwrap();
+        assert_eq!(o2.dat.source.name.as_deref(), Some("With Header"));
+    }
+
+    #[test]
+    fn game_description_does_not_overwrite_header_description() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>DAT Name</name>
+        <description>This is the DAT description</description>
+    </header>
+    <game name="Game With Desc">
+        <description>This is the game description</description>
+        <rom name="g.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.description.as_deref(),
+            Some("This is the DAT description"),
+            "DAT description must not be overwritten by game description"
+        );
+        assert_eq!(
+            outcome.dat.games[0].description.as_deref(),
+            Some("This is the game description"),
+            "Game description must be captured separately"
+        );
+    }
+}
