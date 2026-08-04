@@ -18,7 +18,14 @@
 //! - xenia_canary_game_patches (xenia-canary/game-patches)
 //! - bsfree-archive (Andrew Mackrodt's BSFree Archive)
 //!
-//! Eight distinct upstream projects, nine registry entries.
+//! Six distinct upstream projects, nine registry entries. The two counts differ
+//! because gamehacking.org supplies three entries and dolphin-emu/dolphin two:
+//! `upstream_project` names the repository, and those five entries name only two
+//! between them. Counting the Dolphin pair as separate data sources - the
+//! GameSettings INIs and the catalogue are different products of one repository -
+//! is where the "eight" in earlier drafts came from; it is not what this field
+//! records, and `the_registry_covers_six_distinct_upstream_projects` pins the
+//! number the code actually produces.
 
 pub mod capabilities;
 pub mod config;
@@ -377,6 +384,27 @@ pub fn build_default_registry() -> CheatSourceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_registry_covers_six_distinct_upstream_projects() {
+        // The module doc gave two different numbers for this - "six" in one
+        // sentence and "Eight" in another. Six is what the registry produces:
+        // three entries share gamehacking.org and two share dolphin-emu/dolphin.
+        // Deriving it from the entries is what stops the prose drifting again.
+        let registry = build_default_registry();
+        let upstreams: std::collections::BTreeSet<&str> = registry
+            .entries
+            .iter()
+            .map(|entry| entry.spec.upstream_project.as_str())
+            .collect();
+        assert_eq!(
+            upstreams.len(),
+            6,
+            "expected six distinct upstream projects, got {upstreams:?}"
+        );
+        // Nine entries over those six repositories.
+        assert_eq!(registry.entries.len(), 9);
+    }
 
     #[test]
     fn default_registry_contains_nine_entries() {
