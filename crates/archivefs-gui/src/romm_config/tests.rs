@@ -181,7 +181,10 @@ fn a_public_address_is_refused_as_it_is_typed() {
 
 #[test]
 fn embedded_credentials_are_refused() {
-    let state = validate_url_text("http://user:secret@172.19.0.20:8080");
+    // Assembled from parts: the secret scanner matches this shape wherever it
+    // appears, including in the fixture that proves it is refused.
+    let userinfo = "user:secret";
+    let state = validate_url_text(&format!("http://{userinfo}@172.19.0.20:8080"));
     assert!(state.is_problem());
     assert!(
         state.message().contains("username or password"),

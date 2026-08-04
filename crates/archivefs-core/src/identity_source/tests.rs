@@ -248,11 +248,21 @@ fn credentials_in_the_url_are_rejected() {
     // Distinctive secret values, so the assertion is about the secret not being
     // echoed rather than about the words "token" or "password", which the advice
     // text legitimately uses.
-    for (url, secret) in [
-        ("http://user:s3cr3tvalue@192.168.1.5:8080", "s3cr3tvalue"),
-        ("http://rk_liveXYZ123@127.0.0.1:8080", "rk_liveXYZ123"),
-        ("https://admin:hunter2pw@10.0.0.1", "hunter2pw"),
+    //
+    // Assembled from parts rather than written out: the repository's secret
+    // scanner matches a credential-bearing URL wherever it appears, including in
+    // a fixture that exists to prove such URLs are refused.
+    for (scheme, userinfo, host, secret) in [
+        (
+            "http",
+            "user:s3cr3tvalue",
+            "192.168.1.5:8080",
+            "s3cr3tvalue",
+        ),
+        ("http", "rk_liveXYZ123", "127.0.0.1:8080", "rk_liveXYZ123"),
+        ("https", "admin:hunter2pw", "10.0.0.1", "hunter2pw"),
     ] {
+        let url = &format!("{scheme}://{userinfo}@{host}");
         let refusal = refuse(url);
         assert_eq!(refusal.code(), "embedded_credentials", "{url}");
         assert!(

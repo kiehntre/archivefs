@@ -4587,12 +4587,10 @@ impl ArchiveFsApp {
     /// re-run (inside the executor), never the whole scan, and exactly one
     /// History entry is recorded whatever the result.
     fn confirm_doctor_repair(&mut self) {
-        let Some(review) = self.doctor_repair_review.take() else {
-            return;
-        };
         let config = match Config::load_default() {
             Ok(config) => config,
             Err(error) => {
+                self.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -4605,6 +4603,7 @@ impl ArchiveFsApp {
         let index_path = match default_index_path() {
             Ok(path) => path,
             Err(error) => {
+                self.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -4613,6 +4612,20 @@ impl ArchiveFsApp {
                 ));
                 return;
             }
+        };
+        self.confirm_doctor_repair_with(config, index_path);
+    }
+
+    /// The repair itself, against an already-resolved configuration.
+    ///
+    /// `confirm_doctor_repair` reads the per-user configuration and the index
+    /// path and delegates here. Tests supply both directly: reading them meant a
+    /// test of *refusal* first had to get past a config load, so it passed only
+    /// on a machine that happened to have `~/.config/archivefs/config.toml` and
+    /// failed on CI, which does not.
+    fn confirm_doctor_repair_with(&mut self, config: Config, index_path: PathBuf) {
+        let Some(review) = self.doctor_repair_review.take() else {
+            return;
         };
         let Some(displayed) = self.doctor_scan.displayed() else {
             return;
@@ -48905,7 +48918,21 @@ $Instant Growth [Nayr]\n";
         app.doctor_repair_review = Some(doctor_review());
         let history_before = app.history.entries().count();
 
-        app.confirm_doctor_repair();
+        // Configuration supplied directly. Reading the real one made this test
+        // pass only on a machine that happened to have
+        // `~/.config/archivefs/config.toml`, and fail on CI, which does not - and
+        // it was never what the test is about.
+        // Paths that deliberately do not exist: the repair is refused at
+        // revalidation, so nothing here is ever opened, created or written.
+        let scratch = std::env::temp_dir().join("archivefs-doctor-repair-refusal-fixture");
+        app.confirm_doctor_repair_with(
+            Config {
+                source_folders: vec![scratch.join("sources")],
+                mount_root: scratch.join("mounts"),
+                ratarmount_bin: "ratarmount".to_string(),
+            },
+            scratch.join("index.json"),
+        );
 
         assert_eq!(
             app.history.entries().count(),
