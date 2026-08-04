@@ -39,7 +39,7 @@ encoding_rs = "0.8"
 # TOML syntax via this crate, then mapped through our own strict,
 # schema-specific validator - see patch_manager::xenia_patch_document.
 # Never used to interpret or execute upstream content, only to read it.
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 # Archive Inspector (read-only ZIP listing): a small, focused, well
 # established crate rather than hand-parsed ZIP structure or shelling out
 # to `unzip`/`7z`. Production code only ever lists entry metadata via

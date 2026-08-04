@@ -30,6 +30,7 @@ mod cheat_installer;
 mod cheat_provider;
 mod cheat_rollback;
 mod cheat_rollback_result;
+mod cheat_source_registry;
 mod cheat_sources;
 mod cht_document;
 mod destination_safety;
@@ -167,6 +168,13 @@ pub use cheat_rollback_result::{
     CHEAT_ROLLBACK_RUN_SCHEMA_VERSION, CheatRollbackEntryResult, CheatRollbackOutcome,
     CheatRollbackRun, CheatRollbackRunSchemaError, CheatRollbackRunStatus, CheatRollbackSummary,
     parse_cheat_rollback_run,
+};
+pub use cheat_source_registry::{
+    CheatSourceCapabilities, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,
+    CheatSourceSpec, CheatSourcesConfig, PlatformOverrideEntry, ProviderConfigEntry,
+    ProviderPriorityOverride, build_default_registry, default_cheat_sources_config_path,
+    load_cheat_sources_config_default, load_cheat_sources_config_from,
+    save_cheat_sources_config_default, save_cheat_sources_config_to,
 };
 pub use cheat_sources::{
     CHEAT_SOURCE_CONCURRENT_OPERATIONS_PER_PROVIDER, CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
