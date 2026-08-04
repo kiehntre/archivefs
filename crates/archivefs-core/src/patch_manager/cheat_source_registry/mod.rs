@@ -6,7 +6,8 @@
 //!
 //! ## Provider counting
 //!
-//! The registry contains nine entries across six upstream projects:
+//! Nine registry entries covering six distinct upstream projects and eight
+//! logical data sources:
 //!
 //! - libretro-buildbot-cheats (libretro/libretro-database)
 //! - pcsx2-official-patches-tree (PCSX2/pcsx2_patches)
@@ -18,14 +19,14 @@
 //! - xenia_canary_game_patches (xenia-canary/game-patches)
 //! - bsfree-archive (Andrew Mackrodt's BSFree Archive)
 //!
-//! Six distinct upstream projects, nine registry entries. The two counts differ
-//! because gamehacking.org supplies three entries and dolphin-emu/dolphin two:
-//! `upstream_project` names the repository, and those five entries name only two
-//! between them. Counting the Dolphin pair as separate data sources - the
-//! GameSettings INIs and the catalogue are different products of one repository -
-//! is where the "eight" in earlier drafts came from; it is not what this field
-//! records, and `the_registry_covers_six_distinct_upstream_projects` pins the
-//! number the code actually produces.
+//! The three figures differ for different reasons. `upstream_project` names a
+//! repository, and gamehacking.org accounts for three entries while
+//! dolphin-emu/dolphin accounts for two, so nine entries name only six
+//! repositories between them - that is the number
+//! `the_registry_covers_six_distinct_upstream_projects` derives from the entries
+//! and pins. "Logical data sources" counts the distinct bodies of data rather
+//! than the repositories or the entries; it is an editorial figure with no field
+//! behind it, so nothing asserts it.
 
 pub mod capabilities;
 pub mod config;
