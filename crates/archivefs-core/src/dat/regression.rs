@@ -695,3 +695,104 @@ fn json_output_is_deterministic_across_repeated_parses() {
         "repeated parses of the same DAT must produce byte-identical JSON"
     );
 }
+
+// --- RUSTSEC-2026-0194: duplicate attribute names ------------------------
+
+#[test]
+fn a_start_tag_with_many_duplicate_attribute_names_completes_promptly() {
+    // quick-xml 0.37 checked a start tag for duplicate attribute names in
+    // quadratic time (RUSTSEC-2026-0194), so a DAT carrying one enormous tag was
+    // a denial of service against `dat inspect`. A DAT file is attacker-supplied
+    // by definition, and this parser reads attributes from every start tag.
+    //
+    // The assertion is on the *outcome*, not on a stopwatch: the parse must
+    // finish and return a controlled result rather than run away or panic. The
+    // wall-clock bound is deliberately loose - it is there to fail a genuine
+    // regression to quadratic behaviour, not to measure the machine.
+    let mut attributes = String::new();
+    for index in 0..20_000 {
+        // Repeated names, which is the case the advisory is about.
+        attributes.push_str(&format!(r#" dup="{index}""#));
+    }
+    let xml = format!(
+        r#"<datafile><game name="G"><rom name="a.bin" size="1" crc="aabbccdd"{attributes}/></game></datafile>"#
+    );
+    let (_d, path) = write(&xml);
+
+    let started = std::time::Instant::now();
+    let result = parse_logiqx(&path, DatLimits::default());
+    let elapsed = started.elapsed();
+
+    // A controlled result either way: parsed, or refused with a real error.
+    match &result {
+        Ok(outcome) => {
+            assert_eq!(outcome.dat.games.len(), 1);
+            assert_eq!(outcome.dat.games[0].roms.len(), 1);
+            // The attributes this parser cares about are still read correctly.
+            let rom = &outcome.dat.games[0].roms[0];
+            assert_eq!(rom.name, "a.bin");
+            assert_eq!(rom.crc32.as_deref(), Some("aabbccdd"));
+        }
+        Err(error) => {
+            // A refusal is acceptable; a panic or a hang is not.
+            let _ = error.to_string();
+        }
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "parsing 20,000 duplicate attributes took {elapsed:?}, which suggests the \
+         quadratic duplicate-name check is back"
+    );
+}
+
+#[test]
+fn duplicate_attribute_names_do_not_corrupt_the_parsed_rom() {
+    // The narrower correctness question behind the same input: a repeated
+    // attribute must not change what the parser reads for the ones it uses.
+    let xml = r#"<datafile><game name="G"><rom name="a.bin" size="7" crc="aabbccdd" dup="1" dup="2" dup="3"/></game></datafile>"#;
+    let (_d, path) = write(xml);
+    match parse_logiqx(&path, DatLimits::default()) {
+        Ok(outcome) => {
+            let rom = &outcome.dat.games[0].roms[0];
+            assert_eq!(rom.name, "a.bin");
+            assert_eq!(rom.size_bytes, Some(7));
+            assert_eq!(rom.crc32.as_deref(), Some("aabbccdd"));
+        }
+        Err(error) => {
+            // Refusing a malformed document is also a controlled outcome.
+            assert!(!error.to_string().is_empty());
+        }
+    }
+}
+
+#[test]
+fn an_attribute_that_is_not_valid_utf8_is_reported_not_silently_replaced() {
+    // Decoding lossily before unescaping would swap the bad bytes for U+FFFD and
+    // then unescape cleanly, so a corrupted identifier reached the catalogue with
+    // nothing to notice. Text nodes already warned; attributes must too.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.dat");
+    let mut bytes = br#"<datafile><game name="G"><rom name="bad"#.to_vec();
+    bytes.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 inside the ROM name
+    bytes.extend_from_slice(br#".bin" size="1" crc="aabbccdd"/></game></datafile>"#);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let out = parse_logiqx(&path, DatLimits::default()).expect("parsed");
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.to_string().contains("not valid UTF-8")),
+        "invalid UTF-8 in an attribute must be reported, got {:?}",
+        out.warnings
+    );
+    // Still parsed, still usable - the point is that the loss is visible.
+    assert_eq!(out.dat.games[0].roms.len(), 1);
+}
+
+#[test]
+fn a_valid_utf8_attribute_produces_no_encoding_warning() {
+    let xml = r#"<datafile><game name="Café"><rom name="café.bin" size="1" crc="aabbccdd"/></game></datafile>"#;
+    let out = parse(xml).expect("parsed");
+    assert_eq!(out.dat.games[0].name, "Café");
+    assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+}
