@@ -22,6 +22,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use quick_xml::Reader;
+use quick_xml::escape::{resolve_predefined_entity, unescape};
 use quick_xml::events::Event;
 
 use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
@@ -394,28 +395,78 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                 text_buf.clear();
             }
             Ok(Event::Text(ref text_bytes)) => {
-                match text_bytes.unescape() {
-                    Ok(decoded) => text_buf.push_str(&decoded),
+                // quick-xml 0.41 split what `BytesText::unescape` used to do into
+                // decoding the bytes and then resolving entity references. The
+                // pair is used rather than `normalized_value`, which additionally
+                // collapses tabs and newlines to spaces - that would rewrite a ROM
+                // name rather than read it.
+                match text_bytes.decode() {
+                    Ok(decoded) => match unescape(&decoded) {
+                        Ok(text) => text_buf.push_str(&text),
+                        Err(error) => {
+                            // Only a DTD could define whatever this references, and
+                            // no DTD is processed. Keeping the raw text preserves
+                            // the field; the warning is what stops the loss being
+                            // silent.
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                format!(
+                                    "unresolvable entity reference in text kept as \
+                                     written: {error}"
+                                ),
+                            );
+                            text_buf.push_str(&decoded);
+                        }
+                    },
                     Err(error) => {
-                        // Only a DTD could define whatever this references, and no
-                        // DTD is processed. Keeping the raw text preserves the
-                        // field; the warning is what stops the loss being silent.
                         record_warning(
                             &mut warnings,
                             limits.max_warnings,
-                            format!(
-                                "unresolvable entity reference in text kept as written: {error}"
-                            ),
+                            format!("text that is not valid UTF-8 was dropped: {error}"),
                         );
-                        if let Ok(raw) = std::str::from_utf8(text_bytes.as_ref()) {
-                            text_buf.push_str(raw);
-                        }
                     }
                 }
             }
             Ok(Event::CData(ref cdata_bytes)) => {
                 if let Ok(s) = std::str::from_utf8(cdata_bytes.as_ref()) {
                     text_buf.push_str(s);
+                }
+            }
+            Ok(Event::GeneralRef(ref reference)) => {
+                // New in quick-xml 0.41: entity and character references arrive as
+                // their own event instead of being resolved inside `Text`. The
+                // rules are the ones this parser already applied - the five
+                // predefined entities and numeric character references resolve,
+                // and anything a DTD would have to define does not, because no DTD
+                // is ever processed.
+                match reference.decode() {
+                    Ok(name) => {
+                        if let Ok(Some(character)) = reference.resolve_char_ref() {
+                            text_buf.push(character);
+                        } else if let Some(resolved) = resolve_predefined_entity(&name) {
+                            text_buf.push_str(resolved);
+                        } else {
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                format!(
+                                    "unresolvable entity reference in text kept as \
+                                     written: unrecognized entity `{name}`"
+                                ),
+                            );
+                            text_buf.push('&');
+                            text_buf.push_str(&name);
+                            text_buf.push(';');
+                        }
+                    }
+                    Err(error) => {
+                        record_warning(
+                            &mut warnings,
+                            limits.max_warnings,
+                            format!("a reference that is not valid UTF-8 was dropped: {error}"),
+                        );
+                    }
                 }
             }
             Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {}
@@ -582,7 +633,11 @@ fn attr_str_opt(
     max_warnings: usize,
 ) -> Option<String> {
     let attr = elem.try_get_attribute(attr_name).ok().flatten()?;
-    let value = match attr.unescape_value() {
+    // As for text nodes: decode, then resolve entities. `normalized_value` would
+    // also apply XML attribute-value whitespace normalisation, turning a tab or a
+    // newline inside a name into a space.
+    let raw = String::from_utf8_lossy(&attr.value);
+    let value = match unescape(&raw) {
         Ok(decoded) => decoded.into_owned(),
         Err(error) => {
             record_warning(
@@ -593,7 +648,7 @@ fn attr_str_opt(
                     String::from_utf8_lossy(attr_name)
                 ),
             );
-            String::from_utf8_lossy(&attr.value).into_owned()
+            raw.into_owned()
         }
     };
     if value.is_empty() {
