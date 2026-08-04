@@ -97,6 +97,27 @@ impl CheatSourceEntry {
     }
 }
 
+/// Two registry entries claimed the same source ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateSourceId {
+    pub id: String,
+    /// Where the ID was first seen, and where it was seen again.
+    pub first_index: usize,
+    pub duplicate_index: usize,
+}
+
+impl std::fmt::Display for DuplicateSourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "duplicate cheat source ID '{}': entries {} and {} both claim it",
+            self.id, self.first_index, self.duplicate_index
+        )
+    }
+}
+
+impl std::error::Error for DuplicateSourceId {}
+
 #[derive(Debug, Clone)]
 pub struct CheatSourceRegistry {
     entries: Vec<CheatSourceEntry>,
@@ -105,16 +126,46 @@ pub struct CheatSourceRegistry {
 }
 
 impl CheatSourceRegistry {
-    pub fn new(entries: Vec<CheatSourceEntry>) -> Self {
+    /// Builds a registry, refusing two entries that claim the same ID.
+    ///
+    /// The ID is what every lookup, every preference and every CLI argument
+    /// names a source by. Letting a later entry overwrite an earlier one left the
+    /// first source present in `entries` but unreachable through `get`, so it
+    /// could still be listed and still be counted while nothing could enable,
+    /// disable or re-prioritise it. Today's built-in IDs are unique; the point of
+    /// refusing is that a custom source added later cannot quietly displace a
+    /// built-in one.
+    pub fn new(entries: Vec<CheatSourceEntry>) -> Result<Self, DuplicateSourceId> {
         let mut by_id = BTreeMap::new();
         for (idx, entry) in entries.iter().enumerate() {
+            if let Some(&first) = by_id.get(&entry.spec.id) {
+                return Err(DuplicateSourceId {
+                    id: entry.spec.id.clone(),
+                    first_index: first,
+                    duplicate_index: idx,
+                });
+            }
             by_id.insert(entry.spec.id.clone(), idx);
         }
-        Self {
+        Ok(Self {
             entries,
             by_id,
             platform_overrides: Vec::new(),
-        }
+        })
+    }
+
+    /// Every registered source, enabled or not, in the order `list` shows them.
+    ///
+    /// Sorted the same way as [`Self::sorted_enabled`], so enabling a source does
+    /// not move it: it is already in the position it will occupy.
+    pub fn sorted_all(&self) -> Vec<&CheatSourceEntry> {
+        let mut all: Vec<&CheatSourceEntry> = self.entries.iter().collect();
+        all.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| a.spec.id.cmp(&b.spec.id))
+        });
+        all
     }
 
     pub fn entries(&self) -> &[CheatSourceEntry] {
@@ -380,11 +431,70 @@ pub fn build_default_registry() -> CheatSourceRegistry {
     }));
 
     CheatSourceRegistry::new(entries)
+        .expect("the built-in registry is a fixed list with unique IDs; a duplicate here is a bug")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_entries_claiming_one_id_are_rejected() {
+        // Silently keeping the last one left the first present in `entries` but
+        // unreachable through `get`, so it could be listed and counted while
+        // nothing could enable, disable or re-prioritise it.
+        let registry = build_default_registry();
+        let mut entries: Vec<CheatSourceEntry> = registry.entries().to_vec();
+        let mut clone = entries[0].clone();
+        clone.spec.display_name = "An impostor claiming a taken ID".to_string();
+        let taken = clone.spec.id.clone();
+        entries.push(clone);
+
+        let error = CheatSourceRegistry::new(entries).expect_err("a duplicate ID must be refused");
+        assert_eq!(error.id, taken);
+        assert!(
+            error.to_string().contains(&taken),
+            "the message must name the duplicate ID, got {error}"
+        );
+        assert_ne!(
+            error.first_index, error.duplicate_index,
+            "the error should point at both entries"
+        );
+    }
+
+    #[test]
+    fn unique_ids_are_accepted() {
+        let entries: Vec<CheatSourceEntry> = build_default_registry().entries().to_vec();
+        let count = entries.len();
+        let registry = CheatSourceRegistry::new(entries).expect("unique IDs are fine");
+        assert_eq!(registry.entries().len(), count);
+    }
+
+    #[test]
+    fn sorted_all_includes_disabled_entries_in_the_same_order() {
+        // What `cheat-source list` relies on: disabling a source must not remove
+        // it from the listing, nor move anything else.
+        let mut registry = build_default_registry();
+        let before: Vec<String> = registry
+            .sorted_all()
+            .iter()
+            .map(|e| e.spec.id.clone())
+            .collect();
+        let victim = before[0].clone();
+        registry.get_mut(&victim).expect("entry").enabled = false;
+
+        let after: Vec<String> = registry
+            .sorted_all()
+            .iter()
+            .map(|e| e.spec.id.clone())
+            .collect();
+        assert_eq!(before, after, "disabling a source reordered the listing");
+        assert_eq!(
+            registry.sorted_enabled().len(),
+            after.len() - 1,
+            "exactly one source should have left the enabled set"
+        );
+    }
 
     #[test]
     fn the_registry_covers_six_distinct_upstream_projects() {

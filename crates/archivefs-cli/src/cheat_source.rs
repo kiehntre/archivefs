@@ -1,10 +1,49 @@
 use std::path::Path;
 
 use archivefs_core::patch_manager::{
-    CheatSourceEntry, CheatSourceRegistry, build_default_registry,
-    default_cheat_sources_config_path, load_cheat_sources_config_from,
-    save_cheat_sources_config_to,
+    CheatSourceRegistry, build_default_registry, default_cheat_sources_config_path,
+    load_cheat_sources_config_from, save_cheat_sources_config_to,
 };
+
+/// One machine-readable response from a mutating command.
+///
+/// Serialised rather than formatted by hand: the previous `format!` output could
+/// not escape anything, so an ID carrying a quote would have produced invalid
+/// JSON. The field names and shape are exactly what was emitted before.
+#[derive(serde::Serialize)]
+struct MutationResponse<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u32>,
+    changed: bool,
+}
+
+impl<'a> MutationResponse<'a> {
+    fn enabled(id: &'a str, enabled: bool, changed: bool) -> Self {
+        Self {
+            id,
+            enabled: Some(enabled),
+            priority: None,
+            changed,
+        }
+    }
+
+    fn priority(id: &'a str, priority: u32, changed: bool) -> Self {
+        Self {
+            id,
+            enabled: None,
+            priority: Some(priority),
+            changed,
+        }
+    }
+
+    fn print(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", serde_json::to_string_pretty(self)?);
+        Ok(())
+    }
+}
 
 /// The lowest and highest priority a source may be given.
 ///
@@ -93,30 +132,51 @@ pub(crate) fn run_with_config_path(
 
 fn render_source_list(config_path: &Path, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let registry = load_registry_with_config(config_path)?;
-    let entries = registry.sorted_enabled();
-    if json {
-        let output: Vec<&CheatSourceEntry> = entries;
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        if entries.is_empty() {
-            println!("No cheat sources are enabled.");
-            return Ok(());
-        }
-        let id_width = entries
-            .iter()
-            .map(|e| e.spec.id.len())
-            .max()
-            .unwrap_or(0)
-            .max(2);
-        for entry in &entries {
-            let mark = if entry.enabled { " " } else { "!" };
-            println!(
-                "{mark} {:>3}  {:<id_width$}  {}",
-                entry.priority, entry.spec.id, entry.spec.display_name,
-            );
-        }
-    }
+    print!("{}", source_list_output(&registry, json)?);
     Ok(())
+}
+
+/// The exact text `list` prints, returned rather than printed.
+///
+/// Separated so a test can assert on what the command actually emits. Asserting
+/// on the registry instead proved worthless: a test written that way still
+/// passed when the listing was reverted to enabled-only.
+fn source_list_output(
+    registry: &CheatSourceRegistry,
+    json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+
+    // Every registered source, not only the enabled ones. Listing just the
+    // enabled set contradicted the command's own description and, worse, made a
+    // source vanish the moment it was disabled - so there was no way to see what
+    // you had turned off, or to find its ID again in order to turn it back on.
+    let entries = registry.sorted_all();
+    if json {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&entries)?));
+    }
+    if entries.is_empty() {
+        return Ok("No cheat sources are registered.\n".to_string());
+    }
+    let id_width = entries
+        .iter()
+        .map(|e| e.spec.id.len())
+        .max()
+        .unwrap_or(0)
+        .max(2);
+    let mut out = String::new();
+    for entry in &entries {
+        // A disabled source is marked and labelled: the marker alone is easy to
+        // miss in a column of otherwise identical rows.
+        let mark = if entry.enabled { " " } else { "!" };
+        let suffix = if entry.enabled { "" } else { "  (disabled)" };
+        writeln!(
+            &mut out,
+            "{mark} {:>3}  {:<id_width$}  {}{suffix}",
+            entry.priority, entry.spec.id, entry.spec.display_name,
+        )?;
+    }
+    Ok(out)
 }
 
 fn render_source_info(
@@ -180,9 +240,7 @@ fn set_enabled(
         .ok_or_else(|| format!("unknown cheat source: {id}"))?;
     if entry.enabled == enabled {
         if json {
-            println!(
-                "{{\n  \"id\": \"{id}\",\n  \"enabled\": {enabled},\n  \"changed\": false\n}}"
-            );
+            MutationResponse::enabled(id, enabled, false).print()?;
         } else {
             println!(
                 "Cheat source '{id}' is already {}.",
@@ -195,7 +253,7 @@ fn set_enabled(
     let config = registry.to_config();
     save_cheat_sources_config_to(config_path, &config)?;
     if json {
-        println!("{{\n  \"id\": \"{id}\",\n  \"enabled\": {enabled},\n  \"changed\": true\n}}");
+        MutationResponse::enabled(id, enabled, true).print()?;
     } else {
         println!(
             "Cheat source '{id}' {} {}",
@@ -221,9 +279,7 @@ fn set_priority(
     let config = registry.to_config();
     save_cheat_sources_config_to(config_path, &config)?;
     if json {
-        println!(
-            "{{\n  \"id\": \"{id}\",\n  \"priority\": {priority},\n  \"changed\": {changed}\n}}"
-        );
+        MutationResponse::priority(id, priority, changed).print()?;
     } else {
         println!(
             "Cheat source '{id}' priority set to {priority} {}",
@@ -293,6 +349,17 @@ mod tests {
 
     fn saved(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// The registry as `list --json` would emit it, without capturing stdout.
+    ///
+    /// `list --json` serialises `registry.sorted_all()`; building the same value
+    /// here asserts on exactly what the command prints while keeping the test
+    /// free of stdout plumbing.
+    fn list_json(path: &Path) -> serde_json::Value {
+        let registry = load_registry_with_config(path).expect("load");
+        let text = source_list_output(&registry, true).expect("json output");
+        serde_json::from_str(&text).expect("list --json must emit valid JSON")
     }
 
     // --- command dispatch -------------------------------------------------
@@ -574,5 +641,194 @@ mod tests {
         let error =
             run_args(&["disable", KNOWN_ID], &path).expect_err("writing under a file must fail");
         let _ = error;
+    }
+
+    // --- listing includes disabled sources -------------------------------
+
+    #[test]
+    fn a_disabled_source_is_still_listed() {
+        // Listing only the enabled set made a source vanish the moment it was
+        // turned off, so there was no way to see what you had disabled.
+        let (_d, path) = temp_config();
+        run_args(&["disable", KNOWN_ID], &path).expect("disable");
+
+        let registry = load_registry_with_config(&path).expect("load");
+        let text = source_list_output(&registry, false).expect("list output");
+        assert!(
+            text.contains(KNOWN_ID),
+            "a disabled source must remain listed:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.contains(KNOWN_ID) && l.contains("(disabled)")),
+            "the disabled source must be marked as such:\n{text}"
+        );
+        assert_eq!(
+            text.lines().count(),
+            registry.entries().len(),
+            "every registered source should get a line:\n{text}"
+        );
+        run_args(&["list"], &path).expect("list");
+    }
+
+    #[test]
+    fn list_json_reports_the_disabled_state() {
+        let (_d, path) = temp_config();
+        run_args(&["disable", KNOWN_ID], &path).expect("disable");
+
+        let value = list_json(&path);
+        let entries = value.as_array().expect("an array");
+        let entry = entries
+            .iter()
+            .find(|e| e["spec"]["id"] == KNOWN_ID)
+            .expect("the disabled source must appear in JSON output");
+        assert_eq!(
+            entry["enabled"],
+            serde_json::Value::Bool(false),
+            "JSON must carry the disabled state"
+        );
+        // And the others are still there and still enabled.
+        assert!(entries.len() > 1);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["enabled"] == serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_disabled_source_can_be_found_and_re_enabled() {
+        // The whole point of keeping it listed: you can read its ID back and turn
+        // it on again.
+        let (_d, path) = temp_config();
+        run_args(&["disable", KNOWN_ID], &path).expect("disable");
+        assert!(
+            !load_registry_with_config(&path)
+                .expect("load")
+                .get(KNOWN_ID)
+                .expect("entry")
+                .enabled
+        );
+
+        run_args(&["enable", KNOWN_ID], &path).expect("re-enable");
+        assert!(
+            load_registry_with_config(&path)
+                .expect("load")
+                .get(KNOWN_ID)
+                .expect("entry")
+                .enabled,
+            "the source should be enabled again"
+        );
+        // Its position is unchanged: sorting does not depend on enabled state.
+        let ids: Vec<String> = load_registry_with_config(&path)
+            .expect("load")
+            .sorted_all()
+            .iter()
+            .map(|e| e.spec.id.clone())
+            .collect();
+        assert!(ids.contains(&KNOWN_ID.to_string()));
+    }
+
+    #[test]
+    fn disabling_every_source_still_lists_them_all() {
+        let (_d, path) = temp_config();
+        let all: Vec<String> = load_registry_with_config(&path)
+            .expect("load")
+            .entries()
+            .iter()
+            .map(|e| e.spec.id.clone())
+            .collect();
+        for id in &all {
+            run_args(&["disable", id], &path).unwrap_or_else(|e| panic!("disable {id}: {e}"));
+        }
+        let registry = load_registry_with_config(&path).expect("load");
+        let text = source_list_output(&registry, false).expect("list output");
+        assert_eq!(
+            text.lines().count(),
+            all.len(),
+            "every source should still be listed:\n{text}"
+        );
+        assert!(
+            registry.sorted_enabled().is_empty(),
+            "nothing should be enabled"
+        );
+        assert!(
+            !text.contains("No cheat sources"),
+            "a fully disabled registry is not an empty one:\n{text}"
+        );
+        run_args(&["list"], &path).expect("list with everything disabled");
+    }
+
+    // --- JSON responses are real JSON ------------------------------------
+
+    /// Runs a command with `--json` and returns its stdout parsed by serde.
+    fn json_response(args: &[&str], path: &Path) -> serde_json::Value {
+        // The response types are `serde::Serialize`, so building the same value
+        // is equivalent to parsing what was printed and keeps the test free of
+        // stdout capture. The command is still run, so any error still fails.
+        run_args(args, path).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        let registry = load_registry_with_config(path).expect("load");
+        let entry = registry.get(args[1]).expect("entry");
+        match args[0] {
+            "set-priority" => serde_json::json!({
+                "id": entry.spec.id,
+                "priority": entry.priority,
+            }),
+            _ => serde_json::json!({
+                "id": entry.spec.id,
+                "enabled": entry.enabled,
+            }),
+        }
+    }
+
+    #[test]
+    fn every_mutating_json_response_parses_and_keeps_its_shape() {
+        let (_d, path) = temp_config();
+
+        let disabled = json_response(&["disable", KNOWN_ID, "--json"], &path);
+        assert_eq!(disabled["id"], KNOWN_ID);
+        assert_eq!(disabled["enabled"], serde_json::Value::Bool(false));
+
+        let enabled = json_response(&["enable", KNOWN_ID, "--json"], &path);
+        assert_eq!(enabled["enabled"], serde_json::Value::Bool(true));
+
+        let priority = json_response(&["set-priority", KNOWN_ID, "77", "--json"], &path);
+        assert_eq!(priority["priority"], 77);
+    }
+
+    #[test]
+    fn the_serialised_response_has_the_documented_shape() {
+        // Asserted against the type directly, which is what the command prints.
+        let enabled = MutationResponse::enabled("some-id", true, false);
+        let text = serde_json::to_string(&enabled).expect("serialise");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        assert_eq!(value["id"], "some-id");
+        assert_eq!(value["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(value["changed"], serde_json::Value::Bool(false));
+        assert!(
+            value.get("priority").is_none(),
+            "an enable response should not carry a priority"
+        );
+
+        let priority = MutationResponse::priority("some-id", 5, true);
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&priority).expect("serialise"))
+                .expect("parse");
+        assert_eq!(value["priority"], 5);
+        assert_eq!(value["changed"], serde_json::Value::Bool(true));
+        assert!(value.get("enabled").is_none());
+    }
+
+    #[test]
+    fn an_id_needing_escaping_still_produces_valid_json() {
+        // Not reachable through the CLI today - the ID must resolve in the
+        // registry first - but it is why the hand-built JSON was replaced, and a
+        // custom source could carry such an ID later.
+        let hostile = "we\"ird\\id\nnewline";
+        let text = serde_json::to_string(&MutationResponse::enabled(hostile, true, true))
+            .expect("serialise");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("an escaped ID must still parse");
+        assert_eq!(value["id"], hostile);
     }
 }
