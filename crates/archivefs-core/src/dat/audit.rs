@@ -7,13 +7,23 @@
 //!
 //! # Verdict rules
 //!
-//! - **Exact**: SHA-256, SHA-1, or MD5 exact match against exactly one DAT entry.
-//! - **ExactMultipleCandidates**: strong hash matches multiple DAT entries (collision).
-//! - **Probable**: CRC32 plus exact size match (no stronger hash available).
-//! - **FilenameOnly**: filename matches, but no hash evidence.
-//! - **Ambiguous**: credible candidate exists, but conflicting evidence.
-//! - **NotInDat**: usable known hash has no candidate in the DAT.
-//! - **NoUsableEvidence**: no known hash to compare.
+//! - **Exact**: SHA-256, SHA-1, or MD5 matches exactly one DAT entry.
+//! - **ExactMultipleCandidates**: a cryptographic hash matches several entries.
+//! - **Probable**: CRC32 (with size, where both are known) matches one entry.
+//! - **ProbableMultipleCandidates**: CRC32 matches several entries.
+//! - **FilenameOnly**: filename matches, and no hash evidence was available.
+//! - **Ambiguous**: candidates exist, but the evidence conflicts.
+//! - **NotInDat**: every hash that could be compared found no candidate.
+//! - **NoUsableEvidence**: no hash to compare, and the filename matched nothing.
+//!
+//! # Every shared algorithm is tried, not just the strongest
+//!
+//! A DAT carries the algorithms its publisher chose; the caller knows whatever
+//! ArchiveFS happens to have computed. The two sets overlap but neither contains
+//! the other - a No-Intro DAT publishes CRC32/MD5/SHA-1 and no SHA-256, so
+//! stopping at the strongest hash the *caller* holds reports a perfectly matching
+//! file as absent from the catalogue. Each algorithm is tried in descending order
+//! of strength and the first that finds any candidate decides the verdict.
 
 use serde::Serialize;
 
@@ -29,7 +39,7 @@ pub enum AuditVerdict {
         rom_name: String,
         algorithm: &'static str,
     },
-    /// Strong hash matches multiple DAT entries.
+    /// A cryptographic hash matches multiple DAT entries.
     ExactMultipleCandidates {
         algorithm: &'static str,
         count: usize,
@@ -37,6 +47,17 @@ pub enum AuditVerdict {
     },
     /// CRC32 plus exact size match.
     Probable { game_name: String, rom_name: String },
+    /// CRC32 (with or without size) matches several DAT entries.
+    ///
+    /// Deliberately *not* `ExactMultipleCandidates`: CRC32 is a 32-bit checksum,
+    /// and several entries sharing one is as likely to be a collision as a real
+    /// set of identical dumps. Reporting it as an "Exact" verdict would claim a
+    /// confidence the evidence does not support.
+    ProbableMultipleCandidates {
+        algorithm: &'static str,
+        count: usize,
+        game_names: Vec<String>,
+    },
     /// Filename matches, but no hash to confirm.
     FilenameOnly { game_name: String, rom_name: String },
     /// Candidate exists, but evidence conflicts.
@@ -52,6 +73,7 @@ impl AuditVerdict {
         match self {
             Self::Exact { .. } => "Exact",
             Self::ExactMultipleCandidates { .. } => "Exact (multiple)",
+            Self::ProbableMultipleCandidates { .. } => "Probable (multiple)",
             Self::Probable { .. } => "Probable",
             Self::FilenameOnly { .. } => "Filename only",
             Self::Ambiguous { .. } => "Ambiguous",
@@ -60,6 +82,10 @@ impl AuditVerdict {
         }
     }
 
+    /// Whether the verdict rests on a cryptographic hash.
+    ///
+    /// CRC32 verdicts are excluded however many entries they matched: a 32-bit
+    /// checksum agreeing is not the same kind of evidence as SHA-1 agreeing.
     pub fn is_confident(&self) -> bool {
         matches!(
             self,
@@ -90,6 +116,7 @@ pub struct AuditSummary {
     pub exact_multiple: usize,
     pub probable: usize,
     pub filename_only: usize,
+    pub probable_multiple: usize,
     pub ambiguous: usize,
     pub not_in_dat: usize,
     pub no_evidence: usize,
@@ -171,81 +198,87 @@ pub fn audit_files(known: &[KnownFileEvidence], index: &DatIndex) -> AuditReport
 }
 
 fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
-    // Try SHA-256 first (strongest).
-    if let Some(ref sha256) = known.sha256 {
-        let candidates = index.lookup_sha256(sha256);
-        return handle_candidates(candidates, "SHA-256");
-    }
+    // Strongest first, but *every* algorithm the caller holds is tried until one
+    // finds candidates. Returning on the first algorithm the caller happens to
+    // know reports a matching file as absent whenever the DAT does not publish
+    // that particular algorithm.
+    let mut compared_any = false;
 
-    // Try SHA-1.
-    if let Some(ref sha1) = known.sha1 {
-        let candidates = index.lookup_sha1(sha1);
-        return handle_candidates(candidates, "SHA-1");
-    }
-
-    // Try MD5.
-    if let Some(ref md5) = known.md5 {
-        let candidates = index.lookup_md5(md5);
-        return handle_candidates(candidates, "MD5");
-    }
-
-    // Try CRC32 with exact size.
-    if let Some(ref crc) = known.crc32 {
-        if let Some(size) = known.size_bytes {
-            let candidates = index.lookup_crc32(crc);
-            let size_matched: Vec<_> = candidates
-                .iter()
-                .filter(|r| r.size_bytes == Some(size))
-                .collect();
-            match size_matched.len() {
-                1 => {
-                    return AuditVerdict::Probable {
-                        game_name: size_matched[0].game_name.clone(),
-                        rom_name: size_matched[0].rom_name.clone(),
-                    };
-                }
-                0 => {
-                    // CRC32 matched but size didn't — ambiguous.
-                    if !candidates.is_empty() {
-                        return AuditVerdict::Ambiguous {
-                            detail: format!(
-                                "CRC32 {crc} matches {} DAT entry(s), but size {size} disagrees",
-                                candidates.len()
-                            ),
-                        };
-                    }
-                }
-                _ => {
-                    return AuditVerdict::ExactMultipleCandidates {
-                        algorithm: "CRC32+size",
-                        count: size_matched.len(),
-                        game_names: size_matched.iter().map(|r| r.game_name.clone()).collect(),
-                    };
-                }
-            }
-        } else {
-            // CRC32 without size — less strong, but still evidence.
-            let candidates = index.lookup_crc32(crc);
-            match candidates.len() {
-                0 => return AuditVerdict::NotInDat,
-                1 => {
-                    return AuditVerdict::Probable {
-                        game_name: candidates[0].game_name.clone(),
-                        rom_name: candidates[0].rom_name.clone(),
-                    };
-                }
-                _ => {
-                    return AuditVerdict::ExactMultipleCandidates {
-                        algorithm: "CRC32",
-                        count: candidates.len(),
-                        game_names: candidates.iter().map(|r| r.game_name.clone()).collect(),
-                    };
-                }
-            }
+    for (value, algorithm) in [
+        (known.sha256.as_deref(), "SHA-256"),
+        (known.sha1.as_deref(), "SHA-1"),
+        (known.md5.as_deref(), "MD5"),
+    ] {
+        let Some(value) = value else { continue };
+        let Some(normalised) = normalise_for_lookup(value, algorithm) else {
+            continue;
+        };
+        compared_any = true;
+        let candidates = match algorithm {
+            "SHA-256" => index.lookup_sha256(&normalised),
+            "SHA-1" => index.lookup_sha1(&normalised),
+            _ => index.lookup_md5(&normalised),
+        };
+        if !candidates.is_empty() {
+            return handle_candidates(candidates, algorithm);
         }
     }
 
-    // Try filename as last resort.
+    // CRC32, qualified by size when both are known.
+    if let Some(crc) = known.crc32.as_deref()
+        && let Some(normalised) = normalise_for_lookup(crc, "CRC32")
+    {
+        compared_any = true;
+        let candidates = index.lookup_crc32(&normalised);
+        if !candidates.is_empty() {
+            return match known.size_bytes {
+                Some(size) => {
+                    let matched: Vec<_> = candidates
+                        .iter()
+                        .filter(|r| r.size_bytes == Some(size))
+                        .collect();
+                    match matched.len() {
+                        1 => AuditVerdict::Probable {
+                            game_name: matched[0].game_name.clone(),
+                            rom_name: matched[0].rom_name.clone(),
+                        },
+                        0 => AuditVerdict::Ambiguous {
+                            detail: format!(
+                                "CRC32 {normalised} matches {} DAT entry(s), but size {size} \
+                                 disagrees with all of them",
+                                candidates.len()
+                            ),
+                        },
+                        _ => AuditVerdict::ProbableMultipleCandidates {
+                            algorithm: "CRC32+size",
+                            count: matched.len(),
+                            game_names: matched.iter().map(|r| r.game_name.clone()).collect(),
+                        },
+                    }
+                }
+                None => match candidates.len() {
+                    1 => AuditVerdict::Probable {
+                        game_name: candidates[0].game_name.clone(),
+                        rom_name: candidates[0].rom_name.clone(),
+                    },
+                    _ => AuditVerdict::ProbableMultipleCandidates {
+                        algorithm: "CRC32",
+                        count: candidates.len(),
+                        game_names: candidates.iter().map(|r| r.game_name.clone()).collect(),
+                    },
+                },
+            };
+        }
+    }
+
+    // Something was comparable and none of it found anything: the file is not in
+    // this DAT. Falling through to the filename here would dress a name collision
+    // up as a match after the hashes had already said otherwise.
+    if compared_any {
+        return AuditVerdict::NotInDat;
+    }
+
+    // No hash at all. A filename match is worth reporting, but only as itself.
     let filename = std::path::Path::new(&known.filepath)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -261,6 +294,23 @@ fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
     }
 
     AuditVerdict::NoUsableEvidence
+}
+
+/// Normalises a caller-supplied hash the same way the index normalised the DAT's.
+///
+/// The index is keyed on lowercase hex of a fixed length, because that is what
+/// the parsers store. A caller holding the same hash in uppercase - which is how
+/// plenty of tools print them - would otherwise miss every entry and be told the
+/// file is not in the DAT. A value that is not a well-formed hash for its
+/// algorithm is not looked up at all.
+fn normalise_for_lookup(value: &str, algorithm: &str) -> Option<String> {
+    use super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
+    match algorithm {
+        "SHA-256" => normalise_sha256(value),
+        "SHA-1" => normalise_sha1(value),
+        "MD5" => normalise_md5(value),
+        _ => normalise_crc32(value),
+    }
 }
 
 fn handle_candidates(
@@ -292,6 +342,7 @@ fn build_summary(entries: &[AuditEntry]) -> AuditSummary {
             AuditVerdict::Exact { .. } => summary.exact += 1,
             AuditVerdict::ExactMultipleCandidates { .. } => summary.exact_multiple += 1,
             AuditVerdict::Probable { .. } => summary.probable += 1,
+            AuditVerdict::ProbableMultipleCandidates { .. } => summary.probable_multiple += 1,
             AuditVerdict::FilenameOnly { .. } => summary.filename_only += 1,
             AuditVerdict::Ambiguous { .. } => summary.ambiguous += 1,
             AuditVerdict::NotInDat => summary.not_in_dat += 1,

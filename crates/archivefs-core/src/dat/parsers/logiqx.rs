@@ -1,9 +1,21 @@
 //! Streaming Logiqx XML DAT file parser.
 //!
 //! Parses the standard XML format used by No-Intro and Redump DAT files.
-//! Uses streaming (pull-based) XML parsing to keep memory flat regardless
-//! of file size, and explicitly rejects DOCTYPE declarations, entity
-//! declarations, and unsupported entity references.
+//! Uses streaming (pull-based) XML parsing, so the *document* is never held in
+//! memory at once - though the parsed model is, and it grows with the number of
+//! entries.
+//!
+//! # Entities
+//!
+//! `quick-xml` with `default-features = false` performs no DTD processing: a
+//! DOCTYPE arrives as inert text, no external DTD is fetched, and no declared
+//! entity is ever expanded. A DOCTYPE is therefore accepted (every real
+//! No-Intro and Redump DAT carries one) and recorded as a warning.
+//!
+//! Only the five predefined XML entities and numeric character references are
+//! resolved. A reference to anything else - including an entity a DOCTYPE
+//! purports to declare - cannot be resolved, and is reported as a warning
+//! rather than silently dropping the text that contained it.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -125,11 +137,11 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         current_roms = Vec::new();
                     }
                     "rom" => {
-                        if let Some(ref game_name) = current_game_name
-                            && current_roms.len() >= limits.max_roms_per_entry
-                        {
+                        if current_roms.len() >= limits.max_roms_per_entry {
                             return Err(ParseError::RomsPerEntryExceeded {
-                                game_name: game_name.clone(),
+                                game_name: current_game_name
+                                    .clone()
+                                    .unwrap_or_else(|| "<unnamed game>".to_string()),
                                 count: current_roms.len(),
                                 limit: limits.max_roms_per_entry,
                             });
@@ -250,6 +262,21 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     .to_ascii_lowercase();
 
                 if tag == "rom" {
+                    // Real Logiqx DATs write every ROM as a self-closing element,
+                    // so this - not the Start/End pair below - is the path that
+                    // actually needs the ceiling. Checked against the game being
+                    // built whether or not it carries a name, because an unnamed
+                    // game is exactly the case where an unbounded list would be
+                    // built without anyone noticing.
+                    if current_roms.len() >= limits.max_roms_per_entry {
+                        return Err(ParseError::RomsPerEntryExceeded {
+                            game_name: current_game_name
+                                .clone()
+                                .unwrap_or_else(|| "<unnamed game>".to_string()),
+                            count: current_roms.len(),
+                            limit: limits.max_roms_per_entry,
+                        });
+                    }
                     let rom_name =
                         attr_str_checked(empty_bytes, b"name", limits.max_identifier_length)?;
                     let rom_name = match rom_name {
@@ -290,8 +317,23 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                 text_buf.clear();
             }
             Ok(Event::Text(ref text_bytes)) => {
-                if let Ok(s) = text_bytes.unescape() {
-                    text_buf.push_str(&s);
+                match text_bytes.unescape() {
+                    Ok(decoded) => text_buf.push_str(&decoded),
+                    Err(error) => {
+                        // Only a DTD could define whatever this references, and no
+                        // DTD is processed. Keeping the raw text preserves the
+                        // field; the warning is what stops the loss being silent.
+                        record_warning(
+                            &mut warnings,
+                            limits.max_warnings,
+                            format!(
+                                "unresolvable entity reference in text kept as written: {error}"
+                            ),
+                        );
+                        if let Ok(raw) = std::str::from_utf8(text_bytes.as_ref()) {
+                            text_buf.push_str(raw);
+                        }
+                    }
                 }
             }
             Ok(Event::CData(ref cdata_bytes)) => {
@@ -300,7 +342,24 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                 }
             }
             Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {}
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // quick-xml rejects a cut *inside* a tag, but a file cut cleanly
+                // between elements simply ends with elements still open - which is
+                // what a half-written or half-downloaded DAT looks like. The
+                // entries recovered so far are real, so they are kept, but the
+                // caller has to be told the catalogue is incomplete.
+                if depth > 0 {
+                    record_warning(
+                        &mut warnings,
+                        limits.max_warnings,
+                        format!(
+                            "document ended with {depth} element(s) still open: the DAT is \
+                             truncated and these entries may be incomplete"
+                        ),
+                    );
+                }
+                break;
+            }
             Err(error) => {
                 return Err(ParseError::MalformedXml {
                     detail: error.to_string(),
@@ -393,12 +452,35 @@ fn attr_str_checked(
     Ok(value)
 }
 
+/// Reads one attribute, resolving XML entity references in its value.
+///
+/// `Attribute::value` is the *raw* escaped bytes. Real DAT files are full of
+/// `&amp;` in game and ROM names ("Tom &amp; Jerry"), so using the raw value
+/// stores a name that matches nothing and displays wrongly. `unescape_value`
+/// resolves the predefined entities and numeric character references.
+///
+/// A value that cannot be unescaped - it references an entity only a DTD could
+/// define - falls back to the raw text rather than being dropped, so the name is
+/// still present and still comparable, and `attribute_unescape_failed` reports
+/// it to the caller.
 fn attr_str_opt(elem: &quick_xml::events::BytesStart<'_>, attr_name: &[u8]) -> Option<String> {
-    elem.try_get_attribute(attr_name)
-        .ok()
-        .flatten()
-        .map(|attr| String::from_utf8_lossy(&attr.value).into_owned())
-        .filter(|v| !v.is_empty())
+    attr_str_reporting(elem, attr_name).map(|(value, _)| value)
+}
+
+/// As [`attr_str_opt`], but also says whether unescaping failed.
+fn attr_str_reporting(
+    elem: &quick_xml::events::BytesStart<'_>,
+    attr_name: &[u8],
+) -> Option<(String, bool)> {
+    let attr = elem.try_get_attribute(attr_name).ok().flatten()?;
+    let (value, failed) = match attr.unescape_value() {
+        Ok(decoded) => (decoded.into_owned(), false),
+        Err(_) => (String::from_utf8_lossy(&attr.value).into_owned(), true),
+    };
+    if value.is_empty() {
+        return None;
+    }
+    Some((value, failed))
 }
 
 fn attr_u64(

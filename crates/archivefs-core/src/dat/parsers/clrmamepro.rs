@@ -399,9 +399,16 @@ fn apply_kvs(line: &str, cb: &mut dyn FnMut(&str, &str)) {
             break;
         }
 
-        // Read key (alphabetic chars)
+        // Read key.
+        //
+        // Alphanumeric, not alphabetic: every strong-hash key in this format ends
+        // in a digit (`md5`, `sha1`, `sha256`). Stopping at the first digit split
+        // `md5 <hash>` into the key `md` with the value `5`, left the hash itself
+        // starting with a hex digit, and the next iteration discarded it as a
+        // non-alphabetic token - so every MD5, SHA-1 and SHA-256 in a ClrMamePro
+        // DAT was silently dropped while `crc` came through.
         let key_start = pos;
-        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
+        while pos < bytes.len() && bytes[pos].is_ascii_alphanumeric() {
             pos += 1;
         }
         if key_start == pos {
@@ -581,9 +588,9 @@ fn parse_header_field(
 ) {
     let lower = line.to_ascii_lowercase();
     if lower.starts_with("name ") {
-        *name = Some(line[5..].trim().to_string());
+        *name = Some(unquote(&line[5..]));
     } else if lower.starts_with("description ") {
-        let text = line[12..].trim().to_string();
+        let text = unquote(&line[12..]);
         if text.len() > limits.max_description_length {
             push_warning(
                 warnings,
@@ -599,10 +606,25 @@ fn parse_header_field(
             *description = Some(text);
         }
     } else if lower.starts_with("version ") {
-        *version = Some(line[8..].trim().to_string());
+        *version = Some(unquote(&line[8..]));
     } else if lower.starts_with("author ") {
-        *author = Some(line[7..].trim().to_string());
+        *author = Some(unquote(&line[7..]));
     }
+}
+
+/// Trims a header value and removes one matched pair of surrounding quotes.
+///
+/// The game and ROM parsers already strip quotes via `apply_kvs`; the header
+/// parser did not, so a header read back `"\"Commodore C64 - Games\""` while the
+/// games in the same file read back cleanly. Ecosystem detection and every
+/// display of the DAT's name inherited the stray quotes.
+fn unquote(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    unquoted.to_string()
 }
 
 fn detect_clrmamepro_ecosystem(

@@ -45,7 +45,9 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(command) = args.first().cloned() else {
         return Err(
             "dat requires a sub-command: inspect <path> | validate <path> | audit <path> [--json] \
-             [--file <path> ...]"
+             [--file <path> ...]\n\
+             \x20 --file compares the given name against the DAT. It does not open,\n\
+             \x20 read or hash the file."
                 .into(),
         );
     };
@@ -282,7 +284,13 @@ fn run_audit(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = extract_flag(&mut args, "--json");
     let path = take_first_path(&mut args, "dat audit requires a DAT file path")?;
 
-    // Collect --file arguments for local files to audit.
+    // Collect --file arguments.
+    //
+    // Stage 1A audits *known hashes*, and the CLI has no source of hashes for an
+    // arbitrary path: nothing here opens, stats or hashes the file named. So a
+    // `--file` can only ever be compared on its name, and the output has to say
+    // so - reporting a bare "Filename only -> Some Game" for a corrupt dump, or
+    // for a path that does not exist, reads as though the file had been checked.
     let mut local_files: Vec<PathBuf> = Vec::new();
     while let Some(pos) = args.iter().position(|a| a == "--file") {
         if pos + 1 >= args.len() {
@@ -360,10 +368,20 @@ fn run_audit(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     // Audit results
     let s = &report.summary;
-    writeln!(&mut out, "Audited: {} files", s.total).unwrap();
+    if !local_files.is_empty() {
+        writeln!(
+            &mut out,
+            "Note: --file compares names only. No file is opened, read or hashed,\n\
+             \x20     so a match here says a name is in the DAT - not that this file is."
+        )
+        .unwrap();
+        writeln!(&mut out).unwrap();
+    }
+    writeln!(&mut out, "Audited: {} files (by name)", s.total).unwrap();
     writeln!(&mut out, "  Exact:       {}", s.exact).unwrap();
     writeln!(&mut out, "  Exact (mult): {}", s.exact_multiple).unwrap();
     writeln!(&mut out, "  Probable:    {}", s.probable).unwrap();
+    writeln!(&mut out, "  Probable (mult): {}", s.probable_multiple).unwrap();
     writeln!(&mut out, "  Filename:    {}", s.filename_only).unwrap();
     writeln!(&mut out, "  Ambiguous:   {}", s.ambiguous).unwrap();
     writeln!(&mut out, "  Not in DAT:  {}", s.not_in_dat).unwrap();
@@ -384,6 +402,10 @@ fn run_audit(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 archivefs_core::dat::audit::AuditVerdict::ExactMultipleCandidates {
                     count, ..
+                }
+                | archivefs_core::dat::audit::AuditVerdict::ProbableMultipleCandidates {
+                    count,
+                    ..
                 } => {
                     format!(" -> {count} candidates")
                 }

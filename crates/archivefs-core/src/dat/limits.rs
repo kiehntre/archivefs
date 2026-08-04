@@ -17,10 +17,23 @@ pub const DEFAULT_MAX_ENTRIES: usize = 500_000;
 pub const ABSOLUTE_MAX_ENTRIES: usize = 2_000_000;
 
 /// Maximum number of ROM entries per game.
-pub const DEFAULT_MAX_ROMS_PER_ENTRY: usize = 256;
+///
+/// Raised hard from 256 during review. The old value was never reached, because
+/// the ceiling was not enforced on the self-closing `<rom/>` form every real
+/// Logiqx DAT uses; now that it is, the number has to clear real data by a wide
+/// margin rather than merely look conservative. A MAME machine routinely
+/// declares several hundred ROM regions and the largest run into the thousands,
+/// so a tight value here rejects correct catalogues - the failure mode nobody
+/// wants from a limit whose only job is to stop a hostile file exhausting
+/// memory.
+///
+/// The real bound on memory is [`DEFAULT_MAX_FILE_SIZE`]: a file cannot declare
+/// more ROM elements than there is room to write them in. This ceiling is a
+/// backstop behind that one, so it is set far above any plausible catalogue.
+pub const DEFAULT_MAX_ROMS_PER_ENTRY: usize = 1_000_000;
 
 /// Upper ceiling for ROMs per game.
-pub const ABSOLUTE_MAX_ROMS_PER_ENTRY: usize = 2_048;
+pub const ABSOLUTE_MAX_ROMS_PER_ENTRY: usize = 16_000_000;
 
 /// Maximum length of a game name or ROM name, in bytes.
 pub const DEFAULT_MAX_IDENTIFIER_LENGTH: usize = 8_192;
