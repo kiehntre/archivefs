@@ -1,0 +1,475 @@
+//! Running a read-only DAT audit over a folder of local files.
+//!
+//! [`crate::dat::audit`] compares *known evidence* against an index and never
+//! touches a file. This module is what produces that evidence for a real
+//! library: it walks a folder, hashes what it finds, and hands the results to
+//! the existing audit. Every verdict a run reports comes from
+//! [`crate::dat::audit::audit_files`] unchanged - no category is added here,
+//! and none is reinterpreted.
+//!
+//! # Read-only, and provably so
+//!
+//! The only filesystem calls in this module are `read_dir`, `symlink_metadata`,
+//! and [`crate::identity_source::hashing::hash_file_reporting`], which opens
+//! read-only through [`crate::safe_read`]. There is no create, write, rename,
+//! remove, truncate, permission change, or symlink operation anywhere in the
+//! module, and nothing is written beside the files being scanned. An audit
+//! leaves a library byte-for-byte as it found it.
+//!
+//! # Bounded and cancellable
+//!
+//! - The walk stops at [`MAX_SCAN_DEPTH`] directories deep and
+//!   [`MAX_SCAN_FILES`] files, reporting that it truncated rather than
+//!   pretending it saw everything.
+//! - Files are hashed in fixed chunks, so memory is flat regardless of how big
+//!   a disc image is.
+//! - The cancellation flag is checked before every file and inside every chunk,
+//!   so stopping a run over a large library takes effect within one chunk
+//!   rather than at the end.
+//! - Progress is reported through a callback the caller supplies. The callback
+//!   runs on the worker thread and must not block; a GUI sends one bounded
+//!   channel message and returns.
+//!
+//! # What "no hash" means in a verdict
+//!
+//! A file too large for automatic hashing, or one the read policy refuses, is
+//! still audited - by name only - and is listed separately in
+//! [`DatAuditOutcome::unhashed`] with the reason. That distinction matters: a
+//! `FilenameOnly` verdict for a file nobody hashed says a *name* is in the
+//! catalogue, not that this file is, and the report has to be able to say which
+//! of the two happened.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde::Serialize;
+
+use super::{DatSourceKind, validation};
+use crate::dat::audit::{AuditReport, KnownFileEvidence, audit_files};
+use crate::dat::index::DatIndex;
+use crate::dat::limits::DatLimits;
+use crate::dat::model::ParsedDat;
+use crate::dat::parsers::parse_dat_file;
+use crate::identity_source::hashing::{HashRefusal, hash_file_reporting};
+use crate::safe_read::TrustedRoots;
+
+/// How deep the scan descends below the chosen folder.
+///
+/// A ROM library is normally two or three levels - platform, maybe publisher,
+/// then files. Eight leaves generous room for an unusual arrangement while
+/// keeping the walk finite on a tree that has been made pathological.
+pub const MAX_SCAN_DEPTH: usize = 8;
+
+/// How many files one audit run will take.
+///
+/// This is the memory bound: each file contributes one [`KnownFileEvidence`]
+/// (a handful of short strings) and one [`crate::dat::audit::AuditEntry`], so
+/// the ceiling is what keeps a run over an enormous tree from growing without
+/// limit. Exceeding it truncates the run and says so.
+pub const MAX_SCAN_FILES: usize = 25_000;
+
+/// How many directory entries the walk will examine, DAT-relevant or not.
+pub const MAX_SCAN_ENTRIES_EXAMINED: usize = 200_000;
+
+/// What the audit is being run against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatAuditRequest {
+    pub source_id: String,
+    pub source_display_name: String,
+    pub dat_path: PathBuf,
+    pub dat_kind: DatSourceKind,
+    /// The folder of local files to compare against the catalogue.
+    pub scan_root: PathBuf,
+    pub limits: DatLimits,
+}
+
+/// A file that was audited without hash evidence, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnhashedFile {
+    pub path: String,
+    pub file_name: String,
+    /// A stable reason code from [`HashRefusal::code`].
+    pub code: String,
+    pub detail: String,
+}
+
+/// Progress from a running audit.
+///
+/// Every variant is cheap to construct: a run over 20,000 files must not spend
+/// its time building progress messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatAuditProgress {
+    /// Reading the catalogue itself.
+    ReadingCatalogue { file_name: String },
+    /// The catalogue is indexed and the walk is about to start.
+    CatalogueReady { entries: usize, roms: usize },
+    /// Walking the folder, before any hashing.
+    Scanning { files_found: usize },
+    /// Hashing one file. `index` is 1-based over `total`.
+    Hashing {
+        index: usize,
+        total: usize,
+        file_name: String,
+    },
+    /// Comparing the collected evidence against the index.
+    Comparing { files: usize },
+}
+
+/// Why an audit could not produce a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatAuditError {
+    /// The DAT source's own path was refused.
+    DatPath(String),
+    /// The folder to audit was refused.
+    ScanPath(String),
+    /// Every DAT file in the source failed to parse.
+    NoCatalogue(String),
+    /// There was nothing to compare.
+    NothingToAudit(String),
+    Cancelled,
+}
+
+impl std::fmt::Display for DatAuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DatPath(detail) => write!(f, "the DAT source could not be read: {detail}"),
+            Self::ScanPath(detail) => write!(f, "the folder could not be read: {detail}"),
+            Self::NoCatalogue(detail) => write!(f, "no usable catalogue: {detail}"),
+            Self::NothingToAudit(detail) => write!(f, "{detail}"),
+            Self::Cancelled => write!(f, "the audit was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for DatAuditError {}
+
+/// Everything one audit run produced.
+///
+/// Provenance is part of the result, not something a caller has to remember:
+/// the source ID, its display name, the catalogue path, and the catalogue
+/// headers the run actually read are all carried here, so a report can say
+/// which source produced it long after the page state has moved on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatAuditOutcome {
+    pub source_id: String,
+    pub source_display_name: String,
+    pub dat_path: String,
+    pub scan_root: String,
+    /// The catalogue headers read, for provenance. One per DAT file that
+    /// parsed.
+    pub catalogue_names: Vec<String>,
+    pub catalogue_entries: usize,
+    pub catalogue_roms: usize,
+    /// DAT files in a folder source that did not parse and so contributed
+    /// nothing to the index.
+    pub unreadable_catalogues: Vec<String>,
+    pub report: AuditReport,
+    pub unhashed: Vec<UnhashedFile>,
+    pub files_scanned: usize,
+    pub bytes_hashed: u64,
+    /// The walk hit a ceiling, so this is part of the folder and not all of it.
+    pub truncated: bool,
+}
+
+impl DatAuditOutcome {
+    /// One line describing what was compared, for a status row.
+    pub fn headline(&self) -> String {
+        format!(
+            "{} files compared against {} catalogue entries from '{}'",
+            self.report.summary.total, self.catalogue_entries, self.source_display_name
+        )
+    }
+}
+
+/// Runs a read-only audit.
+///
+/// `trusted` is passed straight to the hashing policy: it decides whether a
+/// symlinked ROM may be followed, exactly as it does everywhere else in the
+/// build. Pass [`TrustedRoots::none`] to refuse every symlink.
+///
+/// `on_progress` runs on the calling thread between units of work.
+pub fn run_dat_audit(
+    request: &DatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<DatAuditOutcome, DatAuditError> {
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
+
+    // ---- 1. Read the catalogue ------------------------------------------
+    let dat_files = match request.dat_kind {
+        DatSourceKind::File => {
+            validation::validate_dat_path(&request.dat_path, DatSourceKind::File)
+                .map_err(|refusal| DatAuditError::DatPath(refusal.detail()))?;
+            vec![request.dat_path.clone()]
+        }
+        DatSourceKind::Folder => {
+            validation::discover_dat_files(&request.dat_path)
+                .map_err(|refusal| DatAuditError::DatPath(refusal.detail()))?
+                .files
+        }
+    };
+
+    if dat_files.is_empty() {
+        return Err(DatAuditError::NoCatalogue(
+            "the source contains no DAT files".to_string(),
+        ));
+    }
+
+    let mut catalogue_names = Vec::new();
+    let mut unreadable_catalogues = Vec::new();
+    let mut merged: Option<ParsedDat> = None;
+
+    for path in &dat_files {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let file_name = file_name_of(path);
+        on_progress(DatAuditProgress::ReadingCatalogue {
+            file_name: file_name.clone(),
+        });
+        match parse_dat_file(path, request.limits) {
+            Ok(parsed) => {
+                catalogue_names.push(
+                    parsed
+                        .dat
+                        .source
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| file_name.clone()),
+                );
+                match merged.as_mut() {
+                    // Several DAT files in one folder source become one index:
+                    // the user registered the folder as a single source, so a
+                    // file matching any catalogue in it is a match for the
+                    // source. Collisions between them are not hidden - the
+                    // index keeps every candidate, and the audit reports the
+                    // multiple-candidate verdicts it already has for that.
+                    Some(target) => {
+                        target.games.extend(parsed.dat.games);
+                        target.source.entry_count = target
+                            .source
+                            .entry_count
+                            .saturating_add(parsed.dat.source.entry_count);
+                        target.source.rom_count = target
+                            .source
+                            .rom_count
+                            .saturating_add(parsed.dat.source.rom_count);
+                    }
+                    None => merged = Some(parsed.dat),
+                }
+            }
+            Err(error) => {
+                unreadable_catalogues.push(format!("{file_name}: {error}"));
+            }
+        }
+    }
+
+    let Some(catalogue) = merged else {
+        return Err(DatAuditError::NoCatalogue(unreadable_catalogues.join("; ")));
+    };
+
+    let index = DatIndex::build(&catalogue);
+    let catalogue_entries = catalogue.source.entry_count;
+    let catalogue_roms = catalogue.source.rom_count;
+    // The parsed games are no longer needed once indexed; the index owns what
+    // the lookups use, and a 500,000-entry catalogue is not worth holding twice.
+    drop(catalogue);
+
+    on_progress(DatAuditProgress::CatalogueReady {
+        entries: catalogue_entries,
+        roms: catalogue_roms,
+    });
+
+    // ---- 2. Walk the folder ---------------------------------------------
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
+    let scan = scan_local_files(&request.scan_root, cancel, on_progress)?;
+    if scan.files.is_empty() {
+        return Err(DatAuditError::NothingToAudit(format!(
+            "no files were found in {}",
+            request.scan_root.display()
+        )));
+    }
+
+    // ---- 3. Hash what was found -----------------------------------------
+    let total = scan.files.len();
+    let mut known: Vec<KnownFileEvidence> = Vec::with_capacity(total);
+    let mut unhashed: Vec<UnhashedFile> = Vec::new();
+    let mut bytes_hashed: u64 = 0;
+
+    for (position, path) in scan.files.iter().enumerate() {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let file_name = file_name_of(path);
+        on_progress(DatAuditProgress::Hashing {
+            index: position + 1,
+            total,
+            file_name: file_name.clone(),
+        });
+
+        let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
+        // Progress inside a single file is deliberately not forwarded: a
+        // per-chunk callback over 25,000 files is a great deal of traffic for
+        // a number nobody reads, and the per-file line already moves.
+        match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
+            Ok(hashes) => {
+                bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
+                known.push(
+                    evidence
+                        .with_size(hashes.fingerprint.size_bytes)
+                        .with_crc32(hashes.crc32)
+                        .with_md5(hashes.md5)
+                        .with_sha1(hashes.sha1),
+                );
+            }
+            Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
+            Err(refusal) => {
+                unhashed.push(UnhashedFile {
+                    path: path.to_string_lossy().into_owned(),
+                    file_name,
+                    code: refusal.code().to_string(),
+                    detail: refusal.detail(),
+                });
+                // Still audited, on its name alone. The verdict it can reach
+                // that way is `FilenameOnly` at best, which is exactly what
+                // the evidence supports, and `unhashed` records why.
+                known.push(evidence);
+            }
+        }
+    }
+
+    // ---- 4. Compare ------------------------------------------------------
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
+    on_progress(DatAuditProgress::Comparing { files: known.len() });
+    let report = audit_files(&known, &index);
+
+    Ok(DatAuditOutcome {
+        source_id: request.source_id.clone(),
+        source_display_name: request.source_display_name.clone(),
+        dat_path: request.dat_path.to_string_lossy().into_owned(),
+        scan_root: request.scan_root.to_string_lossy().into_owned(),
+        catalogue_names,
+        catalogue_entries,
+        catalogue_roms,
+        unreadable_catalogues,
+        files_scanned: scan.files.len(),
+        truncated: scan.truncated,
+        report,
+        unhashed,
+        bytes_hashed,
+    })
+}
+
+struct LocalScan {
+    files: Vec<PathBuf>,
+    truncated: bool,
+}
+
+/// Walks `root`, collecting regular files in a deterministic order.
+///
+/// Symlinked *directories* are not descended into: following one can produce a
+/// cycle, and a folder that links elsewhere is asking the scan to leave the
+/// tree the user chose. Symlinked *files* are collected and left to the read
+/// policy, which is the one place in the build that decides whether a link may
+/// be followed - duplicating that decision here would be a second, divergent
+/// answer to the same question.
+fn scan_local_files(
+    root: &Path,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<LocalScan, DatAuditError> {
+    if !root.is_absolute() {
+        return Err(DatAuditError::ScanPath(
+            "the folder path is not absolute".to_string(),
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| DatAuditError::ScanPath(format!("{}: {error}", root.display())))?;
+    if !metadata.is_dir() {
+        return Err(DatAuditError::ScanPath(format!(
+            "{} is not a folder",
+            root.display()
+        )));
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut truncated = false;
+    let mut examined = 0usize;
+    // Breadth-first over an explicit queue rather than recursion, so depth is a
+    // number this function controls instead of a property of the call stack.
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+
+    while let Some((directory, depth)) = queue.pop_front() {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let Ok(read_dir) = std::fs::read_dir(&directory) else {
+            // An unreadable subdirectory is skipped, not fatal: one permission
+            // problem deep in a library should not throw away the rest of the
+            // audit.
+            continue;
+        };
+
+        let mut children: Vec<PathBuf> = Vec::new();
+        for entry in read_dir {
+            let Ok(entry) = entry else { continue };
+            examined += 1;
+            if examined > MAX_SCAN_ENTRIES_EXAMINED {
+                truncated = true;
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if depth < MAX_SCAN_DEPTH {
+                    children.push(path);
+                } else {
+                    truncated = true;
+                }
+            } else if file_type.is_file() || file_type.is_symlink() {
+                if files.len() >= MAX_SCAN_FILES {
+                    truncated = true;
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+
+        // Sorted per directory so the walk order is stable across runs and
+        // across filesystems; `read_dir` order is not defined.
+        children.sort();
+        for child in children {
+            queue.push_back((child, depth + 1));
+        }
+
+        on_progress(DatAuditProgress::Scanning {
+            files_found: files.len(),
+        });
+        if truncated && files.len() >= MAX_SCAN_FILES {
+            break;
+        }
+    }
+
+    files.sort();
+    Ok(LocalScan { files, truncated })
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
