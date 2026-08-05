@@ -551,17 +551,26 @@ impl CheatSourcesPageState {
             // every non-participating platform announced exceptions the user
             // saved long ago as though saving would newly apply them.
             for (platform, now_participating) in self.participation_changes(&row.id) {
-                out.push(if now_participating {
+                let platform = archivefs_core::platform::display_name_for(&platform);
+                // A source turned off outright is consulted nowhere, so a
+                // per-platform exception under it changes nothing yet. Saying
+                // it "stays enabled elsewhere" - or that it will be used again
+                // - would promise behaviour the user will not observe.
+                out.push(if !row.enabled {
                     format!(
-                        "'{}' will be used for {} games again.",
-                        row.display_name,
-                        archivefs_core::platform::display_name_for(&platform)
+                        "'{}' is turned off everywhere, so this {platform} setting \
+                         has no effect until it is turned back on.",
+                        row.display_name
+                    )
+                } else if now_participating {
+                    format!(
+                        "'{}' will be used for {platform} games again.",
+                        row.display_name
                     )
                 } else {
                     format!(
-                        "'{}' will not be used for {} games, but stays enabled elsewhere.",
-                        row.display_name,
-                        archivefs_core::platform::display_name_for(&platform)
+                        "'{}' will not be used for {platform} games, but stays enabled elsewhere.",
+                        row.display_name
                     )
                 });
             }

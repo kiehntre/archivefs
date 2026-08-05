@@ -856,6 +856,34 @@ fn an_already_saved_exception_is_not_announced_as_a_pending_change() {
 }
 
 #[test]
+fn a_platform_exception_under_a_disabled_source_does_not_promise_it_stays_enabled() {
+    // The line claimed the source "stays enabled elsewhere". When the source is
+    // switched off at source level it is consulted nowhere, so that sentence
+    // described behaviour the user would never see.
+    let path = config_path("consequence-disabled-source");
+    let mut state = CheatSourcesPageState::load(path);
+    state.apply(CheatSourcesPageAction::SetEnabled {
+        id: KNOWN_ID.to_string(),
+        enabled: false,
+    });
+    state.apply(CheatSourcesPageAction::SetPlatformParticipation {
+        id: KNOWN_ID.to_string(),
+        platform: "PS2".to_string(),
+        participating: false,
+    });
+
+    let joined = state.view().pending_consequences.join(" ");
+    assert!(
+        !joined.contains("stays enabled elsewhere"),
+        "a source that is off everywhere does not stay enabled anywhere: {joined}"
+    );
+    assert!(
+        joined.contains("has no effect until it is turned back on"),
+        "the inert setting must be stated plainly: {joined}"
+    );
+}
+
+#[test]
 fn removing_a_saved_exception_is_announced() {
     let path = config_path("consequence-removal");
     let mut state = CheatSourcesPageState::load(path);

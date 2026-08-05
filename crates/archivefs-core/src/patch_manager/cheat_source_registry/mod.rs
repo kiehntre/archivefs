@@ -181,6 +181,13 @@ pub enum UnresolvedPreferenceKind {
     /// A `priority_overrides` line naming a source that is not in the
     /// registry, inside an otherwise resolvable platform block.
     UnknownPriorityOverride { platform: String },
+    /// A `disabled_providers` entry naming a source that is not in the
+    /// registry, inside an otherwise resolvable platform block.
+    ///
+    /// Kept separate from [`Self::UnknownPriorityOverride`] because the two
+    /// send the user to different lines of their file: telling someone to look
+    /// for a priority override that is not there wastes their time.
+    UnknownDisabledProvider { platform: String },
 }
 
 impl UnresolvedPreference {
@@ -197,6 +204,10 @@ impl UnresolvedPreference {
             ),
             UnresolvedPreferenceKind::UnknownPriorityOverride { platform } => format!(
                 "Priority override for unknown provider '{}' under platform '{platform}'. Kept as written.",
+                self.detail
+            ),
+            UnresolvedPreferenceKind::UnknownDisabledProvider { platform } => format!(
+                "Disabled entry for unknown provider '{}' under platform '{platform}'. Kept as written.",
                 self.detail
             ),
         }
@@ -584,7 +595,7 @@ impl CheatSourceRegistry {
             for id in block.disabled_providers.iter().flatten() {
                 if !self.by_id.contains_key(id.as_str()) {
                     out.push(UnresolvedPreference {
-                        kind: UnresolvedPreferenceKind::UnknownPriorityOverride {
+                        kind: UnresolvedPreferenceKind::UnknownDisabledProvider {
                             platform: block.platform.clone(),
                         },
                         detail: id.clone(),
@@ -1471,6 +1482,40 @@ mod tests {
                 entry.describe()
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_disabled_entry_is_not_described_as_a_priority_override() {
+        // Both kinds were reported as UnknownPriorityOverride, so the note sent
+        // the user looking for a priority_overrides line that does not exist in
+        // their file. The two live on different lines and must read differently.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "PS2".to_string(),
+                disabled_providers: Some(vec!["ghost-source".to_string()]),
+                priority_overrides: None,
+            }]),
+        });
+
+        let unresolved = registry.unresolved_preferences();
+        assert_eq!(unresolved.len(), 1, "got {unresolved:?}");
+        assert!(
+            matches!(
+                &unresolved[0].kind,
+                UnresolvedPreferenceKind::UnknownDisabledProvider { platform } if platform == "PS2"
+            ),
+            "got {:?}",
+            unresolved[0].kind
+        );
+
+        let described = unresolved[0].describe();
+        assert!(
+            !described.contains("Priority override"),
+            "a disabled entry must not be called a priority override: {described}"
+        );
+        assert!(described.contains("ghost-source") && described.contains("Kept as written"));
     }
 
     #[test]
