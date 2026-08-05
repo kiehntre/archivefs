@@ -393,6 +393,32 @@ impl DatSourcesPageState {
         self.job.is_some()
     }
 
+    /// Signals cancellation and immediately forgets the running job, whatever
+    /// it targets.
+    ///
+    /// Dropping `self.job` drops the channel's receiving end, so any message
+    /// the worker later sends - including one already in flight - fails
+    /// silently on the sending side (every send in this module is `let _ =
+    /// sender.send(...)`) rather than being read by a future `poll()`. That is
+    /// what makes this safe to call even though the worker thread itself is
+    /// not joined: it keeps running to whatever its own bound is (a parse
+    /// bounded by `DatLimits`, or an audit that now observes `cancel`), but
+    /// nothing it produces can reach page state again.
+    fn abandon_running_job(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Self::abandon_running_job`], but only when the running job targets
+    /// `id` - so removing one source does not cancel an audit or validation
+    /// legitimately running against a different one.
+    fn abandon_job_for(&mut self, id: &str) {
+        if self.job.as_ref().is_some_and(|job| job.source_id == id) {
+            self.abandon_running_job();
+        }
+    }
+
     /// Drains whatever the worker has sent since the last frame.
     ///
     /// Called before [`Self::view`] so the view stays a pure function of state.
@@ -478,6 +504,14 @@ impl DatSourcesPageState {
             }
             DatSourcesPageAction::Remove { id } => {
                 self.action_error = None;
+                // A job in flight for exactly this source must not be allowed
+                // to complete after removal: `poll()` would otherwise write a
+                // validation or audit result for a source no longer in the
+                // registry. The GUI already keeps Remove disabled while any
+                // job runs, but that is a presentation-layer gate, not a
+                // guarantee this state machine can rely on - so it is
+                // enforced here too.
+                self.abandon_job_for(&id);
                 // Registry only. The DAT file, the folder, and everything in it
                 // are untouched - see `DatSourceRegistry::remove`.
                 if self.draft.remove(&id).is_some() {
@@ -501,6 +535,18 @@ impl DatSourcesPageState {
                 }
             }
             DatSourcesPageAction::Revert => {
+                // A running job's result would otherwise still land after the
+                // discard it was supposed to be swept away by: `poll()` does
+                // not check that the job's source survived the revert, so a
+                // job left running here would populate `self.audit` (or a
+                // stale `self.validations` entry) for a source the user just
+                // discarded - including one that no longer exists in the
+                // registry at all, if it had never been saved. Dropping the
+                // job unconditionally, not just when its target vanished,
+                // matches what "discard changes" means: nothing this job
+                // would report is still trustworthy against the reverted
+                // state, whether or not the row it targeted survives.
+                self.abandon_running_job();
                 self.draft = self.saved.clone();
                 self.action_error = None;
             }

@@ -575,6 +575,33 @@ fn removing_a_source_never_deletes_the_dat_file() {
     assert!(registry.is_empty());
 }
 
+#[test]
+fn removing_a_saved_source_then_discarding_restores_it() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("keep.dat", LOGIQX);
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Save);
+    assert!(!page.view().dirty);
+
+    page.apply(DatSourcesPageAction::Remove {
+        id: "keep".to_string(),
+    });
+    assert!(page.view().rows.is_empty(), "removed from the draft");
+    assert!(page.view().dirty);
+
+    page.apply(DatSourcesPageAction::Revert);
+    let view = page.view();
+    assert!(
+        !view.dirty,
+        "discarding a pending removal must restore exactly what was saved"
+    );
+    assert_eq!(view.rows.len(), 1, "the saved source must come back");
+    assert_eq!(view.rows[0].id, "keep");
+    assert!(!view.rows[0].changed);
+}
+
 // ---------------------------------------------------------------------------
 // Validation through the page
 // ---------------------------------------------------------------------------
@@ -657,6 +684,54 @@ fn a_validation_result_becomes_an_unsaved_change_the_user_can_discard() {
     page.apply(DatSourcesPageAction::Revert);
     assert!(!page.view().dirty);
     assert_eq!(page.view().rows[0].health_state, DatHealthState::NotChecked);
+}
+
+#[test]
+fn discarding_while_a_validation_is_in_flight_stops_it_from_landing() {
+    // Regression: `Revert` used to leave the background job running. `poll()`
+    // never checked whether the job's target survived the discard, so a
+    // validation that finished afterwards still wrote its result into
+    // `self.validations` under the source's id - and if that id had never
+    // been saved, the id no longer named anything in the registry at all. A
+    // later add that reused the same auto-suggested id (the ordinary case for
+    // re-adding the same file) would then show stale Inspect detail for a
+    // source nobody had actually checked yet.
+    let fixture = Fixture::new();
+    let dat = fixture.write("no-intro.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat.clone() });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "no-intro".to_string(),
+    });
+    assert!(page.is_busy());
+
+    // The source was never saved, so discarding removes it from the draft
+    // entirely - the sharpest version of the race, since the id the worker is
+    // about to report against will not exist anywhere in the registry.
+    page.apply(DatSourcesPageAction::Revert);
+    assert!(!page.is_busy(), "discarding must stop the job immediately");
+    assert!(page.view().rows.is_empty());
+
+    run_to_completion(&mut page);
+    assert!(page.view().running.is_none());
+    assert!(
+        page.view().rows.is_empty(),
+        "the discarded source must not have reappeared"
+    );
+
+    // Re-adding the same file gets the same suggested id. If the abandoned
+    // job's result had still landed in `self.validations`, this row would
+    // show Inspect detail for a source that was never actually validated.
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    let view = page.view();
+    assert_eq!(view.rows[0].id, "no-intro");
+    assert_eq!(view.rows[0].health_state, DatHealthState::NotChecked);
+    assert!(
+        view.rows[0].detail.is_none(),
+        "a freshly re-added source must not carry Inspect detail from an \
+         abandoned job: {:?}",
+        view.rows[0].detail
+    );
 }
 
 #[test]
@@ -846,6 +921,87 @@ fn removing_a_source_drops_a_result_attributed_to_it() {
     assert!(
         page.view().audit.is_none(),
         "a result attributed to a source that is gone has nothing to point at"
+    );
+}
+
+#[test]
+fn discarding_while_an_audit_is_in_flight_stops_it_from_landing() {
+    // Regression: the same race as
+    // `discarding_while_a_validation_is_in_flight_stops_it_from_landing`, for
+    // the path where the checklist calls it out explicitly - a late audit
+    // result must not be able to update a job that discard already swept
+    // away, even though a real `AuditReport` moving out of the channel does
+    // not touch the row it was for the way a health write does.
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    assert!(page.is_busy());
+
+    page.apply(DatSourcesPageAction::Revert);
+    assert!(
+        !page.is_busy(),
+        "discarding must stop the audit immediately"
+    );
+    assert!(page.view().audit.is_none());
+
+    run_to_completion(&mut page);
+    let view = page.view();
+    assert!(view.running.is_none());
+    assert!(
+        view.audit.is_none(),
+        "an audit result must not appear for a source that was discarded before \
+         the run finished, got: {:?}",
+        view.audit
+    );
+    assert!(
+        view.audit_error.is_none(),
+        "an abandoned job is not a failure the user needs telling about"
+    );
+}
+
+#[test]
+fn removing_a_source_with_no_job_running_does_not_touch_a_different_jobs_job() {
+    // `abandon_job_for` must be surgical: removing a source that is not the
+    // one a running job targets must leave that job alone. Reachable only at
+    // the state layer today, since the GUI disables Remove entirely while any
+    // job runs - covered here so the guarantee does not depend on that gate
+    // staying in place.
+    let (_fixture, mut page, roms) = audit_fixture();
+    let dat_path = page.view().rows[0].path.clone();
+    let unrelated = DatSourceEntry::new(
+        "unrelated".to_string(),
+        "Unrelated".to_string(),
+        PathBuf::from(&dat_path).with_file_name("unrelated.dat"),
+        DatSourceKind::File,
+    );
+    std::fs::write(&unrelated.path, LOGIQX).unwrap();
+    page.apply(DatSourcesPageAction::AddFile {
+        path: unrelated.path.clone(),
+    });
+
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    assert!(page.is_busy());
+
+    // Removing the *other* source must not cancel the audit running against
+    // "collection".
+    page.apply(DatSourcesPageAction::Remove {
+        id: "unrelated".to_string(),
+    });
+    assert!(
+        page.is_busy(),
+        "removing an unrelated source must not cancel a running job"
+    );
+
+    run_to_completion(&mut page);
+    let view = page.view();
+    assert!(
+        view.audit.is_some(),
+        "the audit against the still-registered source must have completed"
     );
 }
 
