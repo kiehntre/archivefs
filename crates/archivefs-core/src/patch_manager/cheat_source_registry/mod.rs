@@ -45,6 +45,21 @@ pub use config::{
 };
 pub use health::CheatSourceHealth;
 
+/// Per-platform participation for one source, as the GUI edits it.
+///
+/// A source can be off for one platform while still enabled everywhere else;
+/// that is `disabled_providers`, and it is deliberately distinct from the
+/// source-level `enabled` flag. Source-level off wins: a platform block can
+/// subtract participation, never add it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformParticipation {
+    /// False when a `disabled_providers` entry names this source.
+    pub participating: bool,
+    /// True when the source is off at source level, which no platform block
+    /// can override. The GUI shows the platform control as inactive then.
+    pub overridden_by_source_level: bool,
+}
+
 use super::bsfree::{BSFREE_PROVIDER_ID, BSFREE_UPSTREAM_PROJECT};
 use super::cheat_sources::trusted_retroarch_cheat_sources;
 use super::dolphin_cheat_catalogue::{DOLPHIN_CATALOGUE_PROVIDER_ID, DOLPHIN_CATALOGUE_REPOSITORY};
@@ -86,6 +101,31 @@ pub struct CheatSourceEntry {
     pub health: Option<CheatSourceHealth>,
 }
 
+impl CheatSourceSpec {
+    /// Whether this source covers `platform_id` at all.
+    ///
+    /// An empty `platforms` list means "every platform" - that is how the
+    /// cross-platform sources are registered - so it is not the same as
+    /// "covers nothing", and the two must not be conflated in a display.
+    pub fn covers_platform(&self, platform_id: &str) -> bool {
+        if self.platforms.is_empty() {
+            return true;
+        }
+        let normalized = crate::canonical_platform_for_alias(platform_id).unwrap_or(platform_id);
+        self.platforms.iter().any(|p| p == normalized)
+    }
+
+    /// Platform coverage for display: the listed platforms, or `None` when the
+    /// source is not platform-specific.
+    pub fn platform_coverage(&self) -> Option<&[String]> {
+        if self.platforms.is_empty() {
+            None
+        } else {
+            Some(&self.platforms)
+        }
+    }
+}
+
 impl CheatSourceEntry {
     pub fn from_spec(spec: CheatSourceSpec) -> Self {
         Self {
@@ -118,11 +158,73 @@ impl std::fmt::Display for DuplicateSourceId {
 
 impl std::error::Error for DuplicateSourceId {}
 
+/// A preferences entry this build cannot act on, kept exactly as written.
+///
+/// Not an error and not a warning about the file being wrong: the usual cause
+/// is a provider a different ArchiveFS build knows about, or a typo the user
+/// can fix. Either way the entry is inert - it never affects resolution - and
+/// it is never rewritten or dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedPreference {
+    pub kind: UnresolvedPreferenceKind,
+    /// The identifier as the user wrote it, for display and for correcting.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnresolvedPreferenceKind {
+    /// A `[[providers]]` entry naming a source that is not in the registry.
+    UnknownProvider,
+    /// A `[[platform_overrides]]` entry whose platform does not canonicalise,
+    /// so it can never match. Its whole block is inert.
+    UnresolvedPlatform,
+    /// A `priority_overrides` line naming a source that is not in the
+    /// registry, inside an otherwise resolvable platform block.
+    UnknownPriorityOverride { platform: String },
+    /// A `disabled_providers` entry naming a source that is not in the
+    /// registry, inside an otherwise resolvable platform block.
+    ///
+    /// Kept separate from [`Self::UnknownPriorityOverride`] because the two
+    /// send the user to different lines of their file: telling someone to look
+    /// for a priority override that is not there wastes their time.
+    UnknownDisabledProvider { platform: String },
+}
+
+impl UnresolvedPreference {
+    /// One line of plain language, for a GUI list or a CLI note.
+    pub fn describe(&self) -> String {
+        match &self.kind {
+            UnresolvedPreferenceKind::UnknownProvider => format!(
+                "Provider '{}' is not one this build knows about. Kept as written.",
+                self.detail
+            ),
+            UnresolvedPreferenceKind::UnresolvedPlatform => format!(
+                "Platform '{}' was not recognised, so its overrides do nothing. Kept as written.",
+                self.detail
+            ),
+            UnresolvedPreferenceKind::UnknownPriorityOverride { platform } => format!(
+                "Priority override for unknown provider '{}' under platform '{platform}'. Kept as written.",
+                self.detail
+            ),
+            UnresolvedPreferenceKind::UnknownDisabledProvider { platform } => format!(
+                "Disabled entry for unknown provider '{}' under platform '{platform}'. Kept as written.",
+                self.detail
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CheatSourceRegistry {
     entries: Vec<CheatSourceEntry>,
     by_id: BTreeMap<String, usize>,
     platform_overrides: Vec<PlatformOverrideEntry>,
+    /// `[[providers]]` entries whose ID matched no registry source, retained
+    /// verbatim and in file order so [`Self::to_config`] can re-emit them.
+    ///
+    /// Without this the provider list was rebuilt from live entries only, and
+    /// an unknown ID vanished the first time anything else was saved.
+    unknown_providers: Vec<ProviderConfigEntry>,
 }
 
 impl CheatSourceRegistry {
@@ -151,6 +253,7 @@ impl CheatSourceRegistry {
             entries,
             by_id,
             platform_overrides: Vec::new(),
+            unknown_providers: Vec::new(),
         })
     }
 
@@ -260,22 +363,40 @@ impl CheatSourceRegistry {
         })
     }
 
+    /// Applies user preferences, keeping every entry this build cannot act on.
+    ///
+    /// An entry naming an unknown provider is moved to `unknown_providers`
+    /// rather than skipped, so [`Self::to_config`] can write it back
+    /// unchanged. Platform overrides are already retained wholesale, including
+    /// ones whose platform never canonicalises; they stay inert but present.
     pub fn apply_config(&mut self, cfg: &CheatSourcesConfig) {
+        self.unknown_providers.clear();
         for provider_cfg in cfg.providers.iter().flatten() {
-            if let Some(entry) = self.get_mut(&provider_cfg.id) {
-                if let Some(enabled) = provider_cfg.enabled {
-                    entry.enabled = enabled;
+            match self.by_id.get(provider_cfg.id.as_str()).copied() {
+                Some(idx) => {
+                    let entry = &mut self.entries[idx];
+                    if let Some(enabled) = provider_cfg.enabled {
+                        entry.enabled = enabled;
+                    }
+                    if let Some(priority) = provider_cfg.priority {
+                        entry.priority = priority.clamp(1, 999);
+                    }
                 }
-                if let Some(priority) = provider_cfg.priority {
-                    entry.priority = priority.clamp(1, 999);
-                }
+                None => self.unknown_providers.push(provider_cfg.clone()),
             }
         }
         self.platform_overrides = cfg.platform_overrides.clone().unwrap_or_default();
     }
 
+    /// Serialises current state back to the preferences shape.
+    ///
+    /// Known sources contribute a line only when they differ from their
+    /// compiled-in default, which is what keeps an untouched file empty.
+    /// Entries for unknown providers are appended verbatim: they have no
+    /// default to compare against, so "differs from default" cannot be asked
+    /// of them, and dropping them was the data loss this fixes.
     pub fn to_config(&self) -> CheatSourcesConfig {
-        let providers: Vec<config::ProviderConfigEntry> = self
+        let mut providers: Vec<config::ProviderConfigEntry> = self
             .entries
             .iter()
             .filter(|e| !e.enabled || e.priority != e.spec.default_priority)
@@ -289,6 +410,8 @@ impl CheatSourceRegistry {
                 },
             })
             .collect();
+        providers.extend(self.unknown_providers.iter().cloned());
+
         let providers = if providers.is_empty() {
             None
         } else {
@@ -303,6 +426,184 @@ impl CheatSourceRegistry {
             providers,
             platform_overrides,
         }
+    }
+
+    /// `[[providers]]` entries retained because no registry source claims them.
+    pub fn unknown_providers(&self) -> &[ProviderConfigEntry] {
+        &self.unknown_providers
+    }
+
+    /// The platform-override blocks, exactly as loaded.
+    pub fn platform_overrides(&self) -> &[PlatformOverrideEntry] {
+        &self.platform_overrides
+    }
+
+    /// Replaces the platform-override blocks.
+    ///
+    /// Whole-list replacement rather than per-field edits: unresolved blocks
+    /// are carried through by the caller passing them back untouched, which
+    /// keeps "preserve what you did not edit" a property of one call site
+    /// instead of a rule every mutation has to remember.
+    pub fn set_platform_overrides(&mut self, overrides: Vec<PlatformOverrideEntry>) {
+        self.platform_overrides = overrides;
+    }
+
+    /// Whether `source_id` currently participates for `platform_id`.
+    ///
+    /// Answers only the *policy* question. Whether the source's own
+    /// `spec.platforms` covers the platform is a separate, non-editable fact;
+    /// callers pair this with [`CheatSourceSpec::covers_platform`].
+    pub fn platform_participation(
+        &self,
+        source_id: &str,
+        platform_id: &str,
+    ) -> PlatformParticipation {
+        let overridden_by_source_level = self.get(source_id).map(|e| !e.enabled).unwrap_or(false);
+        let normalized = crate::canonical_platform_for_alias(platform_id).unwrap_or(platform_id);
+        let participating = !self
+            .find_platform_override(normalized)
+            .and_then(|block| block.disabled_providers.as_ref())
+            .map(|ids| ids.iter().any(|id| id == source_id))
+            .unwrap_or(false);
+        PlatformParticipation {
+            participating,
+            overridden_by_source_level,
+        }
+    }
+
+    /// Turns per-platform participation for one source on or off.
+    ///
+    /// Edits only the `disabled_providers` lists, leaving every block's other
+    /// fields untouched - including blocks whose platform does not resolve. A
+    /// block emptied of all content is removed so toggling a setting on and
+    /// then off again does not leave an inert stub behind in the user's file.
+    ///
+    /// # Duplicate platform blocks
+    ///
+    /// A file may name one platform in several blocks (see
+    /// `duplicate_platform_overrides_last_wins`). Resolution reads the *last*
+    /// match, so the write has to agree with it or a toggle edits a block
+    /// nobody is reading:
+    ///
+    /// - Turning participation **off** records it in the last matching block,
+    ///   which is the one [`Self::find_platform_override`] will read back.
+    /// - Turning it **on** clears the source from *every* matching block.
+    ///   Removing it from only one would leave a later block still disabling
+    ///   it, so the control would appear to do nothing.
+    ///
+    /// This makes the operation idempotent and makes the state the user sees
+    /// after it the state that actually resolves.
+    pub fn set_platform_participation(
+        &mut self,
+        source_id: &str,
+        platform_id: &str,
+        participating: bool,
+    ) {
+        let normalized = crate::canonical_platform_for_alias(platform_id)
+            .unwrap_or(platform_id)
+            .to_string();
+        let matches_platform = |block: &PlatformOverrideEntry| {
+            crate::canonical_platform_for_alias(&block.platform)
+                .map(|canon| canon == normalized)
+                .unwrap_or(false)
+        };
+
+        if participating {
+            for block in self
+                .platform_overrides
+                .iter_mut()
+                .filter(|block| matches_platform(block))
+            {
+                if let Some(disabled) = block.disabled_providers.as_mut() {
+                    disabled.retain(|id| id != source_id);
+                    if disabled.is_empty() {
+                        block.disabled_providers = None;
+                    }
+                }
+            }
+            self.platform_overrides.retain(|block| {
+                block.disabled_providers.is_some() || block.priority_overrides.is_some()
+            });
+            return;
+        }
+
+        // Last match, so the read sees what was just written.
+        let existing = self.platform_overrides.iter().rposition(matches_platform);
+
+        let idx = match existing {
+            Some(idx) => idx,
+            None => {
+                self.platform_overrides.push(PlatformOverrideEntry {
+                    platform: normalized,
+                    disabled_providers: None,
+                    priority_overrides: None,
+                });
+                self.platform_overrides.len() - 1
+            }
+        };
+
+        let block = &mut self.platform_overrides[idx];
+        let mut disabled = block.disabled_providers.take().unwrap_or_default();
+        if !disabled.iter().any(|id| id == source_id) {
+            disabled.push(source_id.to_string());
+        }
+        block.disabled_providers = if disabled.is_empty() {
+            None
+        } else {
+            Some(disabled)
+        };
+
+        if block.disabled_providers.is_none() && block.priority_overrides.is_none() {
+            self.platform_overrides.remove(idx);
+        }
+    }
+
+    /// Everything in the loaded preferences this build cannot act on.
+    ///
+    /// Deterministic order: unknown providers in file order, then platform
+    /// blocks in file order, each followed by its unknown priority overrides.
+    pub fn unresolved_preferences(&self) -> Vec<UnresolvedPreference> {
+        let mut out: Vec<UnresolvedPreference> = self
+            .unknown_providers
+            .iter()
+            .map(|entry| UnresolvedPreference {
+                kind: UnresolvedPreferenceKind::UnknownProvider,
+                detail: entry.id.clone(),
+            })
+            .collect();
+
+        for block in &self.platform_overrides {
+            if crate::canonical_platform_for_alias(&block.platform).is_none() {
+                // The whole block is inert, so its inner IDs are not reported
+                // separately - one clear cause beats a cascade of symptoms.
+                out.push(UnresolvedPreference {
+                    kind: UnresolvedPreferenceKind::UnresolvedPlatform,
+                    detail: block.platform.clone(),
+                });
+                continue;
+            }
+            for over in block.priority_overrides.iter().flatten() {
+                if !self.by_id.contains_key(over.id.as_str()) {
+                    out.push(UnresolvedPreference {
+                        kind: UnresolvedPreferenceKind::UnknownPriorityOverride {
+                            platform: block.platform.clone(),
+                        },
+                        detail: over.id.clone(),
+                    });
+                }
+            }
+            for id in block.disabled_providers.iter().flatten() {
+                if !self.by_id.contains_key(id.as_str()) {
+                    out.push(UnresolvedPreference {
+                        kind: UnresolvedPreferenceKind::UnknownDisabledProvider {
+                            platform: block.platform.clone(),
+                        },
+                        detail: id.clone(),
+                    });
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1010,5 +1311,561 @@ mod tests {
             description: "test".to_string(),
         });
         assert!(entry.health.is_none());
+    }
+
+    // ---- Lossless round-trip -------------------------------------------
+    //
+    // The property under test throughout: loading preferences, changing
+    // something this build understands, and saving must not delete anything
+    // it does not understand. Before this, `to_config` rebuilt the provider
+    // list from live registry entries alone, so an unknown ID disappeared the
+    // first time any unrelated setting was saved.
+
+    const UNKNOWN_ID: &str = "a-provider-from-some-other-build";
+    const KNOWN_ID: &str = "bsfree-archive";
+
+    #[test]
+    fn an_unknown_provider_survives_load_edit_save() {
+        let cfg = CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: Some(42),
+            }]),
+            platform_overrides: None,
+        };
+
+        let mut registry = build_default_registry();
+        registry.apply_config(&cfg);
+        // Edit something entirely unrelated, the way a user would.
+        registry.get_mut(KNOWN_ID).expect("known source").enabled = false;
+        let saved = registry.to_config();
+
+        let kept = saved
+            .providers
+            .expect("providers")
+            .into_iter()
+            .find(|p| p.id == UNKNOWN_ID)
+            .expect("the unknown provider must survive the save");
+        assert_eq!(kept.enabled, Some(false), "its value must be unchanged");
+        assert_eq!(kept.priority, Some(42), "its value must be unchanged");
+    }
+
+    #[test]
+    fn an_unknown_provider_does_not_affect_resolution() {
+        let cfg = CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: Some(1),
+            }]),
+            platform_overrides: None,
+        };
+        let mut registry = build_default_registry();
+        let before: Vec<String> = registry
+            .sorted_all()
+            .iter()
+            .map(|e| e.spec.id.clone())
+            .collect();
+        registry.apply_config(&cfg);
+        let after: Vec<String> = registry
+            .sorted_all()
+            .iter()
+            .map(|e| e.spec.id.clone())
+            .collect();
+        assert_eq!(before, after, "a retained unknown entry must stay inert");
+    }
+
+    #[test]
+    fn an_unresolvable_platform_block_survives_load_edit_save() {
+        let block = PlatformOverrideEntry {
+            platform: "NotAPlatformThisBuildKnows".to_string(),
+            disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+            priority_overrides: Some(vec![ProviderPriorityOverride {
+                id: KNOWN_ID.to_string(),
+                priority: 7,
+            }]),
+        };
+        let cfg = CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![block.clone()]),
+        };
+
+        let mut registry = build_default_registry();
+        registry.apply_config(&cfg);
+        registry.get_mut(KNOWN_ID).expect("known source").priority = 55;
+        let saved = registry.to_config();
+
+        assert_eq!(
+            saved.platform_overrides.expect("platform overrides"),
+            vec![block],
+            "an unresolvable platform block must be re-emitted verbatim"
+        );
+    }
+
+    #[test]
+    fn an_unknown_priority_override_inside_a_known_platform_survives() {
+        let block = PlatformOverrideEntry {
+            platform: "PS2".to_string(),
+            disabled_providers: None,
+            priority_overrides: Some(vec![ProviderPriorityOverride {
+                id: UNKNOWN_ID.to_string(),
+                priority: 3,
+            }]),
+        };
+        let cfg = CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![block.clone()]),
+        };
+
+        let mut registry = build_default_registry();
+        registry.apply_config(&cfg);
+        registry.get_mut(KNOWN_ID).expect("known source").enabled = false;
+
+        assert_eq!(
+            registry.to_config().platform_overrides.expect("overrides"),
+            vec![block]
+        );
+    }
+
+    #[test]
+    fn every_unresolvable_entry_is_reported_not_hidden() {
+        let cfg = CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: None,
+            }]),
+            platform_overrides: Some(vec![
+                PlatformOverrideEntry {
+                    platform: "NotAPlatform".to_string(),
+                    disabled_providers: None,
+                    priority_overrides: None,
+                },
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: None,
+                    priority_overrides: Some(vec![ProviderPriorityOverride {
+                        id: "another-unknown".to_string(),
+                        priority: 5,
+                    }]),
+                },
+            ]),
+        };
+
+        let mut registry = build_default_registry();
+        registry.apply_config(&cfg);
+        let unresolved = registry.unresolved_preferences();
+
+        assert_eq!(unresolved.len(), 3, "got {unresolved:?}");
+        assert!(
+            unresolved
+                .iter()
+                .any(|u| u.kind == UnresolvedPreferenceKind::UnknownProvider
+                    && u.detail == UNKNOWN_ID)
+        );
+        assert!(
+            unresolved
+                .iter()
+                .any(|u| u.kind == UnresolvedPreferenceKind::UnresolvedPlatform
+                    && u.detail == "NotAPlatform")
+        );
+        assert!(unresolved.iter().any(|u| matches!(
+            &u.kind,
+            UnresolvedPreferenceKind::UnknownPriorityOverride { platform } if platform == "PS2"
+        ) && u.detail == "another-unknown"));
+
+        for entry in &unresolved {
+            assert!(
+                entry.describe().contains("Kept as written"),
+                "the wording must tell the user nothing was lost: {}",
+                entry.describe()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_disabled_entry_is_not_described_as_a_priority_override() {
+        // Both kinds were reported as UnknownPriorityOverride, so the note sent
+        // the user looking for a priority_overrides line that does not exist in
+        // their file. The two live on different lines and must read differently.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "PS2".to_string(),
+                disabled_providers: Some(vec!["ghost-source".to_string()]),
+                priority_overrides: None,
+            }]),
+        });
+
+        let unresolved = registry.unresolved_preferences();
+        assert_eq!(unresolved.len(), 1, "got {unresolved:?}");
+        assert!(
+            matches!(
+                &unresolved[0].kind,
+                UnresolvedPreferenceKind::UnknownDisabledProvider { platform } if platform == "PS2"
+            ),
+            "got {:?}",
+            unresolved[0].kind
+        );
+
+        let described = unresolved[0].describe();
+        assert!(
+            !described.contains("Priority override"),
+            "a disabled entry must not be called a priority override: {described}"
+        );
+        assert!(described.contains("ghost-source") && described.contains("Kept as written"));
+    }
+
+    #[test]
+    fn an_unresolvable_platform_block_reports_one_cause_not_a_cascade() {
+        // The block never matches, so its inner IDs are moot. Reporting each
+        // of them as separately broken would bury the single real cause.
+        let cfg = CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "NotAPlatform".to_string(),
+                disabled_providers: Some(vec!["unknown-a".to_string()]),
+                priority_overrides: Some(vec![ProviderPriorityOverride {
+                    id: "unknown-b".to_string(),
+                    priority: 5,
+                }]),
+            }]),
+        };
+        let mut registry = build_default_registry();
+        registry.apply_config(&cfg);
+        let unresolved = registry.unresolved_preferences();
+        assert_eq!(unresolved.len(), 1, "got {unresolved:?}");
+        assert_eq!(
+            unresolved[0].kind,
+            UnresolvedPreferenceKind::UnresolvedPlatform
+        );
+    }
+
+    #[test]
+    fn a_clean_registry_reports_nothing_unresolved() {
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig::default());
+        assert!(registry.unresolved_preferences().is_empty());
+        assert!(registry.unknown_providers().is_empty());
+    }
+
+    #[test]
+    fn reapplying_a_config_does_not_accumulate_unknown_entries() {
+        let cfg = CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: None,
+            }]),
+            platform_overrides: None,
+        };
+        let mut registry = build_default_registry();
+        registry.apply_config(&cfg);
+        registry.apply_config(&cfg);
+        registry.apply_config(&cfg);
+        assert_eq!(registry.unknown_providers().len(), 1);
+    }
+
+    #[test]
+    fn an_untouched_registry_still_saves_an_empty_config() {
+        // The compatibility floor: never having opened the GUI must not
+        // start writing preferences that were previously absent.
+        let registry = build_default_registry();
+        let cfg = registry.to_config();
+        assert_eq!(cfg, CheatSourcesConfig::default());
+        assert!(cfg.providers.is_none() && cfg.platform_overrides.is_none());
+    }
+
+    // ---- Per-platform participation ------------------------------------
+
+    #[test]
+    fn participation_defaults_to_on_and_records_nothing() {
+        let mut registry = build_default_registry();
+        assert!(
+            registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating
+        );
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+        assert!(
+            registry.to_config().platform_overrides.is_none(),
+            "the default must not be written out"
+        );
+    }
+
+    #[test]
+    fn participation_can_be_turned_off_and_back_on_without_residue() {
+        let mut registry = build_default_registry();
+        registry.set_platform_participation(KNOWN_ID, "PS2", false);
+        assert!(
+            !registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating
+        );
+        assert!(registry.to_config().platform_overrides.is_some());
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+        assert!(
+            registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating
+        );
+        assert!(
+            registry.to_config().platform_overrides.is_none(),
+            "toggling back must leave no inert stub in the user's file"
+        );
+    }
+
+    #[test]
+    fn participation_edits_do_not_disturb_other_blocks() {
+        let foreign = PlatformOverrideEntry {
+            platform: "NotAPlatform".to_string(),
+            disabled_providers: Some(vec!["unknown".to_string()]),
+            priority_overrides: None,
+        };
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![foreign.clone()]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", false);
+        let saved = registry.to_config().platform_overrides.expect("overrides");
+
+        assert!(
+            saved.contains(&foreign),
+            "an unrelated, unresolvable block must survive an edit elsewhere"
+        );
+        assert!(saved.iter().any(|b| b.platform == "PS2"));
+    }
+
+    #[test]
+    fn source_level_disable_is_reported_as_overriding_the_platform_control() {
+        let mut registry = build_default_registry();
+        registry.get_mut(KNOWN_ID).expect("known source").enabled = false;
+        let participation = registry.platform_participation(KNOWN_ID, "PS2");
+        assert!(
+            participation.overridden_by_source_level,
+            "the GUI needs to know the platform toggle cannot help here"
+        );
+    }
+
+    #[test]
+    fn platform_participation_survives_an_alias() {
+        // Stored values and typed values may spell a platform differently;
+        // both must reach the same block rather than creating a second one.
+        let mut registry = build_default_registry();
+        registry.set_platform_participation(KNOWN_ID, "PS2", false);
+        let blocks = registry.to_config().platform_overrides.expect("overrides");
+        assert_eq!(blocks.len(), 1, "an alias must not create a second block");
+        assert!(
+            !registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating
+        );
+    }
+
+    #[test]
+    fn empty_platform_list_means_every_platform() {
+        let registry = build_default_registry();
+        let cross_platform = registry.get(KNOWN_ID).expect("bsfree is cross-platform");
+        assert!(cross_platform.spec.platforms.is_empty());
+        assert!(cross_platform.spec.covers_platform("PS2"));
+        assert!(cross_platform.spec.covers_platform("Wii"));
+        assert!(
+            cross_platform.spec.platform_coverage().is_none(),
+            "no list must not be displayed as covering nothing"
+        );
+    }
+
+    #[test]
+    fn re_enabling_clears_every_duplicate_block_for_that_platform() {
+        // A file may name one platform in several blocks, and resolution reads
+        // the last match. Removing the source from only the first left a later
+        // block still disabling it, so the toggle silently did nothing: the
+        // control moved, the resolved state did not, and the GUI redrew it as
+        // still disabled.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+            ]),
+        });
+        assert!(
+            !registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating
+        );
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+
+        assert!(
+            registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating,
+            "re-enabling must actually take effect, not be masked by a later block"
+        );
+        assert!(
+            registry
+                .to_config()
+                .platform_overrides
+                .unwrap_or_default()
+                .iter()
+                .all(|block| block
+                    .disabled_providers
+                    .iter()
+                    .flatten()
+                    .all(|id| id != KNOWN_ID)),
+            "no block may still name the source after re-enabling"
+        );
+    }
+
+    #[test]
+    fn disabling_records_into_the_block_resolution_reads() {
+        // The mirror of the above: the write must land in the block that will
+        // be read back, or the new setting is invisible to resolution.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec!["gamehacking.org-ps2".to_string()]),
+                    priority_overrides: None,
+                },
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: None,
+                    priority_overrides: Some(vec![ProviderPriorityOverride {
+                        id: "gamehacking.org-ps2".to_string(),
+                        priority: 5,
+                    }]),
+                },
+            ]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", false);
+
+        assert!(
+            !registry
+                .platform_participation(KNOWN_ID, "PS2")
+                .participating,
+            "the new exception must be visible to resolution immediately"
+        );
+        assert!(
+            !registry
+                .sorted_enabled_for_platform("PS2")
+                .iter()
+                .any(|e| e.spec.id == KNOWN_ID),
+            "and must actually remove the source from that platform's results"
+        );
+    }
+
+    #[test]
+    fn re_enabling_preserves_unrelated_and_unresolvable_blocks() {
+        // Cleanup must never reach past the platform being edited.
+        let unresolvable = PlatformOverrideEntry {
+            platform: "NotAPlatform".to_string(),
+            disabled_providers: Some(vec!["someone-else".to_string()]),
+            priority_overrides: None,
+        };
+        let other_platform = PlatformOverrideEntry {
+            platform: "Wii".to_string(),
+            disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+            priority_overrides: None,
+        };
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: Some(vec![ProviderConfigEntry {
+                id: UNKNOWN_ID.to_string(),
+                enabled: Some(false),
+                priority: Some(42),
+            }]),
+            platform_overrides: Some(vec![
+                unresolvable.clone(),
+                other_platform.clone(),
+                PlatformOverrideEntry {
+                    platform: "PS2".to_string(),
+                    disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                    priority_overrides: None,
+                },
+            ]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+        let saved = registry.to_config();
+        let blocks = saved.platform_overrides.expect("overrides");
+
+        assert!(
+            blocks.contains(&unresolvable),
+            "an unresolvable block must survive an unrelated removal: {blocks:?}"
+        );
+        assert!(
+            blocks.contains(&other_platform),
+            "another platform's exception must survive: {blocks:?}"
+        );
+        assert!(
+            !blocks.iter().any(|b| b.platform == "PS2"),
+            "the emptied PS2 block should be gone: {blocks:?}"
+        );
+        assert_eq!(
+            saved
+                .providers
+                .expect("providers")
+                .iter()
+                .filter(|p| p.id == UNKNOWN_ID)
+                .count(),
+            1,
+            "the unknown provider must survive a platform edit"
+        );
+    }
+
+    #[test]
+    fn a_block_kept_only_for_its_priority_overrides_is_not_deleted() {
+        // Cleanup removes blocks with nothing left in them. A block whose
+        // priority_overrides are still present has content, even if the
+        // disabled list just emptied.
+        let mut registry = build_default_registry();
+        registry.apply_config(&CheatSourcesConfig {
+            providers: None,
+            platform_overrides: Some(vec![PlatformOverrideEntry {
+                platform: "PS2".to_string(),
+                disabled_providers: Some(vec![KNOWN_ID.to_string()]),
+                priority_overrides: Some(vec![ProviderPriorityOverride {
+                    id: "gamehacking.org-ps2".to_string(),
+                    priority: 5,
+                }]),
+            }]),
+        });
+
+        registry.set_platform_participation(KNOWN_ID, "PS2", true);
+        let blocks = registry
+            .to_config()
+            .platform_overrides
+            .expect("the block must remain for its priority overrides");
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].disabled_providers.is_none());
+        assert!(blocks[0].priority_overrides.is_some());
+    }
+
+    #[test]
+    fn a_platform_specific_source_reports_its_coverage() {
+        let registry = build_default_registry();
+        let ps2 = registry.get("gamehacking.org-ps2").expect("entry");
+        assert!(ps2.spec.covers_platform("PS2"));
+        assert!(!ps2.spec.covers_platform("Wii"));
+        assert_eq!(ps2.spec.platform_coverage(), Some(&["PS2".to_string()][..]));
     }
 }
