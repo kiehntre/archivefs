@@ -129,6 +129,7 @@ use archivefs_core::patch_manager::{
 };
 pub mod bulk_confirmation;
 pub(crate) mod cheat_sources_page;
+pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod romm_browse;
@@ -2888,6 +2889,11 @@ enum MainView {
     /// Cheats & Mods, because it is configuration that outlives any one
     /// archive being worked on.
     CheatSources,
+    /// The registered DAT catalogues: which local DAT files and folders
+    /// ArchiveFS can check a library against. Its own destination for the
+    /// same reason Cheat Sources is: it is configuration that outlives any
+    /// one archive being worked on.
+    DatSources,
     ActiveMounts,
     Doctor,
     HistoryLogs,
@@ -3100,11 +3106,12 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 12] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 13] = [
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::CheatSources, "Cheat Sources"),
+    (MainView::DatSources, "DAT Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::RecentlyFound, "Recently Found"),
@@ -3172,6 +3179,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Selected => "Selected",
         MainView::CheatsMods => "Cheats & Mods",
         MainView::CheatSources => "Cheat Sources",
+        MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
         MainView::HistoryLogs => "History & Logs",
@@ -3193,9 +3201,11 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Sources
         | MainView::LibraryViews
         | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
-        MainView::CheatSources | MainView::Doctor | MainView::Settings | MainView::About => {
-            ui_layout::ContentWidth::Normal
-        }
+        MainView::CheatSources
+        | MainView::DatSources
+        | MainView::Doctor
+        | MainView::Settings
+        | MainView::About => ui_layout::ContentWidth::Normal,
     }
 }
 
@@ -3230,6 +3240,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
         MainView::Selected
             | MainView::Sources
             | MainView::CheatSources
+            | MainView::DatSources
             | MainView::Doctor
             | MainView::HistoryLogs
             | MainView::Settings
@@ -3490,6 +3501,13 @@ struct ArchiveFsApp {
     /// than in the page state because none of it is policy - see
     /// `CheatSourcesPageUi`.
     cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi,
+    /// The DAT Sources page, loaded lazily on first visit for the same reason
+    /// Cheat Sources is: starting the GUI should not read a registry file for
+    /// a page nobody has opened.
+    dat_sources_page: Option<dat_sources_page::DatSourcesPageState>,
+    /// Unsubmitted DAT Sources text and disclosure state. Held here rather
+    /// than in the page state because none of it is policy.
+    dat_sources_ui: dat_sources_page::DatSourcesPageUi,
     /// The finding whose evidence panel is open, by stable finding id.
     doctor_selected_finding: Option<String>,
     /// The repair awaiting confirmation, if any.
@@ -3789,6 +3807,8 @@ impl ArchiveFsApp {
             database_generation,
             cheat_sources_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
+            dat_sources_page: None,
+            dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
@@ -4698,6 +4718,68 @@ impl ArchiveFsApp {
             // show a value that is no longer anywhere in the state.
             if matches!(action, cheat_sources_page::CheatSourcesPageAction::Revert) {
                 self.cheat_sources_ui.clear();
+            }
+            page.apply(action);
+        }
+    }
+
+    /// Draws the DAT Sources page and applies whatever it asked for.
+    ///
+    /// Loaded on first visit rather than at startup, for the same reason Cheat
+    /// Sources is. A path that cannot be resolved (no `HOME`) is reported in
+    /// place instead of failing the whole page.
+    ///
+    /// The library folders offered as audit targets, and the trusted roots the
+    /// hashing policy uses, both come from the same `Config` the rest of the
+    /// build reads. A missing or unreadable config is not fatal here: it means
+    /// no folders are offered and no symlink may be followed, which are the
+    /// safe answers rather than an error the user cannot act on from this page.
+    fn show_dat_sources_page(&mut self, ui: &mut egui::Ui) {
+        if self.dat_sources_page.is_none() {
+            let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    widgets::banner(
+                        ui,
+                        "Registry location unknown",
+                        &format!(
+                            "{error}. DAT sources cannot be read or saved without a home \
+                             directory."
+                        ),
+                        widgets::StatusTone::Blocked,
+                    );
+                    return;
+                }
+            };
+            let config = Config::load_default().ok();
+            let library_folders = config
+                .as_ref()
+                .map(|config| config.source_folders.clone())
+                .unwrap_or_default();
+            let trusted = config
+                .as_ref()
+                .map(archivefs_core::safe_read::TrustedRoots::from_config)
+                .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
+            self.dat_sources_page = Some(dat_sources_page::DatSourcesPageState::load(
+                path,
+                library_folders,
+                trusted,
+            ));
+        }
+
+        let Some(page) = self.dat_sources_page.as_mut() else {
+            return;
+        };
+        // Drained before the view is built, so the view stays a pure function
+        // of state. A running job repaints continuously; an idle page does not.
+        if page.poll() || page.is_busy() {
+            ui.ctx().request_repaint();
+        }
+        let view = page.view();
+        let action = dat_sources_page::show_dat_sources_page(ui, &view, &mut self.dat_sources_ui);
+        if let Some(action) = action {
+            if matches!(action, dat_sources_page::DatSourcesPageAction::Revert) {
+                self.dat_sources_ui.clear();
             }
             page.apply(action);
         }
@@ -13270,6 +13352,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::CheatSources {
                     self.show_cheat_sources_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::DatSources {
+                    self.show_dat_sources_page(ui);
                     return;
                 }
 
@@ -50604,6 +50691,8 @@ $Instant Growth [Nayr]\n";
             // and loading it here would read the real per-user preferences.
             cheat_sources_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
+            dat_sources_page: None,
+            dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,

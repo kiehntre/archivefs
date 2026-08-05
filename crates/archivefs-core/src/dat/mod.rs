@@ -41,3 +41,4 @@ pub mod parser;
 pub mod parsers;
 #[cfg(test)]
 mod regression;
+pub mod sources;
