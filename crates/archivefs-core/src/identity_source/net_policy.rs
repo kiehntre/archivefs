@@ -73,8 +73,13 @@ pub enum EndpointRefusal {
     /// A scheme other than `http` or `https`. Names the scheme so `file:` and
     /// `unix:` attempts are legible in a diagnostic.
     UnsupportedScheme { scheme: String },
-    /// `http://user:password@host` - credentials in a URL are never accepted,
-    /// because they would end up in caches, logs and diagnostics.
+    /// A URL carrying a username or password in its authority component, before
+    /// the `@`. Never accepted, because such a URL ends up in caches, logs and
+    /// diagnostics.
+    ///
+    /// Written as prose rather than as an example URL: the repository's secret
+    /// scanner matches that shape wherever it appears, and a doc comment is not
+    /// worth a standing exception to it.
     EmbeddedCredentials,
     /// No host at all.
     MissingHost,

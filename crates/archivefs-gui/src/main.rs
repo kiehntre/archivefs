@@ -128,6 +128,7 @@ use archivefs_core::patch_manager::{
     XeniaProviderFetchStatus,
 };
 pub mod bulk_confirmation;
+pub(crate) mod cheat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod romm_browse;
@@ -2882,6 +2883,11 @@ enum MainView {
     Mount,
     Selected,
     CheatsMods,
+    /// The registered cheat sources: which are consulted, in what order, and
+    /// for which platforms. Its own destination rather than a section of
+    /// Cheats & Mods, because it is configuration that outlives any one
+    /// archive being worked on.
+    CheatSources,
     ActiveMounts,
     Doctor,
     HistoryLogs,
@@ -3094,10 +3100,11 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 11] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 12] = [
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
+    (MainView::CheatSources, "Cheat Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::RecentlyFound, "Recently Found"),
@@ -3164,6 +3171,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Mount => "Mount",
         MainView::Selected => "Selected",
         MainView::CheatsMods => "Cheats & Mods",
+        MainView::CheatSources => "Cheat Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
         MainView::HistoryLogs => "History & Logs",
@@ -3185,7 +3193,9 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Sources
         | MainView::LibraryViews
         | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
-        MainView::Doctor | MainView::Settings | MainView::About => ui_layout::ContentWidth::Normal,
+        MainView::CheatSources | MainView::Doctor | MainView::Settings | MainView::About => {
+            ui_layout::ContentWidth::Normal
+        }
     }
 }
 
@@ -3219,6 +3229,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
         view,
         MainView::Selected
             | MainView::Sources
+            | MainView::CheatSources
             | MainView::Doctor
             | MainView::HistoryLogs
             | MainView::Settings
@@ -3471,6 +3482,14 @@ struct ArchiveFsApp {
     /// reloads the application.
     doctor_scan: DoctorScanState,
     doctor_scan_generation: RefreshGeneration,
+    /// The Cheat Sources page, loaded lazily the first time it is opened so
+    /// that starting the GUI never reads the preferences file for a page the
+    /// user has not visited.
+    cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
+    /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
+    /// than in the page state because none of it is policy - see
+    /// `CheatSourcesPageUi`.
+    cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi,
     /// The finding whose evidence panel is open, by stable finding id.
     doctor_selected_finding: Option<String>,
     /// The repair awaiting confirmation, if any.
@@ -3735,6 +3754,8 @@ impl ArchiveFsApp {
             state: start_load(context.clone(), generation, None),
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
+            cheat_sources_page: None,
+            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
@@ -4602,13 +4623,57 @@ impl ArchiveFsApp {
     /// captured path. Afterwards only the affected finding's own check is
     /// re-run (inside the executor), never the whole scan, and exactly one
     /// History entry is recorded whatever the result.
-    fn confirm_doctor_repair(&mut self) {
-        let Some(review) = self.doctor_repair_review.take() else {
+    /// Draws the Cheat Sources page and applies whatever it asked for.
+    ///
+    /// The state is loaded on first visit rather than at startup: opening the
+    /// GUI should not read a preferences file for a page nobody has looked
+    /// at. A path that cannot even be resolved (no `HOME`) is reported in
+    /// place instead of failing the whole page, since every other part of the
+    /// GUI still works without it.
+    fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
+        if self.cheat_sources_page.is_none() {
+            match archivefs_core::patch_manager::default_cheat_sources_config_path() {
+                Ok(path) => {
+                    self.cheat_sources_page =
+                        Some(cheat_sources_page::CheatSourcesPageState::load(path));
+                }
+                Err(error) => {
+                    widgets::banner(
+                        ui,
+                        "Preferences location unknown",
+                        &format!(
+                            "{error}. Cheat source preferences cannot be read or saved without a \
+                             home directory."
+                        ),
+                        widgets::StatusTone::Blocked,
+                    );
+                    return;
+                }
+            }
+        }
+
+        let Some(page) = self.cheat_sources_page.as_mut() else {
             return;
         };
+        let view = page.view();
+        let action =
+            cheat_sources_page::show_cheat_sources_page(ui, &view, &mut self.cheat_sources_ui);
+        if let Some(action) = action {
+            // Reverting throws away in-progress text and any open picker too:
+            // leaving a typed priority behind after "Discard changes" would
+            // show a value that is no longer anywhere in the state.
+            if matches!(action, cheat_sources_page::CheatSourcesPageAction::Revert) {
+                self.cheat_sources_ui.clear();
+            }
+            page.apply(action);
+        }
+    }
+
+    fn confirm_doctor_repair(&mut self) {
         let config = match Config::load_default() {
             Ok(config) => config,
             Err(error) => {
+                self.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -4621,6 +4686,7 @@ impl ArchiveFsApp {
         let index_path = match default_index_path() {
             Ok(path) => path,
             Err(error) => {
+                self.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -4629,6 +4695,20 @@ impl ArchiveFsApp {
                 ));
                 return;
             }
+        };
+        self.confirm_doctor_repair_with(config, index_path);
+    }
+
+    /// The repair itself, against an already-resolved configuration.
+    ///
+    /// `confirm_doctor_repair` reads the per-user configuration and the index
+    /// path and delegates here. Tests supply both directly: reading them meant a
+    /// test of *refusal* first had to get past a config load, so it passed only
+    /// on a machine that happened to have `~/.config/archivefs/config.toml` and
+    /// failed on CI, which does not.
+    fn confirm_doctor_repair_with(&mut self, config: Config, index_path: PathBuf) {
+        let Some(review) = self.doctor_repair_review.take() else {
+            return;
         };
         let Some(displayed) = self.doctor_scan.displayed() else {
             return;
@@ -13017,6 +13097,11 @@ impl ArchiveFsApp {
 
                     ui.add_space(theme::SECTION_GAP);
                     show_sources_recent_activity(ui, &self.history);
+                    return;
+                }
+
+                if self.view == MainView::CheatSources {
+                    self.show_cheat_sources_page(ui);
                     return;
                 }
 
@@ -38005,10 +38090,18 @@ mod tests {
                 "{absent:?} must not be a separate sidebar destination any more"
             );
         }
+        // The Library area contributes exactly one destination. Counting only
+        // those, rather than the whole sidebar, is what this test is actually
+        // about: pinning the total meant any unrelated page added elsewhere
+        // failed a Library-consolidation test, which says nothing about
+        // Library. Cheat Sources was the first such page.
+        let library_area_destinations = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .filter(|(view, _)| library_tab_for_main_view(*view).is_some())
+            .count();
         assert_eq!(
-            PRIMARY_NAVIGATION_DESTINATIONS.len(),
-            11,
-            "sidebar consolidation must not add or remove any other destination"
+            library_area_destinations, 1,
+            "sidebar consolidation must leave Library as the area's only destination"
         );
     }
 
@@ -49324,7 +49417,21 @@ $Instant Growth [Nayr]\n";
         app.doctor_repair_review = Some(doctor_review());
         let history_before = app.history.entries().count();
 
-        app.confirm_doctor_repair();
+        // Configuration supplied directly. Reading the real one made this test
+        // pass only on a machine that happened to have
+        // `~/.config/archivefs/config.toml`, and fail on CI, which does not - and
+        // it was never what the test is about.
+        // Paths that deliberately do not exist: the repair is refused at
+        // revalidation, so nothing here is ever opened, created or written.
+        let scratch = std::env::temp_dir().join("archivefs-doctor-repair-refusal-fixture");
+        app.confirm_doctor_repair_with(
+            Config {
+                source_folders: vec![scratch.join("sources")],
+                mount_root: scratch.join("mounts"),
+                ratarmount_bin: "ratarmount".to_string(),
+            },
+            scratch.join("index.json"),
+        );
 
         assert_eq!(
             app.history.entries().count(),
@@ -49469,6 +49576,10 @@ $Instant Growth [Nayr]\n";
                 database_path: PathBuf::from("/config/library.sqlite3"),
             },
             database_generation: DatabaseGeneration::INITIAL,
+            // Left unloaded: these tests never open the Cheat Sources page,
+            // and loading it here would read the real per-user preferences.
+            cheat_sources_page: None,
+            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,

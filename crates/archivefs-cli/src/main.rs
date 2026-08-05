@@ -80,6 +80,8 @@ use archivefs_core::{
 use serde::Serialize;
 
 mod bsfree;
+mod cheat_source;
+mod dat;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -334,6 +336,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             input_args.drain(0..2);
             bsfree::run(input_args)?;
+        }
+        "cheat-source" => {
+            let input_args = args.collect::<Vec<_>>();
+            cheat_source::run(input_args)?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -1600,6 +1606,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             }
+        }
+        "dat" => {
+            let input_args: Vec<String> = args.collect();
+            dat::run(input_args)?;
         }
         // `--version`/`-V` are recognised only in the command position -
         // exactly the same scope `--help`/`-h` already have (neither is
@@ -5440,6 +5450,21 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
+    println!(
+        "  cheat-source list  List all registered cheat sources ordered by priority; add --json for structured output"
+    );
+    println!(
+        "  cheat-source info <id>  Show details for one cheat source; add --json for structured output"
+    );
+    println!(
+        "  cheat-source enable <id>  Enable a cheat source and persist the change to cheat_sources.toml; add --json for structured output"
+    );
+    println!(
+        "  cheat-source disable <id>  Disable a cheat source and persist the change to cheat_sources.toml; add --json for structured output"
+    );
+    println!(
+        "  cheat-source set-priority <id> <priority>  Set a cheat source's priority (1-999) and persist to cheat_sources.toml; add --json for structured output. Ties are broken by source ID."
     );
     println!(
         "  identity source romm <status|configure|test|mappings|import|refresh|records|record|conflicts|verify-hash|enable|disable|remove>  Use a local RomM server as an external identity source. Read-only towards RomM: no command writes to it, triggers a scan, edits metadata, or touches a ROM. Only loopback and private LAN addresses are accepted. The token is passed by file path with --token-file and is never printed, logged or stored in config or cache JSON. Add --json for structured output on stdout, with progress on stderr."
