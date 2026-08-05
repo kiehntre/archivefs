@@ -237,6 +237,72 @@ fn what_is_held_stays_bounded_for_a_large_library() {
     );
 }
 
+#[test]
+fn an_empty_library_asks_for_nothing_and_holds_nothing() {
+    // Gamer View is reachable before a library is loaded and after one is
+    // filtered down to nothing. Neither may produce a request, and neither may
+    // leave a slot behind for a path that is not on screen.
+    let mut cache = GamerCoverCache::default();
+
+    assert!(
+        cache.visible(None, &[], &[]).is_empty(),
+        "an empty library asked for a cover"
+    );
+    // A second frame: the look-ahead must not invent work from an empty window.
+    assert!(cache.visible(None, &[], &[]).is_empty());
+    assert_eq!(cache.tracked(), 0, "an empty library held something");
+
+    // And an empty window with a selection that is no longer in the list.
+    assert_eq!(
+        job_paths(&cache.visible(Some(&path("1")), &[], &[])),
+        vec![path("1")],
+        "a selected game must still be requested even when the list is empty"
+    );
+}
+
+#[test]
+fn two_files_of_one_game_each_draw_that_games_cover() {
+    // A duplicate or alternate dump gives two local paths that resolve to the
+    // same RomM record, so both rows share one artwork key. Each row must get
+    // its own slot and its own answer: keying a slot by anything but the path
+    // would let one of the two rows sit blank forever, and accepting an answer
+    // whose game id does not match would let a shared key smear one game's art
+    // across a neighbour.
+    let context = context();
+    let mut cache = GamerCoverCache::default();
+    let (first, second) = (path("disc-a"), path("disc-b"));
+
+    let jobs = cache.visible(None, &[first.clone(), second.clone()], &[]);
+    assert_eq!(job_paths(&jobs), vec![first.clone(), second.clone()]);
+
+    // One game id, one artwork key, two paths - exactly what the worker returns
+    // for a duplicate entry.
+    for local_path in [&first, &second] {
+        assert!(cache.absorb(
+            &context,
+            CoverReply {
+                generation: cache.generation(),
+                local_path: local_path.clone(),
+                provider_game_id: Some("shared-game".to_string()),
+                answer: CoverAnswer::Ready(image("shared-key")),
+            }
+        ));
+    }
+
+    for local_path in [&first, &second] {
+        match cache.slot_for(local_path, Some("shared-game")) {
+            Some(CoverSlot::Ready { key, .. }) => assert_eq!(key, "shared-key"),
+            _ => panic!("{local_path:?} did not hold the shared cover"),
+        }
+    }
+
+    // The shared key must not make the cover reachable under the wrong game.
+    assert!(
+        cache.slot_for(&first, Some("a-different-game")).is_none(),
+        "a shared artwork key let one game's cover answer for another"
+    );
+}
+
 // --- Stale and misattributed answers -------------------------------------
 
 #[test]

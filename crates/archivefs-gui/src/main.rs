@@ -40772,6 +40772,89 @@ mod tests {
     }
 
     #[test]
+    fn gamer_view_renders_without_a_romm_catalogue_and_contacts_nothing() {
+        // The cover column draws on every Gamer View frame. With no RomM
+        // catalogue imported - a clean install, or an import that never ran -
+        // every row falls to the placeholder path. That path runs inside the
+        // real frame here rather than only in the scheduler's unit tests, so a
+        // panic while drawing a coverless row is caught.
+        //
+        // It also pins the rule that opening Gamer View is not a network event:
+        // no cover worker is started by rendering, so nothing can be fetched by
+        // looking at the page.
+        let mut app = app_for_operation_tests();
+        let mut records = Vec::new();
+        for index in 0..40 {
+            let mut row = record(&format!("/roms/g{index:02}.zip"), MountState::Pending);
+            row.metadata.title = Some(format!("Coverless Game {index:02}"));
+            row.metadata.platform = Some("GameCube".to_string());
+            records.push(row);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // Several passes: scrolling state and the look-ahead settle across
+        // frames, and a repeat frame is where a re-request storm would show up.
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame)));
+        }
+        let output = output.expect("a rendered frame");
+
+        assert!(
+            rendered_text_contains(&output, "Coverless Game 00"),
+            "the list must still draw when no cover is available"
+        );
+        assert!(
+            app.gamer_covers.tracked() <= crate::gamer_artwork::MAX_TRACKED_COVERS,
+            "rendering pushed the cover cache past its bound, held {}",
+            app.gamer_covers.tracked()
+        );
+    }
+
+    #[test]
+    fn an_empty_gamer_view_starts_no_cover_worker_at_all() {
+        // The worker is what opens the catalogue and is the only thing that can
+        // reach the configured RomM instance. It is started lazily, on the first
+        // frame that actually asks for a cover, so a Gamer View with nothing to
+        // show must never bring it up: no thread, no catalogue read, no request.
+        let mut app = app_for_operation_tests();
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", Vec::new())));
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+        }
+
+        assert!(
+            app.gamer_cover_worker.is_none(),
+            "an empty library started a cover worker, so opening the page alone \
+             would open the catalogue and could reach the network"
+        );
+        assert_eq!(app.gamer_covers.tracked(), 0);
+    }
+
+    #[test]
     fn changing_the_archive_clears_the_candidate_and_selection() {
         let mut app = app_with_cheats_mods_context();
         workflow_at_cheat_selection_stage(&mut app);
